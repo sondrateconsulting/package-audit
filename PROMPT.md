@@ -809,7 +809,12 @@ E. Introspect API surface, deduplicated GLOBALLY by (package_name, resolved_vers
    versionsSeen (§7) and needs no per-version coverage; log it once at resolution time as a
    PACKAGE-scoped `errors` row (`package_name` set; `version` = the raw resolved spec, e.g.
    the `git+`/`file:`/`workspace:` reference, for traceability), independent of the
-   versionsSeen reconciliation loop.
+   versionsSeen reconciliation loop. NOTE the asymmetry: a non-registry skip error is
+   emitted ONLY on the run that resolves it (a later skip-as-current run that reuses the
+   prior `dependency_findings` does NOT re-emit it — it needs none, being outside
+   versionsSeen), whereas a REGISTRY-version failure IS re-emitted every run its version
+   stays in the slice (that per-run re-emission is exactly what keeps the §8 `run_id=R`
+   guarantee satisfiable).
 F. Find in-repo API usage: detect `named-import`, `namespace-import` (`import * as`),
    `default-import`, `require(...)` (incl. destructured), `dynamic-import` (`import(...)`),
    `reexport` (`export … from 'pkg'`), and `side-effect-import` (`import 'pkg'`). Match
