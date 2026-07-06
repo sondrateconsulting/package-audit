@@ -203,57 +203,45 @@ Create idempotently (CREATE TABLE IF NOT EXISTS) — never LOSE DATA without
 transaction and only after every row has been copied into its replacement.
 Schema evolution: track the schema version with `PRAGMA user_version`. When a
 pre-existing DB's version is older, migrate INSIDE ONE TRANSACTION, preserving
-all rows: use additive `ALTER TABLE ... ADD COLUMN` where sufficient (a NOT NULL
+all REPORTABLE and CACHE data (the `runs` and `run_unit_head` provenance tables and the
+`api_cache`/`package_api_surface` caches) while RESETTING the run-scoped finding/error/queue
+tables for regeneration (the run-scoped-reset rule below): use additive
+`ALTER TABLE ... ADD COLUMN` where sufficient (a NOT NULL
 column added via ALTER MUST carry a DEFAULT satisfying any CHECK — SQLite rejects
 it otherwise); where a UNIQUE constraint must change, a NOT NULL column has no
 sensible DEFAULT, OR an FK must be added to an existing column (SQLite's ALTER cannot
 add a FOREIGN KEY — so dependency_findings/usage_findings/errors, which all gain
-`run_id REFERENCES runs(run_id)`, require the rebuild purely to acquire that FK; and
-`api_cache`, whose PRIMARY KEY changes from `(url)` to `(method,url,variant_hash)` and
-which gains two NOT NULL columns, also requires the rebuild — backfill legacy rows with
+`run_id REFERENCES runs(run_id)`, and `api_cache`, whose PRIMARY KEY changes from `(url)`
+to `(method,url,variant_hash)` and which gains two NOT NULL columns, all require a rebuild),
+use the sanctioned rebuild (CREATE new-shape temp table, `INSERT ... SELECT`, DROP, RENAME,
+bump user_version). For `api_cache` PRESERVE the rows — backfill legacy rows with
 `method='GET'` and `variant_hash=''` (they predate GraphQL/variant support), preserving
 url/etag/response_body/cached_at; this keeps the `--fresh`-preserves-api_cache guarantee
-intact), use the sanctioned rebuild instead: CREATE the new-shape table
-under a temporary name, `INSERT ... SELECT` the old rows (backfilling new columns:
-dependency_key := package_name; usage_findings.dependency_key := '',
-`COALESCE(export_name,'')`, and context := ''; dependency_findings.resolved_version_source
-:= NULL; for work_queue, config_hash from a join to `runs`,
-created_run_id = last_run_id = old run_id, and `COALESCE(col,'')` for the new sentinel
-columns), DROP the old table, RENAME — then bump user_version. Dedup rule: adding a column TO an
-existing UNIQUE key makes it LOOSER (dependency_findings gaining `dependency_type` needs
-no dedup), but ADDING a UNIQUE where there was none, or COLLAPSING NULLs into sentinels,
-is TIGHTER and the `INSERT ... SELECT` MUST de-duplicate (`GROUP BY` the new key keeping
-the latest row by that table's OWN timestamp — `MAX(updated_at)` for work_queue,
-`MAX(found_at)` for usage_findings; there is no `updated_at` on findings. Select the
-whole winning row deterministically (a correlated subquery or `ROW_NUMBER()` window
-ordered by the timestamp DESC then `id` DESC as a tie-break — do NOT rely on SQLite's
-bare-column-follows-MAX shortcut on a non-idiomatic engine)). Two tables
-tighten here: work_queue (old NULL-distinct org/repo rows collapse under the '' sentinels)
-and usage_findings (it had NO UNIQUE before, so pre-existing duplicate rows must be
-collapsed). For work_queue also DERIVE `scope` from
-the presence of repository/branch during the copy (scope='org' when both empty, 'repo'
-when only branch empty, else 'branch') so legacy rows satisfy the new mutually-exclusive
-scope CHECK. Because the old schema FK'd run_id to `runs` on NONE of these tables, ALL of
-work_queue, dependency_findings, usage_findings, and errors can hold rows whose run_id has
-no `runs` row (partial writes / pre-FK crashes). BEFORE any FK-bearing `INSERT ... SELECT`,
-quarantine every orphaned run_id — collected across ALL FOUR child tables, not just
-work_queue — by synthesizing ONE `status='failed'` legacy `runs` row per distinct orphaned
-run_id (otherwise the FK copy aborts the whole one-transaction migration with FOREIGN KEY
-constraint failed). An orphaned run_id has no `runs` row, so its original config_hash is
-UNKNOWABLE; give the synthesized run a distinct PLACEHOLDER hash `legacy-orphan:<run_id>`
-that can never equal a real current config_hash (so those rows are never mistaken for
-current-config completed work), a deterministic `started_at` = the earliest timestamp of
-that run_id's rows across ANY table (work_queue.updated_at, dependency_findings.date_fetched,
-usage_findings.found_at, errors.occurred_at), else the migration timestamp, and
-`status='failed'`. Then the new FK does not reject any copy. Ordering within the
-migration transaction: run the additive ALTERs on tables that are NOT rebuilt FIRST — the
+intact. But the RUN-SCOPED tables `dependency_findings`, `usage_findings`, `errors`, AND
+`work_queue` are rebuilt in their new shape EMPTY — the migration does NOT copy their legacy
+rows (the run-scoped-reset rule). This is deliberate: those rows belong only to PRE-migration
+runs, which are non-reportable (see `tracked_packages` below), and their newly-added columns
+have no sound legacy value — a backfilled sentinel (`usage_findings.dependency_key := ''`
+would even COLLIDE with the CLI-usage sentinel, §5.F/§7) could be surfaced by the FIRST
+post-migration live run through the skip-as-current report-head path (§3) and corrupt that
+run's report. Emptying them removes the hazard AND all the copy machinery it would otherwise
+need: no finding-column backfill, no `work_queue.scope`/config_hash derivation, no
+NULL-collapse or no-prior-UNIQUE dedup, and — because there is now NO FK-bearing copy — no
+orphaned-run_id quarantine and no synthesized `legacy-orphan` `runs` rows (a partial-write
+row whose `run_id` has no `runs` parent simply vanishes with its emptied table). Because
+`work_queue` starts empty, the first post-migration live run RE-DISCOVERS (§5.A/§5.B) and
+FULLY scans every unit — nothing is skip-eligible — regenerating every finding, error, and
+queue row under the new schema before any report can read them; the preserved `api_cache`
+and `package_api_surface` (durable introspection, §5.E) make that first full rescan cheap.
+Ordering within the
+migration transaction: apply the additive ALTERs on the PRESERVED tables — the
 `runs` ALTERs (effective_owners, owners_source, tracked_packages, cutoff_date, github_host
 — all NOT NULL with DEFAULTs), `package_api_surface.version_source` (NOT NULL DEFAULT
 'lockfile', satisfying its CHECK), and `run_unit_head.status` (NOT NULL DEFAULT 'scanned')
-— so synthesized orphan `runs` rows acquire `tracked_packages='[]'` via the column DEFAULT,
-before any FK-bearing copy. Do NOT ALTER-add `usage_findings.context` or
-`dependency_findings.resolved_version_source`: those two tables are REBUILT (they need the
-new `run_id` FK), so their new columns arrive via the rebuild's new-shape `CREATE`, and a
+— then rebuild `api_cache` (rows copied) and the run-scoped tables (empty), then bump
+user_version. Do NOT ALTER-add `usage_findings.context` or
+`dependency_findings.resolved_version_source`: those tables are REBUILT (empty) for their
+new `run_id` FK, so every new column arrives via the rebuild's new-shape `CREATE`, and a
 separate ALTER would either mutate the doomed old table or abort with "duplicate column
 name". (`run_unit_head.commit_sha` was already NOT NULL in the prior
 schema; SQLite cannot retro-add a DEFAULT to an existing column via ALTER, but this is
@@ -281,8 +269,11 @@ runs predate the snapshot and carry `tracked_packages='[]'`, so they must NOT be
 as the live run — otherwise the startup resume rule would pick a same-config one and
 produce an empty, non-reportable "latest". Their orphaned `in_progress` work_queue rows
 then heal via the self-healing recovery path, and a fresh post-migration run starts with
-`tracked_packages` persisted EXACTLY from the current config. Data loss is
-never acceptable outside `--fresh`:
+`tracked_packages` persisted EXACTLY from the current config. The run-scoped-reset above is
+NOT user-meaningful data loss — pre-migration runs are non-reportable, the forced full
+rescan regenerates every row, and all reportable provenance (`runs`, `run_unit_head`) and
+caches (`api_cache`, `package_api_surface`) are preserved. Outside that migration reset and
+`--fresh`, data loss is never acceptable:
 
 ```sql
 CREATE TABLE IF NOT EXISTS runs (
@@ -551,11 +542,14 @@ A. Resolve the effective owner list per the NORMATIVE algorithm in §1 (base set
    sort+cap ourselves over the REST result avoids depending on gh's internal ordering
    at all). The wrapper PAGINATES IN TYPESCRIPT rather than using gh's
    `--paginate`/`--slurp` (which interleave badly with `-i` header capture, §4): request
-   each page with `gh api -i "orgs/<org>/repos?per_page=100&page=<n>&type=sources"` (an
-   org; `type=sources` server-excludes forks) or, for the personal namespace,
+   each page with `gh api -i "orgs/<org>/repos?per_page=100&page=<n>&type=all"` (an org;
+   `type=all` — the endpoint default — returns sources AND forks so the CLIENT-SIDE fork
+   filter below, not the server, enforces `includeForks`; do NOT use `type=sources`, which
+   server-drops every fork and would make `includeForks: true` a silent no-op for orgs — the
+   primary scan target) or, for the personal namespace,
    `gh api -i "user/repos?affiliation=owner&per_page=100&page=<n>"` (includes private
-   personal repos; `type` is mutually exclusive with `affiliation` here, so exclude forks
-   CLIENT-SIDE with `fork === false`); read each page's rate-limit headers (§4) and follow
+   personal repos; `type` is mutually exclusive with `affiliation` here, so forks are
+   likewise filtered CLIENT-SIDE); read each page's rate-limit headers (§4) and follow
    `Link: rel="next"` until absent, accumulating the repo objects into one flat list.
    Then, in TypeScript: filter out `archived` when `includeArchived=false` (the REST
    endpoints have no server-side archived filter) and forks per policy (exclude by default
@@ -685,7 +679,18 @@ D. Extract dependency facts: a tracked package "appears" in a manifest when the
    line-level parse). Record
    resolved_version + line(s) + permalink; NEVER fail the run on a lockfile you can't
    parse. Upsert into dependency_findings.
-E. Introspect API surface — ONCE per unique (package_name, resolved_version). The
+E. Introspect API surface, deduplicated GLOBALLY by (package_name, resolved_version,
+   version_source) — a version with a durable `package_api_surface` SUCCESS record is
+   NEVER re-fetched. But introspection is RECONCILED PER RUN and DECOUPLED from unit skip:
+   every distinct (package_name, resolved_version, version_source) in THIS run's reportable
+   slice (the versionsSeen the report will show, §7 — INCLUDING versions carried by units
+   SKIPPED-as-current, §3, whose `dependency_findings` are reused) that LACKS a success
+   record is introspected THIS run, recording either a fresh success record OR an `errors`
+   row for THIS run. This keeps §8's per-version guarantee — every versionsSeen version has
+   an apiSurface record OR a current-run `errors` row — satisfiable even on skip-heavy runs
+   (run-scoped `errors` are filtered by `run_id=R`, §7): a version that failed or was
+   skipped (non-registry) in an earlier run is RE-attempted and RE-explained every run it
+   remains in the slice, until it earns a durable success record. The
    resolved_version comes from a lockfile (§5.D); when a repo committed NO lockfile,
    FALL BACK to resolving the manifest's declared range against the packument (the
    MAX-SATISFYING published version, applying a documented prerelease policy — exclude
@@ -813,7 +818,8 @@ genuinely non-deterministic sub-tasks.
   cliScanner.ts, permalink.ts, readOnlyGuard.ts, orchestrate.ts, report.ts.
   Keep side effects (network/fs/db) at the edges; parsers/matchers pure and unit-testable.
 - Idempotent, re-runnable; no data-losing migrations without `--fresh` (the §3
-  sanctioned transactional rebuild is data-preserving and allowed).
+  sanctioned transactional rebuild preserves all REPORTABLE and CACHE data and regenerates
+  the reset run-scoped findings via a forced rescan — not user-meaningful data loss).
 - Log one structured JSON line per completed unit of work (observable, greppable).
 
 Entrypoints:
@@ -842,7 +848,7 @@ graphql -f query='fragment F on T{a} mutation{x}'`, `gh api graphql --input body
 `tar -xf f.tar --use-compress-program=sh`, and any `npm`/`npx`/`yarn`/`pnpm`/`bunx`/`bun
 x` spawn; and that these all PASS (they are the tool's OWN reads): `gh api -i
 "user/orgs?per_page=100&page=1"`, `gh api -i user`, `gh api -i
-"orgs/o/repos?per_page=100&page=1&type=sources"`, `gh api -i
+"orgs/o/repos?per_page=100&page=1&type=all"`, `gh api -i
 "user/repos?affiliation=owner&per_page=100&page=1"`, `gh api
 repos/o/r/contents/p?ref=sha --jq .content`, `gh api repos/o/r/git/blobs/sha`, `gh api
 "repos/o/r/git/trees/treeoid?recursive=1"`, `gh api graphql -f query='query{...}'`, `gh api rate_limit`, the hardened `git clone`, `git
