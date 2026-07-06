@@ -399,7 +399,12 @@ CREATE TABLE IF NOT EXISTS errors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL REFERENCES runs(run_id),
   scope TEXT NOT NULL,
-  organization TEXT, repository TEXT, branch TEXT, message TEXT NOT NULL,
+  organization TEXT, repository TEXT, branch TEXT,
+  package_name TEXT, version TEXT,     -- SET for per-version introspection errors (§5.E), so the
+                                       -- "apiSurface entry OR current-run errors row" guarantee (§8)
+                                       -- is derivable by (run_id, package_name, version); NULL for
+                                       -- repo/branch/network/auth-scoped errors
+  message TEXT NOT NULL,
   occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_usage_loc  ON usage_findings(organization, repository, branch, commit_sha);
@@ -427,10 +432,15 @@ Resumability rules:
   anyway, §5.B). If the live head DIFFERS, atomically reset the unit to `pending` and
   re-scan — so repeated daily/weekly runs DO pick up new commits (a `done` branch is
   never frozen forever). `--fresh` and `--rescan-branch` override the skip. Edge case: a
-  previously-`done` branch that §5.B no longer surfaces (it fell before `cutoffDate` or
-  past `maxBranchesPerRepo`) is neither re-evaluated nor re-scanned this run; it simply
-  retains its prior `done` state and historical findings/snapshot — this is intended, not
-  an error (its usage is genuinely stale), and it just isn't refreshed into new runs.
+  previously-`done` branch that §5.B no longer PROCESSES — because it was DELETED on the
+  remote (no longer a live ref) or fell past `maxBranchesPerRepo` (only the most-recent N
+  heads are kept) — is neither re-evaluated nor re-scanned this run; it simply retains its
+  prior `done` state and historical findings/snapshot — this is intended, not an error (its
+  usage is genuinely stale), and it just isn't refreshed into new runs. A still-live branch
+  whose head fell BEFORE `cutoffDate` is DIFFERENT: §5.B DOES surface it and records it THIS
+  run as `skipped-cutoff` in `run_unit_head` (commit_sha=''), so it stays per-run
+  reproducible (§7's `branchesSkippedByCutoff`) — it is NOT left in this retain-prior-state
+  path.
 - Report-head invariant (co-designed with the skip predicate): as each unit is
   processed (scanned OR skipped-as-current), the run upserts `run_unit_head(run_id, org,
   repo, branch, commit_sha=the head it reported)`. Findings accumulate across commits
@@ -753,15 +763,26 @@ E. Introspect API surface, deduplicated GLOBALLY by (package_name, resolved_vers
    order); authors conventionally list `types` first so it usually wins, but if
    an earlier key is also in the set it wins per object order. `types` is a TS/tooling
    condition (Node ignores it at runtime). If the matched target is a `.d.ts`, use it;
-   otherwise locate the `.d.ts` adjacent to the matched runtime target. Handle NESTED
-   condition objects, subpath entries (`"./config"`), and fallback ARRAYS (first valid
+   otherwise locate the `.d.ts` adjacent to the matched runtime target.
+   IMPORTANT — because this tool records BOTH `import` and `require` usage (§5.F), the API
+   surface must cover BOTH resolution modes: when a subpath's `exports` branches on `import`
+   vs `require` with DIFFERENT targets, resolve the type surface UNDER EACH mode (an
+   import-condition pass and a require-condition pass, each still traversed in object order
+   with `types` winning where present) and UNION the two export sets — never let a single
+   object-order match collapse a dual-package surface to one mode. When a top-level `types`
+   condition resolves the SAME `.d.ts` for both modes, one resolution suffices. Handle
+   NESTED condition objects, subpath entries (`"./config"`), and fallback ARRAYS (first valid
    wins). NOTE
    `typesVersions` applies ONLY when `exports` is ABSENT (TypeScript ignores it once
    `exports` is present) — use it only in the fallback path: no `exports` →
    `typesVersions` remap → `types`/`typings` → `index.d.ts`. Enumerate named exports from
    the resolved .d.ts (preferred; else statically parse top-level export/module.exports —
-   never execute). Record bin names. Upsert into
-   package_api_surface. On failure, log to errors and continue.
+   never execute). Record bin names. Upsert the export/bin rows into package_api_surface,
+   THEN the completion marker (`export_name=''`, `export_kind='__complete__'`, sentinel
+   `source='__complete__'`) LAST in the same transaction. On introspection FAILURE
+   (network/parse/integrity/off-origin) or a non-registry SKIP, write NO marker and instead
+   log an `errors` row with `package_name` AND the concrete `version` set (so §7/§8's
+   per-version guarantee is derivable by `(run_id, package_name, version)`), then continue.
 F. Find in-repo API usage: detect `named-import`, `namespace-import` (`import * as`),
    `default-import`, `require(...)` (incl. destructured), `dynamic-import` (`import(...)`),
    `reexport` (`export … from 'pkg'`), and `side-effect-import` (`import 'pkg'`). Match
@@ -1022,9 +1043,14 @@ order never leaks in. `apiSurface` keys are exactly the `versionsSeen` versions 
 (non-registry) or failed has NO marker and is OMITTED (it instead has an `errors` row, §8),
 so apiSurface keys are a SUBSET of versionsSeen, not a 1:1 map. Each present version's
 `exports` come from its `package_api_surface` rows WHERE `export_kind NOT IN
-('cli-bin','__complete__')` and `cli.binNames` from `export_kind='cli-bin'`; a marked
-version with a zero-export/zero-bin surface still appears, with empty `exports`/`binNames`. A run with no findings
-still emits the full shape with empty arrays and a zeroed summary.
+('cli-bin','__complete__')` and `cli.binNames` from `export_kind='cli-bin'`, with
+`cli.hasCli = (binNames non-empty)`; a marked version with a zero-export/zero-bin surface
+still appears, with empty `exports`, empty `binNames`, and `hasCli:false`.
+(`package_api_surface.version_source` is INFORMATIONAL only — the report's per-repo
+`resolvedVersionSource` comes from `dependency_findings.resolved_version_source`, never from
+the surface table, whose value is per-first-writer since the introspection dedup key ignores
+it, §5.E.) A run with no findings still emits the full shape with empty arrays and a zeroed
+summary.
 ```jsonc
 {
   "runId": "...",
@@ -1061,7 +1087,9 @@ still emits the full shape with empty arrays and a zeroed summary.
       "cliUsage":[{"file":"package.json","line":8,"context":"scripts.build","permalink":"...","snippet":"\"build\": \"my-package build\""}]
     }]
   }],
-  "errors": [ ... ],                             // errors WHERE run_id=R, sorted (occurredAt,id)
+  "errors": [ ... ],                             // errors WHERE run_id=R, sorted (occurredAt,id); each row
+                                                 //   carries scope + optional packageName/version (§5.E
+                                                 //   per-version introspection errors) + message
   "summary": { "organizationsScanned":0,"repositoriesScanned":0,"branchesScanned":0,
                "branchesSkippedByCutoff":0,"totalDependencyFindings":0,"totalUsageFindings":0 }
 }
