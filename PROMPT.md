@@ -306,8 +306,8 @@ CREATE TABLE IF NOT EXISTS dependency_findings (
   package_name TEXT NOT NULL,          -- always the canonical registry name
   dependency_key TEXT NOT NULL,        -- the manifest key; equals package_name
                                        -- unless npm-aliased ("key": "npm:<name>@...")
-  dependency_type TEXT NOT NULL,       -- deps/devDeps/peerDeps/optionalDeps (overrides/
-                                       -- resolutions values reserved for §5.D pending work)
+  dependency_type TEXT NOT NULL,       -- deps/devDeps/peerDeps/optionalDeps/overrides/
+                                       -- resolutions (all populated by §5.D)
   manifest_path TEXT NOT NULL, manifest_line INTEGER NOT NULL,
   manifest_permalink TEXT NOT NULL, declared_version TEXT NOT NULL,
   lockfile_path TEXT, lockfile_kind TEXT, lockfile_lines TEXT,   -- JSON array
@@ -332,7 +332,9 @@ CREATE TABLE IF NOT EXISTS usage_findings (
   run_id TEXT NOT NULL REFERENCES runs(run_id),
   organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
   commit_sha TEXT NOT NULL, package_name TEXT NOT NULL,
-  dependency_key TEXT NOT NULL DEFAULT '',  -- which manifest alias resolved this import ('' if bare name)
+  dependency_key TEXT NOT NULL DEFAULT '',  -- the manifest key that resolved this specifier
+                                       -- (= package_name for a direct install, the alias for an
+                                       -- aliased install); '' only for CLI/unattributable usage
   usage_type TEXT NOT NULL,            -- 'named-import'|'default-import'|'namespace-import'|'require'|'dynamic-import'|'reexport'|'side-effect-import'|'cli'
   export_name TEXT NOT NULL DEFAULT '', -- '' (not NULL — NULLs don't dedupe) when usage_type='cli' or unattributable
   file_path TEXT NOT NULL, line_number INTEGER NOT NULL,
@@ -531,7 +533,8 @@ A. Resolve the effective owner list per the NORMATIVE algorithm in §1 (base set
    workflow uses. maxReposPerOrg applies per OWNER (incl. the personal namespace).
 B. Discover & prioritize branches: via `gh api graphql` querying
    refs(refPrefix:"refs/heads/", first:100, after:$endCursor) with
-   target{...on Commit{committedDate,oid}} and `pageInfo{hasNextPage endCursor}`.
+   target{...on Commit{committedDate,oid,tree{oid}}} and `pageInfo{hasNextPage endCursor}`
+   (the `tree.oid` is the commit's ROOT TREE SHA, needed by §5.C's git/trees call).
    GitHub's `RefOrderField` cannot order heads by commit date server-side (only
    ALPHABETICAL, or TAG_COMMIT_DATE for tags), so ENUMERATE ALL PAGES — a repo with >100
    branches would otherwise silently lose branches. As in §5.A, PAGINATE IN TYPESCRIPT
@@ -566,29 +569,97 @@ C. Locate manifests read-only. Build the API path in TypeScript (github.ts) —
    file object, so branch on array-vs-object before attempting a raw/blob read). A raw fetch and a default-JSON fetch of the SAME url are cached under
    distinct `api_cache.variant_hash` values (the Accept media type; §3) so they never
    collide. (Only when you deliberately use the default JSON representation must
-   you base64-decode `content`, which contains newlines.) Fetch package.json and the
-   lockfiles (§5.D) at repo root AND workspace packages (honor `workspaces`, recurse,
-   skip excludeDirGlobs). Delete any tmp dir in `finally`. Never
-   install, never execute.
+   you base64-decode `content`, which contains newlines.)
+   MANIFEST DISCOVERY — one `gh api "repos/<org>/<repo>/git/trees/<tree_oid>?recursive=1"`
+   call (use the commit's ROOT TREE oid from §5.B — the `git/trees` endpoint takes a TREE
+   SHA, not the commit SHA; the commit SHA is still what pins the permalinks)
+   returns the whole tree; filter paths ending in `package.json` and the lockfile
+   names (§5.D) against `excludeDirGlobs` (always skip `**/node_modules/**` and vendored/
+   generated dirs). This finds EVERY manifest — workspace-declared or not (pnpm
+   monorepos keep globs in `pnpm-workspace.yaml` not package.json; yarn uses the object
+   form `workspaces:{packages,nohoist}`; split repos have undeclared nested
+   package.json) — in a single request. If the tree response is `truncated:true`, fall
+   back to the hardened shallow clone from §0 and walk the working tree. Delete any tmp
+   dir in `finally`. Never install, never execute.
 D. Extract dependency facts: a tracked package "appears" in a manifest when the
    dependency KEY equals its registry name, OR the dependency VALUE is an npm-alias
    spec targeting it (`"<anyKey>": "npm:<name>@<range>"`). Persist the manifest key
    as `dependency_key` (equals package_name unless aliased) so multiple aliases of
-   the same package in one manifest are distinct findings. If the key equals the
-   registry name but the value aliases a DIFFERENT package
-   (`"my-package": "npm:@corp/fork@^2"`), it is NOT a finding — the name is
-   shadowed in that repo. For each manifest where a tracked package
-   appears in dependencies/devDependencies/peerDependencies/optionalDependencies,
-   record the
-   exact declared version and the 1-based line number (parse JSON with line
-   tracking — do not assume formatting). Build a COMMIT-SHA-pinned permalink
-   `https://{host}/{org}/{repo}/blob/{commit_sha}/{path}#L{line}` (never branch —
-   avoids link rot). If package-lock.json exists, handle npm lockfile v1/v2/v3
-   shapes (`dependencies.<pkg>.version` and `packages."node_modules/<pkg>".version`);
-   record resolved version + line(s) + permalink. For yarn.lock / pnpm-lock.yaml do
-   best-effort parsing, set `lockfile_kind`, and never fail the run. Upsert into
-   dependency_findings.
-E. Introspect API surface — ONCE per unique (package_name, resolved_version):
+   the same package in one manifest are distinct findings; the SAME key threads into
+   the lockfile lookup and the §5.F import-name set. If the key equals the registry
+   name but the value aliases a DIFFERENT package (`"my-package": "npm:@corp/fork@^2"`),
+   it is NOT a finding — the name is shadowed in that repo. Sections scanned:
+   dependencies/devDependencies/peerDependencies/optionalDependencies are normal
+   declarations. ALSO scan npm `overrides` and yarn/pnpm `resolutions` for the tracked
+   package (dependency_type `overrides`/`resolutions`); these change RESOLUTION, not
+   declaration, so record them as findings ONLY when the package is also declared or
+   (best-effort — no full lock-tree walk required) pulled transitively; never as a
+   standalone "appearance". `bundledDependencies` is
+   metadata (a name list, not a version pin) — record its presence but it does not by
+   itself resolve a version. For each finding record the exact declared version and the
+   1-based line number (parse JSON with line tracking — do not assume formatting; note
+   some tool-context package.json files use JSON5/JSONC). Build a COMMIT-SHA-pinned
+   permalink `https://{host}/{org}/{repo}/blob/{commit_sha}/{path}#L{line}` (never
+   branch — avoids link rot).
+   LOCKFILES (§5.C fetches them): resolve the version PER (manifest, dependency_key) via
+   the IMPORTER EDGE — do NOT broad-match by real name alone, which would collapse two
+   aliases of the same package. Use the lockfile at the manifest's directory OR its
+   nearest ANCESTOR (one lockfile per project/workspace root; nested non-workspace apps
+   have their own — search upward). npm (npm-shrinkwrap.json precedes package-lock.json;
+   `lockfile_kind='npm'`): for v2/v3 the `packages` map is PRIMARY (v3 has NO top-level
+   `dependencies` block) — the manifest's own `packages` entry (key = its workspace-
+   relative dir, `""` for root) lists `dependency_key → spec`; resolve to the install
+   entry at `packages["<dir>/node_modules/<dependency_key>"]` (or the hoisted
+   `packages["node_modules/<dependency_key>"]`), whose `version` is the resolved version.
+   For an ALIAS the entry carries `name` = the real package, so confirm the tracked
+   package by `entry.name === registryName` (else the bare `<dependency_key>`); `.name`
+   is a VALIDATION/target signal, never the match key. For v1 (no `packages` map): read
+   `dependencies.<dependency_key>.version`, and for a v1 alias that value is
+   `npm:<registryName>@x.y.z` (extract the concrete version after the LAST `@`). yarn (`lockfile_kind='yarn'`): SPLIT
+   each entry's (possibly COMMA-JOINED) descriptor KEY and pick the descriptor whose
+   `<dependency_key>@` PREFIX matches the manifest key — this is robust for scoped keys
+   (e.g. `@babel/core@npm:@babel/core@^7.0.0`). Do NOT use `@npm:` presence to classify
+   alias-vs-direct: berry injects the `npm:` protocol on BOTH (classic direct
+   `<dependency_key>@<range>`; berry direct `<dependency_key>@npm:<range>`; alias in both
+   `<dependency_key>@npm:<registryName>@<range>`). When the prefix matches MULTIPLE entries
+   (a non-deduped monorepo can hold `lodash@^3.0.0:`→3.10.1 AND `lodash@^4.0.0:`→4.17.21 in
+   one flat yarn.lock), disambiguate by STRIPPING the matched `<dependency_key>@` PREFIX
+   from the descriptor (NOT the first `@`, which mis-splits scoped names like
+   `@babel/code-frame@7.10.4`) and matching the remainder — skipping any `npm:` protocol —
+   against the manifest's declared RANGE. Take the
+   RESOLVED version from the sibling `version:` field (protocol-agnostic — survives
+   patch:/workspace:/git: resolutions), and use `resolution: "<registryName>@npm:<ver>"`
+   only to confirm the real NAME — NOT by segmenting the descriptor after `@npm:` (scoped
+   names reintroduce `@`/`/`). pnpm
+   (`lockfile_kind='pnpm'`; v5/v6/v9 differ): in the per-manifest
+   `importers.<dir>.{dependencies,devDependencies,optionalDependencies}` edge, the newer
+   OBJECT form is `<dependency_key>: {specifier:<declared range>, version:<resolved key>}`
+   — `specifier` is the DECLARED RANGE (do NOT treat it as a pointer), `version` is the
+   RESOLVED reference (`1.2.3`, alias `left-pad@1.2.3`, or peer-suffixed
+   `foo@1.2.3(bar@2)`). The older STRING form maps `<dependency_key>: <resolved string>`
+   with the range in a sibling `specifiers.<dependency_key>`. Parse the resolved reference
+   for the concrete version (and, for an alias, the real name) and confirm it is the
+   tracked package; the `packages`/snapshot keys are slash-shaped `/pkg/ver` (v5/older) or
+   `pkg@ver` (v6+). A peer-only declaration with no installed edge has no lockfile
+   resolved_version (record the declaration, leave resolved_version null) — though pnpm's
+   default `autoInstallPeers` surfaces an auto-installed peer under the `dependencies` edge
+   WITH a version, in which case use it. bun (`bun.lock` JSONC parseable: the importer
+   edge `workspaces.<dir>.dependencies` maps `dependency_key → spec` and `packages.<key>`
+   carries `[<realname>@<ver>, …]`; `bun.lockb` binary — set `lockfile_kind='bun'`, skip
+   line-level parse). Record
+   resolved_version + line(s) + permalink; NEVER fail the run on a lockfile you can't
+   parse. Upsert into dependency_findings.
+E. Introspect API surface — ONCE per unique (package_name, resolved_version). The
+   resolved_version comes from a lockfile (§5.D); when a repo committed NO lockfile,
+   FALL BACK to resolving the manifest's declared range against the packument (the
+   MAX-SATISFYING published version, applying a documented prerelease policy — exclude
+   prereleases unless the range explicitly names one) and record it with
+   `version_source='range-resolved'` (§3) so step F still has an export list. SKIP
+   introspection (recording a specific `errors` reason, NOT a generic failure) when the
+   lockfile "version" is a NON-registry spec — `git+…`, `file:`, `link:`, `portal:`,
+   `workspace:*`, `catalog:`, or a tarball URL — since those cannot be fetched from
+   registryUrl. (The dependency is still RECORDED in dependency_findings with its raw
+   declared_version; only the API-surface introspection is skipped.)
    `registryUrl` is a registry BASE URL — fetch the packument
    (`GET {registryUrl}/{name}` with SLASH-ONLY encoding of scoped names:
    `@scope/name` → `@scope%2Fname`; NOT full encodeURIComponent, which would also
@@ -613,26 +684,52 @@ E. Introspect API surface — ONCE per unique (package_name, resolved_version):
    `--no-same-owner --no-same-permissions` (and note GNU tar vs macOS bsdtar differ
    in defaults, so pass flags explicitly rather than trusting either). Then
    statically inspect package.json
-   (main/module/types/typings/exports/bin) and referenced .d.ts files. Enumerate
-   named exports (prefer .d.ts; else statically parse top-level export/module.exports
-   — never execute). Record bin names. Upsert into package_api_surface. On failure,
-   log to errors and continue.
-F. Find in-repo API usage: detect static imports, `import * as`, default imports,
-   `require(...)` (incl. destructured), and dynamic `import(...)`. Match module
-   specifiers against the owning manifest's INSTALL-NAME set from step D: exactly
-   the dependency KEYS whose values resolve to the tracked package — alias keys,
-   plus the registry name ONLY when the manifest declares it under its own
-   (unshadowed) name. An alias-only install must NOT match the bare registry name
-   (it would not resolve there). Include subpath specifiers (`<key>/...`). Map
-   each binding
-   back to the export names from step E. Record one usage_findings row per
-   occurrence with exact line_number, commit-pinned permalink, trimmed snippet, and
-   usage_type. Prefer Bun.Transpiler for lightweight import scanning; only reach for
-   `typescript` if regex/native scanning is materially unreliable.
-G. Find CLI usage (if the package has a bin): search package.json#scripts, `*.sh`,
-   `.github/workflows/**`, Makefiles, and `npx/bunx/<bin>` invocations. Record as
-   usage_findings with usage_type='cli', export_name='' (the empty sentinel — the column
-   is NOT NULL, §3), plus location/permalink/snippet.
+   (main/module/types/typings/exports/bin). The `exports` field is usually a
+   CONDITIONAL map, not a string. Resolution TRAVERSES the object keys in DECLARED ORDER
+   and takes the FIRST key present in the active condition SET — do not force any fixed
+   priority. For this tool's TYPE surface, use TypeScript's condition set, which INCLUDES
+   `types` (alongside the resolution-mode runtime conditions `import`/`require` and
+   `node`/`default` — all members of the set, matched by object order, not by this listing
+   order); authors conventionally list `types` first so it usually wins, but if
+   an earlier key is also in the set it wins per object order. `types` is a TS/tooling
+   condition (Node ignores it at runtime). If the matched target is a `.d.ts`, use it;
+   otherwise locate the `.d.ts` adjacent to the matched runtime target. Handle NESTED
+   condition objects, subpath entries (`"./config"`), and fallback ARRAYS (first valid
+   wins). NOTE
+   `typesVersions` applies ONLY when `exports` is ABSENT (TypeScript ignores it once
+   `exports` is present) — use it only in the fallback path: no `exports` →
+   `typesVersions` remap → `types`/`typings` → `index.d.ts`. Enumerate named exports from
+   the resolved .d.ts (preferred; else statically parse top-level export/module.exports —
+   never execute). Record bin names. Upsert into
+   package_api_surface. On failure, log to errors and continue.
+F. Find in-repo API usage: detect `named-import`, `namespace-import` (`import * as`),
+   `default-import`, `require(...)` (incl. destructured), `dynamic-import` (`import(...)`),
+   `reexport` (`export … from 'pkg'`), and `side-effect-import` (`import 'pkg'`). Match
+   module specifiers against the owning manifest's INSTALL-NAME set from step D: exactly
+   the dependency KEYS whose values resolve to the tracked package — alias keys, plus the
+   registry name ONLY when the manifest declares it under its own (unshadowed) name. An
+   alias-only install must NOT match the bare registry name (it would not resolve there).
+   Match SUBPATH specifiers by prefix (`<installName>/…`) and map the subpath through the
+   package's `exports` map (§5.E); a subpath that is unresolved/private still records
+   usage (with `export_name=''` and lower attribution confidence). For `reexport` and
+   `side-effect-import` there is NO binding, so record `export_name=''` (the usage_type
+   explains the absence — do NOT force a specific export). Map bindable forms back to the
+   step-E export names. Record one usage_findings row per occurrence with exact
+   line_number, commit-pinned permalink, trimmed snippet, usage_type, and the resolving
+   `dependency_key` (= `package_name` for a direct unaliased install, the alias key for
+   an aliased one; never '' for an import — '' is reserved for CLI usage, §5.G). Prefer
+   Bun.Transpiler for lightweight import scanning; only reach
+   for `typescript` if regex/native scanning is materially unreliable.
+G. Find CLI usage (if the package has a bin). Normalize the bin name set: object-form
+   `bin` uses its keys; STRING-form `bin` ("bin":"./cli.js") is named after the UNSCOPED
+   package name (`@scope/pkg` → `pkg`). The search-term set is `binNames ∪ {name,
+   unscoped-name}` because `npx`/`dlx`/`bun x` invoke by PACKAGE SPECIFIER (`npx @scope/pkg`)
+   as well as by bin. Search package.json#scripts, `*.sh`, `.github/workflows/**`,
+   Makefiles, AND Dockerfiles for: runner invocations `npx`/`bunx`/`pnpm dlx`/`yarn dlx`/
+   `bun x <specifier-or-bin>` and `pnpm exec`/`yarn exec <bin>`; and BARE `<bin>` tokens
+   using WORD-BOUNDARY matching (a bin like `expo` must NOT substring-match `export`).
+   Record as usage_findings with usage_type='cli', export_name='' (empty sentinel — NOT
+   NULL, §3), plus location/permalink/snippet.
 H. Upsert `run_unit_head(this run, org, repo, branch, commit_sha=the head just scanned)`,
    mark work_queue `done`, and proceed. Units SKIPPED as already-current (§3 skip
    predicate) ALSO upsert `run_unit_head` for this run with their unchanged head, so the
@@ -687,7 +784,7 @@ x` spawn; and that these all PASS (they are the tool's OWN reads): `gh api
 "orgs/o/repos?per_page=100&page=1&type=sources"`, `gh api -i
 "user/repos?affiliation=owner&per_page=100&page=1"`, `gh api
 repos/o/r/contents/p?ref=sha --jq .content`, `gh api repos/o/r/git/blobs/sha`, `gh api
-graphql -f query='query{...}'`, `gh api rate_limit`, the hardened `git clone`, `git
+"repos/o/r/git/trees/treeoid?recursive=1"`, `gh api graphql -f query='query{...}'`, `gh api rate_limit`, the hardened `git clone`, `git
 rev-parse HEAD`, `tar -xzf f.tgz -C dir`, `tar -tzf f.tgz`, and `tar --version`.
 
 Illustrative snippets (adapt, don't copy blindly):
