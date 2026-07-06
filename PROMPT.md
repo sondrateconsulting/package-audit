@@ -13,18 +13,38 @@ every run as "continue the job," not "start over," unless the user passes `--fre
 - You MUST NOT modify, create, delete, or push to any source repo, branch, tag,
   issue, PR, or file in any target org/repo — including the repos that own the
   tracked packages.
-- You MUST NOT run `npm install`, `bun install`, `yarn install`, `pnpm install`,
-  `npm pack` (non-dry), postinstall scripts, or ANY command that executes code from
-  a cloned repo or fetched package. Only STATICALLY read files. This is the single
-  biggest read-only risk — treat it as sacred.
-- Any `git clone` must be shallow (`--depth 1 --single-branch`), into an ephemeral
-  temp dir (`mktemp -d`), and deleted in a `finally` block. Never write inside a
-  repo working tree.
-- All `gh` calls must be read-only (GET-equivalent). Do NOT enforce this with naive
-  substring matching on args (a repo named `create-x` would false-positive).
-  Instead, use an ALLOWLIST of permitted read-only subcommands/endpoints in a shared
-  `readOnlyGuard.ts`, and reject anything not on it.
-- No `fs.writeFile` anywhere except the tool's own `./data` and `./output` dirs.
+- BLANKET PACKAGE-MANAGER BAN: the tool NEVER invokes `npm`, `npx`, `yarn`, `pnpm`,
+  `bunx`, or `bun install|add|remove|x|pm` in ANY form (not even `npm pack
+  --dry-run` — it still runs `prepack`/`prepare` lifecycle scripts; not `--ignore-
+  scripts` either). It needs none of them: tarballs arrive via direct `fetch`, all
+  parsing is static. `bun run scripts/*.ts` (this tool's own code) is the ONLY
+  permitted `bun` use. These binaries are on the shell denylist (§6). No process is
+  ever spawned with cwd inside a cloned repo or extracted tarball except `git`/`tar`
+  themselves. Only STATICALLY read files; static scanners MUST NOT follow symlinks
+  out of the clone/tarball root. This is the single biggest read-only risk — sacred.
+- Any `git clone` must be shallow, into an ephemeral temp dir, and removed on exit.
+  Full hardened invocation (the §5.C clone fallback uses exactly this):
+  `GIT_TERMINAL_PROMPT=0 git clone --depth 1
+  --single-branch --branch <branch> --no-tags --no-recurse-submodules --template=
+  <url> <mktemp-dir>` — `--branch` fetches the prioritized non-default branch (§5.B),
+  `--template=` blocks init.templateDir hooks, `GIT_TERMINAL_PROMPT=0` prevents
+  credential-prompt hangs. Record `git rev-parse HEAD` so permalinks pin the fetched
+  SHA. Never write inside a repo working tree.
+- All `gh`/`git`/`tar` shell-outs go through the single wrapper module (§6) that
+  invokes `readOnlyGuard` on the argv ARRAY — never a joined string (naive substring
+  matching false-positives on a repo named `create-x` and, worse, lets `gh api -X
+  DELETE` through). The guard is an ALLOWLIST of read-only `gh`/`git` verbs+argv
+  shapes; it rejects `gh api` with a non-GET method or body flags, `git` mutations,
+  and command-injection options (§6). Direct `Bun.$` on these binaries is forbidden
+  (grep-enforced in tests).
+- WRITE CONTAINMENT: every write mechanism — `Bun.write`, `fs.*`, shell redirects,
+  `git clone`, `tar -x`, the SQLite file, report output — may only target paths
+  under `./data`, `./output`, or a run-scoped `mktemp` dir with the `pkg-audit-*`
+  prefix. A single path allocator realpath-resolves every target and asserts
+  prefix-containment in an allowed root (realpath defeats symlink escape); it also
+  validates the configured `sqlitePath`/`outputDir` are so contained. A startup
+  sweep removes stale `pkg-audit-*` dirs (direct children of the temp root only,
+  never following symlinks) left by crashed prior runs.
 - If unsure whether an action is read-only, DO NOT do it — log and skip.
 
 ================================================================================
@@ -135,7 +155,11 @@ Fail fast with actionable remediation if any of these fail:
    hints) fires when the list is actually RESOLVED in §8 step 3; an empty
    `user/orgs` enumeration is still valid there when
    `includePersonalNamespace: true` yields a non-empty list.
-4. `git --version`, `tar --version` succeed.
+4. `git --version` (enforce a patched MINIMUM — a currently-maintained, security-
+   patched release: >= 2.45.1, which fixed the May-2024 clone/checkout CVEs such as
+   CVE-2024-32002; a bare 2.45.0 is still vulnerable, so compare the full
+   micro-version) and `tar --version` succeed; detect GNU vs bsdtar so §5.E passes
+   the right extraction flags.
 5. Network reachability to the API of the configured `githubHost` (exercise via
    `gh api rate_limit` with `GH_HOST=<githubHost>` — never hand-derive the API
    hostname) and to each effective (default-applied) per-package registryUrl —
@@ -274,8 +298,9 @@ B. Discover & prioritize branches: via `gh api graphql` querying
    maxBranchesPerRepo after filtering.
 C. Locate manifests read-only: prefer `gh api repos/{org}/{repo}/contents/{path}?ref={sha}`
    for package.json and package-lock.json at repo root AND workspace packages
-   (honor `workspaces`, recurse, skip excludeDirGlobs). Fall back to shallow clone
-   only if needed; delete the tmp dir in `finally`. Never install, never execute.
+   (honor `workspaces`, recurse, skip excludeDirGlobs). Fall back to the hardened
+   shallow clone from §0 only if needed; delete the tmp dir in `finally`. Never
+   install, never execute.
 D. Extract dependency facts: a tracked package "appears" in a manifest when the
    dependency KEY equals its registry name, OR the dependency VALUE is an npm-alias
    spec targeting it (`"<anyKey>": "npm:<name>@<range>"`). Persist the manifest key
@@ -305,8 +330,20 @@ E. Introspect API surface — ONCE per unique (package_name, resolved_version):
    via `fetch` (NO npm pack, NO install). If the package sets `registryAuthEnvVar`, attach
    `Authorization: Bearer ${env[<name>]}` to packument and tarball requests ONLY
    for that same origin; never log the header and never include it in cache keys.
-   Then
-   extract with system `tar` into a tmp dir, statically inspect package.json
+   Handle HTTP redirects MANUALLY — never let `fetch` auto-follow a redirect that
+   would carry the Authorization header to a different origin; re-verify origin on
+   each hop. After download, VERIFY the tarball against the packument's
+   `dist.integrity` (SRI) or `dist.shasum` BEFORE extracting.
+   Then extract with system `tar` into a fresh `pkg-audit-*` tmp dir. Registry
+   tarballs are untrusted third-party input, so BEFORE extraction enumerate entries
+   and their header metadata (not just names — `tar -tzf` shows names but not link
+   type) and REJECT the archive if any member is an absolute path, contains a `..`
+   component, or is a symlink/hardlink/device/fifo (npm tarballs legitimately
+   contain none of these), or if cumulative uncompressed size or entry count exceeds
+   a cap (e.g. 100 MB / 20k entries — stops decompression bombs). Extract with
+   `--no-same-owner --no-same-permissions` (and note GNU tar vs macOS bsdtar differ
+   in defaults, so pass flags explicitly rather than trusting either). Then
+   statically inspect package.json
    (main/module/types/typings/exports/bin) and referenced .d.ts files. Enumerate
    named exports (prefer .d.ts; else statically parse top-level export/module.exports
    — never execute). Record bin names. Upsert into package_api_surface. On failure,
@@ -352,6 +389,32 @@ Entrypoints:
   bun run scripts/orchestrate.ts [--config <path>] [--fresh] [--rescan-branch <name>]
   bun run scripts/report.ts [--run-id <id>]   # default: latest
 
+The wrapper module (github.ts) is the ONLY place `Bun.$` touches `gh`/`git`/`tar`;
+each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
+(`assertReadOnlyGh`/`assertReadOnlyGit`/`assertReadOnlyTar`) on the argv ARRAY before
+spawning. Because a test greps the repo to assert NO other file calls `Bun.$` on
+these binaries (and that no code path spawns a `PM_DENYLIST` binary), no call site
+can route around the guard — the guard is the single chokepoint, and it enforces the
+read-only allowlist including tar's command-execution options
+(`--checkpoint-action=exec=…`, `--to-command`, `--use-compress-program`/`-I`, `-F`). Every invocation runs with a sanitized env
+(`GH_HOST=<githubHost>`, `GIT_TERMINAL_PROMPT=0`, no pager/prompt/extension
+overrides). `gh auth refresh` is NEVER run by the tool — it is printed as human
+remediation only, and is deliberately absent from the guard allowlist. Unit tests
+MUST assert that these all THROW: `gh api -X DELETE ...`, `gh api -XDELETE ...`, `gh
+api -X GET -X DELETE ...` (later value wins), `gh api --method=DELETE ...`, `gh api
+repos/o/r/issues -f title=x`, `gh api repos/o/r/issues -fbody=x`, `gh api
+repos/o/r/issues --field=title=x`, `gh api graphql -f query='mutation{...}'`, `gh api
+graphql -f query='fragment F on T{a} mutation{x}'`, `gh api graphql --input body.json`,
+`git push`, `git clone -c core.fsmonitor=x ...`, `git clone -cfoo=baz ...`, `git clone
+-ufoo ...`, `tar -cf ...`, `tar --create ...`, `tar -xzf f.tgz --checkpoint-action=exec=sh`,
+`tar -xf f.tar --use-compress-program=sh`, and any `npm`/`npx`/`yarn`/`pnpm`/`bunx`/`bun
+x` spawn; and that these all PASS (they are the tool's OWN reads): `gh api
+"user/orgs?per_page=100" --paginate --jq '.[].login'`, `gh api -i user`, `gh api
+repos/o/r/contents/p?ref=sha --jq .content`, `gh api graphql -f query='query{...}'`,
+`gh api rate_limit`, `gh repo list o --json name --limit 100`, the hardened `git
+clone`, `git rev-parse HEAD`, `tar -xzf f.tgz -C dir`, `tar -tzf f.tgz`, and
+`tar --version`.
+
 Illustrative snippets (adapt, don't copy blindly):
 ```typescript
 // db.ts
@@ -360,11 +423,114 @@ const db = new Database(path, { create: true });
 db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
 // prefer prepared statements + transactions for batch writes
 
-// readOnlyGuard.ts — ALLOWLIST, not blocklist
-const ALLOWED = new Set(["api","repo list","auth status","api rate_limit","api graphql"]);
-export function assertReadOnlyGh(subcommand: string) {
-  if (![...ALLOWED].some(a => subcommand.startsWith(a)))
-    throw new Error(`READ-ONLY VIOLATION: gh ${subcommand}`);
+// readOnlyGuard.ts — ARGV-ARRAY allowlist, not substring/prefix matching.
+// Canonicalize first so `--flag=value` cannot dodge a `--flag value` check.
+const BODY_FLAGS = new Set(["-f","-F","--field","--raw-field","--input"]);
+const GIT_READ = new Set(["clone","rev-parse","ls-tree","cat-file","show","--version"]);
+// package managers are NEVER spawned (§0). Their binaries are hard-denied here.
+export const PM_DENYLIST = new Set(["npm","npx","yarn","pnpm","bunx"]);
+const BUN_DENY_SUBS = new Set(["install","add","remove","x","pm"]);
+// gh api endpoint allowlist (matched on the path with any ?query-string stripped):
+const GH_API_PATHS = ["repos","user","rate_limit","graphql"];  // "user/orgs" ⊂ "user" prefix
+// gh api flags that CONSUME the next token as their value (so it is not the endpoint):
+const GH_VALUE_FLAGS = new Set(["-X","--method","-f","-F","--field","--raw-field",
+  "--input","-H","--header","-q","--jq","-t","--template","--hostname","-p","--preview","--cache"]);
+const SHORT_VALUE = new Set(["-X","-f","-F","-H","-q","-t","-p"]); // gh short flags that take a value
+
+// Normalize BOTH `--flag=value` and attached short forms (`-XDELETE`, `-fbody=x`,
+// `-X=DELETE`) into separate tokens so no attached-value form dodges the checks.
+function canon(args: string[]): string[] {
+  return args.flatMap(a => {
+    if (a.startsWith("--") && a.includes("="))
+      return [a.slice(0, a.indexOf("=")), a.slice(a.indexOf("=")+1)];
+    const m = /^(-[A-Za-z])=?(.+)$/.exec(a);         // -Xvalue / -X=value (not bare -i)
+    if (m && SHORT_VALUE.has(m[1])) return [m[1], m[2]];
+    return [a];
+  });
+}
+
+export function assertReadOnlyGh(rawArgs: string[]) {
+  const args = canon(rawArgs);
+  const [sub, ...rest] = args;
+  if (sub === "api") {
+    // endpoint = first positional token, skipping flags AND the values they consume
+    // (so `gh api -i user` and `gh api --jq .x repos/...` both resolve correctly)
+    let endpoint = "";
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i].startsWith("-")) { if (GH_VALUE_FLAGS.has(rest[i])) i++; continue; }
+      endpoint = rest[i]; break;
+    }
+    const pathOnly = endpoint.split("?")[0];         // ignore ?per_page=… etc
+    const isGraphql = pathOnly === "graphql";
+    if (!GH_API_PATHS.some(p => pathOnly === p || pathOnly.startsWith(p + "/")))
+      throw new Error(`READ-ONLY VIOLATION: gh api endpoint ${endpoint}`);
+    for (let i = 0; i < rest.length; i++)            // check EVERY -X/--method (gh honors the last)
+      if ((rest[i] === "-X" || rest[i] === "--method") && (rest[i+1] ?? "").toUpperCase() !== "GET")
+        throw new Error(`READ-ONLY VIOLATION: gh api method ${rest[i+1]}`);
+    for (const a of rest)
+      if (BODY_FLAGS.has(a) && !isGraphql)          // body flags force POST on REST endpoints
+        throw new Error(`READ-ONLY VIOLATION: gh api body flag ${a}`);
+    if (isGraphql) assertGraphqlQueryIsReadOnly(rest);
+    return;
+  }
+  const tuple = `${sub} ${rest[0] ?? ""}`.trim();
+  const OK = new Set(["repo list","auth status","--version"]); // NOT auth refresh (mutates local auth; human-only remediation)
+  if (!OK.has(tuple) && !OK.has(sub))
+    throw new Error(`READ-ONLY VIOLATION: gh ${args.join(" ")}`);
+}
+
+// Reject GraphQL mutations/subscriptions. Require an INLINE `query=…` (reject
+// --input and @file forms the guard cannot statically inspect), strip leading
+// BOM/whitespace/comments, and require the first top-level operation keyword to be
+// a read (query/introspection/anonymous), never mutation/subscription.
+export function assertGraphqlQueryIsReadOnly(rest: string[]) {
+  if (rest.includes("--input"))
+    throw new Error(`READ-ONLY VIOLATION: gh api graphql --input (uninspectable body)`);
+  const qi = rest.findIndex(a => /^query=/.test(a));
+  const raw = qi === -1 ? "" : rest[qi].slice("query=".length);
+  if (!raw || raw.startsWith("@"))
+    throw new Error(`READ-ONLY VIOLATION: gh api graphql query not inline/inspectable`);
+  const head = raw.replace(/^﻿/, "").replace(/(^|\s)#[^\n]*/g, "");
+  // reject a mutation/subscription operation at document start OR after a prior
+  // definition's closing brace (defeats a fragment- or query-prefixed mutation)
+  if (/(^|\})\s*(mutation|subscription)\b/i.test(head))
+    throw new Error(`READ-ONLY VIOLATION: gh api graphql non-read operation`);
+}
+
+export function assertReadOnlyGit(rawArgs: string[]) {
+  const args = canon(rawArgs);
+  if (!GIT_READ.has(args[0]))
+    throw new Error(`READ-ONLY VIOLATION: git ${args[0]}`);
+  for (const a of args)                              // command-injection options (incl. attached
+    if (/^-c/.test(a) ||                             // short forms like -cfoo=baz and -u<path>);
+        /^-u/.test(a) ||                             // -u is git's short --upload-pack
+        /^--(upload-pack|exec|receive-pack|config)/.test(a))
+      throw new Error(`READ-ONLY VIOLATION: git option ${a}`);
+}
+
+// tar is only ever list (-t/--list) or extract (-x/--extract) into a contained
+// pkg-audit-* dir, after the §5.E entry/link/size validation — never create/append/
+// update/concatenate/delete. `--version` (preflight tar-flavor detection) is allowed.
+export function assertReadOnlyTar(rawArgs: string[]) {
+  if (rawArgs.includes("--version") || rawArgs.includes("--help")) return;
+  for (const a of rawArgs) {
+    if (/^--(create|append|update|concatenate|catenate|delete)$/.test(a))
+      throw new Error(`READ-ONLY VIOLATION: tar ${a}`);
+    // GNU tar options that execute external commands / arbitrary programs — deny outright
+    if (/^--(checkpoint-action|to-command|use-compress-program|rmt-command|info-script|new-volume-script)/.test(a)
+        || /^-[IF]/.test(a) || a.includes("exec="))
+      throw new Error(`READ-ONLY VIOLATION: tar exec option ${a}`);
+  }
+  const clusters = rawArgs.filter(a => /^-[A-Za-z]/.test(a)); // scan ALL short clusters, any order
+  const isWrite = clusters.some(c => /[cruA]/.test(c));       // c/r/u/A = create/append/update/concat
+  const isRead  = clusters.some(c => /[tx]/.test(c)) || rawArgs.includes("--list") || rawArgs.includes("--extract");
+  if (isWrite || !isRead)                                     // note: -C (changedir) is uppercase, not matched
+    throw new Error(`READ-ONLY VIOLATION: tar mode`);
+}
+
+export function assertSpawnAllowed(bin: string, sub?: string) {
+  if (PM_DENYLIST.has(bin)) throw new Error(`BANNED PACKAGE MANAGER: ${bin}`);
+  if (bin === "bun" && sub && BUN_DENY_SUBS.has(sub)) throw new Error(`BANNED bun ${sub}`);
 }
 ```
 
