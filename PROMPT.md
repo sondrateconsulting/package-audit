@@ -172,8 +172,10 @@ Fail fast with actionable remediation if any of these fail:
    https:// with no userinfo; every configured registryAuthEnvVar names a SET,
    non-empty environment variable (fail fast otherwise rather than proceeding
    unauthenticated).
-7. `gh api rate_limit` succeeds; record remaining quota and adapt concurrency down
-   if quota is low.
+7. `gh api rate_limit` succeeds; record remaining quota for BOTH `resources.core`
+   (REST) AND `resources.graphql` (branch discovery uses the separate GraphQL bucket)
+   and adapt concurrency down if either is low. (`resources.search` is not consumed —
+   discovery uses paginated REST, §5.A, not the search API — so it need not be tracked.)
 8. Sufficient disk space for ephemeral clones.
 Emit "Preflight OK" plus, if resuming, existing row counts and last run id/time.
 
@@ -466,25 +468,107 @@ returning structured JSON.
 If subagents are unavailable, run the SAME workflow sequentially in the same order,
 but keep code structured (pure functions) so it could parallelize later.
 
+RATE-LIMIT & THROTTLING (all gh calls go through the github.ts wrapper, so this is
+enforced in one place): the `concurrency.*` fan-out (e.g. 3 orgs × 6 repos × 4 branches)
+can trip GitHub's rate limits, so cap TOTAL in-flight `gh` processes with one GLOBAL
+semaphore (not just per-level). The wrapper reads the relevant response headers
+(`x-ratelimit-remaining`/`x-ratelimit-reset`/`Retry-After`/`x-github-sso`) via `gh api -i`
+(as §2.3/§3 already do). Two distinct retryable throttles, handled the same way (WAIT
+then RE-QUEUE the unit by setting its work_queue row back to `pending` — never a
+permanent `error`) but with different wait computations:
+  - PRIMARY limit exhaustion: 403 OR 429 with `x-ratelimit-remaining: 0`; wait until the
+    `x-ratelimit-reset` EPOCH timestamp (this branch is keyed on remaining==0, NOT on the
+    status code, so a 429 with remaining==0 is primary, not secondary).
+  - SECONDARY/abuse limit (concurrent-request / per-minute point caps): 403 or 429,
+    `x-ratelimit-remaining` NONZERO. If a `Retry-After` header is present, wait that many
+    RELATIVE seconds; if it is ABSENT (a documented secondary-limit case), wait at LEAST
+    60 seconds, then exponential backoff.
+  Distinguish BOTH from a NON-retryable 403 — SSO enforcement (the `x-github-sso`
+  response header; classify as in §1's SAML/SSO note), missing permission, or a plain
+  404 — which IS an `errors` row with its own classification.
+  GraphQL is different: `gh api graphql` PRIMARY exhaustion arrives as HTTP 200 with a
+  body `errors[].type == 'RATE_LIMITED'` and `x-ratelimit-remaining: 0` (NOT a 403/429
+  status), while a SECONDARY/abuse throttle on GraphQL may surface EITHER as a 200 body
+  error OR as a 403 with a message — so the branch-discovery path MUST check BOTH the
+  HTTP status AND the response BODY (`errors[]`), then apply the same primary/secondary
+  wait-and-requeue logic keyed on the `x-ratelimit-*` headers of the graphql bucket.
+  Disambiguate a GraphQL 403: a `Retry-After` header or a documented abuse-rate message
+  means SECONDARY (retryable, requeue); an `x-github-sso` header or a
+  permission/`RESOURCE not accessible` error means NON-retryable (an `errors` row).
+  Mechanics: the wrapper paginates in TypeScript (§5.A/§5.B) with `gh api -i` per page —
+  `-i` prints the header block THEN the JSON body — so it parses each page's leading
+  header block for `x-ratelimit-*`/`Retry-After` and the trailing JSON for the body,
+  never relying on gh `--paginate`/`--slurp` (which interleave the two). Track the primary
+`core` vs `graphql` buckets separately (§2.7) and pause a bucket when its remaining quota
+nears zero.
+
 ================================================================================
 5. WORKFLOW
 ================================================================================
 A. Resolve the effective owner list per the NORMATIVE algorithm in §1 (base set
    from allowlist or discovery; personal namespace, excludes, dedupe, sort, and
-   empty-fail-fast apply in BOTH modes); persist it on the runs row. Then
-   discover repos per owner:
-   `gh repo list <owner> --json name,defaultBranchRef,isArchived,pushedAt,url --limit <n>`.
-   Respect includeArchived and maxReposPerOrg (which applies per OWNER, including
-   the personal namespace when enabled). Sort by pushedAt DESC.
+   empty-fail-fast apply in BOTH modes); persist it on the runs row. Then discover
+   repos per owner using ONE code path — the paginated REST endpoint — for BOTH the
+   unlimited (`maxReposPerOrg: null`) and finite-N cases (do NOT use `gh repo list
+   --limit N` for finite: with the archived filter it uses gh's own ordering (its
+   filtered path sorts by updated-desc, not pushedAt), so `--limit N` truncates BEFORE
+   any pushedAt sort and can drop repos that belong in the pushedAt top-N. Doing the
+   sort+cap ourselves over the REST result avoids depending on gh's internal ordering
+   at all). The wrapper PAGINATES IN TYPESCRIPT rather than using gh's
+   `--paginate`/`--slurp` (which interleave badly with `-i` header capture, §4): request
+   each page with `gh api -i "orgs/<org>/repos?per_page=100&page=<n>&type=sources"` (an
+   org; `type=sources` server-excludes forks) or, for the personal namespace,
+   `gh api -i "user/repos?affiliation=owner&per_page=100&page=<n>"` (includes private
+   personal repos; `type` is mutually exclusive with `affiliation` here, so exclude forks
+   CLIENT-SIDE with `fork === false`); read each page's rate-limit headers (§4) and follow
+   `Link: rel="next"` until absent, accumulating the repo objects into one flat list.
+   Then, in TypeScript: filter out `archived` when `includeArchived=false` (the REST
+   endpoints have no server-side archived filter) and forks per policy (exclude by default
+   so a package's own forks don't double-count; a config flag may opt in), SORT by
+   `pushed_at` DESC (nulls last), and TAKE the first N when maxReposPerOrg is finite (all
+   when null). The REST shape is snake_case (`pushed_at`, `archived`, `fork`,
+   `default_branch` as a flat STRING) — map it into the one internal shape the rest of the
+   workflow uses. maxReposPerOrg applies per OWNER (incl. the personal namespace).
 B. Discover & prioritize branches: via `gh api graphql` querying
-   refs(refPrefix:"refs/heads/") with target{...on Commit{committedDate,oid}}.
-   Sort branches by last commit date DESC (process most-recent FIRST). Filter out
-   branches with last commit BEFORE cutoffDate (do not inspect at all). Cap at
-   maxBranchesPerRepo after filtering.
-C. Locate manifests read-only: prefer `gh api repos/{org}/{repo}/contents/{path}?ref={sha}`
-   for package.json and package-lock.json at repo root AND workspace packages
-   (honor `workspaces`, recurse, skip excludeDirGlobs). Fall back to the hardened
-   shallow clone from §0 only if needed; delete the tmp dir in `finally`. Never
+   refs(refPrefix:"refs/heads/", first:100, after:$endCursor) with
+   target{...on Commit{committedDate,oid}} and `pageInfo{hasNextPage endCursor}`.
+   GitHub's `RefOrderField` cannot order heads by commit date server-side (only
+   ALPHABETICAL, or TAG_COMMIT_DATE for tags), so ENUMERATE ALL PAGES — a repo with >100
+   branches would otherwise silently lose branches. As in §5.A, PAGINATE IN TYPESCRIPT
+   (not gh `--paginate`/`--slurp`, which conflict with `-i`): loop `gh api -i graphql
+   -f query='...' [-f endCursor=<cursor>]`. Use `-f` (raw-field, always a STRING), NOT
+   `-F` (typed) — `-F` coerces a pure-digit value to an integer, which GitHub rejects
+   against the `$endCursor:String` variable. On the FIRST call OMIT `-f endCursor`
+   entirely so the variable defaults to null (GraphQL `after: null` = first page; do NOT
+   pass an empty string); on later calls pass the returned non-null cursor. Read each page's rate-limit headers (§4), concatenate
+   `data.repository.refs.nodes`, and continue while `pageInfo.hasNextPage`. ALSO check each page BODY for
+   `errors[].type == 'RATE_LIMITED'` (§4 — GraphQL throttles arrive as HTTP 200). THEN
+   sort client-side by committedDate DESC (most-recent FIRST), filter out branches whose
+   last commit is BEFORE cutoffDate (do not inspect at all — and record them as
+   `work_queue` status `skipped`, §7's branchesSkippedByCutoff), and cap at
+   maxBranchesPerRepo. The `oid` is the live head the §3 skip predicate compares against —
+   obtaining it here costs zero extra requests.
+C. Locate manifests read-only. Build the API path in TypeScript (github.ts) —
+   `repos/<org>/<repo>/contents/<path>?ref=<sha>` with `encodeURIComponent` applied
+   per PATH SEGMENT (preserving `/`) and on the `ref` value; do NOT rely on `gh api`'s
+   brace placeholders (`gh` only substitutes `{owner}`/`{repo}`/`{branch}` and fills
+   them from the CURRENT directory's repo, so `{org}`/`{path}`/`{sha}` would be left
+   literal and `{repo}` would resolve to the audit tool's OWN repo). CRITICAL for large
+   files: the default JSON contents representation returns base64 `content` ONLY for
+   files ≤ 1 MB (for 1–100 MB it returns 200 with an empty `content` and
+   `encoding: "none"`) — real monorepo lockfiles exceed 1 MB — so fetch file bodies with
+   `-H "Accept: application/vnd.github.raw+json"` (raw, up to 100 MB; do NOT
+   `--jq .content` a raw response) or via `repos/<owner>/<repo>/git/blobs/<blob_sha>`
+   with the raw media type (the blob SHA comes from the `sha` field of the file's
+   default-JSON `contents` metadata — it is NOT the commit SHA). For files > 100 MB, or a `contents` entry whose `type` is
+   `symlink`/`submodule`/`dir` (not a plain file), fall back to the hardened shallow
+   clone from §0 (note a directory path returns a JSON ARRAY of entries rather than a
+   file object, so branch on array-vs-object before attempting a raw/blob read). A raw fetch and a default-JSON fetch of the SAME url are cached under
+   distinct `api_cache.variant_hash` values (the Accept media type; §3) so they never
+   collide. (Only when you deliberately use the default JSON representation must
+   you base64-decode `content`, which contains newlines.) Fetch package.json and the
+   lockfiles (§5.D) at repo root AND workspace packages (honor `workspaces`, recurse,
+   skip excludeDirGlobs). Delete any tmp dir in `finally`. Never
    install, never execute.
 D. Extract dependency facts: a tracked package "appears" in a manifest when the
    dependency KEY equals its registry name, OR the dependency VALUE is an npm-alias
@@ -599,11 +683,12 @@ graphql -f query='fragment F on T{a} mutation{x}'`, `gh api graphql --input body
 -ufoo ...`, `tar -cf ...`, `tar --create ...`, `tar -xzf f.tgz --checkpoint-action=exec=sh`,
 `tar -xf f.tar --use-compress-program=sh`, and any `npm`/`npx`/`yarn`/`pnpm`/`bunx`/`bun
 x` spawn; and that these all PASS (they are the tool's OWN reads): `gh api
-"user/orgs?per_page=100" --paginate --jq '.[].login'`, `gh api -i user`, `gh api
-repos/o/r/contents/p?ref=sha --jq .content`, `gh api graphql -f query='query{...}'`,
-`gh api rate_limit`, `gh repo list o --json name --limit 100`, the hardened `git
-clone`, `git rev-parse HEAD`, `tar -xzf f.tgz -C dir`, `tar -tzf f.tgz`, and
-`tar --version`.
+"user/orgs?per_page=100" --paginate --jq '.[].login'`, `gh api -i user`, `gh api -i
+"orgs/o/repos?per_page=100&page=1&type=sources"`, `gh api -i
+"user/repos?affiliation=owner&per_page=100&page=1"`, `gh api
+repos/o/r/contents/p?ref=sha --jq .content`, `gh api repos/o/r/git/blobs/sha`, `gh api
+graphql -f query='query{...}'`, `gh api rate_limit`, the hardened `git clone`, `git
+rev-parse HEAD`, `tar -xzf f.tgz -C dir`, `tar -tzf f.tgz`, and `tar --version`.
 
 Illustrative snippets (adapt, don't copy blindly):
 ```typescript
@@ -621,7 +706,8 @@ const GIT_READ = new Set(["clone","rev-parse","ls-tree","cat-file","show","--ver
 export const PM_DENYLIST = new Set(["npm","npx","yarn","pnpm","bunx"]);
 const BUN_DENY_SUBS = new Set(["install","add","remove","x","pm"]);
 // gh api endpoint allowlist (matched on the path with any ?query-string stripped):
-const GH_API_PATHS = ["repos","user","rate_limit","graphql"];  // "user/orgs" ⊂ "user" prefix
+const GH_API_PATHS = ["repos","orgs","user","rate_limit","graphql"];  // "user/orgs" ⊂ "user";
+                                       // "orgs" covers orgs/<org>/repos discovery (§5.A)
 // gh api flags that CONSUME the next token as their value (so it is not the endpoint):
 const GH_VALUE_FLAGS = new Set(["-X","--method","-f","-F","--field","--raw-field",
   "--input","-H","--header","-q","--jq","-t","--template","--hostname","-p","--preview","--cache"]);
@@ -783,6 +869,10 @@ Acceptance checklist — the run is NOT complete until all are true:
 [ ] Every tracked package has an API-surface record per resolved version seen.
 [ ] Every in-repo usage is attributed to a specific named export (or marked CLI).
 [ ] Branches processed most-recent-first; none before cutoffDate inspected.
-[ ] SQLite is the source of truth; a second run with no changes performs zero
-    redundant GitHub calls for already-done work.
+[ ] SQLite is the source of truth. A second run still performs the cheap discovery
+    calls needed to detect change (paginated-REST repo discovery, per-repo branch-head
+    GraphQL), but performs
+    ZERO content re-fetches for already-done units whose head is unchanged: commit-SHA-
+    pinned contents URLs are immutable and served from SQLite with no request (a 304
+    revalidation would still be a call and is therefore avoided for pinned URLs).
 [ ] Exactly one consolidated JSON file written for this run.
