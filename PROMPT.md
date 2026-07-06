@@ -723,9 +723,12 @@ E. Introspect API surface, deduplicated GLOBALLY by (package_name, resolved_vers
    marker is introspected THIS run, writing either the marker (+ export/bin rows) OR an
    `errors` row for THIS run. This keeps §8's per-version guarantee — every versionsSeen
    version has an apiSurface entry OR a current-run `errors` row — satisfiable even on
-   skip-heavy runs (run-scoped `errors` are filtered by `run_id=R`, §7): a version that
-   failed or was skipped (non-registry) in an earlier run has NO marker, so it is
-   RE-attempted and RE-explained every run it remains in the slice, until it earns one. The
+   skip-heavy runs (run-scoped `errors` are filtered by `run_id=R`, §7): a versionsSeen
+   version that FAILED registry introspection in an earlier run has NO marker, so it is
+   RE-attempted and RE-explained every run it remains in the slice, until it earns one.
+   (Non-registry specs never enter versionsSeen — they are semver-excluded, §7 — so they are
+   NOT part of this reconciliation; their package-scoped skip error is logged once at
+   resolution time, below.) The
    resolved_version comes from a lockfile (§5.D); when a repo committed NO lockfile,
    FALL BACK to resolving the manifest's declared range against the packument (the
    MAX-SATISFYING published version, applying a documented prerelease policy — exclude
@@ -1054,8 +1057,10 @@ line, context); errors by (occurredAt, id). Nested structures too: emit the `api
 version KEYS in `versionsSeen` order, each version's `exports` sorted by (kind, name), and
 `cli.binNames` lexicographically. These keys cover every UNIQUE dimension, so SQLite row
 order never leaks in. `apiSurface` keys are exactly the `versionsSeen` versions carrying a COMPLETION MARKER
-(§5.E) — those introspected to completion; a version whose introspection was skipped
-(non-registry) or failed has NO marker and is OMITTED (it instead has an `errors` row, §8),
+(§5.E) — those introspected to completion; a versionsSeen version whose registry
+introspection FAILED has NO marker and is OMITTED (it instead has a version-keyed `errors`
+row, §8; non-registry specs are already excluded from versionsSeen, so a versionsSeen
+omission is always a failure, never a non-registry skip),
 so apiSurface keys are a SUBSET of versionsSeen, not a 1:1 map. Each present version's
 `exports` come from its `package_api_surface` rows WHERE `export_kind NOT IN
 ('cli-bin','__complete__')` and `cli.binNames` from `export_kind='cli-bin'`, with
@@ -1152,11 +1157,13 @@ Acceptance checklist — the run is NOT complete until all are true:
     path+line(s)+permalink+resolved version.
 [ ] Every versionsSeen version introspected to completion (it carries a `__complete__`
     COMPLETION MARKER, §5.E — this run or a prior one) appears in `apiSurface`, with
-    possibly-empty exports/binNames for a zero-surface package; a version whose
-    introspection was SKIPPED (non-registry spec) or FAILED (network/parse) carries NO
-    marker, is RE-attempted this run, and yields a current-run `errors` row instead — so
+    possibly-empty exports/binNames for a zero-surface package; a versionsSeen version whose
+    registry introspection FAILED (network/parse/integrity) carries NO marker, is
+    RE-attempted this run, and yields a current-run version-keyed `errors` row instead — so
     apiSurface is a subset of versionsSeen (§7), not a 1:1 map, and EVERY versionsSeen
-    version has an apiSurface entry OR a run-scoped `errors` row.
+    version has an apiSurface entry OR a run-scoped `errors` row. (Non-registry specs are
+    excluded from versionsSeen entirely, §7, so they need no per-version coverage; their
+    package-scoped skip error is logged once at resolution time, §5.E.)
 [ ] Every in-repo usage is attributed to a specific named export where one exists;
     usage types with no single binding (side-effect-import, reexport, namespace-import,
     an unresolved/private subpath) and CLI usage correctly carry export_name=''.
