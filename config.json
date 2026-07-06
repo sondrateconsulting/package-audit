@@ -1,0 +1,28 @@
+{
+    "concurrency": {
+        "branches": 4,
+        "organizations": 3,
+        "repositories": 6
+    },
+    "cutoffDate": "2024-01-01",
+    "excludeDirGlobs": [
+        "**/node_modules/**",
+        "**/dist/**",
+        "**/build/**",
+        "**/vendor/**"
+    ],
+    "githubHost": "github.com",
+    "includeArchived": false,
+    "maxBranchesPerRepo": 25,
+    "maxReposPerOrg": null,
+    "packages": [
+        {
+            "name": "expo",
+            "npmName": "expo"
+        }
+    ],
+    "paths": {
+        "outputDir": "./output",
+        "sqlitePath": "./data/audit.db"
+    }
+}
