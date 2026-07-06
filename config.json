@@ -15,10 +15,12 @@
     "includeArchived": false,
     "maxBranchesPerRepo": 25,
     "maxReposPerOrg": null,
+    "organizations": null,
+    "excludeOrganizations": [],
+    "includePersonalNamespace": false,
     "packages": [
         {
-            "name": "expo",
-            "npmName": "expo"
+            "name": "expo"
         }
     ],
     "paths": {
