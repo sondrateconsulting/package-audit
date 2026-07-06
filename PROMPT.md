@@ -172,7 +172,11 @@ Fail fast with actionable remediation if any of these fail:
    hostname) and to each effective (default-applied) per-package registryUrl —
    any HTTP response counts as reachable (private registries may 401 an
    unauthenticated probe).
-6. Config parses AND validates — including: every effective registryUrl is
+6. Config parses AND validates — including: `packages[].name` is UNIQUE across the array
+   — reject duplicate names, even across different `registryUrl` values, so a package name
+   maps to EXACTLY ONE registry and `(package_name, version)` is an unambiguous
+   introspection/surface identity (no two registries can claim the same tracked name in one
+   run); every effective registryUrl is
    https:// with no userinfo; every configured registryAuthEnvVar names a SET,
    non-empty environment variable (fail fast otherwise rather than proceeding
    unauthenticated).
@@ -488,7 +492,12 @@ Resumability rules:
 - CLI flags:
   - `--fresh` DROPs and recreates the run-scoped tables but PRESERVES `api_cache` and
     `package_api_surface` (content-addressed and expensive to rebuild) unless
-    `--purge-cache` is ALSO passed. DROP in FK-safe CHILD-BEFORE-PARENT order —
+    `--purge-cache` is ALSO passed. `package_api_surface` is keyed by `(package_name,
+    version)` — well-defined because a name maps to exactly one registry per config (§2.6).
+    It is NOT partitioned by registry origin, so if you CHANGE a package's `registryUrl` such
+    that a version's published artifact differs, run `--purge-cache` to discard the
+    prior-registry surface and force fresh introspection (the durable cache assumes a stable
+    name→registry→artifact mapping). DROP in FK-safe CHILD-BEFORE-PARENT order —
     `run_unit_head`, `dependency_findings`, `usage_findings`, `errors`, `work_queue`,
     THEN `runs` — because every one references `runs(run_id)`. (`PRAGMA foreign_keys=OFF`
     is a no-op INSIDE a transaction, so it cannot be used as an in-transaction shortcut;
@@ -779,10 +788,16 @@ E. Introspect API surface, deduplicated GLOBALLY by (package_name, resolved_vers
    the resolved .d.ts (preferred; else statically parse top-level export/module.exports —
    never execute). Record bin names. Upsert the export/bin rows into package_api_surface,
    THEN the completion marker (`export_name=''`, `export_kind='__complete__'`, sentinel
-   `source='__complete__'`) LAST in the same transaction. On introspection FAILURE
-   (network/parse/integrity/off-origin) or a non-registry SKIP, write NO marker and instead
-   log an `errors` row with `package_name` AND the concrete `version` set (so §7/§8's
-   per-version guarantee is derivable by `(run_id, package_name, version)`), then continue.
+   `source='__complete__'`) LAST in the same transaction. On introspection FAILURE of a
+   REGISTRY version (network/parse/integrity/off-origin), write NO marker and instead log an
+   `errors` row with `package_name` AND the concrete semver `version` set — so §7/§8's
+   per-version guarantee (scoped to versionsSeen, which is semver-only) is derivable by
+   `(run_id, package_name, version)` — then continue. A NON-registry SKIP (§5.D-E) is
+   different: its resolved reference is NOT a registry semver, so it is EXCLUDED from
+   versionsSeen (§7) and needs no per-version coverage; log it once at resolution time as a
+   PACKAGE-scoped `errors` row (`package_name` set; `version` = the raw resolved spec, e.g.
+   the `git+`/`file:`/`workspace:` reference, for traceability), independent of the
+   versionsSeen reconciliation loop.
 F. Find in-repo API usage: detect `named-import`, `namespace-import` (`import * as`),
    `default-import`, `require(...)` (incl. destructured), `dynamic-import` (`import(...)`),
    `reexport` (`export … from 'pkg'`), and `side-effect-import` (`import 'pkg'`). Match
@@ -1088,8 +1103,9 @@ summary.
     }]
   }],
   "errors": [ ... ],                             // errors WHERE run_id=R, sorted (occurredAt,id); each row
-                                                 //   carries scope + optional packageName/version (§5.E
-                                                 //   per-version introspection errors) + message
+                                                 //   carries scope + message, plus optional
+                                                 //   organization/repository/branch (repo/branch-scoped) or
+                                                 //   packageName/version (§5.E per-version introspection)
   "summary": { "organizationsScanned":0,"repositoriesScanned":0,"branchesScanned":0,
                "branchesSkippedByCutoff":0,"totalDependencyFindings":0,"totalUsageFindings":0 }
 }
