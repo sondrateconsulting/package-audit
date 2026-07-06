@@ -663,8 +663,15 @@ D. Extract dependency facts: a tracked package "appears" in a manifest when the
    dependency_type) for it. For each finding record the exact declared version and the
    1-based line number (parse JSON with line tracking — do not assume formatting; note
    some tool-context package.json files use JSON5/JSONC). Build a COMMIT-SHA-pinned
-   permalink `https://{host}/{org}/{repo}/blob/{commit_sha}/{path}#L{line}` (never
-   branch — avoids link rot).
+   permalink via the SINGLE `permalink.ts` builder that EVERY finding writer (manifest,
+   lockfile, API-usage, CLI-usage) calls, so the shape can never drift:
+   `https://{host}/{org}/{repo}/blob/{commit_sha}/{path}#L{line}` for one line, or
+   `…#L{startLine}-L{endLine}` for a multi-line span (e.g. a lockfile block, §5.D) — a
+   span of a SINGLE line collapses to the `#L{line}` form, never `#L{n}-L{n}`. `{host}`
+   is `githubHost` (GHES hosts share the `/blob/` URL shape, so they work unchanged);
+   `{path}` is URL-encoded PER SEGMENT (preserving `/`, matching §5.C's contents-path
+   encoding) so paths with spaces/unicode still yield valid links; NEVER a branch name —
+   commit-pinning avoids link rot.
    LOCKFILES (§5.C fetches them): resolve the version PER (manifest, dependency_key) via
    the IMPORTER EDGE — do NOT broad-match by real name alone, which would collapse two
    aliases of the same package. Use the lockfile at the manifest's directory OR its
