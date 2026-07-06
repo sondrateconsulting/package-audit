@@ -100,7 +100,10 @@ below).
   "excludeDirGlobs": ["**/node_modules/**", "**/dist/**", "**/build/**", "**/vendor/**"]
 }
 ```
-(Ship a companion JSON Schema file for validation.)
+(Ship a companion JSON Schema file for validation. `packages` is required and MUST be
+non-empty — `minItems: 1`. This is load-bearing for §3: a LIVE run's
+`runs.tracked_packages` is therefore never `[]`, so an empty `tracked_packages` cleanly
+and unambiguously marks a pre-migration, not-per-run-reportable run.)
 
 Effective owner resolution (normative — EVERY run, BOTH modes):
 1. Base set: the explicit `organizations` allowlist if configured
@@ -182,6 +185,8 @@ https://bun.com/docs/runtime/sqlite). NO third-party ORM/wrapper. Enable:
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;   -- single-writer, but report.ts / cache reads can still
+                              -- hit transient locks; back off instead of erroring
 ```
 Create idempotently (CREATE TABLE IF NOT EXISTS) — never LOSE DATA without
 `--fresh`; the sanctioned rebuild below may DROP an old table, but only inside a
@@ -190,11 +195,73 @@ Schema evolution: track the schema version with `PRAGMA user_version`. When a
 pre-existing DB's version is older, migrate INSIDE ONE TRANSACTION, preserving
 all rows: use additive `ALTER TABLE ... ADD COLUMN` where sufficient (a NOT NULL
 column added via ALTER MUST carry a DEFAULT satisfying any CHECK — SQLite rejects
-it otherwise); where a UNIQUE constraint must change or a NOT NULL column has no
-sensible DEFAULT, use the sanctioned rebuild instead: CREATE the new-shape table
-under a temporary name, `INSERT ... SELECT` the old rows (backfilling new columns,
-e.g. dependency_key := package_name), DROP the old table, RENAME — then bump
-user_version. Data loss is never acceptable outside `--fresh`:
+it otherwise); where a UNIQUE constraint must change, a NOT NULL column has no
+sensible DEFAULT, OR an FK must be added to an existing column (SQLite's ALTER cannot
+add a FOREIGN KEY — so dependency_findings/usage_findings/errors, which all gain
+`run_id REFERENCES runs(run_id)`, require the rebuild purely to acquire that FK; and
+`api_cache`, whose PRIMARY KEY changes from `(url)` to `(method,url,variant_hash)` and
+which gains two NOT NULL columns, also requires the rebuild — backfill legacy rows with
+`method='GET'` and `variant_hash=''` (they predate GraphQL/variant support), preserving
+url/etag/response_body/cached_at; this keeps the `--fresh`-preserves-api_cache guarantee
+intact), use the sanctioned rebuild instead: CREATE the new-shape table
+under a temporary name, `INSERT ... SELECT` the old rows (backfilling new columns:
+dependency_key := package_name; usage_findings.dependency_key := '' and
+`COALESCE(export_name,'')`; for work_queue, config_hash from a join to `runs`,
+created_run_id = last_run_id = old run_id, and `COALESCE(col,'')` for the new sentinel
+columns), DROP the old table, RENAME — then bump user_version. Dedup rule: adding a column TO an
+existing UNIQUE key makes it LOOSER (dependency_findings gaining `dependency_type` needs
+no dedup), but ADDING a UNIQUE where there was none, or COLLAPSING NULLs into sentinels,
+is TIGHTER and the `INSERT ... SELECT` MUST de-duplicate (`GROUP BY` the new key keeping
+the latest row by that table's OWN timestamp — `MAX(updated_at)` for work_queue,
+`MAX(found_at)` for usage_findings; there is no `updated_at` on findings. Select the
+whole winning row deterministically (a correlated subquery or `ROW_NUMBER()` window
+ordered by the timestamp DESC then `id` DESC as a tie-break — do NOT rely on SQLite's
+bare-column-follows-MAX shortcut on a non-idiomatic engine)). Two tables
+tighten here: work_queue (old NULL-distinct org/repo rows collapse under the '' sentinels)
+and usage_findings (it had NO UNIQUE before, so pre-existing duplicate rows must be
+collapsed). For work_queue also DERIVE `scope` from
+the presence of repository/branch during the copy (scope='org' when both empty, 'repo'
+when only branch empty, else 'branch') so legacy rows satisfy the new mutually-exclusive
+scope CHECK. Because the old schema FK'd run_id to `runs` on NONE of these tables, ALL of
+work_queue, dependency_findings, usage_findings, and errors can hold rows whose run_id has
+no `runs` row (partial writes / pre-FK crashes). BEFORE any FK-bearing `INSERT ... SELECT`,
+quarantine every orphaned run_id — collected across ALL FOUR child tables, not just
+work_queue — by synthesizing ONE `status='failed'` legacy `runs` row per distinct orphaned
+run_id (otherwise the FK copy aborts the whole one-transaction migration with FOREIGN KEY
+constraint failed). An orphaned run_id has no `runs` row, so its original config_hash is
+UNKNOWABLE; give the synthesized run a distinct PLACEHOLDER hash `legacy-orphan:<run_id>`
+that can never equal a real current config_hash (so those rows are never mistaken for
+current-config completed work), a deterministic `started_at` = the earliest timestamp of
+that run_id's rows across ANY table (work_queue.updated_at, dependency_findings.date_fetched,
+usage_findings.found_at, errors.occurred_at), else the migration timestamp, and
+`status='failed'`. Then the new FK does not reject any copy. Ordering within the
+migration transaction: run the additive `runs` ALTERs (effective_owners, owners_source,
+tracked_packages — all NOT NULL with DEFAULTs) FIRST, so synthesized orphan `runs` rows
+acquire `tracked_packages='[]'` via the column DEFAULT, before any FK-bearing copy. `runs.tracked_packages` is NOT reconstructed for pre-existing runs. It is persisted
+EXACTLY from config at run creation, so every LIVE run (the first post-migration run and
+all later ones — including the one that reports "latest") has the correct, exact set. But
+the old schema never recorded a run's package set, and `findings.run_id` is last-writer
+(never a stable ownership signal — §work_queue note), so there is NO sound source to
+recover a pre-migration run's tracked set. Therefore pre-migration runs keep
+`tracked_packages='[]'` and are explicitly NOT per-run reportable: `report --run-id <a
+pre-migration run>` returns empty with a "not reportable (pre-migration)" notice (the
+`run_unit_head` paragraph below makes the same units non-reportable from the snapshot
+side). Do NOT derive it from findings and do NOT add
+an "empty = no filter" fallback — both would join through the unstable run_id and re-open
+cross-config bleed. This keeps the report invariant (`package_name IN
+json_each(tracked_packages)`) unqualified and sound for every reportable (live) run.
+Finally, `run_unit_head` is NOT backfilled for pre-existing runs — consistent with
+tracked_packages above, pre-migration runs are simply not per-run reportable (they
+predate the snapshot); live runs populate `run_unit_head` going forward via §5.H. This
+avoids inventing a head from a lexicographic `MAX(commit_sha)` (wrong — hashes are
+unordered) or from the last-writer `run_id`. CRUCIAL migration-boundary rule: mark EVERY
+pre-existing `status='running'` run (any config_hash) as `failed` during migration. Such
+runs predate the snapshot and carry `tracked_packages='[]'`, so they must NOT be resumed
+as the live run — otherwise the startup resume rule would pick a same-config one and
+produce an empty, non-reportable "latest". Their orphaned `in_progress` work_queue rows
+then heal via the self-healing recovery path, and a fresh post-migration run starts with
+`tracked_packages` persisted EXACTLY from the current config. Data loss is
+never acceptable outside `--fresh`:
 
 ```sql
 CREATE TABLE IF NOT EXISTS runs (
@@ -203,66 +270,184 @@ CREATE TABLE IF NOT EXISTS runs (
   effective_owners TEXT NOT NULL DEFAULT '[]',  -- JSON array; resolved per §1
   owners_source TEXT NOT NULL DEFAULT 'discovered'
     CHECK (owners_source IN ('configured','discovered')),
+  tracked_packages TEXT NOT NULL DEFAULT '[]',  -- JSON array of this run's package NAMES,
+                                       -- so report.ts scopes findings to the run's own
+                                       -- config and never bleeds another config's packages
+                                       -- (same commit, different tracked set) into the report
   status TEXT NOT NULL CHECK (status IN ('running','completed','failed'))
 );
 CREATE TABLE IF NOT EXISTS work_queue (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
-  scope TEXT NOT NULL,                 -- 'org' | 'repo' | 'branch'
-  organization TEXT NOT NULL, repository TEXT, branch TEXT,
-  last_commit_sha TEXT, last_commit_date TEXT,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  config_hash TEXT NOT NULL,           -- scopes a unit to its config; part of identity+skip
+  created_run_id TEXT NOT NULL REFERENCES runs(run_id),  -- run that first enqueued it
+  last_run_id TEXT NOT NULL REFERENCES runs(run_id),     -- run that last touched it (run_id is
+                                       -- NOT stable ownership — never join reports through it)
+  scope TEXT NOT NULL CHECK (scope IN ('org','repo','branch')),
+  organization TEXT NOT NULL,
+  repository TEXT NOT NULL DEFAULT '', -- '' sentinel for org scope (NULLs don't dedupe in SQLite)
+  branch TEXT NOT NULL DEFAULT '',     -- '' sentinel for org/repo scope
+  last_commit_sha TEXT NOT NULL DEFAULT '',  -- the CURRENT live head, used by the skip
+                                       -- predicate (NOT the report head — that comes from run_unit_head)
+  last_commit_date TEXT,
   status TEXT NOT NULL CHECK (status IN ('pending','in_progress','done','skipped','error')),
   error_message TEXT, updated_at TEXT NOT NULL,
-  UNIQUE(organization, repository, branch)
+  CHECK ((scope='org'    AND repository='' AND branch='') OR
+         (scope='repo'   AND repository<>'' AND branch='') OR
+         (scope='branch' AND repository<>'' AND branch<>'')),
+  UNIQUE(config_hash, scope, organization, repository, branch)  -- fires for all scopes now
 );
 CREATE TABLE IF NOT EXISTS dependency_findings (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
   organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
   commit_sha TEXT NOT NULL, date_fetched TEXT NOT NULL,
   package_name TEXT NOT NULL,          -- always the canonical registry name
   dependency_key TEXT NOT NULL,        -- the manifest key; equals package_name
                                        -- unless npm-aliased ("key": "npm:<name>@...")
-  dependency_type TEXT NOT NULL,
+  dependency_type TEXT NOT NULL,       -- deps/devDeps/peerDeps/optionalDeps (overrides/
+                                       -- resolutions values reserved for §5.D pending work)
   manifest_path TEXT NOT NULL, manifest_line INTEGER NOT NULL,
   manifest_permalink TEXT NOT NULL, declared_version TEXT NOT NULL,
   lockfile_path TEXT, lockfile_kind TEXT, lockfile_lines TEXT,   -- JSON array
   lockfile_permalink TEXT, resolved_version TEXT,
-  UNIQUE(organization, repository, branch, commit_sha, package_name, dependency_key, manifest_path)
+  -- dependency_type in the key: a package in BOTH peerDeps and devDeps of one manifest
+  -- is two DISTINCT findings, not a collision
+  UNIQUE(organization, repository, branch, commit_sha, package_name, dependency_key, dependency_type, manifest_path)
 );
 CREATE TABLE IF NOT EXISTS package_api_surface (
   id INTEGER PRIMARY KEY AUTOINCREMENT, package_name TEXT NOT NULL,
-  version TEXT NOT NULL, export_name TEXT NOT NULL,
+  version TEXT NOT NULL,               -- the RESOLVED concrete version, never a declared range
+  version_source TEXT NOT NULL DEFAULT 'lockfile'
+    CHECK (version_source IN ('lockfile','range-resolved')),  -- 'range-resolved' = max-satisfying
+                                       -- packument version when a repo committed no lockfile
+  export_name TEXT NOT NULL,
   export_kind TEXT NOT NULL,           -- 'named'|'default'|'type'|'cli-bin'
   source TEXT NOT NULL, introspected_at TEXT NOT NULL,
   UNIQUE(package_name, version, export_name, export_kind)
 );
 CREATE TABLE IF NOT EXISTS usage_findings (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
   organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
   commit_sha TEXT NOT NULL, package_name TEXT NOT NULL,
-  usage_type TEXT NOT NULL,            -- 'named-import'|'default-import'|'namespace-import'|'require'|'dynamic-import'|'cli'
-  export_name TEXT,                    -- NULL when usage_type='cli'
+  dependency_key TEXT NOT NULL DEFAULT '',  -- which manifest alias resolved this import ('' if bare name)
+  usage_type TEXT NOT NULL,            -- 'named-import'|'default-import'|'namespace-import'|'require'|'dynamic-import'|'reexport'|'side-effect-import'|'cli'
+  export_name TEXT NOT NULL DEFAULT '', -- '' (not NULL — NULLs don't dedupe) when usage_type='cli' or unattributable
   file_path TEXT NOT NULL, line_number INTEGER NOT NULL,
-  permalink TEXT NOT NULL, snippet TEXT NOT NULL, found_at TEXT NOT NULL
+  permalink TEXT NOT NULL, snippet TEXT NOT NULL, found_at TEXT NOT NULL,
+  UNIQUE(organization, repository, branch, commit_sha, package_name, dependency_key, usage_type, file_path, line_number, export_name)
+);
+-- immutable per-run snapshot: the head commit each run REPORTED for each unit.
+-- report.ts joins findings through this (not the mutable work_queue.last_commit_sha),
+-- so `report --run-id` reconstructs the exact state of the world as of that run even
+-- after a later same-config run advances the head.
+CREATE TABLE IF NOT EXISTS run_unit_head (
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+  commit_sha TEXT NOT NULL,
+  PRIMARY KEY (run_id, organization, repository, branch)
 );
 CREATE TABLE IF NOT EXISTS api_cache (
-  url TEXT PRIMARY KEY, etag TEXT, response_body TEXT, cached_at TEXT NOT NULL
+  method TEXT NOT NULL,                -- 'GET' (REST). GraphQL branch-discovery is never
+                                       -- cached (always live, §resumability), so no 'POST' rows
+  url TEXT NOT NULL,
+  variant_hash TEXT NOT NULL,          -- a stable discriminator for the request variant
+                                       -- (the Accept media type, or its hash), so JSON-vs-raw
+                                       -- contents reads of one URL don't collide
+  etag TEXT,                           -- REST GET conditional requests
+  response_body TEXT, cached_at TEXT NOT NULL,
+  PRIMARY KEY (method, url, variant_hash)
 );
 CREATE TABLE IF NOT EXISTS errors (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, scope TEXT NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  scope TEXT NOT NULL,
   organization TEXT, repository TEXT, branch TEXT, message TEXT NOT NULL,
   occurred_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ix_usage_loc  ON usage_findings(organization, repository, branch, commit_sha);
+CREATE INDEX IF NOT EXISTS ix_usage_run  ON usage_findings(run_id);
+CREATE INDEX IF NOT EXISTS ix_dep_run    ON dependency_findings(run_id);
+CREATE INDEX IF NOT EXISTS ix_dep_loc    ON dependency_findings(organization, repository, branch, commit_sha);
+CREATE INDEX IF NOT EXISTS ix_err_run    ON errors(run_id);
+CREATE INDEX IF NOT EXISTS ix_wq_status  ON work_queue(config_hash, status);  -- stale-recovery + skip scans
+CREATE INDEX IF NOT EXISTS ix_ruh_loc    ON run_unit_head(organization, repository, branch, commit_sha);
 ```
 
 Resumability rules:
-- Compute a stable `config_hash`. If a `status='running'` run with the same hash
-  exists, RESUME it (reuse run_id); else start a new run.
-- Before working an org/repo/branch, check `work_queue`; skip `done` units for the
-  current config_hash unless `--fresh` or `--rescan-branch <name>`.
+- Compute a stable `config_hash` from the normalized config content (§1). On startup,
+  mark every `status='running'` run whose `config_hash` DIFFERS from the current one as
+  `failed` (a crashed run under another config can never be resumed). If one or more
+  `status='running'` runs with the SAME hash exist, RESUME the most recent `started_at`
+  (tie-break on `run_id` for determinism) and mark the OLDER same-hash running runs
+  `failed` too (only one active run per config);
+  if none exist, start a new run. A new run row persists `config_hash`, `effective_owners`,
+  `owners_source`, and `tracked_packages` (the config's package names) at creation.
+- Skip predicate (the key resumability + freshness invariant): a work unit is skipped
+  ONLY when `status='done'` AND `config_hash` = current AND its stored `last_commit_sha`
+  equals the branch's LIVE head (obtained from the branch-discovery call that runs
+  anyway, §5.B). If the live head DIFFERS, atomically reset the unit to `pending` and
+  re-scan — so repeated daily/weekly runs DO pick up new commits (a `done` branch is
+  never frozen forever). `--fresh` and `--rescan-branch` override the skip. Edge case: a
+  previously-`done` branch that §5.B no longer surfaces (it fell before `cutoffDate` or
+  past `maxBranchesPerRepo`) is neither re-evaluated nor re-scanned this run; it simply
+  retains its prior `done` state and historical findings/snapshot — this is intended, not
+  an error (its usage is genuinely stale), and it just isn't refreshed into new runs.
+- Report-head invariant (co-designed with the skip predicate): as each unit is
+  processed (scanned OR skipped-as-current), the run upserts `run_unit_head(run_id, org,
+  repo, branch, commit_sha=the head it reported)`. Findings accumulate across commits
+  (commit_sha is in their UNIQUE keys), so report.ts for a run R selects, per
+  (organization, repository, branch), ONLY finding rows whose `commit_sha` equals the
+  `run_unit_head` commit_sha for R AND whose `package_name` is in R's
+  `runs.tracked_packages` (a JSON array — match via
+  `package_name IN (SELECT value FROM json_each(runs.tracked_packages))`) — NEVER by the
+  findings' own `run_id` (rows for units skipped
+  this run keep a prior run_id). The package filter is essential: two configs can scan
+  the SAME (org,repo,branch,commit) but track DIFFERENT packages, and findings there are
+  shared rows; without the filter, run R's report would leak the other config's packages.
+  Because the snapshot is per-run and immutable,
+  `report --run-id <id>` reconstructs "the state of the world as of that run" exactly,
+  even after a later same-config run advances the head, and even across a config change
+  (the snapshot disambiguates the multiple work_queue rows a branch can have across
+  config_hashes). Default `report` uses the latest LIVE run's snapshot (the most recent run with a
+  non-empty `tracked_packages`); if NO live run exists yet (e.g. a freshly-migrated DB
+  reported before its first orchestrate run), it emits the same "not reportable
+  (pre-migration)" notice rather than a silent empty report. Never prune finding rows on
+  head advance — history is retained; the snapshot selects the right slice.
 - ALL finding writes use `INSERT ... ON CONFLICT DO UPDATE` (upsert) keyed by the
-  UNIQUE constraints — never `INSERT OR IGNORE` (so resolved versions stay fresh).
-- Update work_queue status transactionally; recover stale `in_progress` on resume.
-- Use ETags in `api_cache` for conditional GitHub requests to save rate limit.
+  UNIQUE constraints — never `INSERT OR IGNORE` (so resolved versions stay fresh). Every
+  UNIQUE key is now NULL-free (sentinels/`DEFAULT ''`) so the conflict target always fires.
+- Update work_queue status transactionally (single-writer coordinator, §4). Do the
+  stale-run fail-marking AND its in_progress reset in ONE transaction. Additionally,
+  make recovery self-healing: on EVERY startup reset to `pending` any `in_progress` unit
+  of the current config whose `last_run_id` is any run now in status `failed` (not just
+  the ones failed this startup) OR is the run being resumed — so a crash BETWEEN
+  fail-marking and reset heals on the next startup rather than orphaning the unit.
+- Caching (see api_cache): commit-SHA-pinned contents URLs are IMMUTABLE — serve them
+  from cache with ZERO network request. For other REST GETs use ETag/If-None-Match
+  conditional requests (treat gh's non-zero exit on HTTP 304 as a cache HIT, capture the
+  ETag via `gh api -i`). Branch-discovery GraphQL is NEVER cached — it BYPASSES
+  api_cache entirely and always hits the network. Two reasons: (a) the skip predicate
+  depends on seeing the LIVE head every invocation, and a resumed run's persisted
+  `started_at` predates a crash, so ANY time-based cache check would risk serving a
+  pre-crash (stale) head; (b) each repo's branch query is unique, so it never repeats
+  within a run and caching would buy nothing. The branch-discovery call also passes NO
+  `gh --cache` flag, so gh's OWN on-disk response cache cannot serve a stale head either.
+  api_cache is therefore effectively REST-GET only; the `method` column stays for
+  defensiveness but GraphQL rows are not written.
+- CLI flags:
+  - `--fresh` DROPs and recreates the run-scoped tables but PRESERVES `api_cache` and
+    `package_api_surface` (content-addressed and expensive to rebuild) unless
+    `--purge-cache` is ALSO passed. DROP in FK-safe CHILD-BEFORE-PARENT order —
+    `run_unit_head`, `dependency_findings`, `usage_findings`, `errors`, `work_queue`,
+    THEN `runs` — because every one references `runs(run_id)`. (`PRAGMA foreign_keys=OFF`
+    is a no-op INSIDE a transaction, so it cannot be used as an in-transaction shortcut;
+    it only takes effect if issued before `BEGIN`. Prefer the explicit order.)
+  - `--rescan-branch <org>/<repo>@<branch>` (repeatable) resets the matching branch-scope
+    work_queue row for the CURRENT `config_hash` to `pending` (a branch can have rows
+    under several config_hashes; only the active config's is reset); superseded finding
+    rows are handled by the report-head invariant above. A bare branch name is rejected
+    as ambiguous.
 
 ================================================================================
 4. SUBAGENT / PARALLELISM STRATEGY
@@ -362,8 +547,12 @@ F. Find in-repo API usage: detect static imports, `import * as`, default imports
    `typescript` if regex/native scanning is materially unreliable.
 G. Find CLI usage (if the package has a bin): search package.json#scripts, `*.sh`,
    `.github/workflows/**`, Makefiles, and `npx/bunx/<bin>` invocations. Record as
-   usage_findings with usage_type='cli', export_name=NULL, plus location/permalink/snippet.
-H. Mark work_queue done; proceed to the next unit.
+   usage_findings with usage_type='cli', export_name='' (the empty sentinel — the column
+   is NOT NULL, §3), plus location/permalink/snippet.
+H. Upsert `run_unit_head(this run, org, repo, branch, commit_sha=the head just scanned)`,
+   mark work_queue `done`, and proceed. Units SKIPPED as already-current (§3 skip
+   predicate) ALSO upsert `run_unit_head` for this run with their unchanged head, so the
+   report for this run includes them without re-scanning.
 
 ================================================================================
 6. SCRIPT ENGINEERING STANDARDS
@@ -386,8 +575,9 @@ genuinely non-deterministic sub-tasks.
 - Log one structured JSON line per completed unit of work (observable, greppable).
 
 Entrypoints:
-  bun run scripts/orchestrate.ts [--config <path>] [--fresh] [--rescan-branch <name>]
-  bun run scripts/report.ts [--run-id <id>]   # default: latest
+  bun run scripts/orchestrate.ts [--config <path>] [--fresh] [--purge-cache] \
+                                 [--rescan-branch <org>/<repo>@<branch>]...   # repeatable
+  bun run scripts/report.ts [--run-id <id>]   # default: latest run's snapshot
 
 The wrapper module (github.ts) is the ONLY place `Bun.$` touches `gh`/`git`/`tar`;
 each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
@@ -420,7 +610,7 @@ Illustrative snippets (adapt, don't copy blindly):
 // db.ts
 import { Database } from "bun:sqlite";
 const db = new Database(path, { create: true });
-db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
 // prefer prepared statements + transactions for batch writes
 
 // readOnlyGuard.ts — ARGV-ARRAY allowlist, not substring/prefix matching.
