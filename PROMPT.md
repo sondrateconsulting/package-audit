@@ -183,7 +183,11 @@ Emit "Preflight OK" plus, if resuming, existing row counts and last run id/time.
 3. DURABILITY & RESUMABILITY (SQLite is the source of truth)
 ================================================================================
 Use Bun's built-in driver (`import { Database } from "bun:sqlite"`, see
-https://bun.com/docs/runtime/sqlite). NO third-party ORM/wrapper. Enable:
+https://bun.com/docs/runtime/sqlite). NO third-party ORM/wrapper. ALL TEXT timestamp
+columns (started_at, completed_at, date_fetched, found_at, occurred_at, updated_at,
+introspected_at, cached_at) are persisted in ONE canonical fixed-width ISO-8601 UTC form
+(`new Date().toISOString()`), so lexicographic ordering equals chronological ordering
+everywhere (§7 MAX/COALESCE, §3 earliest-timestamp synthesis). Enable:
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -238,8 +242,14 @@ that run_id's rows across ANY table (work_queue.updated_at, dependency_findings.
 usage_findings.found_at, errors.occurred_at), else the migration timestamp, and
 `status='failed'`. Then the new FK does not reject any copy. Ordering within the
 migration transaction: run the additive `runs` ALTERs (effective_owners, owners_source,
-tracked_packages — all NOT NULL with DEFAULTs) FIRST, so synthesized orphan `runs` rows
-acquire `tracked_packages='[]'` via the column DEFAULT, before any FK-bearing copy. `runs.tracked_packages` is NOT reconstructed for pre-existing runs. It is persisted
+tracked_packages, cutoff_date, github_host — all NOT NULL with DEFAULTs), the additive
+nullable `usage_findings.context` and `dependency_findings.resolved_version_source`
+ALTERs, and the additive `run_unit_head.status` (NOT NULL DEFAULT 'scanned') ALTER FIRST,
+so synthesized orphan `runs` rows acquire `tracked_packages='[]'` via the column DEFAULT,
+before any FK-bearing copy. (`run_unit_head.commit_sha` was already NOT NULL in the prior
+schema; SQLite cannot retro-add a DEFAULT to an existing column via ALTER, but this is
+immaterial — skipped-cutoff inserts always pass `commit_sha=''` explicitly, and the
+DEFAULT only matters for fresh `CREATE TABLE`.) `runs.tracked_packages` is NOT reconstructed for pre-existing runs. It is persisted
 EXACTLY from config at run creation, so every LIVE run (the first post-migration run and
 all later ones — including the one that reports "latest") has the correct, exact set. But
 the old schema never recorded a run's package set, and `findings.run_id` is last-writer
@@ -276,6 +286,8 @@ CREATE TABLE IF NOT EXISTS runs (
                                        -- so report.ts scopes findings to the run's own
                                        -- config and never bleeds another config's packages
                                        -- (same commit, different tracked set) into the report
+  cutoff_date TEXT NOT NULL DEFAULT '',   -- so §7's config.cutoffDate is derivable from SQLite alone
+  github_host TEXT NOT NULL DEFAULT 'github.com',  -- echoed in the report
   status TEXT NOT NULL CHECK (status IN ('running','completed','failed'))
 );
 CREATE TABLE IF NOT EXISTS work_queue (
@@ -312,6 +324,8 @@ CREATE TABLE IF NOT EXISTS dependency_findings (
   manifest_permalink TEXT NOT NULL, declared_version TEXT NOT NULL,
   lockfile_path TEXT, lockfile_kind TEXT, lockfile_lines TEXT,   -- JSON array
   lockfile_permalink TEXT, resolved_version TEXT,
+  resolved_version_source TEXT,        -- 'lockfile' | 'range-resolved' | NULL (non-registry/none);
+                                       -- lets the report attribute a concrete version per repo
   -- dependency_type in the key: a package in BOTH peerDeps and devDeps of one manifest
   -- is two DISTINCT findings, not a collision
   UNIQUE(organization, repository, branch, commit_sha, package_name, dependency_key, dependency_type, manifest_path)
@@ -337,6 +351,8 @@ CREATE TABLE IF NOT EXISTS usage_findings (
                                        -- aliased install); '' only for CLI/unattributable usage
   usage_type TEXT NOT NULL,            -- 'named-import'|'default-import'|'namespace-import'|'require'|'dynamic-import'|'reexport'|'side-effect-import'|'cli'
   export_name TEXT NOT NULL DEFAULT '', -- '' (not NULL — NULLs don't dedupe) when usage_type='cli' or unattributable
+  context TEXT,                        -- CLI only: the script name / Dockerfile stage / etc; NULL for imports.
+                                       -- functionally determined by (file_path,line_number), so NOT in the UNIQUE
   file_path TEXT NOT NULL, line_number INTEGER NOT NULL,
   permalink TEXT NOT NULL, snippet TEXT NOT NULL, found_at TEXT NOT NULL,
   UNIQUE(organization, repository, branch, commit_sha, package_name, dependency_key, usage_type, file_path, line_number, export_name)
@@ -348,7 +364,11 @@ CREATE TABLE IF NOT EXISTS usage_findings (
 CREATE TABLE IF NOT EXISTS run_unit_head (
   run_id TEXT NOT NULL REFERENCES runs(run_id),
   organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
-  commit_sha TEXT NOT NULL,
+  commit_sha TEXT NOT NULL DEFAULT '',  -- '' for skipped-cutoff branches (never scanned)
+  status TEXT NOT NULL DEFAULT 'scanned'
+    CHECK (status IN ('scanned','skipped-cutoff')),  -- per-run, immutable: lets the report
+                                       -- count scanned vs cutoff-skipped branches for THIS run
+                                       -- alone (work_queue is mutable and cross-run)
   PRIMARY KEY (run_id, organization, repository, branch)
 );
 CREATE TABLE IF NOT EXISTS api_cache (
@@ -386,7 +406,8 @@ Resumability rules:
   (tie-break on `run_id` for determinism) and mark the OLDER same-hash running runs
   `failed` too (only one active run per config);
   if none exist, start a new run. A new run row persists `config_hash`, `effective_owners`,
-  `owners_source`, and `tracked_packages` (the config's package names) at creation.
+  `owners_source`, `tracked_packages` (the config's package names), `cutoff_date`, and
+  `github_host` at creation, so §7's config echo is derivable from SQLite alone.
 - Skip predicate (the key resumability + freshness invariant): a work unit is skipped
   ONLY when `status='done'` AND `config_hash` = current AND its stored `last_commit_sha`
   equals the branch's LIVE head (obtained from the branch-discovery call that runs
@@ -402,7 +423,8 @@ Resumability rules:
   repo, branch, commit_sha=the head it reported)`. Findings accumulate across commits
   (commit_sha is in their UNIQUE keys), so report.ts for a run R selects, per
   (organization, repository, branch), ONLY finding rows whose `commit_sha` equals the
-  `run_unit_head` commit_sha for R AND whose `package_name` is in R's
+  `run_unit_head` commit_sha for R (over its `status='scanned'` rows — `skipped-cutoff`
+  rows carry commit_sha='' and contribute no findings) AND whose `package_name` is in R's
   `runs.tracked_packages` (a JSON array — match via
   `package_name IN (SELECT value FROM json_each(runs.tracked_packages))`) — NEVER by the
   findings' own `run_id` (rows for units skipped
@@ -413,10 +435,11 @@ Resumability rules:
   `report --run-id <id>` reconstructs "the state of the world as of that run" exactly,
   even after a later same-config run advances the head, and even across a config change
   (the snapshot disambiguates the multiple work_queue rows a branch can have across
-  config_hashes). Default `report` uses the latest LIVE run's snapshot (the most recent run with a
-  non-empty `tracked_packages`); if NO live run exists yet (e.g. a freshly-migrated DB
-  reported before its first orchestrate run), it emits the same "not reportable
-  (pre-migration)" notice rather than a silent empty report. Never prune finding rows on
+  config_hashes). Default `report` uses the latest `status='completed'` live run's snapshot
+  (most recent by started_at, tie-break run_id DESC; non-empty `tracked_packages` —
+  completed so `generatedAt=completed_at` is populated, §7); if NO such run exists yet (e.g. a
+  freshly-migrated DB, or only a still-running run), it emits the same "not reportable"
+  notice rather than a silent empty report. Never prune finding rows on
   head advance — history is retained; the snapshot selects the right slice.
 - ALL finding writes use `INSERT ... ON CONFLICT DO UPDATE` (upsert) keyed by the
   UNIQUE constraints — never `INSERT OR IGNORE` (so resolved versions stay fresh). Every
@@ -547,9 +570,10 @@ B. Discover & prioritize branches: via `gh api graphql` querying
    `data.repository.refs.nodes`, and continue while `pageInfo.hasNextPage`. ALSO check each page BODY for
    `errors[].type == 'RATE_LIMITED'` (§4 — GraphQL throttles arrive as HTTP 200). THEN
    sort client-side by committedDate DESC (most-recent FIRST), filter out branches whose
-   last commit is BEFORE cutoffDate (do not inspect at all — and record them as
-   `work_queue` status `skipped`, §7's branchesSkippedByCutoff), and cap at
-   maxBranchesPerRepo. The `oid` is the live head the §3 skip predicate compares against —
+   last commit is BEFORE cutoffDate (do not inspect at all — record them as `work_queue`
+   status `skipped` AND upsert a `run_unit_head` row for THIS run with
+   `status='skipped-cutoff'`, commit_sha='', so §7's branchesSkippedByCutoff is per-run
+   reproducible), and cap at maxBranchesPerRepo. The `oid` is the live head the §3 skip predicate compares against —
    obtaining it here costs zero extra requests.
 C. Locate manifests read-only. Build the API path in TypeScript (github.ts) —
    `repos/<org>/<repo>/contents/<path>?ref=<sha>` with `encodeURIComponent` applied
@@ -653,8 +677,11 @@ E. Introspect API surface — ONCE per unique (package_name, resolved_version). 
    resolved_version comes from a lockfile (§5.D); when a repo committed NO lockfile,
    FALL BACK to resolving the manifest's declared range against the packument (the
    MAX-SATISFYING published version, applying a documented prerelease policy — exclude
-   prereleases unless the range explicitly names one) and record it with
-   `version_source='range-resolved'` (§3) so step F still has an export list. SKIP
+   prereleases unless the range explicitly names one), record `package_api_surface` with
+   `version_source='range-resolved'`, AND write that concrete version back onto the repo's
+   `dependency_findings` row (`resolved_version` + `resolved_version_source='range-resolved'`)
+   so the report can attribute a per-repo version (§7); lockfile-resolved rows set
+   `resolved_version_source='lockfile'`. SKIP
    introspection (recording a specific `errors` reason, NOT a generic failure) when the
    lockfile "version" is a NON-registry spec — `git+…`, `file:`, `link:`, `portal:`,
    `workspace:*`, `catalog:`, or a tarball URL — since those cannot be fetched from
@@ -711,9 +738,11 @@ F. Find in-repo API usage: detect `named-import`, `namespace-import` (`import * 
    alias-only install must NOT match the bare registry name (it would not resolve there).
    Match SUBPATH specifiers by prefix (`<installName>/…`) and map the subpath through the
    package's `exports` map (§5.E); a subpath that is unresolved/private still records
-   usage (with `export_name=''` and lower attribution confidence). For `reexport` and
-   `side-effect-import` there is NO binding, so record `export_name=''` (the usage_type
-   explains the absence — do NOT force a specific export). Map bindable forms back to the
+   usage (with `export_name=''` and lower attribution confidence). For `reexport`,
+   `side-effect-import`, and `namespace-import` (`import * as ns` binds the whole namespace,
+   not one export) there is NO single named export, so record `export_name=''` (the
+   usage_type explains the absence — do NOT force a specific export). Map bindable forms
+   (named-import, default-import, require, dynamic-import) back to the
    step-E export names. Record one usage_findings row per occurrence with exact
    line_number, commit-pinned permalink, trimmed snippet, usage_type, and the resolving
    `dependency_key` (= `package_name` for a direct unaliased install, the alias key for
@@ -729,11 +758,13 @@ G. Find CLI usage (if the package has a bin). Normalize the bin name set: object
    `bun x <specifier-or-bin>` and `pnpm exec`/`yarn exec <bin>`; and BARE `<bin>` tokens
    using WORD-BOUNDARY matching (a bin like `expo` must NOT substring-match `export`).
    Record as usage_findings with usage_type='cli', export_name='' (empty sentinel — NOT
-   NULL, §3), plus location/permalink/snippet.
-H. Upsert `run_unit_head(this run, org, repo, branch, commit_sha=the head just scanned)`,
-   mark work_queue `done`, and proceed. Units SKIPPED as already-current (§3 skip
+   NULL, §3), the `context` column (the script name e.g. `scripts.build`, Dockerfile
+   stage, or file kind), plus location/permalink/snippet.
+H. Upsert `run_unit_head(this run, org, repo, branch, commit_sha=the head just scanned,
+   status='scanned')`, mark work_queue `done`, and proceed. Units SKIPPED as already-current (§3 skip
    predicate) ALSO upsert `run_unit_head` for this run with their unchanged head, so the
-   report for this run includes them without re-scanning.
+   report for this run includes them without re-scanning (also with `status='scanned'` —
+   a current unit is scanned-state, never skipped-cutoff).
 
 ================================================================================
 6. SCRIPT ENGINEERING STANDARDS
@@ -758,7 +789,7 @@ genuinely non-deterministic sub-tasks.
 Entrypoints:
   bun run scripts/orchestrate.ts [--config <path>] [--fresh] [--purge-cache] \
                                  [--rescan-branch <org>/<repo>@<branch>]...   # repeatable
-  bun run scripts/report.ts [--run-id <id>]   # default: latest run's snapshot
+  bun run scripts/report.ts [--run-id <id>]   # default: latest completed run's snapshot
 
 The wrapper module (github.ts) is the ONLY place `Bun.$` touches `gh`/`git`/`tar`;
 each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
@@ -910,35 +941,87 @@ export function assertSpawnAllowed(bin: string, sub?: string) {
 ================================================================================
 7. FINAL OUTPUT (every run)
 ================================================================================
-Run report.ts to emit ONE consolidated JSON at `<outputDir>/run-<run_id>.json` and
-overwrite `<outputDir>/latest.json`, generated deterministically from SQLite alone:
+Run report.ts to emit the consolidated JSON at `<outputDir>/run-<run_id>.json`. The
+DEFAULT report (no `--run-id`) ALSO overwrites `<outputDir>/latest.json` with a byte copy;
+a `report --run-id <historical>` writes ONLY its own `run-<id>.json` and does NOT touch
+latest.json (which must keep tracking the latest run). All output is generated
+deterministically from SQLite
+ALONE. Determinism rules: default to the latest run (by started_at, tie-break run_id DESC)
+that is BOTH `status='completed'` AND has non-empty `tracked_packages` (a reportable live
+run, matching §3); if none exists, emit the "not reportable" notice (§3), never an empty
+full-shape report. `report --run-id
+<id>` joins findings through `run_unit_head` for that run (§3) filtered to
+`runs.tracked_packages`. SORT every emitted array by a TOTAL, stable key so output is
+byte-reproducible: packages by name; versionsSeen by semver PRECEDENCE, then raw version
+STRING lexicographic as a tie-break (so build-metadata variants that compare semver-equal
+still order deterministically); usageByRepo (its units are the UNION of
+dependency-finding and usage-finding units at the snapshot commit — a package can have CLI
+usage with no manifest declaration) by (org, repo, branch, commitSha); its scalar
+`dateFetched` = MAX over BOTH `dependency_findings.date_fetched` AND `usage_findings.found_at`
+for the unit (so a CLI-only unit still has a timestamp; deterministic — one scan pass. All
+timestamps are persisted in ISO-8601 UTC `Z` form, so the lexicographic MAX is also the
+true chronological latest); declarations by (dependencyType, dependencyKey, path,
+line); apiUsage by (file, line, usageType, exportName, dependencyKey); cliUsage by (file,
+line, context); errors by (occurredAt, id). Nested structures too: emit the `apiSurface`
+version KEYS in `versionsSeen` order, each version's `exports` sorted by (kind, name), and
+`cli.binNames` lexicographically. These keys cover every UNIQUE dimension, so SQLite row
+order never leaks in. `apiSurface` is restricted to `versionsSeen` (join
+package_api_surface on package_name AND version IN versionsSeen) — and may legitimately
+OMIT a versionsSeen entry whose version had introspection skipped (a non-registry spec,
+§5.E), so apiSurface keys are a SUBSET of versionsSeen, not a 1:1 map. A run with no findings
+still emits the full shape with empty arrays and a zeroed summary.
 ```jsonc
 {
-  "runId": "...", "generatedAt": "...",
-  "config": { "packages": ["..."], "cutoffDate": "...",
-              "organizations": ["..."],          // the EFFECTIVE owner list this run
-                                                 //   (runs.effective_owners)
-              "organizationsSource": "discovered" /* or "configured" — report.ts maps
-                                                    runs.owners_source to this field */ },
+  "runId": "...",
+  "generatedAt": "...",                          // COALESCE(runs.completed_at, runs.started_at) of
+                                                 //   the reported run — a persisted SQLite value,
+                                                 //   never NULL (completed for the default report;
+                                                 //   started_at fallback for a --run-id running/failed run)
+  "config": { "packages": ["..."],              // runs.tracked_packages
+              "cutoffDate": "...",              // runs.cutoff_date
+              "githubHost": "github.com",       // runs.github_host (also the permalink host)
+              "organizations": ["..."],         // runs.effective_owners
+              "organizationsSource": "discovered" /* runs.owners_source */ },
   "packages": [{
     "name": "@myorg/my-package",
-    "versionsSeen": ["1.2.3","1.3.0"],
-    "apiSurface": { "1.3.0": { "exports": [{"name":"foo","kind":"named"}],
-                               "cli": { "hasCli": true, "binNames": ["my-package"] } } },
+    "versionsSeen": ["1.2.3","1.3.0"],           // DISTINCT dependency_findings.resolved_version
+                                                 //   for this package in the run's slice (excl. NULL)
+    "apiSurface": { "1.3.0": { "exports": [{"name":"foo","kind":"named"}],  // per-version, source-
+                               "cli": { "hasCli": true, "binNames": ["my-package"] } } },  // independent
     "usageByRepo": [{
       "organization":"org-a","repository":"service-x","branch":"main",
       "commitSha":"abc123","dateFetched":"2025-01-15T00:00:00Z",
-      "manifest":{"path":"package.json","line":23,"permalink":"https://github.com/org-a/service-x/blob/abc123/package.json#L23","declaredVersion":"^1.2.3"},
-      "lockfile":{"path":"package-lock.json","lines":[451,452],"permalink":"https://github.com/org-a/service-x/blob/abc123/package-lock.json#L451-L452","resolvedVersion":"1.2.4"},
-      "apiUsage":[{"exportName":"foo","usageType":"named-import","file":"src/index.ts","line":12,"permalink":"...","snippet":"import { foo } from '@myorg/my-package';"}],
+      // a package can be declared in several sections/aliases of one manifest → a LIST:
+      "declarations":[{"dependencyType":"dependencies","dependencyKey":"@myorg/my-package",
+        "path":"package.json","line":23,
+        "permalink":"https://{githubHost}/org-a/service-x/blob/abc123/package.json#L23",
+        "declaredVersion":"^1.2.3",
+        "resolvedVersion":"1.2.4","resolvedVersionSource":"lockfile", // 'lockfile'|'range-resolved'|null
+        "lockfile":{"path":"package-lock.json","lines":[451,452],
+          "permalink":"https://{githubHost}/org-a/service-x/blob/abc123/package-lock.json#L451-L452"}}],
+      "apiUsage":[{"exportName":"foo","dependencyKey":"@myorg/my-package","usageType":"named-import","file":"src/index.ts","line":12,"permalink":"...","snippet":"import { foo } from '@myorg/my-package';"}],
       "cliUsage":[{"file":"package.json","line":8,"context":"scripts.build","permalink":"...","snippet":"\"build\": \"my-package build\""}]
     }]
   }],
-  "errors": [ ... ],
+  "errors": [ ... ],                             // errors WHERE run_id=R, sorted (occurredAt,id)
   "summary": { "organizationsScanned":0,"repositoriesScanned":0,"branchesScanned":0,
                "branchesSkippedByCutoff":0,"totalDependencyFindings":0,"totalUsageFindings":0 }
 }
 ```
+Summary derivation — ALL per-run from the IMMUTABLE `run_unit_head` slice for the reported
+run (NEVER from the mutable work_queue, which is cross-run): `branchesScanned` =
+COUNT(*) WHERE run_id=R AND status='scanned'; `branchesSkippedByCutoff` = COUNT WHERE
+run_id=R AND status='skipped-cutoff'; `repositoriesScanned` =
+COUNT(DISTINCT organization||'/'||repository) and `organizationsScanned` =
+COUNT(DISTINCT organization) — both over run_id=R AND status='scanned' rows (matching
+branchesScanned semantics; a repo/org whose every branch was cutoff-skipped is NOT
+"scanned"), using a `/` separator so `('a','bc')` and `('ab','c')` never collide. Totals
+from the finding tables joined through the same snapshot. `generatedAt` =
+`COALESCE(runs.completed_at, runs.started_at)` — never NULL: §8 marks the run `completed`
+(setting completed_at) BEFORE report.ts, and the default report selects only
+`status='completed'` runs; a `--run-id` on a non-completed (running OR failed) run uses the
+NOT-NULL `started_at`.
+Permalink line anchor: `#L<n>` for a single line, `#L<a>-L<b>` for a range.
 
 ================================================================================
 8. EXECUTION PROTOCOL FOR THIS SESSION
@@ -953,7 +1036,9 @@ overwrite `<outputDir>/latest.json`, generated deterministically from SQLite alo
    rather than rewriting wholesale.
 5. Execute the workflow (§5), using subagents where available (§4), persisting
    continuously to SQLite (§3).
-6. Produce the consolidated JSON (§7).
+6. Mark the run `completed` (setting `runs.completed_at`), THEN produce the
+   consolidated JSON (§7) — so `generatedAt=completed_at` is always populated for the
+   reported run.
 7. Print a concise human-readable summary and output file path(s).
 
 Acceptance checklist — the run is NOT complete until all are true:
@@ -964,7 +1049,9 @@ Acceptance checklist — the run is NOT complete until all are true:
     manifest path+line+permalink, declared version, and (if present) lockfile
     path+line(s)+permalink+resolved version.
 [ ] Every tracked package has an API-surface record per resolved version seen.
-[ ] Every in-repo usage is attributed to a specific named export (or marked CLI).
+[ ] Every in-repo usage is attributed to a specific named export where one exists;
+    usage types with no single binding (side-effect-import, reexport, namespace-import,
+    an unresolved/private subpath) and CLI usage correctly carry export_name=''.
 [ ] Branches processed most-recent-first; none before cutoffDate inspected.
 [ ] SQLite is the source of truth. A second run still performs the cheap discovery
     calls needed to detect change (paginated-REST repo discovery, per-repo branch-head
@@ -972,4 +1059,5 @@ Acceptance checklist — the run is NOT complete until all are true:
     ZERO content re-fetches for already-done units whose head is unchanged: commit-SHA-
     pinned contents URLs are immutable and served from SQLite with no request (a 304
     revalidation would still be a call and is therefore avoided for pinned URLs).
-[ ] Exactly one consolidated JSON file written for this run.
+[ ] Exactly one per-run report file (run-<run_id>.json) written; the default (no
+    --run-id) report additionally overwrites latest.json with a byte copy.
