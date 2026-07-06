@@ -404,9 +404,12 @@ CREATE TABLE IF NOT EXISTS errors (
   run_id TEXT NOT NULL REFERENCES runs(run_id),
   scope TEXT NOT NULL,
   organization TEXT, repository TEXT, branch TEXT,
-  package_name TEXT, version TEXT,     -- SET for per-version introspection errors (§5.E), so the
-                                       -- "apiSurface entry OR current-run errors row" guarantee (§8)
-                                       -- is derivable by (run_id, package_name, version); NULL for
+  package_name TEXT, version TEXT,     -- SET for per-version REGISTRY introspection errors (§5.E),
+                                       -- where version is a concrete semver, so the "apiSurface entry
+                                       -- OR current-run errors row" guarantee (§8) is derivable by
+                                       -- (run_id, package_name, version). For a NON-registry skip
+                                       -- (§5.E) package_name is set and version is the raw NON-semver
+                                       -- resolved spec (git+/file:/workspace:/…). NULL for both on
                                        -- repo/branch/network/auth-scoped errors
   message TEXT NOT NULL,
   occurred_at TEXT NOT NULL
@@ -688,10 +691,16 @@ D. Extract dependency facts: a tracked package "appears" in a manifest when the
    from the descriptor (NOT the first `@`, which mis-splits scoped names like
    `@babel/code-frame@7.10.4`) and matching the remainder — skipping any `npm:` protocol —
    against the manifest's declared RANGE. Take the
-   RESOLVED version from the sibling `version:` field (protocol-agnostic — survives
-   patch:/workspace:/git: resolutions), and use `resolution: "<registryName>@npm:<ver>"`
+   RESOLVED version STRING from the sibling `version:` field (present regardless of
+   protocol), and use `resolution: "<registryName>@npm:<ver>"`
    only to confirm the real NAME — NOT by segmenting the descriptor after `@npm:` (scoped
-   names reintroduce `@`/`/`). pnpm
+   names reintroduce `@`/`/`). CLASSIFY registry-vs-non-registry by the resolution PROTOCOL
+   (the descriptor / `resolution:` protocol), NOT by whether `version:` looks like semver: a
+   `patch:`/`workspace:`/`git:`/`file:`/`link:`/`portal:` resolution is NON-registry (§5.E)
+   even when its `version:` sibling is a semver — record that raw resolved reference as the
+   `dependency_findings.resolved_version`, EXCLUDE it from versionsSeen, and log the
+   package-scoped skip error once (§5.E). Only a registry-backed (`npm:` or plain) resolution
+   contributes an introspectable semver `resolved_version`. pnpm
    (`lockfile_kind='pnpm'`; v5/v6/v9 differ): in the per-manifest
    `importers.<dir>.{dependencies,devDependencies,optionalDependencies}` edge, the newer
    OBJECT form is `<dependency_key>: {specifier:<declared range>, version:<resolved key>}`
