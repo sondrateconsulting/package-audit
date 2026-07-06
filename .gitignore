@@ -1,0 +1,12 @@
+# Local session / scratch artifacts
+.context/
+
+# Node / Bun
+node_modules/
+
+# Tool runtime outputs (created by orchestrate.ts / report.ts)
+/output/
+/data/
+
+# OS
+.DS_Store

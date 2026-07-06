@@ -13,6 +13,7 @@
     ],
     "githubHost": "github.com",
     "includeArchived": false,
+    "includeForks": false,
     "maxBranchesPerRepo": 25,
     "maxReposPerOrg": null,
     "organizations": null,

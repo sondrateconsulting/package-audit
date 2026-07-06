@@ -76,6 +76,8 @@ below).
   "excludeOrganizations": [],          // optional; removed from the effective list
   "includePersonalNamespace": false,   // opt-in: also scan the authenticated user's
                                        //   own repos (not an org, so off by default)
+  "includeForks": false,               // opt-in: include forked repos (excluded by default
+                                       //   so a package's own forks don't double-count, §5.A)
   "packages": [
     {
       "name": "@myorg/my-package",     // the npm REGISTRY name — the single canonical
@@ -108,10 +110,12 @@ and unambiguously marks a pre-migration, not-per-run-reportable run.)
 Effective owner resolution (normative — EVERY run, BOTH modes):
 1. Base set: the explicit `organizations` allowlist if configured
    (`owners_source='configured'`); otherwise DISCOVER org memberships
-   (`owners_source='discovered'`) via
-   `gh api "user/orgs?per_page=100" --paginate --jq '.[].login'`
-   (requires the `read:org` scope; a stock `gh auth login` grants it — if missing,
-   remediate with `gh auth refresh -h <githubHost> -s read:org`).
+   (`owners_source='discovered'`) by enumerating `user/orgs?per_page=100` through the §4
+   gh wrapper (TypeScript pagination via the `Link` header with per-page `gh api -i` so it
+   participates in the same rate-limit/throttle handling as repo/branch discovery — NOT a
+   raw `--paginate --jq`), taking each org's `.login` (requires the `read:org` scope; a
+   stock `gh auth login` grants it — if missing, remediate with
+   `gh auth refresh -h <githubHost> -s read:org`).
 2. If `includePersonalNamespace` is true, append the personal login
    (`gh api user --jq .login`) — in BOTH modes.
 3. Subtract `excludeOrganizations` (BOTH modes), de-duplicate, sort
@@ -211,8 +215,9 @@ which gains two NOT NULL columns, also requires the rebuild — backfill legacy 
 url/etag/response_body/cached_at; this keeps the `--fresh`-preserves-api_cache guarantee
 intact), use the sanctioned rebuild instead: CREATE the new-shape table
 under a temporary name, `INSERT ... SELECT` the old rows (backfilling new columns:
-dependency_key := package_name; usage_findings.dependency_key := '' and
-`COALESCE(export_name,'')`; for work_queue, config_hash from a join to `runs`,
+dependency_key := package_name; usage_findings.dependency_key := '',
+`COALESCE(export_name,'')`, and context := ''; dependency_findings.resolved_version_source
+:= NULL; for work_queue, config_hash from a join to `runs`,
 created_run_id = last_run_id = old run_id, and `COALESCE(col,'')` for the new sentinel
 columns), DROP the old table, RENAME — then bump user_version. Dedup rule: adding a column TO an
 existing UNIQUE key makes it LOOSER (dependency_findings gaining `dependency_type` needs
@@ -241,12 +246,16 @@ current-config completed work), a deterministic `started_at` = the earliest time
 that run_id's rows across ANY table (work_queue.updated_at, dependency_findings.date_fetched,
 usage_findings.found_at, errors.occurred_at), else the migration timestamp, and
 `status='failed'`. Then the new FK does not reject any copy. Ordering within the
-migration transaction: run the additive `runs` ALTERs (effective_owners, owners_source,
-tracked_packages, cutoff_date, github_host — all NOT NULL with DEFAULTs), the additive
-nullable `usage_findings.context` and `dependency_findings.resolved_version_source`
-ALTERs, and the additive `run_unit_head.status` (NOT NULL DEFAULT 'scanned') ALTER FIRST,
-so synthesized orphan `runs` rows acquire `tracked_packages='[]'` via the column DEFAULT,
-before any FK-bearing copy. (`run_unit_head.commit_sha` was already NOT NULL in the prior
+migration transaction: run the additive ALTERs on tables that are NOT rebuilt FIRST — the
+`runs` ALTERs (effective_owners, owners_source, tracked_packages, cutoff_date, github_host
+— all NOT NULL with DEFAULTs), `package_api_surface.version_source` (NOT NULL DEFAULT
+'lockfile', satisfying its CHECK), and `run_unit_head.status` (NOT NULL DEFAULT 'scanned')
+— so synthesized orphan `runs` rows acquire `tracked_packages='[]'` via the column DEFAULT,
+before any FK-bearing copy. Do NOT ALTER-add `usage_findings.context` or
+`dependency_findings.resolved_version_source`: those two tables are REBUILT (they need the
+new `run_id` FK), so their new columns arrive via the rebuild's new-shape `CREATE`, and a
+separate ALTER would either mutate the doomed old table or abort with "duplicate column
+name". (`run_unit_head.commit_sha` was already NOT NULL in the prior
 schema; SQLite cannot retro-add a DEFAULT to an existing column via ALTER, but this is
 immaterial — skipped-cutoff inserts always pass `commit_sha=''` explicitly, and the
 DEFAULT only matters for fresh `CREATE TABLE`.) `runs.tracked_packages` is NOT reconstructed for pre-existing runs. It is persisted
@@ -351,11 +360,12 @@ CREATE TABLE IF NOT EXISTS usage_findings (
                                        -- aliased install); '' only for CLI/unattributable usage
   usage_type TEXT NOT NULL,            -- 'named-import'|'default-import'|'namespace-import'|'require'|'dynamic-import'|'reexport'|'side-effect-import'|'cli'
   export_name TEXT NOT NULL DEFAULT '', -- '' (not NULL — NULLs don't dedupe) when usage_type='cli' or unattributable
-  context TEXT,                        -- CLI only: the script name / Dockerfile stage / etc; NULL for imports.
-                                       -- functionally determined by (file_path,line_number), so NOT in the UNIQUE
+  context TEXT NOT NULL DEFAULT '',     -- CLI only: the script name / Dockerfile stage / etc; '' for
+                                       -- imports. In the UNIQUE so two CLI invocations on ONE line
+                                       -- ("a":"expo build","b":"expo test") don't collapse
   file_path TEXT NOT NULL, line_number INTEGER NOT NULL,
   permalink TEXT NOT NULL, snippet TEXT NOT NULL, found_at TEXT NOT NULL,
-  UNIQUE(organization, repository, branch, commit_sha, package_name, dependency_key, usage_type, file_path, line_number, export_name)
+  UNIQUE(organization, repository, branch, commit_sha, package_name, dependency_key, usage_type, file_path, line_number, export_name, context)
 );
 -- immutable per-run snapshot: the head commit each run REPORTED for each unit.
 -- report.ts joins findings through this (not the mutable work_queue.last_commit_sha),
@@ -549,7 +559,7 @@ A. Resolve the effective owner list per the NORMATIVE algorithm in §1 (base set
    `Link: rel="next"` until absent, accumulating the repo objects into one flat list.
    Then, in TypeScript: filter out `archived` when `includeArchived=false` (the REST
    endpoints have no server-side archived filter) and forks per policy (exclude by default
-   so a package's own forks don't double-count; a config flag may opt in), SORT by
+   so a package's own forks don't double-count; `includeForks: true` opts in), SORT by
    `pushed_at` DESC (nulls last), and TAKE the first N when maxReposPerOrg is finite (all
    when null). The REST shape is snake_case (`pushed_at`, `archived`, `fork`,
    `default_branch` as a flat STRING) — map it into the one internal shape the rest of the
@@ -618,9 +628,11 @@ D. Extract dependency facts: a tracked package "appears" in a manifest when the
    package (dependency_type `overrides`/`resolutions`); these change RESOLUTION, not
    declaration, so record them as findings ONLY when the package is also declared or
    (best-effort — no full lock-tree walk required) pulled transitively; never as a
-   standalone "appearance". `bundledDependencies` is
-   metadata (a name list, not a version pin) — record its presence but it does not by
-   itself resolve a version. For each finding record the exact declared version and the
+   standalone "appearance". `bundledDependencies` is NOT
+   a separate finding: it is a name list naming a SUBSET of the already-declared
+   dependencies, so a tracked package that is bundled already appears via its normal
+   `dependencies`/etc. declaration — do not synthesize a standalone finding (or a
+   dependency_type) for it. For each finding record the exact declared version and the
    1-based line number (parse JSON with line tracking — do not assume formatting; note
    some tool-context package.json files use JSON5/JSONC). Build a COMMIT-SHA-pinned
    permalink `https://{host}/{org}/{repo}/blob/{commit_sha}/{path}#L{line}` (never
@@ -732,10 +744,19 @@ E. Introspect API surface — ONCE per unique (package_name, resolved_version). 
 F. Find in-repo API usage: detect `named-import`, `namespace-import` (`import * as`),
    `default-import`, `require(...)` (incl. destructured), `dynamic-import` (`import(...)`),
    `reexport` (`export … from 'pkg'`), and `side-effect-import` (`import 'pkg'`). Match
-   module specifiers against the owning manifest's INSTALL-NAME set from step D: exactly
+   module specifiers against the OWNING MANIFEST's INSTALL-NAME set from step D: exactly
    the dependency KEYS whose values resolve to the tracked package — alias keys, plus the
    registry name ONLY when the manifest declares it under its own (unshadowed) name. An
    alias-only install must NOT match the bare registry name (it would not resolve there).
+   The OWNING MANIFEST of a source file is resolved by walking UP the directory tree from
+   the file's location to the repo root and taking the NEAREST-ANCESTOR package.json (a
+   step-C manifest) whose INSTALL-NAME set contains a key resolving to the tracked package;
+   if that nearest ancestor declares none, continue upward (workspace hoisting means a
+   dependency declared only at the root — or an intermediate workspace root — still
+   resolves for a nested file). A file whose ENTIRE ancestor chain, up to and including the
+   repo-root manifest, declares no resolving key does NOT resolve to the tracked package and
+   records NO usage. The resolving manifest fixes the `dependency_key` attributed to every
+   occurrence in that file.
    Match SUBPATH specifiers by prefix (`<installName>/…`) and map the subpath through the
    package's `exports` map (§5.E); a subpath that is unresolved/private still records
    usage (with `export_name=''` and lower attribution confidence). For `reexport`,
@@ -749,14 +770,23 @@ F. Find in-repo API usage: detect `named-import`, `namespace-import` (`import * 
    an aliased one; never '' for an import — '' is reserved for CLI usage, §5.G). Prefer
    Bun.Transpiler for lightweight import scanning; only reach
    for `typescript` if regex/native scanning is materially unreliable.
-G. Find CLI usage (if the package has a bin). Normalize the bin name set: object-form
-   `bin` uses its keys; STRING-form `bin` ("bin":"./cli.js") is named after the UNSCOPED
-   package name (`@scope/pkg` → `pkg`). The search-term set is `binNames ∪ {name,
-   unscoped-name}` because `npx`/`dlx`/`bun x` invoke by PACKAGE SPECIFIER (`npx @scope/pkg`)
-   as well as by bin. Search package.json#scripts, `*.sh`, `.github/workflows/**`,
-   Makefiles, AND Dockerfiles for: runner invocations `npx`/`bunx`/`pnpm dlx`/`yarn dlx`/
-   `bun x <specifier-or-bin>` and `pnpm exec`/`yarn exec <bin>`; and BARE `<bin>` tokens
-   using WORD-BOUNDARY matching (a bin like `expo` must NOT substring-match `export`).
+G. Find CLI usage via TWO distinct term sets. (1) SPECIFIER terms — ALWAYS run, needing
+   NO introspected metadata: exactly `{name}` (the config package specifier, scoped or
+   not). Search runner invocations `npx`/`bunx`/`pnpm dlx`/`yarn dlx`/`bun x <name>`
+   (this covers a CLI-only package invoked with no manifest declaration, §7's usageByRepo
+   union). For an UNSCOPED `name` ONLY, ALSO search `pnpm exec`/`yarn exec <name>` and
+   BARE `<name>` tokens — an unscoped package's bin conventionally equals its name, so the
+   bare name is a safe term; a SCOPED package's unscoped tail (`@scope/pkg` → `pkg`) is
+   NOT a specifier and is NEVER searched here (it would false-match an unrelated `pkg`).
+   (2) BIN terms — run ADDITIONALLY only when introspection (§5.E) yielded bin names; this
+   is the ONLY path by which a non-`name` token (including a scoped package's unscoped
+   tail) becomes a search term, because a bin token is trustworthy only once metadata
+   establishes it. Normalize the bin set: object-form `bin` uses its keys; STRING-form
+   `bin` ("bin":"./cli.js") is named after the UNSCOPED package name (`@scope/pkg` →
+   `pkg`). For each `binName`, search `npx`/`bunx`/`pnpm dlx`/`yarn dlx`/`bun x <binName>`,
+   `pnpm exec`/`yarn exec <binName>`, and BARE `<binName>` tokens. ALL bare-token matching
+   uses WORD-BOUNDARY matching (a bin like `expo` must NOT substring-match `export`).
+   Search package.json#scripts, `*.sh`, `.github/workflows/**`, Makefiles, AND Dockerfiles.
    Record as usage_findings with usage_type='cli', export_name='' (empty sentinel — NOT
    NULL, §3), the `context` column (the script name e.g. `scripts.build`, Dockerfile
    stage, or file kind), plus location/permalink/snippet.
@@ -810,8 +840,8 @@ graphql -f query='fragment F on T{a} mutation{x}'`, `gh api graphql --input body
 `git push`, `git clone -c core.fsmonitor=x ...`, `git clone -cfoo=baz ...`, `git clone
 -ufoo ...`, `tar -cf ...`, `tar --create ...`, `tar -xzf f.tgz --checkpoint-action=exec=sh`,
 `tar -xf f.tar --use-compress-program=sh`, and any `npm`/`npx`/`yarn`/`pnpm`/`bunx`/`bun
-x` spawn; and that these all PASS (they are the tool's OWN reads): `gh api
-"user/orgs?per_page=100" --paginate --jq '.[].login'`, `gh api -i user`, `gh api -i
+x` spawn; and that these all PASS (they are the tool's OWN reads): `gh api -i
+"user/orgs?per_page=100&page=1"`, `gh api -i user`, `gh api -i
 "orgs/o/repos?per_page=100&page=1&type=sources"`, `gh api -i
 "user/repos?affiliation=owner&per_page=100&page=1"`, `gh api
 repos/o/r/contents/p?ref=sha --jq .content`, `gh api repos/o/r/git/blobs/sha`, `gh api
@@ -952,9 +982,9 @@ run, matching §3); if none exists, emit the "not reportable" notice (§3), neve
 full-shape report. `report --run-id
 <id>` joins findings through `run_unit_head` for that run (§3) filtered to
 `runs.tracked_packages`. SORT every emitted array by a TOTAL, stable key so output is
-byte-reproducible: packages by name; versionsSeen by semver PRECEDENCE, then raw version
-STRING lexicographic as a tie-break (so build-metadata variants that compare semver-equal
-still order deterministically); usageByRepo (its units are the UNION of
+byte-reproducible: packages by name; versionsSeen (all valid semver) by semver PRECEDENCE,
+then raw version STRING lexicographic as a tie-break (so build-metadata variants that
+compare semver-equal still order deterministically); usageByRepo (its units are the UNION of
 dependency-finding and usage-finding units at the snapshot commit — a package can have CLI
 usage with no manifest declaration) by (org, repo, branch, commitSha); its scalar
 `dateFetched` = MAX over BOTH `dependency_findings.date_fetched` AND `usage_findings.found_at`
@@ -984,10 +1014,12 @@ still emits the full shape with empty arrays and a zeroed summary.
               "organizationsSource": "discovered" /* runs.owners_source */ },
   "packages": [{
     "name": "@myorg/my-package",
-    "versionsSeen": ["1.2.3","1.3.0"],           // DISTINCT dependency_findings.resolved_version
-                                                 //   for this package in the run's slice (excl. NULL)
-    "apiSurface": { "1.3.0": { "exports": [{"name":"foo","kind":"named"}],  // per-version, source-
-                               "cli": { "hasCli": true, "binNames": ["my-package"] } } },  // independent
+    "versionsSeen": ["1.2.3","1.3.0"],           // DISTINCT valid-SEMVER
+                                                 //   dependency_findings.resolved_version in the run's
+                                                 //   slice (NULL and non-semver excluded)
+    "apiSurface": { "1.3.0": { "exports": [{"name":"foo","kind":"named"}], // package_api_surface rows
+                                                                          //   WHERE export_kind != 'cli-bin'
+                               "cli": { "hasCli": true, "binNames": ["my-package"] } } }, // export_kind == 'cli-bin'
     "usageByRepo": [{
       "organization":"org-a","repository":"service-x","branch":"main",
       "commitSha":"abc123","dateFetched":"2025-01-15T00:00:00Z",
@@ -1048,7 +1080,10 @@ Acceptance checklist — the run is NOT complete until all are true:
 [ ] Every dependency finding has org, repo, branch, commit SHA, date fetched,
     manifest path+line+permalink, declared version, and (if present) lockfile
     path+line(s)+permalink+resolved version.
-[ ] Every tracked package has an API-surface record per resolved version seen.
+[ ] Every REGISTRY resolved version that was successfully introspected has an
+    API-surface record; a version whose introspection was SKIPPED (non-registry spec) or
+    FAILED (network/parse) has an `errors` row instead — so apiSurface is a subset of
+    versionsSeen (§7), not a 1:1 map.
 [ ] Every in-repo usage is attributed to a specific named export where one exists;
     usage types with no single binding (side-effect-import, reexport, namespace-import,
     an unresolved/private subpath) and CLI usage correctly carry export_name=''.
