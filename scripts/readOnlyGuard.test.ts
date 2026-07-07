@@ -44,9 +44,28 @@ describe("assertReadOnlyGh — spec PASS vectors (tool's own reads)", () => {
     ["api", "rate_limit"],
     ["repo", "list"],
     ["auth", "status"],
+    ["auth", "status", "--hostname", "github.com"], // the sole permitted trailing form
     ["--version"],
   ];
   for (const args of good) test(args.join(" "), () => ok(() => assertReadOnlyGh(args)));
+});
+
+describe("assertReadOnlyGh — token-disclosure / host-override hardening", () => {
+  test("gh auth status --show-token is rejected (§2: never print tokens)", () =>
+    throws(() => assertReadOnlyGh(["auth", "status", "--show-token"])));
+  test("gh auth status -t is rejected", () => throws(() => assertReadOnlyGh(["auth", "status", "-t"])));
+  test("gh api --hostname <other> is rejected (overrides the GH_HOST pin)", () =>
+    throws(() => assertReadOnlyGh(["api", "--hostname", "evil.example", "user"])));
+  test("gh api --hostname=<other> is rejected", () =>
+    throws(() => assertReadOnlyGh(["api", "--hostname=evil.example", "user"])));
+  test("gh auth status --hostname --show-token (flag-as-value) is rejected", () =>
+    throws(() => assertReadOnlyGh(["auth", "status", "--hostname", "--show-token"])));
+  test("gh auth status --hostname with no value is rejected", () =>
+    throws(() => assertReadOnlyGh(["auth", "status", "--hostname"])));
+  test("gh auth status --hostname host --show-token (extra trailing) is rejected", () =>
+    throws(() => assertReadOnlyGh(["auth", "status", "--hostname", "github.com", "--show-token"])));
+  test("gh auth status --hostname=host (attached form) is rejected — tool only emits the separate form", () =>
+    throws(() => assertReadOnlyGh(["auth", "status", "--hostname=github.com"])));
 });
 
 describe("assertReadOnlyGh — extra bypass vectors", () => {

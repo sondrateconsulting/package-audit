@@ -104,6 +104,9 @@ export function assertReadOnlyGh(rawArgs: string[]): void {
       // --cache writes gh's response cache to disk OUTSIDE the §0 contained write roots; the
       // tool caches in SQLite (api_cache) instead and never passes --cache (§3).
       if (a === "--cache") deny("gh api --cache (writes a local cache outside contained roots)");
+      // --hostname on `gh api` OVERRIDES the GH_HOST pin (§6), redirecting a token-bearing
+      // request to an arbitrary host. The tool relies on GH_HOST env exclusively — deny it.
+      if (a === "--hostname") deny("gh api --hostname (overrides the GH_HOST pin)");
     }
     if (isGraphql) assertGraphqlQueryIsReadOnly(rest);
     return;
@@ -115,6 +118,21 @@ export function assertReadOnlyGh(rawArgs: string[]): void {
   const OK_TUPLES = new Set(["repo list", "auth status"]);
   const OK_BARE = new Set(["--version"]);
   if (!OK_TUPLES.has(tuple) && !OK_BARE.has(sub)) deny(`gh ${args.join(" ")}`);
+
+  // `auth status` accepts token-DISCLOSURE flags (`--show-token`/`-t`) on modern gh (§2 says
+  // never print tokens), so its trailing args must be EXACTLY nothing or `--hostname <host>`
+  // with a concrete host value. Any other shape — `--show-token`/`-t`, a bare `--hostname`
+  // with no value, or `--hostname --show-token` (flag-as-value) — is refused.
+  if (tuple === "auth status") {
+    // Validate the RAW (pre-canon) trailing args: the tool only ever emits the separate
+    // `--hostname <host>` form, so the attached `--hostname=<host>` form is rejected too —
+    // keeping the grammar exact and consistent with the `gh api --hostname` denial above.
+    const extra = rawArgs.slice(2);
+    if (extra.length === 0) return;
+    const host = extra[1] ?? "";
+    if (extra.length !== 2 || extra[0] !== "--hostname" || host === "" || host.startsWith("-"))
+      deny(`gh auth status trailing args ${extra.join(" ")}`);
+  }
 }
 
 // Validate a gh api endpoint path: reject percent-encoded separators and `.`/`..`
