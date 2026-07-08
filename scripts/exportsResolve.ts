@@ -105,6 +105,23 @@ export function resolveSubpath(pkg: PkgJson, subpath: string): SubpathResolution
   return { targets, resolved: targets.length > 0 };
 }
 
+// The declared subpath KEYS in `exports` (excluding the root '.'), split into exact keys and
+// '*'-pattern keys. Used by apiSurface to enumerate the FULL public type surface (§5.E), not
+// just the root — a package's `./config` etc. exports are part of its surface.
+export function exportsSubpathKeys(pkg: PkgJson): { exact: string[]; patterns: string[] } {
+  const exports = pkg["exports"];
+  if (exports === null || typeof exports !== "object" || Array.isArray(exports)) return { exact: [], patterns: [] };
+  const map = exports as Record<string, unknown>;
+  if (!isSubpathMap(map)) return { exact: [], patterns: [] };
+  const exact: string[] = [];
+  const patterns: string[] = [];
+  for (const key of Object.keys(map)) {
+    if (key === ".") continue;
+    (key.includes("*") ? patterns : exact).push(key);
+  }
+  return { exact, patterns };
+}
+
 // The ROOT type-surface targets (union of both modes). Falls back, ONLY when `exports` is
 // ABSENT, to typesVersions remap → types/typings → index.d.ts (§5.E: TS ignores typesVersions
 // once exports is present).

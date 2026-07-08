@@ -1,5 +1,5 @@
 import { expect, test, describe } from "bun:test";
-import { resolveSubpath, resolveTypeTargets, typeTargetToDts, binNames } from "./exportsResolve.ts";
+import { resolveSubpath, resolveTypeTargets, typeTargetToDts, binNames, exportsSubpathKeys } from "./exportsResolve.ts";
 
 describe("resolveTypeTargets — root type surface (§5.E)", () => {
   test("string exports sugar (root only)", () => {
@@ -90,6 +90,22 @@ describe("resolveSubpath — subpath mapping (§5.F)", () => {
   });
   test("no exports field → unresolved (caller uses the legacy fallback for root)", () => {
     expect(resolveSubpath({ types: "./index.d.ts" }, ".").resolved).toBe(false);
+  });
+});
+
+describe("exportsSubpathKeys — declared subpath enumeration (§5.E full surface)", () => {
+  test("splits exact keys from '*'-pattern keys, excluding the root", () => {
+    const pkg = { exports: { ".": "./index.js", "./config": "./config.js", "./features/*": "./features/*.js" } };
+    expect(exportsSubpathKeys(pkg)).toEqual({ exact: ["./config"], patterns: ["./features/*"] });
+  });
+  test("a bare conditions object (no subpath map) yields nothing", () => {
+    expect(exportsSubpathKeys({ exports: { types: "./index.d.ts", import: "./index.mjs" } })).toEqual({ exact: [], patterns: [] });
+  });
+  test("absent/string/array/null exports yield nothing", () => {
+    expect(exportsSubpathKeys({})).toEqual({ exact: [], patterns: [] });
+    expect(exportsSubpathKeys({ exports: "./index.js" })).toEqual({ exact: [], patterns: [] });
+    expect(exportsSubpathKeys({ exports: ["./a.js"] })).toEqual({ exact: [], patterns: [] });
+    expect(exportsSubpathKeys({ exports: null })).toEqual({ exact: [], patterns: [] });
   });
 });
 
