@@ -62,6 +62,40 @@ const depFinding = (db: AuditDb, overrides: Record<string, unknown> = {}) =>
     ...overrides,
   } as Parameters<AuditDb["upsertDependencyFinding"]>[0]);
 
+describe("setRangeResolvedVersion (§5.E write-back)", () => {
+  const key = {
+    organization: "org-a", repository: "repo", branch: "main", commitSha: "abc123",
+    packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies" as const, manifestPath: "package.json",
+  };
+  test("writes a version onto a NULL-resolved row and marks it range-resolved", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    depFinding(db); // resolved_version defaults to null
+    expect(db.setRangeResolvedVersion(key, "50.0.7")).toBe(true);
+    const row = db.read(`SELECT resolved_version, resolved_version_source FROM dependency_findings`).get() as { resolved_version: string; resolved_version_source: string };
+    expect(row).toEqual({ resolved_version: "50.0.7", resolved_version_source: "range-resolved" });
+    db.close();
+  });
+  test("NEVER clobbers a lockfile-resolved row", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    depFinding(db, { resolvedVersion: "50.0.0", resolvedVersionSource: "lockfile" });
+    expect(db.setRangeResolvedVersion(key, "99.9.9")).toBe(false); // guarded by resolved_version IS NULL
+    const row = db.read(`SELECT resolved_version, resolved_version_source FROM dependency_findings`).get() as { resolved_version: string; resolved_version_source: string };
+    expect(row).toEqual({ resolved_version: "50.0.0", resolved_version_source: "lockfile" });
+    db.close();
+  });
+  test("does NOT range-resolve a row with a GOVERNING lockfile that left it unresolved (peer)", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    depFinding(db, { lockfilePath: "package-lock.json", lockfileKind: "npm" }); // resolved_version stays null
+    expect(db.setRangeResolvedVersion(key, "50.0.7")).toBe(false); // guarded by lockfile_path IS NULL
+    const row = db.read(`SELECT resolved_version FROM dependency_findings`).get() as { resolved_version: string | null };
+    expect(row.resolved_version).toBeNull();
+    db.close();
+  });
+});
+
 describe("open — fresh create", () => {
   test("creates the full schema at SCHEMA_VERSION with WAL + FK on", () => {
     const db = AuditDb.open({ sqlitePath: nextFile() });

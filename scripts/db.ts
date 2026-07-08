@@ -127,6 +127,17 @@ export interface DependencyFindingInput {
   resolvedVersionSource?: ResolvedVersionSource | null;
 }
 
+export interface RangeResolveKey {
+  organization: string;
+  repository: string;
+  branch: string;
+  commitSha: string;
+  packageName: string;
+  dependencyKey: string;
+  dependencyType: DependencyType;
+  manifestPath: string;
+}
+
 export interface UsageFindingInput {
   runId: string;
   organization: string;
@@ -710,6 +721,28 @@ export class AuditDb {
         f.lockfileLines === undefined || f.lockfileLines === null ? null : JSON.stringify(f.lockfileLines),
         f.lockfilePermalink ?? null, f.resolvedVersion ?? null, f.resolvedVersionSource ?? null,
       );
+  }
+
+  // §5.E range-resolution write-back: for a repo that committed NO lockfile, the orchestrator
+  // resolves the declared range against the packument (max-satisfying) and records that concrete
+  // version on the dependency finding so the report can attribute a per-repo version. GUARDED by
+  // `resolved_version IS NULL` so it NEVER clobbers a lockfile-resolved row (whose resolution is
+  // authoritative). Returns true when a row was updated.
+  setRangeResolvedVersion(key: RangeResolveKey, version: string): boolean {
+    const res = this.db
+      .query(
+        `UPDATE dependency_findings
+           SET resolved_version = ?, resolved_version_source = 'range-resolved'
+         WHERE organization = ? AND repository = ? AND branch = ? AND commit_sha = ?
+           AND package_name = ? AND dependency_key = ? AND dependency_type = ? AND manifest_path = ?
+           AND resolved_version IS NULL AND resolved_version_source IS NULL
+           AND lockfile_path IS NULL`,
+      )
+      .run(
+        version, key.organization, key.repository, key.branch, key.commitSha,
+        key.packageName, key.dependencyKey, key.dependencyType, key.manifestPath,
+      );
+    return res.changes > 0;
   }
 
   upsertUsageFinding(f: UsageFindingInput): void {
