@@ -1,0 +1,47 @@
+# Static security audit of GitHub Actions workflows with zizmor (https://zizmor.sh), via
+# the official zizmor-action (https://docs.zizmor.sh/integrations/#github-actions).
+#
+# Primary purpose: enforce that every `uses:` action is pinned to a full commit SHA (policy in
+# .github/zizmor.yml, auto-discovered). zizmor also flags template injection, excessive permissions,
+# cache poisoning, dangerous triggers, and known-vulnerable actions.
+#
+# `advanced-security: false` because this repo is PRIVATE without GitHub Advanced Security. With the default
+# (advanced-security: true) the action uploads SARIF to code scanning — which errors here without GHAS — and
+# SARIF mode always exits 0, so findings would never fail the job. With it off, the action runs zizmor in
+# fail-on-findings mode, so an unpinned or unsafe action blocks the job, and findings surface as inline
+# annotations. When the repo goes public (and code scanning is available), flip to `advanced-security: true`.
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read # zizmor's online audits resolve actions via the API (needed for a private repo)
+
+concurrency:
+  # PRs coalesce by ref: a newer push cancels the superseded run, since only the
+  # latest commit gates the merge. main and workflow_dispatch instead get a
+  # per-commit group (the github.sha suffix), so a security-gate scan is never
+  # cancelled — nor dropped as a superseded *pending* run — by a later push; every
+  # commit is audited to completion. ('pr' is a truthy constant, avoiding the
+  # empty-string falsy pitfall in GitHub's `a && b || c` ternary.)
+  group: security-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  workflows:
+    name: workflow audit + pin enforcement
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
+        with:
+          version: 1.26.1          # pin the zizmor CLI (the action defaults to "latest"); 1.26.1 is the action v0.5.7 default
+          advanced-security: false # private repo w/o GHAS: fail the job on findings instead of uploading SARIF
+          annotations: true        # surface findings as inline GitHub annotations

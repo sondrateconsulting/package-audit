@@ -1,0 +1,45 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    assignees:
+      - sondrateconsulting-ryan
+    cooldown:
+      default-days: 7
+      include:
+        - '*'
+    commit-message:
+      prefix: ci-cd
+    directory: /
+    labels:
+      - bot
+      - bot-dependabot
+      - github-actions
+    open-pull-requests-limit: 25
+    schedule:
+      interval: weekly
+      day: wednesday
+      time: '07:00'
+      timezone: Etc/UTC
+
+  - package-ecosystem: bun
+    assignees:
+      - sondrateconsulting-ryan
+    cooldown:
+      default-days: 7
+      include:
+        - '*'
+    commit-message:
+      prefix: deps
+    directory: /
+
+    labels:
+      - bot
+      - bot-dependabot
+      - bun
+    open-pull-requests-limit: 25
+    schedule:
+      interval: weekly
+      day: wednesday
+      time: '07:00'
+      timezone: Etc/UTC
