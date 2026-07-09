@@ -1,5 +1,5 @@
 // report.ts — §7 consolidated report, generated DETERMINISTICALLY from SQLite ALONE. Entry point:
-//   bun run scripts/report.ts [--run-id <id>]
+//   bun run scripts/report.ts [--config <path>] [--run-id <id>]
 // Default (no --run-id): the latest COMPLETED run with non-empty tracked_packages; also overwrites
 // <outputDir>/latest.json. A --run-id writes ONLY <outputDir>/run-<id>.json (never latest.json).
 // Findings are joined through the IMMUTABLE run_unit_head snapshot (never findings.run_id) filtered
@@ -12,6 +12,8 @@ import { loadConfig } from "./config.ts";
 import { AuditDb, type RunRecord } from "./db.ts";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
+import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
+import { renderFatal } from "./cliErrors.ts";
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -188,7 +190,12 @@ export function emitReport(db: AuditDb, run: RunRecord, outputDir: string, opts:
 // ---- entry point ----------------------------------------------------------------------------
 async function main(): Promise<void> {
   const argv = Bun.argv.slice(2);
-  const runIdArg = getRunIdArg(argv);
+  const rargs = parseReportArgs(argv); // strict: unknown flags / valueless --run-id are rejected
+  if (rargs.help) {
+    process.stdout.write(REPORT_HELP + "\n");
+    return;
+  }
+  const runIdArg = rargs.runId;
   const { config } = await loadConfig(argv);
   const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath });
   try {
@@ -211,15 +218,6 @@ async function main(): Promise<void> {
   }
 }
 
-function getRunIdArg(argv: string[]): string | null {
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!;
-    if (a === "--run-id") return argv[i + 1] ?? null;
-    if (a.startsWith("--run-id=")) return a.slice("--run-id=".length);
-  }
-  return null;
-}
-
 function writeJson(path: string, outputDir: string, value: unknown): void {
   assertContained(path, [outputDir]); // §0 write containment
   Bun.write(path, JSON.stringify(value, null, 2) + "\n");
@@ -227,7 +225,7 @@ function writeJson(path: string, outputDir: string, value: unknown): void {
 
 if (import.meta.main) {
   main().catch((e) => {
-    process.stderr.write(`report failed: ${(e as Error).stack ?? (e as Error).message}\n`);
+    process.stderr.write(renderFatal(e, { command: "report", usage: REPORT_USAGE }));
     process.exit(1);
   });
 }

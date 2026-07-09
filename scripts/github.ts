@@ -590,7 +590,11 @@ export class GithubClient {
       const dest = positionals[1] ?? "";
       assertContained(dest, [this.tempRoot]);
     }
-    const env = buildGitEnv(this.baseEnv, this.ensureGitConfig());
+    // The `--version` probe (§2 preflight — also --plan's ONLY git invocation) needs no
+    // credential helper: point its global config at devNull instead of materializing the temp
+    // gitconfig, so plan mode truly writes nothing and leaks no pkg-audit-gitcfg-* dir.
+    const isVersionProbe = args.length === 1 && args[0] === "--version";
+    const env = buildGitEnv(this.baseEnv, isVersionProbe ? devNull : this.ensureGitConfig());
     return this.spawn(this.bins.git, args, { env, cwd });
   }
 

@@ -1,7 +1,7 @@
 import { expect, test, describe, afterAll } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, devNull } from "node:os";
 import { join } from "node:path";
 import {
   GithubClient, GithubApiError, ThrottleExhausted,
@@ -573,6 +573,26 @@ describe("hardened clone (§0/§5.C)", () => {
       ]),
     ).rejects.toThrow(ReadOnlyViolation);
     expect(calls.length).toBe(0);
+  });
+  test("git --version probe writes NOTHING: no temp gitconfig materialized, global config pinned to devNull", async () => {
+    const root = mkdtempSync(join(tmpdir(), "gitver-test-"));
+    const { client, calls } = makeClient([ok("git version 2.45.1\n")], { tempRoot: root });
+    const res = await client.git(["--version"]);
+    expect(res.stdout).toContain("2.45.1");
+    // --plan's only git invocation must not leak a pkg-audit-gitcfg-* dir (plan mode never sweeps)
+    expect(readdirSync(root)).toEqual([]);
+    expect(calls[0]!.opts.env["GIT_CONFIG_GLOBAL"]).toBe(devNull);
+    expect(calls[0]!.opts.env["GIT_CONFIG_NOSYSTEM"]).toBe("1");
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("a non-version git call still materializes the pinned credential-helper gitconfig", async () => {
+    const root = mkdtempSync(join(tmpdir(), "gitcfg-test-"));
+    const { client, calls } = makeClient([ok("abc123\n")], { tempRoot: root });
+    await client.git(["rev-parse", "HEAD"], undefined);
+    const cfgPath = calls[0]!.opts.env["GIT_CONFIG_GLOBAL"]!;
+    expect(cfgPath.startsWith(root)).toBe(true);
+    expect(readFileSync(cfgPath, "utf8")).toContain("auth git-credential");
+    rmSync(root, { recursive: true, force: true });
   });
 });
 

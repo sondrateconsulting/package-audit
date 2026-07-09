@@ -1,6 +1,6 @@
 // orchestrate.ts — the single-writer coordinator (§5, §8). Entry point:
-//   bun run scripts/orchestrate.ts [--config <path>] [--fresh] [--purge-cache] \
-//                                  [--rescan-branch <org>/<repo>@<branch>]...
+//   bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
+//                                  [--rescan-branch <org>/<repo>@<branch>]... [--help]
 // Flow (§8): restate config → preflight (§2) → resolve effective owners (§1) → start/resume run
 // (§3) → discover repos+branches and process each branch unit (§5.A-H) → reconcile introspection
 // (§5.E) → BIN-term CLI pass (§5.G) → mark run completed. ALL SQLite writes happen HERE (single
@@ -13,9 +13,10 @@ import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { GithubClient, filterSortCapRepos, type RepoInfo, type BranchHead } from "./github.ts";
 import { assertContained } from "./readOnlyGuard.ts";
-import { parseArgs, type OrchestrateArgs } from "./args.ts";
+import { parseArgs, ORCHESTRATE_HELP, ORCHESTRATE_USAGE, type OrchestrateArgs } from "./args.ts";
+import { renderFatal } from "./cliErrors.ts";
 import { runPreflight } from "./preflight.ts";
-import { resolveEffectiveOwners } from "./ownerResolve.ts";
+import { resolveEffectiveOwners, type OwnersSource } from "./ownerResolve.ts";
 import { scanUnit, type TreeEntry, type UnitLocation } from "./unitPipeline.ts";
 import { parseSemver, maxSatisfying } from "./semver.ts";
 import { parseAlias, type DependencyType } from "./manifest.ts";
@@ -90,16 +91,27 @@ function walkClone(root: string): TreeEntry[] {
 async function main(): Promise<void> {
   const argv = Bun.argv.slice(2);
   const args: OrchestrateArgs = parseArgs(argv);
+  if (args.help) {
+    process.stdout.write(ORCHESTRATE_HELP + "\n");
+    return;
+  }
   const { config, configHash } = await loadConfig(argv);
   const trackedNames = config.packages.map((p) => p.name);
 
-  logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh });
+  logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
 
   // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
   // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls).
   const preflightClient = new GithubClient({ githubHost: config.githubHost });
   const preflight = await runPreflight(preflightClient, config);
   logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
+
+  // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
+  // this point in plan mode is read-only discovery through a CACHE-LESS client.
+  if (args.plan) {
+    await runPlan(config, preflight.githubLogin);
+    return;
+  }
 
   // Only AFTER preflight passes do we touch the database (open/migrate/--fresh) and build the
   // caching client for the scan.
@@ -111,15 +123,7 @@ async function main(): Promise<void> {
     client.sweepStaleTempDirs();
 
     // §1 effective owner resolution (discovery runs every invocation).
-    const discoveredOrgs = config.organizations === null ? await client.listOrgMemberships() : [];
-    const { owners, source } = resolveEffectiveOwners({
-      organizations: config.organizations,
-      excludeOrganizations: config.excludeOrganizations,
-      includePersonalNamespace: config.includePersonalNamespace,
-      discoveredOrgs,
-      personalLogin: config.includePersonalNamespace ? preflight.githubLogin : null,
-    });
-    logLine({ event: "owners", owners, source });
+    const { owners, source } = await resolveOwners(client, config, preflight.githubLogin);
 
     // §3 run lifecycle: start or resume.
     const { runId, resumed } = db.startRun({
@@ -177,6 +181,44 @@ async function main(): Promise<void> {
   }
 }
 
+// ---- owner resolution + branch classification (shared by the run and --plan paths) -----------
+// §1 effective owner resolution: discovery re-runs every invocation through the given client.
+async function resolveOwners(
+  client: GithubClient, config: Config, personalLogin: string,
+): Promise<{ owners: string[]; source: OwnersSource }> {
+  const discoveredOrgs = config.organizations === null ? await client.listOrgMemberships() : [];
+  const { owners, source } = resolveEffectiveOwners({
+    organizations: config.organizations,
+    excludeOrganizations: config.excludeOrganizations,
+    includePersonalNamespace: config.includePersonalNamespace,
+    discoveredOrgs,
+    personalLogin: config.includePersonalNamespace ? personalLogin : null,
+  });
+  logLine({ event: "owners", owners, source });
+  return { owners, source };
+}
+
+// §5.B classification, pure: heads arrive sorted committedDate DESC. EVERY still-live branch
+// before cutoffDate is `cutoffSkipped` (regardless of the cap); the after-cutoff survivors are
+// `eligible` up to maxBranchesPerRepo; older survivors past the cap are `pastCap` (they retain
+// prior state and are not surfaced this run). Order within each group preserves the input order.
+export interface BranchPlan {
+  cutoffSkipped: BranchHead[];
+  eligible: BranchHead[];
+  pastCap: BranchHead[];
+}
+export function classifyBranchPlan(heads: BranchHead[], cutoffDate: string, maxBranchesPerRepo: number): BranchPlan {
+  const cutoffSkipped: BranchHead[] = [];
+  const eligible: BranchHead[] = [];
+  const pastCap: BranchHead[] = [];
+  for (const h of heads) {
+    if (h.committedDate.slice(0, 10) < cutoffDate) cutoffSkipped.push(h);
+    else if (eligible.length < maxBranchesPerRepo) eligible.push(h);
+    else pastCap.push(h);
+  }
+  return { cutoffSkipped, eligible, pastCap };
+}
+
 // Discover a repo's branches, apply the cutoff + cap, and process/skip each branch unit (§5.B/§3).
 async function processRepo(
   db: AuditDb, client: GithubClient, config: Config, runId: string, configHash: string,
@@ -189,23 +231,17 @@ async function processRepo(
     db.insertError({ runId, scope: "discovery", organization: repo.organization, repository: repo.name, message: `branch discovery failed: ${(e as Error).message}` });
     return;
   }
-  // §5.B ordering: heads arrive sorted committedDate DESC. Filter CUTOFF branches FIRST (record
-  // EVERY still-live branch before cutoffDate as skipped-cutoff, regardless of the cap), THEN cap
-  // the after-cutoff survivors at maxBranchesPerRepo (older survivors past the cap retain their
-  // prior state and are not surfaced this run).
-  let keptCount = 0;
-  for (const h of heads) {
+  const plan = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo);
+  for (const h of plan.cutoffSkipped) {
     const key: WorkUnitKey = { configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch: h.name };
-    if (h.committedDate.slice(0, 10) < config.cutoffDate) {
-      db.enqueueUnit(key, runId);
-      db.setUnitStatus(key, { status: "skipped", runId, lastCommitSha: "", lastCommitDate: h.committedDate });
-      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff" });
-      logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-cutoff" });
-      continue;
-    }
-    if (keptCount >= config.maxBranchesPerRepo) continue; // after-cutoff past the cap → retain prior state
-    keptCount++;
-
+    db.enqueueUnit(key, runId);
+    db.setUnitStatus(key, { status: "skipped", runId, lastCommitSha: "", lastCommitDate: h.committedDate });
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff" });
+    logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-cutoff" });
+  }
+  // plan.pastCap: after-cutoff past the cap → retain prior state, not surfaced this run.
+  for (const h of plan.eligible) {
+    const key: WorkUnitKey = { configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch: h.name };
     db.enqueueUnit(key, runId);
     const unit = db.getUnit(key);
     // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is
@@ -438,8 +474,82 @@ async function discoverCliTerms(db: AuditDb, client: GithubClient, config: Confi
   return sets;
 }
 
-// Entry point.
-main().catch((e) => {
-  process.stderr.write(`orchestrate failed: ${(e as Error).stack ?? (e as Error).message}\n`);
-  process.exit(1);
-});
+// ---- §8 --plan: preview the scan scope with ZERO writes ---------------------------------------
+// No DB open (so no api_cache reads/writes), no content fetches, no clones, and no registry
+// packument/tarball fetches — preflight's registry REACHABILITY probe (§2.5) is the only registry
+// contact, and it carries no auth beyond the configured header. Discovery runs through a
+// CACHE-LESS client (db: null). `branchesEligible` is the pre-database view: a real run may still
+// skip some of these units as already-current (§3 skip predicate) — that state lives in the DB,
+// which plan mode deliberately never opens.
+async function runPlan(config: Config, personalLogin: string): Promise<void> {
+  const client = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories });
+  const { owners, source } = await resolveOwners(client, config, personalLogin);
+
+  let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, discoveryErrors = 0;
+  for (const owner of owners) {
+    const isPersonal = config.includePersonalNamespace && owner === personalLogin;
+    let repos: RepoInfo[];
+    try {
+      repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
+    } catch (e) {
+      discoveryErrors++;
+      logLine({ event: "plan", org: owner, error: `repo discovery failed: ${(e as Error).message}` });
+      continue;
+    }
+    reposDiscovered += repos.length;
+    const kept = filterSortCapRepos(repos, {
+      includeArchived: config.includeArchived, includeForks: config.includeForks, maxReposPerOrg: config.maxReposPerOrg,
+    });
+    reposKept += kept.length;
+    for (const repo of kept) {
+      let heads: BranchHead[];
+      try {
+        heads = await client.listBranchHeads(repo.organization, repo.name);
+      } catch (e) {
+        discoveryErrors++;
+        logLine({ event: "plan", org: repo.organization, repo: repo.name, error: `branch discovery failed: ${(e as Error).message}` });
+        continue;
+      }
+      const p = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo);
+      branchesEligible += p.eligible.length;
+      branchesSkippedByCutoff += p.cutoffSkipped.length;
+      branchesPastCap += p.pastCap.length;
+      logLine({
+        event: "plan", org: repo.organization, repo: repo.name,
+        branchesEligible: p.eligible.length, branchesSkippedByCutoff: p.cutoffSkipped.length, branchesPastCap: p.pastCap.length,
+      });
+    }
+  }
+
+  const totals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, discoveryErrors };
+  logLine({ event: "plan-summary", ...totals });
+  process.stderr.write(planSummaryText(config, totals));
+}
+
+// The human-facing plan block goes to STDERR so stdout stays pure JSONL for pipes/agents.
+export function planSummaryText(
+  config: Config,
+  t: { owners: string[]; ownersSource: OwnersSource; reposDiscovered: number; reposKept: number; branchesEligible: number; branchesSkippedByCutoff: number; branchesPastCap: number; discoveryErrors: number },
+): string {
+  const lines = [
+    "",
+    "PLAN — preview only: no database opened, nothing scanned, nothing written",
+    `  Owners (${t.ownersSource}):  ${t.owners.join(", ")}`,
+    `  Repos:                ${t.reposDiscovered} discovered, ${t.reposKept} kept after archive/fork filters and caps`,
+    `  Branches:             ${t.branchesEligible} eligible to scan (a real run may skip already-current ones)`,
+    `                        ${t.branchesSkippedByCutoff} skipped by cutoff (< ${config.cutoffDate}) · ${t.branchesPastCap} past the per-repo cap (${config.maxBranchesPerRepo})`,
+    `  Packages tracked:     ${config.packages.map((p) => p.name).join(", ")}`,
+    `  Discovery errors:     ${t.discoveryErrors}`,
+    `  Next:                 bun run audit   (narrow scope first via "organizations" in the config if this is broader than intended)`,
+    "",
+  ];
+  return lines.join("\n");
+}
+
+// Entry point (guarded so importing this module — e.g. from tests — never launches an audit).
+if (import.meta.main) {
+  main().catch((e) => {
+    process.stderr.write(renderFatal(e, { command: "orchestrate", usage: ORCHESTRATE_USAGE }));
+    process.exit(1);
+  });
+}
