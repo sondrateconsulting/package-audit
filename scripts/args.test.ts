@@ -69,6 +69,11 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--plan", "--fresh", "--purge-cache"])).toThrow(ArgsError);
     expect(() => parseArgs(["--plan", "--rescan-branch", "o/r@main"])).toThrow(ArgsError);
   });
+  test("bare --plan --purge-cache names the PLAN conflict, not the purge/fresh coupling", () => {
+    // the plan-conflict check is deliberately ordered before the purge-requires-fresh check —
+    // this pins that ordering so a reorder regresses loudly
+    expect(() => parseArgs(["--plan", "--purge-cache"])).toThrow(/--plan cannot be combined/);
+  });
   test("--plan combines with --config", () => {
     const a = parseArgs(["--plan", "--config", "/c.json"]);
     expect(a.plan).toBe(true);

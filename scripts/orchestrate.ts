@@ -21,7 +21,7 @@ import { scanUnit, type TreeEntry, type UnitLocation } from "./unitPipeline.ts";
 import { parseSemver, maxSatisfying } from "./semver.ts";
 import { parseAlias, type DependencyType } from "./manifest.ts";
 import { introspectVersion, fetchPackument, resolveRangeToVersion, type Packument } from "./apiSurface.ts";
-import { emitReportDetailed } from "./report.ts";
+import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
 
 // One structured JSON log line (§6/§8 observability).
@@ -156,7 +156,9 @@ async function main(): Promise<void> {
       try {
         repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
       } catch (e) {
-        db.insertError({ runId, scope: "discovery", organization: owner, message: `repo discovery failed: ${(e as Error).message}` });
+        const message = `repo discovery failed: ${(e as Error).message}`;
+        db.insertError({ runId, scope: "discovery", organization: owner, message });
+        logLine({ event: "discovery", org: owner, error: message });
         continue;
       }
       const kept = filterSortCapRepos(repos, {
@@ -177,8 +179,8 @@ async function main(): Promise<void> {
     // the emitted report object itself, so the three can never disagree.
     const completedRun = db.getRun(runId)!;
     const emitted = emitReportDetailed(db, completedRun, config.paths.outputDir, { alsoLatest: true });
-    const summary = (emitted.report as { summary: ReportSummary; errors: unknown[] }).summary;
-    const errorCount = (emitted.report as { errors: unknown[] }).errors.length;
+    const summary = emitted.report.summary;
+    const errorCount = emitted.report.errors.length;
     logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount });
     process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path));
   } finally {
@@ -187,15 +189,8 @@ async function main(): Promise<void> {
 }
 
 // §8 step 7's "concise human-readable summary": stderr only — stdout stays pure JSONL. The
-// counters are the report's own §7 summary block, labels matching the report field names.
-interface ReportSummary {
-  organizationsScanned: number;
-  repositoriesScanned: number;
-  branchesScanned: number;
-  branchesSkippedByCutoff: number;
-  totalDependencyFindings: number;
-  totalUsageFindings: number;
-}
+// counters are the report's own §7 summary block (the imported ReportSummary type), labels
+// matching the report field names.
 export function runSummaryText(runId: string, s: ReportSummary, errorCount: number, reportPath: string): string {
   return [
     "",
@@ -250,7 +245,8 @@ export function classifyBranchPlan(heads: BranchHead[], cutoffDate: string, maxB
 }
 
 // Discover a repo's branches, apply the cutoff + cap, and process/skip each branch unit (§5.B/§3).
-async function processRepo(
+// Exported for the wiring tests (scripted client + real in-memory DB); main() is its only runtime caller.
+export async function processRepo(
   db: AuditDb, client: GithubClient, config: Config, runId: string, configHash: string,
   owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
 ): Promise<void> {
@@ -258,7 +254,9 @@ async function processRepo(
   try {
     heads = await client.listBranchHeads(repo.organization, repo.name);
   } catch (e) {
-    db.insertError({ runId, scope: "discovery", organization: repo.organization, repository: repo.name, message: `branch discovery failed: ${(e as Error).message}` });
+    const message = `branch discovery failed: ${(e as Error).message}`;
+    db.insertError({ runId, scope: "discovery", organization: repo.organization, repository: repo.name, message });
+    logLine({ event: "discovery", org: repo.organization, repo: repo.name, error: message });
     return;
   }
   const plan = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo);
@@ -522,6 +520,10 @@ export interface PlanTotals {
   discoveryErrors: number;
 }
 export async function runPlan(client: GithubClient, config: Config, personalLogin: string): Promise<PlanTotals> {
+  // The zero-write contract is enforced, not assumed: a caching client would write api_cache rows
+  // into the DB during discovery. This is an internal contract violation (a bug, not an operator
+  // error), so a plain Error with a stack is the right rendering.
+  if (client.cachesToDb) throw new Error("runPlan requires a cache-less client (db: null) — plan mode must not write api_cache");
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 
   let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, discoveryErrors = 0;

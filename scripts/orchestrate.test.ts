@@ -1,9 +1,10 @@
-import { expect, test, describe } from "bun:test";
+import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyBranchPlan, planSummaryText, runPlan, runSummaryText } from "./orchestrate.ts";
-import { GithubClient, type BranchHead } from "./github.ts";
+import { classifyBranchPlan, planSummaryText, processRepo, runPlan, runSummaryText } from "./orchestrate.ts";
+import { GithubClient, type BranchHead, type RepoInfo } from "./github.ts";
+import { AuditDb, type WorkUnitKey } from "./db.ts";
 import type { Config } from "./config.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
@@ -136,6 +137,179 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     expect(totals.discoveryErrors).toBe(1);
     expect(totals.branchesEligible).toBe(0);
     expect(readdirSync(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+// Shared minimal Config for the guard/wiring tests below (single configured org, cap via arg).
+const testConfig = (root: string, maxBranchesPerRepo = 25): Config => ({
+  githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], includePersonalNamespace: false,
+  includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo, cutoffDate: "2024-01-01",
+  concurrency: { organizations: 1, repositories: 1, branches: 1 },
+  packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+  excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
+});
+
+// Capture stdout JSONL lines emitted during `fn`, returned parsed.
+async function captureJsonl(fn: () => Promise<void>): Promise<Array<Record<string, unknown>>> {
+  const chunks: string[] = [];
+  const spy = spyOn(process.stdout, "write").mockImplementation(((chunk: unknown) => {
+    chunks.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write);
+  try {
+    await fn();
+  } finally {
+    spy.mockRestore();
+  }
+  return chunks.join("").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+describe("runPlan cache-less client guard (§8 --plan zero-write)", () => {
+  test("rejects a caching (db-backed) client before any discovery call", async () => {
+    const root = mkdtempSync(join(tmpdir(), "plan-guard-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    let spawns = 0;
+    const client = new GithubClient({
+      githubHost: "github.com", db, // WRONG client for plan mode: it would cache into the DB
+      spawnImpl: async () => { spawns++; return { exitCode: 1, stderr: "never reached", stdout: "" }; },
+      sleepImpl: async () => {},
+      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
+    });
+    await expect(runPlan(client, testConfig(root), "rvo")).rejects.toThrow(/cache-less/);
+    expect(spawns).toBe(0); // the guard fires before owner resolution / any gh call
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("processRepo discovery-failure observability (fail-soft, README log vocabulary)", () => {
+  test("a branch-discovery failure emits a JSONL discovery event AND the DB error row", async () => {
+    const root = mkdtempSync(join(tmpdir(), "disc-ev-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const client = new GithubClient({
+      githubHost: "github.com", db: null,
+      spawnImpl: async () => ({ exitCode: 1, stderr: "gh: boom", stdout: "" }),
+      sleepImpl: async () => {},
+      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
+    });
+    const repo: RepoInfo = { name: "svc", organization: "org-a", defaultBranch: "main", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+
+    const events = await captureJsonl(async () => {
+      await processRepo(db, client, testConfig(root), runId, "h", "org-a", repo, [], new Set());
+    });
+
+    const disc = events.find((e) => e["event"] === "discovery");
+    expect(disc).toBeDefined();
+    expect(disc?.["org"]).toBe("org-a");
+    expect(disc?.["repo"]).toBe("svc");
+    expect(String(disc?.["error"])).toContain("branch discovery failed");
+    // fail-soft: the DB error row is still recorded alongside the live event
+    const row = db.read(`SELECT scope, organization, repository, message FROM errors WHERE run_id = ?`).get(runId) as { scope: string; organization: string; repository: string; message: string };
+    expect(row.scope).toBe("discovery");
+    expect(row.message).toContain("branch discovery failed");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("runPlan org-level discovery failure (fail-soft continue)", () => {
+  const http = (status: number, body: string): string => `HTTP/2.0 ${status} X\r\n\r\n${body}`;
+
+  test("a failing org's repo discovery is counted and the NEXT owner still runs", async () => {
+    const root = mkdtempSync(join(tmpdir(), "plan-orgfail-"));
+    // route by args, not call order, so retry counts can't skew the script:
+    // org-a REST repo listing always fails; org-b succeeds; GraphQL (branch heads) succeeds.
+    const client = new GithubClient({
+      githubHost: "github.com", db: null,
+      spawnImpl: async (_bin, args) => {
+        const joined = args.join(" ");
+        if (joined.includes("graphql")) {
+          return { exitCode: 0, stderr: "", stdout: http(200, JSON.stringify({ data: { repository: { refs: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [{ name: "main", target: { oid: "o1", committedDate: "2025-06-01T00:00:00Z", tree: { oid: "t1" } } }],
+          } } } })) };
+        }
+        if (joined.includes("org-a")) return { exitCode: 1, stderr: "gh: boom", stdout: "" };
+        return { exitCode: 0, stderr: "", stdout: http(200, JSON.stringify([
+          { name: "svc", owner: { login: "org-b" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
+        ])) };
+      },
+      sleepImpl: async () => {},
+      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
+    });
+    const config = { ...testConfig(root), organizations: ["org-a", "org-b"] };
+
+    let totals: Awaited<ReturnType<typeof runPlan>> | undefined;
+    const events = await captureJsonl(async () => {
+      totals = await runPlan(client, config, "rvo");
+    });
+
+    expect(totals?.discoveryErrors).toBe(1);
+    expect(totals?.reposDiscovered).toBe(1); // org-b's repo still counted after org-a failed
+    expect(totals?.branchesEligible).toBe(1);
+    const planError = events.find((e) => e["event"] === "plan" && e["error"] !== undefined);
+    expect(planError?.["org"]).toBe("org-a");
+    expect(String(planError?.["error"])).toContain("repo discovery failed");
+    expect(readdirSync(root)).toEqual([]); // zero-write contract holds through the failure
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-cap untouched)", () => {
+  const graphqlHeads = (nodes: Array<{ name: string; oid: string; date: string }>): string =>
+    `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: { refs: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: `t-${n.name}` } } })),
+    } } } })}`;
+
+  test("classified groups land in the right DB states without scanning", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wiring-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const key = (branch: string): WorkUnitKey => ({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch });
+    // pre-seed "main" as done AT the live head so the §3 skip-current path is taken (no scanUnit)
+    db.enqueueUnit(key("main"), runId);
+    db.setUnitStatus(key("main"), { status: "done", runId, lastCommitSha: "o-main", lastCommitDate: "2025-06-01T00:00:00Z" });
+
+    const client = new GithubClient({
+      githubHost: "github.com", db: null,
+      // heads arrive newest-first; cap=1 → main eligible(current), dev past-cap, stale pre-cutoff
+      spawnImpl: async () => ({ exitCode: 0, stderr: "", stdout: graphqlHeads([
+        { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
+        { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+        { name: "stale", oid: "o-stale", date: "2023-06-01T00:00:00Z" },
+      ]) }),
+      sleepImpl: async () => {},
+      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
+    });
+    const repo: RepoInfo = { name: "svc", organization: "org-a", defaultBranch: "main", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+
+    const events = await captureJsonl(async () => {
+      await processRepo(db, client, testConfig(root, 1), runId, "h", "org-a", repo, [], new Set());
+    });
+
+    // run_unit_head: stale → skipped-cutoff (empty sha), main → scanned at the live head; dev absent
+    const headRows = db.read(`SELECT branch, commit_sha, status FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<{ branch: string; commit_sha: string; status: string }>;
+    expect(headRows).toEqual([
+      { branch: "main", commit_sha: "o-main", status: "scanned" },
+      { branch: "stale", commit_sha: "", status: "skipped-cutoff" },
+    ]);
+    // work-queue state: stale skipped, main still done (reused), dev never enqueued (past cap)
+    expect(db.getUnit(key("stale"))?.status).toBe("skipped");
+    expect(db.getUnit(key("main"))?.status).toBe("done");
+    expect(db.getUnit(key("dev"))).toBeNull();
+    // live JSONL: one skip-cutoff, one skip-current, nothing else unit-scoped
+    const actions = events.filter((e) => e["event"] === "unit").map((e) => `${e["branch"]}:${e["action"]}`).sort();
+    expect(actions).toEqual(["main:skip-current", "stale:skip-cutoff"]);
+    db.close();
     rmSync(root, { recursive: true, force: true });
   });
 });

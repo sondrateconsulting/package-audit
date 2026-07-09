@@ -1,9 +1,17 @@
 import { expect, test, describe } from "bun:test";
-import { isKnownOperatorError, renderFatal } from "./cliErrors.ts";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { KNOWN_OPERATOR_ERRORS, isKnownOperatorError, renderFatal } from "./cliErrors.ts";
 import { ArgsError, ORCHESTRATE_USAGE } from "./args.ts";
 import { PreflightError } from "./preflight.ts";
 import { ConfigError } from "./config.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
+import { JsoncError } from "./jsonc.ts";
+import { YamlLiteError } from "./yamlLite.ts";
+import { EmptyOwnersError } from "./ownerResolve.ts";
+import { DbError } from "./db.ts";
+import { GithubApiError, ThrottleExhausted } from "./github.ts";
+import { IntrospectionError } from "./apiSurface.ts";
 
 const OPTS = { command: "orchestrate", usage: ORCHESTRATE_USAGE };
 
@@ -22,6 +30,39 @@ describe("isKnownOperatorError", () => {
     expect(isKnownOperatorError(new TypeError("undefined is not a function"))).toBe(false);
     expect(isKnownOperatorError("string")).toBe(false);
     expect(isKnownOperatorError(null)).toBe(false);
+  });
+});
+
+describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never drift)", () => {
+  test("a REAL instance of every registered class is recognized, and the names cover the registry exactly", () => {
+    // one live instance per registered class — a typo'd `this.name` in any constructor fails here
+    const instances: Error[] = [
+      new ArgsError("x"), new ConfigError("x"), new JsoncError("x", 1), new YamlLiteError("x", 1),
+      new PreflightError("x"), new EmptyOwnersError("x"), new DbError("x"),
+      new GithubApiError("x"), new ThrottleExhausted("graphql"),
+      new IntrospectionError("x"), new ReadOnlyViolation("READ-ONLY VIOLATION: x"),
+    ];
+    expect(new Set(instances.map((e) => e.name))).toEqual(new Set(KNOWN_OPERATOR_ERRORS));
+    for (const e of instances) expect(isKnownOperatorError(e)).toBe(true);
+  });
+
+  test("every exported Error subclass in scripts/ is registered or explicitly excluded (source scan)", () => {
+    // A NEW operator-facing error class must either join the registry (clean message, no stack)
+    // or this exclusion list (deliberate decision, with the stack-dump consequence on record).
+    // Naming constraint the regex relies on: error base classes must be named `Error` or `*Error`
+    // (all 11 current classes extend Error directly).
+    const EXCLUDED_NON_OPERATOR_ERRORS = new Set<string>([]);
+    const declared = new Set<string>();
+    for (const file of readdirSync(import.meta.dir)) {
+      if (!file.endsWith(".ts") || file.endsWith(".test.ts")) continue;
+      const src = readFileSync(join(import.meta.dir, file), "utf8");
+      for (const m of src.matchAll(/export class (\w+) extends \w*Error\b/g)) declared.add(m[1]!);
+    }
+    expect(declared.size).toBeGreaterThan(0); // the scan itself works
+    const unregistered = [...declared].filter((n) => !KNOWN_OPERATOR_ERRORS.has(n) && !EXCLUDED_NON_OPERATOR_ERRORS.has(n)).sort();
+    expect(unregistered).toEqual([]);
+    const stale = [...KNOWN_OPERATOR_ERRORS].filter((n) => !declared.has(n)).sort();
+    expect(stale).toEqual([]);
   });
 });
 

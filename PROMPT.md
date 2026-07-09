@@ -35,8 +35,8 @@ every run as "continue the job," not "start over," unless the user passes `--fre
   matching false-positives on a repo named `create-x` and, worse, lets `gh api -X
   DELETE` through). The guard is an ALLOWLIST of read-only `gh`/`git` verbs+argv
   shapes; it rejects `gh api` with a non-GET method or body flags, `git` mutations,
-  and command-injection options (§6). Direct `Bun.$` on these binaries is forbidden
-  (grep-enforced in tests).
+  and command-injection options (§6). Spawning these binaries outside the wrapper
+  (`Bun.spawn`/`Bun.spawnSync`/`Bun.$`) is forbidden (grep-enforced in tests).
 - WRITE CONTAINMENT: every write mechanism — `Bun.write`, `fs.*`, shell redirects,
   `git clone`, `tar -x`, the SQLite file, report output — may only target paths
   under `./data`, `./output`, or a run-scoped `mktemp` dir with the `pkg-audit-*`
@@ -149,7 +149,7 @@ instead (§5.D/§5.F).
 2. PREREQUISITE CHECKS (every invocation, before any work)
 ================================================================================
 Fail fast with actionable remediation if any of these fail:
-1. `bun --version` >= 1.1 (bun:sqlite + Bun.$ required).
+1. `bun --version` >= 1.1 (bun:sqlite + Bun.spawn required).
 2. `gh --version` succeeds.
 3. `gh auth status --hostname <githubHost>` shows an authenticated read-capable
    account (capture login for audit; never print tokens). In discovery mode
@@ -883,7 +883,7 @@ H. Upsert `run_unit_head(this run, org, repo, branch, commit_sha=the head just s
 All deterministic logic MUST live in on-disk Bun + TypeScript modules (inspectable,
 testable, reusable) — not inline shell one-liners. Only defer to model reasoning for
 genuinely non-deterministic sub-tasks.
-- Idiomatic Bun: bun:sqlite, `Bun.$` for shell (gh/git/tar), `Bun.file`/`Bun.write`,
+- Idiomatic Bun: bun:sqlite, `Bun.spawn` for shell (gh/git/tar), `Bun.file`/`Bun.write`,
   `Bun.Glob`, native `fetch`, top-level await. A single `gh()` wrapper (github.ts)
   sets `GH_HOST=<githubHost>` on every invocation so no call site can drift.
 - Minimize deps: default to ZERO npm deps. Add one only with a documented
@@ -910,11 +910,12 @@ Entrypoints:
     # default: latest completed run's snapshot (also refreshes latest.json); strict flags —
     #   unknown/valueless arguments are rejected, never silently defaulted
 
-The wrapper module (github.ts) is the ONLY place `Bun.$` touches `gh`/`git`/`tar`;
+The wrapper module (github.ts) is the ONLY place `Bun.spawn` touches `gh`/`git`/`tar`;
 each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
 (`assertReadOnlyGh`/`assertReadOnlyGit`/`assertReadOnlyTar`) on the argv ARRAY before
-spawning. Because a test greps the repo to assert NO other file calls `Bun.$` on
-these binaries (and that no code path spawns a `PM_DENYLIST` binary), no call site
+spawning. Because a test greps the repo to assert NO other file spawns these binaries
+(via `Bun.spawn`/`Bun.spawnSync`/`Bun.$`, and that no code path spawns a
+`PM_DENYLIST` binary), no call site
 can route around the guard — the guard is the single chokepoint, and it enforces the
 read-only allowlist including tar's command-execution options
 (`--checkpoint-action=exec=…`, `--to-command`, `--use-compress-program`/`-I`, `-F`). Every invocation runs with a sanitized env

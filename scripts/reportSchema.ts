@@ -11,6 +11,10 @@
 // is dependency-free and pinned exactly.
 
 import { z } from "zod";
+// Type-only import (zero runtime coupling — the emit path never touches this module, and this
+// module never touches the DB): the enum literals below are pinned to db.ts's unions at compile
+// time, so a new/renamed member on either side fails `bun run typecheck` instead of drifting.
+import type { ExportKind, UsageType } from "./db.ts";
 
 const semverish = z.string().min(1);
 const isoUtc = z.string().describe("ISO-8601 UTC timestamp (fixed-width, lexicographically sortable)");
@@ -23,6 +27,13 @@ export const usageTypeSchema = z
 export const exportKindSchema = z
   .enum(["named", "default", "type"])
   .describe("§5.E export classification ('cli-bin' rows surface as cli.binNames, the '__complete__' marker is never emitted)");
+
+// Bidirectional compile-time sync with db.ts (report enums = DB unions minus the CLI members,
+// which surface via cliUsage / cli.binNames instead). Equal<> fails in BOTH drift directions.
+type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+export type UsageEnumSyncedWithDb = Expect<Equal<(typeof usageTypeSchema.options)[number], Exclude<UsageType, "cli">>>;
+export type ExportEnumSyncedWithDb = Expect<Equal<(typeof exportKindSchema.options)[number], Exclude<ExportKind, "cli-bin">>>;
 
 const lockfileRefSchema = z
   .strictObject({

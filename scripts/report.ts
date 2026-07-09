@@ -36,8 +36,32 @@ function unitKey(o: string, r: string, b: string, c: string): string {
   return `${o}\0${r}\0${b}\0${c}`;
 }
 
+// The report's §7 summary block — the ONE hand-written source for this shape. orchestrate.ts
+// imports it for the done event + stderr summary, and reportSchema's summarySchema is key-synced
+// to it by test, so the three can never silently disagree.
+export interface ReportSummary {
+  organizationsScanned: number;
+  repositoriesScanned: number;
+  branchesScanned: number;
+  branchesSkippedByCutoff: number;
+  totalDependencyFindings: number;
+  totalUsageFindings: number;
+}
+
+// Top-level envelope of the emitted report. Leaf shapes (packages[], errors[]) stay untyped here
+// on purpose — their contract lives in reportSchema.ts and is enforced in tests, never in this
+// emit path. The envelope types exactly what orchestrate.ts's done event derives from.
+export interface EmittedReport {
+  runId: string;
+  generatedAt: string;
+  config: { packages: string[]; cutoffDate: string; githubHost: string; organizations: string[]; organizationsSource: string };
+  packages: unknown[];
+  errors: unknown[];
+  summary: ReportSummary;
+}
+
 // Build the whole §7 report object for a run from SQLite alone.
-export function buildReport(db: AuditDb, run: RunRecord): unknown {
+export function buildReport(db: AuditDb, run: RunRecord): EmittedReport {
   const runId = run.runId;
   const tracked = JSON.stringify(run.trackedPackages);
 
@@ -88,7 +112,7 @@ export function buildReport(db: AuditDb, run: RunRecord): unknown {
   };
 }
 
-function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[]) {
+function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[]): ReportSummary {
   const orgs = new Set(scannedHeads.map((h) => h.organization));
   const repos = new Set(scannedHeads.map((h) => `${h.organization}/${h.repository}`));
   return {
@@ -182,7 +206,7 @@ function buildUnit(
 // report (never a separate re-query that could disagree with run-<id>.json).
 export function emitReportDetailed(
   db: AuditDb, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean },
-): { path: string; report: unknown } {
+): { path: string; report: EmittedReport } {
   mkdirSync(outputDir, { recursive: true });
   const report = buildReport(db, run);
   const runPath = join(outputDir, `run-${run.runId}.json`);
@@ -192,6 +216,16 @@ export function emitReportDetailed(
 }
 export function emitReport(db: AuditDb, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean }): string {
   return emitReportDetailed(db, run, outputDir, opts).path;
+}
+
+// The "nothing to report" notice (no completed reportable run, or an unknown/pre-migration
+// --run-id). Exported so tests validate the REAL emitted object against notReportableSchema,
+// not a hand-written lookalike.
+export function buildNotReportableNotice(runIdArg: string | null): { notReportable: true; reason: string } {
+  return {
+    notReportable: true,
+    reason: runIdArg !== null ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)` : "no completed reportable run yet",
+  };
 }
 
 // ---- entry point ----------------------------------------------------------------------------
@@ -211,7 +245,7 @@ async function main(): Promise<void> {
     mkdirSync(outputDir, { recursive: true });
 
     if (run === null || run.trackedPackages.length === 0) {
-      const notice = { notReportable: true, reason: runIdArg !== null ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)` : "no completed reportable run yet" };
+      const notice = buildNotReportableNotice(runIdArg);
       const path = join(outputDir, runIdArg !== null ? `run-${runIdArg}.json` : "latest.json");
       writeJson(path, outputDir, notice);
       process.stdout.write(`${JSON.stringify(notice)}\n`);

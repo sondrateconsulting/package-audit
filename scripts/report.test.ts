@@ -1,7 +1,7 @@
 import { expect, test, describe } from "bun:test";
 import { AuditDb, nowIso } from "./db.ts";
-import { buildReport } from "./report.ts";
-import { reportSchema, notReportableSchema } from "./reportSchema.ts";
+import { buildNotReportableNotice, buildReport } from "./report.ts";
+import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
 
@@ -130,12 +130,27 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
   test("strictness: an extra field on the report is rejected (drift fails loudly)", () => {
     const db = mem();
     const run = seed(db);
-    const drifted = { ...(buildReport(db, run) as Record<string, unknown>), extraField: 1 };
+    const drifted = { ...buildReport(db, run), extraField: 1 };
     expect(reportSchema.safeParse(drifted).success).toBe(false);
     db.close();
   });
-  test("the not-reportable notice matches its own schema", () => {
-    expect(notReportableSchema.safeParse({ notReportable: true, reason: "no completed reportable run yet" }).success).toBe(true);
+  test("the REAL not-reportable notice (both branches) matches its schema", () => {
+    // the actual objects report.ts emits — not hand-written lookalikes
+    const noRun = buildNotReportableNotice(null);
+    const badId = buildNotReportableNotice("run-x");
+    expect(notReportableSchema.safeParse(noRun).success).toBe(true);
+    expect(notReportableSchema.safeParse(badId).success).toBe(true);
+    expect(noRun.reason).toBe("no completed reportable run yet");
+    expect(badId.reason).toContain("run-x not found");
+    // negative instance stays: the schema still rejects a wrong discriminant
     expect(notReportableSchema.safeParse({ notReportable: false, reason: "x" }).success).toBe(false);
+  });
+  test("buildReport's summary keys match summarySchema exactly (guards the done event + stderr summary)", () => {
+    const db = mem();
+    const run = seed(db);
+    // orchestrate.ts derives its done event and human summary from report.summary via the
+    // ReportSummary type — this pins the runtime keys to the schema so neither can drift alone.
+    expect(Object.keys(buildReport(db, run).summary).sort()).toEqual(Object.keys(summarySchema.shape).sort());
+    db.close();
   });
 });
