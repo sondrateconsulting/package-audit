@@ -320,13 +320,14 @@ describe("runSummaryText", () => {
       organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
       branchesSkippedByCutoff: 13, totalDependencyFindings: 104, totalUsageFindings: 994,
     }, 3, "output/run-run-abc.json");
+    // labels + values pinned; column padding is cosmetic and free to change
     expect(text).toContain("AUDIT COMPLETE — run run-abc");
-    expect(text).toContain("Organizations scanned:  2");
-    expect(text).toContain("Repositories scanned:   7");
-    expect(text).toContain("Branches scanned:       88 (13 skipped by cutoff)");
-    expect(text).toContain("Dependency findings:    104");
-    expect(text).toContain("Usage findings:         994");
-    expect(text).toContain("Errors recorded:        3 (fail-soft");
+    expect(text).toMatch(/Organizations scanned:\s+2\b/);
+    expect(text).toMatch(/Repositories scanned:\s+7\b/);
+    expect(text).toMatch(/Branches scanned:\s+88 \(13 skipped by cutoff\)/);
+    expect(text).toMatch(/Dependency findings:\s+104\b/);
+    expect(text).toMatch(/Usage findings:\s+994\b/);
+    expect(text).toMatch(/Errors recorded:\s+3 \(fail-soft/);
     expect(text).toContain("output/run-run-abc.json (+ latest.json)");
   });
 });
@@ -352,6 +353,6 @@ describe("planSummaryText", () => {
     expect(text).toContain("58 skipped by cutoff (< 2024-01-01)");
     expect(text).toContain("12 past the per-repo cap (25)");
     expect(text).toContain("expo");
-    expect(text).toContain("Discovery errors:     0");
+    expect(text).toMatch(/Discovery errors:\s+0\b/);
   });
 });

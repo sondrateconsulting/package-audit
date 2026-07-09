@@ -228,9 +228,9 @@ async function resolveOwners(
 // `eligible` up to maxBranchesPerRepo; older survivors past the cap are `pastCap` (they retain
 // prior state and are not surfaced this run). Order within each group preserves the input order.
 export interface BranchPlan {
-  cutoffSkipped: BranchHead[];
-  eligible: BranchHead[];
-  pastCap: BranchHead[];
+  readonly cutoffSkipped: readonly BranchHead[];
+  readonly eligible: readonly BranchHead[];
+  readonly pastCap: readonly BranchHead[];
 }
 export function classifyBranchPlan(heads: BranchHead[], cutoffDate: string, maxBranchesPerRepo: number): BranchPlan {
   const cutoffSkipped: BranchHead[] = [];
@@ -510,14 +510,14 @@ async function discoverCliTerms(db: AuditDb, client: GithubClient, config: Confi
 // of these units as already-current (§3 skip predicate) — that state lives in the DB, which plan
 // mode deliberately never opens. Returns the totals (integration-tested with a scripted client).
 export interface PlanTotals {
-  owners: string[];
-  ownersSource: OwnersSource;
-  reposDiscovered: number;
-  reposKept: number;
-  branchesEligible: number;
-  branchesSkippedByCutoff: number;
-  branchesPastCap: number;
-  discoveryErrors: number;
+  readonly owners: readonly string[];
+  readonly ownersSource: OwnersSource;
+  readonly reposDiscovered: number;
+  readonly reposKept: number;
+  readonly branchesEligible: number;
+  readonly branchesSkippedByCutoff: number;
+  readonly branchesPastCap: number;
+  readonly discoveryErrors: number;
 }
 export async function runPlan(client: GithubClient, config: Config, personalLogin: string): Promise<PlanTotals> {
   // The zero-write contract is enforced, not assumed: a caching client would write api_cache rows

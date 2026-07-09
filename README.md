@@ -72,7 +72,7 @@ Every field is documented in [config.schema.json](config.schema.json) (your edit
 
 **stdout is pure JSONL** — one structured event per line, safe to pipe. Vocabulary: `config`, `preflight`, `owners`, `run`, `rescan-branch`, `cli-terms`, `plan`, `plan-summary`, `unit` (actions `scanned`, `skip-current`, `skip-cutoff`, `error`), `discovery`, `done`.
 
-**Mid-run `"action":"error"` and `"event":"discovery"` lines are fail-soft**: the failure (a branch scan, or a repo/branch listing for one owner) is recorded in the report's `errors` array and the run continues — one unreachable repo never kills an org-wide audit. The human-readable end-of-run summary prints to **stderr**.
+**Mid-run `"action":"error"` and `"event":"discovery"` lines are fail-soft**: the failure (a branch scan, or a repo/branch listing for one owner) is recorded in the report's `errors` array and the run continues — one unreachable repo never kills an org-wide audit. Org-scoped `discovery` lines (a whole owner's repo listing failed) carry no `repo` field; branch-scoped ones do. The human-readable end-of-run summary prints to **stderr**.
 
 ## Report anatomy
 

@@ -64,7 +64,7 @@ export const declarationSchema = z
 
 export const apiUsageSchema = z
   .strictObject({
-    exportName: z.string().describe("The bound export; '' for forms with no single binding (namespace/side-effect/reexport, unresolved subpaths)"),
+    exportName: z.string().describe("The bound export; '' for forms with no single named binding (whole-module require/dynamic-import bindings, namespace/side-effect/reexport, unresolved subpaths)"),
     dependencyKey: z.string().describe("The manifest key that resolved this specifier (the alias for aliased installs); never '' for imports"),
     usageType: usageTypeSchema,
     file: z.string().describe("Repo-relative source path"),

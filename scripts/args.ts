@@ -68,12 +68,12 @@ export interface RescanTarget {
 }
 
 export interface OrchestrateArgs {
-  configPath: string | null; // explicit --config; null → resolve via env/default in config.ts
-  plan: boolean; // preview scope, no DB / no writes (§8 --plan)
-  fresh: boolean;
-  purgeCache: boolean;
-  rescanBranches: RescanTarget[]; // de-duplicated, order-stable
-  help: boolean; // --help/-h seen anywhere: print help, do nothing else
+  readonly configPath: string | null; // explicit --config; null → resolve via env/default in config.ts
+  readonly plan: boolean; // preview scope, no DB / no writes (§8 --plan)
+  readonly fresh: boolean;
+  readonly purgeCache: boolean;
+  readonly rescanBranches: readonly RescanTarget[]; // de-duplicated, order-stable
+  readonly help: boolean; // --help/-h seen anywhere: print help, do nothing else
 }
 
 // Parse a `<org>/<repo>@<branch>` rescan target (§3). Split at the FIRST '@' so a branch name
@@ -100,9 +100,24 @@ const isHelpFlag = (a: string): boolean => a === "--help" || a === "-h";
 const VALUE_FLAGS = new Set(["--config", "--rescan-branch"]);
 const BOOL_FLAGS = new Set(["--fresh", "--purge-cache", "--plan"]);
 
+// Normalize `--flag=value` into flag + attached value (shared by both parsers).
+function splitFlag(arg: string): { flag: string; attached: string | null } {
+  if (!arg.startsWith("--") || !arg.includes("=")) return { flag: arg, attached: null };
+  return { flag: arg.slice(0, arg.indexOf("=")), attached: arg.slice(arg.indexOf("=") + 1) };
+}
+
+// A DETACHED value that looks like a flag is a missing value, not a value — `--config --fresh`
+// must not silently swallow `--fresh` as the path. The attached `--flag=-x` form stays available
+// for values that genuinely start with '-'.
+function requireValue(flag: string, attached: string | null, next: string | undefined): string {
+  const value = attached !== null ? attached : next;
+  if (value === undefined || value === "" || (attached === null && value.startsWith("-")))
+    fail(`${flag} requires a value`);
+  return value;
+}
+
 export function parseArgs(argv: string[]): OrchestrateArgs {
-  const none: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
-  if (argv.some(isHelpFlag)) return { ...none, help: true };
+  if (argv.some(isHelpFlag)) return { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: true };
 
   let configPath: string | null = null;
   let plan = false;
@@ -113,13 +128,7 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
-    // normalize `--flag=value` into flag + value
-    let flag = arg;
-    let attached: string | null = null;
-    if (arg.startsWith("--") && arg.includes("=")) {
-      flag = arg.slice(0, arg.indexOf("="));
-      attached = arg.slice(arg.indexOf("=") + 1);
-    }
+    const { flag, attached } = splitFlag(arg);
 
     if (BOOL_FLAGS.has(flag)) {
       if (attached !== null) fail(`${flag} takes no value`);
@@ -129,8 +138,8 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
       continue;
     }
     if (VALUE_FLAGS.has(flag)) {
-      const value = attached !== null ? attached : argv[++i];
-      if (value === undefined || value === "") fail(`${flag} requires a value`);
+      const value = requireValue(flag, attached, argv[i + 1]);
+      if (attached === null) i++;
       if (flag === "--config") {
         if (configPath !== null) fail("--config given more than once");
         configPath = value;
@@ -161,9 +170,9 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
 
 // ---- report arguments -----------------------------------------------------------------------
 export interface ReportArgs {
-  configPath: string | null; // explicit --config; null → resolve via env/default in config.ts
-  runId: string | null; // --run-id <id>; null → latest completed reportable run
-  help: boolean;
+  readonly configPath: string | null; // explicit --config; null → resolve via env/default in config.ts
+  readonly runId: string | null; // --run-id <id>; null → latest completed reportable run
+  readonly help: boolean;
 }
 
 // Strict parser for report.ts (§7). Unknown flags are REJECTED — a silently-ignored typo (e.g.
@@ -175,15 +184,10 @@ export function parseReportArgs(argv: string[]): ReportArgs {
   let runId: string | null = null;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
-    let flag = arg;
-    let attached: string | null = null;
-    if (arg.startsWith("--") && arg.includes("=")) {
-      flag = arg.slice(0, arg.indexOf("="));
-      attached = arg.slice(arg.indexOf("=") + 1);
-    }
+    const { flag, attached } = splitFlag(arg);
     if (flag !== "--config" && flag !== "--run-id") fail(`unknown argument '${arg}'`);
-    const value = attached !== null ? attached : argv[++i];
-    if (value === undefined || value === "") fail(`${flag} requires a value`);
+    const value = requireValue(flag, attached, argv[i + 1]);
+    if (attached === null) i++;
     if (flag === "--config") {
       if (configPath !== null) fail("--config given more than once");
       configPath = value;

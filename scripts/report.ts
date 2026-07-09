@@ -214,10 +214,6 @@ export function emitReportDetailed(
   if (opts.alsoLatest) writeJson(join(outputDir, "latest.json"), outputDir, report);
   return { path: runPath, report };
 }
-export function emitReport(db: AuditDb, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean }): string {
-  return emitReportDetailed(db, run, outputDir, opts).path;
-}
-
 // The "nothing to report" notice (no completed reportable run, or an unknown/pre-migration
 // --run-id). Exported so tests validate the REAL emitted object against notReportableSchema,
 // not a hand-written lookalike.
@@ -252,7 +248,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    const runPath = emitReport(db, run, outputDir, { alsoLatest: runIdArg === null });
+    const runPath = emitReportDetailed(db, run, outputDir, { alsoLatest: runIdArg === null }).path;
     process.stdout.write(`report written: ${runPath}${runIdArg === null ? " (+ latest.json)" : ""}\n`);
   } finally {
     db.close();

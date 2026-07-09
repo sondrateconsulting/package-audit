@@ -60,6 +60,15 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--config=", ""])).toThrow(ArgsError);
     expect(() => parseArgs(["--config", "/a", "--config", "/b"])).toThrow(ArgsError);
   });
+  test("a detached value that looks like a flag is rejected, not consumed", () => {
+    // previously --config silently swallowed the next flag as its path
+    expect(() => parseArgs(["--config", "--fresh"])).toThrow(/--config requires a value/);
+    expect(() => parseArgs(["--rescan-branch", "--fresh"])).toThrow(/--rescan-branch requires a value/);
+    expect(() => parseReportArgs(["--config", "--run-id", "x"])).toThrow(/--config requires a value/);
+    expect(() => parseReportArgs(["--run-id", "--config"])).toThrow(/--run-id requires a value/);
+    // the attached `=` form stays available for weird-but-explicit values
+    expect(parseReportArgs(["--run-id=-x"]).runId).toBe("-x");
+  });
   test("--plan parses; rejects a value", () => {
     expect(parseArgs(["--plan"]).plan).toBe(true);
     expect(() => parseArgs(["--plan=1"])).toThrow(ArgsError);

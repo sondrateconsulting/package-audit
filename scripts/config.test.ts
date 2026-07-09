@@ -222,6 +222,13 @@ describe("unknown-key rejection (strict at every level)", () => {
     expect(() => norm({ ...baseRaw(), totallyWrong: 1 } as Record<string, unknown>)).toThrow(/\(valid keys: /);
     expect(() => norm({ ...baseRaw(), totallyWrong: 1 } as Record<string, unknown>)).not.toThrow(/did you mean/);
   });
+  test("the did-you-mean cutoff is exactly distance <= 2 (a distance-3 typo gets no hint)", () => {
+    // "pathxyz" is edit-distance 3 from "paths" and farther from every other root key. (No
+    // equidistant-tie test exists because none is constructible: the minimum pairwise distance
+    // between known keys at any level is 5, so no typo can sit within distance 2 of two keys.)
+    expect(() => norm({ ...baseRaw(), pathxyz: 1 })).toThrow(/\(valid keys: /);
+    expect(() => norm({ ...baseRaw(), pathxyz: 1 })).not.toThrow(/did you mean/);
+  });
   test("nested unknown keys report the full JSON path", () => {
     expect(() => norm({ ...baseRaw(), concurrency: { organizations: 3, repositories: 6, branches: 4, brnaches: 2 } }))
       .toThrow(/unknown config key \$\.concurrency\.brnaches — did you mean "branches"\?/);
@@ -328,5 +335,40 @@ describe("config.schema.json ↔ runtime sync", () => {
   });
   test("packages.items requires exactly name", () => {
     expect(schema["properties"]["packages"]["items"]["required"]).toEqual(["name"]);
+  });
+  test("every schema 'default' annotation equals the actual runtime default", () => {
+    // required keys only, so every optional field falls back to its runtime default; a schema
+    // 'default' that drifts from the code would silently mislead operators editing config.json.
+    const minimal: Record<string, unknown> = {
+      cutoffDate: "2024-01-01", maxBranchesPerRepo: 25,
+      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      packages: [{ name: "expo" }],
+      paths: { sqlitePath: "./data/audit.db", outputDir: "./output" },
+    };
+    const config = norm(minimal);
+    const pkg = config.packages[0]!;
+    // Typed projections of every defaulted field — a schema default on a key missing here
+    // compares against undefined and fails loudly.
+    const runtimeDefaults: Record<string, unknown> = {
+      githubHost: config.githubHost, organizations: config.organizations,
+      excludeOrganizations: config.excludeOrganizations, includePersonalNamespace: config.includePersonalNamespace,
+      includeForks: config.includeForks, includeArchived: config.includeArchived,
+      maxReposPerOrg: config.maxReposPerOrg, excludeDirGlobs: config.excludeDirGlobs,
+    };
+    const pkgRuntimeDefaults: Record<string, unknown> = {
+      registryUrl: pkg.registryUrl, registryAuthEnvVar: pkg.registryAuthEnvVar,
+    };
+    let defaultsChecked = 0;
+    for (const [key, prop] of Object.entries<Record<string, unknown>>(schema["properties"])) {
+      if (!("default" in prop)) continue;
+      defaultsChecked++;
+      expect({ key, value: runtimeDefaults[key] }).toEqual({ key, value: prop["default"] });
+    }
+    for (const [key, prop] of Object.entries<Record<string, unknown>>(schema["properties"]["packages"]["items"]["properties"])) {
+      if (!("default" in prop)) continue;
+      defaultsChecked++;
+      expect({ key, value: pkgRuntimeDefaults[key] }).toEqual({ key, value: prop["default"] });
+    }
+    expect(defaultsChecked).toBeGreaterThanOrEqual(9); // the walk actually found the annotations
   });
 });

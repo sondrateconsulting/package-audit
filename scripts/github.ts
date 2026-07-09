@@ -525,11 +525,6 @@ export class GithubClient {
   readonly githubHost: string;
   readonly tempRoot: string;
   private readonly db: AuditDb | null;
-  // Observable cache-role: --plan's zero-write contract requires a cache-less client (db: null),
-  // and runPlan guards on this rather than trusting its caller's construction.
-  get cachesToDb(): boolean {
-    return this.db !== null;
-  }
   private readonly spawn: SpawnFn;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
@@ -540,6 +535,12 @@ export class GithubClient {
   private readonly core: Bucket = { pausedUntilMs: 0 };
   private readonly graphqlBucket: Bucket = { pausedUntilMs: 0 };
   private gitConfigPath: string | null = null;
+
+  // Observable cache-role: --plan's zero-write contract requires a cache-less client (db: null),
+  // and runPlan guards on this rather than trusting its caller's construction.
+  get cachesToDb(): boolean {
+    return this.db !== null;
+  }
 
   constructor(opts: GithubClientOptions) {
     this.githubHost = opts.githubHost;
