@@ -177,14 +177,21 @@ function buildUnit(
 
 // Emit a run's report files into outputDir (§7). Writes run-<id>.json always; the DEFAULT
 // report also overwrites latest.json with a byte copy. Reused by orchestrate.ts (§8 step 6-7) so
-// a full run ends with a report without a second command. Returns the primary file path.
-export function emitReport(db: AuditDb, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean }): string {
+// a full run ends with a report without a second command. Returns the path AND the report
+// object, so the caller's done-event counters and human summary derive from the EXACT emitted
+// report (never a separate re-query that could disagree with run-<id>.json).
+export function emitReportDetailed(
+  db: AuditDb, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean },
+): { path: string; report: unknown } {
   mkdirSync(outputDir, { recursive: true });
   const report = buildReport(db, run);
   const runPath = join(outputDir, `run-${run.runId}.json`);
   writeJson(runPath, outputDir, report);
   if (opts.alsoLatest) writeJson(join(outputDir, "latest.json"), outputDir, report);
-  return runPath;
+  return { path: runPath, report };
+}
+export function emitReport(db: AuditDb, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean }): string {
+  return emitReportDetailed(db, run, outputDir, opts).path;
 }
 
 // ---- entry point ----------------------------------------------------------------------------

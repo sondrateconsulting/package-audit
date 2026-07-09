@@ -21,7 +21,7 @@ function fail(msg: string): never {
 const CONFIG_PRECEDENCE = "Config path precedence: --config <path> > CONFIG_PATH env > ./config.json";
 
 export const ORCHESTRATE_USAGE =
-  "Usage: bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] [--rescan-branch <org>/<repo>@<branch>]...";
+  "Usage: bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] [--rescan-branch <org>/<repo>@<branch>]... [--help]";
 
 export const ORCHESTRATE_HELP = `package-audit — READ-ONLY npm-package-usage audit over GitHub orgs (gh CLI + Bun + SQLite)
 
@@ -43,7 +43,7 @@ Flags:
 The audit writes <outputDir>/run-<run_id>.json and <outputDir>/latest.json when it completes;
 a separate \`bun run report\` is only needed to re-emit a historical run (--run-id).`;
 
-export const REPORT_USAGE = "Usage: bun run scripts/report.ts [--config <path>] [--run-id <id>]";
+export const REPORT_USAGE = "Usage: bun run scripts/report.ts [--config <path>] [--run-id <id>] [--help]";
 
 export const REPORT_HELP = `package-audit report — re-emit the consolidated §7 report from SQLite alone
 

@@ -1,6 +1,7 @@
 import { expect, test, describe } from "bun:test";
 import { AuditDb, nowIso } from "./db.ts";
 import { buildReport } from "./report.ts";
+import { reportSchema, notReportableSchema } from "./reportSchema.ts";
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
 
@@ -102,5 +103,39 @@ describe("buildReport (§7)", () => {
     expect(pkg.versionsSeen).toEqual(["49.0.0", "50.0.7"]); // both present, semver-sorted
     expect(Object.keys(pkg.apiSurface)).toEqual(["50.0.7"]); // only the marked one
     db.close();
+  });
+});
+
+describe("reportSchema (§7 contract as a strict Zod schema)", () => {
+  test("a fully-populated emitted report validates", () => {
+    const db = mem();
+    const run = seed(db);
+    // add an error row so the errors[] branch of the schema is exercised too
+    db.insertError({ runId: run.runId, scope: "introspection", packageName: "expo", version: "49.0.0", message: "tarball integrity mismatch" });
+    const parsed = reportSchema.safeParse(buildReport(db, run));
+    expect(parsed.success ? [] : parsed.error.issues).toEqual([]);
+    db.close();
+  });
+  test("an empty run (no findings) still emits the full, schema-valid shape", () => {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h2", effectiveOwners: ["org-b"], ownersSource: "configured",
+      trackedPackages: ["left-pad"], cutoffDate: "2024-01-01", githubHost: "ghe.corp.example",
+    });
+    db.completeRun(runId);
+    const parsed = reportSchema.safeParse(buildReport(db, db.getRun(runId)!));
+    expect(parsed.success ? [] : parsed.error.issues).toEqual([]);
+    db.close();
+  });
+  test("strictness: an extra field on the report is rejected (drift fails loudly)", () => {
+    const db = mem();
+    const run = seed(db);
+    const drifted = { ...(buildReport(db, run) as Record<string, unknown>), extraField: 1 };
+    expect(reportSchema.safeParse(drifted).success).toBe(false);
+    db.close();
+  });
+  test("the not-reportable notice matches its own schema", () => {
+    expect(notReportableSchema.safeParse({ notReportable: true, reason: "no completed reportable run yet" }).success).toBe(true);
+    expect(notReportableSchema.safeParse({ notReportable: false, reason: "x" }).success).toBe(false);
   });
 });

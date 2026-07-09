@@ -1,6 +1,10 @@
 import { expect, test, describe } from "bun:test";
-import { classifyBranchPlan, planSummaryText } from "./orchestrate.ts";
-import type { BranchHead } from "./github.ts";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { classifyBranchPlan, planSummaryText, runPlan, runSummaryText } from "./orchestrate.ts";
+import { GithubClient, type BranchHead } from "./github.ts";
+import type { Config } from "./config.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
 
@@ -35,6 +39,121 @@ describe("classifyBranchPlan (§5.B cutoff + cap)", () => {
   });
   test("empty input yields empty groups", () => {
     expect(classifyBranchPlan([], "2024-01-01", 25)).toEqual({ cutoffSkipped: [], eligible: [], pastCap: [] });
+  });
+});
+
+describe("runPlan (integration, scripted client — zero-write contract)", () => {
+  const http = (status: number, headers: Record<string, string>, body: string): string =>
+    [`HTTP/2.0 ${status} X`, ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`)].join("\r\n") + "\r\n\r\n" + body;
+
+  test("computes totals from discovery alone; writes nothing under tempRoot; spawns only gh", async () => {
+    const root = mkdtempSync(join(tmpdir(), "plan-int-"));
+    const responses = [
+      // 1) listOrgRepos("org-a") — single REST page (no Link header)
+      { exitCode: 0, stderr: "", stdout: http(200, {}, JSON.stringify([
+        { name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
+      ])) },
+      // 2) listBranchHeads("org-a","svc") — single GraphQL page: one eligible + one pre-cutoff head
+      { exitCode: 0, stderr: "", stdout: http(200, {}, JSON.stringify({ data: { repository: { refs: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [
+          { name: "main", target: { oid: "o-main", committedDate: "2025-06-01T00:00:00Z", tree: { oid: "t1" } } },
+          { name: "stale", target: { oid: "o-stale", committedDate: "2023-06-01T00:00:00Z", tree: { oid: "t2" } } },
+        ],
+      } } } })) },
+    ];
+    const calls: Array<{ bin: string; args: string[] }> = [];
+    const client = new GithubClient({
+      githubHost: "github.com",
+      db: null, // cache-less: exactly how main() builds the plan client
+      spawnImpl: async (bin, args) => {
+        calls.push({ bin, args });
+        const r = responses[calls.length - 1];
+        if (r === undefined) throw new Error(`unexpected spawn #${calls.length}: ${bin} ${args.join(" ")}`);
+        return r;
+      },
+      env: { PATH: "/bin" },
+      binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" },
+      tempRoot: root,
+    });
+    const config: Config = {
+      githubHost: "github.com",
+      organizations: ["org-a"], // configured mode: no membership-discovery call
+      excludeOrganizations: [],
+      includePersonalNamespace: false,
+      includeForks: false,
+      includeArchived: false,
+      maxReposPerOrg: null,
+      maxBranchesPerRepo: 25,
+      cutoffDate: "2024-01-01",
+      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [],
+      paths: { sqlitePath: join(root, "never-created.db"), outputDir: root },
+    };
+
+    const totals = await runPlan(client, config, "rvo");
+    expect(totals).toEqual({
+      owners: ["org-a"], ownersSource: "configured",
+      reposDiscovered: 1, reposKept: 1,
+      branchesEligible: 1, branchesSkippedByCutoff: 1, branchesPastCap: 0, discoveryErrors: 0,
+    });
+    // the zero-write contract: no db file, no gitconfig, no pkg-audit-* dir — nothing at all
+    expect(readdirSync(root)).toEqual([]);
+    // discovery is gh-only: no git, no tar, no clone, no content fetch
+    expect(calls.map((c) => c.bin)).toEqual(["/opt/bin/gh", "/opt/bin/gh"]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a branch-discovery failure is counted fail-soft, not fatal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "plan-int2-"));
+    const responses = [
+      { exitCode: 0, stderr: "", stdout: http(200, {}, JSON.stringify([
+        { name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
+      ])) },
+      { exitCode: 1, stderr: "gh: boom", stdout: "" },
+      { exitCode: 1, stderr: "gh: boom", stdout: "" },
+      { exitCode: 1, stderr: "gh: boom", stdout: "" },
+      { exitCode: 1, stderr: "gh: boom", stdout: "" },
+      { exitCode: 1, stderr: "gh: boom", stdout: "" },
+      { exitCode: 1, stderr: "gh: boom", stdout: "" },
+    ];
+    let n = 0;
+    const client = new GithubClient({
+      githubHost: "github.com", db: null,
+      spawnImpl: async () => responses[Math.min(n++, responses.length - 1)]!,
+      sleepImpl: async () => {},
+      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
+    });
+    const config: Config = {
+      githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], includePersonalNamespace: false,
+      includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
+      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
+    };
+    const totals = await runPlan(client, config, "rvo");
+    expect(totals.discoveryErrors).toBe(1);
+    expect(totals.branchesEligible).toBe(0);
+    expect(readdirSync(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("runSummaryText", () => {
+  test("prints the §7 counters with report-matching labels and the fail-soft note", () => {
+    const text = runSummaryText("run-abc", {
+      organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
+      branchesSkippedByCutoff: 13, totalDependencyFindings: 104, totalUsageFindings: 994,
+    }, 3, "output/run-run-abc.json");
+    expect(text).toContain("AUDIT COMPLETE — run run-abc");
+    expect(text).toContain("Organizations scanned:  2");
+    expect(text).toContain("Repositories scanned:   7");
+    expect(text).toContain("Branches scanned:       88 (13 skipped by cutoff)");
+    expect(text).toContain("Dependency findings:    104");
+    expect(text).toContain("Usage findings:         994");
+    expect(text).toContain("Errors recorded:        3 (fail-soft");
+    expect(text).toContain("output/run-run-abc.json (+ latest.json)");
   });
 });
 

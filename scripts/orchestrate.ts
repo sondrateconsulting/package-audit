@@ -21,7 +21,7 @@ import { scanUnit, type TreeEntry, type UnitLocation } from "./unitPipeline.ts";
 import { parseSemver, maxSatisfying } from "./semver.ts";
 import { parseAlias, type DependencyType } from "./manifest.ts";
 import { introspectVersion, fetchPackument, resolveRangeToVersion, type Packument } from "./apiSurface.ts";
-import { emitReport } from "./report.ts";
+import { emitReportDetailed } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
 
 // One structured JSON log line (§6/§8 observability).
@@ -107,9 +107,10 @@ async function main(): Promise<void> {
   logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
 
   // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
-  // this point in plan mode is read-only discovery through a CACHE-LESS client.
+  // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
   if (args.plan) {
-    await runPlan(config, preflight.githubLogin);
+    const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories });
+    await runPlan(planClient, config, preflight.githubLogin);
     return;
   }
 
@@ -171,14 +172,43 @@ async function main(): Promise<void> {
 
     // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at).
     db.completeRun(runId);
-    // §8 step 7: produce the consolidated §7 report (run-<id>.json + latest.json) from SQLite.
+    // §8 step 7: produce the consolidated §7 report (run-<id>.json + latest.json) from SQLite,
+    // then the machine done-event (stdout) and the human summary (stderr) — BOTH derived from
+    // the emitted report object itself, so the three can never disagree.
     const completedRun = db.getRun(runId)!;
-    const reportPath = emitReport(db, completedRun, config.paths.outputDir, { alsoLatest: true });
-    const head = db.read(`SELECT COUNT(*) AS n FROM run_unit_head WHERE run_id = ? AND status='scanned'`).get(runId) as { n: number };
-    logLine({ event: "done", runId, unitsScanned: head.n, report: reportPath });
+    const emitted = emitReportDetailed(db, completedRun, config.paths.outputDir, { alsoLatest: true });
+    const summary = (emitted.report as { summary: ReportSummary; errors: unknown[] }).summary;
+    const errorCount = (emitted.report as { errors: unknown[] }).errors.length;
+    logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount });
+    process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path));
   } finally {
     db.close();
   }
+}
+
+// §8 step 7's "concise human-readable summary": stderr only — stdout stays pure JSONL. The
+// counters are the report's own §7 summary block, labels matching the report field names.
+interface ReportSummary {
+  organizationsScanned: number;
+  repositoriesScanned: number;
+  branchesScanned: number;
+  branchesSkippedByCutoff: number;
+  totalDependencyFindings: number;
+  totalUsageFindings: number;
+}
+export function runSummaryText(runId: string, s: ReportSummary, errorCount: number, reportPath: string): string {
+  return [
+    "",
+    `AUDIT COMPLETE — run ${runId}`,
+    `  Organizations scanned:  ${s.organizationsScanned}`,
+    `  Repositories scanned:   ${s.repositoriesScanned}`,
+    `  Branches scanned:       ${s.branchesScanned} (${s.branchesSkippedByCutoff} skipped by cutoff)`,
+    `  Dependency findings:    ${s.totalDependencyFindings}`,
+    `  Usage findings:         ${s.totalUsageFindings}`,
+    `  Errors recorded:        ${errorCount} (fail-soft; details in the report's errors[])`,
+    `  Report:                 ${reportPath} (+ latest.json)`,
+    "",
+  ].join("\n");
 }
 
 // ---- owner resolution + branch classification (shared by the run and --plan paths) -----------
@@ -477,12 +507,21 @@ async function discoverCliTerms(db: AuditDb, client: GithubClient, config: Confi
 // ---- §8 --plan: preview the scan scope with ZERO writes ---------------------------------------
 // No DB open (so no api_cache reads/writes), no content fetches, no clones, and no registry
 // packument/tarball fetches — preflight's registry REACHABILITY probe (§2.5) is the only registry
-// contact, and it carries no auth beyond the configured header. Discovery runs through a
-// CACHE-LESS client (db: null). `branchesEligible` is the pre-database view: a real run may still
-// skip some of these units as already-current (§3 skip predicate) — that state lives in the DB,
-// which plan mode deliberately never opens.
-async function runPlan(config: Config, personalLogin: string): Promise<void> {
-  const client = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories });
+// contact, and it carries no auth beyond the configured header. The caller passes a CACHE-LESS
+// client (db: null). `branchesEligible` is the pre-database view: a real run may still skip some
+// of these units as already-current (§3 skip predicate) — that state lives in the DB, which plan
+// mode deliberately never opens. Returns the totals (integration-tested with a scripted client).
+export interface PlanTotals {
+  owners: string[];
+  ownersSource: OwnersSource;
+  reposDiscovered: number;
+  reposKept: number;
+  branchesEligible: number;
+  branchesSkippedByCutoff: number;
+  branchesPastCap: number;
+  discoveryErrors: number;
+}
+export async function runPlan(client: GithubClient, config: Config, personalLogin: string): Promise<PlanTotals> {
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 
   let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, discoveryErrors = 0;
@@ -521,16 +560,14 @@ async function runPlan(config: Config, personalLogin: string): Promise<void> {
     }
   }
 
-  const totals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, discoveryErrors };
+  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, discoveryErrors };
   logLine({ event: "plan-summary", ...totals });
   process.stderr.write(planSummaryText(config, totals));
+  return totals;
 }
 
 // The human-facing plan block goes to STDERR so stdout stays pure JSONL for pipes/agents.
-export function planSummaryText(
-  config: Config,
-  t: { owners: string[]; ownersSource: OwnersSource; reposDiscovered: number; reposKept: number; branchesEligible: number; branchesSkippedByCutoff: number; branchesPastCap: number; discoveryErrors: number },
-): string {
+export function planSummaryText(config: Config, t: PlanTotals): string {
   const lines = [
     "",
     "PLAN — preview only: no database opened, nothing scanned, nothing written",

@@ -886,9 +886,11 @@ genuinely non-deterministic sub-tasks.
 - Idiomatic Bun: bun:sqlite, `Bun.$` for shell (gh/git/tar), `Bun.file`/`Bun.write`,
   `Bun.Glob`, native `fetch`, top-level await. A single `gh()` wrapper (github.ts)
   sets `GH_HOST=<githubHost>` on every invocation so no call site can drift.
-- Minimize deps: default to ZERO npm deps. Only add one (e.g., `typescript` for
-  robust .d.ts AST parsing) with a documented justification; never for something Bun
-  provides natively.
+- Minimize deps: default to ZERO npm deps. Add one only with a documented
+  justification; never for something Bun provides natively. Two are currently
+  justified: `typescript` (robust .d.ts AST parsing, §5.E/§5.F) and `zod`
+  (scripts/reportSchema.ts — the §7 report contract as schema-as-docs, `.strict()`
+  + per-field descriptions, validated in TESTS only, never in the emit path).
 - DRY, small pure modules under `./scripts/`:
   config.ts, db.ts, github.ts, manifest.ts, apiSurface.ts, usageScanner.ts,
   cliScanner.ts, permalink.ts, readOnlyGuard.ts, orchestrate.ts, report.ts.
@@ -899,9 +901,14 @@ genuinely non-deterministic sub-tasks.
 - Log one structured JSON line per completed unit of work (observable, greppable).
 
 Entrypoints:
-  bun run scripts/orchestrate.ts [--config <path>] [--fresh] [--purge-cache] \
-                                 [--rescan-branch <org>/<repo>@<branch>]...   # repeatable
-  bun run scripts/report.ts [--run-id <id>]   # default: latest completed run's snapshot
+  bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
+                                 [--rescan-branch <org>/<repo>@<branch>]... [--help]
+    # --plan: preview scope (config validation, preflight, owner resolution, repo+branch
+    #   discovery, would-scan counts) and exit BEFORE the DB is opened — zero writes,
+    #   zero content/registry-artifact fetches. Rejects --fresh/--purge-cache/--rescan-branch.
+  bun run scripts/report.ts [--config <path>] [--run-id <id>] [--help]
+    # default: latest completed run's snapshot (also refreshes latest.json); strict flags —
+    #   unknown/valueless arguments are rejected, never silently defaulted
 
 The wrapper module (github.ts) is the ONLY place `Bun.$` touches `gh`/`git`/`tar`;
 each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
