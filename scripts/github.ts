@@ -361,7 +361,7 @@ export function classifyRest(
       return { kind: "primary", untilMs: Math.max(untilMs, nowMs + 1000) };
     }
     if (headers["x-github-sso"] !== undefined)
-      return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso)" };
+      return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso). Remediate: gh auth refresh (see README § Authentication)" };
     const retryAfter = parseRetryAfterMs(headers["retry-after"], nowMs);
     if (retryAfter !== null) return { kind: "secondary", waitMs: retryAfter };
     if (status === 429 || SECONDARY_BODY_RE.test(body)) return { kind: "secondary", waitMs: null };
@@ -390,7 +390,7 @@ export function classifyGraphql(
   // status BEFORE the RATE_LIMITED body branch, so even a (hypothetical) 403 carrying both an
   // x-github-sso header and a RATE_LIMITED body stays fatal.
   if ((status === 403 || status === 429) && headers["x-github-sso"] !== undefined)
-    return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso)" };
+    return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso). Remediate: gh auth refresh (see README § Authentication)" };
   // §4: GraphQL PRIMARY exhaustion is keyed on the BODY error (arrives as HTTP 200 with
   // errors[].type == 'RATE_LIMITED' and remaining 0) — never on the status code alone.
   const rateLimited = bodyErrors.some((e) => e.type === "RATE_LIMITED");
