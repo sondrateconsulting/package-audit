@@ -676,23 +676,65 @@ describe("temp sweep (§0)", () => {
 
 // ---- the §6 single-chokepoint guarantee (grep-enforced) --------------------------------------
 describe("single chokepoint (grep-enforced)", () => {
-  // NOTE: this test's own titles/strings must not contain the spawn tokens it greps for.
-  test("no file other than github.ts calls the spawn primitives; github.ts has exactly one spawn site", () => {
+  // A best-effort textual tripwire, NOT a semantic proof. It fails on the common direct routes
+  // to a spawn surface — a dotted/optional-chained/whitespaced `Bun.spawn|spawnSync|$`; a
+  // `"bun"`-module import (quote or backtick); `Bun` aliased, parenthesized, bracket-indexed,
+  // or reached via `globalThis.Bun`; `child_process` in any form; and a dynamic import whose
+  // specifier is a bare variable/expression or is built with `+`/`${}`. What it CANNOT catch,
+  // and what the trust dossier therefore does not claim: tokens split across comments, a module
+  // name assembled by other means (`.concat`, char codes), or the Bun global routed through
+  // several intermediate bindings (`const g = globalThis; const b = g.Bun; b.spawn(...)`).
+  // Defense against those deliberately-evasive forms is code review, not this grep. This file
+  // is exempt from the scan — it must name the very tokens it asserts about.
+  test("no file other than github.ts reaches a spawn surface; github.ts has exactly one spawn site", () => {
     // Walk the WHOLE repo (the locked guarantee is repo-wide), skipping only non-code dirs.
     const skip = new Set(["node_modules", ".git", "data", "output"]);
-    const SPAWN_RE = /Bun\.(spawn|spawnSync|\$)/g;
+    // dotted call, tolerating whitespace and optional chaining before the member (Bun?.spawn,
+    // `Bun . spawn`); the captured member is still one of the three primitives, so widening the
+    // separator cannot false-positive on Bun.file/Bun.env/etc.
+    const SPAWN_RE = /Bun\s*\??\s*\.\s*(spawn|spawnSync|\$)/g;
     // node:child_process is another process-launch surface — no file may import or use it.
     const CHILD_PROC_RE = /(?:node:)?child_process|\b(?:execSync|execFileSync|execFile|spawnSync)\b/g;
-    // meta-check: the patterns actually match known spawn forms (guards the test itself)
+    // the same primitives are importable from the plain "bun" module (static, dynamic, or
+    // require form; single-, double-, or backtick-quoted) — no file may import it at all
+    // ("bun:sqlite"/"bun:test" do not match; the quote must hug the bare name).
+    const BUN_MODULE_RE = /(?:from|import|require)\s*\(?\s*["'`]bun["'`]/g;
+    // reaching the primitives without the dotted token: destructuring / `const B = Bun` /
+    // `= (Bun)`, a parenthesized `(Bun)`, computed `Bun[...]` or `Bun?.[...]`, any `["Bun"]`
+    // property access, and the `globalThis.Bun` global. None appear in real code (the tool
+    // always writes `Bun.<member>`).
+    const BUN_INDIRECT_RE = /\bBun\s*(?:\?\.)?\s*\[|=\s*\(?\s*Bun\b(?!\s*\.)|\(\s*Bun\s*\)|\[\s*["']Bun["']\s*\]|globalThis\s*\.\s*Bun\b/g;
+    // a dynamic import/require whose specifier is ASSEMBLED with `+` or `${}` can smuggle the
+    // module name past the literal-token regexes above; literal specifiers stay allowed.
+    const DYN_ASSEMBLY_RE = /\b(?:import|require)\s*\(\s*(?:(["'])[^"'\n]*\1\s*\+|[^)"'`\n]*\+|`[^`\n]*\$\{)/g;
+    // a dynamic import/require whose first specifier char is not a quote/backtick is non-literal
+    // (a variable or expression) — not statically verifiable, so flag it. `\s*` before `(` keeps
+    // parity with DYN_ASSEMBLY_RE (a space, `import (spec)`, must not evade); the only prose that
+    // would otherwise collide (a comment reading `import (word`) was reworded out of the tree.
+    const DYN_NONLITERAL_RE = /\b(?:import|require)\s*\(\s*[^)"'`.\s]/g;
+
+    // meta-checks: the patterns match the spawn forms they must (guards the test itself)…
     expect("Bun.spawn(x); Bun.$`y`".match(SPAWN_RE)?.length).toBe(2);
     expect(`import { execSync } from "node:child_process"`.match(CHILD_PROC_RE)?.length).toBe(2);
+    const trips = (re: RegExp) => (s: string) => expect({ s, hit: (s.match(re) ?? []).length > 0 }).toEqual({ s, hit: true });
+    // …every direct-route evasion surfaced in dual review trips its rule…
+    [`Bun.spawn(c)`, `Bun?.spawn(c)`, `Bun . spawn(c)`, "Bun\n.spawn(c)", `Bun.spawnSync(c)`].forEach(trips(SPAWN_RE));
+    [`import { spawn } from "bun"`, `import { $ } from "bun"`, `await import("bun")`, `require("bun")`, "import(`bun`)"].forEach(trips(BUN_MODULE_RE));
+    [`const { spawn } = Bun;`, `Bun["spawn"](c)`, `Bun?.["spawn"](c)`, `const B = Bun;`, `const B = (Bun);`, `(Bun).spawn(c)`, `(Bun)["spawn"](c)`, `globalThis.Bun.spawn(c)`, `globalThis["Bun"].x`, `const { spawn } = globalThis.Bun;`].forEach(trips(BUN_INDIRECT_RE));
+    [`await import("node:child_" + "process")`, `require("child_" + "process")`, "import(`node:child_${x}`)", `import(prefix + "process")`].forEach(trips(DYN_ASSEMBLY_RE));
+    [`import(spec)`, `require(spec)`, `import( spec )`, `await import (spec)`, `require (spec)`].forEach(trips(DYN_NONLITERAL_RE));
+    // …and the codebase's real legitimate forms trip NOTHING (false-positive guards).
+    const allRe = [SPAWN_RE, CHILD_PROC_RE, BUN_MODULE_RE, BUN_INDIRECT_RE, DYN_ASSEMBLY_RE, DYN_NONLITERAL_RE];
+    for (const s of [`Bun.file(p)`, `const f = Bun.env;`, `Bun.which("gh")`, `new Bun.Glob(g)`, `Bun.gzipSync(b)`, `import { Database } from "bun:sqlite"`, `import { test } from "bun:test"`, `import("expo")`, `require("node:fs")`, `import("./local.ts")`, `a require(...)/import(...) expression`])
+      expect({ s, hits: allRe.reduce((n, re) => n + (s.match(re) ?? []).length, 0) }).toEqual({ s, hits: 0 });
 
     const srcFiles: string[] = [];
     const walk = (dir: string): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         if (entry.isDirectory()) {
           if (!skip.has(entry.name)) walk(join(dir, entry.name));
-        } else if (/\.(ts|tsx|js|mjs|cjs)$/.test(entry.name)) {
+        } else if (/\.(ts|tsx|js|jsx|mts|cts|mjs|cjs)$/.test(entry.name)) {
+          // every extension Bun executes is scanned — .mts/.cts/.jsx must not be a blind spot
           srcFiles.push(join(dir, entry.name));
         }
       }
@@ -701,15 +743,22 @@ describe("single chokepoint (grep-enforced)", () => {
     expect(srcFiles.length).toBeGreaterThanOrEqual(6);
     for (const f of srcFiles) {
       const src = readFileSync(f, "utf8");
-      const bunSpawn = src.match(SPAWN_RE) ?? [];
-      const childProcess = src.match(CHILD_PROC_RE) ?? [];
+      const counts = {
+        bun: (src.match(SPAWN_RE) ?? []).length,
+        cp: (src.match(CHILD_PROC_RE) ?? []).length,
+        bunModule: (src.match(BUN_MODULE_RE) ?? []).length,
+        bunIndirect: (src.match(BUN_INDIRECT_RE) ?? []).length,
+        dynAssembly: (src.match(DYN_ASSEMBLY_RE) ?? []).length,
+        dynNonliteral: (src.match(DYN_NONLITERAL_RE) ?? []).length,
+      };
+      const zero = { bun: 0, cp: 0, bunModule: 0, bunIndirect: 0, dynAssembly: 0, dynNonliteral: 0 };
       if (f.endsWith("scripts/github.ts")) {
-        expect(bunSpawn.length).toBe(1); // the single realSpawn site
-        expect({ file: f, childProcess: childProcess.length }).toEqual({ file: f, childProcess: 0 });
+        // the single realSpawn site; zero on every other surface
+        expect({ file: f, ...counts }).toEqual({ file: f, ...zero, bun: 1 });
       } else if (f.endsWith("scripts/github.test.ts")) {
         // this test file names the patterns in its own assertions — exempt it from the scan
       } else {
-        expect({ file: f, bun: bunSpawn.length, cp: childProcess.length }).toEqual({ file: f, bun: 0, cp: 0 });
+        expect({ file: f, ...counts }).toEqual({ file: f, ...zero });
       }
     }
   });

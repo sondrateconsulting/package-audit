@@ -913,10 +913,16 @@ Entrypoints:
 The wrapper module (github.ts) is the ONLY place `Bun.spawn` touches `gh`/`git`/`tar`;
 each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
 (`assertReadOnlyGh`/`assertReadOnlyGit`/`assertReadOnlyTar`) on the argv ARRAY before
-spawning. Because a test greps the repo to assert NO other file spawns these binaries
-(via `Bun.spawn`/`Bun.spawnSync`/`Bun.$`, and that no code path spawns a
-`PM_DENYLIST` binary), no call site
-can route around the guard — the guard is the single chokepoint, and it enforces the
+spawning. A test greps the repo as a best-effort tripwire asserting NO other file reaches a
+spawn surface (`Bun.spawn`/`Bun.spawnSync`/`Bun.$` — dotted, optional-chained, or whitespaced;
+imported from the `"bun"` module; aliased, parenthesized, bracket-accessed, or reached via
+`globalThis.Bun`), uses `child_process` in any form, imports a dynamic specifier that is a bare
+variable/expression or `+`/`${}`-assembled, or spawns a `PM_DENYLIST` binary. It catches the
+common direct wrapper-bypasses and fails them in CI, but it is a textual lint, not a semantic
+proof: deliberately evasive forms — comment-hidden tokens, a module name assembled by other
+means (`.concat`, char codes), or the Bun global routed through several intermediate bindings — are out of
+its scope (caught by code review). The load-bearing read-only guarantee is the argv allowlist
+below, of which github.ts is the single chokepoint; it enforces the
 read-only allowlist including tar's command-execution options
 (`--checkpoint-action=exec=…`, `--to-command`, `--use-compress-program`/`-I`, `-F`). Every invocation runs with a sanitized env
 (`GH_HOST=<githubHost>`, `GIT_TERMINAL_PROMPT=0`, no pager/prompt/extension
