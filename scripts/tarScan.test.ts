@@ -1,4 +1,8 @@
 import { expect, test, describe } from "bun:test";
+// node:zlib, not Bun.gzipSync/gunzipSync: @types/bun >=1.3 requires Uint8Array<ArrayBuffer>,
+// which neither the tar builders' return type nor scanTarball's gunzip-callback parameter
+// guarantees — and production feeds scanTarball node:zlib via inflateBounded anyway.
+import { gzipSync, gunzipSync } from "node:zlib";
 import { parseTarEntries, validateEntries, scanTarball, type TarEntry } from "./tarScan.ts";
 
 // ---- a minimal tar builder (checksums are not validated by the scanner) --------------------
@@ -347,19 +351,19 @@ describe("scanTarball — gunzip integration", () => {
       { name: "package/", type: "5" },
       { name: "package/package.json", data: data(`{"name":"x"}`) },
     ]);
-    const gz = Bun.gzipSync(tar);
-    const r = scanTarball(gz, (b) => Bun.gunzipSync(b));
+    const gz = gzipSync(tar);
+    const r = scanTarball(gz, (b) => gunzipSync(b));
     expect(r.ok).toBe(true);
     expect(r.entries.map((e) => e.name)).toContain("package/package.json");
   });
   test("a malformed gzip fails closed", () => {
-    const r = scanTarball(new Uint8Array([1, 2, 3, 4]), (b) => Bun.gunzipSync(b));
+    const r = scanTarball(new Uint8Array([1, 2, 3, 4]), (b) => gunzipSync(b));
     expect(r.ok).toBe(false);
     expect(r.reason).toBe("gunzip failed");
   });
   test("a symlink in a gzipped tarball is rejected", () => {
     const tar = buildTar([{ name: "package/evil", type: "2" }]);
-    const r = scanTarball(Bun.gzipSync(tar), (b) => Bun.gunzipSync(b));
+    const r = scanTarball(gzipSync(tar), (b) => gunzipSync(b));
     expect(r.ok).toBe(false);
     expect(r.reason).toContain("disallowed member type");
   });
