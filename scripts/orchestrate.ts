@@ -23,11 +23,7 @@ import { parseAlias, type DependencyType } from "./manifest.ts";
 import { introspectVersion, fetchPackument, resolveRangeToVersion, type Packument } from "./apiSurface.ts";
 import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
-
-// One structured JSON log line (§6/§8 observability).
-function logLine(event: Record<string, unknown>): void {
-  process.stdout.write(JSON.stringify(event) + "\n");
-}
+import { logLine } from "./log.ts";
 
 // ---- per-unit read helpers ------------------------------------------------------------------
 // API reader: SHA-pinned raw fetch (≤100MB) for blob entries; non-blobs (submodule/symlink) and
@@ -363,7 +359,9 @@ async function processUnit(
       const skipKey = `${s.packageName}\0${s.rawSpec}`;
       if (nonRegistrySkipSeen.has(skipKey)) continue;
       nonRegistrySkipSeen.add(skipKey);
-      db.insertError({ runId, scope: "introspection", packageName: s.packageName, version: s.rawSpec, message: `non-registry spec skipped (not introspectable): ${s.rawSpec}` });
+      const skipMessage = `non-registry spec skipped (not introspectable): ${s.rawSpec}`;
+      db.insertError({ runId, scope: "introspection", packageName: s.packageName, version: s.rawSpec, message: skipMessage });
+      logLine({ event: "introspection", packageName: s.packageName, version: s.rawSpec, error: skipMessage });
     }
     db.upsertRunUnitHead({ runId, organization: loc.organization, repository: loc.repository, branch: loc.branch, commitSha: loc.commitSha, status: "scanned" });
 
@@ -400,7 +398,9 @@ interface SliceRow {
   resolved_version_source: string | null;
 }
 
-async function reconcileIntrospection(db: AuditDb, client: GithubClient, config: Config, runId: string, trackedNames: string[]): Promise<void> {
+// Exported for the introspection-observability tests (scripted client + real in-memory DB);
+// main() is its only runtime caller.
+export async function reconcileIntrospection(db: AuditDb, client: GithubClient, config: Config, runId: string, trackedNames: string[]): Promise<void> {
   const rows = db
     .read(
       `SELECT df.organization, df.repository, df.branch, df.commit_sha, df.package_name,
@@ -424,7 +424,9 @@ async function reconcileIntrospection(db: AuditDb, client: GithubClient, config:
     try {
       pk = await fetchPackument({ packageName: pkg, registryUrl: cfg.registryUrl, registryAuthEnvVar: cfg.registryAuthEnvVar });
     } catch (e) {
-      db.insertError({ runId, scope: "introspection", packageName: pkg, message: `packument fetch failed: ${(e as Error).message}` });
+      const message = `packument fetch failed: ${(e as Error).message}`;
+      db.insertError({ runId, scope: "introspection", packageName: pkg, message });
+      logLine({ event: "introspection", packageName: pkg, error: message });
     }
     packumentCache.set(pkg, pk);
     return pk;
@@ -489,7 +491,9 @@ function deriveRange(declaredVersion: string, packageName: string): string | nul
 // by introspecting the package's LATEST published version once. A bin-discovery failure degrades
 // to specifier-only (still correct, just no bin terms). Introspecting one version up front lets
 // every unit's CLI scan run in a single pass (no post-introspection re-scan of files).
-async function discoverCliTerms(db: AuditDb, client: GithubClient, config: Config, runId: string): Promise<CliTermSet[]> {
+// Exported for the introspection-observability tests (scripted client + real in-memory DB);
+// main() is its only runtime caller.
+export async function discoverCliTerms(db: AuditDb, client: GithubClient, config: Config, runId: string): Promise<CliTermSet[]> {
   const sets: CliTermSet[] = [];
   for (const pkg of config.packages) {
     let binNames: string[] = [];
@@ -507,7 +511,9 @@ async function discoverCliTerms(db: AuditDb, client: GithubClient, config: Confi
         binNames = bins.map((b) => b.export_name).filter((b) => b !== "");
       }
     } catch (e) {
-      db.insertError({ runId, scope: "introspection", packageName: pkg.name, message: `bin discovery failed: ${(e as Error).message}` });
+      const message = `bin discovery failed: ${(e as Error).message}`;
+      db.insertError({ runId, scope: "introspection", packageName: pkg.name, message });
+      logLine({ event: "introspection", packageName: pkg.name, error: message });
     }
     sets.push({ packageName: pkg.name, name: pkg.name, binNames });
   }
@@ -581,7 +587,9 @@ export async function runPlan(client: GithubClient, config: Config, personalLogi
 }
 
 // The human-facing plan block goes to STDERR so stdout stays pure JSONL for pipes/agents.
-export function planSummaryText(config: Config, t: PlanTotals): string {
+// The param names only the three config fields the text actually reads (interface segregation —
+// tests can pass the narrow literal instead of forging a full Config).
+export function planSummaryText(config: Pick<Config, "cutoffDate" | "maxBranchesPerRepo" | "packages">, t: PlanTotals): string {
   const lines = [
     "",
     "PLAN — preview only: no database opened, nothing scanned, nothing written",

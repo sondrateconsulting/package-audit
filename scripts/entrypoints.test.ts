@@ -105,7 +105,10 @@ async function inFixture(fx: { binDir: string; cwdDir: string }, fn: () => Promi
     await fn();
   } finally {
     globalThis.fetch = prevFetch;
-    process.env.PATH = prevPath;
+    // restore ABSENCE too: assigning undefined coerces to the string "undefined" on node and
+    // leaves a present-but-undefined key on bun — neither is the pre-test state
+    if (prevPath === undefined) delete process.env.PATH;
+    else process.env.PATH = prevPath;
     process.chdir(prevCwd);
   }
 }
@@ -130,48 +133,53 @@ describe("entrypoint --help (both binaries, in-process)", () => {
 describe("orchestrate main() --plan (offline shims — the zero-write early return)", () => {
   test("plan mode runs preflight + discovery, ends at plan-summary, and touches NOTHING", async () => {
     const fx = makeFixture();
-    const tmpBefore = new Set(readdirSync(realpathSync(tmpdir())).filter((n) => n.startsWith("pkg-audit-")));
+    try {
+      const tmpBefore = new Set(readdirSync(realpathSync(tmpdir())).filter((n) => n.startsWith("pkg-audit-")));
 
-    const { out, err } = await captureStreams(() =>
-      inFixture(fx, () => orchestrateMain(["--plan", "--config", fx.configPath])),
-    );
+      const { out, err } = await captureStreams(() =>
+        inFixture(fx, () => orchestrateMain(["--plan", "--config", fx.configPath])),
+      );
 
-    // stdout is PURE JSONL, and the dispatch stopped at the plan summary — nothing after it
-    const events = out.split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
-    expect(events.map((e) => e["event"])).toEqual(["config", "preflight", "owners", "plan-summary"]);
-    const summary = events[3]!;
-    expect(summary["owners"]).toEqual(["pkg-audit-test-org-that-cannot-exist"]);
-    expect(summary["reposDiscovered"]).toBe(0);
-    expect(summary["discoveryErrors"]).toBe(0);
-    expect(events[1]!["login"]).toBe("tester"); // preflight really ran against the shims
-    expect(err).toContain("PLAN — preview only");
+      // stdout is PURE JSONL, and the dispatch stopped at the plan summary — nothing after it
+      const events = out.split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(events.map((e) => e["event"])).toEqual(["config", "preflight", "owners", "plan-summary"]);
+      const summary = events[3]!;
+      expect(summary["owners"]).toEqual(["pkg-audit-test-org-that-cannot-exist"]);
+      expect(summary["reposDiscovered"]).toBe(0);
+      expect(summary["discoveryErrors"]).toBe(0);
+      expect(events[1]!["login"]).toBe("tester"); // preflight really ran against the shims
+      expect(err).toContain("PLAN — preview only");
 
-    // §0 zero-write, at the process level: the cwd tree is EXACTLY the two empty roots it
-    // started with — no data/audit.db (the DB never opened), no output artifacts, no strays.
-    expect(readdirSync(fx.cwdDir).sort()).toEqual(["data", "output"]);
-    expect(readdirSync(join(fx.cwdDir, "data"))).toEqual([]);
-    expect(readdirSync(join(fx.cwdDir, "output"))).toEqual([]);
-    // ... and no pkg-audit-* temp dirs appeared (the git probe runs config-less by design)
-    const tmpAfter = readdirSync(realpathSync(tmpdir())).filter((n) => n.startsWith("pkg-audit-"));
-    expect(tmpAfter.filter((n) => !tmpBefore.has(n))).toEqual([]);
-
-    rmSync(fx.root, { recursive: true, force: true });
+      // §0 zero-write, at the process level: the cwd tree is EXACTLY the two empty roots it
+      // started with — no data/audit.db (the DB never opened), no output artifacts, no strays.
+      expect(readdirSync(fx.cwdDir).sort()).toEqual(["data", "output"]);
+      expect(readdirSync(join(fx.cwdDir, "data"))).toEqual([]);
+      expect(readdirSync(join(fx.cwdDir, "output"))).toEqual([]);
+      // ... and no pkg-audit-* temp dirs appeared (the git probe runs config-less by design)
+      const tmpAfter = readdirSync(realpathSync(tmpdir())).filter((n) => n.startsWith("pkg-audit-"));
+      expect(tmpAfter.filter((n) => !tmpBefore.has(n))).toEqual([]);
+    } finally {
+      rmSync(fx.root, { recursive: true, force: true });
+    }
   });
 });
 
 describe("report main() wiring (missing DB stays a no-op through the real entrypoint)", () => {
   test("report before any audit prints the notReportable notice and touches NOTHING", async () => {
     const fx = makeFixture();
-    const { out, err } = await captureStreams(() =>
-      inFixture(fx, () => reportMain(["--config", fx.configPath])),
-    );
-    const notice = JSON.parse(out.trim()) as Record<string, unknown>;
-    expect(notice["notReportable"]).toBe(true);
-    expect(String(notice["reason"])).toContain("run `bun run audit` first");
-    expect(err).toBe("");
-    expect(readdirSync(fx.cwdDir).sort()).toEqual(["data", "output"]);
-    expect(readdirSync(join(fx.cwdDir, "data"))).toEqual([]);
-    expect(readdirSync(join(fx.cwdDir, "output"))).toEqual([]);
-    rmSync(fx.root, { recursive: true, force: true });
+    try {
+      const { out, err } = await captureStreams(() =>
+        inFixture(fx, () => reportMain(["--config", fx.configPath])),
+      );
+      const notice = JSON.parse(out.trim()) as Record<string, unknown>;
+      expect(notice["notReportable"]).toBe(true);
+      expect(String(notice["reason"])).toContain("run `bun run audit` first");
+      expect(err).toBe("");
+      expect(readdirSync(fx.cwdDir).sort()).toEqual(["data", "output"]);
+      expect(readdirSync(join(fx.cwdDir, "data"))).toEqual([]);
+      expect(readdirSync(join(fx.cwdDir, "output"))).toEqual([]);
+    } finally {
+      rmSync(fx.root, { recursive: true, force: true });
+    }
   });
 });

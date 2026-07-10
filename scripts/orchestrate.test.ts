@@ -2,12 +2,22 @@ import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyBranchPlan, discoverOwnerRepos, planSummaryText, processRepo, runPlan, runSummaryText } from "./orchestrate.ts";
-import { GithubClient, type BranchHead, type RepoInfo } from "./github.ts";
-import { AuditDb, type WorkUnitKey } from "./db.ts";
+import { classifyBranchPlan, discoverCliTerms, discoverOwnerRepos, planSummaryText, processRepo, reconcileIntrospection, runPlan, runSummaryText } from "./orchestrate.ts";
+import { GithubClient, type BranchHead, type RepoInfo, type SpawnFn } from "./github.ts";
+import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import type { Config } from "./config.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
+
+// Scripted client factory — every test client shares this boilerplate (offline binPaths, noop
+// sleep, tempRoot under the test dir) and differs ONLY in its spawn script and cache role.
+function makeClient(root: string, spawnImpl: SpawnFn, opts: { db?: AuditDb | null } = {}): GithubClient {
+  return new GithubClient({
+    githubHost: "github.com", db: opts.db ?? null, spawnImpl,
+    sleepImpl: async () => {},
+    env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
+  });
+}
 
 describe("classifyBranchPlan (§5.B cutoff + cap)", () => {
   test("splits cutoff-skipped, eligible, and past-cap preserving input order", () => {
@@ -64,18 +74,12 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       } } } })) },
     ];
     const calls: Array<{ bin: string; args: string[] }> = [];
-    const client = new GithubClient({
-      githubHost: "github.com",
-      db: null, // cache-less: exactly how main() builds the plan client
-      spawnImpl: async (bin, args) => {
-        calls.push({ bin, args });
-        const r = responses[calls.length - 1];
-        if (r === undefined) throw new Error(`unexpected spawn #${calls.length}: ${bin} ${args.join(" ")}`);
-        return r;
-      },
-      env: { PATH: "/bin" },
-      binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" },
-      tempRoot: root,
+    // cache-less (db: null): exactly how main() builds the plan client
+    const client = makeClient(root, async (bin, args) => {
+      calls.push({ bin, args });
+      const r = responses[calls.length - 1];
+      if (r === undefined) throw new Error(`unexpected spawn #${calls.length}: ${bin} ${args.join(" ")}`);
+      return r;
     });
     const config: Config = {
       githubHost: "github.com",
@@ -120,12 +124,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       { exitCode: 1, stderr: "gh: boom", stdout: "" },
     ];
     let n = 0;
-    const client = new GithubClient({
-      githubHost: "github.com", db: null,
-      spawnImpl: async () => responses[Math.min(n++, responses.length - 1)]!,
-      sleepImpl: async () => {},
-      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
-    });
+    const client = makeClient(root, async () => responses[Math.min(n++, responses.length - 1)]!);
     const config: Config = {
       githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], includePersonalNamespace: false,
       includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
@@ -170,12 +169,8 @@ describe("runPlan cache-less client guard (§8 --plan zero-write)", () => {
     const root = mkdtempSync(join(tmpdir(), "plan-guard-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     let spawns = 0;
-    const client = new GithubClient({
-      githubHost: "github.com", db, // WRONG client for plan mode: it would cache into the DB
-      spawnImpl: async () => { spawns++; return { exitCode: 1, stderr: "never reached", stdout: "" }; },
-      sleepImpl: async () => {},
-      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
-    });
+    // WRONG client for plan mode: it would cache into the DB
+    const client = makeClient(root, async () => { spawns++; return { exitCode: 1, stderr: "never reached", stdout: "" }; }, { db });
     await expect(runPlan(client, testConfig(root), "rvo")).rejects.toThrow(/cache-less/);
     expect(spawns).toBe(0); // the guard fires before owner resolution / any gh call
     db.close();
@@ -191,12 +186,7 @@ describe("processRepo discovery-failure observability (fail-soft, README log voc
       configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
-    const client = new GithubClient({
-      githubHost: "github.com", db: null,
-      spawnImpl: async () => ({ exitCode: 1, stderr: "gh: boom", stdout: "" }),
-      sleepImpl: async () => {},
-      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
-    });
+    const client = makeClient(root, async () => ({ exitCode: 1, stderr: "gh: boom", stdout: "" }));
     const repo: RepoInfo = { name: "svc", organization: "org-a", defaultBranch: "main", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
 
     const events = await captureJsonl(async () => {
@@ -229,12 +219,7 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
     const root = mkdtempSync(join(tmpdir(), "own-disc-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startRun(db);
-    const client = new GithubClient({
-      githubHost: "github.com", db: null,
-      spawnImpl: async () => ({ exitCode: 1, stderr: "gh: boom", stdout: "" }),
-      sleepImpl: async () => {},
-      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
-    });
+    const client = makeClient(root, async () => ({ exitCode: 1, stderr: "gh: boom", stdout: "" }));
 
     let kept: unknown;
     const events = await captureJsonl(async () => {
@@ -261,19 +246,14 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startRun(db);
     // route by args, not call order, so retry counts can't skew the script
-    const client = new GithubClient({
-      githubHost: "github.com", db: null,
-      spawnImpl: async (_bin, args) => {
+    const client = makeClient(root, async (_bin, args) => {
         const joined = args.join(" ");
         if (joined.includes("org-a")) return { exitCode: 1, stderr: "gh: boom", stdout: "" };
         return { exitCode: 0, stderr: "", stdout: http(200, JSON.stringify([
           { name: "svc", owner: { login: "org-b" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
           { name: "old", owner: { login: "org-b" }, default_branch: "main", pushed_at: "2024-01-01T00:00:00Z", archived: true, fork: false, private: false },
         ])) };
-      },
-      sleepImpl: async () => {},
-      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
-    });
+      });
 
     const events = await captureJsonl(async () => {
       const keptA = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-a", false);
@@ -291,15 +271,10 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startRun(db);
     const calls: string[][] = [];
-    const client = new GithubClient({
-      githubHost: "github.com", db: null,
-      spawnImpl: async (_bin, args) => {
+    const client = makeClient(root, async (_bin, args) => {
         calls.push(args);
         return { exitCode: 0, stderr: "", stdout: http(200, "[]") };
-      },
-      sleepImpl: async () => {},
-      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
-    });
+      });
 
     const kept = await discoverOwnerRepos(db, client, testConfig(root), runId, "rvo", true);
     expect(kept).toEqual([]);
@@ -310,6 +285,79 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
   });
 });
 
+describe("introspection-failure observability (fail-soft, README log vocabulary)", () => {
+  const startRun = (db: AuditDb): string =>
+    db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    }).runId;
+  const failingFetch = (async () => {
+    throw new Error("registry down");
+  }) as unknown as typeof fetch;
+
+  test("a bin-discovery failure emits a JSONL introspection event AND the DB error row, degrading to specifier-only", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cli-terms-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const client = makeClient(root, async () => { throw new Error("no spawn expected"); });
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = failingFetch; // fetchPackument rides global fetch
+    try {
+      const events = await captureJsonl(async () => {
+        const sets = await discoverCliTerms(db, client, testConfig(root), runId);
+        expect(sets).toEqual([{ packageName: "expo", name: "expo", binNames: [] }]); // fail-soft: specifier-only
+      });
+      const ev = events.find((e) => e["event"] === "introspection");
+      expect(ev).toBeDefined();
+      expect(ev?.["packageName"]).toBe("expo");
+      expect(String(ev?.["error"])).toContain("bin discovery failed");
+      const row = db.read(`SELECT scope, package_name, message FROM errors WHERE run_id = ?`).get(runId) as { scope: string; package_name: string; message: string };
+      expect(row.scope).toBe("introspection");
+      expect(row.package_name).toBe("expo");
+      expect(row.message).toContain("bin discovery failed");
+    } finally {
+      globalThis.fetch = prevFetch;
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a packument-fetch failure during reconciliation emits the event AND the row; reconciliation completes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "reconcile-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const now = nowIso();
+    const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned" });
+    // no lockfile + unresolved registry range → the §5.E range-resolution path needs the packument
+    db.upsertDependencyFinding({
+      runId, ...unit, dateFetched: now, packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
+      manifestPath: "package.json", manifestLine: 5, manifestPermalink: "https://github.com/org-a/svc/blob/abc123def/package.json#L5",
+      declaredVersion: "^50.0.0", lockfilePath: null, lockfileKind: null, lockfileLines: null, lockfilePermalink: null,
+      resolvedVersion: null, resolvedVersionSource: null,
+    });
+    const client = makeClient(root, async () => { throw new Error("no spawn expected"); });
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = failingFetch;
+    try {
+      const events = await captureJsonl(async () => {
+        await reconcileIntrospection(db, client, testConfig(root), runId, ["expo"]); // must not throw
+      });
+      const ev = events.find((e) => e["event"] === "introspection");
+      expect(ev).toBeDefined();
+      expect(ev?.["packageName"]).toBe("expo");
+      expect(String(ev?.["error"])).toContain("packument fetch failed");
+      const row = db.read(`SELECT scope, package_name, message FROM errors WHERE run_id = ?`).get(runId) as { scope: string; package_name: string; message: string };
+      expect(row.scope).toBe("introspection");
+      expect(row.message).toContain("packument fetch failed");
+    } finally {
+      globalThis.fetch = prevFetch;
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("runPlan org-level discovery failure (fail-soft continue)", () => {
   const http = (status: number, body: string): string => `HTTP/2.0 ${status} X\r\n\r\n${body}`;
 
@@ -317,9 +365,7 @@ describe("runPlan org-level discovery failure (fail-soft continue)", () => {
     const root = mkdtempSync(join(tmpdir(), "plan-orgfail-"));
     // route by args, not call order, so retry counts can't skew the script:
     // org-a REST repo listing always fails; org-b succeeds; GraphQL (branch heads) succeeds.
-    const client = new GithubClient({
-      githubHost: "github.com", db: null,
-      spawnImpl: async (_bin, args) => {
+    const client = makeClient(root, async (_bin, args) => {
         const joined = args.join(" ");
         if (joined.includes("graphql")) {
           return { exitCode: 0, stderr: "", stdout: http(200, JSON.stringify({ data: { repository: { refs: {
@@ -331,10 +377,7 @@ describe("runPlan org-level discovery failure (fail-soft continue)", () => {
         return { exitCode: 0, stderr: "", stdout: http(200, JSON.stringify([
           { name: "svc", owner: { login: "org-b" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
         ])) };
-      },
-      sleepImpl: async () => {},
-      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
-    });
+      });
     const config = { ...testConfig(root), organizations: ["org-a", "org-b"] };
 
     let totals: Awaited<ReturnType<typeof runPlan>> | undefined;
@@ -372,17 +415,12 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     db.enqueueUnit(key("main"), runId);
     db.setUnitStatus(key("main"), { status: "done", runId, lastCommitSha: "o-main", lastCommitDate: "2025-06-01T00:00:00Z" });
 
-    const client = new GithubClient({
-      githubHost: "github.com", db: null,
-      // heads arrive newest-first; cap=1 → main eligible(current), dev past-cap, stale pre-cutoff
-      spawnImpl: async () => ({ exitCode: 0, stderr: "", stdout: graphqlHeads([
+    const client = // heads arrive newest-first; cap=1 → main eligible(current), dev past-cap, stale pre-cutoff
+    makeClient(root, async () => ({ exitCode: 0, stderr: "", stdout: graphqlHeads([
         { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
         { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
         { name: "stale", oid: "o-stale", date: "2023-06-01T00:00:00Z" },
-      ]) }),
-      sleepImpl: async () => {},
-      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
-    });
+      ]) }));
     const repo: RepoInfo = { name: "svc", organization: "org-a", defaultBranch: "main", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
 
     const events = await captureJsonl(async () => {
@@ -426,11 +464,11 @@ describe("runSummaryText", () => {
 });
 
 describe("planSummaryText", () => {
-  const config = {
+  const config: Parameters<typeof planSummaryText>[0] = {
     cutoffDate: "2024-01-01",
     maxBranchesPerRepo: 25,
     packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
-  } as unknown as Parameters<typeof planSummaryText>[0];
+  };
 
   test("names the counts, the cutoff, the packages, and the no-writes guarantee", () => {
     const text = planSummaryText(config, {

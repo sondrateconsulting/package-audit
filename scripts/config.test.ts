@@ -250,14 +250,17 @@ describe("config.schema.json ↔ runtime sync", () => {
   const schema = JSON.parse(readFileSync(join(repoRoot, "config.schema.json"), "utf8")) as Record<string, any>;
   const committedConfig = JSON.parse(readFileSync(join(repoRoot, "config.json"), "utf8")) as Record<string, unknown>;
 
+  // The ONE keyword allowlist both the value-checker and the schema-only walk trust — a new
+  // schema keyword must be added here (and taught to the checker) exactly once.
+  const KNOWN_SCHEMA_KEYWORDS = new Set(["$schema", "$id", "title", "description", "type", "properties", "required", "additionalProperties", "items", "minItems", "minimum", "minLength", "pattern", "format", "default"]);
+
   // Minimal JSON-Schema-subset checker covering exactly the features config.schema.json uses:
   // type (string | union incl. "null"), properties/required/additionalProperties:false, items,
   // minItems, minimum, minLength, pattern. Fails the test on any schema feature it doesn't know.
   // `format` is recognized but deliberately NOT enforced (annotation-only in JSON Schema; the
   // real-calendar-date check is runtime-enforced in validateAndNormalize).
   function check(value: unknown, node: Record<string, any>, path: string, violations: string[]): void {
-    const KNOWN = new Set(["$schema", "$id", "title", "description", "type", "properties", "required", "additionalProperties", "items", "minItems", "minimum", "minLength", "pattern", "format", "default"]);
-    for (const k of Object.keys(node)) if (!KNOWN.has(k)) violations.push(`${path}: unsupported schema keyword '${k}' — extend the test checker`);
+    for (const k of Object.keys(node)) if (!KNOWN_SCHEMA_KEYWORDS.has(k)) violations.push(`${path}: unsupported schema keyword '${k}' — extend the test checker`);
     const types: string[] = Array.isArray(node["type"]) ? node["type"] : node["type"] !== undefined ? [node["type"]] : [];
     const jsType = value === null ? "null" : Array.isArray(value) ? "array" : typeof value === "number" && Number.isInteger(value) ? "integer" : typeof value;
     if (types.length > 0 && !types.includes(jsType) && !(jsType === "integer" && types.includes("number")))
@@ -300,10 +303,9 @@ describe("config.schema.json ↔ runtime sync", () => {
     expect(bad3.some((v) => v.includes("does not match"))).toBe(true);
   });
   test("every schema node uses only keywords the checker understands (schema-only walk)", () => {
-    const KNOWN = new Set(["$schema", "$id", "title", "description", "type", "properties", "required", "additionalProperties", "items", "minItems", "minimum", "minLength", "pattern", "format", "default"]);
     const unknownKeywords: string[] = [];
     const walk = (node: Record<string, any>, path: string): void => {
-      for (const k of Object.keys(node)) if (!KNOWN.has(k)) unknownKeywords.push(`${path}: ${k}`);
+      for (const k of Object.keys(node)) if (!KNOWN_SCHEMA_KEYWORDS.has(k)) unknownKeywords.push(`${path}: ${k}`);
       for (const [name, child] of Object.entries((node["properties"] ?? {}) as Record<string, any>)) walk(child, `${path}.${name}`);
       if (node["items"] !== undefined) walk(node["items"], `${path}[]`);
     };

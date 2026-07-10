@@ -31,7 +31,8 @@ export class GithubApiError extends Error {
 // Retryable throttle that outlived the wrapper's internal wait+retry budget (§4). The wrapper
 // already slept through every window it was told about, so the orchestrator does NOT re-queue
 // in-run: a mid-scan exhaustion marks that unit `error` (retried by the NEXT invocation — the
-// §3 skip predicate only skips current `done` units) and an owner-resolution exhaustion aborts
+// §3 skip predicate only skips current `done` units); a discovery-time exhaustion is recorded
+// fail-soft as a discovery error row + JSONL event; and an owner-resolution exhaustion aborts
 // the run as an operator-rendered fatal (cliErrors.ts) — the remediation is time, then re-run.
 export class ThrottleExhausted extends Error {
   readonly endpoint: string;

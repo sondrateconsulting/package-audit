@@ -30,11 +30,11 @@ function seed(db: AuditDb) {
   });
   db.upsertUsageFinding({
     runId, ...unit, packageName: "expo", dependencyKey: "expo", usageType: "named-import", exportName: "registerRootComponent",
-    context: "", filePath: "src/index.ts", lineNumber: 1, permalink: "p", snippet: "import { registerRootComponent } from 'expo';", foundAt: now,
+    context: "", filePath: "src/index.ts", lineNumber: 1, permalink: "https://github.com/org-a/svc/blob/abc123def/src/index.ts#L1", snippet: "import { registerRootComponent } from 'expo';", foundAt: now,
   });
   db.upsertUsageFinding({
     runId, ...unit, packageName: "expo", dependencyKey: "", usageType: "cli", exportName: "",
-    context: "scripts.start", filePath: "package.json", lineNumber: 7, permalink: "p2", snippet: "\"start\": \"expo start\"", foundAt: now,
+    context: "scripts.start", filePath: "package.json", lineNumber: 7, permalink: "https://github.com/org-a/svc/blob/abc123def/package.json#L7", snippet: "\"start\": \"expo start\"", foundAt: now,
   });
   db.writeApiSurface({ packageName: "expo", version: "50.0.7", versionSource: "lockfile", rows: [
     { exportName: "registerRootComponent", exportKind: "named", source: "index.d.ts" },
@@ -163,21 +163,54 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
     db.close();
   });
 
+  test("schema strength: an apiSurface key NOT in versionsSeen is rejected (the documented subset invariant)", () => {
+    const db = mem();
+    const run = seed(db);
+    const drifted = structuredClone(buildReport(db, run)) as any;
+    drifted.packages[0].apiSurface["99.99.99"] = drifted.packages[0].apiSurface["50.0.7"];
+    expect(reportSchema.safeParse(drifted).success).toBe(false);
+    db.close();
+  });
+  test("schema strength: a non-canonical generatedAt is rejected", () => {
+    const db = mem();
+    const run = seed(db);
+    const drifted = structuredClone(buildReport(db, run)) as any;
+    drifted.generatedAt = "2026-07-09 12:00:00"; // space form — not the nowIso canonical shape
+    expect(reportSchema.safeParse(drifted).success).toBe(false);
+    db.close();
+  });
+  test("schema strength: a permalink that is not a commit-pinned https blob link is rejected", () => {
+    const db = mem();
+    const run = seed(db);
+    const drifted = structuredClone(buildReport(db, run)) as any;
+    drifted.packages[0].usageByRepo[0].apiUsage[0].permalink = "http://evil.example/x";
+    expect(reportSchema.safeParse(drifted).success).toBe(false);
+    db.close();
+  });
+
   test("no production module imports reportSchema or zod — schema validation stays test-only (source scan)", () => {
     // §7 determinism guarantee: a schema bug must never be able to fail a completed scan's
     // report write, so validation runs in tests only. This scan keeps that comment TRUE the
     // same way the Bun-spawn chokepoint and cliErrors registry scans guard their invariants.
     // TYPE-ONLY imports are banned too — compile-time coupling invites runtime use later.
-    const BANNED_SPECIFIER = /(?:from\s*|require\s*\(\s*|import\s*\(\s*|import\s+)["'`](?:zod|\.\/reportSchema(?:\.ts)?)["'`]/;
+    // The specifier alternative covers any relative depth (./ ../ ../../) so a future subdir
+    // layout can't slip a nested `../reportSchema` past the scan; the walk recurses for the
+    // same reason.
+    const BANNED_SPECIFIER = /(?:from\s*|require\s*\(\s*|import\s*\(\s*|import\s+)["'`](?:zod|(?:\.\.?\/)+reportSchema(?:\.ts)?)["'`]/;
     const offenders: string[] = [];
-    for (const file of readdirSync(import.meta.dir)) {
-      if (!file.endsWith(".ts") || file.endsWith(".test.ts") || file === "reportSchema.ts") continue;
-      const src = readFileSync(join(import.meta.dir, file), "utf8");
-      if (BANNED_SPECIFIER.test(src)) offenders.push(file);
+    for (const rel of readdirSync(import.meta.dir, { recursive: true }).map(String)) {
+      if (!rel.endsWith(".ts") || rel.endsWith(".test.ts") || rel.endsWith("reportSchema.ts")) continue;
+      const src = readFileSync(join(import.meta.dir, rel), "utf8");
+      if (BANNED_SPECIFIER.test(src)) offenders.push(rel);
     }
     expect(offenders).toEqual([]);
-    // positive control — the scan's regex does trip on a real zod import: reportSchema's own
-    expect(BANNED_SPECIFIER.test(readFileSync(join(import.meta.dir, "reportSchema.ts"), "utf8"))).toBe(true);
+    // positive controls — the regex trips on every import form it must catch…
+    expect(BANNED_SPECIFIER.test(readFileSync(join(import.meta.dir, "reportSchema.ts"), "utf8"))).toBe(true); // real zod import
+    expect(BANNED_SPECIFIER.test('import type { X } from "../reportSchema.ts";')).toBe(true); // nested + type-only
+    expect(BANNED_SPECIFIER.test('const s = require("./reportSchema");')).toBe(true);
+    expect(BANNED_SPECIFIER.test('await import("zod");')).toBe(true);
+    // …and stays quiet on prose that merely mentions the module
+    expect(BANNED_SPECIFIER.test("// the contract lives in reportSchema.ts and is enforced in tests")).toBe(false);
   });
 });
 

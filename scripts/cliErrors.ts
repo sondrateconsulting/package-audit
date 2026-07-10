@@ -1,11 +1,14 @@
 // cliErrors.ts — shared fatal-error rendering for the two entrypoints (§8). KNOWN operator-facing
 // failures (bad flags, invalid config, failed preflight, exhausted throttles, guard violations, …)
-// print their actionable message WITHOUT a stack trace — the message already carries the
-// remediation, and a stack makes an expected condition read as a crash. Anything else is a
+// print their message WITHOUT a stack trace — a stack makes an expected condition read as a
+// crash. Most of these messages carry their remediation directly (auth/SSO/config/preflight/
+// throttle); the rest are concise diagnostics — e.g. GithubApiError's HTTP/parse failures name
+// the status and endpoint — where a stack would add noise, not action. Anything else is a
 // genuine bug and keeps the full stack for the report.
 
 // Matched by error.name (survives module boundaries and subclassing quirks). Every class here is
-// thrown with a human-actionable message by design.
+// operator-facing by design: an expected failure of the run's preconditions or environment,
+// rendered message-only.
 export const KNOWN_OPERATOR_ERRORS: ReadonlySet<string> = new Set([
   "ArgsError", // args.ts
   "ConfigError", // config.ts
@@ -30,7 +33,7 @@ export function isKnownOperatorError(e: unknown): e is Error {
 
 // Render a fatal error for stderr. `usage` is the entrypoint's one-line usage synopsis — appended
 // only for argument errors, where "what are my options" is the actual question; other known
-// failures already end with their remediation and get the message alone.
+// failures get the message alone.
 export function renderFatal(e: unknown, opts: { command: string; usage: string }): string {
   if (isKnownOperatorError(e)) {
     const usageHint = e.name === "ArgsError" ? `${opts.usage}\nRun with --help for details.\n` : "";

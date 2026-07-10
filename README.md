@@ -22,7 +22,7 @@ Checked at startup with actionable errors (nothing here is silently assumed):
 ```sh
 git clone git@github.com:sondrateconsulting/package-audit.git
 cd package-audit
-bun install   # required: `typescript` powers the .d.ts/source scanners at runtime; `zod` backs the report schema
+bun install   # required: `typescript` powers the .d.ts/source scanners at runtime; dev-only `zod` backs the report-schema tests
 ```
 
 ## Quickstart
@@ -70,9 +70,9 @@ Every field is documented in [config.schema.json](config.schema.json) (your edit
 
 ## Reading a run
 
-**stdout is pure JSONL** — one structured event per line, safe to pipe. Vocabulary: `config`, `preflight`, `owners`, `run`, `rescan-branch`, `cli-terms`, `plan`, `plan-summary`, `unit` (actions `scanned`, `skip-current`, `skip-cutoff`, `error`), `discovery`, `done`.
+**stdout is pure JSONL** — one structured event per line, safe to pipe. Vocabulary: `config`, `preflight`, `owners`, `run`, `rescan-branch`, `cli-terms`, `plan`, `plan-summary`, `unit` (actions `scanned`, `skip-current`, `skip-cutoff`, `error`), `discovery`, `introspection`, `done`.
 
-**Mid-run `"action":"error"` and `"event":"discovery"` lines are fail-soft**: the failure (a branch scan, or a repo/branch listing for one owner) is recorded in the report's `errors` array and the run continues — one unreachable repo never kills an org-wide audit. Org-scoped `discovery` lines (a whole owner's repo listing failed) carry no `repo` field; branch-scoped ones do. The human-readable end-of-run summary prints to **stderr**.
+**Mid-run `"action":"error"`, `"event":"discovery"`, and `"event":"introspection"` lines are fail-soft**: the failure (a branch scan, a repo/branch listing for one owner, or a registry packument/tarball/bin-discovery step for one package version) is recorded in the report's `errors` array and the run continues — one unreachable repo or registry hiccup never kills an org-wide audit. Org-scoped `discovery` lines (a whole owner's repo listing failed) carry no `repo` field; branch-scoped ones do. `introspection` lines are package-scoped (`packageName`, plus `version` when the failure is version-specific). The human-readable end-of-run summary prints to **stderr**.
 
 ## Report anatomy
 

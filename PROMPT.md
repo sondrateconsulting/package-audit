@@ -892,7 +892,7 @@ genuinely non-deterministic sub-tasks.
 - Minimize deps: default to ZERO npm deps. Add one only with a documented
   justification; never for something Bun provides natively. Two are currently
   justified: `typescript` (robust .d.ts AST parsing, §5.E/§5.F) and `zod`
-  (scripts/reportSchema.ts — the §7 report contract as schema-as-docs, `.strict()`
+  (a devDependency — scripts/reportSchema.ts, the §7 report contract as schema-as-docs, `.strict()`
   + per-field descriptions, validated in TESTS only, never in the emit path).
 - DRY, small pure modules under `./scripts/`:
   config.ts, db.ts, github.ts, manifest.ts, apiSurface.ts, usageScanner.ts,

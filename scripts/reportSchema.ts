@@ -4,11 +4,11 @@
 // Validation runs in TESTS (report.test.ts), never in the emit path — a schema bug must not be
 // able to fail a completed scan's report write (§7 determinism).
 //
-// DEPENDENCY JUSTIFICATION (§6 — minimize deps): zod is the repo's second npm dependency
-// (after `typescript`, used for .d.ts AST parsing). Justification: a schema-as-docs contract for
-// the report consumed by downstream tooling, with validation errors that name the failing path —
-// hand-rolling that (or maintaining prose docs against a moving shape) is strictly worse. zod v4
-// is dependency-free and pinned exactly.
+// DEPENDENCY JUSTIFICATION (§6 — minimize deps): zod is the repo's second npm package — a
+// devDependency, test-only (`typescript`, used for .d.ts AST parsing, is the sole runtime dep).
+// Justification: a schema-as-docs contract for the report consumed by downstream tooling, with
+// validation errors that name the failing path — hand-rolling that (or maintaining prose docs
+// against a moving shape) is strictly worse. zod v4 is dependency-free and pinned exactly.
 
 import { z } from "zod";
 // Type-only import — zero runtime coupling: the emit path never touches this module, and this
@@ -17,8 +17,18 @@ import { z } from "zod";
 import type { ExportKind, UsageType } from "./db.ts";
 
 const semverish = z.string().min(1);
-const isoUtc = z.string().describe("ISO-8601 UTC timestamp (fixed-width, lexicographically sortable)");
-const permalink = z.string().describe("Commit-SHA-pinned permalink: https://{host}/{org}/{repo}/blob/{sha}/{path}#L{n} or #L{a}-L{b}");
+// The nowIso canonical form (db.ts validates writes against the same shape) — every timestamp
+// the report emits comes from nowIso, so the fixed-width millisecond form is exact, not lax.
+const isoUtc = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, "must be canonical fixed-width ISO-8601 UTC (nowIso form)")
+  .describe("ISO-8601 UTC timestamp (fixed-width, lexicographically sortable)");
+// Pinned to buildPermalink's output grammar (permalink.ts): https scheme, host[:port], org/repo,
+// /blob/<hex sha>/, a non-empty path, and a #L{n} or #L{a}-L{b} line anchor — always present.
+const permalink = z
+  .string()
+  .regex(/^https:\/\/[^/\s]+\/[^/\s]+\/[^/\s]+\/blob\/[0-9a-f]{7,64}\/\S+#L[1-9]\d*(?:-L[1-9]\d*)?$/, "must be a commit-pinned https blob permalink with a line anchor")
+  .describe("Commit-SHA-pinned permalink: https://{host}/{org}/{repo}/blob/{sha}/{path}#L{n} or #L{a}-L{b}");
 
 export const usageTypeSchema = z
   .enum(["named-import", "default-import", "namespace-import", "require", "dynamic-import", "reexport", "side-effect-import"])
@@ -117,6 +127,14 @@ export const packageReportSchema = z
       .record(z.string(), apiSurfaceEntrySchema)
       .describe("Keyed by version, in versionsSeen order. A SUBSET of versionsSeen: only versions introspected to completion appear — a versionsSeen version MISSING here is a registry-introspection FAILURE (see errors[]), not absent data"),
     usageByRepo: z.array(usageByRepoSchema).describe("Sorted (org, repo, branch, commitSha)"),
+  })
+  // Enforce the subset invariant the apiSurface description documents — a key with no matching
+  // versionsSeen entry is drift (a stale surface surviving a version's disappearance), not data.
+  .superRefine((pkg, ctx) => {
+    for (const v of Object.keys(pkg.apiSurface)) {
+      if (!pkg.versionsSeen.includes(v))
+        ctx.addIssue({ code: "custom", path: ["apiSurface", v], message: `apiSurface key '${v}' is not in versionsSeen — apiSurface must be a subset` });
+    }
   })
   .describe("Everything the run knows about one tracked package");
 
