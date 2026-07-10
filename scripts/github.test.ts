@@ -171,7 +171,7 @@ describe("classifyRest / classifyGraphql / parseRetryAfterMs", () => {
     const plain429 = classifyRest(429, { "x-ratelimit-remaining": "100" }, "{}", NOW);
     expect(plain429).toEqual({ kind: "secondary", waitMs: null });
   });
-  test("a plain permission 403 (nonzero remaining, no throttle evidence) is FATAL, never requeued", () => {
+  test("a plain permission 403 (nonzero remaining, no throttle evidence) is FATAL, never retried as a throttle", () => {
     const cls = classifyRest(403, { "x-ratelimit-remaining": "100" }, `{"message":"Must have admin rights"}`, NOW);
     expect(cls.kind).toBe("fatal");
     if (cls.kind === "fatal") expect(cls.ssoRequired).toBe(false);
@@ -208,7 +208,7 @@ describe("classifyRest / classifyGraphql / parseRetryAfterMs", () => {
   });
   test("graphql 403: SSO disambiguation runs BEFORE the header-keyed primary shortcut", () => {
     const cls = classifyGraphql(403, { "x-ratelimit-remaining": "0", "x-github-sso": "required" }, [], NOW);
-    expect(cls.kind).toBe("fatal"); // never requeued as a rate-limit wait
+    expect(cls.kind).toBe("fatal"); // never retried as a rate-limit wait
     if (cls.kind === "fatal") expect(cls.ssoRequired).toBe(true);
     // …while a genuine header-exhausted 403 with no fatal evidence stays primary
     expect(classifyGraphql(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1000000100" }, [], NOW).kind).toBe("primary");

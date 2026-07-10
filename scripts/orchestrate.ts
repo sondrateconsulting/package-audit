@@ -88,8 +88,9 @@ function walkClone(root: string): TreeEntry[] {
 }
 
 // ---- coordinator ----------------------------------------------------------------------------
-async function main(): Promise<void> {
-  const argv = Bun.argv.slice(2);
+// argv is injectable (defaulting to the process argv) so the entrypoint tests can drive the
+// REAL dispatch — help short-circuit, --plan's stop-before-DB early return — in-process.
+export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const args: OrchestrateArgs = parseArgs(argv);
   if (args.help) {
     process.stdout.write(ORCHESTRATE_HELP + "\n");
@@ -152,18 +153,7 @@ async function main(): Promise<void> {
     // §5.A/§5.B discover + process, deterministically.
     for (const owner of owners) {
       const isPersonal = config.includePersonalNamespace && owner === preflight.githubLogin;
-      let repos: RepoInfo[];
-      try {
-        repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
-      } catch (e) {
-        const message = `repo discovery failed: ${(e as Error).message}`;
-        db.insertError({ runId, scope: "discovery", organization: owner, message });
-        logLine({ event: "discovery", org: owner, error: message });
-        continue;
-      }
-      const kept = filterSortCapRepos(repos, {
-        includeArchived: config.includeArchived, includeForks: config.includeForks, maxReposPerOrg: config.maxReposPerOrg,
-      });
+      const kept = await discoverOwnerRepos(db, client, config, runId, owner, isPersonal);
       for (const repo of kept) {
         await processRepo(db, client, config, runId, configHash, owner, repo, cliTermSets, nonRegistrySkipSeen);
       }
@@ -242,6 +232,28 @@ export function classifyBranchPlan(heads: BranchHead[], cutoffDate: string, maxB
     else pastCap.push(h);
   }
   return { cutoffSkipped, eligible, pastCap };
+}
+
+// §5.A run-path repo discovery for one owner, fail-soft: a failure records the DB error row AND
+// emits the matching JSONL `discovery` event (org-scoped — no `repo` field), then yields [] so
+// main()'s owner loop simply moves on. Exported for tests (scripted client + real in-memory DB);
+// main() is its only runtime caller. The --plan twin lives in runPlan, deliberately separate —
+// plan mode has no DB and counts failures into its totals instead.
+export async function discoverOwnerRepos(
+  db: AuditDb, client: GithubClient, config: Config, runId: string, owner: string, isPersonal: boolean,
+): Promise<RepoInfo[]> {
+  let repos: RepoInfo[];
+  try {
+    repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
+  } catch (e) {
+    const message = `repo discovery failed: ${(e as Error).message}`;
+    db.insertError({ runId, scope: "discovery", organization: owner, message });
+    logLine({ event: "discovery", org: owner, error: message });
+    return [];
+  }
+  return filterSortCapRepos(repos, {
+    includeArchived: config.includeArchived, includeForks: config.includeForks, maxReposPerOrg: config.maxReposPerOrg,
+  });
 }
 
 // Discover a repo's branches, apply the cutoff + cap, and process/skip each branch unit (§5.B/§3).

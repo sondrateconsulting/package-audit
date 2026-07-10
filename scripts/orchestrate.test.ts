@@ -2,7 +2,7 @@ import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyBranchPlan, planSummaryText, processRepo, runPlan, runSummaryText } from "./orchestrate.ts";
+import { classifyBranchPlan, discoverOwnerRepos, planSummaryText, processRepo, runPlan, runSummaryText } from "./orchestrate.ts";
 import { GithubClient, type BranchHead, type RepoInfo } from "./github.ts";
 import { AuditDb, type WorkUnitKey } from "./db.ts";
 import type { Config } from "./config.ts";
@@ -212,6 +212,99 @@ describe("processRepo discovery-failure observability (fail-soft, README log voc
     const row = db.read(`SELECT scope, organization, repository, message FROM errors WHERE run_id = ?`).get(runId) as { scope: string; organization: string; repository: string; message: string };
     expect(row.scope).toBe("discovery");
     expect(row.message).toContain("branch discovery failed");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README log vocabulary)", () => {
+  const http = (status: number, body: string): string => `HTTP/2.0 ${status} X\r\n\r\n${body}`;
+  const startRun = (db: AuditDb): string =>
+    db.startRun({
+      configHash: "h", effectiveOwners: ["org-a", "org-b"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    }).runId;
+
+  test("a failing owner records the DB error row AND the org-scoped JSONL discovery event, then yields []", async () => {
+    const root = mkdtempSync(join(tmpdir(), "own-disc-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const client = new GithubClient({
+      githubHost: "github.com", db: null,
+      spawnImpl: async () => ({ exitCode: 1, stderr: "gh: boom", stdout: "" }),
+      sleepImpl: async () => {},
+      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
+    });
+
+    let kept: unknown;
+    const events = await captureJsonl(async () => {
+      kept = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-a", false);
+    });
+
+    expect(kept).toEqual([]); // fail-soft: the owner loop simply moves on
+    const disc = events.find((e) => e["event"] === "discovery");
+    expect(disc).toBeDefined();
+    expect(disc?.["org"]).toBe("org-a");
+    expect(disc?.["repo"]).toBeUndefined(); // org-scoped event carries no repo field (README)
+    expect(String(disc?.["error"])).toContain("repo discovery failed");
+    const row = db.read(`SELECT scope, organization, repository, message FROM errors WHERE run_id = ?`).get(runId) as { scope: string; organization: string; repository: string | null; message: string };
+    expect(row.scope).toBe("discovery");
+    expect(row.organization).toBe("org-a");
+    expect(row.repository).toBeNull();
+    expect(row.message).toContain("repo discovery failed");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a failing owner does not poison the next: the follow-up owner still discovers, filtered and capped", async () => {
+    const root = mkdtempSync(join(tmpdir(), "own-disc2-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    // route by args, not call order, so retry counts can't skew the script
+    const client = new GithubClient({
+      githubHost: "github.com", db: null,
+      spawnImpl: async (_bin, args) => {
+        const joined = args.join(" ");
+        if (joined.includes("org-a")) return { exitCode: 1, stderr: "gh: boom", stdout: "" };
+        return { exitCode: 0, stderr: "", stdout: http(200, JSON.stringify([
+          { name: "svc", owner: { login: "org-b" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
+          { name: "old", owner: { login: "org-b" }, default_branch: "main", pushed_at: "2024-01-01T00:00:00Z", archived: true, fork: false, private: false },
+        ])) };
+      },
+      sleepImpl: async () => {},
+      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
+    });
+
+    const events = await captureJsonl(async () => {
+      const keptA = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-a", false);
+      const keptB = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-b", false);
+      expect(keptA).toEqual([]);
+      expect(keptB.map((r) => r.name)).toEqual(["svc"]); // archived repo filtered by config
+    });
+    expect(events.filter((e) => e["event"] === "discovery")).toHaveLength(1); // only org-a's failure
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("isPersonal routes to the affiliation-scoped user listing, not the org endpoint", async () => {
+    const root = mkdtempSync(join(tmpdir(), "own-disc3-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const calls: string[][] = [];
+    const client = new GithubClient({
+      githubHost: "github.com", db: null,
+      spawnImpl: async (_bin, args) => {
+        calls.push(args);
+        return { exitCode: 0, stderr: "", stdout: http(200, "[]") };
+      },
+      sleepImpl: async () => {},
+      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
+    });
+
+    const kept = await discoverOwnerRepos(db, client, testConfig(root), runId, "rvo", true);
+    expect(kept).toEqual([]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.join(" ")).toContain("user/repos?affiliation=owner");
     db.close();
     rmSync(root, { recursive: true, force: true });
   });

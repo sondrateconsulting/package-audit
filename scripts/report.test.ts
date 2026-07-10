@@ -162,6 +162,23 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
     expect(Object.keys(buildReport(db, run).summary).sort()).toEqual(Object.keys(summarySchema.shape).sort());
     db.close();
   });
+
+  test("no production module imports reportSchema or zod — schema validation stays test-only (source scan)", () => {
+    // §7 determinism guarantee: a schema bug must never be able to fail a completed scan's
+    // report write, so validation runs in tests only. This scan keeps that comment TRUE the
+    // same way the Bun-spawn chokepoint and cliErrors registry scans guard their invariants.
+    // TYPE-ONLY imports are banned too — compile-time coupling invites runtime use later.
+    const BANNED_SPECIFIER = /(?:from\s*|require\s*\(\s*|import\s*\(\s*|import\s+)["'`](?:zod|\.\/reportSchema(?:\.ts)?)["'`]/;
+    const offenders: string[] = [];
+    for (const file of readdirSync(import.meta.dir)) {
+      if (!file.endsWith(".ts") || file.endsWith(".test.ts") || file === "reportSchema.ts") continue;
+      const src = readFileSync(join(import.meta.dir, file), "utf8");
+      if (BANNED_SPECIFIER.test(src)) offenders.push(file);
+    }
+    expect(offenders).toEqual([]);
+    // positive control — the scan's regex does trip on a real zod import: reportSchema's own
+    expect(BANNED_SPECIFIER.test(readFileSync(join(import.meta.dir, "reportSchema.ts"), "utf8"))).toBe(true);
+  });
 });
 
 // runReport before any audit is a pure no-op: report.ts must NOT open (create) the database

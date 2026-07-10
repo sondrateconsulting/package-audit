@@ -91,4 +91,14 @@ describe("renderFatal", () => {
     expect(out).toContain("report failed (unexpected):");
     expect(out).toContain("string throw");
   });
+  test("ThrottleExhausted carries wait/re-run remediation in its message, NO stack", () => {
+    // §4: exhaustion means the wrapper already waited through its retry budget — the operator's
+    // remediation is time, not configuration, and resume semantics make a re-run cheap.
+    const out = renderFatal(new ThrottleExhausted("graphql"), OPTS);
+    expect(out).toContain("orchestrate failed: ");
+    expect(out).toContain("graphql");
+    expect(out.toLowerCase()).toContain("wait");
+    expect(out.toLowerCase()).toContain("re-run");
+    expect(out).not.toContain("    at "); // no stack frames
+  });
 });

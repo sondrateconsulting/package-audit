@@ -28,12 +28,17 @@ export class GithubApiError extends Error {
     this.ssoRequired = opts.ssoRequired ?? false;
   }
 }
-// Retryable throttle that outlived the wrapper's internal retries — the orchestrator
-// RE-QUEUES the unit (work_queue back to pending, §4), never marks it a permanent error.
+// Retryable throttle that outlived the wrapper's internal wait+retry budget (§4). The wrapper
+// already slept through every window it was told about, so the orchestrator does NOT re-queue
+// in-run: a mid-scan exhaustion marks that unit `error` (retried by the NEXT invocation — the
+// §3 skip predicate only skips current `done` units) and an owner-resolution exhaustion aborts
+// the run as an operator-rendered fatal (cliErrors.ts) — the remediation is time, then re-run.
 export class ThrottleExhausted extends Error {
   readonly endpoint: string;
   constructor(endpoint: string) {
-    super(`rate-limit throttling persisted beyond retries for ${endpoint}`);
+    super(
+      `rate-limit throttling persisted beyond retries for ${endpoint} — wait for the rate-limit window to reset, then re-run; a resumed run skips already-completed units`,
+    );
     this.name = "ThrottleExhausted";
     this.endpoint = endpoint;
   }
@@ -500,6 +505,15 @@ class Semaphore {
 }
 
 // ---- client ---------------------------------------------------------------------------------
+// Resolve a binary against the SAME env the children are spawned with, so an injected PATH
+// (e.g. the entrypoint tests' offline shim dir) governs resolution too. Bare Bun.which reads
+// the process's INITIAL environ and ignores runtime PATH changes, which would silently reach
+// past an injected env to the machine's real binaries.
+function whichIn(env: Env, bin: string): string {
+  const path = env["PATH"];
+  return (path !== undefined ? Bun.which(bin, { PATH: path }) : Bun.which(bin)) ?? bin;
+}
+
 const RAW_ACCEPT = "application/vnd.github.raw+json";
 const MAX_ATTEMPTS = 6;
 const SECONDARY_BASE_WAIT_MS = 60_000; // §4: no Retry-After → wait at LEAST 60s, then backoff
@@ -550,9 +564,9 @@ export class GithubClient {
     this.now = opts.nowImpl ?? Date.now;
     this.baseEnv = opts.env ?? process.env;
     this.bins = opts.binPaths ?? {
-      gh: Bun.which("gh") ?? "gh",
-      git: Bun.which("git") ?? "git",
-      tar: Bun.which("tar") ?? "tar",
+      gh: whichIn(this.baseEnv, "gh"),
+      git: whichIn(this.baseEnv, "git"),
+      tar: whichIn(this.baseEnv, "tar"),
     };
     this.ghEnv = buildGhEnv(this.baseEnv, this.githubHost);
     this.sem = new Semaphore(opts.concurrency ?? 8);

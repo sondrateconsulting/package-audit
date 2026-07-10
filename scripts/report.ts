@@ -269,8 +269,9 @@ export function runReport(config: Config, runIdArg: string | null): { line: stri
 }
 
 // ---- entry point ----------------------------------------------------------------------------
-async function main(): Promise<void> {
-  const argv = Bun.argv.slice(2);
+// argv is injectable (defaulting to the process argv) so the entrypoint tests can drive the
+// REAL dispatch — help short-circuit before config/DB, runReport wiring — in-process.
+export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const rargs = parseReportArgs(argv); // strict: unknown flags / valueless --run-id are rejected
   if (rargs.help) {
     process.stdout.write(REPORT_HELP + "\n");

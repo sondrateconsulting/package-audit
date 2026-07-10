@@ -533,9 +533,12 @@ enforced in one place): the `concurrency.*` fan-out (e.g. 3 orgs × 6 repos × 4
 can trip GitHub's rate limits, so cap TOTAL in-flight `gh` processes with one GLOBAL
 semaphore (not just per-level). The wrapper reads the relevant response headers
 (`x-ratelimit-remaining`/`x-ratelimit-reset`/`Retry-After`/`x-github-sso`) via `gh api -i`
-(as §2.3/§3 already do). Two distinct retryable throttles, handled the same way (WAIT
-then RE-QUEUE the unit by setting its work_queue row back to `pending` — never a
-permanent `error`) but with different wait computations:
+(as §2.3/§3 already do). Two distinct retryable throttles, handled the same way (the
+wrapper WAITS through the computed window and RETRIES the request IN PLACE, up to its
+attempt budget; only when that budget is exhausted does `ThrottleExhausted` escape —
+a mid-scan escape marks that unit `error` and the NEXT invocation retries it, because
+the §3 skip predicate only skips units that are `done` at the current head; there is
+no mid-run re-queue) but with different wait computations:
   - PRIMARY limit exhaustion: 403 OR 429 with `x-ratelimit-remaining: 0`; wait until the
     `x-ratelimit-reset` EPOCH timestamp (this branch is keyed on remaining==0, NOT on the
     status code, so a 429 with remaining==0 is primary, not secondary).
@@ -551,9 +554,9 @@ permanent `error`) but with different wait computations:
   status), while a SECONDARY/abuse throttle on GraphQL may surface EITHER as a 200 body
   error OR as a 403 with a message — so the branch-discovery path MUST check BOTH the
   HTTP status AND the response BODY (`errors[]`), then apply the same primary/secondary
-  wait-and-requeue logic keyed on the `x-ratelimit-*` headers of the graphql bucket.
+  wait-and-retry logic keyed on the `x-ratelimit-*` headers of the graphql bucket.
   Disambiguate a GraphQL 403: a `Retry-After` header or a documented abuse-rate message
-  means SECONDARY (retryable, requeue); an `x-github-sso` header or a
+  means SECONDARY (retryable — wait, then retry in place); an `x-github-sso` header or a
   permission/`RESOURCE not accessible` error means NON-retryable (an `errors` row).
   Mechanics: the wrapper paginates in TypeScript (§5.A/§5.B) with `gh api -i` per page —
   `-i` prints the header block THEN the JSON body — so it parses each page's leading
