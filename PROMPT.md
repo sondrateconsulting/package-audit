@@ -35,8 +35,8 @@ every run as "continue the job," not "start over," unless the user passes `--fre
   matching false-positives on a repo named `create-x` and, worse, lets `gh api -X
   DELETE` through). The guard is an ALLOWLIST of read-only `gh`/`git` verbs+argv
   shapes; it rejects `gh api` with a non-GET method or body flags, `git` mutations,
-  and command-injection options (§6). Direct `Bun.$` on these binaries is forbidden
-  (grep-enforced in tests).
+  and command-injection options (§6). Spawning these binaries outside the wrapper
+  (`Bun.spawn`/`Bun.spawnSync`/`Bun.$`) is forbidden (grep-enforced in tests).
 - WRITE CONTAINMENT: every write mechanism — `Bun.write`, `fs.*`, shell redirects,
   `git clone`, `tar -x`, the SQLite file, report output — may only target paths
   under `./data`, `./output`, or a run-scoped `mktemp` dir with the `pkg-audit-*`
@@ -149,7 +149,7 @@ instead (§5.D/§5.F).
 2. PREREQUISITE CHECKS (every invocation, before any work)
 ================================================================================
 Fail fast with actionable remediation if any of these fail:
-1. `bun --version` >= 1.1 (bun:sqlite + Bun.$ required).
+1. `bun --version` >= 1.1 (bun:sqlite + Bun.spawn required).
 2. `gh --version` succeeds.
 3. `gh auth status --hostname <githubHost>` shows an authenticated read-capable
    account (capture login for audit; never print tokens). In discovery mode
@@ -533,9 +533,12 @@ enforced in one place): the `concurrency.*` fan-out (e.g. 3 orgs × 6 repos × 4
 can trip GitHub's rate limits, so cap TOTAL in-flight `gh` processes with one GLOBAL
 semaphore (not just per-level). The wrapper reads the relevant response headers
 (`x-ratelimit-remaining`/`x-ratelimit-reset`/`Retry-After`/`x-github-sso`) via `gh api -i`
-(as §2.3/§3 already do). Two distinct retryable throttles, handled the same way (WAIT
-then RE-QUEUE the unit by setting its work_queue row back to `pending` — never a
-permanent `error`) but with different wait computations:
+(as §2.3/§3 already do). Two distinct retryable throttles, handled the same way (the
+wrapper WAITS through the computed window and RETRIES the request IN PLACE, up to its
+attempt budget; only when that budget is exhausted does `ThrottleExhausted` escape —
+a mid-scan escape marks that unit `error` and the NEXT invocation retries it, because
+the §3 skip predicate only skips units that are `done` at the current head; there is
+no mid-run re-queue) but with different wait computations:
   - PRIMARY limit exhaustion: 403 OR 429 with `x-ratelimit-remaining: 0`; wait until the
     `x-ratelimit-reset` EPOCH timestamp (this branch is keyed on remaining==0, NOT on the
     status code, so a 429 with remaining==0 is primary, not secondary).
@@ -551,9 +554,9 @@ permanent `error`) but with different wait computations:
   status), while a SECONDARY/abuse throttle on GraphQL may surface EITHER as a 200 body
   error OR as a 403 with a message — so the branch-discovery path MUST check BOTH the
   HTTP status AND the response BODY (`errors[]`), then apply the same primary/secondary
-  wait-and-requeue logic keyed on the `x-ratelimit-*` headers of the graphql bucket.
+  wait-and-retry logic keyed on the `x-ratelimit-*` headers of the graphql bucket.
   Disambiguate a GraphQL 403: a `Retry-After` header or a documented abuse-rate message
-  means SECONDARY (retryable, requeue); an `x-github-sso` header or a
+  means SECONDARY (retryable — wait, then retry in place); an `x-github-sso` header or a
   permission/`RESOURCE not accessible` error means NON-retryable (an `errors` row).
   Mechanics: the wrapper paginates in TypeScript (§5.A/§5.B) with `gh api -i` per page —
   `-i` prints the header block THEN the JSON body — so it parses each page's leading
@@ -883,12 +886,14 @@ H. Upsert `run_unit_head(this run, org, repo, branch, commit_sha=the head just s
 All deterministic logic MUST live in on-disk Bun + TypeScript modules (inspectable,
 testable, reusable) — not inline shell one-liners. Only defer to model reasoning for
 genuinely non-deterministic sub-tasks.
-- Idiomatic Bun: bun:sqlite, `Bun.$` for shell (gh/git/tar), `Bun.file`/`Bun.write`,
+- Idiomatic Bun: bun:sqlite, `Bun.spawn` for shell (gh/git/tar), `Bun.file`/`Bun.write`,
   `Bun.Glob`, native `fetch`, top-level await. A single `gh()` wrapper (github.ts)
   sets `GH_HOST=<githubHost>` on every invocation so no call site can drift.
-- Minimize deps: default to ZERO npm deps. Only add one (e.g., `typescript` for
-  robust .d.ts AST parsing) with a documented justification; never for something Bun
-  provides natively.
+- Minimize deps: default to ZERO npm deps. Add one only with a documented
+  justification; never for something Bun provides natively. Two are currently
+  justified: `typescript` (robust .d.ts AST parsing, §5.E/§5.F) and `zod`
+  (a devDependency — scripts/reportSchema.ts, the §7 report contract as schema-as-docs, `.strict()`
+  + per-field descriptions, validated in TESTS only, never in the emit path).
 - DRY, small pure modules under `./scripts/`:
   config.ts, db.ts, github.ts, manifest.ts, apiSurface.ts, usageScanner.ts,
   cliScanner.ts, permalink.ts, readOnlyGuard.ts, orchestrate.ts, report.ts.
@@ -899,16 +904,28 @@ genuinely non-deterministic sub-tasks.
 - Log one structured JSON line per completed unit of work (observable, greppable).
 
 Entrypoints:
-  bun run scripts/orchestrate.ts [--config <path>] [--fresh] [--purge-cache] \
-                                 [--rescan-branch <org>/<repo>@<branch>]...   # repeatable
-  bun run scripts/report.ts [--run-id <id>]   # default: latest completed run's snapshot
+  bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
+                                 [--rescan-branch <org>/<repo>@<branch>]... [--help]
+    # --plan: preview scope (config validation, preflight, owner resolution, repo+branch
+    #   discovery, would-scan counts) and exit BEFORE the DB is opened — zero writes,
+    #   zero content/registry-artifact fetches. Rejects --fresh/--purge-cache/--rescan-branch.
+  bun run scripts/report.ts [--config <path>] [--run-id <id>] [--help]
+    # default: latest completed run's snapshot (also refreshes latest.json); strict flags —
+    #   unknown/valueless arguments are rejected, never silently defaulted
 
-The wrapper module (github.ts) is the ONLY place `Bun.$` touches `gh`/`git`/`tar`;
+The wrapper module (github.ts) is the ONLY place `Bun.spawn` touches `gh`/`git`/`tar`;
 each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
 (`assertReadOnlyGh`/`assertReadOnlyGit`/`assertReadOnlyTar`) on the argv ARRAY before
-spawning. Because a test greps the repo to assert NO other file calls `Bun.$` on
-these binaries (and that no code path spawns a `PM_DENYLIST` binary), no call site
-can route around the guard — the guard is the single chokepoint, and it enforces the
+spawning. A test greps the repo as a best-effort tripwire asserting NO other file reaches a
+spawn surface (`Bun.spawn`/`Bun.spawnSync`/`Bun.$` — dotted, optional-chained, or whitespaced;
+imported from the `"bun"` module; aliased, parenthesized, bracket-accessed, or reached via
+`globalThis.Bun`), uses `child_process` in any form, imports a dynamic specifier that is a bare
+variable/expression or `+`/`${}`-assembled, or spawns a `PM_DENYLIST` binary. It catches the
+common direct wrapper-bypasses and fails them in CI, but it is a textual lint, not a semantic
+proof: deliberately evasive forms — comment-hidden tokens, a module name assembled by other
+means (`.concat`, char codes), or the Bun global routed through several intermediate bindings — are out of
+its scope (caught by code review). The load-bearing read-only guarantee is the argv allowlist
+below, of which github.ts is the single chokepoint; it enforces the
 read-only allowlist including tar's command-execution options
 (`--checkpoint-action=exec=…`, `--to-command`, `--use-compress-program`/`-I`, `-F`). Every invocation runs with a sanitized env
 (`GH_HOST=<githubHost>`, `GIT_TERMINAL_PROMPT=0`, no pager/prompt/extension
