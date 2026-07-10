@@ -164,8 +164,8 @@ export const reportSchema = z
 export const notReportableSchema = z
   .strictObject({
     notReportable: z.literal(true),
-    reason: z.string().describe("Why no report could be produced (no completed run, or a pre-migration --run-id)"),
+    reason: z.string().describe("Why no report could be produced (no database yet, no completed run, or a pre-migration --run-id)"),
   })
-  .describe("Emitted instead of a report when no completed reportable run exists (or --run-id names a pre-migration run)");
+  .describe("Emitted instead of a report when there is no database yet, no completed reportable run exists, or --run-id names a pre-migration run");
 
 export type Report = z.infer<typeof reportSchema>;

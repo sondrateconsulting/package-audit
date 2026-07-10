@@ -1,7 +1,11 @@
 import { expect, test, describe } from "bun:test";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AuditDb, nowIso } from "./db.ts";
-import { buildNotReportableNotice, buildReport } from "./report.ts";
+import { buildNotReportableNotice, buildReport, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
+import type { Config } from "./config.ts";
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
 
@@ -134,14 +138,19 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
     expect(reportSchema.safeParse(drifted).success).toBe(false);
     db.close();
   });
-  test("the REAL not-reportable notice (both branches) matches its schema", () => {
+  test("the REAL not-reportable notice (all three branches) matches its schema", () => {
     // the actual objects report.ts emits — not hand-written lookalikes
     const noRun = buildNotReportableNotice(null);
     const badId = buildNotReportableNotice("run-x");
+    const noDb = buildNotReportableNotice(null, "./data/audit.db");
     expect(notReportableSchema.safeParse(noRun).success).toBe(true);
     expect(notReportableSchema.safeParse(badId).success).toBe(true);
+    expect(notReportableSchema.safeParse(noDb).success).toBe(true);
     expect(noRun.reason).toBe("no completed reportable run yet");
     expect(badId.reason).toContain("run-x not found");
+    expect(noDb.reason).toBe("no database at ./data/audit.db — run `bun run audit` first");
+    // the missing-db reason takes precedence over the run-id reason
+    expect(buildNotReportableNotice("run-x", "./data/audit.db").reason).toContain("no database at");
     // negative instance stays: the schema still rejects a wrong discriminant
     expect(notReportableSchema.safeParse({ notReportable: false, reason: "x" }).success).toBe(false);
   });
@@ -152,5 +161,58 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
     // ReportSummary type — this pins the runtime keys to the schema so neither can drift alone.
     expect(Object.keys(buildReport(db, run).summary).sort()).toEqual(Object.keys(summarySchema.shape).sort());
     db.close();
+  });
+});
+
+// runReport before any audit is a pure no-op: report.ts must NOT open (create) the database
+// or mkdir the output dir when there is nothing to report yet (the boomerang finding — the old
+// entrypoint materialized a migrated data/audit.db + a stub output/latest.json on first run).
+describe("runReport zero-write on a missing database", () => {
+  const config = (root: string): Config => ({
+    concurrency: { branches: 1, organizations: 1, repositories: 1 },
+    cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
+    includeArchived: false, includeForks: false, includePersonalNamespace: false,
+    maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],
+    packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+    // both under root, which starts empty — any create/mkdir would leave a trace
+    paths: { sqlitePath: join(root, "data", "audit.db"), outputDir: join(root, "output") },
+  });
+
+  test("prints the actionable notice and touches nothing (no data/, no output/, no db file)", () => {
+    const root = mkdtempSync(join(tmpdir(), "report-nodb-"));
+    const { line } = runReport(config(root), null);
+    const notice = JSON.parse(line);
+    expect(notice.notReportable).toBe(true);
+    expect(notice.reason).toContain("run `bun run audit` first");
+    expect(notReportableSchema.safeParse(notice).success).toBe(true);
+    expect(readdirSync(root)).toEqual([]); // no data/audit.db created, no output/latest.json written
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("--run-id against a missing database still reports missing-db (precedence) and writes nothing", () => {
+    const root = mkdtempSync(join(tmpdir(), "report-nodb-id-"));
+    const { line } = runReport(config(root), "some-run-id");
+    const notice = JSON.parse(line);
+    expect(notice.notReportable).toBe(true);
+    expect(notice.reason).toContain("no database at");
+    expect(readdirSync(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // Contrast case: when the database OPENS but holds no completed run, report must still write
+  // the notice to output/latest.json — proving the missing-db guard only short-circuits the
+  // genuinely-absent case and does not suppress a real (if empty) report. An in-memory DB is a
+  // real, empty database that opens without hitting §0 write-containment (which pins a FILE db to
+  // ./data|./output and so rules out a temp-dir file db here); the notReportable branch is
+  // identical regardless of DB backing, and outputDir stays a real temp dir we can assert on.
+  test("DB opens but no completed run: writes the notice to latest.json, no run file", () => {
+    const root = mkdtempSync(join(tmpdir(), "report-emptydb-"));
+    const cfg: Config = { ...config(root), paths: { sqlitePath: ":memory:", outputDir: join(root, "output") } };
+    const { line } = runReport(cfg, null);
+    expect(JSON.parse(line).reason).toBe("no completed reportable run yet");
+    expect(readdirSync(join(root, "output"))).toEqual(["latest.json"]); // only latest.json, no run-<id>.json
+    const written = JSON.parse(readFileSync(join(root, "output", "latest.json"), "utf8"));
+    expect(notReportableSchema.safeParse(written).success).toBe(true);
+    rmSync(root, { recursive: true, force: true });
   });
 });

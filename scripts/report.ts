@@ -6,9 +6,9 @@
 // to runs.tracked_packages, and EVERY emitted array has a total, stable sort key so the output is
 // byte-reproducible.
 
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { loadConfig } from "./config.ts";
+import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type RunRecord } from "./db.ts";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
@@ -217,11 +217,55 @@ export function emitReportDetailed(
 // The "nothing to report" notice (no completed reportable run, or an unknown/pre-migration
 // --run-id). Exported so tests validate the REAL emitted object against notReportableSchema,
 // not a hand-written lookalike.
-export function buildNotReportableNotice(runIdArg: string | null): { notReportable: true; reason: string } {
+export function buildNotReportableNotice(runIdArg: string | null, missingDbPath?: string): { notReportable: true; reason: string } {
+  // A missing database is the most fundamental "nothing to report" cause and gets an actionable
+  // reason (run the audit first); it takes precedence over the run-id/empty cases, which only
+  // make sense once a database exists.
   return {
     notReportable: true,
-    reason: runIdArg !== null ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)` : "no completed reportable run yet",
+    reason:
+      missingDbPath !== undefined
+        ? `no database at ${missingDbPath} — run \`bun run audit\` first`
+        : runIdArg !== null
+          ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)`
+          : "no completed reportable run yet",
   };
+}
+
+// The report flow minus argv/config parsing (main() below wires those in). Exported as a
+// testable seam — like orchestrate.ts's runPlan — so the "no database yet" invariant is proven
+// against a real temp dir, not just asserted. Returns the exact line main() writes to stdout.
+//
+// Invariant (the reason this seam exists): running `report` before any `audit` is a pure no-op.
+// AuditDb.open would create data/audit.db (create:true) and the emit path would mkdir outputDir;
+// a first report must touch NOTHING and just say so. So we exist-check before opening: a missing
+// database short-circuits with the notReportable notice and zero filesystem effect.
+export function runReport(config: Config, runIdArg: string | null): { line: string } {
+  const sqlitePath = config.paths.sqlitePath;
+  if (sqlitePath !== ":memory:" && !existsSync(sqlitePath)) {
+    // Exit 0 (main() returns normally): notReportable is a well-formed, successful answer on the
+    // stdout JSONL contract — consumers branch on the parsed `notReportable` field, not the exit
+    // code — and this matches the exit-0 behavior of the DB-present notReportable cases below.
+    return { line: `${JSON.stringify(buildNotReportableNotice(runIdArg, sqlitePath))}\n` };
+  }
+  const db = AuditDb.open({ sqlitePath });
+  try {
+    const run = runIdArg !== null ? db.getRun(runIdArg) : db.latestReportableRun();
+    const outputDir = config.paths.outputDir;
+    mkdirSync(outputDir, { recursive: true });
+
+    if (run === null || run.trackedPackages.length === 0) {
+      const notice = buildNotReportableNotice(runIdArg);
+      const path = join(outputDir, runIdArg !== null ? `run-${runIdArg}.json` : "latest.json");
+      writeJson(path, outputDir, notice);
+      return { line: `${JSON.stringify(notice)}\n` };
+    }
+
+    const runPath = emitReportDetailed(db, run, outputDir, { alsoLatest: runIdArg === null }).path;
+    return { line: `report written: ${runPath}${runIdArg === null ? " (+ latest.json)" : ""}\n` };
+  } finally {
+    db.close();
+  }
 }
 
 // ---- entry point ----------------------------------------------------------------------------
@@ -232,27 +276,8 @@ async function main(): Promise<void> {
     process.stdout.write(REPORT_HELP + "\n");
     return;
   }
-  const runIdArg = rargs.runId;
   const { config } = await loadConfig(argv);
-  const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath });
-  try {
-    const run = runIdArg !== null ? db.getRun(runIdArg) : db.latestReportableRun();
-    const outputDir = config.paths.outputDir;
-    mkdirSync(outputDir, { recursive: true });
-
-    if (run === null || run.trackedPackages.length === 0) {
-      const notice = buildNotReportableNotice(runIdArg);
-      const path = join(outputDir, runIdArg !== null ? `run-${runIdArg}.json` : "latest.json");
-      writeJson(path, outputDir, notice);
-      process.stdout.write(`${JSON.stringify(notice)}\n`);
-      return;
-    }
-
-    const runPath = emitReportDetailed(db, run, outputDir, { alsoLatest: runIdArg === null }).path;
-    process.stdout.write(`report written: ${runPath}${runIdArg === null ? " (+ latest.json)" : ""}\n`);
-  } finally {
-    db.close();
-  }
+  process.stdout.write(runReport(config, rargs.runId).line);
 }
 
 function writeJson(path: string, outputDir: string, value: unknown): void {
