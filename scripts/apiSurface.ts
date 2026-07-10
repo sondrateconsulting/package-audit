@@ -11,6 +11,7 @@ import { mkdirSync, rmSync, existsSync, readFileSync, readdirSync, lstatSync } f
 import { gunzipSync } from "node:zlib";
 import { join } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
+import { logLine } from "./log.ts";
 import type { GithubClient } from "./github.ts";
 import type { AuditDb, ApiSurfaceRow, ResolvedVersionSource } from "./db.ts";
 import { parseJsoncObject } from "./jsonc.ts";
@@ -373,8 +374,11 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
       rmSync(dir, { recursive: true, force: true });
     }
   } catch (e) {
-    // per-version REGISTRY failure → version-keyed errors row (§5.E/§8), no marker written.
-    db.insertError({ runId, scope: "introspection", packageName, version, message: (e as Error).message });
+    // per-version REGISTRY failure → version-keyed errors row (§5.E/§8) + the live JSONL event
+    // (fail-soft: an operator tailing stdout sees it now, not only in the report), no marker.
+    const message = (e as Error).message;
+    db.insertError({ runId, scope: "introspection", packageName, version, message });
+    logLine({ event: "introspection", packageName, version, error: message });
   }
 }
 

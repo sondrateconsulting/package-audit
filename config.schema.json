@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sondrateconsulting/package-audit/config.schema.json",
+  "title": "package-audit configuration",
+  "description": "Input config for the READ-ONLY npm-package-usage auditor (PROMPT.md §1). Path precedence at runtime: --config <path> > CONFIG_PATH env var > ./config.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["cutoffDate", "maxBranchesPerRepo", "concurrency", "packages", "paths"],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional editor hint pointing at this schema. Ignored by the tool (excluded from config_hash)."
+    },
+    "githubHost": {
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9.-]+(:[0-9]{1,5})?$",
+      "default": "github.com",
+      "description": "Bare host or host:port (port 1-65535; the upper bound is enforced at runtime). Every gh call runs with GH_HOST=<githubHost>; API hostnames are never hand-built (GHES paths differ — gh handles them). null = use the default."
+    },
+    "organizations": {
+      "type": ["array", "null"],
+      "items": { "type": "string", "minLength": 1 },
+      "default": null,
+      "description": "null/omitted = DISCOVERY MODE: enumerate every org the authenticated gh account is a MEMBER of and scan them all. An explicit array restricts scope (recommended for engagements). An explicit [] is 'configured' (not discovery): the effective list is then just the personal namespace when includePersonalNamespace is true, otherwise the run fails fast."
+    },
+    "excludeOrganizations": {
+      "type": ["array", "null"],
+      "items": { "type": "string", "minLength": 1 },
+      "default": [],
+      "description": "Removed from the effective owner list in BOTH modes. null = use the default (none)."
+    },
+    "includePersonalNamespace": {
+      "type": ["boolean", "null"],
+      "default": false,
+      "description": "Opt-in: also scan the authenticated user's own repos (not an org, so off by default). null = use the default."
+    },
+    "includeForks": {
+      "type": ["boolean", "null"],
+      "default": false,
+      "description": "Opt-in: include forked repos (excluded by default so a package's own forks don't double-count). null = use the default."
+    },
+    "includeArchived": {
+      "type": ["boolean", "null"],
+      "default": false,
+      "description": "Opt-in: include archived repos. null = use the default."
+    },
+    "maxReposPerOrg": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "default": null,
+      "description": "Per-owner cap applied after sorting repos by pushed_at DESC. null = unlimited."
+    },
+    "maxBranchesPerRepo": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Per-repo cap on after-cutoff branches, newest-commit first. Branches past the cap are not surfaced in a run."
+    },
+    "cutoffDate": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "format": "date",
+      "description": "ISO date (YYYY-MM-DD; must be a real calendar date — enforced at runtime). Branches whose last commit is strictly BEFORE this date are recorded as skipped-cutoff and never inspected."
+    },
+    "concurrency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["organizations", "repositories", "branches"],
+      "description": "Fan-out bounds. Excluded from config_hash (tuning speed never orphans resumable work).",
+      "properties": {
+        "organizations": { "type": "integer", "minimum": 1 },
+        "repositories": { "type": "integer", "minimum": 1 },
+        "branches": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "packages": {
+      "type": "array",
+      "minItems": 1,
+      "description": "The tracked npm packages. Names must be UNIQUE across the array (a name maps to exactly one registry per config).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The npm REGISTRY name — the single canonical identity for manifest/lockfile matching, API introspection, and reporting. npm-alias installs are detected at scan time."
+          },
+          "registryUrl": {
+            "type": ["string", "null"],
+            "pattern": "^https://[^/@\\s]+(/[^\\s]*)?$",
+            "default": "https://registry.npmjs.org",
+            "description": "Registry BASE URL. Must be https:// and must not contain userinfo (user:pass@) — the pattern rejects an '@' in the authority; full URL validity (parseable, port <= 65535) is enforced at runtime. null = use the default."
+          },
+          "registryAuthEnvVar": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "default": null,
+            "description": "NAME of the env var holding a bearer token for a private registry. The var name participates in config_hash; the token value is never hashed or logged. Must be SET and non-empty at runtime."
+          }
+        }
+      }
+    },
+    "excludeDirGlobs": {
+      "type": ["array", "null"],
+      "items": { "type": "string", "minLength": 1 },
+      "default": ["**/node_modules/**", "**/dist/**", "**/build/**", "**/vendor/**"],
+      "description": "Paths matching these globs are never scanned (vendored/generated code). null = use the default."
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sqlitePath", "outputDir"],
+      "description": "Write locations. Both must resolve under ./data or ./output (write containment, PROMPT.md §0).",
+      "properties": {
+        "sqlitePath": { "type": "string", "minLength": 1, "description": "SQLite database file (the durable source of truth)." },
+        "outputDir": { "type": "string", "minLength": 1, "description": "Where run-<run_id>.json and latest.json are written." }
+      }
+    }
+  }
+}

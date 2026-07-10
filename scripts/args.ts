@@ -1,8 +1,11 @@
-// args.ts — pure CLI-argument parsing for orchestrate.ts (§8). No I/O: turns an argv array into
-// a validated options object, failing fast with actionable messages on any malformed/unknown
-// input. Entrypoint grammar (§8):
-//   bun run scripts/orchestrate.ts [--config <path>] [--fresh] [--purge-cache] \
+// args.ts — pure CLI-argument parsing for the two entrypoints (§8). No I/O: turns an argv array
+// into a validated options object, failing fast with actionable messages on any malformed/unknown
+// input. Entrypoint grammars (§8):
+//   bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
 //                                  [--rescan-branch <org>/<repo>@<branch>]...   # repeatable
+//   bun run scripts/report.ts      [--config <path>] [--run-id <id>]
+// `--help`/`-h` on either entrypoint wins over every other argument (even invalid ones), so a
+// confused operator can always reach the help text.
 
 export class ArgsError extends Error {
   constructor(message: string) {
@@ -14,6 +17,49 @@ function fail(msg: string): never {
   throw new ArgsError(msg);
 }
 
+// ---- usage / help text ------------------------------------------------------------------------
+const CONFIG_PRECEDENCE = "Config path precedence: --config <path> > CONFIG_PATH env > ./config.json";
+
+export const ORCHESTRATE_USAGE =
+  "Usage: bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] [--rescan-branch <org>/<repo>@<branch>]... [--help]";
+
+export const ORCHESTRATE_HELP = `package-audit — READ-ONLY npm-package-usage audit over GitHub orgs (gh CLI + Bun + SQLite)
+
+${ORCHESTRATE_USAGE}
+
+Flags:
+  --config <path>     Config file to load. ${CONFIG_PRECEDENCE}
+  --plan              Preview the scan scope and exit: validates config, runs preflight,
+                      resolves the effective owner list, discovers repos + branches, and
+                      prints what WOULD be scanned. Opens no database, writes nothing,
+                      fetches no repo content, and fetches no registry packument/tarball.
+  --fresh             Drop and recreate the run-scoped tables (runs, findings, errors,
+                      work queue). PRESERVES the api_cache and package_api_surface caches.
+  --purge-cache       Only valid with --fresh: ALSO drop the caches (the real full wipe).
+  --rescan-branch <org>/<repo>@<branch>
+                      Force one branch unit back to pending (repeatable).
+  --help, -h          Show this help and exit.
+
+The audit writes <outputDir>/run-<run_id>.json and <outputDir>/latest.json when it completes;
+a separate \`bun run report\` is only needed to re-emit a historical run (--run-id).`;
+
+export const REPORT_USAGE = "Usage: bun run scripts/report.ts [--config <path>] [--run-id <id>] [--help]";
+
+export const REPORT_HELP = `package-audit report — re-emit the consolidated §7 report from SQLite alone
+
+${REPORT_USAGE}
+
+Flags:
+  --config <path>     Config file to load (for sqlitePath/outputDir). ${CONFIG_PRECEDENCE}
+  --run-id <id>       Emit run-<id>.json for that historical run (never touches latest.json).
+                      Default (no --run-id): the latest completed reportable run; also
+                      overwrites latest.json.
+  --help, -h          Show this help and exit.
+
+Note: \`bun run audit\` already emits the report when a run completes — this entrypoint exists
+for re-emitting, especially historical runs.`;
+
+// ---- orchestrate arguments ----------------------------------------------------------------
 // A --rescan-branch target: a branch-scope work unit to force back to `pending` (§3).
 export interface RescanTarget {
   organization: string;
@@ -22,10 +68,12 @@ export interface RescanTarget {
 }
 
 export interface OrchestrateArgs {
-  configPath: string | null; // explicit --config; null → resolve via env/default in config.ts
-  fresh: boolean;
-  purgeCache: boolean;
-  rescanBranches: RescanTarget[]; // de-duplicated, order-stable
+  readonly configPath: string | null; // explicit --config; null → resolve via env/default in config.ts
+  readonly plan: boolean; // preview scope, no DB / no writes (§8 --plan)
+  readonly fresh: boolean;
+  readonly purgeCache: boolean;
+  readonly rescanBranches: readonly RescanTarget[]; // de-duplicated, order-stable
+  readonly help: boolean; // --help/-h seen anywhere: print help, do nothing else
 }
 
 // Parse a `<org>/<repo>@<branch>` rescan target (§3). Split at the FIRST '@' so a branch name
@@ -44,12 +92,35 @@ export function parseRescanTarget(spec: string): RescanTarget {
   return { organization: repoSpec.slice(0, slash), repository: repoSpec.slice(slash + 1), branch };
 }
 
+// `--help`/`-h` anywhere wins — checked BEFORE validation so a malformed command line can still
+// reach the help text.
+const isHelpFlag = (a: string): boolean => a === "--help" || a === "-h";
+
 // A flag that consumes the following token as its value (or the `--flag=value` attached form).
 const VALUE_FLAGS = new Set(["--config", "--rescan-branch"]);
-const BOOL_FLAGS = new Set(["--fresh", "--purge-cache"]);
+const BOOL_FLAGS = new Set(["--fresh", "--purge-cache", "--plan"]);
+
+// Normalize `--flag=value` into flag + attached value (shared by both parsers).
+function splitFlag(arg: string): { flag: string; attached: string | null } {
+  if (!arg.startsWith("--") || !arg.includes("=")) return { flag: arg, attached: null };
+  return { flag: arg.slice(0, arg.indexOf("=")), attached: arg.slice(arg.indexOf("=") + 1) };
+}
+
+// A DETACHED value that looks like a flag is a missing value, not a value — `--config --fresh`
+// must not silently swallow `--fresh` as the path. The attached `--flag=-x` form stays available
+// for values that genuinely start with '-'.
+function requireValue(flag: string, attached: string | null, next: string | undefined): string {
+  const value = attached !== null ? attached : next;
+  if (value === undefined || value === "" || (attached === null && value.startsWith("-")))
+    fail(`${flag} requires a value`);
+  return value;
+}
 
 export function parseArgs(argv: string[]): OrchestrateArgs {
+  if (argv.some(isHelpFlag)) return { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: true };
+
   let configPath: string | null = null;
+  let plan = false;
   let fresh = false;
   let purgeCache = false;
   const rescanBranches: RescanTarget[] = [];
@@ -57,23 +128,18 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
-    // normalize `--flag=value` into flag + value
-    let flag = arg;
-    let attached: string | null = null;
-    if (arg.startsWith("--") && arg.includes("=")) {
-      flag = arg.slice(0, arg.indexOf("="));
-      attached = arg.slice(arg.indexOf("=") + 1);
-    }
+    const { flag, attached } = splitFlag(arg);
 
     if (BOOL_FLAGS.has(flag)) {
       if (attached !== null) fail(`${flag} takes no value`);
       if (flag === "--fresh") fresh = true;
+      else if (flag === "--plan") plan = true;
       else purgeCache = true;
       continue;
     }
     if (VALUE_FLAGS.has(flag)) {
-      const value = attached !== null ? attached : argv[++i];
-      if (value === undefined || value === "") fail(`${flag} requires a value`);
+      const value = requireValue(flag, attached, argv[i + 1]);
+      if (attached === null) i++;
       if (flag === "--config") {
         if (configPath !== null) fail("--config given more than once");
         configPath = value;
@@ -90,9 +156,45 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
     fail(`unknown argument '${arg}'`);
   }
 
+  // --plan opens no database, so the DB/cache mutation flags are meaningless with it; reject the
+  // combination rather than silently ignoring a requested mutation. Checked FIRST so
+  // `--plan --purge-cache` names the actual conflict rather than the purge/fresh coupling.
+  if (plan && (fresh || purgeCache || rescanBranches.length > 0))
+    fail("--plan cannot be combined with --fresh, --purge-cache, or --rescan-branch (plan mode opens no database)");
   // --purge-cache only takes effect alongside --fresh (db.ts purges the caches only when fresh);
   // reject the misleading combination rather than silently ignoring it (§3 CLI flags).
   if (purgeCache && !fresh) fail("--purge-cache requires --fresh (it only purges caches during a --fresh rebuild)");
 
-  return { configPath, fresh, purgeCache, rescanBranches };
+  return { configPath, plan, fresh, purgeCache, rescanBranches, help: false };
+}
+
+// ---- report arguments -----------------------------------------------------------------------
+export interface ReportArgs {
+  readonly configPath: string | null; // explicit --config; null → resolve via env/default in config.ts
+  readonly runId: string | null; // --run-id <id>; null → latest completed reportable run
+  readonly help: boolean;
+}
+
+// Strict parser for report.ts (§7). Unknown flags are REJECTED — a silently-ignored typo (e.g.
+// `--runid`) would fall through to the DEFAULT report and overwrite latest.json.
+export function parseReportArgs(argv: string[]): ReportArgs {
+  if (argv.some(isHelpFlag)) return { configPath: null, runId: null, help: true };
+
+  let configPath: string | null = null;
+  let runId: string | null = null;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    const { flag, attached } = splitFlag(arg);
+    if (flag !== "--config" && flag !== "--run-id") fail(`unknown argument '${arg}'`);
+    const value = requireValue(flag, attached, argv[i + 1]);
+    if (attached === null) i++;
+    if (flag === "--config") {
+      if (configPath !== null) fail("--config given more than once");
+      configPath = value;
+    } else {
+      if (runId !== null) fail("--run-id given more than once");
+      runId = value;
+    }
+  }
+  return { configPath, runId, help: false };
 }

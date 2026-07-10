@@ -1,17 +1,19 @@
 // report.ts — §7 consolidated report, generated DETERMINISTICALLY from SQLite ALONE. Entry point:
-//   bun run scripts/report.ts [--run-id <id>]
+//   bun run scripts/report.ts [--config <path>] [--run-id <id>]
 // Default (no --run-id): the latest COMPLETED run with non-empty tracked_packages; also overwrites
 // <outputDir>/latest.json. A --run-id writes ONLY <outputDir>/run-<id>.json (never latest.json).
 // Findings are joined through the IMMUTABLE run_unit_head snapshot (never findings.run_id) filtered
 // to runs.tracked_packages, and EVERY emitted array has a total, stable sort key so the output is
 // byte-reproducible.
 
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { loadConfig } from "./config.ts";
+import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type RunRecord } from "./db.ts";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
+import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
+import { renderFatal } from "./cliErrors.ts";
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -34,8 +36,32 @@ function unitKey(o: string, r: string, b: string, c: string): string {
   return `${o}\0${r}\0${b}\0${c}`;
 }
 
+// The report's §7 summary block — the ONE hand-written source for this shape. orchestrate.ts
+// imports it for the done event + stderr summary, and reportSchema's summarySchema is key-synced
+// to it by test, so the three can never silently disagree.
+export interface ReportSummary {
+  organizationsScanned: number;
+  repositoriesScanned: number;
+  branchesScanned: number;
+  branchesSkippedByCutoff: number;
+  totalDependencyFindings: number;
+  totalUsageFindings: number;
+}
+
+// Top-level envelope of the emitted report. Leaf shapes (packages[], errors[]) stay untyped here
+// on purpose — their contract lives in reportSchema.ts and is enforced in tests, never in this
+// emit path. The envelope types exactly what orchestrate.ts's done event derives from.
+export interface EmittedReport {
+  runId: string;
+  generatedAt: string;
+  config: { packages: string[]; cutoffDate: string; githubHost: string; organizations: string[]; organizationsSource: string };
+  packages: unknown[];
+  errors: unknown[];
+  summary: ReportSummary;
+}
+
 // Build the whole §7 report object for a run from SQLite alone.
-export function buildReport(db: AuditDb, run: RunRecord): unknown {
+export function buildReport(db: AuditDb, run: RunRecord): EmittedReport {
   const runId = run.runId;
   const tracked = JSON.stringify(run.trackedPackages);
 
@@ -86,7 +112,7 @@ export function buildReport(db: AuditDb, run: RunRecord): unknown {
   };
 }
 
-function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[]) {
+function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[]): ReportSummary {
   const orgs = new Set(scannedHeads.map((h) => h.organization));
   const repos = new Set(scannedHeads.map((h) => `${h.organization}/${h.repository}`));
   return {
@@ -175,49 +201,84 @@ function buildUnit(
 
 // Emit a run's report files into outputDir (§7). Writes run-<id>.json always; the DEFAULT
 // report also overwrites latest.json with a byte copy. Reused by orchestrate.ts (§8 step 6-7) so
-// a full run ends with a report without a second command. Returns the primary file path.
-export function emitReport(db: AuditDb, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean }): string {
+// a full run ends with a report without a second command. Returns the path AND the report
+// object, so the caller's done-event counters and human summary derive from the EXACT emitted
+// report (never a separate re-query that could disagree with run-<id>.json).
+export function emitReportDetailed(
+  db: AuditDb, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean },
+): { path: string; report: EmittedReport } {
   mkdirSync(outputDir, { recursive: true });
   const report = buildReport(db, run);
   const runPath = join(outputDir, `run-${run.runId}.json`);
   writeJson(runPath, outputDir, report);
   if (opts.alsoLatest) writeJson(join(outputDir, "latest.json"), outputDir, report);
-  return runPath;
+  return { path: runPath, report };
+}
+// The "nothing to report" notice (no completed reportable run, or an unknown/pre-migration
+// --run-id). Exported so tests validate the REAL emitted object against notReportableSchema,
+// not a hand-written lookalike.
+export function buildNotReportableNotice(runIdArg: string | null, missingDbPath?: string): { notReportable: true; reason: string } {
+  // A missing database is the most fundamental "nothing to report" cause and gets an actionable
+  // reason (run the audit first); it takes precedence over the run-id/empty cases, which only
+  // make sense once a database exists.
+  return {
+    notReportable: true,
+    reason:
+      missingDbPath !== undefined
+        ? `no database at ${missingDbPath} — run \`bun run audit\` first`
+        : runIdArg !== null
+          ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)`
+          : "no completed reportable run yet",
+  };
 }
 
-// ---- entry point ----------------------------------------------------------------------------
-async function main(): Promise<void> {
-  const argv = Bun.argv.slice(2);
-  const runIdArg = getRunIdArg(argv);
-  const { config } = await loadConfig(argv);
-  const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath });
+// The report flow minus argv/config parsing (main() below wires those in). Exported as a
+// testable seam — like orchestrate.ts's runPlan — so the "no database yet" invariant is proven
+// against a real temp dir, not just asserted. Returns the exact line main() writes to stdout.
+//
+// Invariant (the reason this seam exists): running `report` before any `audit` is a pure no-op.
+// AuditDb.open would create data/audit.db (create:true) and the emit path would mkdir outputDir;
+// a first report must touch NOTHING and just say so. So we exist-check before opening: a missing
+// database short-circuits with the notReportable notice and zero filesystem effect.
+export function runReport(config: Config, runIdArg: string | null): { line: string } {
+  const sqlitePath = config.paths.sqlitePath;
+  if (sqlitePath !== ":memory:" && !existsSync(sqlitePath)) {
+    // Exit 0 (main() returns normally): notReportable is a well-formed, successful answer on the
+    // stdout JSONL contract — consumers branch on the parsed `notReportable` field, not the exit
+    // code — and this matches the exit-0 behavior of the DB-present notReportable cases below.
+    return { line: `${JSON.stringify(buildNotReportableNotice(runIdArg, sqlitePath))}\n` };
+  }
+  const db = AuditDb.open({ sqlitePath });
   try {
     const run = runIdArg !== null ? db.getRun(runIdArg) : db.latestReportableRun();
     const outputDir = config.paths.outputDir;
     mkdirSync(outputDir, { recursive: true });
 
     if (run === null || run.trackedPackages.length === 0) {
-      const notice = { notReportable: true, reason: runIdArg !== null ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)` : "no completed reportable run yet" };
+      const notice = buildNotReportableNotice(runIdArg);
       const path = join(outputDir, runIdArg !== null ? `run-${runIdArg}.json` : "latest.json");
       writeJson(path, outputDir, notice);
-      process.stdout.write(`${JSON.stringify(notice)}\n`);
-      return;
+      return { line: `${JSON.stringify(notice)}\n` };
     }
 
-    const runPath = emitReport(db, run, outputDir, { alsoLatest: runIdArg === null });
-    process.stdout.write(`report written: ${runPath}${runIdArg === null ? " (+ latest.json)" : ""}\n`);
+    const runPath = emitReportDetailed(db, run, outputDir, { alsoLatest: runIdArg === null }).path;
+    return { line: `report written: ${runPath}${runIdArg === null ? " (+ latest.json)" : ""}\n` };
   } finally {
     db.close();
   }
 }
 
-function getRunIdArg(argv: string[]): string | null {
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!;
-    if (a === "--run-id") return argv[i + 1] ?? null;
-    if (a.startsWith("--run-id=")) return a.slice("--run-id=".length);
+// ---- entry point ----------------------------------------------------------------------------
+// argv is injectable (defaulting to the process argv) so the entrypoint tests can drive the
+// REAL dispatch — help short-circuit before config/DB, runReport wiring — in-process.
+export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
+  const rargs = parseReportArgs(argv); // strict: unknown flags / valueless --run-id are rejected
+  if (rargs.help) {
+    process.stdout.write(REPORT_HELP + "\n");
+    return;
   }
-  return null;
+  const { config } = await loadConfig(argv);
+  process.stdout.write(runReport(config, rargs.runId).line);
 }
 
 function writeJson(path: string, outputDir: string, value: unknown): void {
@@ -227,7 +288,7 @@ function writeJson(path: string, outputDir: string, value: unknown): void {
 
 if (import.meta.main) {
   main().catch((e) => {
-    process.stderr.write(`report failed: ${(e as Error).stack ?? (e as Error).message}\n`);
+    process.stderr.write(renderFatal(e, { command: "report", usage: REPORT_USAGE }));
     process.exit(1);
   });
 }

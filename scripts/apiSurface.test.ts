@@ -1,4 +1,4 @@
-import { expect, test, describe, afterAll } from "bun:test";
+import { expect, test, describe, afterAll, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { GithubClient } from "./github.ts";
 import { AuditDb } from "./db.ts";
@@ -360,6 +360,37 @@ describe("introspectVersion — integration (real system tar)", () => {
     expect(err.package_name).toBe("expo");
     expect(err.version).toBe("1.0.0");
     expect(err.message).toContain("integrity");
+    db.close();
+  });
+
+  test("a per-version failure emits a JSONL introspection event beside the error row", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const tgz = buildTgz([{ name: "package.json", content: `{"name":"expo"}` }]);
+    const badPackument = JSON.stringify({
+      versions: { "1.0.0": { dist: { tarball: "https://registry.example.com/expo/-/expo-1.0.0.tgz", integrity: "sha512-WRONGWRONG=" } } },
+    });
+    const runId = seedRun(db);
+    const { fetchImpl } = mockRegistry(badPackument, tgz);
+    const client = new GithubClient({ githubHost: "github.com", tempRoot: TMP });
+    const chunks: string[] = [];
+    const spy = spyOn(process.stdout, "write").mockImplementation(((c: unknown) => {
+      chunks.push(String(c));
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      await introspectVersion({
+        client, db, runId, packageName: "expo", registryUrl: "https://registry.example.com",
+        registryAuthEnvVar: null, version: "1.0.0", versionSource: "lockfile", fetchImpl,
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    const events = chunks.join("").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
+    const ev = events.find((e) => e["event"] === "introspection");
+    expect(ev).toBeDefined();
+    expect(ev?.["packageName"]).toBe("expo");
+    expect(ev?.["version"]).toBe("1.0.0");
+    expect(String(ev?.["error"])).toContain("integrity");
     db.close();
   });
 

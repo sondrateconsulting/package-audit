@@ -51,12 +51,12 @@ export function resolveEffectiveOwners(input: OwnerResolveInput): OwnerResolveRe
 function emptyRemediation(input: OwnerResolveInput, source: OwnersSource): string {
   const hints: string[] = [];
   if (source === "discovered") {
-    hints.push("no discoverable org memberships (a token may be missing the `read:org` scope or SSO authorization)");
+    hints.push("no discoverable org memberships (a token may be missing the `read:org` scope — remediate: gh auth refresh -h <githubHost> -s read:org — or SSO authorization)");
     if (!input.includePersonalNamespace) hints.push("set `includePersonalNamespace: true` to scan your own repos");
   } else {
     hints.push("the configured `organizations` allowlist resolved to nothing");
     if (!input.includePersonalNamespace) hints.push("an explicit `organizations: []` needs `includePersonalNamespace: true` to have any owner");
   }
   if (input.excludeOrganizations.length > 0) hints.push("`excludeOrganizations` may be removing every owner");
-  return `effective owner list is EMPTY (${source} mode). Likely causes: ${hints.join("; ")}.`;
+  return `effective owner list is EMPTY (${source} mode). Likely causes: ${hints.join("; ")}. See README § Scoping your scan.`;
 }

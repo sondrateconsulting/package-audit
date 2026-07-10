@@ -88,14 +88,16 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
   const auth = await client.gh(["auth", "status", "--hostname", config.githubHost]);
   if (auth.exitCode !== 0)
     throw new PreflightError(
-      `not authenticated to ${config.githubHost}. Remediate: gh auth login -h ${config.githubHost}\n${auth.stderr.trim().slice(0, 300)}`,
+      `not authenticated to ${config.githubHost}. Remediate: gh auth login -h ${config.githubHost} (see README § Authentication)\n${auth.stderr.trim().slice(0, 300)}`,
     );
 
   // 4. git >= 2.45.1 and tar present (+ flavor)
   const gitVer = await client.git(["--version"]);
   const gv = parseVersion(gitVer.stdout);
   if (gitVer.exitCode !== 0 || gv === null || !meetsMinimum(gv, MIN_GIT))
-    throw new PreflightError(`git >= 2.45.1 required (found '${gitVer.stdout.trim()}') — older releases carry the May-2024 clone CVEs`);
+    throw new PreflightError(
+      `git >= 2.45.1 required (found '${gitVer.stdout.trim()}') — older releases carry the May-2024 clone CVEs. Remediate: brew upgrade git (macOS) / apt-get install --only-upgrade git (Debian/Ubuntu)`,
+    );
   const tarVer = await client.tar(["--version"]);
   if (tarVer.exitCode !== 0) throw new PreflightError(`tar --version failed: ${tarVer.stderr.trim().slice(0, 200)}`);
   const tarFlavor = detectTarFlavor(tarVer.stdout);
