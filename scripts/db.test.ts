@@ -1,14 +1,21 @@
 import { expect, test, describe, afterAll } from "bun:test";
 import { Database } from "bun:sqlite";
-import { rmSync, mkdirSync, existsSync } from "node:fs";
+import { rmSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { AuditDb, DbError, SCHEMA_VERSION, nowIso, type RunInput } from "./db.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 
 // File-backed tests must live under ./data (§0 write containment is enforced by AuditDb.open).
 const TEST_ROOT = `./data/.dbtest-${process.pid}-${Math.random().toString(36).slice(2)}`;
+const DATA_EXISTED_BEFORE = existsSync("./data");
 mkdirSync(TEST_ROOT, { recursive: true });
-afterAll(() => rmSync(TEST_ROOT, { recursive: true, force: true }));
+afterAll(() => {
+  rmSync(TEST_ROOT, { recursive: true, force: true });
+  // Leave the checkout the way we found it: on a fresh clone the recursive mkdir above created
+  // ./data itself, and a leftover empty ./data pollutes the operator's zero-write verification
+  // (a tree diff after `bun test` + `--plan` would show a dir the PRODUCT never made).
+  if (!DATA_EXISTED_BEFORE && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+});
 let fileCounter = 0;
 const nextFile = (): string => join(TEST_ROOT, `db-${fileCounter++}.db`);
 
