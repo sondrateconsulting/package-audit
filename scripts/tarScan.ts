@@ -210,7 +210,8 @@ export function validateEntries(entries: TarEntry[]): { ok: boolean; reason: str
 }
 
 // Full pre-scan: gunzip the .tgz, parse headers, enforce caps, then validate members. `gunzip`
-// is injected so the parser stays pure/testable (production passes Bun.gunzipSync).
+// is injected so the parser stays pure/testable (production passes apiSurface's inflateBounded —
+// node:zlib gunzipSync with a maxOutputLength decompression-bomb cap).
 export function scanTarball(gzBytes: Uint8Array, gunzip: (b: Uint8Array) => Uint8Array): ScanResult {
   let tar: Uint8Array;
   try {
