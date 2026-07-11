@@ -575,9 +575,15 @@ const mdCell = (value: string): string => value.replaceAll("\\", "\\\\").replace
 // close the span early and smuggle live markdown — e.g. a link — into the copied text.
 const mdCode = (value: string): string => {
   const flat = value.replace(/\r\n|[\r\n]/g, " ");
+  if (flat === "") return "` `"; // the closest representable span — an empty one is not a span at all
   const longest = flat.match(/`+/g)?.reduce((max, run) => Math.max(max, run.length), 0) ?? 0;
   const fence = "`".repeat(longest + 1);
-  return `${fence} ${flat} ${fence}`;
+  // Pad ONLY when CommonMark needs it: a backtick edge would merge with the fence, and space
+  // edges need sacrificial padding (the renderer strips one space per side when content begins
+  // AND ends with a space). Unconditional padding would ADD spaces to plain content (the
+  // stripping rule skips all-space spans and single-sided spaces).
+  const pad = flat.startsWith("`") || flat.endsWith("`") || flat.startsWith(" ") || flat.endsWith(" ") ? " " : "";
+  return `${fence}${pad}${flat}${pad}${fence}`;
 };
 const mdTable = (header: readonly string[], rows: ReadonlyArray<readonly string[]>): string =>
   [`| ${header.map(mdCell).join(" | ")} |`, `| ${header.map(() => "---").join(" | ")} |`, ...rows.map((r) => `| ${r.map(mdCell).join(" | ")} |`)].join("\n");
@@ -596,8 +602,10 @@ function execSentence(m: DossierModel): string {
     const suffix = m.headlineRepos.length > m.headlineImportingRepoCount ? `; declared or used by ${repos} in total` : "";
     return `${m.packageName} is imported by ${importing} (${scope}) across ${plural(m.headlineSiteCount, "usage site")}, ${tail}${suffix}.`;
   }
+  // "declared or used": this branch also covers CLI-only units with no declaration row — a
+  // bare "declared by" would claim a manifest entry the scan never found.
   if (m.headlineRepos.length > 0)
-    return `${m.packageName} is declared by ${repos} (${scope}); no import usage sites were detected in the scanned slice.`;
+    return `${m.packageName} is declared or used by ${repos} (${scope}); no import usage sites were detected in the scanned slice.`;
   return `${m.packageName} shows no default-branch usage in this run; ${plural(m.totalSiteCount, "usage site")} appear on other branches.`;
 }
 
@@ -755,7 +763,7 @@ function renderMatrix(m: DossierModel): string {
         : "no usage sites to chart in this run.";
     return `<section id="matrix" aria-label="Repository by export matrix"><h2>Repository × export matrix</h2><p class="note">${esc(note)}</p></section>`;
   }
-  const header = ["repository", "branches", ...m.matrix.columns.map((c) => c.label)];
+  const header = ["repository", "branches with findings", ...m.matrix.columns.map((c) => c.label)];
   const md = mdTable(
     header,
     m.matrix.rows.map((r) => [r.repo, String(r.branchCount), ...r.cells.map((c) => (c === 0 ? "" : String(c)))]),

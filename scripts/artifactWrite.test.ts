@@ -1,7 +1,7 @@
 import { expect, test, describe, afterAll } from "bun:test";
 import { createHash } from "node:crypto";
 import {
-  existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -377,21 +377,41 @@ describe("ArtifactBundle — sweep confinement", () => {
     expect(readFileSync(join(xray, "operator-subdir", "note.txt"), "utf8")).toBe("keep");
   });
 
-  test("sweep keeps entries by CASE-INSENSITIVE key — an overwritten stale case-variant is never self-swept", () => {
+  test("sweep and stale case-variants: kept on case-insensitive filesystems (it IS the artifact), swept on case-sensitive ones (distinct twin)", () => {
     const out = nextOutputDir();
     const xray = join(out, XRAY_DIR_NAME);
     mkdirSync(xray, { recursive: true });
     // A previous generation left EXPO-dossier.html. On a case-insensitive filesystem, writing
     // expo-dossier.html OVERWRITES that entry but readdir keeps the ORIGINAL spelling — an
-    // exact-match keep-set would then sweep our own fresh artifact.
+    // exact-match keep-set would then sweep our own fresh artifact. On a case-SENSITIVE
+    // filesystem the two names are distinct files, and the stale twin must sweep (the
+    // sweepVictims contract) — so this test branches on the filesystem's actual behavior.
     writeFileSync(join(xray, "EXPO-dossier.html"), "stale");
+    const caseInsensitive = existsSync(join(xray, "expo-DOSSIER.html"));
 
     const bundle = new ArtifactBundle(out, "dossier");
     bundle.write("expo-dossier.html", "<html>fresh</html>");
     const { swept } = bundle.finalize({ runId: "run-6" });
 
-    expect(swept).toEqual([]); // same key → kept on BOTH sensitive and insensitive filesystems
+    expect(swept).toEqual(caseInsensitive ? [] : ["EXPO-dossier.html"]);
     expect(readFileSync(join(xray, "expo-dossier.html"), "utf8")).toBe("<html>fresh</html>");
+  });
+
+  test("sweep never unlinks a directory entry that IS a kept artifact (same inode) — Unicode case-fold aliases cannot delete the manifest", () => {
+    // JS toLowerCase can never replicate a filesystem's Unicode case folding exactly (e.g.
+    // APFS folds U+017F ſ → s, JS does not), so keep/sweep name math alone could classify a
+    // directory entry that ALIASES a just-written artifact as a victim. The inode guard makes
+    // that class impossible: an entry whose inode matches a kept artifact is never unlinked.
+    // A hardlink is the deterministic cross-filesystem stand-in for such an alias.
+    const out = nextOutputDir();
+    const xray = join(out, XRAY_DIR_NAME);
+    const bundle = new ArtifactBundle(out, "dossier");
+    bundle.write("expo-dossier.html", "<html>fresh</html>");
+    linkSync(join(xray, "expo-dossier.html"), join(xray, "alias-of-artifact.html"));
+    const { swept } = bundle.finalize({ runId: "run-6b" });
+    expect(swept).toEqual([]); // the alias shares the artifact's inode — kept, not swept
+    expect(readFileSync(join(xray, "expo-dossier.html"), "utf8")).toBe("<html>fresh</html>");
+    expect(existsSync(join(xray, "alias-of-artifact.html"))).toBe(true);
   });
 
   test("sweep removes a stale file whose name contains a backslash (legal POSIX basename)", () => {

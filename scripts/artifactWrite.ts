@@ -287,10 +287,25 @@ export class ArtifactBundle {
     // it. Entries are readdir basenames — including legal-but-odd POSIX names like
     // `old\artifact` — swept normally.)
     const kept = artifacts.map((a) => a.path).concat(MANIFEST_NAME);
+    // Inode guard: JS case math (collisionKey's toLowerCase) can never replicate a
+    // filesystem's Unicode case folding exactly (APFS folds U+017F ſ → s; toLowerCase does
+    // not), so a directory entry could ALIAS a just-written artifact under a spelling the
+    // keep-set doesn't recognize — and sweeping it would delete the artifact itself. An entry
+    // whose inode matches a kept file is therefore never unlinked, whatever it is named.
+    const keptInodes = new Set<number>();
+    for (const name of kept) {
+      try {
+        keptInodes.add(lstatSync(join(this.dir, name)).ino);
+      } catch {
+        /* vanished — nothing to protect */
+      }
+    }
     const swept: string[] = [];
     for (const entry of sweepVictims(readdirSync(this.dir), kept)) {
       const target = join(this.dir, entry);
-      if (lstatSync(target).isDirectory()) continue; // operator dirs survive; never recurse
+      const st = lstatSync(target);
+      if (st.isDirectory()) continue; // operator dirs survive; never recurse
+      if (keptInodes.has(st.ino)) continue; // IS a kept artifact under an aliased spelling
       rmSync(target, { force: true }); // unlinks files and symlinks themselves; never follows
       swept.push(entry);
     }

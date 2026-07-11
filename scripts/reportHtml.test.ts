@@ -126,7 +126,7 @@ const syntheticPkg = (units: DossierUnit[], over: Partial<DossierPackage> = {}):
 // count, matrix branch-column relabel, versions-card semver restriction, row-id separator '.',
 // markdown code-span fencing, bidi isolation CSS. Absorbed without a formatVersion bump under the
 // pre-public-launch rule; post-launch output changes require bumping XRAY_FORMAT_VERSION.
-const GOLDEN_DOSSIER_SHA256 = "d6ce7271347bd52240e8a5e7bfa0393aca0cb061c3fd14738818738cafbde23f";
+const GOLDEN_DOSSIER_SHA256 = "8c32159cc75475665ced03bdca45377d0ae07ff58ae289d26433d439f09b98db";
 const GOLDEN_EMPTY_SHA256 = "0b5f954d9d70c5be81410be4cff3fd6a851982b8153712bd4f7d0ecc359c9eb4";
 
 describe("renderDossier — determinism and golden bytes", () => {
@@ -619,7 +619,7 @@ describe("codex re-pass regressions", () => {
     const hostile = "const q = `[click](https://evil.example)`;";
     const units = [syntheticUnit({ apiUsage: [{ ...syntheticUsage("foo", "src/a.ts", 1), snippet: hostile }] })];
     const md = templateMd(renderDossier(syntheticPkg(units), FIXED_CTX), "evidence");
-    expect(md).toContain("`` const q = `[click](https://evil.example)`; ``");
+    expect(md).toContain("``const q = `[click](https://evil.example)`;``"); // no pad: edges are not backticks/spaces
     expect(md).not.toContain("- `const q");
   });
 
@@ -639,4 +639,33 @@ test("bidi isolation: code and .loc carry unicode-bidi:isolate", () => {
   expect(html).toContain("unicode-bidi:isolate");
   expect(html).toMatch(/code \{[^}]*unicode-bidi:isolate/);
   expect(html).toMatch(/\.loc \{[^}]*unicode-bidi:isolate/);
+});
+
+// ---- dual-review round-2 regressions (2026-07-11) ------------------------------------------------
+describe("dual-review round-2 regressions", () => {
+  test("exec sentence: CLI-only usage without declarations is not called 'declared by'", () => {
+    const units = [
+      syntheticUnit({
+        cliUsage: [{ file: "package.json", line: 1, context: "scripts.x", permalink: "https://github.com/o/r/blob/abc123def4567/package.json#L1", snippet: '"x": "pkg"' }],
+      }),
+    ];
+    const html = renderDossier(syntheticPkg(units), FIXED_CTX);
+    expect(html).toContain("pkg is declared or used by 1 repository");
+    expect(html).not.toContain("pkg is declared by 1 repository");
+  });
+
+  test("matrix markdown mirror header carries the corrected branch-column semantics", () => {
+    const units = [syntheticUnit({ apiUsage: [syntheticUsage("foo", "src/a.ts", 1)] })];
+    const md = templateMd(renderDossier(syntheticPkg(units), FIXED_CTX), "matrix");
+    expect(md).toContain("| branches with findings |");
+    expect(md).not.toContain("| branches |");
+  });
+
+  test("mdCode: padding only when CommonMark needs it (backtick or space edges); plain edges stay unpadded", () => {
+    const render = (snippet: string): string =>
+      templateMd(renderDossier(syntheticPkg([syntheticUnit({ apiUsage: [{ ...syntheticUsage("foo", "src/a.ts", 1), snippet }] })]), FIXED_CTX), "evidence");
+    expect(render("plain(x)")).toContain("- `plain(x)` —"); // unpadded
+    expect(render("`lead")).toContain("- `` `lead `` —"); // backtick edge → padded, out-fenced
+    expect(render(" spaced ")).toContain("- `  spaced  ` —"); // space edges → padded so the renderer's strip preserves them
+  });
 });

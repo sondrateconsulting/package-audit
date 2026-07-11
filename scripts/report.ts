@@ -8,6 +8,7 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { assertContained } from "./readOnlyGuard.ts";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
 import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
@@ -230,7 +231,7 @@ function buildUnit(
 export function emitReportDetailed(
   db: AuditDbReader, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean },
 ): { path: string; report: EmittedReport } {
-  mkdirSync(outputDir, { recursive: true });
+  mkdirCanonical(outputDir);
   const report = buildReport(db, run);
   const runPath = join(outputDir, `run-${run.runId}.json`);
   writeJson(runPath, outputDir, report);
@@ -310,7 +311,7 @@ export function runReport(config: Config, runIdArg: string | null, opts: { html?
   try {
     const run = runIdArg !== null ? db.getRun(runIdArg) : db.latestReportableRun();
     const outputDir = config.paths.outputDir;
-    mkdirSync(outputDir, { recursive: true });
+    mkdirCanonical(outputDir);
 
     if (run === null || run.trackedPackages.length === 0) {
       const notice = buildNotReportableNotice(runIdArg);
@@ -350,6 +351,15 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
 // writeFileAtomic (roots = [outputDir], the same contract as before).
 function writeJson(path: string, outputDir: string, value: unknown): void {
   writeFileAtomic(path, JSON.stringify(value, null, 2) + "\n", [outputDir]);
+}
+
+// mkdir the CANONICAL outputDir, never the raw configured string: recursive mkdirSync creates
+// every path component physically, so a config-accepted `..` chain (canonical resolution lands
+// inside the roots) would otherwise create its intermediate directories OUTSIDE them —
+// `out/../evil/../out` must never create `evil/`. assertContained(dir, [dir]) is the resolving
+// identity: it returns the symlink-aware canonical path (the writeFileAtomic precedent).
+function mkdirCanonical(outputDir: string): void {
+  mkdirSync(assertContained(outputDir, [outputDir]), { recursive: true });
 }
 
 if (import.meta.main) {

@@ -416,3 +416,29 @@ describe("report --html wiring (emitDossiers + runReport integration)", () => {
     }
   });
 });
+
+// ---- dual-review round-2 regression (2026-07-11): raw outputDir mkdir must be canonical ----------
+// A config-accepted outputDir containing a `..` chain (canonical resolution lands INSIDE the
+// roots) must not cause recursive mkdir to create the chain's intermediate directories OUTSIDE
+// them: mkdirSync creates each component physically, so `out/../evil/../out/sub` would create
+// `evil/`. The emit path must mkdir the CANONICAL path only.
+test("emitReportDetailed: a ..-chain outputDir creates no directories outside its canonical root", async () => {
+  const { emitReportDetailed } = await import("./report.ts");
+  const tmp = mkdtempSync(join(tmpdir(), "report-esc-"));
+  try {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["o"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    db.completeRun(runId);
+    const run = db.getRun(runId)!;
+    const outputDir = `${tmp}/out/../evil/../out/sub`; // canonical: <tmp>/out/sub
+    emitReportDetailed(db, run, outputDir, { alsoLatest: false });
+    db.close();
+    expect(existsSync(join(tmp, "evil"))).toBe(false); // nothing outside the canonical root
+    expect(existsSync(join(tmp, "out", "sub", `run-${runId}.json`))).toBe(true);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
