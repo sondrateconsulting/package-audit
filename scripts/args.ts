@@ -17,6 +17,20 @@ function fail(msg: string): never {
   throw new ArgsError(msg);
 }
 
+// Run ids are generated internally (randomUUID → hex + hyphens). A user-supplied run id (report's
+// `--run-id`, export's `--run-id`, compare's two positionals) is string-interpolated into a
+// `run-<id>.json` path template in report.ts, so validate it against a conservative grammar with no
+// path separators BEFORE it can reach a path or a query. This is defense in depth over
+// writeFileAtomic's §0 containment: a value like `../../xray/manifest` is rejected here outright.
+const RUN_ID_GRAMMAR = /^[A-Za-z0-9._-]+$/;
+export function assertRunId(value: string): string {
+  // The grammar already excludes path separators, so no traversal is possible; the `.`/`..` reject
+  // is belt-and-suspenders against a run id that IS a path component.
+  if (!RUN_ID_GRAMMAR.test(value) || value === "." || value === "..")
+    throw new ArgsError(`invalid run id ${JSON.stringify(value)} — allowed characters are letters, digits, '.', '_', '-'`);
+  return value;
+}
+
 // ---- usage / help text ------------------------------------------------------------------------
 const CONFIG_PRECEDENCE = "Config path precedence: --config <path> > CONFIG_PATH env > ./config.json";
 
@@ -204,7 +218,7 @@ export function parseReportArgs(argv: string[]): ReportArgs {
       configPath = value;
     } else {
       if (runId !== null) fail("--run-id given more than once");
-      runId = value;
+      runId = assertRunId(value);
     }
   }
   return { configPath, runId, html, help: false };

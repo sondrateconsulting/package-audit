@@ -53,6 +53,23 @@ describe("csvCell — OWASP formula-injection defense (string cells only)", () =
     expect(csvCell("\r=1+1")).toBe(`"'\r=1+1"`); // CR also forces RFC quoting
   });
 
+  test("leading-whitespace-then-trigger is neutralized (a first-byte-only check misses it)", () => {
+    // Some spreadsheet imports trim a leading space and then evaluate the formula; neutralize any
+    // cell that begins with whitespace so ` =cmd|...` cannot slip through un-prefixed.
+    expect(csvCell(" =cmd|' /C calc'!A0")).toBe("' =cmd|' /C calc'!A0");
+    expect(csvCell("  -2+5")).toBe("'  -2+5");
+    expect(csvCell("\t\t=1+1")).toBe("'\t\t=1+1"); // leading tabs (no CR, so no RFC quoting)
+    expect(csvCell("\u00A0=1+1")).toBe("'\u00A0=1+1"); // a non-breaking space counts as whitespace
+  });
+
+  test("benign leading whitespace before a NON-trigger char is NOT over-neutralized", () => {
+    // The trigger is whitespace-THEN-`= + - @` (or a leading TAB/CR), not any leading whitespace.
+    // A stray-spaced version or path must pass through unprefixed — `^`, digits, letters are safe.
+    expect(csvCell(" ^50.0.0")).toBe(" ^50.0.0");
+    expect(csvCell("  src/index.ts")).toBe("  src/index.ts");
+    expect(csvCell(" 42")).toBe(" 42"); // string " 42" (not a typed number) still passes through
+  });
+
   test("the prefix is a literal apostrophe INSIDE the field, applied before RFC quoting", () => {
     expect(csvCell("=a,b")).toBe(`"'=a,b"`);
   });

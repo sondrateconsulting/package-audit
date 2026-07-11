@@ -24,7 +24,7 @@
 import { existsSync } from "node:fs";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
-import { ArgsError } from "./args.ts";
+import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
@@ -94,7 +94,7 @@ export function parseCompareArgs(argv: string[]): CompareArgs {
     positionals.push(arg);
   }
   if (positionals.length !== 2) failArgs(`expected exactly two run ids, got ${positionals.length}`);
-  return { configPath, runIdA: positionals[0]!, runIdB: positionals[1]!, help: false };
+  return { configPath, runIdA: assertRunId(positionals[0]!), runIdB: assertRunId(positionals[1]!), help: false };
 }
 
 // ---- emitted shapes -----------------------------------------------------------------------------

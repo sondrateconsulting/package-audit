@@ -55,14 +55,18 @@ export interface ReportSummary {
   totalUsageFindings: number;
 }
 
-// Top-level envelope of the emitted report. Leaf shapes (packages[], errors[]) stay untyped here
-// on purpose — their contract lives in reportSchema.ts and is enforced in tests, never in this
-// emit path. The envelope types exactly what orchestrate.ts's done event derives from.
+// Top-level envelope of the emitted report. `packages` is typed as the exact shape buildPackage
+// emits, which (by construction — see report.ts's apiSurface typing) stays assignable to the
+// dossier renderer's DossierPackage contract. This is the compile-time link (review M5): if
+// buildPackage/buildUnit rename or drop a field the renderer reads, emitDossiers' renderDossierDetailed
+// call stops compiling here instead of throwing at render time. The full report shape (declarations,
+// cli, dateFetched — a superset of the renderer's view) is preserved for run-<id>.json; its JSON
+// contract is separately enforced by reportSchema.ts in tests. errors[] stays untyped (leaf only).
 export interface EmittedReport {
   runId: string;
   generatedAt: string;
   config: { packages: string[]; cutoffDate: string; githubHost: string; organizations: string[]; organizationsSource: string };
-  packages: unknown[];
+  packages: ReadonlyArray<ReturnType<typeof buildPackage>>;
   errors: unknown[];
   summary: ReportSummary;
 }
@@ -157,8 +161,10 @@ function buildPackage(
   const versionsSeen = [...new Set(deps.map((d) => d.resolved_version).filter((v): v is string => v !== null && parseSemver(v) !== null))]
     .sort(compareForReport);
 
-  // apiSurface: only versions carrying a completion marker; keys in versionsSeen order.
-  const apiSurface: Record<string, unknown> = {};
+  // apiSurface: only versions carrying a completion marker; keys in versionsSeen order. Typed
+  // concretely (not Record<string, unknown>) so the emitted package stays statically assignable to
+  // the dossier renderer's DossierApiSurfaceEntry — see the compile-time link on EmittedReport.packages.
+  const apiSurface: Record<string, { exports: { name: string; kind: string }[]; cli: { hasCli: boolean; binNames: string[] } }> = {};
   for (const version of versionsSeen) {
     if (!db.hasCompletionMarker(name, version)) continue;
     const rows = db.read(`SELECT export_name, export_kind FROM package_api_surface WHERE package_name = ? AND version = ?`).all(name, version) as Array<{ export_name: string; export_kind: string }>;
@@ -280,16 +286,18 @@ export function emitDossiers(report: EmittedReport, outputDir: string): { dossie
   const bundle = new ArtifactBundle(outputDir, "dossier");
   let dossiers = 0;
   for (const pkg of report.packages) {
-    const { html, observationsStatus, observationCount } = renderDossierDetailed(pkg as Parameters<typeof renderDossierDetailed>[0], ctx);
-    const name = dossierFilename((pkg as { name: string }).name);
+    // No cast: report.packages is typed as buildPackage's output, statically assignable to the
+    // renderer's DossierPackage — a drift in the build shape fails to compile right here.
+    const { html, observationsStatus, observationCount } = renderDossierDetailed(pkg, ctx);
+    const name = dossierFilename(pkg.name);
     const record = bundle.write(name, html);
     dossiers++;
     logLine({
-      event: "dossier", package: (pkg as { name: string }).name, path: join(outputDir, XRAY_DIR_NAME, record.path),
+      event: "dossier", package: pkg.name, path: join(outputDir, XRAY_DIR_NAME, record.path),
       bytes: record.bytes, observations: observationsStatus, observationCount,
     });
   }
-  bundle.write(INDEX_FILENAME, renderIndex(report as Parameters<typeof renderIndex>[0], { formatVersion: XRAY_FORMAT_VERSION }));
+  bundle.write(INDEX_FILENAME, renderIndex(report, { formatVersion: XRAY_FORMAT_VERSION }));
   const { swept } = bundle.finalize({ runId: report.runId });
   logLine({ event: "dossier-summary", runId: report.runId, dossiers, index: join(outputDir, XRAY_DIR_NAME, INDEX_FILENAME), swept });
   return { dossiers, swept };

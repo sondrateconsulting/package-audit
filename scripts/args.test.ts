@@ -122,6 +122,15 @@ describe("parseReportArgs", () => {
     expect(() => parseReportArgs(["--run-id"])).toThrow(ArgsError);
     expect(() => parseReportArgs(["--run-id="])).toThrow(ArgsError);
   });
+  test("rejects a --run-id with a path separator or traversal (it is interpolated into run-<id>.json)", () => {
+    // report.ts builds `run-${runId}.json`; a value with '/' or '..' must never reach that template.
+    expect(() => parseReportArgs(["--run-id", "../../xray/manifest"])).toThrow(/invalid run id/);
+    expect(() => parseReportArgs(["--run-id", "a/b"])).toThrow(/invalid run id/);
+    expect(() => parseReportArgs(["--run-id", ".."])).toThrow(/invalid run id/);
+    expect(() => parseReportArgs(["--run-id", "a b"])).toThrow(/invalid run id/);
+    // a real (randomUUID-shaped) run id is accepted unchanged
+    expect(parseReportArgs(["--run-id", "1f2e3d4c-5b6a-7089-90ab-cdef01234567"]).runId).toBe("1f2e3d4c-5b6a-7089-90ab-cdef01234567");
+  });
   test("rejects duplicate --run-id and duplicate --config", () => {
     expect(() => parseReportArgs(["--run-id", "a", "--run-id", "b"])).toThrow(ArgsError);
     expect(() => parseReportArgs(["--config", "/a", "--config", "/b"])).toThrow(ArgsError);

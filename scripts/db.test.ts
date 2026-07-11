@@ -1132,8 +1132,7 @@ describe("migration — v2 → v3 (version-stepped, CRITICAL round-trip)", () =>
       // marker is load-bearing. A bare/stale marker reads as ABSENT (§7 epoch), so the surface would
       // empty out and the byte-identity above would still pass empty-vs-empty (both build from the
       // same fixture) — asserting NOTHING. This positive check makes that regression fail (see 4d0b42d).
-      const migratedExpo = (migratedReport as { packages: Array<{ name: string; apiSurface: Record<string, { exports: Array<{ name: string; kind: string }> }> }> })
-        .packages.find((p) => p.name === "expo");
+      const migratedExpo = migratedReport.packages.find((p) => p.name === "expo");
       expect(migratedExpo?.apiSurface["50.0.0"]?.exports).toContainEqual({ name: "registerRootComponent", kind: "named" });
     } finally {
       db.close();

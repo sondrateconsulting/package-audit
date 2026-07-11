@@ -16,7 +16,7 @@ import { ArtifactBundle, XRAY_DIR_NAME } from "./artifactWrite.ts";
 import { toCsv, type CsvCell } from "./csvWrite.ts";
 import { parseSemver } from "./semver.ts";
 import { logLine } from "./log.ts";
-import { ArgsError } from "./args.ts";
+import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
 // ---- usage / help -----------------------------------------------------------------------------
@@ -80,7 +80,7 @@ export function parseExportArgs(argv: string[]): ExportArgs {
       configPath = value;
     } else {
       if (runId !== null) throw new ArgsError("--run-id given more than once");
-      runId = value;
+      runId = assertRunId(value);
     }
   }
   return { configPath, runId, raw, help: false };

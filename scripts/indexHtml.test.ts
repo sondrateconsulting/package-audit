@@ -45,7 +45,9 @@ const OPTS = { formatVersion: 1 };
 // unintended output change and must be treated as a regression, not re-pinned.
 // PRE-LAUNCH RE-PIN (2026-07-11, sanctioned): the index shares the dossier page CSS — the codex
 // re-pass bidi-isolation rule moved these bytes. Same sanction rule as reportHtml.test.ts.
-const GOLDEN_INDEX_SHA256 = "a1168b3e556cb1fd4c2450b7abf4f851898bfa16b8e3aa1b41dbe6b7f79fe661";
+// PRE-LAUNCH RE-PIN (M4 bidi fix): `.branchnote` gains `unicode-bidi:isolate` in the shared
+// PAGE_CSS, shifting the index bytes too. CSS-only.
+const GOLDEN_INDEX_SHA256 = "49d6bfa856007e1e2eb94b13fe17fae4fbb40b75e3ac8fd4934490fa2159f6b0";
 
 describe("renderIndex — copy-as-markdown neutralizes a hostile value through the real render path", () => {
   // Package names are validated and versionsSeen is the valid-semver slice, so a payload cannot

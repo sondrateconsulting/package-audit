@@ -51,10 +51,17 @@ same `--run-id` to regenerate them — the database still has everything.
 
 **CSV** (RFC 4180): header row of column names; `\r\n` row endings including a trailing one;
 fields containing comma, double-quote, CR or LF are double-quoted with embedded quotes
-doubled. **Formula-injection defense (OWASP):** a *string* cell whose first character is one
-of `=` `+` `-` `@` TAB CR is prefixed with a literal apostrophe inside the field, so
-spreadsheet applications render it as text instead of executing it. Typed number cells are
-never prefixed (a negative count is a sign, not a formula). `NULL` is the empty field.
+doubled. **Formula-injection defense (OWASP):** a *string* cell is prefixed with a literal
+apostrophe inside the field — so spreadsheet applications render it as text instead of executing
+it — when its first byte is TAB or CR, **or** when its first *visible* character (after any leading
+whitespace, which some importers trim before evaluating) is one of `=` `+` `-` `@`. A benign
+leading-whitespace value whose first visible character is not a trigger (e.g. ` ^50.0.0`) is left
+unchanged. Typed number cells are never prefixed
+(a negative count is a sign, not a formula). `NULL` is the empty field. **Note for programmatic
+consumers:** because scoped package names begin with `@`, their CSV cells carry this leading
+apostrophe (`@scope/pkg` → `'@scope/pkg`) — a spreadsheet hides it, but an exact-match query or a
+CSV↔JSONL join sees it. Use the **JSONL** export (below), whose values are byte-faithful, as the
+source of truth for identifiers; treat the CSV as the spreadsheet-facing view.
 
 **JSONL**: one JSON object per row per line; keys in the column order below; values
 byte-faithful (no formula defense — JSONL consumers are not spreadsheets); SQL `NULL` is

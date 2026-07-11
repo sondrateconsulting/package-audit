@@ -90,6 +90,11 @@ describe("parseCompareArgs", () => {
     expect(parseCompareArgs(["--wat", "-h"]).help).toBe(true);
     expect(parseCompareArgs(["a", "b", "c", "--help"]).help).toBe(true);
   });
+  test("a positional run id with a path separator or traversal is rejected (shared assertRunId grammar)", () => {
+    expect(() => parseCompareArgs(["../../x", "b"])).toThrow(/invalid run id/);
+    expect(() => parseCompareArgs(["a", "x/y"])).toThrow(/invalid run id/);
+    expect(parseCompareArgs(["run-a1", "run-b2"])).toEqual({ configPath: null, runIdA: "run-a1", runIdB: "run-b2", help: false });
+  });
 });
 
 describe("buildCompare — added/removed sites", () => {

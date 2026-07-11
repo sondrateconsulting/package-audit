@@ -102,7 +102,7 @@ function fixturePackages(): DossierPackage[] {
   const run = seed(db);
   const report = buildReport(db, run);
   db.close();
-  return report.packages as DossierPackage[];
+  return [...report.packages]; // typed as buildPackage output, assignable to DossierPackage
 }
 
 // Synthetic package builders (no DB) for the overflow/cap/chaos suites — deterministic loops.
@@ -130,8 +130,12 @@ const syntheticPkg = (units: DossierUnit[], over: Partial<DossierPackage> = {}):
 // surface/matrix/evidence) now backslash-escape inline link/image/HTML formers, so `<template>`
 // bytes shift (e.g. `(default branches)` → `\(default branches\)`, which GFM renders identically).
 // Copy-markdown only; the visible dossier is byte-unchanged. Verified escaping-only before re-pin.
-const GOLDEN_DOSSIER_SHA256 = "8bc3aa41ac2f81d4f6c85705057faf27fb332ae602eef1efc64b09a21894536d";
-const GOLDEN_EMPTY_SHA256 = "e67b530b1415a6e1e44730abf0ac9124c06feb19a3e48a9853862fa962d71248";
+// PRE-LAUNCH RE-PIN (M4 bidi fix, sanctioned): two visual-isolation changes — (1) `.branchnote`
+// gains `unicode-bidi:isolate` in the shared PAGE_CSS (so all three goldens shift), and (2) the CLI
+// usage location cell is wrapped in a `<span class="loc">` (a markup change, dossier golden only).
+// Both isolate hostile RTL branch/repo/file names; no data change and the markup was always inert.
+const GOLDEN_DOSSIER_SHA256 = "ab174249db384ec8d98861a5d2915cb2d71f71bae8b764a57d5ceced87b0a76e";
+const GOLDEN_EMPTY_SHA256 = "dbf98a9aa63bc94212e930355cc8fcc87e28804080caa55ead1299fc6eda9a34";
 
 describe("renderDossier — determinism and golden bytes", () => {
   test("double-render byte equality (same DB, two builds, two renders)", () => {
@@ -290,7 +294,7 @@ describe("adversarial fixture — hostile snippets, paths, branch names (escape-
     db.completeRun(runId);
     const report = buildReport(db, db.getRun(runId)!);
     db.close();
-    return (report.packages as DossierPackage[])[0]!;
+    return report.packages[0]!;
   }
   const html = renderDossier(adversarialPkg(), FIXED_CTX);
 
@@ -355,7 +359,7 @@ describe("copy-as-markdown: hostile identifiers cannot inject links/images (H1)"
     db.completeRun(runId);
     const report = buildReport(db, db.getRun(runId)!);
     db.close();
-    return (report.packages as DossierPackage[])[0]!;
+    return report.packages[0]!;
   }
 
   const html = renderDossier(hostileExportPkg(), FIXED_CTX);
@@ -438,7 +442,7 @@ describe("partial state — versionsSeen entries missing from apiSurface", () =>
     db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456abc7890", status: "scanned", isDefaultBranch: true });
     const report = buildReport(db, run);
     db.close();
-    const html = renderDossier((report.packages as DossierPackage[])[0]!, FIXED_CTX);
+    const html = renderDossier(report.packages[0]!, FIXED_CTX);
     // static band prose is our own literal (raw apostrophe is legal HTML); only the version list is dynamic
     expect(html).toContain("API surface unavailable for version(s) 49.0.0 (introspection failed — see the run report's errors[]).");
     expect(html).toContain('id="surface"'); // the rest of the dossier still renders
@@ -686,12 +690,36 @@ describe("codex re-pass regressions", () => {
 // The bidi guard is CSS (visual isolation, not markup safety — markup was always inert): pin the
 // rules so a stylesheet refactor cannot silently drop them and reopen the display-spoofing vector
 // (a hostile U+202E in a snippet visually reordering the rest of its evidence row's location line).
-test("bidi isolation: code and .loc carry unicode-bidi:isolate", () => {
+test("bidi isolation: code, .loc, and .branchnote carry unicode-bidi:isolate", () => {
   const [pkg] = fixturePackages();
   const html = renderDossier(pkg!, FIXED_CTX);
   expect(html).toContain("unicode-bidi:isolate");
   expect(html).toMatch(/code \{[^}]*unicode-bidi:isolate/);
   expect(html).toMatch(/\.loc \{[^}]*unicode-bidi:isolate/);
+  // .branchnote holds hostile-controllable branch names ("on: <branch>"); it must isolate too, or a
+  // U+202E in a branch name visually reorders the surrounding evidence.
+  expect(html).toMatch(/\.branchnote \{[^}]*unicode-bidi:isolate/);
+});
+
+test("the CLI usage location cell is wrapped in .loc so a hostile repo/file name stays bidi-isolated", () => {
+  const db = mem();
+  const { runId } = db.startRun({
+    configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+    trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+  });
+  const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
+  db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true });
+  db.upsertUsageFinding({
+    runId, ...main, packageName: "expo", dependencyKey: "expo", usageType: "cli", exportName: "",
+    context: "npx expo", filePath: "scripts/‮lmth.evil", lineNumber: 1,
+    permalink: `https://github.com/org-a/svc/blob/${main.commitSha}/x#L1`, snippet: "npx expo start", foundAt: T0,
+  });
+  db.completeRun(runId);
+  const report = buildReport(db, db.getRun(runId)!);
+  const html = renderDossier(report.packages[0]!, FIXED_CTX);
+  db.close();
+  // the CLI location text sits inside a .loc span (which carries unicode-bidi:isolate)
+  expect(html).toMatch(/<td><span class="loc">org-a\/svc · scripts\//);
 });
 
 // ---- dual-review round-2 regressions (2026-07-11) ------------------------------------------------

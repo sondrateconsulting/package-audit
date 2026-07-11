@@ -442,3 +442,61 @@ test("emitReportDetailed: a ..-chain outputDir creates no directories outside it
     rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+describe("buildReport — run-scope head-join discrimination (M7)", () => {
+  test("a finding whose run_id MOVED to a later run still appears in the older run's report", () => {
+    // Load-bearing invariant (mirrors export.test.ts / compare.test.ts): buildReport scopes findings
+    // through run_unit_head, NEVER findings.run_id. A finding's upsert OVERWRITES run_id (db.ts
+    // ON CONFLICT ... SET run_id = excluded.run_id), so a later run re-scanning the SAME commit
+    // steals the row's run_id. Run A's report must still contain the row via its immutable head
+    // snapshot; a `WHERE df/uf.run_id = ?` regression in report.ts drops it and fails here.
+    const db = mem();
+    const input = {
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered" as const,
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    };
+    const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "ccc333def4567" };
+    const usage = {
+      ...unit, packageName: "expo", dependencyKey: "expo", usageType: "named-import" as const,
+      exportName: "sharedExport", context: "", filePath: "src/shared.ts", lineNumber: 4,
+      permalink: "https://github.com/org-a/svc/blob/ccc333def4567/src/shared.ts#L4", snippet: "import { sharedExport } from 'expo';",
+      foundAt: "2026-01-01T00:00:00.000Z",
+    };
+    // A dependency finding on the SAME unit: buildReport joins dependency_findings and usage_findings
+    // through run_unit_head via SEPARATE queries, so the test must move BOTH — a regression that
+    // filters only ONE of the two on findings.run_id would otherwise slip through.
+    const dep = {
+      ...unit, dateFetched: "2026-01-01T00:00:00.000Z", packageName: "expo", dependencyKey: "expo",
+      dependencyType: "dependencies" as const, manifestPath: "package.json", manifestLine: 3,
+      manifestPermalink: "https://github.com/org-a/svc/blob/ccc333def4567/package.json#L3",
+      declaredVersion: "^50.0.0", resolvedVersion: "50.0.9", resolvedVersionSource: "lockfile" as const,
+    };
+    const { runId: rA } = db.startRun(input);
+    db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertUsageFinding({ runId: rA, ...usage });
+    db.upsertDependencyFinding({ runId: rA, ...dep });
+    db.completeRun(rA);
+    Bun.sleepSync(2);
+    const { runId: rB } = db.startRun(input);
+    db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertUsageFinding({ runId: rB, ...usage }); // same UNIQUE key → uf.run_id moves to rB
+    db.upsertDependencyFinding({ runId: rB, ...dep }); // same UNIQUE key → df.run_id moves to rB
+    db.completeRun(rB);
+
+    // Precondition: BOTH findings' run_ids really did move (otherwise this test discriminates nothing).
+    const movedU = db.read("SELECT run_id FROM usage_findings WHERE file_path = 'src/shared.ts'").get() as { run_id: string };
+    const movedD = db.read("SELECT run_id FROM dependency_findings WHERE manifest_path = 'package.json'").get() as { run_id: string };
+    expect(movedU.run_id).toBe(rB);
+    expect(movedD.run_id).toBe(rB);
+
+    const report = buildReport(db, db.getRun(rA)!);
+    const expo = report.packages.find((p) => p.name === "expo");
+    // usage_findings join (a uf.run_id regression drops this)
+    const files = expo?.usageByRepo.flatMap((u) => u.apiUsage.map((a) => a.file)) ?? [];
+    expect(files).toContain("src/shared.ts");
+    // dependency_findings join (a df.run_id regression drops this)
+    const versions = expo?.usageByRepo.flatMap((u) => u.declarations.map((d) => d.resolvedVersion)) ?? [];
+    expect(versions).toContain("50.0.9");
+    db.close();
+  });
+});

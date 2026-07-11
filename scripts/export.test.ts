@@ -161,6 +161,11 @@ describe("parseExportArgs", () => {
     expect(() => parseExportArgs(["--run-id"])).toThrow(ArgsError);
     expect(() => parseExportArgs(["--run-id", "--raw"])).toThrow(ArgsError);
   });
+  test("--run-id with a path separator or traversal is rejected (shared assertRunId grammar)", () => {
+    expect(() => parseExportArgs(["--run-id", "../../xray/manifest"])).toThrow(/invalid run id/);
+    expect(() => parseExportArgs(["--run-id", "a/b"])).toThrow(/invalid run id/);
+    expect(parseExportArgs(["--run-id", "1f2e3d4c-5b6a-7089-90ab-cdef01234567"]).runId).toBe("1f2e3d4c-5b6a-7089-90ab-cdef01234567");
+  });
   test("--raw takes no value", () => {
     expect(() => parseExportArgs(["--raw=1"])).toThrow(ArgsError);
   });

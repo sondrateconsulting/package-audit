@@ -28,8 +28,10 @@ import { deriveFacts, tryEvaluateObservations, type Observation } from "./observ
 
 // ---- input types (structural mirror of the §7 report object) ---------------------------------
 // Deliberately NOT imported from report.ts/reportSchema.ts: reportSchema is test-only by source
-// scan, and report.ts's envelope keeps packages[] untyped on purpose. These interfaces name only
-// the fields the renderer consumes; the tests prove structural compatibility by feeding REAL
+// scan. These interfaces name only the fields the renderer consumes — a MINIMAL contract that the
+// full emitted report (a superset with cli/declarations/dateFetched) stays assignable to. report.ts
+// types EmittedReport.packages as buildPackage's output precisely so that assignability is checked
+// at compile time (the emitDossiers render calls are the check); the tests additionally feed REAL
 // buildReport output through the renderer.
 
 export interface DossierApiUsage {
@@ -525,7 +527,7 @@ details.drawer > summary .num { color:var(--muted); font-weight:400; }
 details.drawer ol { margin:0; padding:.2rem 1rem .8rem 2.4rem; }
 details.drawer li, .print-drawer li { margin:.45rem 0; font-size:.87rem; overflow-wrap:anywhere; }
 .loc { color:var(--muted); unicode-bidi:isolate; }
-.branchnote { color:var(--accent); font-size:.8rem; }
+.branchnote { color:var(--accent); font-size:.8rem; unicode-bidi:isolate; }
 a { color:var(--accent); }
 a:hover { text-decoration-thickness:2px; }
 :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
@@ -745,7 +747,7 @@ function renderCliTable(m: DossierModel): string {
   const rows = shown
     .map(
       (s) =>
-        `<tr><td><code>${esc(s.context)}</code></td><td>${esc(s.repo)} · ${esc(s.file)}:${num(s.line)}` +
+        `<tr><td><code>${esc(s.context)}</code></td><td><span class="loc">${esc(s.repo)} · ${esc(s.file)}:${num(s.line)}</span>` +
         (s.fromHeadline ? "" : ` <span class="branchnote">on: ${esc(s.branch)}</span>`) +
         `</td><td>${permalinkAnchor(s.permalink)}</td></tr>`,
     )
