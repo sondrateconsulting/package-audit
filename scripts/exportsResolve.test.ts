@@ -43,10 +43,22 @@ describe("resolveTypeTargets — root type surface (§5.E)", () => {
     // `types` is present and null → the type surface is private; `default` must NOT leak
     expect(resolveTypeTargets({ exports: { types: null, default: "./index.js" } })).toEqual([]);
   });
-  test("a non-matching nested condition falls through to the next sibling (undefined, not null)", () => {
-    // `import`'s value has no matching sub-condition (only `browser`), so fall through to `require`
+  test("a custom (non-standard) nested condition is UNIONED fail-closed, not silently dropped", () => {
+    // `import`'s only sub-condition is the custom `browser`; a `customConditions` build could pick it
+    // BEFORE our modeled types/default, so it must be audited alongside `require` (fail-closed
+    // superset) rather than dropped — a drop would leave the browser-only surface unaudited.
     const pkg = { exports: { import: { browser: "./b.mjs" }, require: "./index.cjs" } };
-    expect(resolveTypeTargets(pkg)).toEqual(["./index.cjs"]);
+    expect(resolveTypeTargets(pkg).sort()).toEqual(["./b.mjs", "./index.cjs"]);
+  });
+  test("an exports object whose ONLY branch is a custom condition is audited, not left empty", () => {
+    // §5.E fail-closed: `{ ".": { "mycustom": "./real.d.ts" } }` has no standard types/default branch.
+    // Without unioning the custom branch it resolves to nothing → an empty '__complete__' marker while
+    // a `customConditions: ["mycustom"]` build resolves ./real.d.ts. The custom target must be audited.
+    expect(resolveTypeTargets({ exports: { ".": { mycustom: "./real.d.ts" } } })).toEqual(["./real.d.ts"]);
+    // a genuinely empty resolution (private types) stays empty — no over-reach.
+    expect(resolveTypeTargets({ exports: { ".": { types: null } } })).toEqual([]);
+    // even an explicit `types: null` block cannot hide a custom-condition target from the audit.
+    expect(resolveTypeTargets({ exports: { ".": { types: null, mycustom: "./real.d.ts" } } })).toEqual(["./real.d.ts"]);
   });
   test("a top-level exports array is a root fallback list (union of all valid, #5a)", () => {
     expect(resolveTypeTargets({ exports: ["./a.js", "./b.js"] })).toEqual(["./a.js", "./b.js"]);

@@ -85,23 +85,23 @@ function resolveConditionalSet(node: ExportsNode, conditions: Set<string>, valid
         if (r.kind !== "none") { known = r; break; } // first PRESENT known condition wins
       }
     }
-    // Fail-closed (§5.E #5b): a custom condition (TS customConditions) can be picked by the victim's
-    // tsc BEFORE our modeled types/default, hiding the real surface behind a decoy. Once we have
-    // COMMITTED to this object (a known condition matched a target OR an explicit block), UNION every
-    // unknown-condition branch so the real target is audited too. If NO known condition matched
-    // (known=none), we fall through untouched — a wholly-unmodeled object is not our pick.
-    if (known.kind === "targets" || known.kind === "block") {
-      const extra: string[] = [];
-      for (const key of Object.keys(obj)) {
-        if (key.startsWith(".") || KNOWN_CONDITIONS.has(key)) continue; // subpath key or already handled
-        const r = resolveConditionalSet(obj[key], conditions, validateFallback);
-        if (r.kind === "targets") for (const t of r.targets) if (!extra.includes(t)) extra.push(t);
-      }
-      if (extra.length > 0) {
-        const merged = known.kind === "targets" ? [...known.targets] : [];
-        for (const t of extra) if (!merged.includes(t)) merged.push(t);
-        return { kind: "targets", targets: merged };
-      }
+    // Fail-closed (§5.E #5b): a custom condition (a TS `customConditions` entry) can be picked by the
+    // victim's tsc BEFORE our modeled types/default, hiding the real surface behind a decoy. UNION
+    // every unknown-condition branch's targets — REGARDLESS of whether a known condition also matched
+    // — so the real target is audited too. This closes the case where an object's ONLY branch is a
+    // custom condition (`{ "mycustom": "./real.d.ts" }`): without the union it resolves to `none`,
+    // yielding an empty '__complete__' marker on a surface a `customConditions` build actually
+    // exposes. Over-reporting is safe (readContained drops the non-existent misses); a miss is not.
+    const extra: string[] = [];
+    for (const key of Object.keys(obj)) {
+      if (key.startsWith(".") || KNOWN_CONDITIONS.has(key)) continue; // subpath key or already handled
+      const r = resolveConditionalSet(obj[key], conditions, validateFallback);
+      if (r.kind === "targets") for (const t of r.targets) if (!extra.includes(t)) extra.push(t);
+    }
+    if (extra.length > 0) {
+      const merged = known.kind === "targets" ? [...known.targets] : [];
+      for (const t of extra) if (!merged.includes(t)) merged.push(t);
+      return { kind: "targets", targets: merged };
     }
     return known;
   }
