@@ -535,10 +535,15 @@ semaphore (not just per-level). The wrapper reads the relevant response headers
 (`x-ratelimit-remaining`/`x-ratelimit-reset`/`Retry-After`/`x-github-sso`) via `gh api -i`
 (as §2.3/§3 already do). Two distinct retryable throttles, handled the same way (the
 wrapper WAITS through the computed window and RETRIES the request IN PLACE, up to its
-attempt budget; only when that budget is exhausted does `ThrottleExhausted` escape —
-a mid-scan escape marks that unit `error` and the NEXT invocation retries it, because
-the §3 skip predicate only skips units that are `done` at the current head; there is
-no mid-run re-queue) but with different wait computations:
+attempt budget; `ThrottleExhausted` escapes only when that budget is exhausted, or
+earlier when the client-lifetime cumulative pause budget would be exceeded — the
+orchestrator treats an escape as TRANSIENT: a mid-scan escape (discovery or content
+fetch) resets that unit to `pending` with no errors row and the NEXT invocation retries
+it (the §3 skip predicate only skips units that are `done` at the current head; there
+is no mid-run re-queue), a repo/branch discovery escape logs a JSONL requeue event
+only, and an owner-resolution escape ends the run cleanly without starting one; --plan,
+which has no DB, counts a repo/branch discovery escape into its failure totals while a
+plan-mode owner-discovery escape stays fatal) but with different wait computations:
   - PRIMARY limit exhaustion: 403 OR 429 with `x-ratelimit-remaining: 0`; wait until the
     `x-ratelimit-reset` EPOCH timestamp (this branch is keyed on remaining==0, NOT on the
     status code, so a 429 with remaining==0 is primary, not secondary).
@@ -548,7 +553,8 @@ no mid-run re-queue) but with different wait computations:
     60 seconds, then exponential backoff.
   Distinguish BOTH from a NON-retryable 403 — SSO enforcement (the `x-github-sso`
   response header; classify as in §1's SAML/SSO note), missing permission, or a plain
-  404 — which IS an `errors` row with its own classification.
+  404 — which IS an `errors` row with its own classification (one exception: a 404 on a
+  per-file CONTENT read within a unit is treated as "file absent", not an errors row).
   GraphQL is different: `gh api graphql` PRIMARY exhaustion arrives as HTTP 200 with a
   body `errors[].type == 'RATE_LIMITED'` and `x-ratelimit-remaining: 0` (NOT a 403/429
   status), while a SECONDARY/abuse throttle on GraphQL may surface EITHER as a 200 body

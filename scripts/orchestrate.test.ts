@@ -2,10 +2,11 @@ import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyBranchPlan, discoverCliTerms, discoverOwnerRepos, planSummaryText, processRepo, reconcileIntrospection, runPlan, runSummaryText } from "./orchestrate.ts";
-import { GithubClient, type BranchHead, type RepoInfo, type SpawnFn } from "./github.ts";
+import { classifyBranchPlan, discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText } from "./orchestrate.ts";
+import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type RepoInfo, type SpawnFn } from "./github.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import type { Config } from "./config.ts";
+import type { OrchestrateArgs } from "./args.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
 
@@ -341,7 +342,7 @@ describe("introspection-failure observability (fail-soft, README log vocabulary)
     globalThis.fetch = failingFetch;
     try {
       const events = await captureJsonl(async () => {
-        await reconcileIntrospection(db, client, testConfig(root), runId, ["expo"]); // must not throw
+        await reconcileIntrospection(db, client, testConfig(root), runId); // must not throw
       });
       const ev = events.find((e) => e["event"] === "introspection");
       expect(ev).toBeDefined();
@@ -350,6 +351,37 @@ describe("introspection-failure observability (fail-soft, README log vocabulary)
       const row = db.read(`SELECT scope, package_name, message FROM errors WHERE run_id = ?`).get(runId) as { scope: string; package_name: string; message: string };
       expect(row.scope).toBe("introspection");
       expect(row.message).toContain("packument fetch failed");
+    } finally {
+      globalThis.fetch = prevFetch;
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a scanned dependency row for a package absent from config.packages is ignored (no crash, no fetch)", async () => {
+    // reconciliation's slice must derive from config.packages (the single source of truth for
+    // registry coordinates) — a stale row from a prior run's different config must be skipped,
+    // not dereferenced into a reportless TypeError at the final pipeline stage.
+    const root = mkdtempSync(join(tmpdir(), "reconcile-rogue-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const now = nowIso();
+    const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned" });
+    // a RESOLVED version for a package no current config entry can supply a registry for
+    db.upsertDependencyFinding({
+      runId, ...unit, dateFetched: now, packageName: "rogue", dependencyKey: "rogue", dependencyType: "dependencies",
+      manifestPath: "package.json", manifestLine: 5, manifestPermalink: "https://github.com/org-a/svc/blob/abc123def/package.json#L5",
+      declaredVersion: "^1.0.0", lockfilePath: "bun.lock", lockfileKind: "bun", lockfileLines: null, lockfilePermalink: null,
+      resolvedVersion: "1.2.3", resolvedVersionSource: "lockfile",
+    });
+    const client = makeClient(root, async () => { throw new Error("no spawn expected"); });
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = (async () => { throw new Error("no fetch expected"); }) as unknown as typeof fetch;
+    try {
+      await reconcileIntrospection(db, client, testConfig(root), runId); // must not throw
+      const rows = db.read(`SELECT message FROM errors WHERE run_id = ?`).all(runId) as Array<{ message: string }>;
+      expect(rows).toEqual([]); // ignored entirely: no error rows, no introspection attempts
     } finally {
       globalThis.fetch = prevFetch;
       db.close();
@@ -485,5 +517,238 @@ describe("planSummaryText", () => {
     expect(text).toContain("12 past the per-repo cap (25)");
     expect(text).toContain("expo");
     expect(text).toMatch(/Discovery errors:\s+0\b/);
+  });
+});
+
+// ---- §4 throttle-requeue policy (sites a-d: owner discovery, repo discovery, branch ----------
+// ---- discovery, per-unit scan) ----------------------------------------------------------------
+
+const repo: RepoInfo = {
+  name: "r", organization: "o", defaultBranch: "main",
+  pushedAt: "2026-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false,
+};
+const liveHead: BranchHead = {
+  name: "main", oid: "a".repeat(40), committedDate: "2026-01-01T00:00:00Z", treeOid: "b".repeat(40),
+};
+// frozen: these 9 tests share one config; freezing forbids accidental cross-test mutation.
+const config = Object.freeze({
+  cutoffDate: "2000-01-01", maxBranchesPerRepo: 10, maxReposPerOrg: 10,
+  includeArchived: true, includeForks: true, includePersonalNamespace: false,
+  organizations: null, excludeOrganizations: [],
+}) as unknown as Config;
+const KEY: WorkUnitKey = { configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "main" };
+
+// only the methods each function touches before the injected failure fires.
+const fakeClient = (failure: Error): GithubClient =>
+  ({
+    listBranchHeads: async () => [liveHead],
+    fetchTreeRecursive: async () => { throw failure; },
+  }) as unknown as GithubClient;
+
+const openRun = (): { db: AuditDb; runId: string } => {
+  const db = AuditDb.open({ sqlitePath: ":memory:" });
+  const { runId } = db.startRun({
+    configHash: "hash", effectiveOwners: ["o"], ownersSource: "discovered",
+    trackedPackages: ["expo"], cutoffDate: "2000-01-01", githubHost: "github.com",
+  });
+  return { db, runId };
+};
+
+describe("processRepo throttle requeue (§4)", () => {
+  test("ThrottleExhausted puts the unit back to PENDING with no permanent error row", async () => {
+    const { db, runId } = openRun();
+    await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), config, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("pending"); // a later run retries it
+    const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all();
+    expect(errs.length).toBe(0);
+    db.close();
+  });
+
+  test("a GithubApiError still lands as a permanent ERROR with an errors row", async () => {
+    const { db, runId } = openRun();
+    await processRepo(db, fakeClient(new GithubApiError("boom", { endpoint: "x" })), config, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("error");
+    const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all() as Array<{ message: string }>;
+    expect(errs.length).toBe(1);
+    expect(errs[0]!.message).toMatch(/boom/);
+    db.close();
+  });
+
+  test("a ThrottleExhausted during a unit's CONTENT fetch requeues the unit — never a silent done", async () => {
+    // the api reader degrades ONLY a status-404 to null (file treated as absent); a throttle
+    // means the unit was never fully read, and marking it done would let the §3 skip
+    // predicate skip this head FOREVER with silently missing findings.
+    const scanConfig = {
+      ...(config as unknown as Record<string, unknown>),
+      githubHost: "github.com",
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [],
+    } as unknown as Config;
+    const { db, runId } = openRun();
+    const client = {
+      listBranchHeads: async () => [liveHead],
+      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      fetchFileRaw: async () => { throw new ThrottleExhausted("core bucket"); },
+    } as unknown as GithubClient;
+    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("pending"); // requeued: a later run re-reads the head
+    expect(db.read("SELECT message FROM errors").all().length).toBe(0);
+    db.close();
+  });
+
+  test("a FATAL error during a unit's content fetch marks the unit error — never a silent done", async () => {
+    // an SSO/permission 403 (or an exhausted no-response failure) on a per-file read is NOT
+    // "file absent": completing the unit would permanently under-report its dependencies
+    // with zero trace. It must land as a visible scan error (retried at the next head).
+    const scanConfig = {
+      ...(config as unknown as Record<string, unknown>),
+      githubHost: "github.com",
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [],
+    } as unknown as Config;
+    const { db, runId } = openRun();
+    const client = {
+      listBranchHeads: async () => [liveHead],
+      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      fetchFileRaw: async () => { throw new GithubApiError("HTTP 403 (permission/forbidden) (repos/o/r/contents/package.json)", { status: 403 }); },
+    } as unknown as GithubClient;
+    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("error");
+    const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all() as Array<{ message: string }>;
+    expect(errs.length).toBe(1);
+    expect(errs[0]!.message).toMatch(/403/);
+    db.close();
+  });
+
+  test("a status-0 (no-HTTP-response) content-fetch failure also lands as a unit error", async () => {
+    // pins that the benign degradation is BY STATUS (404 only), not by message shape — an
+    // exhausted no-response failure (network plumbing, spawn timeout 124) must fail loud.
+    const scanConfig = {
+      ...(config as unknown as Record<string, unknown>),
+      githubHost: "github.com",
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [],
+    } as unknown as Config;
+    const { db, runId } = openRun();
+    const client = {
+      listBranchHeads: async () => [liveHead],
+      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      fetchFileRaw: async () => { throw new GithubApiError("gh api produced no HTTP response: spawn timed out", { status: 0 }); },
+    } as unknown as GithubClient;
+    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("error");
+    expect(db.read("SELECT message FROM errors WHERE scope='scan'").all().length).toBe(1);
+    db.close();
+  });
+
+  test("a 404 during a unit's content fetch stays benign (file treated as absent, unit done)", async () => {
+    // the one genuinely-absent case: the tree listed a blob the contents API no longer
+    // serves at that path (e.g. a force-push race) — skipping the file is correct.
+    const scanConfig = {
+      ...(config as unknown as Record<string, unknown>),
+      githubHost: "github.com",
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [],
+    } as unknown as Config;
+    const { db, runId } = openRun();
+    const client = {
+      listBranchHeads: async () => [liveHead],
+      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      fetchFileRaw: async () => { throw new GithubApiError("HTTP 404 (repos/o/r/contents/package.json)", { status: 404 }); },
+    } as unknown as GithubClient;
+    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("done");
+    expect(db.read("SELECT message FROM errors").all().length).toBe(0);
+    db.close();
+  });
+});
+
+describe("processRepo branch-discovery throttle (§4, site c)", () => {
+  // client whose branch discovery (listBranchHeads) fails with the injected error.
+  const branchDiscoveryFails = (failure: Error): GithubClient =>
+    ({ listBranchHeads: async () => { throw failure; } }) as unknown as GithubClient;
+
+  test("ThrottleExhausted is transient — no permanent discovery errors row", async () => {
+    const { db, runId } = openRun();
+    await processRepo(db, branchDiscoveryFails(new ThrottleExhausted("graphql bucket")), config, runId, "hash", "o", repo, [], new Set());
+    const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all();
+    expect(errs.length).toBe(0); // re-discovered next run, not a hard failure
+    db.close();
+  });
+
+  test("a GithubApiError still records a permanent discovery errors row", async () => {
+    const { db, runId } = openRun();
+    await processRepo(db, branchDiscoveryFails(new GithubApiError("branch boom", { endpoint: "x" })), config, runId, "hash", "o", repo, [], new Set());
+    const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all() as Array<{ message: string }>;
+    expect(errs.length).toBe(1);
+    expect(errs[0]!.message).toMatch(/branch discovery failed.*branch boom/);
+    db.close();
+  });
+});
+
+describe("processOwner repo-discovery throttle (§4, site b)", () => {
+  const repoDiscoveryFails = (failure: Error): GithubClient =>
+    ({ listOrgRepos: async () => { throw failure; } }) as unknown as GithubClient;
+
+  test("ThrottleExhausted is transient — no permanent discovery errors row", async () => {
+    const { db, runId } = openRun();
+    await processOwner(db, repoDiscoveryFails(new ThrottleExhausted("core bucket")), config, runId, "hash", "o", null, [], new Set());
+    const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all();
+    expect(errs.length).toBe(0);
+    db.close();
+  });
+
+  test("a GithubApiError still records a permanent discovery errors row", async () => {
+    const { db, runId } = openRun();
+    await processOwner(db, repoDiscoveryFails(new GithubApiError("repo boom", { endpoint: "x" })), config, runId, "hash", "o", null, [], new Set());
+    const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all() as Array<{ message: string }>;
+    expect(errs.length).toBe(1);
+    expect(errs[0]!.message).toMatch(/repo discovery failed.*repo boom/);
+    db.close();
+  });
+});
+
+describe("resolveOwnersWithDiscovery owner-membership throttle (§4, site a)", () => {
+  test("ThrottleExhausted returns null so the run ends cleanly (no crash)", async () => {
+    const client = { listOrgMemberships: async () => { throw new ThrottleExhausted("core bucket"); } } as unknown as GithubClient;
+    expect(await resolveOwnersWithDiscovery(client, config, null)).toBeNull();
+  });
+
+  test("a GithubApiError propagates (a genuine failure still crashes the run)", async () => {
+    const client = { listOrgMemberships: async () => { throw new GithubApiError("membership boom", { endpoint: "x" }); } } as unknown as GithubClient;
+    await expect(resolveOwnersWithDiscovery(client, config, null)).rejects.toThrow(/membership boom/);
+  });
+
+  test("success resolves the discovered owners", async () => {
+    const client = { listOrgMemberships: async () => ["org-a", "org-b"] } as unknown as GithubClient;
+    const resolved = await resolveOwnersWithDiscovery(client, config, null);
+    expect(resolved?.owners).toEqual(["org-a", "org-b"]);
+    expect(resolved?.source).toBe("discovered");
+  });
+
+  test("an empty owner set still throws (fatal, NOT swallowed as a transient throttle)", async () => {
+    // configured-but-empty: the throttle catch rethrows every non-ThrottleExhausted error, so
+    // resolveEffectiveOwners' EmptyOwnersError must propagate — a regression that swallowed it
+    // (returning null) would silently end the run with no remediation message.
+    const emptyConfig = { ...(config as object), organizations: [] } as unknown as Config;
+    const client = { listOrgMemberships: async () => [] } as unknown as GithubClient;
+    await expect(resolveOwnersWithDiscovery(client, emptyConfig, null)).rejects.toThrow();
+  });
+});
+
+describe("runScan owner-discovery throttle (§4, site a — consumer wiring)", () => {
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+
+  test("a throttle during owner discovery ends cleanly WITHOUT starting a run (no phantom run row)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // sweepStaleTempDirs runs first; owner discovery then throttles, so nothing else is reached.
+    const client = {
+      sweepStaleTempDirs: () => [],
+      listOrgMemberships: async () => { throw new ThrottleExhausted("core bucket"); },
+    } as unknown as GithubClient;
+    await runScan(db, client, config, "hash", noArgs, null); // must not throw
+    const runs = db.read("SELECT COUNT(*) AS n FROM runs").get() as { n: number };
+    expect(runs.n).toBe(0); // startRun was never reached — no run, no report
+    db.close();
   });
 });

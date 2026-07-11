@@ -1,14 +1,14 @@
 import { expect, test, describe, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync, readFileSync, readdirSync, chmodSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { tmpdir, devNull } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import {
-  GithubClient, GithubApiError, ThrottleExhausted,
+  GithubClient, GithubApiError, ThrottleExhausted, MAX_PAGES, MAX_PAUSE_MS, SPAWN_TIMEOUT_MS, MAX_TOTAL_PAUSE_MS, SPAWN_KILL_GRACE_MS,
   parseGhApiOutput, parseLinkNext, nextEndpointFromLink, parseRetryAfterMs,
   classifyRest, classifyGraphql, encodeContentsPath, mapRestRepo, filterSortCapRepos,
-  buildGhEnv, buildGitEnv, buildTarEnv,
-  type SpawnFn, type SpawnResult, type RepoInfo,
+  buildGhEnv, buildGitEnv, buildTarEnv, readCapped, makeRealSpawn, joinSpawnOutcome,
+  type SpawnFn, type SpawnResult, type RepoInfo, type SpawnAbortSignal, type StreamReader,
 } from "./github.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import { AuditDb } from "./db.ts";
@@ -228,6 +228,23 @@ describe("classifyRest / classifyGraphql / parseRetryAfterMs", () => {
   test("graphql 200 with non-throttle errors is fatal; clean 200 is ok", () => {
     expect(classifyGraphql(200, {}, [{ type: "NOT_FOUND", message: "gone" }], NOW).kind).toBe("fatal");
     expect(classifyGraphql(200, {}, [], NOW).kind).toBe("ok");
+  });
+  test("poisoned far-future reset / Retry-After waits are clamped to MAX_PAUSE_MS (§4 hardening)", () => {
+    // reset/Retry-After are RESPONSE-controlled; real GitHub resets are <= 1h — a poisoned
+    // header must never command a multi-year pause. Kind stays throttle (retryable), wait clamps.
+    const farReset = String(NOW / 1000 + 315_360_000); // 10 years ahead
+    const primary = classifyRest(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": farReset }, "", NOW);
+    expect(primary.kind).toBe("primary");
+    if (primary.kind === "primary") expect(primary.untilMs).toBe(NOW + MAX_PAUSE_MS);
+    expect(classifyRest(429, { "x-ratelimit-remaining": "9", "retry-after": "315360000" }, "{}", NOW))
+      .toEqual({ kind: "secondary", waitMs: MAX_PAUSE_MS });
+    const gqlPrimary = classifyGraphql(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": farReset }, [{ type: "RATE_LIMITED" }], NOW);
+    expect(gqlPrimary.kind).toBe("primary");
+    if (gqlPrimary.kind === "primary") expect(gqlPrimary.untilMs).toBe(NOW + MAX_PAUSE_MS);
+    expect(classifyGraphql(200, { "x-ratelimit-remaining": "50", "retry-after": "315360000" }, [{ type: "RATE_LIMITED" }], NOW))
+      .toEqual({ kind: "secondary", waitMs: MAX_PAUSE_MS });
+    expect(classifyGraphql(429, { "x-ratelimit-remaining": "9", "retry-after": "315360000" }, [], NOW))
+      .toEqual({ kind: "secondary", waitMs: MAX_PAUSE_MS });
   });
 });
 
@@ -449,7 +466,552 @@ describe("restGet caching + conditional requests", () => {
   });
 });
 
+describe("throttle wait clamping (§4 hardening)", () => {
+  // 10 years past the fake clock — a poisoned response must not command such a pause.
+  const FAR_FUTURE_SEC = String(1_000_000_000 + 315_360_000);
+
+  test("MAX_PAUSE_MS is 2 hours (independent literal pins the magnitude)", () => {
+    // guards against a silent magnitude typo: every other clamp assertion is
+    // self-referential against the imported constant and would scale with it.
+    expect(MAX_PAUSE_MS).toBe(7_200_000);
+  });
+
+  test("a primary 403 with a far-future x-ratelimit-reset sleeps exactly MAX_PAUSE_MS, then retries", async () => {
+    const { client, calls, sleeps } = makeClient([
+      err(http(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"message":"rate limit"}`)),
+      ok(http(200, {}, `{"ok":true}`)),
+    ]);
+    const res = await client.restGet("rate_limit");
+    expect(res.body).toBe(`{"ok":true}`);
+    expect(calls.length).toBe(2);
+    expect(sleeps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
+  });
+
+  test("a 429 with an absurd Retry-After sleeps exactly MAX_PAUSE_MS, then retries", async () => {
+    const { client, calls, sleeps } = makeClient([
+      err(http(429, { "x-ratelimit-remaining": "50", "retry-after": "315360000" }, "{}")),
+      ok(http(200, {}, `{"ok":true}`)),
+    ]);
+    const res = await client.restGet("rate_limit");
+    expect(res.body).toBe(`{"ok":true}`);
+    expect(calls.length).toBe(2);
+    expect(sleeps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
+  });
+
+  test("a graphql RATE_LIMITED with a far-future reset sleeps exactly MAX_PAUSE_MS, then retries", async () => {
+    const { client, sleeps } = makeClient([
+      ok(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`)),
+      ok(http(200, {}, `{"data":{"x":1}}`)),
+    ]);
+    const data = await client.graphql("query{x}", {});
+    expect(data).toEqual({ x: 1 });
+    expect(sleeps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
+  });
+
+  test("MAX_TOTAL_PAUSE_MS is 8 hours (independent literal pins the magnitude)", () => {
+    expect(MAX_TOTAL_PAUSE_MS).toBe(28_800_000);
+  });
+
+  test("cumulative bucket pause budget trips ThrottleExhausted instead of sleeping forever", async () => {
+    // freshly-poisoned primary on every attempt: each response re-arms a 2h pause. The
+    // per-bucket budget must stop the bleeding at MAX_TOTAL_PAUSE_MS total slept — and the
+    // spent budget must persist, so the NEXT call in the bucket fails fast without sleeping.
+    const poisoned = err(http(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"message":"rate limit"}`));
+    const { client, calls, sleeps } = makeClient(Array.from({ length: 12 }, () => poisoned));
+    await expect(client.restGet("rate_limit")).rejects.toThrow(ThrottleExhausted);
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(MAX_TOTAL_PAUSE_MS);
+    const callsBefore = calls.length;
+    const sleepsBefore = sleeps.length;
+    await expect(client.restGet("rate_limit")).rejects.toThrow(ThrottleExhausted);
+    expect(calls.length).toBe(callsBefore); // fails fast: no new spawn
+    expect(sleeps.length).toBe(sleepsBefore); // and no new sleep
+  });
+
+  test("the graphql bucket has its own cumulative pause budget", async () => {
+    const poisoned = ok(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`));
+    const { client, sleeps } = makeClient(Array.from({ length: 12 }, () => poisoned));
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(MAX_TOTAL_PAUSE_MS);
+    const sleepsBefore = sleeps.length;
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
+    expect(sleeps.length).toBe(sleepsBefore);
+  });
+
+  test("the final attempt's classification does not arm a residual pause for the next call", async () => {
+    // 6 secondary throttles exhaust the call; the LAST response must not tax the next,
+    // possibly honest, call with an inherited pause.
+    const throttle = err(http(429, { "x-ratelimit-remaining": "50", "retry-after": "7" }, "{}"));
+    const { client, sleeps } = makeClient([...Array.from({ length: 6 }, () => throttle), ok(http(200, {}, `{"ok":1}`))]);
+    await expect(client.restGet("rate_limit")).rejects.toThrow(ThrottleExhausted);
+    const sleepsBefore = sleeps.length;
+    const res = await client.restGet("rate_limit");
+    expect(res.body).toBe(`{"ok":1}`);
+    expect(sleeps.length).toBe(sleepsBefore); // no residual pause inherited
+  });
+
+  test("Retry-After numeric seconds has the same 1s floor as the HTTP-date form", () => {
+    expect(parseRetryAfterMs("0", 1_000_000_000_000)).toBe(1000);
+  });
+
+  test("graphql: the final attempt's classification does not arm a residual pause either", async () => {
+    const throttle = ok(http(200, { "x-ratelimit-remaining": "50", "retry-after": "7" }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`));
+    const { client, sleeps } = makeClient([...Array.from({ length: 6 }, () => throttle), ok(http(200, {}, `{"data":{"x":1}}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
+    const sleepsBefore = sleeps.length;
+    const data = await client.graphql("query{x}", {});
+    expect(data).toEqual({ x: 1 });
+    expect(sleeps.length).toBe(sleepsBefore); // no residual pause inherited
+  });
+
+  test("restGet: the final attempt's PRIMARY classification does not arm a residual pause", async () => {
+    // small GENUINE resets so all 6 primary attempts complete within budget; the LAST
+    // response's far-future reset must not be armed for the follow-up call.
+    const NOW_SEC = 1_000_000_000;
+    const primaryAt = (sec: number) =>
+      err(http(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(NOW_SEC + sec) }, `{"message":"rate limit"}`));
+    const { client, sleeps } = makeClient([
+      primaryAt(100), primaryAt(300), primaryAt(500), primaryAt(700), primaryAt(900),
+      primaryAt(999_999), // final attempt: would arm ~11 days if the guard regressed
+      ok(http(200, {}, `{"ok":1}`)),
+    ]);
+    await expect(client.restGet("rate_limit")).rejects.toThrow(ThrottleExhausted);
+    const sleepsBefore = sleeps.length;
+    const res = await client.restGet("rate_limit");
+    expect(res.body).toBe(`{"ok":1}`);
+    expect(sleeps.length).toBe(sleepsBefore); // the poisoned final primary was not armed
+  });
+
+  test("a graphql SECONDARY (remaining>0) with an absurd Retry-After sleeps exactly MAX_PAUSE_MS", async () => {
+    // the exact-equality assertion distinguishes a clamped Retry-After from the
+    // exponential-backoff substitute that a nulled wait would produce (60s base).
+    const { client, sleeps } = makeClient([
+      ok(http(200, { "x-ratelimit-remaining": "50", "retry-after": "315360000" }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`)),
+      ok(http(200, {}, `{"data":{"x":1}}`)),
+    ]);
+    const data = await client.graphql("query{x}", {});
+    expect(data).toEqual({ x: 1 });
+    expect(sleeps.length).toBeGreaterThanOrEqual(1);
+    expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
+  });
+});
+
+describe("constructor knob validation (fail-fast at the boundary)", () => {
+  const base = { githubHost: "github.com", env: { HOME: "/tmp", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP };
+  test("concurrency < 1 throws instead of hanging the first acquire forever", () => {
+    expect(() => new GithubClient({ ...base, concurrency: 0 })).toThrow(/concurrency must be >= 1/);
+    expect(() => new GithubClient({ ...base, concurrency: -2 })).toThrow(/concurrency must be >= 1/);
+  });
+  test("spawnTimeoutMs < 1 throws instead of instantly expiring every spawn", () => {
+    expect(() => new GithubClient({ ...base, spawnTimeoutMs: 0 })).toThrow(/spawnTimeoutMs must be >= 1/);
+  });
+});
+
+describe("readCapped spawn-output byte cap (§4/§5.C)", () => {
+  // readCapped gates EVERY gh/git/tar spawn's output at MAX_SPAWN_OUTPUT_BYTES — a fake
+  // reader exercises the cap directly (a real 110MB subprocess would be pure test tax).
+  const bytes = (n: number): Uint8Array => new Uint8Array(n);
+  const scripted = (reads: Array<{ done?: boolean; value?: Uint8Array }>): { reader: StreamReader; readsIssued: () => number } => {
+    let i = 0;
+    return {
+      reader: { read: async () => reads[i++] ?? { done: true }, cancel: async () => {} },
+      readsIssued: () => i,
+    };
+  };
+
+  test("kills the process the moment the cap is crossed and stops reading", async () => {
+    let exceeded = 0;
+    const { reader, readsIssued } = scripted([{ value: bytes(2) }, { value: bytes(2) }, { value: bytes(2) }]);
+    await expect(readCapped(reader, 3, () => { exceeded++; })).rejects.toThrow(/spawn output exceeds 3 bytes/);
+    expect(exceeded).toBe(1); // the kill fired exactly once
+    expect(readsIssued()).toBe(2); // the crossing read was the LAST read — nothing buffered past it
+  });
+
+  test("a final done+value chunk is kept (Bun readers may deliver the last chunk with done)", async () => {
+    const { reader } = scripted([{ done: true, value: new TextEncoder().encode("abc") }]);
+    expect(await readCapped(reader, 3, () => { throw new Error("must not exceed"); })).toBe("abc");
+  });
+
+  test("a final done+value chunk is still cap-checked", async () => {
+    let exceeded = 0;
+    const { reader } = scripted([{ done: true, value: new TextEncoder().encode("abc") }]);
+    await expect(readCapped(reader, 2, () => { exceeded++; })).rejects.toThrow(/spawn output exceeds 2 bytes/);
+    expect(exceeded).toBe(1);
+  });
+});
+
+describe("joinSpawnOutcome (reader/exit merge)", () => {
+  const after = <T,>(ms: number, fn: () => T): Promise<T> =>
+    new Promise((resolve, reject) => setTimeout(() => {
+      try { resolve(fn()); } catch (e) { reject(e); }
+    }, ms));
+
+  test("the TEMPORALLY FIRST reader error wins, regardless of stream", async () => {
+    // stderr fails first, stdout fails later — the earlier error is the diagnostic that
+    // must surface (a later, secondary failure must not replace it).
+    const stdoutP = after(25, (): string => { throw new Error("SECOND"); });
+    const stderrP = after(5, (): string => { throw new Error("FIRST"); });
+    await expect(joinSpawnOutcome(stdoutP, stderrP, after(30, () => 1))).rejects.toThrow(/FIRST/);
+  });
+
+  test("a reader error is HELD until the child has exited", async () => {
+    let exited = false;
+    const exitP = after(40, () => { exited = true; return 137; });
+    const stdoutP = after(5, (): string => { throw new Error("cap"); });
+    try {
+      await joinSpawnOutcome(stdoutP, Promise.resolve(""), exitP);
+      throw new Error("expected rejection");
+    } catch (e) {
+      expect((e as Error).message).toBe("cap");
+      expect(exited).toBe(true); // the throw waited for proc.exited
+    }
+  });
+
+  test("a clean run composes stdout/stderr/exitCode", async () => {
+    expect(await joinSpawnOutcome(Promise.resolve("out"), Promise.resolve("err"), Promise.resolve(0)))
+      .toEqual({ exitCode: 0, stdout: "out", stderr: "err" });
+  });
+});
+
+describe("spawn wall-clock deadline (§4 hardening)", () => {
+  // a poisoned endpoint can hang by PACING the response instead of via headers — every
+  // spawn must carry a kill deadline so one wedged child cannot hold its semaphore slot
+  // (gh) or the serial orchestrator (git) forever.
+  test("SPAWN_TIMEOUT_MS is 15 minutes (independent literal pins the magnitude)", () => {
+    expect(SPAWN_TIMEOUT_MS).toBe(900_000);
+  });
+
+  test("a never-resolving gh spawn times out, retries transiently, then surfaces an error instead of hanging", async () => {
+    const signals: Array<SpawnAbortSignal | undefined> = [];
+    const sleeps: number[] = [];
+    let kills = 0;
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => {
+          signals.push(opts.signal);
+          // stands in for realSpawn: the kill settles the spawn promise (readers cancelled)
+          opts.signal?.onAbort(() => { kills++; resolve({ exitCode: 137, stdout: "", stderr: "killed" }); });
+        }),
+      sleepImpl: async (ms) => { sleeps.push(ms); },
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      spawnTimeoutMs: 15,
+    });
+    await expect(client.restGet("rate_limit")).rejects.toThrow(/timed out/);
+    expect(signals.length).toBe(6); // MAX_ATTEMPTS attempts, none hung forever
+    expect(signals.every((s) => s?.aborted === true)).toBe(true);
+    expect(kills).toBe(6); // the registered killer FIRED for every expired child
+    expect(sleeps.length).toBeGreaterThanOrEqual(5); // transient backoff between attempts
+  });
+
+  test("a timed-out git spawn resolves with a nonzero exit instead of hanging", async () => {
+    let signal: SpawnAbortSignal | undefined;
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => {
+          signal = opts.signal;
+          opts.signal?.onAbort(() => resolve({ exitCode: 137, stdout: "", stderr: "killed" }));
+        }),
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      spawnTimeoutMs: 15,
+    });
+    const res = await client.git(["--version"]);
+    expect(res.exitCode).not.toBe(0);
+    expect(res.stderr).toMatch(/timed out/);
+    expect(res.stdout).toBe(""); // empty stdout is the contract: it parses as "no HTTP response"
+    expect(signal?.aborted).toBe(true);
+  });
+
+  test("a timed-out tar spawn resolves with a nonzero exit instead of hanging", async () => {
+    // tar extracts attacker-supplied registry tarballs — the most attacker-influenced spawn.
+    let signal: SpawnAbortSignal | undefined;
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => {
+          signal = opts.signal;
+          opts.signal?.onAbort(() => resolve({ exitCode: 137, stdout: "", stderr: "killed" }));
+        }),
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      spawnTimeoutMs: 15,
+    });
+    const res = await client.tar(["--version"]);
+    expect(res.exitCode).not.toBe(0);
+    expect(res.stderr).toMatch(/timed out/);
+    expect(res.stdout).toBe("");
+    expect(signal?.aborted).toBe(true);
+  });
+
+  test("a fast spawn is unaffected by the default deadline", async () => {
+    const { client } = makeClient([ok(http(200, {}, `{"ok":1}`))]);
+    const res = await client.restGet("rate_limit");
+    expect(res.body).toBe(`{"ok":1}`);
+  });
+
+  test("a timed-out spawn returns only after the killed child settles (no cleanup race)", async () => {
+    // cloneShallow/introspectVersion delete the child's working directory the moment the
+    // spawn call returns — so a timed-out spawn must not return while the (SIGTERMed but
+    // not yet dead) child can still be writing into that tree.
+    let settled = false;
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => {
+          opts.signal?.onAbort(() => {
+            setTimeout(() => { settled = true; resolve({ exitCode: 137, stdout: "", stderr: "killed" }); }, 50);
+          });
+        }),
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      spawnTimeoutMs: 15,
+    });
+    const res = await client.git(["--version"]);
+    expect(res.stderr).toMatch(/timed out/);
+    expect(settled).toBe(true); // the child had settled BEFORE the caller got control back
+  });
+
+  test("a spawn impl that never settles after the kill still returns once the escalation grace has passed", async () => {
+    // the settle-wait must be BOUNDED: a wedged kill (or a fake that never resolves) cannot
+    // convert the deadline into a hang. The fallback fires after SPAWN_KILL_GRACE_MS + margin.
+    const start = Date.now();
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: () => new Promise<SpawnResult>(() => {}), // never settles, even when killed
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      spawnTimeoutMs: 15,
+    });
+    const res = await client.git(["--version"]);
+    expect(res.stderr).toMatch(/timed out/);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeGreaterThanOrEqual(SPAWN_KILL_GRACE_MS); // waited out the escalation
+    expect(elapsed).toBeLessThan(SPAWN_KILL_GRACE_MS + 4_000); // ...but stayed bounded
+  }, 8_000);
+
+  test("a REAL diagnostic rejection wins over the synthetic timeout (never masked as a retryable 124)", async () => {
+    // a byte-cap/stream failure whose settlement crosses the deadline is still the true
+    // diagnostic — reporting it as a synthetic 124 would classify it as a transient
+    // no-response and re-drive the oversized request through every retry.
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((_resolve, reject) => {
+          opts.signal?.onAbort(() => setTimeout(() => reject(new GithubApiError("spawn output exceeds 42 bytes", {})), 20));
+        }),
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      spawnTimeoutMs: 15,
+    });
+    await expect(client.git(["--version"])).rejects.toThrow(/spawn output exceeds 42 bytes/);
+  });
+
+  test("NaN knobs are rejected like nonpositive ones (NaN < 1 is false — the guard must be finite-aware)", () => {
+    const base = { githubHost: "github.com", env: { HOME: "/tmp", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP };
+    expect(() => new GithubClient({ ...base, concurrency: Number.NaN })).toThrow(/concurrency must be >= 1/);
+    expect(() => new GithubClient({ ...base, spawnTimeoutMs: Number.NaN })).toThrow(/spawnTimeoutMs must be >= 1/);
+  });
+});
+
+describe("cloneShallow temp-dir cleanup on failure", () => {
+  // the shared git-config dir (pkg-audit-gitcfg-*) is a per-client cached resource, NOT a
+  // per-clone leak — the run temp dir holding the partial clone is what must be reclaimed.
+  const cloneRunDirs = (root: string): string[] =>
+    readdirSync(root).filter((n) => n.startsWith("pkg-audit-") && !n.startsWith("pkg-audit-gitcfg-"));
+
+  test("a failed clone leaves no clone run dir behind", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
+    const { client } = makeClient([err("", "fatal: repository not found", 128)], { tempRoot: root });
+    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/clone failed/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("a clone whose rev-parse fails also cleans up", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
+    const { client } = makeClient([ok(""), err("", "fatal: bad revision", 128)], { tempRoot: root });
+    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/rev-parse/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a cleanup failure never masks the original clone error", async () => {
+    // rmSync's force only suppresses ENOENT — an EACCES/EBUSY from the cleanup walk must not
+    // replace the actionable git error (which carries git's stderr). The stuck tree is the
+    // next run's startup sweep's problem; the ORIGINAL error is the operator's diagnostic.
+    const root = mkdtempSync(join(tmpdir(), "clone-mask-"));
+    let cloneDest = "";
+    const spawnImpl: SpawnFn = async (_bin, args) => {
+      cloneDest = args[args.length - 1]!; // clone dest is the final argv token
+      mkdirSync(cloneDest, { recursive: true });
+      writeFileSync(join(cloneDest, "partial"), "x");
+      chmodSync(cloneDest, 0o555); // cleanup cannot unlink `partial` → rmSync throws EACCES
+      return { exitCode: 128, stdout: "", stderr: "ORIGINAL_GIT_FAILURE" };
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl,
+      env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: root,
+    });
+    try {
+      await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/ORIGINAL_GIT_FAILURE/);
+    } finally {
+      if (cloneDest !== "") chmodSync(cloneDest, 0o755);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("spawn kill escalation (§4 hardening)", () => {
+  test("SPAWN_KILL_GRACE_MS is 2s (independent literal pins the magnitude)", () => {
+    expect(SPAWN_KILL_GRACE_MS).toBe(2000);
+  });
+
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const waitFor = async (cond: () => boolean, ms: number): Promise<boolean> => {
+    const start = Date.now();
+    while (Date.now() - start < ms) {
+      if (cond()) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return cond();
+  };
+  // a shell child that IGNORES SIGTERM and parks a background grandchild on the inherited
+  // pipes — the exact shape that previously orphaned the read loop. The deadline must be
+  // long enough that the trap is installed BEFORE the deadline's SIGTERM (otherwise the
+  // signal lands during shell startup and kills it outright, defeating the point).
+  const SPAWN_DEADLINE = 800;
+  const makeTrappingScript = (dir: string): { script: string; pidFile: string } => {
+    const pidFile = join(dir, "pid");
+    const script = join(dir, "fake-git");
+    writeFileSync(script, `#!/bin/sh\ntrap '' TERM\necho $$ > ${pidFile}\nsleep 300 &\nwait\n`);
+    chmodSync(script, 0o755);
+    return { script, pidFile };
+  };
+
+  test("a SIGTERM-trapping real child is SIGKILLed after the grace period", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "kill-esc-"));
+    const { script, pidFile } = makeTrappingScript(dir);
+    const client = new GithubClient({
+      githubHost: "github.com",
+      binPaths: { gh: "/bin/echo", git: script, tar: "/bin/echo" },
+      env: { HOME: "/tmp", PATH: "/bin:/usr/bin" },
+      tempRoot: dir,
+      spawnTimeoutMs: SPAWN_DEADLINE,
+    });
+    const res = await client.git(["--version"]); // real spawn, real deadline
+    expect(res.exitCode).not.toBe(0);
+    expect(await waitFor(() => existsSync(pidFile), 2000)).toBe(true);
+    const shPid = Number(readFileSync(pidFile, "utf8").trim());
+    // the child trapped the deadline's SIGTERM, so only the SIGKILL escalation can reap it —
+    // and git() must NOT settle until that has happened: callers delete the child's working
+    // directory the moment the call returns, which would race a still-writing child.
+    expect(await waitFor(() => !alive(shPid), 500)).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  }, 12_000);
+
+  test("a byte-cap rejection is held until the child has actually exited (no cleanup race)", async () => {
+    // realSpawn must not settle — even by REJECTING — while the child is still alive:
+    // callers treat settlement as "the child is gone" and immediately delete its working
+    // directory. A SIGTERM-trapping child that spews past the cap forces the full
+    // cap → kill → SIGKILL-escalation → exit sequence before the rejection may surface.
+    const dir = mkdtempSync(join(tmpdir(), "cap-hold-"));
+    const pidFile = join(dir, "pid");
+    const script = join(dir, "spewer");
+    writeFileSync(script, `#!/bin/sh\ntrap '' TERM\necho $$ > ${pidFile}\nhead -c 256 /dev/zero\nsleep 300 &\nwait\n`);
+    chmodSync(script, 0o755);
+    const spawn = makeRealSpawn(64);
+    try {
+      await expect(spawn(script, [], { env: { PATH: "/bin:/usr/bin" } })).rejects.toThrow(/spawn output exceeds 64 bytes/);
+      const shPid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(alive(shPid)).toBe(false); // the rejection arrived AFTER the child died
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  test("a standalone run survives the settle-wait even when nothing else holds the event loop", async () => {
+    // the settle-wait window is exactly when every other handle may already be unref'd —
+    // if the awaited timers were unref'd too, a standalone CLI process would drain its
+    // event loop and exit MID-AWAIT (skipping cleanup and report finalization). exitCode
+    // starts at 3 and only the post-await line resets it, so an early drain fails loudly.
+    const dir = mkdtempSync(join(tmpdir(), "settle-ref-"));
+    const runner = join(dir, "runner.ts");
+    // Paths reach the child via env, not string-interpolated into the generated
+    // source — building code from JSON.stringify'd values trips CodeQL's
+    // js/bad-code-sanitization and is a fragile way to escape a string literal.
+    writeFileSync(runner, [
+      `const ghModule = process.env.GH_MODULE, runDir = process.env.RUN_DIR;`,
+      `if (!ghModule || !runDir) throw new Error("runner env not set");`,
+      `const { GithubClient } = await import(ghModule);`,
+      `process.exitCode = 3; // stays 3 if the event loop drains mid-await`,
+      `const client = new GithubClient({ githubHost: "github.com", spawnImpl: () => new Promise(() => {}), env: { HOME: "/tmp", PATH: "/bin:/usr/bin" }, binPaths: { gh: "/bin/echo", git: "/bin/echo", tar: "/bin/echo" }, tempRoot: runDir, spawnTimeoutMs: 50 });`,
+      `const res = await client.git(["--version"]);`,
+      `if (res.stderr.includes("timed out")) process.exitCode = 0;`,
+    ].join("\n"));
+    const proc = Bun.spawn({
+      cmd: [process.execPath, runner],
+      env: { ...process.env, GH_MODULE: join(import.meta.dir, "github.ts"), RUN_DIR: dir },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const killer = setTimeout(() => proc.kill(9), 20_000);
+    const code = await proc.exited;
+    clearTimeout(killer);
+    expect(code).toBe(0); // completed the post-timeout code — the loop was held through the wait
+    rmSync(dir, { recursive: true, force: true });
+  }, 25_000);
+
+  test("the process can exit despite a pipe-holding grandchild (abandoned loser cannot pin the loop)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "kill-exit-"));
+    const { script } = makeTrappingScript(dir);
+    const runner = join(dir, "runner.ts");
+    // Paths reach the child via env, not string-interpolated into the generated
+    // source (see the settle-wait runner above) — keeps CodeQL's
+    // js/bad-code-sanitization quiet and the escaping robust.
+    writeFileSync(runner, [
+      `const ghModule = process.env.GH_MODULE, gitBin = process.env.GIT_BIN, runDir = process.env.RUN_DIR;`,
+      `if (!ghModule || !gitBin || !runDir) throw new Error("runner env not set");`,
+      `const { GithubClient } = await import(ghModule);`,
+      `const client = new GithubClient({ githubHost: "github.com", binPaths: { gh: "/bin/echo", git: gitBin, tar: "/bin/echo" }, env: { HOME: "/tmp", PATH: "/bin:/usr/bin" }, tempRoot: runDir, spawnTimeoutMs: ${SPAWN_DEADLINE} });`,
+      `const res = await client.git(["--version"]);`,
+      `if (res.exitCode === 0) throw new Error("expected a timed-out result");`,
+    ].join("\n"));
+    const proc = Bun.spawn({
+      cmd: [process.execPath, runner],
+      env: { ...process.env, GH_MODULE: join(import.meta.dir, "github.ts"), GIT_BIN: script, RUN_DIR: dir },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const killer = setTimeout(() => proc.kill(9), 20_000); // backstop: a pinned loop never exits
+    const code = await proc.exited;
+    clearTimeout(killer);
+    expect(code).toBe(0); // exited on its own — readers cancelled, handle unref'd
+    rmSync(dir, { recursive: true, force: true });
+  }, 25_000);
+});
+
 describe("pagination", () => {
+  test("MAX_PAGES is 1000 (independent literal pins the magnitude)", () => {
+    expect(MAX_PAGES).toBe(1000);
+  });
+
   test("follows Link rel=next across pages, recomposing relative endpoints", async () => {
     const { client, calls } = makeClient([
       ok(http(200, { link: `<https://api.github.com/orgs/x/repos?per_page=100&page=2&type=all>; rel="next"` }, `[{"name":"a"}]`)),
@@ -460,9 +1022,53 @@ describe("pagination", () => {
     expect(calls[0]!.args).toContain("orgs/x/repos?per_page=100&page=1&type=all");
     expect(calls[1]!.args).toContain("orgs/x/repos?per_page=100&page=2&type=all");
   });
+  test("follows a canonical numeric organizations/<id>/repos Link next URL (§5.A)", async () => {
+    // GitHub can emit the Link rel="next" for orgs/<login>/repos in the numeric
+    // organizations/<id>/repos form — the recomposed relative endpoint must pass the guard.
+    const { client, calls } = makeClient([
+      ok(http(200, { link: `<https://api.github.com/organizations/143746735/repos?per_page=100&page=2&type=all>; rel="next"` }, `[{"name":"a"}]`)),
+      ok(http(200, {}, `[{"name":"b"}]`)),
+    ]);
+    const rows = await client.restGetPagedArray("orgs/x/repos?per_page=100&page=1&type=all");
+    expect(rows.length).toBe(2);
+    expect(calls[0]!.args).toContain("orgs/x/repos?per_page=100&page=1&type=all");
+    expect(calls[1]!.args).toContain("organizations/143746735/repos?per_page=100&page=2&type=all");
+  });
+  test("a poisoned Link to a non-repos organizations resource is a ReadOnlyViolation", async () => {
+    // host-valid but path-poisoned Link: the recomposed follow-up endpoint must still hit
+    // the guard — exactly one spawn (the first page), then fail closed.
+    const { client, calls } = makeClient([
+      ok(http(200, { link: `<https://api.github.com/organizations/143746735/members?page=2>; rel="next"` }, `[{"name":"a"}]`)),
+    ]);
+    await expect(client.restGetPagedArray("orgs/x/repos?per_page=100&page=1&type=all")).rejects.toThrow(ReadOnlyViolation);
+    expect(calls.length).toBe(1);
+  });
   test("a non-array page is an error", async () => {
     const { client } = makeClient([ok(http(200, {}, `{"not":"array"}`))]);
     await expect(client.restGetPagedArray("orgs/x/repos?page=1")).rejects.toThrow(/array/);
+  });
+  test("a self-referential Link cycle throws instead of looping", async () => {
+    // every page points rel="next" at the SAME URL — the second visit to an already-seen
+    // endpoint must fail fast, after exactly two spawns (page 1, page 2), not spawn again.
+    const cyclic = `<https://api.github.com/orgs/x/repos?per_page=100&page=2&type=all>; rel="next"`;
+    const { client, calls } = makeClient([
+      ok(http(200, { link: cyclic }, `[{"name":"a"}]`)),
+      ok(http(200, { link: cyclic }, `[{"name":"b"}]`)),
+    ]);
+    await expect(client.restGetPagedArray("orgs/x/repos?per_page=100&page=1&type=all")).rejects.toThrow(GithubApiError);
+    expect(calls.length).toBe(2);
+  });
+  test(`a non-repeating Link chain longer than MAX_PAGES throws`, async () => {
+    // endless UNIQUE next URLs dodge cycle detection — the page cap must stop the chain.
+    const { client, calls } = makeClient(
+      Array.from({ length: MAX_PAGES + 1 }, (_, i) =>
+        ok(http(200, { link: `<https://api.github.com/orgs/x/repos?page=${i + 2}>; rel="next"` }, `[]`))),
+    );
+    // the class matters: ThrottleExhausted would mean "re-queue", re-driving the poisoned chain.
+    const rejection = client.restGetPagedArray("orgs/x/repos?page=1");
+    await expect(rejection).rejects.toThrow(GithubApiError);
+    await expect(rejection).rejects.toThrow(/exceeded/);
+    expect(calls.length).toBe(MAX_PAGES); // cap checked BEFORE the fetch: exactly MAX_PAGES spawns
   });
 });
 
@@ -527,6 +1133,26 @@ describe("listBranchHeads (§5.B)", () => {
     expect(calls[0]!.args.some((a) => a.startsWith("endCursor="))).toBe(false); // first page omits it
     expect(calls[1]!.args).toContain("endCursor=CUR1");
   });
+  // same poisoned-pagination class as restGetPagedArray: the cursor chain must be bounded.
+  const cursorPage = (cursor: string) =>
+    ok(http(200, {}, JSON.stringify({
+      data: { repository: { refs: { pageInfo: { hasNextPage: true, endCursor: cursor }, nodes: [] } } },
+    })));
+  test("a repeated endCursor throws instead of looping", async () => {
+    const { client, calls } = makeClient([cursorPage("CUR1"), cursorPage("CUR1")]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(GithubApiError);
+    expect(calls.length).toBe(2);
+  });
+  test("a non-repeating cursor chain longer than MAX_PAGES throws", async () => {
+    const { client, calls } = makeClient(
+      Array.from({ length: MAX_PAGES + 2 }, (_, i) => cursorPage(`CUR${i + 1}`)),
+    );
+    // the class matters: ThrottleExhausted would mean "re-queue", re-driving the poisoned chain.
+    const rejection = client.listBranchHeads("o", "r");
+    await expect(rejection).rejects.toThrow(GithubApiError);
+    await expect(rejection).rejects.toThrow(/exceeded/);
+    expect(calls.length).toBe(MAX_PAGES); // loop-top cap: exactly MAX_PAGES spawns, same as REST
+  });
 });
 
 describe("hardened clone (§0/§5.C)", () => {
@@ -538,6 +1164,9 @@ describe("hardened clone (§0/§5.C)", () => {
     const { dir, headSha } = await client.cloneShallow("org-a", "repo-b", "release/1.x");
     expect(headSha).toBe("abc123def");
     expect(dir.startsWith(TEST_TMP)).toBe(true);
+    // a SUCCESSFUL clone must keep its run dir (the failure-only cleanup must not be a finally):
+    // downstream walkClone/cloneReader read this dir, so deleting it would silently zero findings.
+    expect(existsSync(dirname(dir))).toBe(true);
 
     const clone = calls[0]!;
     expect(clone.bin).toBe(BINS.git);

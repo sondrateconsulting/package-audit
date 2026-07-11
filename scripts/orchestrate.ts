@@ -11,7 +11,7 @@ import { readdirSync, lstatSync, readFileSync, existsSync, rmSync } from "node:f
 import { join, dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
-import { GithubClient, filterSortCapRepos, type RepoInfo, type BranchHead } from "./github.ts";
+import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchHead } from "./github.ts";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseArgs, ORCHESTRATE_HELP, ORCHESTRATE_USAGE, type OrchestrateArgs } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -26,15 +26,22 @@ import type { CliTermSet } from "./cliScanner.ts";
 import { logLine } from "./log.ts";
 
 // ---- per-unit read helpers ------------------------------------------------------------------
-// API reader: SHA-pinned raw fetch (≤100MB) for blob entries; non-blobs (submodule/symlink) and
-// failures return null. SHA-pinned reads are served from api_cache with zero network on re-read.
+// API reader: SHA-pinned raw fetch (≤100MB) for blob entries. Non-blobs (submodule/symlink)
+// and a 404 return null — the one genuinely-benign miss (the tree listed a path the contents
+// API no longer serves, e.g. a force-push race), where skipping the file is correct. EVERY
+// other failure RETHROWS: the unit was never fully read, and degrading to null would mark a
+// partially-read head `done` (the §3 skip predicate then skips it forever) with its findings
+// silently under-reported. A ThrottleExhausted reaches processRepo's requeue catch (§4,
+// pending); a fatal GithubApiError (SSO/permission 403, exhausted no-response) lands as a
+// visible scan error. SHA-pinned reads are served from api_cache with zero network on re-read.
 function apiReader(client: GithubClient, org: string, repo: string, commitSha: string) {
   return async (path: string, entry: TreeEntry): Promise<string | null> => {
     if (entry.type !== "blob") return null;
     try {
       return await client.fetchFileRaw(org, repo, path, commitSha);
-    } catch {
-      return null;
+    } catch (e) {
+      if (e instanceof GithubApiError && e.status === 404) return null;
+      throw e;
     }
   };
 }
@@ -117,58 +124,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories });
 
   try {
-    // §0 startup: sweep stale temp dirs from a prior crash.
-    client.sweepStaleTempDirs();
-
-    // §1 effective owner resolution (discovery runs every invocation).
-    const { owners, source } = await resolveOwners(client, config, preflight.githubLogin);
-
-    // §3 run lifecycle: start or resume.
-    const { runId, resumed } = db.startRun({
-      configHash, effectiveOwners: owners, ownersSource: source,
-      trackedPackages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost,
-    });
-    const resume = db.resumeInfo(configHash);
-    logLine({ event: "run", runId, resumed, counts: resume.counts });
-
-    // §3 --rescan-branch: reset matching branch units to pending BEFORE discovery.
-    for (const t of args.rescanBranches) {
-      const reset = db.rescanBranch(configHash, t.organization, t.repository, t.branch);
-      logLine({ event: "rescan-branch", target: `${t.organization}/${t.repository}@${t.branch}`, reset });
-    }
-
-    const nonRegistrySkipSeen = new Set<string>();
-
-    // §5.G bin discovery: introspect each tracked package's LATEST published version ONCE up
-    // front to learn its bin names, so the per-unit CLI scan runs specifier + bin terms in a
-    // SINGLE pass (no fragile post-introspection re-scan). Bins are version-stable, and this also
-    // covers a CLI-only package invoked with no manifest declaration (§5.G/§7 usageByRepo union).
-    const cliTermSets = await discoverCliTerms(db, client, config, runId);
-    logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
-
-    // §5.A/§5.B discover + process, deterministically.
-    for (const owner of owners) {
-      const isPersonal = config.includePersonalNamespace && owner === preflight.githubLogin;
-      const kept = await discoverOwnerRepos(db, client, config, runId, owner, isPersonal);
-      for (const repo of kept) {
-        await processRepo(db, client, config, runId, configHash, owner, repo, cliTermSets, nonRegistrySkipSeen);
-      }
-    }
-
-    // §5.E introspection reconciliation over the run's reportable slice.
-    await reconcileIntrospection(db, client, config, runId, trackedNames);
-
-    // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at).
-    db.completeRun(runId);
-    // §8 step 7: produce the consolidated §7 report (run-<id>.json + latest.json) from SQLite,
-    // then the machine done-event (stdout) and the human summary (stderr) — BOTH derived from
-    // the emitted report object itself, so the three can never disagree.
-    const completedRun = db.getRun(runId)!;
-    const emitted = emitReportDetailed(db, completedRun, config.paths.outputDir, { alsoLatest: true });
-    const summary = emitted.report.summary;
-    const errorCount = emitted.report.errors.length;
-    logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount });
-    process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path));
+    await runScan(db, client, config, configHash, args, preflight.githubLogin);
   } finally {
     db.close();
   }
@@ -192,10 +148,79 @@ export function runSummaryText(runId: string, s: ReportSummary, errorCount: numb
   ].join("\n");
 }
 
+// The full scan lifecycle (§0/§1/§3/§5/§8), after preflight opened the db + caching client.
+// EXPORTED for tests: the site-(a) owner-discovery throttle contract — end cleanly WITHOUT
+// starting a run — is pinned here (a run started on throttle would leave a phantom run row).
+export async function runScan(
+  db: AuditDb, client: GithubClient, config: Config, configHash: string,
+  args: OrchestrateArgs, personalLogin: string | null,
+): Promise<void> {
+  // §0 startup: sweep stale temp dirs from a prior crash.
+  client.sweepStaleTempDirs();
+
+  // §1 effective owner resolution (discovery runs every invocation). A throttle here is
+  // TRANSIENT (§4): end the run cleanly and let the next invocation re-discover, rather than
+  // crashing the whole process with no report.
+  const resolved = await resolveOwnersWithDiscovery(client, config, personalLogin);
+  if (resolved === null) {
+    logLine({ event: "owner-discovery-throttled", action: "retry-next-run" });
+    return; // clean exit; the caller closes the db. No run started, nothing to report.
+  }
+  const { owners, source } = resolved;
+
+  // tracked names derive from config.packages EVERYWHERE (run metadata here, the §5.E
+  // reconciliation slice inside reconcileIntrospection) — a separately-passed list could
+  // drift from the config that supplies each package's registry coordinates.
+  const trackedNames = config.packages.map((p) => p.name);
+
+  // §3 run lifecycle: start or resume.
+  const { runId, resumed } = db.startRun({
+    configHash, effectiveOwners: owners, ownersSource: source,
+    trackedPackages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost,
+  });
+  const resume = db.resumeInfo(configHash);
+  logLine({ event: "run", runId, resumed, counts: resume.counts });
+
+  // §3 --rescan-branch: reset matching branch units to pending BEFORE discovery.
+  for (const t of args.rescanBranches) {
+    const reset = db.rescanBranch(configHash, t.organization, t.repository, t.branch);
+    logLine({ event: "rescan-branch", target: `${t.organization}/${t.repository}@${t.branch}`, reset });
+  }
+
+  const nonRegistrySkipSeen = new Set<string>();
+
+  // §5.G bin discovery: introspect each tracked package's LATEST published version ONCE up
+  // front to learn its bin names, so the per-unit CLI scan runs specifier + bin terms in a
+  // SINGLE pass (no fragile post-introspection re-scan). Bins are version-stable, and this also
+  // covers a CLI-only package invoked with no manifest declaration (§5.G/§7 usageByRepo union).
+  const cliTermSets = await discoverCliTerms(db, client, config, runId);
+  logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
+
+  // §5.A/§5.B discover + process, deterministically.
+  for (const owner of owners) {
+    await processOwner(db, client, config, runId, configHash, owner, personalLogin, cliTermSets, nonRegistrySkipSeen);
+  }
+
+  // §5.E introspection reconciliation over the run's reportable slice.
+  await reconcileIntrospection(db, client, config, runId);
+
+  // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at).
+  db.completeRun(runId);
+  // §8 step 7: produce the consolidated §7 report (run-<id>.json + latest.json) from SQLite,
+  // then the machine done-event (stdout) and the human summary (stderr) — BOTH derived from
+  // the emitted report object itself, so the three can never disagree.
+  const completedRun = db.getRun(runId)!;
+  const emitted = emitReportDetailed(db, completedRun, config.paths.outputDir, { alsoLatest: true });
+  const summary = emitted.report.summary;
+  const errorCount = emitted.report.errors.length;
+  logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount });
+  process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path));
+}
+
 // ---- owner resolution + branch classification (shared by the run and --plan paths) -----------
 // §1 effective owner resolution: discovery re-runs every invocation through the given client.
 async function resolveOwners(
-  client: GithubClient, config: Config, personalLogin: string,
+  client: GithubClient, config: Config, personalLogin: string | null,
 ): Promise<{ owners: string[]; source: OwnersSource }> {
   const discoveredOrgs = config.organizations === null ? await client.listOrgMemberships() : [];
   const { owners, source } = resolveEffectiveOwners({
@@ -207,6 +232,22 @@ async function resolveOwners(
   });
   logLine({ event: "owners", owners, source });
   return { owners, source };
+}
+
+// §1 owner resolution with graceful throttle handling. A ThrottleExhausted during org-membership
+// discovery is TRANSIENT (§4) — return null so the caller ends the run cleanly (the next run
+// re-discovers) instead of crashing. Any OTHER error rethrows (a genuine failure — including an
+// EmptyOwnersError from resolution itself — still fails the run). EXPORTED for tests: the
+// transient-vs-fatal split must stay pinned.
+export async function resolveOwnersWithDiscovery(
+  client: GithubClient, config: Config, personalLogin: string | null,
+): Promise<{ owners: string[]; source: OwnersSource } | null> {
+  try {
+    return await resolveOwners(client, config, personalLogin);
+  } catch (e) {
+    if (e instanceof ThrottleExhausted) return null;
+    throw e;
+  }
 }
 
 // §5.B classification, pure: heads arrive sorted committedDate DESC. EVERY still-live branch
@@ -230,11 +271,26 @@ export function classifyBranchPlan(heads: BranchHead[], cutoffDate: string, maxB
   return { cutoffSkipped, eligible, pastCap };
 }
 
+// Discover ONE owner's repos and process each (§5.A). EXPORTED for tests: the repo-discovery
+// throttle policy (inside discoverOwnerRepos) must stay pinned at this call boundary.
+export async function processOwner(
+  db: AuditDb, client: GithubClient, config: Config, runId: string, configHash: string,
+  owner: string, personalLogin: string | null, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+): Promise<void> {
+  const isPersonal = config.includePersonalNamespace && owner === personalLogin;
+  const kept = await discoverOwnerRepos(db, client, config, runId, owner, isPersonal);
+  for (const repo of kept) {
+    await processRepo(db, client, config, runId, configHash, owner, repo, cliTermSets, nonRegistrySkipSeen);
+  }
+}
+
 // §5.A run-path repo discovery for one owner, fail-soft: a failure records the DB error row AND
 // emits the matching JSONL `discovery` event (org-scoped — no `repo` field), then yields [] so
-// main()'s owner loop simply moves on. Exported for tests (scripted client + real in-memory DB);
-// main() is its only runtime caller. The --plan twin lives in runPlan, deliberately separate —
-// plan mode has no DB and counts failures into its totals instead.
+// the owner loop simply moves on. A ThrottleExhausted is TRANSIENT (§4): discovery re-runs next
+// invocation, so it logs a requeue event and yields [] with NO permanent errors row. Exported
+// for tests (scripted client + real in-memory DB); processOwner is its only runtime caller. The
+// --plan twin lives in runPlan, deliberately separate — plan mode has no DB and counts failures
+// into its totals instead.
 export async function discoverOwnerRepos(
   db: AuditDb, client: GithubClient, config: Config, runId: string, owner: string, isPersonal: boolean,
 ): Promise<RepoInfo[]> {
@@ -242,6 +298,12 @@ export async function discoverOwnerRepos(
   try {
     repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
   } catch (e) {
+    // §4: a throttle during repo discovery is TRANSIENT — no permanent errors row (discovery
+    // re-runs next invocation). Any other error is a permanent discovery failure.
+    if (e instanceof ThrottleExhausted) {
+      logLine({ event: "discovery", org: owner, action: "requeue-throttle", message: (e as Error).message });
+      return [];
+    }
     const message = `repo discovery failed: ${(e as Error).message}`;
     db.insertError({ runId, scope: "discovery", organization: owner, message });
     logLine({ event: "discovery", org: owner, error: message });
@@ -253,7 +315,8 @@ export async function discoverOwnerRepos(
 }
 
 // Discover a repo's branches, apply the cutoff + cap, and process/skip each branch unit (§5.B/§3).
-// Exported for the wiring tests (scripted client + real in-memory DB); main() is its only runtime caller.
+// Exported for the wiring tests (scripted client + real in-memory DB) — the throttle-requeue
+// policy in the catches below must stay pinned; processOwner is its only runtime caller.
 export async function processRepo(
   db: AuditDb, client: GithubClient, config: Config, runId: string, configHash: string,
   owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
@@ -262,6 +325,12 @@ export async function processRepo(
   try {
     heads = await client.listBranchHeads(repo.organization, repo.name);
   } catch (e) {
+    // §4: a throttle during branch discovery is TRANSIENT — no permanent errors row (the
+    // next run re-discovers). Any other error is a permanent discovery failure.
+    if (e instanceof ThrottleExhausted) {
+      logLine({ event: "discovery", org: repo.organization, repo: repo.name, action: "requeue-throttle", message: (e as Error).message });
+      return;
+    }
     const message = `branch discovery failed: ${(e as Error).message}`;
     db.insertError({ runId, scope: "discovery", organization: repo.organization, repository: repo.name, message });
     logLine({ event: "discovery", org: repo.organization, repo: repo.name, error: message });
@@ -294,9 +363,17 @@ export async function processRepo(
       const scannedCommit = await processUnit(db, client, config, runId, repo, h, cliTermSets, nonRegistrySkipSeen);
       db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scannedCommit, lastCommitDate: h.committedDate, errorMessage: null });
     } catch (e) {
-      db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
-      db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
-      logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
+      if (e instanceof ThrottleExhausted) {
+        // §4: throttle exhaustion is NOT a permanent unit failure — put the unit back to
+        // pending so a LATER run retries it. No same-run spin: this loop visits each unit
+        // exactly once and nothing later in the run re-reads pending units.
+        db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
+        logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
+      } else {
+        db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
+        db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
+        logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
+      }
     }
   }
 }
@@ -399,8 +476,11 @@ interface SliceRow {
 }
 
 // Exported for the introspection-observability tests (scripted client + real in-memory DB);
-// main() is its only runtime caller.
-export async function reconcileIntrospection(db: AuditDb, client: GithubClient, config: Config, runId: string, trackedNames: string[]): Promise<void> {
+// runScan is its only runtime caller. The slice filter derives from config.packages — the
+// single source of truth for registry coordinates — so a stale dependency row for a package
+// no longer in the config is simply never selected (it cannot reach the pkgConfig lookups).
+export async function reconcileIntrospection(db: AuditDb, client: GithubClient, config: Config, runId: string): Promise<void> {
+  const trackedNames = config.packages.map((p) => p.name);
   const rows = db
     .read(
       `SELECT df.organization, df.repository, df.branch, df.commit_sha, df.package_name,
