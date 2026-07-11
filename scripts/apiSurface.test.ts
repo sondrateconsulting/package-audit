@@ -261,6 +261,54 @@ describe("fetch timeouts + streamed byte caps (§5.E hardening)", () => {
     })).rejects.toThrow(/fetchTimeoutMs must be >= 1/);
   });
 
+  test("NaN deadlines/caps are rejected too (NaN slips a bare < 1 comparison)", async () => {
+    await expect(readBodyCapped(neverEndingBody(), Number.NaN, 1_000, "x")).rejects.toThrow(/cap must be >= 1/);
+    await expect(readBodyCapped(neverEndingBody(), 10, Number.NaN, "x")).rejects.toThrow(/timeoutMs must be >= 1/);
+    const fetchImpl: FetchFn = async () => { throw new Error("unreachable"); };
+    await expect(fetchPackument({
+      packageName: "expo", registryUrl: "https://registry.example.com", registryAuthEnvVar: null, fetchImpl, fetchTimeoutMs: Number.NaN,
+    })).rejects.toThrow(/fetchTimeoutMs must be >= 1/);
+  });
+
+  test("non-Error rejection reasons keep their diagnostic text in the labels", async () => {
+    // streams and fetch impls may reject with a plain string — the label must carry it,
+    // not "undefined" (or a TypeError from dereferencing .message on null).
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) {
+        pulls++;
+        if (pulls === 1) c.enqueue(new Uint8Array(3));
+        else c.error("plain string reason");
+      },
+    });
+    await expect(readBodyCapped(stream, 10_000, 1_000, "tarball"))
+      .rejects.toThrow(/tarball body read failed after 3 bytes: plain string reason/);
+    const fetchImpl = (async () => { throw "hop failed as string"; }) as unknown as FetchFn;
+    await expect(fetchPackument({
+      packageName: "expo", registryUrl: "https://registry.example.com", registryAuthEnvVar: null, fetchImpl,
+    })).rejects.toThrow(/fetch failed at hop 0 .*: hop failed as string/);
+  });
+
+  test("a hop failure after a query-bearing redirect never leaks the query in the label", async () => {
+    let calls = 0;
+    const fetchImpl: FetchFn = async () => {
+      calls++;
+      if (calls === 1) {
+        return {
+          status: 302, ok: false,
+          headers: { get: (n: string) => (n.toLowerCase() === "location" ? "https://registry.example.com/expo?token=SECRET" : null) },
+          arrayBuffer: async () => new ArrayBuffer(0), text: async () => "",
+        };
+      }
+      throw new Error("boom");
+    };
+    const err = await fetchPackument({
+      packageName: "expo", registryUrl: "https://registry.example.com", registryAuthEnvVar: null, fetchImpl,
+    }).then(() => null, (e: Error) => e.message);
+    expect(err).toMatch(/fetch failed at hop 1 \(https:\/\/registry\.example\.com\/expo\): boom/);
+    expect(err).not.toContain("SECRET");
+  });
+
   test("readBodyCapped fails a chunked over-cap body INCREMENTALLY, not after buffering", async () => {
     // no Content-Length anywhere in sight: the cap must trip per chunk as bytes arrive.
     let pulls = 0;

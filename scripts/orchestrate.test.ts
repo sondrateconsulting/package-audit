@@ -575,9 +575,9 @@ describe("processRepo throttle requeue (§4)", () => {
   });
 
   test("a ThrottleExhausted during a unit's CONTENT fetch requeues the unit — never a silent done", async () => {
-    // the api reader degrades ordinary per-file failures to null (file treated as absent),
-    // but a throttle is different: the unit was never fully read, and marking it done would
-    // let the §3 skip predicate skip this head FOREVER with silently missing findings.
+    // the api reader degrades ONLY a status-404 to null (file treated as absent); a throttle
+    // means the unit was never fully read, and marking it done would let the §3 skip
+    // predicate skip this head FOREVER with silently missing findings.
     const scanConfig = {
       ...(config as unknown as Record<string, unknown>),
       githubHost: "github.com",

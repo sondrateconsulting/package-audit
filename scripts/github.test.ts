@@ -799,23 +799,28 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
     expect(elapsed).toBeLessThan(SPAWN_KILL_GRACE_MS + 4_000); // ...but stayed bounded
   }, 8_000);
 
-  test("a spawn impl that REJECTS after the kill still yields the synthetic timeout result", async () => {
-    // a byte-cap rejection landing during the settle-wait is a settlement, not a hang —
-    // the caller still gets the timeout result and the late rejection is never unhandled.
+  test("a REAL diagnostic rejection wins over the synthetic timeout (never masked as a retryable 124)", async () => {
+    // a byte-cap/stream failure whose settlement crosses the deadline is still the true
+    // diagnostic — reporting it as a synthetic 124 would classify it as a transient
+    // no-response and re-drive the oversized request through every retry.
     const client = new GithubClient({
       githubHost: "github.com",
       spawnImpl: (_bin, _args, opts) =>
         new Promise<SpawnResult>((_resolve, reject) => {
-          opts.signal?.onAbort(() => setTimeout(() => reject(new Error("cap exceeded late")), 20));
+          opts.signal?.onAbort(() => setTimeout(() => reject(new GithubApiError("spawn output exceeds 42 bytes", {})), 20));
         }),
       env: { HOME: "/home/u", PATH: "/bin" },
       binPaths: BINS,
       tempRoot: TEST_TMP,
       spawnTimeoutMs: 15,
     });
-    const res = await client.git(["--version"]);
-    expect(res.exitCode).toBe(124);
-    expect(res.stderr).toMatch(/timed out/);
+    await expect(client.git(["--version"])).rejects.toThrow(/spawn output exceeds 42 bytes/);
+  });
+
+  test("NaN knobs are rejected like nonpositive ones (NaN < 1 is false — the guard must be finite-aware)", () => {
+    const base = { githubHost: "github.com", env: { HOME: "/tmp", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP };
+    expect(() => new GithubClient({ ...base, concurrency: Number.NaN })).toThrow(/concurrency must be >= 1/);
+    expect(() => new GithubClient({ ...base, spawnTimeoutMs: Number.NaN })).toThrow(/spawnTimeoutMs must be >= 1/);
   });
 });
 

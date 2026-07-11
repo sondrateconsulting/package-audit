@@ -146,6 +146,11 @@ export type FetchFn = (url: string, init: { headers: Record<string, string>; red
   text(): Promise<string>;
 }>;
 
+// unknown-safe rendering for diagnostic labels: streams and fetch impls may reject with
+// non-Error values, and a bare `(e as Error).message` would render "undefined" (or throw
+// on null) inside the very label meant to explain the failure.
+const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
 // Stream-read a response body with the cap enforced PER CHUNK and a single wall-clock deadline
 // for the whole read — a trickling registry can neither out-buffer the cap nor stall forever.
 export async function readBodyCapped(
@@ -156,8 +161,8 @@ export async function readBodyCapped(
 ): Promise<Uint8Array> {
   // fail-fast at the boundary: 0/negative does NOT mean "no limit" — a nonpositive cap would
   // reject every body, and a nonpositive deadline fires ~immediately.
-  if (cap < 1) throw new IntrospectionError(`${what} cap must be >= 1 (got ${cap})`);
-  if (timeoutMs < 1) throw new IntrospectionError(`${what} timeoutMs must be >= 1 (got ${timeoutMs})`);
+  if (!Number.isFinite(cap) || cap < 1) throw new IntrospectionError(`${what} cap must be >= 1 (got ${cap})`);
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new IntrospectionError(`${what} timeoutMs must be >= 1 (got ${timeoutMs})`);
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -179,7 +184,7 @@ export async function readBodyCapped(
         // (connection reset, TLS error) gets the same what+progress labeling the sibling
         // timeout/cap diagnostics carry — operators triage these from the errors table.
         if (e instanceof IntrospectionError) throw e;
-        throw new IntrospectionError(`${what} body read failed after ${total} bytes: ${(e as Error).message}`);
+        throw new IntrospectionError(`${what} body read failed after ${total} bytes: ${errText(e)}`);
       }
       if (done || value === undefined) break;
       total += value.byteLength;
@@ -225,7 +230,7 @@ async function fetchFollowing(
 ): Promise<{ bytes: Uint8Array; text: string }> {
   // fail-fast at the chokepoint both callers route through: a nonpositive deadline fires
   // ~immediately (instant abort on every hop), it does NOT mean "no deadline".
-  if (timeoutMs < 1) throw new IntrospectionError(`fetchTimeoutMs must be >= 1 (got ${timeoutMs})`);
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new IntrospectionError(`fetchTimeoutMs must be >= 1 (got ${timeoutMs})`);
   let current = startUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const sameOrigin = new URL(current).origin === registryOrigin;
@@ -238,7 +243,7 @@ async function fetchFollowing(
     } catch (e) {
       // a platform-fetch rejection (abort/network) carries no URL — label the hop, redacted
       // (origin+path only; never query/token), like every sibling diagnostic in this loop.
-      throw new IntrospectionError(`fetch failed at hop ${hop} (${redactUrl(current)}): ${(e as Error).message}`);
+      throw new IntrospectionError(`fetch failed at hop ${hop} (${redactUrl(current)}): ${errText(e)}`);
     }
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");

@@ -15,7 +15,8 @@ import type { AuditDb } from "./db.ts";
 
 // ---- errors -----------------------------------------------------------------------------
 // Non-retryable API failure (404, permission, SSO enforcement, poisoned redirect, …) — the
-// orchestrator records an errors row for it.
+// orchestrator records an errors row for it, with ONE exception: a status-404 on a per-file
+// CONTENT read degrades to "file absent" (see orchestrate.ts apiReader), never a row.
 export class GithubApiError extends Error {
   readonly status: number;
   readonly endpoint: string;
@@ -151,9 +152,17 @@ export function makeRealSpawn(cap: number): SpawnFn {
       escalate.unref?.();
     };
     opts.signal?.onAbort(kill);
+    // ANY reader failure — not only the byte cap's own onExceed — must start the kill
+    // escalation: a raw stream error otherwise leaves the child running and pins the
+    // hold-until-exit wait until the caller's wall-clock deadline. kill() is re-entrant
+    // (every step is a no-op on an already-dead child).
+    const killOnFailure = (p: Promise<string>): Promise<string> => {
+      p.catch(() => kill());
+      return p;
+    };
     return joinSpawnOutcome(
-      readCapped(outReader, cap, kill),
-      readCapped(errReader, cap, kill),
+      killOnFailure(readCapped(outReader, cap, kill)),
+      killOnFailure(readCapped(errReader, cap, kill)),
       proc.exited,
     );
   };
@@ -688,10 +697,10 @@ export class GithubClient {
     // fail-fast knob validation: 0/negative here does NOT mean "unlimited" — a zero-slot
     // semaphore hangs the first acquire forever (no exception, and the spawn deadline never
     // covers semaphore queueing), and a nonpositive deadline instantly expires every spawn.
-    if (this.spawnTimeoutMs < 1)
+    if (!Number.isFinite(this.spawnTimeoutMs) || this.spawnTimeoutMs < 1)
       throw new Error(`spawnTimeoutMs must be >= 1 (got ${this.spawnTimeoutMs}) — a nonpositive deadline instantly times out every spawn`);
     const concurrency = opts.concurrency ?? 8;
-    if (concurrency < 1)
+    if (!Number.isFinite(concurrency) || concurrency < 1)
       throw new Error(`concurrency must be >= 1 (got ${concurrency}) — a zero-slot semaphore hangs the first acquire forever`);
     this.baseEnv = opts.env ?? process.env;
     this.bins = opts.binPaths ?? {
@@ -745,8 +754,17 @@ export class GithubClient {
     });
     try {
       const spawned = this.spawn(bin, args, { ...opts, signal });
-      spawned.catch(() => {});
-      const settled = spawned.then(() => undefined, () => undefined);
+      // the settle observer doubles as the no-op catch (a late rejection is never unhandled)
+      // AND records any rejection so the timeout branch can prefer the real diagnostic.
+      let spawnRejected = false;
+      let spawnRejection: unknown;
+      const settled = spawned.then(
+        () => undefined,
+        (e: unknown) => {
+          spawnRejected = true;
+          spawnRejection = e;
+        },
+      );
       await Promise.race([settled, deadline]);
       // the flag (not race order) decides: a kill that settles the spawn in the same tick as
       // the deadline must still be reported as a timeout, not as the child's own exit.
@@ -755,6 +773,11 @@ export class GithubClient {
         settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
       });
       await Promise.race([settled, gaveUp]);
+      // A rejection that settled the spawn is a REAL diagnostic (byte cap, stream failure) —
+      // it must win over the synthetic timeout even when the deadline fired during the
+      // hold-until-exit window: a synthetic 124 would misclassify it as a transient
+      // no-response and re-drive the oversized request through every retry.
+      if (spawnRejected) throw spawnRejection;
       return { exitCode: 124, stdout: "", stderr: `spawn timed out after ${this.spawnTimeoutMs}ms: ${bin}` };
     } finally {
       clearTimeout(timer);

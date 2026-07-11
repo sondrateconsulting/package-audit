@@ -553,7 +553,8 @@ plan-mode owner-discovery escape stays fatal) but with different wait computatio
     60 seconds, then exponential backoff.
   Distinguish BOTH from a NON-retryable 403 — SSO enforcement (the `x-github-sso`
   response header; classify as in §1's SAML/SSO note), missing permission, or a plain
-  404 — which IS an `errors` row with its own classification.
+  404 — which IS an `errors` row with its own classification (one exception: a 404 on a
+  per-file CONTENT read within a unit is treated as "file absent", not an errors row).
   GraphQL is different: `gh api graphql` PRIMARY exhaustion arrives as HTTP 200 with a
   body `errors[].type == 'RATE_LIMITED'` and `x-ratelimit-remaining: 0` (NOT a 403/429
   status), while a SECONDARY/abuse throttle on GraphQL may surface EITHER as a 200 body
