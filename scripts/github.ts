@@ -679,6 +679,14 @@ export class GithubClient {
     this.sleep = opts.sleepImpl ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.now = opts.nowImpl ?? Date.now;
     this.spawnTimeoutMs = opts.spawnTimeoutMs ?? SPAWN_TIMEOUT_MS;
+    // fail-fast knob validation: 0/negative here does NOT mean "unlimited" — a zero-slot
+    // semaphore hangs the first acquire forever (no exception, and the spawn deadline never
+    // covers semaphore queueing), and a nonpositive deadline instantly expires every spawn.
+    if (this.spawnTimeoutMs < 1)
+      throw new Error(`spawnTimeoutMs must be >= 1 (got ${this.spawnTimeoutMs}) — a nonpositive deadline instantly times out every spawn`);
+    const concurrency = opts.concurrency ?? 8;
+    if (concurrency < 1)
+      throw new Error(`concurrency must be >= 1 (got ${concurrency}) — a zero-slot semaphore hangs the first acquire forever`);
     this.baseEnv = opts.env ?? process.env;
     this.bins = opts.binPaths ?? {
       gh: whichIn(this.baseEnv, "gh"),
@@ -686,7 +694,7 @@ export class GithubClient {
       tar: whichIn(this.baseEnv, "tar"),
     };
     this.ghEnv = buildGhEnv(this.baseEnv, this.githubHost);
-    this.sem = new Semaphore(opts.concurrency ?? 8);
+    this.sem = new Semaphore(concurrency);
     this.tempRoot = opts.tempRoot ?? realpathSync(tmpdir());
   }
 

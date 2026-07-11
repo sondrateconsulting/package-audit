@@ -154,6 +154,10 @@ export async function readBodyCapped(
   timeoutMs: number,
   what: string,
 ): Promise<Uint8Array> {
+  // fail-fast at the boundary: 0/negative does NOT mean "no limit" — a nonpositive cap would
+  // reject every body, and a nonpositive deadline fires ~immediately.
+  if (cap < 1) throw new IntrospectionError(`${what} cap must be >= 1 (got ${cap})`);
+  if (timeoutMs < 1) throw new IntrospectionError(`${what} timeoutMs must be >= 1 (got ${timeoutMs})`);
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -166,8 +170,18 @@ export async function readBodyCapped(
     for (;;) {
       const readP = reader.read();
       readP.catch(() => {}); // a post-deadline rejection must not become unhandled
-      const { done, value } = await Promise.race([readP, deadline]);
-      if (done) break;
+      let done: boolean | undefined;
+      let value: Uint8Array | undefined;
+      try {
+        ({ done, value } = await Promise.race([readP, deadline]));
+      } catch (e) {
+        // the deadline's own labeled timeout passes through; a RAW mid-stream failure
+        // (connection reset, TLS error) gets the same what+progress labeling the sibling
+        // timeout/cap diagnostics carry — operators triage these from the errors table.
+        if (e instanceof IntrospectionError) throw e;
+        throw new IntrospectionError(`${what} body read failed after ${total} bytes: ${(e as Error).message}`);
+      }
+      if (done || value === undefined) break;
       total += value.byteLength;
       if (total > cap) throw new IntrospectionError(`${what} exceeds ${cap} bytes`);
       chunks.push(value);
@@ -209,13 +223,23 @@ async function fetchFollowing(
   wantBytes: boolean,
   timeoutMs: number,
 ): Promise<{ bytes: Uint8Array; text: string }> {
+  // fail-fast at the chokepoint both callers route through: a nonpositive deadline fires
+  // ~immediately (instant abort on every hop), it does NOT mean "no deadline".
+  if (timeoutMs < 1) throw new IntrospectionError(`fetchTimeoutMs must be >= 1 (got ${timeoutMs})`);
   let current = startUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const sameOrigin = new URL(current).origin === registryOrigin;
     const headers: Record<string, string> = { "Accept-Encoding": "identity" };
     if (authToken !== null && sameOrigin) headers["Authorization"] = `Bearer ${authToken}`;
     // per-hop deadline: covers connect/headers on the real fetch; body reads carry their own.
-    const res = await fetchImpl(current, { headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+    let res: Awaited<ReturnType<FetchFn>>;
+    try {
+      res = await fetchImpl(current, { headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+    } catch (e) {
+      // a platform-fetch rejection (abort/network) carries no URL — label the hop, redacted
+      // (origin+path only; never query/token), like every sibling diagnostic in this loop.
+      throw new IntrospectionError(`fetch failed at hop ${hop} (${redactUrl(current)}): ${(e as Error).message}`);
+    }
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
       if (loc === null) throw new IntrospectionError(`redirect ${res.status} without Location`);

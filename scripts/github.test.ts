@@ -598,6 +598,17 @@ describe("throttle wait clamping (§4 hardening)", () => {
   });
 });
 
+describe("constructor knob validation (fail-fast at the boundary)", () => {
+  const base = { githubHost: "github.com", env: { HOME: "/tmp", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP };
+  test("concurrency < 1 throws instead of hanging the first acquire forever", () => {
+    expect(() => new GithubClient({ ...base, concurrency: 0 })).toThrow(/concurrency must be >= 1/);
+    expect(() => new GithubClient({ ...base, concurrency: -2 })).toThrow(/concurrency must be >= 1/);
+  });
+  test("spawnTimeoutMs < 1 throws instead of instantly expiring every spawn", () => {
+    expect(() => new GithubClient({ ...base, spawnTimeoutMs: 0 })).toThrow(/spawnTimeoutMs must be >= 1/);
+  });
+});
+
 describe("readCapped spawn-output byte cap (§4/§5.C)", () => {
   // readCapped gates EVERY gh/git/tar spawn's output at MAX_SPAWN_OUTPUT_BYTES — a fake
   // reader exercises the cap directly (a real 110MB subprocess would be pure test tax).
@@ -972,6 +983,10 @@ describe("spawn kill escalation (§4 hardening)", () => {
 });
 
 describe("pagination", () => {
+  test("MAX_PAGES is 1000 (independent literal pins the magnitude)", () => {
+    expect(MAX_PAGES).toBe(1000);
+  });
+
   test("follows Link rel=next across pages, recomposing relative endpoints", async () => {
     const { client, calls } = makeClient([
       ok(http(200, { link: `<https://api.github.com/orgs/x/repos?per_page=100&page=2&type=all>; rel="next"` }, `[{"name":"a"}]`)),

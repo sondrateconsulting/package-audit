@@ -228,6 +228,39 @@ describe("fetch timeouts + streamed byte caps (§5.E hardening)", () => {
     expect(cancelled).toBe(true); // the source was released, not just abandoned
   });
 
+  test("a mid-stream read failure is labeled with what + bytes-so-far (not a raw stream error)", async () => {
+    // connection reset / TLS failure mid-body: the operator-facing errors row must say WHAT
+    // was being read and HOW FAR it got, like the sibling timeout/cap diagnostics do.
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) {
+        pulls++;
+        if (pulls === 1) c.enqueue(new Uint8Array(7));
+        else c.error(new Error("conn reset"));
+      },
+    });
+    await expect(readBodyCapped(stream, 10_000, 1_000, "tarball"))
+      .rejects.toThrow(/tarball body read failed after 7 bytes: conn reset/);
+  });
+
+  test("a hop-level fetch failure carries the redacted hop URL", async () => {
+    // the platform fetch rejects with a bare TimeoutError/network error carrying no URL —
+    // the wrap must name the hop (redacted: origin+path only, never query/token).
+    const fetchImpl: FetchFn = async () => { throw new Error("The operation timed out"); };
+    await expect(fetchPackument({
+      packageName: "expo", registryUrl: "https://registry.example.com", registryAuthEnvVar: null, fetchImpl,
+    })).rejects.toThrow(/fetch failed at hop 0 \(https:\/\/registry\.example\.com\/expo\): The operation timed out/);
+  });
+
+  test("nonpositive deadlines/caps are rejected at the boundary (0 is not 'no limit')", async () => {
+    await expect(readBodyCapped(neverEndingBody(), 0, 1_000, "x")).rejects.toThrow(/cap must be >= 1/);
+    await expect(readBodyCapped(neverEndingBody(), 10, 0, "x")).rejects.toThrow(/timeoutMs must be >= 1/);
+    const fetchImpl: FetchFn = async () => { throw new Error("unreachable"); };
+    await expect(fetchPackument({
+      packageName: "expo", registryUrl: "https://registry.example.com", registryAuthEnvVar: null, fetchImpl, fetchTimeoutMs: 0,
+    })).rejects.toThrow(/fetchTimeoutMs must be >= 1/);
+  });
+
   test("readBodyCapped fails a chunked over-cap body INCREMENTALLY, not after buffering", async () => {
     // no Content-Length anywhere in sight: the cap must trip per chunk as bytes arrive.
     let pulls = 0;
