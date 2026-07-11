@@ -134,7 +134,11 @@ export const STATIC_SCRIPT: string = [
   "    if (!tpl || !tpl.content) return;",
   "    navigator.clipboard.writeText(tpl.content.textContent).then(function () {",
   '      btn.setAttribute("data-copied", "");',
-  '      setTimeout(function () { btn.removeAttribute("data-copied"); }, 1500);',
+  '      btn.setAttribute("aria-label", "copied");', // aria-live announces the accessible-name change
+  "      setTimeout(function () {",
+  '        btn.removeAttribute("data-copied");',
+  '        btn.removeAttribute("aria-label");',
+  "      }, 1500);",
   "    });",
   "  });",
   "})();",
@@ -468,7 +472,8 @@ const plural = (count: number, singular: string, pluralForm?: string): string =>
   `${count} ${count === 1 ? singular : (pluralForm ?? `${singular}s`)}`;
 
 // Editorial print-report direction (CEO addendum 13): serif display for the exec sentence,
-// system sans body, tabular numerals on every count, ONE semantic accent (hotspots/warning
+// system sans body, tabular numerals on sans-rendered counts (serif card headlines keep
+// Georgia's old-style figures — deliberate), ONE semantic accent (hotspots/warning
 // bands), restrained hairlines. Dark values under prefers-color-scheme; @media print comes LAST
 // so it forces the light palette. Print drawers: closed <details> content is NOT reliably
 // renderable via pure CSS (Chromium/Firefox skip layout for closed details content; the
@@ -477,30 +482,34 @@ const plural = (count: number, singular: string, pluralForm?: string): string =>
 // ids) and once inside a .print-drawer block (display:none on screen, block in print; no ids, so
 // ids stay unique). That keeps drawers native on screen and complete on paper (CEO addendum 6).
 const PAGE_CSS = `
-:root { --bg:#faf9f6; --ink:#1c1b19; --muted:#6b675f; --accent:#a34808; --hairline:#dcd8cf; --card:#ffffff; --code-bg:#f1efe9; }
+:root { color-scheme: light dark; --bg:#faf9f6; --ink:#1c1b19; --muted:#6b675f; --accent:#a34808; --hairline:#dcd8cf; --card:#ffffff; --code-bg:#f1efe9; }
 @media (prefers-color-scheme: dark) {
   :root { --bg:#171614; --ink:#e8e5de; --muted:#98938a; --accent:#e08a4a; --hairline:#37342f; --card:#1f1d1a; --code-bg:#24221e; }
 }
 * { box-sizing: border-box; }
 body { margin:0 auto; max-width:72rem; padding:2.5rem 1.5rem 4rem; background:var(--bg); color:var(--ink);
-  font:15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  font:16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
 h1,h2,h3 { line-height:1.25; }
 h2 { font-size:1.05rem; letter-spacing:.04em; text-transform:uppercase; color:var(--muted); border-bottom:1px solid var(--hairline);
   padding-bottom:.4rem; margin:3rem 0 1rem; }
-.exec { font-family: Georgia, "Times New Roman", serif; font-size:1.65rem; line-height:1.4; margin:1rem 0 .5rem; font-weight:400; }
+h3.subhead { font-size:.95rem; letter-spacing:.03em; text-transform:uppercase; color:var(--muted); font-weight:600; margin:2rem 0 .75rem; }
+.exec { font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif; overflow-wrap:anywhere; font-size:1.65rem; line-height:1.4; margin:1rem 0 .5rem; font-weight:400; }
 .meta, .cap, .pointer, .note { color:var(--muted); font-size:.85rem; }
 .num { font-variant-numeric: tabular-nums; }
 .band { border-left:3px solid var(--accent); background:var(--card); padding:.6rem .9rem; margin:1rem 0; font-size:.9rem; }
 .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(13rem,1fr)); gap:1rem; }
 .card { background:var(--card); border:1px solid var(--hairline); padding:1rem 1.1rem; }
 .card h3 { margin:0 0 .5rem; font-size:.78rem; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); font-weight:600; }
-.card .headline { font-variant-numeric: tabular-nums; font-size:2rem; line-height:1.1; font-family: Georgia, "Times New Roman", serif; }
+.card .headline { font-size:2rem; line-height:1.1; font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif; overflow-wrap:anywhere; }
 .card .hot { color:var(--accent); }
 .card p { margin:.35rem 0 0; font-size:.85rem; }
 .card .annot { color:var(--muted); font-size:.78rem; margin-top:.5rem; }
 table { border-collapse:collapse; width:100%; font-size:.88rem; }
 th,td { text-align:left; padding:.35rem .6rem; border-bottom:1px solid var(--hairline); vertical-align:top; }
 th { font-size:.75rem; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); font-weight:600; }
+/* identifiers in column headers keep their exact case — uppercase transform would merge
+   exports differing only by case and misrender everything camelCased */
+th code { text-transform:none; letter-spacing:0; }
 td.n, th.n { text-align:right; font-variant-numeric: tabular-nums; }
 td.dot { text-align:right; color:var(--muted); }
 .tablewrap { overflow-x:auto; }
@@ -513,17 +522,26 @@ details.drawer { border:1px solid var(--hairline); background:var(--card); margi
 details.drawer > summary { cursor:pointer; padding:.55rem .9rem; font-weight:600; }
 details.drawer > summary .num { color:var(--muted); font-weight:400; }
 details.drawer ol { margin:0; padding:.2rem 1rem .8rem 2.4rem; }
-details.drawer li, .print-drawer li { margin:.45rem 0; font-size:.87rem; }
+details.drawer li, .print-drawer li { margin:.45rem 0; font-size:.87rem; overflow-wrap:anywhere; }
 .loc { color:var(--muted); unicode-bidi:isolate; }
 .branchnote { color:var(--accent); font-size:.8rem; }
 a { color:var(--accent); }
+a:hover { text-decoration-thickness:2px; }
+:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+details.drawer > summary:hover { background:var(--code-bg); }
+details.drawer, details.drawer li { scroll-margin-top:.9rem; }
+details.drawer li:target { outline:1px solid var(--accent); outline-offset:3px; }
 button.copy { float:right; margin-top:-2.2rem; font:.72rem system-ui, sans-serif; color:var(--muted); background:none;
-  border:1px solid var(--hairline); padding:.15rem .55rem; cursor:pointer; }
+  border:1px solid var(--muted); padding:.15rem .55rem; cursor:pointer; }
+button.copy:hover { color:var(--ink); border-color:var(--ink); }
+@media (max-width: 40rem) { button.copy { float:none; margin:0 0 .6rem; display:inline-block; } }
 button.copy[data-copied]::after { content:" — copied"; }
 .print-drawer { display:none; }
 footer { margin-top:3.5rem; border-top:1px solid var(--hairline); padding-top:.8rem; color:var(--muted); font-size:.8rem; }
 @media print {
-  :root { --bg:#ffffff; --ink:#111111; --muted:#555555; --accent:#8a3d06; --hairline:#cccccc; --card:#ffffff; --code-bg:#f2f2f2; }
+  :root { color-scheme: light; --bg:#ffffff; --ink:#111111; --muted:#555555; --accent:#8a3d06; --hairline:#cccccc; --card:#ffffff; --code-bg:#f2f2f2; }
+  /* paper cannot click: expand each evidence link to its actual URL */
+  .print-drawer a[href]::after, td a[href]::after { content:" (" attr(href) ")"; font-size:.85em; word-break:break-all; }
   body { max-width:none; padding:0; font-size:12px; }
   button.copy { display:none; }
   details.drawer { display:none; }
@@ -563,7 +581,7 @@ function permalinkAnchor(url: string): string {
 // entities on parse, so template.content.textContent is the raw markdown again.
 function copyControl(sectionId: string, markdown: string): string {
   return (
-    `<button class="copy" type="button" data-copy-target="${esc(sectionId)}">copy as markdown</button>` +
+    `<button class="copy" type="button" aria-live="polite" data-copy-target="${esc(sectionId)}">copy as markdown</button>` +
     `<template id="${esc(sectionId)}-md">${esc(markdown)}</template>`
   );
 }
@@ -681,7 +699,7 @@ function renderCards(m: DossierModel): string {
         `</div>`,
     )
     .join("\n");
-  return `<section id="cards" aria-label="Decision cards"><h2>Decision cards</h2>${copyControl("cards", md)}<div class="cards">\n${html}\n</div></section>`;
+  return `<section id="cards" aria-labelledby="h-cards"><h2 id="h-cards">Decision cards</h2>${copyControl("cards", md)}<div class="cards">\n${html}\n</div></section>`;
 }
 
 function renderSurface(m: DossierModel): string {
@@ -721,7 +739,8 @@ function renderSurface(m: DossierModel): string {
     .map((r) => {
       // any export with a drawer (≥1 usage site on ANY branch) links into its evidence
       const name = r.slug === null ? `<code>${esc(r.label)}</code>` : `<a href="#e-${esc(r.slug)}"><code>${esc(r.label)}</code></a>`;
-      return `<tr><td>${name}</td><td>${esc(r.kind)}</td><td class="n">${num(r.count)}</td><td class="n">${num(r.repos)}</td><td>${esc(r.inLatest)}</td></tr>`;
+      const dot = (n: number): string => (n === 0 ? `<td class="dot">·</td>` : `<td class="n">${num(n)}</td>`);
+      return `<tr><td>${name}</td><td>${esc(r.kind)}</td>${dot(r.count)}${dot(r.repos)}<td>${esc(r.inLatest)}</td></tr>`;
     })
     .join("\n");
   const versionNote =
@@ -730,9 +749,9 @@ function renderSurface(m: DossierModel): string {
       : `<p class="note">surface rows come from the latest introspected version, ${esc(m.latestVersion)}.</p>`;
   const cli = renderCliTable(m);
   return (
-    `<section id="surface" aria-label="API surface"><h2>API surface, sorted by real usage</h2>${copyControl("surface", md)}` +
-    `${versionNote}<div class="tablewrap"><table><thead><tr><th>export</th><th>kind</th><th class="n">${esc(scopeHead)}</th>` +
-    `<th class="n">repos using it</th><th>in latest surface?</th></tr></thead><tbody>\n${body}\n</tbody></table></div>${cli}</section>`
+    `<section id="surface" aria-labelledby="h-surface"><h2 id="h-surface">API surface, sorted by real usage</h2>${copyControl("surface", md)}` +
+    `${versionNote}<div class="tablewrap"><table><thead><tr><th scope="col">export</th><th scope="col">kind</th><th class="n" scope="col">${esc(scopeHead)}</th>` +
+    `<th class="n" scope="col">repos using it</th><th scope="col">in latest surface?</th></tr></thead><tbody>\n${body}\n</tbody></table></div>${cli}</section>`
   );
 }
 
@@ -750,8 +769,8 @@ function renderCliTable(m: DossierModel): string {
   const capLine =
     m.cliSites.length > EVIDENCE_CAP ? `<p class="cap">showing ${num(EVIDENCE_CAP)} of ${num(m.cliSites.length)} CLI usage sites</p>` : "";
   return (
-    `<h3>CLI usage — ${esc(plural(m.cliHeadlineCount, "site"))} (${esc(m.scopeLabel)}), ${esc(String(m.cliTotalCount))} total</h3>` +
-    `<div class="tablewrap"><table><thead><tr><th>context</th><th>location</th><th>evidence</th></tr></thead><tbody>\n${rows}\n</tbody></table></div>${capLine}`
+    `<h3 class="subhead">CLI usage — ${esc(plural(m.cliHeadlineCount, "site"))} (${esc(m.scopeLabel)}), ${esc(String(m.cliTotalCount))} total</h3>` +
+    `<div class="tablewrap"><table><thead><tr><th scope="col">context</th><th scope="col">location</th><th scope="col">evidence</th></tr></thead><tbody>\n${rows}\n</tbody></table></div>${capLine}`
   );
 }
 
@@ -761,14 +780,14 @@ function renderMatrix(m: DossierModel): string {
       m.totalSiteCount > 0
         ? `no ${m.scopeLabel === "default branches" ? "default-branch" : ""} usage sites to chart; ${plural(m.totalSiteCount, "usage site")} exist on other branches.`
         : "no usage sites to chart in this run.";
-    return `<section id="matrix" aria-label="Repository by export matrix"><h2>Repository × export matrix</h2><p class="note">${esc(note)}</p></section>`;
+    return `<section id="matrix" aria-labelledby="h-matrix"><h2 id="h-matrix">Repository × export matrix</h2><p class="note">${esc(note)}</p></section>`;
   }
   const header = ["repository", "branches with findings", ...m.matrix.columns.map((c) => c.label)];
   const md = mdTable(
     header,
     m.matrix.rows.map((r) => [r.repo, String(r.branchCount), ...r.cells.map((c) => (c === 0 ? "" : String(c)))]),
   );
-  const head = m.matrix.columns.map((c) => `<th class="n">${esc(c.label)}</th>`).join("");
+  const head = m.matrix.columns.map((c) => `<th class="n" scope="col"><code>${esc(c.label)}</code></th>`).join("");
   const body = m.matrix.rows
     .map(
       (r) =>
@@ -786,8 +805,8 @@ function renderMatrix(m: DossierModel): string {
   // coverage (global coverage receipts live in the footer / empty state).
   const scopeNote = `<p class="note">cells count usage sites on ${esc(m.scopeLabel)}; the branches column counts branches where this package was found, never a multiplier.</p>`;
   return (
-    `<section id="matrix" aria-label="Repository by export matrix"><h2>Repository × export matrix</h2>${copyControl("matrix", md)}${scopeNote}` +
-    `<div class="tablewrap"><table><thead><tr><th>repository</th><th class="n">branches with findings</th>${head}</tr></thead><tbody>\n${body}\n</tbody></table></div>${overflowNote}</section>`
+    `<section id="matrix" aria-labelledby="h-matrix"><h2 id="h-matrix">Repository × export matrix</h2>${copyControl("matrix", md)}${scopeNote}` +
+    `<div class="tablewrap"><table><thead><tr><th scope="col">repository</th><th class="n" scope="col">branches with findings</th>${head}</tr></thead><tbody>\n${body}\n</tbody></table></div>${overflowNote}</section>`
   );
 }
 
@@ -807,7 +826,7 @@ function renderSiteRow(g: ExportGroup, s: EvidenceSite, index: number, withIds: 
 function renderEvidence(m: DossierModel): string {
   const groups = m.exportGroups.filter((g) => g.totalCount > 0);
   if (groups.length === 0)
-    return `<section id="evidence" aria-label="Evidence"><h2>Evidence</h2><p class="note">no usage sites were detected in the scanned slice.</p></section>`;
+    return `<section id="evidence" aria-labelledby="h-evidence"><h2 id="h-evidence">Evidence</h2><p class="note">no usage sites were detected in the scanned slice.</p></section>`;
   const mdParts: string[] = [];
   const html = groups
     .map((g) => {
@@ -831,7 +850,7 @@ function renderEvidence(m: DossierModel): string {
     })
     .join("\n");
   return (
-    `<section id="evidence" aria-label="Evidence"><h2>Evidence</h2>${copyControl("evidence", mdParts.join("\n"))}` +
+    `<section id="evidence" aria-labelledby="h-evidence"><h2 id="h-evidence">Evidence</h2>${copyControl("evidence", mdParts.join("\n"))}` +
     `${html}<p class="pointer">full data lives in the exports (xray/usage_findings.csv)</p></section>`
   );
 }
@@ -840,7 +859,7 @@ function renderObservations(observations: readonly Observation[]): string {
   if (observations.length === 0) return "";
   const md = observations.map((o) => `- ${o.text}`).join("\n");
   const items = observations.map((o) => `<li>${esc(o.text)}</li>`).join("\n");
-  return `<section id="observations" aria-label="What this means"><h2>What this means</h2>${copyControl("observations", md)}<ul>\n${items}\n</ul></section>`;
+  return `<section id="observations" aria-labelledby="h-observations"><h2 id="h-observations">What this means</h2>${copyControl("observations", md)}<ul>\n${items}\n</ul></section>`;
 }
 
 function renderBands(m: DossierModel): string {
@@ -873,10 +892,10 @@ function renderEmptyBody(pkg: DossierPackage, ctx: DossierContext): string {
   return (
     `<header id="exec"><p class="meta">package usage dossier</p><h1 class="exec">${esc(sentence)}</h1>` +
     `<p class="meta num">${esc(receipts)}</p></header>` +
-    `<section id="coverage" aria-label="Coverage"><h2>What was scanned</h2>` +
+    `<main><section id="coverage" aria-labelledby="h-coverage"><h2 id="h-coverage">What was scanned</h2>` +
     `<p>Detection is scoped to the scanned slice: repositories and branches admitted by this run's configuration ` +
     `(cutoff ${esc(ctx.config.cutoffDate)}, host ${esc(ctx.config.githubHost)}). A finding requires the package to be declared, imported, ` +
-    `or invoked in that slice; branches outside it were not examined.</p></section>` +
+    `or invoked in that slice; branches outside it were not examined.</p></section></main>` +
     renderFooter(ctx)
   );
 }
@@ -915,12 +934,14 @@ export function renderDossierDetailed(pkg: DossierPackage, ctx: DossierContext):
     `<p class="meta num">run ${esc(ctx.runId)} · generated ${esc(ctx.generatedAt)} · headline scope: ${esc(m.scopeLabel)}</p></header>`;
   const body = [
     header,
+    "<main>",
     renderBands(m),
     renderCards(m),
     renderSurface(m),
     renderMatrix(m),
     renderEvidence(m),
     observationsStatus === "emitted" ? renderObservations(observations) : "",
+    "</main>",
     renderFooter(ctx),
   ]
     .filter((part) => part !== "")

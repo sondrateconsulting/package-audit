@@ -126,8 +126,8 @@ const syntheticPkg = (units: DossierUnit[], over: Partial<DossierPackage> = {}):
 // count, matrix branch-column relabel, versions-card semver restriction, row-id separator '.',
 // markdown code-span fencing, bidi isolation CSS. Absorbed without a formatVersion bump under the
 // pre-public-launch rule; post-launch output changes require bumping XRAY_FORMAT_VERSION.
-const GOLDEN_DOSSIER_SHA256 = "8c32159cc75475665ced03bdca45377d0ae07ff58ae289d26433d439f09b98db";
-const GOLDEN_EMPTY_SHA256 = "0b5f954d9d70c5be81410be4cff3fd6a851982b8153712bd4f7d0ecc359c9eb4";
+const GOLDEN_DOSSIER_SHA256 = "620bcf2bfb53c000dda5cb18870ad0db27d4ae38a23a5e906a356c7cf3d88321";
+const GOLDEN_EMPTY_SHA256 = "e67b530b1415a6e1e44730abf0ac9124c06feb19a3e48a9853862fa962d71248";
 
 describe("renderDossier — determinism and golden bytes", () => {
   test("double-render byte equality (same DB, two builds, two renders)", () => {
@@ -667,5 +667,67 @@ describe("dual-review round-2 regressions", () => {
     expect(render("plain(x)")).toContain("- `plain(x)` —"); // unpadded
     expect(render("`lead")).toContain("- `` `lead `` —"); // backtick edge → padded, out-fenced
     expect(render(" spaced ")).toContain("- `  spaced  ` —"); // space edges → padded so the renderer's strip preserves them
+  });
+});
+
+// ---- design-review pins (2026-07-11) --------------------------------------------------------------
+// Pins for the design-review + consistency-audit fixes, so a stylesheet or markup refactor
+// cannot silently regress them. CSS pins assert the RULE text; markup pins assert emission.
+describe("design-review pins", () => {
+  const html = renderDossier(fixturePackages()[0]!, FIXED_CTX);
+
+  test("CLI heading carries the designed subhead treatment (no hierarchy inversion)", () => {
+    expect(html).toContain('<h3 class="subhead">CLI usage —');
+    expect(html).toContain("h3.subhead {");
+  });
+
+  test("matrix export headers keep identifier case (code-wrapped, transform off)", () => {
+    const units = [syntheticUnit({ apiUsage: [syntheticUsage("useState", "src/a.ts", 1)] })];
+    const matrixHtml = renderDossier(syntheticPkg(units), FIXED_CTX);
+    expect(matrixHtml).toContain('<th class="n" scope="col"><code>useState</code></th>');
+    expect(matrixHtml).toContain("th code { text-transform:none;");
+  });
+
+  test("print stylesheet expands evidence hrefs to visible URLs", () => {
+    expect(html).toContain('content:" (" attr(href) ")"');
+  });
+
+  test("interactive states are designed: focus-visible ring, summary hover, target affordance", () => {
+    expect(html).toContain(":focus-visible { outline:2px solid var(--accent)");
+    expect(html).toContain("details.drawer > summary:hover");
+    expect(html).toContain("details.drawer li:target");
+    expect(html).toContain("scroll-margin-top");
+  });
+
+  test("color-scheme declared for both themes and forced light in print", () => {
+    expect(html).toContain("color-scheme: light dark;");
+    expect(html).toContain("color-scheme: light;");
+  });
+
+  test("main landmark wraps the sections; header and footer flank it", () => {
+    expect(html).toMatch(/<\/header>\s*<main>/);
+    expect(html).toMatch(/<\/main>\s*<footer>/);
+  });
+
+  test("sections take their accessible names from the visible headings", () => {
+    expect(html).toContain('<section id="surface" aria-labelledby="h-surface"><h2 id="h-surface">');
+    expect(html).toContain('<section id="matrix" aria-labelledby="h-matrix"><h2 id="h-matrix">');
+    expect(html).toContain('<section id="evidence" aria-labelledby="h-evidence"><h2 id="h-evidence">');
+  });
+
+  test("surface table renders zero counts as the quiet dot, matching the matrix", () => {
+    // fixture has unusedThing in the latest surface with zero usage
+    expect(html).toMatch(/<td><code>unusedThing<\/code><\/td><td>named<\/td><td class="dot">·<\/td><td class="dot">·<\/td>/);
+  });
+
+  test("body base size meets the 16px floor; serif stack leads with an editorial face", () => {
+    expect(html).toContain("font:16px/1.55 system-ui");
+    expect(html).toContain('"Iowan Old Style"');
+  });
+
+  test("copy buttons announce their confirmation (aria-live + name change in the static script)", () => {
+    expect(html).toContain('aria-live="polite"');
+    expect(STATIC_SCRIPT).toContain('btn.setAttribute("aria-label", "copied")');
+    expect(STATIC_SCRIPT).toContain('btn.removeAttribute("aria-label")');
   });
 });

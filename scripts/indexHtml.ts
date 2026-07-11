@@ -70,8 +70,8 @@ export function renderIndex(report: DossierReport, opts: { formatVersion: number
   const body =
     rows.length === 0
       ? `<p class="note">no tracked packages in this run.</p>`
-      : `<div class="tablewrap"><table><thead><tr><th>package</th><th class="n">repos (default branches)</th>` +
-        `<th class="n">usage sites</th><th>versions seen</th><th>dossier</th></tr></thead><tbody>\n` +
+      : `<div class="tablewrap"><table><thead><tr><th scope="col">package</th><th class="n" scope="col">repos (default branches)</th>` +
+        `<th class="n" scope="col">usage sites</th><th scope="col">versions seen</th><th scope="col">dossier</th></tr></thead><tbody>\n` +
         rows
           .map(
             (r) =>
@@ -88,9 +88,9 @@ export function renderIndex(report: DossierReport, opts: { formatVersion: number
   const html =
     `<header id="exec"><p class="meta">package usage x-ray</p><h1 class="exec">Package usage dossiers — ${esc(plural(rows.length, "tracked package"))}.</h1>` +
     `<p class="meta num">run ${esc(report.runId)} · generated ${esc(report.generatedAt)} · ${esc(receipts)}</p></header>` +
-    `<section id="packages" aria-label="Tracked packages"><h2>Tracked packages</h2>` +
-    `<button class="copy" type="button" data-copy-target="packages">copy as markdown</button>` +
-    `<template id="packages-md">${esc(md)}</template>${body}</section>` +
+    `<main><section id="packages" aria-labelledby="h-packages"><h2 id="h-packages">Tracked packages</h2>` +
+    `<button class="copy" type="button" aria-live="polite" data-copy-target="packages">copy as markdown</button>` +
+    `<template id="packages-md">${esc(md)}</template>${body}</section></main>` +
     `<footer>package usage x-ray · report-format version ${num(opts.formatVersion)} · run ${esc(report.runId)} · generated ${esc(report.generatedAt)}</footer>`;
 
   return renderShell({ title: "Package usage x-ray — index", body: html, formatVersion: opts.formatVersion });

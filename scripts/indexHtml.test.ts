@@ -45,7 +45,7 @@ const OPTS = { formatVersion: 1 };
 // unintended output change and must be treated as a regression, not re-pinned.
 // PRE-LAUNCH RE-PIN (2026-07-11, sanctioned): the index shares the dossier page CSS — the codex
 // re-pass bidi-isolation rule moved these bytes. Same sanction rule as reportHtml.test.ts.
-const GOLDEN_INDEX_SHA256 = "2a2b58f328f530f1ece021235edfb5bdac949c6b6994315d56e32df399508c26";
+const GOLDEN_INDEX_SHA256 = "a1168b3e556cb1fd4c2450b7abf4f851898bfa16b8e3aa1b41dbe6b7f79fe661";
 
 describe("renderIndex", () => {
   const report = fixtureReport();
