@@ -457,7 +457,8 @@ Resumability rules:
   never frozen forever). `--fresh` and `--rescan-branch` override the skip. Edge case: a
   previously-`done` branch that §5.B no longer PROCESSES — because it was DELETED on the
   remote (no longer a live ref) or fell past `maxBranchesPerRepo` (only the most-recent N
-  heads are kept) — is neither re-evaluated nor re-scanned this run; it simply retains its
+  non-default heads are kept; the repo's DEFAULT branch is always processed, §5.B) — is
+  neither re-evaluated nor re-scanned this run; it simply retains its
   prior `done` state and historical findings/snapshot — this is intended, not an error (its
   usage is genuinely stale), and it just isn't refreshed into new runs. A still-live branch
   whose head fell BEFORE `cutoffDate` is DIFFERENT: §5.B DOES surface it and records it THIS
@@ -648,7 +649,13 @@ B. Discover & prioritize branches: via `gh api graphql` querying
    last commit is BEFORE cutoffDate (do not inspect at all — record them as `work_queue`
    status `skipped` AND upsert a `run_unit_head` row for THIS run with
    `status='skipped-cutoff'`, commit_sha='', so §7's branchesSkippedByCutoff is per-run
-   reproducible), and cap at maxBranchesPerRepo. The `oid` is the live head the §3 skip predicate compares against —
+   reproducible), and cap at maxBranchesPerRepo. EXCEPTION: the repo's DEFAULT branch
+   (known from §5.A discovery) is ALWAYS eligible — exempt from both the cutoff filter
+   and the cap (the cap counts the remaining branches, so a repo can yield cap+1
+   eligible units) — the default-branch view the report's headline metrics depend on
+   must never be silently absent; a default branch not among the live heads admits
+   nothing. Record `is_default_branch` (1/0, §3) on every `run_unit_head` upsert —
+   discovery always knows it, so live runs never write NULL. The `oid` is the live head the §3 skip predicate compares against —
    obtaining it here costs zero extra requests.
 C. Locate manifests read-only. Build the API path in TypeScript (github.ts) —
    `repos/<org>/<repo>/contents/<path>?ref=<sha>` with `encodeURIComponent` applied

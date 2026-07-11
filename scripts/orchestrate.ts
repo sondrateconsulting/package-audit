@@ -250,23 +250,35 @@ export async function resolveOwnersWithDiscovery(
   }
 }
 
-// §5.B classification, pure: heads arrive sorted committedDate DESC. EVERY still-live branch
-// before cutoffDate is `cutoffSkipped` (regardless of the cap); the after-cutoff survivors are
-// `eligible` up to maxBranchesPerRepo; older survivors past the cap are `pastCap` (they retain
-// prior state and are not surfaced this run). Order within each group preserves the input order.
+// §5.B classification, pure: heads arrive sorted committedDate DESC. The repo's DEFAULT branch
+// (matched by name; known from §5.A discovery) is ALWAYS eligible — exempt from BOTH the cutoff
+// filter and the cap — so the default-branch view the report's headline metrics depend on is
+// never silently absent (CV2: a dormant default behind active feature branches, or one past the
+// cap, must still be scanned). Every OTHER still-live branch before cutoffDate is
+// `cutoffSkipped` (regardless of the cap); the after-cutoff survivors are `eligible` up to
+// maxBranchesPerRepo (the cap counts NON-default branches only, so a repo can yield cap+1
+// eligible units); older survivors past the cap are `pastCap` (they retain prior state and are
+// not surfaced this run). Order within each group preserves the input order. A defaultBranch
+// not among the live heads admits nothing — heads are never synthesized.
 export interface BranchPlan {
   readonly cutoffSkipped: readonly BranchHead[];
   readonly eligible: readonly BranchHead[];
   readonly pastCap: readonly BranchHead[];
 }
-export function classifyBranchPlan(heads: BranchHead[], cutoffDate: string, maxBranchesPerRepo: number): BranchPlan {
+export function classifyBranchPlan(
+  heads: BranchHead[], cutoffDate: string, maxBranchesPerRepo: number, defaultBranch: string,
+): BranchPlan {
   const cutoffSkipped: BranchHead[] = [];
   const eligible: BranchHead[] = [];
   const pastCap: BranchHead[] = [];
+  let nonDefaultEligible = 0;
   for (const h of heads) {
-    if (h.committedDate.slice(0, 10) < cutoffDate) cutoffSkipped.push(h);
-    else if (eligible.length < maxBranchesPerRepo) eligible.push(h);
-    else pastCap.push(h);
+    if (h.name === defaultBranch) eligible.push(h);
+    else if (h.committedDate.slice(0, 10) < cutoffDate) cutoffSkipped.push(h);
+    else if (nonDefaultEligible < maxBranchesPerRepo) {
+      eligible.push(h);
+      nonDefaultEligible++;
+    } else pastCap.push(h);
   }
   return { cutoffSkipped, eligible, pastCap };
 }
@@ -336,12 +348,15 @@ export async function processRepo(
     logLine({ event: "discovery", org: repo.organization, repo: repo.name, error: message });
     return;
   }
-  const plan = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo);
+  const plan = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
+  // Discovery KNOWS the default branch (§5.A), so every head row this run writes carries a
+  // definite true/false — NULL is reserved for pre-v3 rows where nothing ever recorded it.
+  const isDefault = (h: BranchHead): boolean => h.name === repo.defaultBranch;
   for (const h of plan.cutoffSkipped) {
     const key: WorkUnitKey = { configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch: h.name };
     db.enqueueUnit(key, runId);
     db.setUnitStatus(key, { status: "skipped", runId, lastCommitSha: "", lastCommitDate: h.committedDate });
-    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: null });
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: isDefault(h) });
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-cutoff" });
   }
   // plan.pastCap: after-cutoff past the cap → retain prior state, not surfaced this run.
@@ -352,7 +367,7 @@ export async function processRepo(
     // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is
     // reused (skip-as-current) — still upsert run_unit_head for THIS run so the report includes it.
     if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
-      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: null });
+      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: isDefault(h) });
       db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
       logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
       continue;
@@ -440,7 +455,7 @@ async function processUnit(
       db.insertError({ runId, scope: "introspection", packageName: s.packageName, version: s.rawSpec, message: skipMessage });
       logLine({ event: "introspection", packageName: s.packageName, version: s.rawSpec, error: skipMessage });
     }
-    db.upsertRunUnitHead({ runId, organization: loc.organization, repository: loc.repository, branch: loc.branch, commitSha: loc.commitSha, status: "scanned", isDefaultBranch: null });
+    db.upsertRunUnitHead({ runId, organization: loc.organization, repository: loc.repository, branch: loc.branch, commitSha: loc.commitSha, status: "scanned", isDefaultBranch: h.name === repo.defaultBranch });
 
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: commitSha, action: "scanned", deps: result.dependencyFindings.length, usage: result.usageFindings.length, cli: result.cliFindings.length });
     return commitSha;
@@ -649,7 +664,7 @@ export async function runPlan(client: GithubClient, config: Config, personalLogi
         logLine({ event: "plan", org: repo.organization, repo: repo.name, error: `branch discovery failed: ${(e as Error).message}` });
         continue;
       }
-      const p = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo);
+      const p = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
       branchesEligible += p.eligible.length;
       branchesSkippedByCutoff += p.cutoffSkipped.length;
       branchesPastCap += p.pastCap.length;
