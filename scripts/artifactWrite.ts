@@ -254,6 +254,10 @@ export class ArtifactBundle {
       const kind = e["kind"];
       if (kind === this.kind || (kind !== "export" && kind !== "dossier")) continue;
       const name = e["path"];
+      // A prior manifest is data on disk; a tampered `path` (e.g. `../secret`) must never reach
+      // join()/lstat — validate it against the SAME flat-name grammar fresh writes use, and skip
+      // (never throw: one bad entry can't fail the whole finalize) anything outside it.
+      if (name === "." || name === ".." || !NAME_GRAMMAR.test(name)) continue;
       if (this.nameKeys.has(collisionKey(name))) continue; // this generation rewrote it
       let st;
       try {
@@ -292,10 +296,14 @@ export class ArtifactBundle {
     // not), so a directory entry could ALIAS a just-written artifact under a spelling the
     // keep-set doesn't recognize — and sweeping it would delete the artifact itself. An entry
     // whose inode matches a kept file is therefore never unlinked, whatever it is named.
-    const keptInodes = new Set<number>();
+    // Key on `dev:ino`, not `ino` alone: inode numbers are unique only per filesystem, so a
+    // cross-device or bind-mounted entry under xray/ could share a bare inode with a kept file and
+    // be wrongly spared; pairing the device id keeps the guard exact.
+    const keptInodes = new Set<string>();
+    const inodeKey = (st: { dev: number; ino: number }): string => `${st.dev}:${st.ino}`;
     for (const name of kept) {
       try {
-        keptInodes.add(lstatSync(join(this.dir, name)).ino);
+        keptInodes.add(inodeKey(lstatSync(join(this.dir, name))));
       } catch {
         /* vanished — nothing to protect */
       }
@@ -305,7 +313,7 @@ export class ArtifactBundle {
       const target = join(this.dir, entry);
       const st = lstatSync(target);
       if (st.isDirectory()) continue; // operator dirs survive; never recurse
-      if (keptInodes.has(st.ino)) continue; // IS a kept artifact under an aliased spelling
+      if (keptInodes.has(inodeKey(st))) continue; // IS a kept artifact under an aliased spelling
       rmSync(target, { force: true }); // unlinks files and symlinks themselves; never follows
       swept.push(entry);
     }

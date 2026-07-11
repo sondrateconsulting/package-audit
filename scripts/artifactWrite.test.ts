@@ -476,6 +476,51 @@ describe("ArtifactBundle — cross-kind manifest adoption (export + dossier shar
     expect(manifest.artifacts.length).toBe(2);
   });
 
+  test("a tampered manifest path (../evil) is name-validated and NEVER adopted or lstat-probed (L1)", () => {
+    const out = nextOutputDir();
+    const exports = new ArtifactBundle(out, "export");
+    exports.write("usage_findings.csv", "a,b\r\n");
+    exports.finalize({ runId: "run-1" });
+
+    // Tamper the on-disk manifest: inject a traversal path an attacker with write access could plant.
+    const mpath = join(out, XRAY_DIR_NAME, "manifest.json");
+    const m = JSON.parse(readFileSync(mpath, "utf8")) as { artifacts: Array<Record<string, unknown>> };
+    m.artifacts.push({ path: "../evil.txt", kind: "export", sha256: "0".repeat(64), bytes: 1 });
+    writeFileSync(mpath, JSON.stringify(m));
+    // A real file at the traversal TARGET (outside xray/): without the name-grammar guard,
+    // adoptableEntries would lstat(join(xray, "../evil.txt")) = out/evil.txt, find it, and adopt
+    // the escaping entry into the new manifest.
+    writeFileSync(join(out, "evil.txt"), "x");
+
+    const dossiers = new ArtifactBundle(out, "dossier");
+    dossiers.write("expo-dossier.html", "<html/>");
+    const { artifacts } = dossiers.finalize({ runId: "run-1" });
+
+    // the legit export IS adopted; the traversal entry is skipped by NAME_GRAMMAR, never adopted
+    expect(artifacts.map((a) => a.path)).toEqual(["expo-dossier.html", "usage_findings.csv"]);
+    expect(artifacts.some((a) => a.path.includes(".."))).toBe(false);
+    expect(existsSync(join(out, "evil.txt"))).toBe(true); // the out-of-bundle file is never touched
+  });
+
+  test("a tampered manifest path of exactly `.` or `..` is rejected (the non-regex adoption branch)", () => {
+    // `.` and `..` match NAME_GRAMMAR's char class, so they need the explicit reject in
+    // adoptableEntries — exercise it directly (distinct from the `/`-bearing `../evil.txt` case).
+    const out = nextOutputDir();
+    const exports = new ArtifactBundle(out, "export");
+    exports.write("usage_findings.csv", "a,b\r\n");
+    exports.finalize({ runId: "run-1" });
+    const mpath = join(out, XRAY_DIR_NAME, "manifest.json");
+    const m = JSON.parse(readFileSync(mpath, "utf8")) as { artifacts: Array<Record<string, unknown>> };
+    m.artifacts.push({ path: "..", kind: "export", sha256: "0".repeat(64), bytes: 1 });
+    m.artifacts.push({ path: ".", kind: "export", sha256: "0".repeat(64), bytes: 1 });
+    writeFileSync(mpath, JSON.stringify(m));
+
+    const dossiers = new ArtifactBundle(out, "dossier");
+    dossiers.write("expo-dossier.html", "<html/>");
+    const { artifacts } = dossiers.finalize({ runId: "run-1" });
+    expect(artifacts.map((a) => a.path)).toEqual(["expo-dossier.html", "usage_findings.csv"]); // neither . nor .. adopted
+  });
+
   test("a DIFFERENT runId is a wholesale replacement: the other kind's stale artifacts die", () => {
     const out = nextOutputDir();
     const exports = new ArtifactBundle(out, "export");

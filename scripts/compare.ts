@@ -382,18 +382,25 @@ export function runCompare(config: Config, runIdA: string, runIdB: string): { li
   // Pure READ — openReadOnly can never create, migrate, or write the database (CV5).
   const db = AuditDb.openReadOnly({ sqlitePath });
   try {
-    const runs: Array<readonly [string, RunRecord | null]> = [
+    const entries: Array<readonly [string, RunRecord | null]> = [
       [runIdA, db.getRun(runIdA)],
       [runIdB, db.getRun(runIdB)],
     ];
-    for (const [id, run] of runs)
+    // Two-phase (all missing-run checks before all not-completed checks — the error precedence the
+    // notices/tests expect), but collect the narrowed runs into `loaded` so the second phase and the
+    // buildCompare call carry NO cross-loop `run!` assertion: `run` here is a RunRecord, not
+    // RunRecord|null, so a future edit can't silently reintroduce a null deref.
+    const loaded: Array<[string, RunRecord]> = [];
+    for (const [id, run] of entries) {
       if (run === null || run.trackedPackages.length === 0)
         return { line: `${JSON.stringify(buildNotComparableNotice({ kind: "missing-run", runId: id }))}\n` };
-    for (const [id, run] of runs)
-      if (run!.status !== "completed")
-        return { line: `${JSON.stringify(buildNotComparableNotice({ kind: "not-completed", runId: id, status: run!.status }))}\n` };
+      loaded.push([id, run]);
+    }
+    for (const [id, run] of loaded)
+      if (run.status !== "completed")
+        return { line: `${JSON.stringify(buildNotComparableNotice({ kind: "not-completed", runId: id, status: run.status }))}\n` };
 
-    const result = buildCompare(db, runs[0]![1]!, runs[1]![1]!);
+    const result = buildCompare(db, loaded[0]![1], loaded[1]![1]);
     process.stderr.write(compareSummaryText(result));
     return { line: `${JSON.stringify(result)}\n` };
   } finally {

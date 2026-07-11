@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso } from "./db.ts";
-import { buildNotReportableNotice, buildReport, emitDossiers, runReport } from "./report.ts";
+import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
 import type { Config } from "./config.ts";
 
@@ -498,5 +498,19 @@ describe("buildReport — run-scope head-join discrimination (M7)", () => {
     const versions = expo?.usageByRepo.flatMap((u) => u.declarations.map((d) => d.resolvedVersion)) ?? [];
     expect(versions).toContain("50.0.9");
     db.close();
+  });
+});
+
+describe("parseLockfileLines — corrupted self-produced data degrades to null, never throws (L5)", () => {
+  test("null passes through; a valid integer array parses", () => {
+    expect(parseLockfileLines(null)).toBeNull();
+    expect(parseLockfileLines("[10, 11]")).toEqual([10, 11]);
+    expect(parseLockfileLines("[]")).toEqual([]);
+  });
+  test("a corrupted cell (invalid JSON or wrong shape) degrades to null instead of throwing", () => {
+    expect(parseLockfileLines("not json")).toBeNull(); // would have thrown SyntaxError before the guard
+    expect(parseLockfileLines('{"a":1}')).toBeNull(); // parseable but not an array
+    expect(parseLockfileLines('["10","11"]')).toBeNull(); // array of non-numbers
+    expect(parseLockfileLines("42")).toBeNull(); // parseable but not an array
   });
 });

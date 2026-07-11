@@ -190,6 +190,20 @@ function buildPackage(
   return { name, versionsSeen, apiSurface, usageByRepo };
 }
 
+// lockfile_lines is self-produced (written via JSON.stringify at ingest), so this parse is not
+// attacker-facing — but guard it anyway, matching artifactWrite.ts's guarded manifest parse: a
+// corrupted DB cell degrades that one declaration's line refs to null instead of throwing and
+// failing the ENTIRE report build (report/report --html/orchestrate's final step).
+export function parseLockfileLines(json: string | null): number[] | null {
+  if (json === null) return null;
+  try {
+    const v: unknown = JSON.parse(json);
+    return Array.isArray(v) && v.every((n) => typeof n === "number") ? (v as number[]) : null;
+  } catch {
+    return null;
+  }
+}
+
 function buildUnit(
   unit: { organization: string; repository: string; branch: string; commitSha: string },
   deps: DepRow[], usage: UsageRowDb[], isDefaultBranch: boolean | null,
@@ -211,7 +225,7 @@ function buildUnit(
       permalink: d.manifest_permalink, declaredVersion: d.declared_version,
       resolvedVersion: d.resolved_version, resolvedVersionSource: d.resolved_version_source,
       lockfile: d.lockfile_path === null ? null : {
-        path: d.lockfile_path, lines: d.lockfile_lines === null ? null : (JSON.parse(d.lockfile_lines) as number[]), permalink: d.lockfile_permalink,
+        path: d.lockfile_path, lines: parseLockfileLines(d.lockfile_lines), permalink: d.lockfile_permalink,
       },
     }))
     .sort((a, b) => cmp(a.dependencyType, b.dependencyType) || cmp(a.dependencyKey, b.dependencyKey) || cmp(a.path, b.path) || a.line - b.line);

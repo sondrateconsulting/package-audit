@@ -181,7 +181,7 @@ export interface ExportTableSpec {
   readonly orderBy: readonly string[];
 }
 
-export const EXPORT_REGISTRY: Record<ExportTableName, ExportTableSpec> = {
+export const EXPORT_REGISTRY: Readonly<Record<ExportTableName, ExportTableSpec>> = {
   dependency_findings: { columns: DEPENDENCY_FINDINGS_COLUMNS, orderBy: DEPENDENCY_FINDINGS_ORDER_BY },
   package_api_surface: { columns: PACKAGE_API_SURFACE_COLUMNS, orderBy: PACKAGE_API_SURFACE_ORDER_BY },
   runs: { columns: RUNS_COLUMNS, orderBy: RUNS_ORDER_BY },

@@ -2,6 +2,7 @@ import { expect, test, describe, afterAll, spyOn } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { AuditDb, type RunRecord } from "./db.ts";
 import { ArgsError } from "./args.ts";
 import {
@@ -425,6 +426,29 @@ describe("runExport guards (mirroring runReport, notices to stdout only)", () =>
       expect(readdirSync(root)).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a too-old (v2) file database is refused through runExport; zero filesystem effect (L6)", () => {
+    // export.ts calls the same AuditDb.openReadOnly seam runReport does; a v2-stamped file DB must
+    // be refused with the migrate-first error BEFORE any bundle/artifact write. (Mirrors the report
+    // too-old guard; the file DB lives under ./data so openReadOnly's §0 containment is satisfied.)
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.exporttest-v2-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const root = mkdtempSync(join(tmpdir(), "export-v2db-"));
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      AuditDb.open({ sqlitePath }).close(); // create a real v3 db…
+      const bump = new Database(sqlitePath, { strict: true });
+      bump.exec("PRAGMA user_version = 2"); // …then stamp it old
+      bump.close();
+      const cfg = config(sqlitePath, join(root, "output"));
+      expect(() => runExport(cfg, { runId: null, raw: false })).toThrow(/run `bun run audit` once to migrate/);
+      expect(existsSync(join(root, "output"))).toBe(false); // refused before any artifact write
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
     }
   });
 

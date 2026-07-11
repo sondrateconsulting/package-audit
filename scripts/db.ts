@@ -569,6 +569,11 @@ export class AuditDb {
       path = assertContained(resolved, roots);
     }
     // strict: throws on binding-count mismatches instead of silently binding NULLs.
+    // NOTE: `safeIntegers` is intentionally left OFF (the default). With it off, bun:sqlite returns
+    // JS `number` for INTEGER columns (not bigint), which the report/export/compare row typings
+    // (`… as { …: number }[]`) rely on. Turning it ON would silently mistype those and break
+    // JSON.stringify / numeric sort comparators / csvCell's number branch — revisit those cast sites
+    // first before ever enabling it.
     const db = new Database(path, { create: true, strict: true });
     // busy_timeout FIRST — it is per-connection and must protect the very next statement
     // (the WAL pragma takes a lock and would otherwise fail immediately under contention).
@@ -657,6 +662,8 @@ export class AuditDb {
     const path = assertContained(opts.sqlitePath, roots);
     let db: Database;
     try {
+      // safeIntegers intentionally off — see the read-write open: INTEGER columns must stay JS
+      // `number` for the report/export/compare row casts.
       db = new Database(path, { readonly: true, strict: true });
     } catch (e) {
       throw mapReadOnlyOpenError(e, path);
