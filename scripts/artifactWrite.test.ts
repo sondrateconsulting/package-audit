@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import {
-  ArtifactBundle, ArtifactWriteError, XRAY_DIR_NAME, XRAY_FORMAT_VERSION, writeFileAtomic,
+  ArtifactBundle, ArtifactWriteError, XRAY_DIR_NAME, XRAY_FORMAT_VERSION, sweepVictims, writeFileAtomic,
 } from "./artifactWrite.ts";
 
 // artifactWrite takes EXPLICIT containment roots (unlike AuditDb.open's hardcoded ./data|./output),
@@ -522,5 +522,48 @@ describe("ArtifactBundle — cross-kind manifest adoption (export + dossier shar
     const { artifacts } = dossiers.finalize({ runId: "run-1" });
     const entries = artifacts.filter((a) => a.path === "shared-name.csv");
     expect(entries).toEqual([{ path: "shared-name.csv", kind: "dossier", sha256: entries[0]!.sha256, bytes: 18 }]);
+  });
+});
+
+// ---- codex re-pass regressions (2026-07-11, F6 + F7) ---------------------------------------------
+describe("bundle dir containment before creation (F6)", () => {
+  test("an outputDir whose lexical xray join diverges from its resolved location is refused BEFORE any mkdir", () => {
+    // out/link -> out/a/b, outputDir 'out/link/../..': symlink-aware resolution lands INSIDE
+    // out/, but path.join collapses the dots LEXICALLY, so the bundle dir computes to
+    // <root>/xray — outside the root the config validated. The bundle must fail closed without
+    // creating that directory.
+    const root = mkdtempSync(join(tmpdir(), "aw-f6-"));
+    try {
+      mkdirSync(join(root, "out", "a", "b"), { recursive: true });
+      symlinkSync(join("a", "b"), join(root, "out", "link"));
+      const bundle = new ArtifactBundle(`${root}/out/link/../..`, "export");
+      expect(() => bundle.write("x.csv", "data")).toThrow();
+      expect(existsSync(join(root, "xray"))).toBe(false); // nothing may be created outside the roots
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("sweepVictims (F7)", () => {
+  // Pure decision function: a true case-twin state cannot be CONSTRUCTED on a case-insensitive
+  // filesystem (macOS dev machines), so the fs-shape matrix is pinned here directly.
+  const kept = ["expo-dossier.html", "index.html", "manifest.json"];
+
+  test("case-sensitive twin: a stale case variant sweeps when the kept spelling is present beside it", () => {
+    expect(sweepVictims(["EXPO-dossier.html", "expo-dossier.html", "index.html", "manifest.json"], kept)).toEqual(["EXPO-dossier.html"]);
+  });
+
+  test("case-insensitive stale spelling: the artifact itself under its old case survives", () => {
+    expect(sweepVictims(["EXPO-dossier.html", "index.html", "manifest.json"], kept)).toEqual([]);
+  });
+
+  test("unmanifested names sweep regardless of case games", () => {
+    expect(sweepVictims(["stray.txt", "STRAY.TXT", "expo-dossier.html", "index.html", "manifest.json"], kept)).toEqual(["STRAY.TXT", "stray.txt"]);
+  });
+
+  test("the manifest itself is protected in both spellings", () => {
+    expect(sweepVictims(["MANIFEST.JSON", "expo-dossier.html", "index.html"], kept)).toEqual([]);
+    expect(sweepVictims(["MANIFEST.JSON", "manifest.json", "expo-dossier.html", "index.html"], kept)).toEqual(["MANIFEST.JSON"]);
   });
 });

@@ -191,6 +191,13 @@ export class ArtifactBundle {
   // throw a raw EEXIST on a dangling/file symlink — every non-real-directory shape must get
   // the same operator-facing remediation.
   private ensureRealDir(): void {
+    // Containment BEFORE creation: this.dir is a LEXICAL join (path.join collapses '..' without
+    // consulting symlinks), so an outputDir like 'output/link/../..' — whose symlink-aware
+    // resolution config.ts validated as inside the roots — can lexically collapse to a path
+    // OUTSIDE them. writeFileAtomic would fail closed on the first write, but only after the
+    // mkdir below had already created the escaped directory; assert the same containment here
+    // so nothing is created at all.
+    assertContained(this.dir, [this.outputDir]);
     let st;
     try {
       st = lstatSync(this.dir);
@@ -274,19 +281,14 @@ export class ArtifactBundle {
     const manifestPath = join(this.dir, MANIFEST_NAME);
     writeFileAtomic(manifestPath, JSON.stringify(manifest, null, 2) + "\n", [this.outputDir]);
 
-    // The keep-set compares by collision key, not raw spelling: on a case-insensitive
-    // filesystem an overwritten artifact KEEPS the directory entry's original case (a stale
-    // `EXPO-dossier.html` overwritten via `expo-dossier.html` still readdirs as the former),
-    // and an exact-match sweep would delete the freshly manifested artifact. Conservative by
-    // design — a same-key stale file on a case-SENSITIVE filesystem is never swept (harmless:
-    // the manifest names the exact artifact path, so it cannot shadow anything).
-    // (No realpath-containment on victims: assertContained FOLLOWS symlinks, and the whole
-    // point is to unlink a stale link itself without ever following it. Entries are readdir
-    // basenames — including legal-but-odd POSIX names like `old\artifact` — swept normally.)
-    const keepKeys = new Set<string>(artifacts.map((a) => collisionKey(a.path)).concat(collisionKey(MANIFEST_NAME)));
+    // Sweep decisions live in sweepVictims (pure, fs-agnostic — see its comment for the
+    // case-fold matrix). (No realpath-containment on victims: assertContained FOLLOWS
+    // symlinks, and the whole point is to unlink a stale link itself without ever following
+    // it. Entries are readdir basenames — including legal-but-odd POSIX names like
+    // `old\artifact` — swept normally.)
+    const kept = artifacts.map((a) => a.path).concat(MANIFEST_NAME);
     const swept: string[] = [];
-    for (const entry of readdirSync(this.dir)) {
-      if (keepKeys.has(collisionKey(entry))) continue;
+    for (const entry of sweepVictims(readdirSync(this.dir), kept)) {
       const target = join(this.dir, entry);
       if (lstatSync(target).isDirectory()) continue; // operator dirs survive; never recurse
       rmSync(target, { force: true }); // unlinks files and symlinks themselves; never follows
@@ -295,4 +297,28 @@ export class ArtifactBundle {
     swept.sort();
     return { manifestPath, artifacts, swept };
   }
+}
+
+// The sweep's keep/remove decision, pure and fs-agnostic (unit-tested directly — a true
+// case-twin state cannot be CONSTRUCTED on the case-insensitive filesystems the suite may run
+// on). A directory entry survives iff (a) it IS a kept path's exact spelling, or (b) it
+// case-folds to a kept path whose exact spelling is ABSENT from the listing — the
+// case-insensitive-filesystem shape where the entry is that very artifact under a stale case
+// (readdir preserves an overwritten name's original case, and an exact-match sweep would
+// delete the freshly manifested artifact). When the kept spelling IS present alongside
+// (case-sensitive filesystem), the variant is a distinct stale file and sweeps like any other
+// unmanifested entry — so successive runs tracking case-variant package names (`JSONStream`
+// then `jsonstream`) cannot strand an unmanifested twin next to the manifested one.
+export function sweepVictims(listing: readonly string[], keptPaths: readonly string[]): string[] {
+  const keepExact = new Set(keptPaths);
+  const exactByKey = new Map(keptPaths.map((p) => [collisionKey(p), p] as const));
+  const present = new Set(listing);
+  return listing
+    .filter((entry) => {
+      if (keepExact.has(entry)) return false;
+      const kept = exactByKey.get(collisionKey(entry));
+      if (kept !== undefined && !present.has(kept)) return false; // the artifact itself, stale case
+      return true;
+    })
+    .sort();
 }
