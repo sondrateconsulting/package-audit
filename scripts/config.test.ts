@@ -245,6 +245,14 @@ describe("unknown-key rejection (strict at every level)", () => {
   });
 });
 
+describe("normalizePackages — hostile package name is rejected (fail-closed)", () => {
+  const BS = String.fromCharCode(92); // a REAL backslash
+  test("an injecting backslash name throws ConfigError (never reaches the network layer)", () =>
+    expect(() => norm({ ...baseRaw(), packages: [{ name: `@x${BS}..${BS}..${BS}admin?x=1` }] })).toThrow(ConfigError));
+  test("a valid name ('expo') does NOT throw for the name reason", () =>
+    expect(() => norm({ ...baseRaw(), packages: [{ name: "expo" }] })).not.toThrow());
+});
+
 describe("config.schema.json ↔ runtime sync", () => {
   const repoRoot = join(import.meta.dir, "..");
   const schema = JSON.parse(readFileSync(join(repoRoot, "config.schema.json"), "utf8")) as Record<string, any>;
@@ -252,11 +260,11 @@ describe("config.schema.json ↔ runtime sync", () => {
 
   // The ONE keyword allowlist both the value-checker and the schema-only walk trust — a new
   // schema keyword must be added here (and taught to the checker) exactly once.
-  const KNOWN_SCHEMA_KEYWORDS = new Set(["$schema", "$id", "title", "description", "type", "properties", "required", "additionalProperties", "items", "minItems", "minimum", "minLength", "pattern", "format", "default"]);
+  const KNOWN_SCHEMA_KEYWORDS = new Set(["$schema", "$id", "title", "description", "type", "properties", "required", "additionalProperties", "items", "minItems", "minimum", "minLength", "maxLength", "pattern", "format", "default"]);
 
   // Minimal JSON-Schema-subset checker covering exactly the features config.schema.json uses:
   // type (string | union incl. "null"), properties/required/additionalProperties:false, items,
-  // minItems, minimum, minLength, pattern. Fails the test on any schema feature it doesn't know.
+  // minItems, minimum, minLength, maxLength, pattern. Fails the test on any schema feature it doesn't know.
   // `format` is recognized but deliberately NOT enforced (annotation-only in JSON Schema; the
   // real-calendar-date check is runtime-enforced in validateAndNormalize).
   function check(value: unknown, node: Record<string, any>, path: string, violations: string[]): void {
@@ -267,6 +275,7 @@ describe("config.schema.json ↔ runtime sync", () => {
       violations.push(`${path}: expected ${types.join("|")}, got ${jsType}`);
     if (typeof value === "string") {
       if (node["minLength"] !== undefined && value.length < node["minLength"]) violations.push(`${path}: shorter than minLength`);
+      if (node["maxLength"] !== undefined && value.length > node["maxLength"]) violations.push(`${path}: longer than maxLength`);
       if (node["pattern"] !== undefined && !new RegExp(node["pattern"]).test(value)) violations.push(`${path}: does not match ${node["pattern"]}`);
     }
     if (typeof value === "number" && node["minimum"] !== undefined && value < node["minimum"]) violations.push(`${path}: below minimum`);

@@ -5,7 +5,7 @@ import { AuditDb } from "./db.ts";
 import {
   parseSRI, verifyIntegrity, selectVersionDist, resolveRangeToVersion, encodePackageNameForUrl,
   introspectVersion, fetchPackument, inflateBounded, assertExtractedTreeSafe,
-  readBodyCapped, FETCH_TIMEOUT_MS, MAX_PACKUMENT_BYTES,
+  readBodyCapped, FETCH_TIMEOUT_MS, MAX_PACKUMENT_BYTES, isValidPackageName,
   IntrospectionError, type FetchFn, type Packument,
 } from "./apiSurface.ts";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync, linkSync, chmodSync } from "node:fs";
@@ -694,5 +694,66 @@ describe("introspectVersion — integration (real system tar)", () => {
     // both packument and tarball are on registry.example.com → auth sent to that host only
     expect(new Set(authHosts)).toEqual(new Set(["registry.example.com"]));
     db.close();
+  });
+});
+
+// ---- §5.E: hostile package name is fail-closed (the bearer token never leaves) ---------------
+describe("fetchPackument — a hostile package name is rejected before any request", () => {
+  const BS = String.fromCharCode(92); // a REAL backslash
+  // `@x\..\..\admin?x=1` — with real backslashes, WHATWG `new URL` would fold the `\` into `/`
+  // and normalize the packument URL to `https://r.example/npm/admin?x=1` on the SAME origin, so
+  // fetchFollowing would attach the bearer token to that attacker-chosen target.
+  const injecting = `@x${BS}..${BS}..${BS}admin?x=1`;
+
+  // A fetch mock that RECORDS every call it sees and would otherwise answer with a valid empty
+  // packument — so a missing guard resolves successfully (leaking the token) instead of erroring
+  // for some unrelated reason.
+  const recordingFetch = (calls: string[]): FetchFn => async (url) => {
+    calls.push(url);
+    return {
+      status: 200,
+      ok: true,
+      headers: { get: () => null },
+      arrayBuffer: async () => new ArrayBuffer(0),
+      text: async () => `{"versions":{}}`,
+    };
+  };
+
+  test("rejects the injecting name with IntrospectionError and makes ZERO fetch calls", async () => {
+    const calls: string[] = [];
+    await expect(
+      fetchPackument({
+        packageName: injecting,
+        registryUrl: "https://r.example/npm/team",
+        registryAuthEnvVar: "TOKEN",
+        env: { TOKEN: "secret-bearer" },
+        fetchImpl: recordingFetch(calls),
+      }),
+    ).rejects.toThrow(IntrospectionError);
+    expect(calls).toEqual([]); // fail-closed BEFORE the network → the bearer token never leaves
+  });
+
+  test("a valid name still fetches EXACTLY the on-target packument URL", async () => {
+    const calls: string[] = [];
+    await fetchPackument({
+      packageName: "expo",
+      registryUrl: "https://r.example/npm/team",
+      registryAuthEnvVar: "TOKEN",
+      env: { TOKEN: "secret-bearer" },
+      fetchImpl: recordingFetch(calls),
+    });
+    expect(calls).toEqual(["https://r.example/npm/team/expo"]);
+  });
+});
+
+describe("isValidPackageName (re-exported from apiSurface) — accept/reject table", () => {
+  const BS = String.fromCharCode(92);
+  test("accepts real npm names", () => {
+    for (const name of ["lodash", "@scope/pkg", "@babel/core", "lodash.merge", "left-pad", "@types/node", "JSONStream"])
+      expect(isValidPackageName(name)).toBe(true);
+  });
+  test("rejects injecting / malformed names (fail-closed)", () => {
+    for (const name of [`@x${BS}..${BS}admin`, "%2e%2e/%2e%2e/admin?x=1", "@x/../../admin?x=1", "../../admin#f", "@a/b/c", "pkg?x=1", "pkg#f", "_hidden", ".dot", ""])
+      expect(isValidPackageName(name)).toBe(false);
   });
 });

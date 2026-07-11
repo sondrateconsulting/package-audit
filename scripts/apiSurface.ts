@@ -19,6 +19,9 @@ import { resolveTypeTargets, typeTargetToDts, binNames, exportsSubpathKeys, reso
 import { enumerateDtsExports, joinRelative, type DtsResolver } from "./dtsExports.ts";
 import { maxSatisfying } from "./semver.ts";
 import { scanTarball } from "./tarScan.ts";
+// Re-exported so callers (and tests) get the same fail-closed name validator the fetch layer uses.
+export { isValidPackageName, MAX_PACKAGE_NAME_LEN } from "./packageName.ts";
+import { isValidPackageName } from "./packageName.ts";
 
 export class IntrospectionError extends Error {
   constructor(message: string) {
@@ -493,8 +496,27 @@ export async function fetchPackument(req: PackumentRequest): Promise<Packument> 
   const fetchImpl = req.fetchImpl ?? realFetch;
   const authToken = req.registryAuthEnvVar !== null ? (env[req.registryAuthEnvVar] ?? null) : null;
   const registryOrigin = new URL(req.registryUrl).origin;
+  // FAIL-CLOSED (§5.E): reject a hostile package name BEFORE it can shape the URL. A name like
+  // `@x\..\..\admin?x=1` (real backslashes) or `%2e%2e/%2e%2e/admin?x=1` would otherwise normalize
+  // (via `new URL`) to a DIFFERENT same-origin path/query, and fetchFollowing attaches the bearer
+  // token to any same-origin URL — leaking it off-target.
+  if (!isValidPackageName(req.packageName))
+    throw new IntrospectionError(`invalid package name: ${JSON.stringify(req.packageName)}`);
   const base = req.registryUrl.replace(/\/+$/, "");
   const url = `${base}/${encodePackageNameForUrl(req.packageName)}`;
+  // Defense-in-depth: even a validated name must resolve to EXACTLY the intended packument path
+  // on the registry origin — no query, fragment, or path drift. EXACT pathname equality (not
+  // startsWith, which would admit `.../expo/../secret`) closes any residual normalization gap.
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    throw new IntrospectionError(`unparseable packument URL for ${req.packageName}`);
+  }
+  const baseUrl = new URL(base);
+  const expectedPath = baseUrl.pathname.replace(/\/+$/, "") + "/" + encodePackageNameForUrl(req.packageName);
+  if (target.origin !== baseUrl.origin || target.search !== "" || target.hash !== "" || target.pathname !== expectedPath)
+    throw new IntrospectionError(`refusing off-target packument URL for ${req.packageName}`);
   const { text } = await fetchFollowing(url, registryOrigin, authToken, fetchImpl, false, req.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
   let parsed: unknown;
   try {
