@@ -9,13 +9,16 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { mkdirSync, rmSync, existsSync, readFileSync, readdirSync, lstatSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { logLine } from "./log.ts";
 import type { GithubClient } from "./github.ts";
 import type { AuditDb, ApiSurfaceRow, ResolvedVersionSource } from "./db.ts";
 import { parseJsoncObject } from "./jsonc.ts";
-import { resolveTypeTargets, typeTargetToDts, binNames, exportsSubpathKeys, resolveSubpath, type PkgJson } from "./exportsResolve.ts";
+import {
+  resolveTypeTargets, typeTargetToDts, binNames, exportsSubpathKeys, resolveSubpath,
+  resolvePatternTargetTemplates, hasVersionedExportCondition, type PkgJson,
+} from "./exportsResolve.ts";
 import { enumerateDtsExports, joinRelative, type DtsResolver } from "./dtsExports.ts";
 import { maxSatisfying } from "./semver.ts";
 import { scanTarball } from "./tarScan.ts";
@@ -216,6 +219,7 @@ export interface IntrospectOptions {
   fetchImpl?: FetchFn;
   fetchTimeoutMs?: number; // wall-clock deadline per hop/body read (default FETCH_TIMEOUT_MS)
   packument?: Packument; // optional pre-fetched packument (the orchestrator caches per package)
+  maxPatternMatches?: number; // §5.E #6a cap on distinct wildcard-export matches (default MAX_PATTERN_MATCHES)
 }
 
 const realFetch: FetchFn = (url, init) =>
@@ -305,7 +309,75 @@ interface ExtractedSurface {
   rows: ApiSurfaceRow[];
 }
 
-function inspectExtracted(packageRoot: string): ExtractedSurface {
+// §5.E #6a pattern-export enumeration bounds (coordinate with §7 resource caps). MAX_PATTERN_MATCHES
+// is DELIBERATELY high (not 256): a legit wildcard package (`"./*": "./dist/*.d.ts"`) can ship
+// hundreds/thousands of declaration files, and rejecting those would leave real surface unaudited.
+// Overflow of any bound is fail-closed (IntrospectionError → no marker), never a silent truncation.
+const MAX_PATTERN_KEYS = 512;
+const MAX_PATTERN_FILES = 20_000; // aligns with tarScan MAX_ENTRIES
+export const MAX_PATTERN_MATCHES = 4096;
+const DECL_OR_SOURCE_FILE_RE = /\.(d\.[cm]?ts|tsx?|mts|cts)$/;
+
+// Turn a raw target TEMPLATE (containing '*') into an ANCHORED RegExp: literal parts are regex-
+// escaped, the FIRST '*' becomes a NAMED capture `(?<cap>[\s\S]+?)`, and every LATER '*' becomes a
+// named backref `\k<cap>`. Named (not numbered) backrefs avoid the `\1`+digit ambiguity; `[\s\S]`
+// (not `.`) matches path separators and line terminators. A no-'*' template anchors to one file.
+function patternTemplateToRegExp(template: string): RegExp {
+  const norm = template.startsWith("./") ? template : "./" + template.replace(/^\.?\/+/, "");
+  const parts = norm.split("*");
+  const escaped = parts.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  let body = escaped[0]!;
+  for (let i = 1; i < escaped.length; i++) {
+    body += (i === 1 ? "(?<cap>[\\s\\S]+?)" : "\\k<cap>") + escaped[i];
+  }
+  return new RegExp("^" + body + "$");
+}
+
+// Match the un-substituted pattern TEMPLATES against a files-only listing, returning the DISTINCT
+// matched files (`./`-relative). Globally capped: distinct matches over `maxMatches` fail closed
+// (IntrospectionError). EXPORTED for direct unit coverage of the regex/backref/escape/cap logic.
+export function matchPatternTemplates(templates: string[], files: string[], maxMatches: number): string[] {
+  const matched: string[] = [];
+  const seen = new Set<string>();
+  for (const template of templates) {
+    const re = patternTemplateToRegExp(template);
+    for (const f of files) {
+      if (!re.test(f) || seen.has(f)) continue;
+      seen.add(f);
+      matched.push(f);
+      if (matched.length > maxMatches) throw new IntrospectionError(`pattern export matches exceed ${maxMatches}`);
+    }
+  }
+  return matched;
+}
+
+// Bounded, files-only recursive listing of declaration/source files under the package root,
+// returned `./`-relative with '/' separators. The tree was already proven symlink-free by
+// assertExtractedTreeSafe, so a plain recursive readdir is safe. Overflow fails closed.
+function listDeclarationFiles(packageRoot: string, cap: number): string[] {
+  const out: string[] = [];
+  const stack: string[] = [packageRoot];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue; // an unreadable subdir yields no candidates (the safety sweep already ran)
+    }
+    for (const ent of entries) {
+      const full = join(dir, ent.name);
+      if (ent.isDirectory()) stack.push(full);
+      else if (ent.isFile() && DECL_OR_SOURCE_FILE_RE.test(ent.name)) {
+        out.push("./" + relative(packageRoot, full).split(sep).join("/"));
+        if (out.length > cap) throw new IntrospectionError(`pattern file-listing exceeds ${cap} files`);
+      }
+    }
+  }
+  return out;
+}
+
+function inspectExtracted(packageRoot: string, caps: { maxPatternMatches?: number } = {}): ExtractedSurface {
   const pkgText = readContained(packageRoot, "package.json");
   if (pkgText === null) throw new IntrospectionError("package/package.json not found in tarball");
   let pkg: PkgJson;
@@ -313,6 +385,14 @@ function inspectExtracted(packageRoot: string): ExtractedSurface {
     pkg = parseJsoncObject(pkgText).value as PkgJson;
   } catch (e) {
     throw new IntrospectionError(`invalid package.json: ${(e as Error).message}`);
+  }
+
+  // §5.E #5b FAIL-CLOSED: a VERSIONED export condition (`types@>=5.0`, `types@<4.5`) selects a
+  // different type surface per tsc version — unmodelable from the manifest alone. Refuse the
+  // version (no marker) rather than risk auditing a decoy branch while the real surface hides
+  // behind a version-gated key. (exportsResolve stays never-throwing; the throw is raised here.)
+  if (hasVersionedExportCondition(pkg["exports"])) {
+    throw new IntrospectionError("versioned export condition (types@<range>) is not statically modelable — fail closed");
   }
 
   const rows: ApiSurfaceRow[] = [];
@@ -340,14 +420,40 @@ function inspectExtracted(packageRoot: string): ExtractedSurface {
     }
   };
 
-  // root surface (union of import+require targets)
-  for (const target of resolveTypeTargets(pkg)) collectFromDts(typeTargetToDts(target));
+  // root surface (union of import+require targets). With `exports` present, resolveTypeTargets
+  // returns RAW targets → map each to its adjacent .d.ts. The no-exports LEGACY branch already
+  // returns final declaration CANDIDATES (incl. .ts sources that must not be re-mapped), so those
+  // are read directly (§5.E #3/#4).
+  const hasExports = pkg["exports"] !== undefined;
+  for (const target of resolveTypeTargets(pkg)) {
+    collectFromDts(hasExports ? typeTargetToDts(target) : target);
+  }
 
   // exact `exports` subpaths ('./config' …) are part of the FULL public surface (§5.E), each
-  // resolved under both modes and unioned. '*'-pattern keys are skipped: their concrete
-  // expansions are not statically enumerable from the map alone.
+  // resolved under both modes and unioned.
   for (const subpath of exportsSubpathKeys(pkg).exact) {
     for (const target of resolveSubpath(pkg, subpath).targets) collectFromDts(typeTargetToDts(target));
+  }
+
+  // '*'-pattern `exports` subpaths (§5.E #6a): resolve each pattern's raw target TEMPLATE under
+  // both modes, map to its .d.ts form, and match against a bounded declaration-file listing of the
+  // extracted tree — so a decoy that hides real surface behind a wildcard export is still audited.
+  const patternKeys = exportsSubpathKeys(pkg).patterns;
+  if (patternKeys.length > 0) {
+    if (patternKeys.length > MAX_PATTERN_KEYS)
+      throw new IntrospectionError(`too many pattern export keys (> ${MAX_PATTERN_KEYS}) — fail closed`);
+    const templates: string[] = [];
+    for (const key of patternKeys) {
+      for (const tmpl of resolvePatternTargetTemplates(pkg, key)) {
+        const dts = typeTargetToDts(tmpl); // '*' preserved; runtime→declaration form
+        if (!templates.includes(dts)) templates.push(dts);
+      }
+    }
+    if (templates.length > 0) {
+      const files = listDeclarationFiles(packageRoot, MAX_PATTERN_FILES);
+      const maxMatches = caps.maxPatternMatches ?? MAX_PATTERN_MATCHES;
+      for (const matchedRel of matchPatternTemplates(templates, files, maxMatches)) collectFromDts(matchedRel);
+    }
   }
 
   // bin names (§5.G) — the cli-bin surface, deduped
@@ -456,7 +562,7 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
       // reject the version if the extracted tree contains any symlink or non-regular member.
       assertExtractedTreeSafe(extractRoot);
       // npm tarballs root everything under `package/`.
-      const surface = inspectExtracted(join(extractRoot, "package"));
+      const surface = inspectExtracted(join(extractRoot, "package"), { maxPatternMatches: opts.maxPatternMatches });
       // atomic surface + '__complete__' marker (durable success record, even for zero rows)
       db.writeApiSurface({ packageName, version, versionSource, rows: surface.rows });
     } finally {

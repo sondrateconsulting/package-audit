@@ -6,7 +6,7 @@ import {
   parseSRI, verifyIntegrity, selectVersionDist, resolveRangeToVersion, encodePackageNameForUrl,
   introspectVersion, fetchPackument, inflateBounded, assertExtractedTreeSafe,
   readBodyCapped, FETCH_TIMEOUT_MS, MAX_PACKUMENT_BYTES, isValidPackageName,
-  IntrospectionError, type FetchFn, type Packument,
+  IntrospectionError, matchPatternTemplates, MAX_PATTERN_MATCHES, type FetchFn, type Packument,
 } from "./apiSurface.ts";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync, linkSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -356,6 +356,32 @@ describe("fetch timeouts + streamed byte caps (§5.E hardening)", () => {
   });
 });
 
+describe("matchPatternTemplates (#6a — anchored template→RegExp matching)", () => {
+  test("MAX_PATTERN_MATCHES is a high cap (not 256 — legit wildcard packages ship many decls)", () => {
+    expect(MAX_PATTERN_MATCHES).toBeGreaterThanOrEqual(1024);
+  });
+  test("single-star template matches by anchored prefix/suffix; distinct files deduped", () => {
+    const files = ["./dts/a.d.ts", "./dts/b.d.ts", "./other/c.d.ts", "./dts/a.js"];
+    expect(matchPatternTemplates(["./dts/*.d.ts"], files, 100).sort()).toEqual(["./dts/a.d.ts", "./dts/b.d.ts"]);
+  });
+  test("multi-star template requires the SAME capture (named backref)", () => {
+    const files = ["./dist/foo/index-foo.d.ts", "./dist/foo/index-bar.d.ts"];
+    expect(matchPatternTemplates(["./dist/*/index-*.d.ts"], files, 100)).toEqual(["./dist/foo/index-foo.d.ts"]);
+  });
+  test("a no-star template matches exactly one concrete file", () => {
+    expect(matchPatternTemplates(["./index.d.ts"], ["./index.d.ts", "./other.d.ts"], 100)).toEqual(["./index.d.ts"]);
+  });
+  test("regex metacharacters in the literal template parts are escaped (no ReDoS / mismatch)", () => {
+    // '.' in the template must match a literal dot, not any char
+    expect(matchPatternTemplates(["./a.b/*.d.ts"], ["./aXb/x.d.ts"], 100)).toEqual([]);
+    expect(matchPatternTemplates(["./a.b/*.d.ts"], ["./a.b/x.d.ts"], 100)).toEqual(["./a.b/x.d.ts"]);
+  });
+  test("throws IntrospectionError when DISTINCT matches exceed the cap (fail-closed)", () => {
+    const files = ["./dts/a.d.ts", "./dts/b.d.ts", "./dts/c.d.ts"];
+    expect(() => matchPatternTemplates(["./dts/*.d.ts"], files, 2)).toThrow(IntrospectionError);
+  });
+});
+
 const TMP = mkdtempSync(join(tmpdir(), "apisurf-"));
 afterAll(() => {
   try {
@@ -460,7 +486,10 @@ describe("introspectVersion — integration (real system tar)", () => {
     db.close();
   });
 
-  test("enumerates EXACT exports subpaths ('./config') beyond the root (§5.E full surface)", async () => {
+  test("enumerates EXACT exports subpaths AND '*'-pattern subpaths from the swept tree (§5.E #6a full surface)", async () => {
+    // The pattern key `./features/*` is NOT skipped: its target template is matched against the
+    // extracted declaration files, so a decoy that hides its surface behind a wildcard export is
+    // still audited. `hidden` (in features/a.d.ts) MUST appear.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     await run(
       [
@@ -471,7 +500,7 @@ describe("introspectVersion — integration (real system tar)", () => {
             exports: {
               ".": { types: "./index.d.ts" },
               "./config": { types: "./config.d.ts" },
-              "./features/*": { types: "./features/*.d.ts" }, // pattern key — skipped (not enumerable)
+              "./features/*": { types: "./features/*.d.ts" }, // pattern key — enumerated (#6a)
             },
           }),
         },
@@ -482,7 +511,161 @@ describe("introspectVersion — integration (real system tar)", () => {
       db,
     );
     const names = (db.read("SELECT export_name FROM package_api_surface WHERE export_kind IN ('named','type') ORDER BY export_name").all() as Array<{ export_name: string }>).map((r) => r.export_name);
-    expect(names).toEqual(["getConfig", "root"]); // subpath surface included; pattern key skipped
+    expect(names).toEqual(["getConfig", "hidden", "root"]); // root + exact subpath + pattern subpath
+    db.close();
+  });
+
+  test("a fallback array covers the REAL target past a missing decoy-first entry (#5a)", async () => {
+    // TS uses the first target that EXISTS; ship ONLY real.d.ts. A resolver returning only the
+    // first structurally-valid target would pick missing.d.ts → drop it → empty marker (fail-open).
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", exports: { ".": ["./missing.d.ts", "./real.d.ts"] } }) },
+        { name: "real.d.ts", content: `export declare function realSurface(): void;` },
+      ],
+      db,
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(true);
+    const names = (db.read("SELECT export_name FROM package_api_surface WHERE export_kind='named'").all() as Array<{ export_name: string }>).map((r) => r.export_name);
+    expect(names).toEqual(["realSurface"]);
+    db.close();
+  });
+
+  test("legacy typings is checked BEFORE a decoy types field (#4)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", types: "./decoy.d.ts", typings: "./real.d.ts" }) },
+        { name: "real.d.ts", content: `export declare function realTyping(): void;` },
+        // decoy.d.ts intentionally NOT shipped — a types-first resolver would read nothing
+      ],
+      db,
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(true);
+    const names = (db.read("SELECT export_name FROM package_api_surface WHERE export_kind='named'").all() as Array<{ export_name: string }>).map((r) => r.export_name);
+    expect(names).toEqual(["realTyping"]);
+    db.close();
+  });
+
+  test("a VERSIONED export condition (types@>=6) is fail-closed: NO marker + errors row (#5b)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { authHosts: _a } = await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", exports: { "types@>=6": "./real.d.ts", types: "./decoy.d.ts" } }) },
+        { name: "real.d.ts", content: `export declare const real: number;` },
+        { name: "decoy.d.ts", content: `` },
+      ],
+      db,
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    expect((db.read("SELECT message FROM errors").get() as { message: string }).message).toContain("versioned");
+    db.close();
+  });
+
+  test("a versioned condition NESTED in a fallback array is also fail-closed (#5b)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", exports: { ".": [{ "types@>=6": "./real.d.ts" }, { types: "./decoy.d.ts" }] } }) },
+        { name: "real.d.ts", content: `export declare const real: number;` },
+      ],
+      db,
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    expect((db.read("SELECT message FROM errors").get() as { message: string }).message).toContain("versioned");
+    db.close();
+  });
+
+  test("an ordinary `foo@bar` custom condition is NOT versioned — the surface still resolves (#5b GREEN)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", exports: { ".": { "foo@bar": "./real.d.ts", types: "./real.d.ts" } } }) },
+        { name: "real.d.ts", content: `export declare function ok(): void;` },
+      ],
+      db,
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(true);
+    const errs = db.read("SELECT message FROM errors").all() as Array<{ message: string }>;
+    expect(errs).toEqual([]);
+    db.close();
+  });
+
+  test("a '*'-pattern export is enumerated from the tree — a wildcard-hidden backdoor is caught (#6a)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", exports: { "./*": { types: "./dts/*.d.ts" } } }) },
+        { name: "dts/secret.d.ts", content: `export declare function backdoor(): void;` },
+      ],
+      db,
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(true);
+    const names = (db.read("SELECT export_name FROM package_api_surface WHERE export_kind='named'").all() as Array<{ export_name: string }>).map((r) => r.export_name);
+    expect(names).toContain("backdoor");
+    db.close();
+  });
+
+  test("a MULTI-star pattern enumerates ONLY same-capture files (#6a)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", exports: { "./*": { types: "./dist/*/index-*.d.ts" } } }) },
+        { name: "dist/foo/index-foo.d.ts", content: `export declare const matched: number;` }, // same capture 'foo'
+        { name: "dist/foo/index-bar.d.ts", content: `export declare const notMatched: number;` }, // capture mismatch
+      ],
+      db,
+    );
+    const names = (db.read("SELECT export_name FROM package_api_surface WHERE export_kind='named' ORDER BY export_name").all() as Array<{ export_name: string }>).map((r) => r.export_name);
+    expect(names).toContain("matched");
+    expect(names).not.toContain("notMatched");
+    db.close();
+  });
+
+  test("a template whose later star is followed by a digit uses NAMED backrefs (no \\1-ambiguity) (#6a)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", exports: { "./*": { types: "./t/*/v*2.d.ts" } } }) },
+        { name: "t/x/vx2.d.ts", content: `export declare const digitBackref: number;` }, // capture 'x', then literal '2'
+      ],
+      db,
+    );
+    const names = (db.read("SELECT export_name FROM package_api_surface WHERE export_kind='named'").all() as Array<{ export_name: string }>).map((r) => r.export_name);
+    expect(names).toContain("digitBackref");
+    db.close();
+  });
+
+  test("a NO-star pattern target enumerates the single file (does not throw) (#6a)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", exports: { "./*": "./index.d.ts" } }) },
+        { name: "index.d.ts", content: `export declare function single(): void;` },
+      ],
+      db,
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(true);
+    const names = (db.read("SELECT export_name FROM package_api_surface WHERE export_kind='named'").all() as Array<{ export_name: string }>).map((r) => r.export_name);
+    expect(names).toEqual(["single"]);
+    db.close();
+  });
+
+  test("pattern matches OVER the cap fail closed: NO marker + errors row (#6a)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", exports: { "./*": { types: "./dts/*.d.ts" } } }) },
+        { name: "dts/a.d.ts", content: `export declare const a: 1;` },
+        { name: "dts/b.d.ts", content: `export declare const b: 1;` },
+        { name: "dts/c.d.ts", content: `export declare const c: 1;` },
+      ],
+      db,
+      { maxPatternMatches: 2 }, // 3 files match → overflow
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    expect((db.read("SELECT message FROM errors").get() as { message: string }).message.toLowerCase()).toContain("pattern");
     db.close();
   });
 
