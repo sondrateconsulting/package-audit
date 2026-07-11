@@ -1124,9 +1124,17 @@ describe("migration — v2 → v3 (version-stepped, CRITICAL round-trip)", () =>
       // v2 running runs are NOT failed by the additive step (that is the LEGACY boundary rule).
       expect(db.getRun("v2-running")?.status).toBe("running");
       // The old run's report is byte-identical to the natively-stored twin's.
-      const afterReport = JSON.stringify(buildReport(db, db.getRun("v2-run")!), null, 2);
+      const migratedReport = buildReport(db, db.getRun("v2-run")!);
+      const afterReport = JSON.stringify(migratedReport, null, 2);
       expect(afterReport).toBe(expectedReport);
       expect(afterReport).toContain('"isDefaultBranch": null'); // pre-v3 rows render as unknown
+      // apiSurface must be POPULATED, not silently drained: the fixture's epoch-stamped completion
+      // marker is load-bearing. A bare/stale marker reads as ABSENT (§7 epoch), so the surface would
+      // empty out and the byte-identity above would still pass empty-vs-empty (both build from the
+      // same fixture) — asserting NOTHING. This positive check makes that regression fail (see 4d0b42d).
+      const migratedExpo = (migratedReport as { packages: Array<{ name: string; apiSurface: Record<string, { exports: Array<{ name: string; kind: string }> }> }> })
+        .packages.find((p) => p.name === "expo");
+      expect(migratedExpo?.apiSurface["50.0.0"]?.exports).toContainEqual({ name: "registerRootComponent", kind: "named" });
     } finally {
       db.close();
     }
