@@ -172,9 +172,13 @@ export function dossierFilename(packageName: string): string {
 //                  '' (the whole-module bucket, or a name with no usable chars) → 'whole-module'.
 //   Uniqueness: slugs are assigned in drawer order; a repeat gets a '~2', '~3', … suffix ('~' is
 //   outside the slug alphabet, so suffixed ids can never collide with unsuffixed ones).
-//   drawer id = 'e-<slug>'; evidence row id = 'e-<slug>-<n>' (n = 1-based position in the
-//   drawer's rendered order). Section ids are fixed: exec, cards, surface, matrix, evidence,
-//   observations; markdown mirrors live in '<section id>-md' templates.
+//   drawer id = 'e-<slug>'; evidence row id = 'e-<slug>.<n>' (n = 1-based position in the
+//   drawer's rendered order). The row separator is '.' — NOT '-' — because '-' is inside the
+//   slug alphabet: exports `foo` and `foo_1` slug to `foo` and `foo-1`, so a '-'-separated row
+//   id for the former (`e-foo-1`) would collide with the latter's drawer id. '.' appears in no
+//   slug and no '~' dedup suffix, so row ids can never collide with any drawer id or each
+//   other. Section ids are fixed: exec, cards, surface, matrix, evidence, observations;
+//   markdown mirrors live in '<section id>-md' templates.
 
 function slugOf(exportName: string): string {
   const s = exportName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -245,6 +249,7 @@ export interface DossierModel {
   readonly otherBranchCount: number; // distinct branches outside headline scope
   readonly totalBranchCount: number;
   readonly headlineSiteCount: number; // apiUsage sites in headline scope (attributed + whole-module)
+  readonly headlineImportingRepoCount: number; // headline repos with ≥1 apiUsage site — the "imported by" count (headlineRepos also admits declaration-only and CLI-only units)
   readonly totalSiteCount: number;
   readonly attributedSiteCount: number; // headline scope, exportName !== ''
   readonly wholeModuleSiteCount: number; // headline scope, exportName === ''
@@ -342,9 +347,15 @@ export function computeDossierModel(pkg: DossierPackage): DossierModel {
   const top3SharePct = attributedSiteCount === 0 ? null : pct(top3, attributedSiteCount);
 
   // ---- versions (from versionsSeen + declarations)
+  // Only versions the report itself recognizes count: versionsSeen is the valid-semver slice
+  // (report.ts), so a raw non-registry resolution (git ref, link:, catalog:) in a declaration
+  // must not inflate the headline count — the card's detail line branches on versionsSeen and
+  // would otherwise contradict its own headline ("1" beside "no resolved versions").
   const resolvedIn = (list: readonly DossierUnit[]): Set<string> => {
     const set = new Set<string>();
-    for (const u of list) for (const d of u.declarations) if (d.resolvedVersion !== null) set.add(d.resolvedVersion);
+    for (const u of list)
+      for (const d of u.declarations)
+        if (d.resolvedVersion !== null && pkg.versionsSeen.includes(d.resolvedVersion)) set.add(d.resolvedVersion);
     return set;
   };
   const orderVersions = (set: ReadonlySet<string>): string[] =>
@@ -429,6 +440,7 @@ export function computeDossierModel(pkg: DossierPackage): DossierModel {
     otherBranchCount: new Set(otherUnits.map(branchKey)).size,
     totalBranchCount: new Set(units.map(branchKey)).size,
     headlineSiteCount: raw.filter((s) => s.headline).length,
+    headlineImportingRepoCount: new Set(raw.filter((s) => s.headline).map((s) => repoKeyOf(s.u))).size,
     totalSiteCount: raw.length,
     attributedSiteCount,
     wholeModuleSiteCount: raw.filter((s) => s.headline && s.row.exportName === "").length,
@@ -492,13 +504,17 @@ th { font-size:.75rem; letter-spacing:.05em; text-transform:uppercase; color:var
 td.n, th.n { text-align:right; font-variant-numeric: tabular-nums; }
 td.dot { text-align:right; color:var(--muted); }
 .tablewrap { overflow-x:auto; }
-code { font:.85em/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--code-bg); padding:.1em .3em; border-radius:2px; }
+/* unicode-bidi isolation: a hostile RLO/LRO override inside a snippet (third-party source
+   code) must not visually reorder the SURROUNDING location line — the spoof stays boxed
+   inside its own span. Markup was never affected (text nodes only); this closes the
+   display-spoofing residue. */
+code { font:.85em/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--code-bg); padding:.1em .3em; border-radius:2px; unicode-bidi:isolate; }
 details.drawer { border:1px solid var(--hairline); background:var(--card); margin:.6rem 0; }
 details.drawer > summary { cursor:pointer; padding:.55rem .9rem; font-weight:600; }
 details.drawer > summary .num { color:var(--muted); font-weight:400; }
 details.drawer ol { margin:0; padding:.2rem 1rem .8rem 2.4rem; }
 details.drawer li, .print-drawer li { margin:.45rem 0; font-size:.87rem; }
-.loc { color:var(--muted); }
+.loc { color:var(--muted); unicode-bidi:isolate; }
 .branchnote { color:var(--accent); font-size:.8rem; }
 a { color:var(--accent); }
 button.copy { float:right; margin-top:-2.2rem; font:.72rem system-ui, sans-serif; color:var(--muted); background:none;
@@ -553,6 +569,16 @@ function copyControl(sectionId: string, markdown: string): string {
 }
 
 const mdCell = (value: string): string => value.replaceAll("\\", "\\\\").replaceAll("|", "\\|").replaceAll(/\r?\n/g, " ");
+// Markdown CODE SPAN — dynamic fence, literal content. Code spans are literal in CommonMark, so
+// mdCell's backslash escaping would corrupt them; instead the fence is one backtick longer than
+// the longest run inside (space-padded, the CommonMark rule), so a hostile snippet can never
+// close the span early and smuggle live markdown — e.g. a link — into the copied text.
+const mdCode = (value: string): string => {
+  const flat = value.replace(/\r\n|[\r\n]/g, " ");
+  const longest = flat.match(/`+/g)?.reduce((max, run) => Math.max(max, run.length), 0) ?? 0;
+  const fence = "`".repeat(longest + 1);
+  return `${fence} ${flat} ${fence}`;
+};
 const mdTable = (header: readonly string[], rows: ReadonlyArray<readonly string[]>): string =>
   [`| ${header.map(mdCell).join(" | ")} |`, `| ${header.map(() => "---").join(" | ")} |`, ...rows.map((r) => `| ${r.map(mdCell).join(" | ")} |`)].join("\n");
 
@@ -564,7 +590,11 @@ function execSentence(m: DossierModel): string {
   if (m.headlineSiteCount > 0) {
     const exportCount = m.exportGroups.filter((g) => g.exportName !== "" && g.headlineCount > 0).length;
     const tail = exportCount > 0 ? `concentrated in ${plural(exportCount, "export")}` : "all of it whole-module usage";
-    return `${m.packageName} is imported by ${repos} (${scope}) across ${plural(m.headlineSiteCount, "usage site")}, ${tail}.`;
+    // "imported by" counts only repos with actual import-usage sites; declaration-only and
+    // CLI-only repos surface in the suffix (and in the cards) instead of inflating the claim.
+    const importing = plural(m.headlineImportingRepoCount, "repository", "repositories");
+    const suffix = m.headlineRepos.length > m.headlineImportingRepoCount ? `; declared or used by ${repos} in total` : "";
+    return `${m.packageName} is imported by ${importing} (${scope}) across ${plural(m.headlineSiteCount, "usage site")}, ${tail}${suffix}.`;
   }
   if (m.headlineRepos.length > 0)
     return `${m.packageName} is declared by ${repos} (${scope}); no import usage sites were detected in the scanned slice.`;
@@ -743,15 +773,18 @@ function renderMatrix(m: DossierModel): string {
     m.matrix.overflowedExportCount > 0
       ? `<p class="note">${num(m.matrix.overflowedExportCount)} lower-usage exports are rolled into the "other" column.</p>`
       : "";
-  const scopeNote = `<p class="note">cells count usage sites on ${esc(m.scopeLabel)}; the branches column shows scan coverage, never a multiplier.</p>`;
+  // The branch column derives from usageByRepo (units with findings for THIS package) — the
+  // report has no per-repo scanned-branch data — so the label must claim findings, not scan
+  // coverage (global coverage receipts live in the footer / empty state).
+  const scopeNote = `<p class="note">cells count usage sites on ${esc(m.scopeLabel)}; the branches column counts branches where this package was found, never a multiplier.</p>`;
   return (
     `<section id="matrix" aria-label="Repository by export matrix"><h2>Repository × export matrix</h2>${copyControl("matrix", md)}${scopeNote}` +
-    `<div class="tablewrap"><table><thead><tr><th>repository</th><th class="n">branches scanned</th>${head}</tr></thead><tbody>\n${body}\n</tbody></table></div>${overflowNote}</section>`
+    `<div class="tablewrap"><table><thead><tr><th>repository</th><th class="n">branches with findings</th>${head}</tr></thead><tbody>\n${body}\n</tbody></table></div>${overflowNote}</section>`
   );
 }
 
 function renderSiteRow(g: ExportGroup, s: EvidenceSite, index: number, withIds: boolean): string {
-  const idAttr = withIds ? ` id="e-${esc(g.slug)}-${esc(String(index + 1))}"` : "";
+  const idAttr = withIds ? ` id="e-${esc(g.slug)}.${esc(String(index + 1))}"` : "";
   const branchNote = s.fromHeadline
     ? s.alsoOn.length > 0
       ? ` <span class="branchnote">also on: ${esc(s.alsoOn.join(", "))}</span>`
@@ -779,7 +812,7 @@ function renderEvidence(m: DossierModel): string {
       const printRows = shown.map((s, i) => renderSiteRow(g, s, i, false)).join("\n");
       mdParts.push(
         `### ${mdCell(g.label)} — ${plural(g.headlineCount, "usage site")} (${m.scopeLabel}), ${g.totalCount} total`,
-        ...shown.map((s) => `- \`${mdCell(s.snippet)}\` — ${mdCell(s.repo)} ${mdCell(s.file)}:${s.line} @ ${s.shortSha} — ${mdCell(s.permalink)}`),
+        ...shown.map((s) => `- ${mdCode(s.snippet)} — ${mdCell(s.repo)} ${mdCell(s.file)}:${s.line} @ ${s.shortSha} — ${mdCell(s.permalink)}`),
         ...(g.sites.length > EVIDENCE_CAP ? [`- … showing ${EVIDENCE_CAP} of ${g.sites.length} evidence rows`] : []),
       );
       return (

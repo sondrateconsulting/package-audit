@@ -43,7 +43,9 @@ const OPTS = { formatVersion: 1 };
 // sha256 of the rendered fixture index. SANCTIONED-CHANGE RULE: this pin may only change in a
 // commit that bumps the report-format version (XRAY_FORMAT_VERSION) — any other diff is an
 // unintended output change and must be treated as a regression, not re-pinned.
-const GOLDEN_INDEX_SHA256 = "e52d77254e9c37747355132c6b1b36cabcbfeff88ae42df3e4e333190f96c5da";
+// PRE-LAUNCH RE-PIN (2026-07-11, sanctioned): the index shares the dossier page CSS — the codex
+// re-pass bidi-isolation rule moved these bytes. Same sanction rule as reportHtml.test.ts.
+const GOLDEN_INDEX_SHA256 = "2a2b58f328f530f1ece021235edfb5bdac949c6b6994315d56e32df399508c26";
 
 describe("renderIndex", () => {
   const report = fixtureReport();

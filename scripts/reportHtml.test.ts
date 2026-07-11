@@ -23,6 +23,22 @@ import {
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
 
+// Extract a copy-as-markdown mirror's text (the templates hold escaped text; the copy handler
+// reads it back through textContent, which is exactly this unescape).
+const templateMd = (html: string, id: string): string => {
+  const open = `<template id="${id}-md">`;
+  const start = html.indexOf(open);
+  const end = html.indexOf("</template>", start);
+  if (start === -1 || end === -1) throw new Error(`template ${id}-md not found`);
+  return html
+    .slice(start + open.length, end)
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll("&amp;", "&");
+};
+
 // Fixed timestamps so DB-built fixtures render byte-identically run after run (goldens below).
 const T0 = "2026-01-01T00:00:00.000Z";
 
@@ -106,8 +122,12 @@ const syntheticPkg = (units: DossierUnit[], over: Partial<DossierPackage> = {}):
 // sha256 of the rendered fixture dossier. SANCTIONED-CHANGE RULE: these pins may only change in a
 // commit that bumps the report-format version (XRAY_FORMAT_VERSION) — any other diff here is an
 // unintended output change and must be treated as a regression, not re-pinned.
-const GOLDEN_DOSSIER_SHA256 = "465a2c56f023265663bb64165ae0e4a4f98e8894bbd579141e13c98767a31f25";
-const GOLDEN_EMPTY_SHA256 = "34d9325fc856590d161af83f8a8920b9f91c85b5287439d10ef306b2ed83c40b";
+// PRE-LAUNCH RE-PIN (2026-07-11, sanctioned): codex re-pass fixes — exec-sentence importing-repo
+// count, matrix branch-column relabel, versions-card semver restriction, row-id separator '.',
+// markdown code-span fencing, bidi isolation CSS. Absorbed without a formatVersion bump under the
+// pre-public-launch rule; post-launch output changes require bumping XRAY_FORMAT_VERSION.
+const GOLDEN_DOSSIER_SHA256 = "d6ce7271347bd52240e8a5e7bfa0393aca0cb061c3fd14738818738cafbde23f";
+const GOLDEN_EMPTY_SHA256 = "0b5f954d9d70c5be81410be4cff3fd6a851982b8153712bd4f7d0ecc359c9eb4";
 
 describe("renderDossier — determinism and golden bytes", () => {
   test("double-render byte equality (same DB, two builds, two renders)", () => {
@@ -174,18 +194,18 @@ describe("renderDossier — content contract on the real report object", () => {
     expect(html).toContain("<code>abc123d</code>"); // short SHA
   });
 
-  test("anchor grammar: drawer and row ids follow e-<slug>[-<n>]", () => {
+  test("anchor grammar: drawer and row ids follow e-<slug>[.<n>]", () => {
     expect(html).toContain('id="e-registerrootcomponent"');
-    expect(html).toContain('id="e-registerrootcomponent-1"');
-    expect(html).toContain('id="e-registerrootcomponent-2"');
+    expect(html).toContain('id="e-registerrootcomponent.1"');
+    expect(html).toContain('id="e-registerrootcomponent.2"');
     expect(html).toContain('id="e-whole-module"');
-    expect(html).toContain('id="e-whole-module-1"');
+    expect(html).toContain('id="e-whole-module.1"');
   });
 
   test("print drawers: evidence rows are duplicated into id-free print-only blocks", () => {
     expect(html).toContain('<div class="print-drawer">');
     // ids exist exactly once (screen copy only) — the print copy must not duplicate anchors
-    expect(html.split('id="e-registerrootcomponent-1"').length - 1).toBe(1);
+    expect(html.split('id="e-registerrootcomponent.1"').length - 1).toBe(1);
     // but the evidence snippet appears twice: once in the drawer, once in the print block
     const snippet = "import { registerRootComponent } from &#39;expo&#39;;";
     expect(html.split(snippet).length - 1).toBeGreaterThanOrEqual(2);
@@ -438,7 +458,7 @@ describe("repo × export matrix — overflow and cells", () => {
     expect(m.matrix.columns.some((c) => c.label.startsWith("other ("))).toBe(false);
   });
 
-  test("cells: zero renders as a quiet dot, never 0; branch count is coverage, not a multiplier", () => {
+  test("cells: zero renders as a quiet dot, never 0; branch count is branches-with-findings, not a multiplier", () => {
     const pkg = syntheticPkg([
       syntheticUnit({ apiUsage: [syntheticUsage("a", "src/a.ts", 1)] }),
       syntheticUnit({ branch: "dev", isDefaultBranch: false }),
@@ -446,7 +466,7 @@ describe("repo × export matrix — overflow and cells", () => {
     ]);
     const html = renderDossier(pkg, FIXED_CTX);
     expect(html).toContain('<td class="dot">·</td>');
-    expect(html).toContain("the branches column shows scan coverage, never a multiplier");
+    expect(html).toContain("the branches column counts branches where this package was found, never a multiplier");
     const m = computeDossierModel(pkg);
     expect(m.matrix.rows.find((r) => r.repo === "o/r")!.branchCount).toBe(2);
     expect(m.matrix.rows.find((r) => r.repo === "o/r")!.cells).toEqual([1, 0]);
@@ -454,13 +474,13 @@ describe("repo × export matrix — overflow and cells", () => {
 });
 
 describe("evidence wall — cap, honest totals, anchor stability", () => {
-  test("30 sites → 25 shown with the honest 'showing 25 of 30' line; ids stop at -25", () => {
+  test("30 sites → 25 shown with the honest 'showing 25 of 30' line; ids stop at .25", () => {
     const rows = [];
     for (let i = 1; i <= 30; i++) rows.push(syntheticUsage("hot", `src/f${String(i).padStart(2, "0")}.ts`, i));
     const html = renderDossier(syntheticPkg([syntheticUnit({ apiUsage: rows })]), FIXED_CTX);
     expect(html).toContain(`showing ${EVIDENCE_CAP} of 30 evidence rows`);
-    expect(html).toContain('id="e-hot-25"');
-    expect(html).not.toContain('id="e-hot-26"');
+    expect(html).toContain('id="e-hot.25"');
+    expect(html).not.toContain('id="e-hot.26"');
     expect(html).toContain("30 total across branches"); // honest drawer total
   });
 
@@ -494,8 +514,8 @@ describe("evidence wall — cap, honest totals, anchor stability", () => {
     const html = renderDossier(pkg, FIXED_CTX);
     expect(html).toContain('id="e-foo"');
     expect(html).toContain('id="e-foo~2"');
-    expect(html).toContain('id="e-foo-1"');
-    expect(html).toContain('id="e-foo~2-1"');
+    expect(html).toContain('id="e-foo.1"');
+    expect(html).toContain('id="e-foo~2.1"');
   });
 
   test("anchor grammar is stable across renders (deep links keep working)", () => {
@@ -530,4 +550,93 @@ describe("chaos fixture (CV9): 10k usage sites", () => {
     expect(Buffer.byteLength(html, "utf8")).toBeLessThan(15 * 1024 * 1024);
     expect(html).toContain("10000 usage sites"); // exec sentence carries the honest headline count
   });
+});
+
+// ---- codex re-pass regressions (2026-07-11) ------------------------------------------------------
+// One test per confirmed finding from the post-rebase codex comprehensive pass over
+// fae5435..5b91a03; each pins the corrected behavior so the defect cannot silently return.
+describe("codex re-pass regressions", () => {
+  test("exec sentence: declaration-only and CLI-only repos are not counted as importing (F1)", () => {
+    const units = [
+      syntheticUnit({ repository: "importer", apiUsage: [syntheticUsage("foo", "src/a.ts", 1)] }),
+      syntheticUnit({ repository: "decl-only", declarations: [{ resolvedVersion: "1.0.0" }] }),
+      syntheticUnit({
+        repository: "cli-only",
+        cliUsage: [{ file: "package.json", line: 1, context: "scripts.x", permalink: "https://github.com/o/r/blob/abc123def4567/package.json#L1", snippet: '"x": "pkg"' }],
+      }),
+    ];
+    const html = renderDossier(syntheticPkg(units, { versionsSeen: ["1.0.0"] }), FIXED_CTX);
+    expect(html).toContain("pkg is imported by 1 repository");
+    expect(html).toContain("declared or used by 3 repositories");
+  });
+
+  test("exec sentence: no declared-or-used suffix when every counted repo imports (F1)", () => {
+    const units = [syntheticUnit({ apiUsage: [syntheticUsage("foo", "src/a.ts", 1)] })];
+    const html = renderDossier(syntheticPkg(units), FIXED_CTX);
+    expect(html).toContain("pkg is imported by 1 repository");
+    expect(html).not.toContain("declared or used by");
+  });
+
+  test("matrix: branch column claims branches with findings, not scan coverage (F2)", () => {
+    const units = [
+      syntheticUnit({ apiUsage: [syntheticUsage("foo", "src/a.ts", 1)] }),
+      syntheticUnit({ branch: "dev", isDefaultBranch: false, commitSha: "def456abc7890", apiUsage: [syntheticUsage("foo", "src/a.ts", 1)] }),
+    ];
+    const html = renderDossier(syntheticPkg(units), FIXED_CTX);
+    expect(html).toContain("branches with findings</th>");
+    expect(html).not.toContain("branches scanned</th>");
+    expect(html).toContain("the branches column counts branches where this package was found, never a multiplier");
+  });
+
+  test("versions card: non-semver resolutions cannot inflate the headline count (F3)", () => {
+    const units = [
+      syntheticUnit({
+        declarations: [{ resolvedVersion: "git+https://github.com/o/dep#abc123" }],
+        apiUsage: [syntheticUsage("foo", "src/a.ts", 1)],
+      }),
+    ];
+    const m = computeDossierModel(syntheticPkg(units)); // versionsSeen: [] — the git ref is not a version
+    expect(m.headlineVersions).toEqual([]);
+    expect(m.otherOnlyVersions).toEqual([]);
+    const html = renderDossier(syntheticPkg(units), FIXED_CTX);
+    expect(html).toContain("no resolved versions in this run&#39;s slice");
+  });
+
+  test("anchor grammar: export names foo and foo_1 produce globally unique ids (F4)", () => {
+    const units = [
+      syntheticUnit({
+        apiUsage: [syntheticUsage("foo", "src/a.ts", 1), syntheticUsage("foo", "src/b.ts", 2), syntheticUsage("foo_1", "src/c.ts", 3)],
+      }),
+    ];
+    const html = renderDossier(syntheticPkg(units), FIXED_CTX);
+    const ids = [...html.matchAll(/ id="([^"]+)"/g)].map((match) => match[1]);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(html).toContain('id="e-foo-1"'); // the foo_1 drawer keeps its natural slug
+    expect(html).toContain('id="e-foo.1"'); // foo's first evidence row — '.' is outside the slug alphabet
+  });
+
+  test("copy-as-markdown: backticked snippets stay inside code spans (F11)", () => {
+    const hostile = "const q = `[click](https://evil.example)`;";
+    const units = [syntheticUnit({ apiUsage: [{ ...syntheticUsage("foo", "src/a.ts", 1), snippet: hostile }] })];
+    const md = templateMd(renderDossier(syntheticPkg(units), FIXED_CTX), "evidence");
+    expect(md).toContain("`` const q = `[click](https://evil.example)`; ``");
+    expect(md).not.toContain("- `const q");
+  });
+
+  test("copy-as-markdown: backslashes in snippets stay literal inside code spans (F11)", () => {
+    const units = [syntheticUnit({ apiUsage: [{ ...syntheticUsage("foo", "src/a.ts", 1), snippet: "require('.\\win\\path')" }] })];
+    const md = templateMd(renderDossier(syntheticPkg(units), FIXED_CTX), "evidence");
+    expect(md).toContain("require('.\\win\\path')"); // code spans are literal — no backslash doubling
+  });
+});
+
+// The bidi guard is CSS (visual isolation, not markup safety — markup was always inert): pin the
+// rules so a stylesheet refactor cannot silently drop them and reopen the display-spoofing vector
+// (a hostile U+202E in a snippet visually reordering the rest of its evidence row's location line).
+test("bidi isolation: code and .loc carry unicode-bidi:isolate", () => {
+  const [pkg] = fixturePackages();
+  const html = renderDossier(pkg!, FIXED_CTX);
+  expect(html).toContain("unicode-bidi:isolate");
+  expect(html).toMatch(/code \{[^}]*unicode-bidi:isolate/);
+  expect(html).toMatch(/\.loc \{[^}]*unicode-bidi:isolate/);
 });
