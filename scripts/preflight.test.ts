@@ -1,5 +1,7 @@
 import { expect, test, describe } from "bun:test";
-import { parseVersion, meetsMinimum, detectTarFlavor, hasReadOrgScope } from "./preflight.ts";
+import { parseVersion, meetsMinimum, detectTarFlavor, hasReadOrgScope, runPreflight } from "./preflight.ts";
+import type { GithubClient } from "./github.ts";
+import type { Config } from "./config.ts";
 
 describe("parseVersion", () => {
   test("extracts the first dotted tuple", () => {
@@ -45,4 +47,42 @@ describe("hasReadOrgScope", () => {
     expect(hasReadOrgScope("repo, gist")).toBe(false);
     expect(hasReadOrgScope("")).toBe(false);
   });
+});
+
+describe("runPreflight registry probe deadline (§5.E hardening)", () => {
+  // every prior test injects deps.fetchImpl, which bypasses the DEFAULT fetch closure — the
+  // one carrying the AbortSignal.timeout deadline. This exercises the real closure against a
+  // wedged registry (a fetch that never responds, only rejecting when the signal aborts).
+  const stubClient = {
+    gh: async () => ({ exitCode: 0, stdout: "gh version 2.95.0", stderr: "" }),
+    git: async () => ({ exitCode: 0, stdout: "git version 2.45.1", stderr: "" }),
+    tar: async () => ({ exitCode: 0, stdout: "bsdtar 3.5.3 - libarchive 3.7.4", stderr: "" }),
+    restGet: async () => ({ body: JSON.stringify({ login: "u" }), headers: {} }),
+    rateLimit: async () => ({ resources: { core: { remaining: 100 }, graphql: { remaining: 100 } } }),
+  } as unknown as GithubClient;
+  const config = {
+    githubHost: "github.com", organizations: ["org-a"],
+    packages: [{ name: "expo", registryUrl: "https://registry.example.com", registryAuthEnvVar: null }],
+  } as unknown as Config;
+
+  // the tsconfig lib is ESNext-only, so the platform AbortSignal type is memberless here —
+  // a minimal structural shape gives the stub the two members it needs.
+  interface AbortSignalLike {
+    addEventListener(type: "abort", cb: () => void): void;
+    reason?: unknown;
+  }
+
+  test("the default fetch closure aborts a hung registry probe at the deadline", async () => {
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = ((_url: string, init?: { signal?: AbortSignalLike }) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+      })) as unknown as typeof fetch;
+    try {
+      await expect(runPreflight(stubClient, config, { registryFetchTimeoutMs: 10 }))
+        .rejects.toThrow(/registry .* unreachable/);
+    } finally {
+      globalThis.fetch = prevFetch;
+    }
+  }, 2_000);
 });

@@ -535,10 +535,15 @@ semaphore (not just per-level). The wrapper reads the relevant response headers
 (`x-ratelimit-remaining`/`x-ratelimit-reset`/`Retry-After`/`x-github-sso`) via `gh api -i`
 (as §2.3/§3 already do). Two distinct retryable throttles, handled the same way (the
 wrapper WAITS through the computed window and RETRIES the request IN PLACE, up to its
-attempt budget; only when that budget is exhausted does `ThrottleExhausted` escape —
-a mid-scan escape marks that unit `error` and the NEXT invocation retries it, because
-the §3 skip predicate only skips units that are `done` at the current head; there is
-no mid-run re-queue) but with different wait computations:
+attempt budget; `ThrottleExhausted` escapes only when that budget is exhausted, or
+earlier when the client-lifetime cumulative pause budget would be exceeded — the
+orchestrator treats an escape as TRANSIENT: a mid-scan escape (discovery or content
+fetch) resets that unit to `pending` with no errors row and the NEXT invocation retries
+it (the §3 skip predicate only skips units that are `done` at the current head; there
+is no mid-run re-queue), a repo/branch discovery escape logs a JSONL requeue event
+only, and an owner-resolution escape ends the run cleanly without starting one; --plan,
+which has no DB, counts a repo/branch discovery escape into its failure totals while a
+plan-mode owner-discovery escape stays fatal) but with different wait computations:
   - PRIMARY limit exhaustion: 403 OR 429 with `x-ratelimit-remaining: 0`; wait until the
     `x-ratelimit-reset` EPOCH timestamp (this branch is keyed on remaining==0, NOT on the
     status code, so a 429 with remaining==0 is primary, not secondary).

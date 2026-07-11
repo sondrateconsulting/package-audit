@@ -29,16 +29,23 @@ export class GithubApiError extends Error {
   }
 }
 // Retryable throttle that outlived the wrapper's internal wait+retry budget (§4). The wrapper
-// already slept through every window it was told about, so the orchestrator does NOT re-queue
-// in-run: a mid-scan exhaustion marks that unit `error` (retried by the NEXT invocation — the
-// §3 skip predicate only skips current `done` units); a discovery-time exhaustion is recorded
-// fail-soft as a discovery error row + JSONL event; and an owner-resolution exhaustion aborts
-// the run as an operator-rendered fatal (cliErrors.ts) — the remediation is time, then re-run.
+// either slept through every window it was told about (attempt budget exhausted) or refused
+// to start a sleep that would blow the client-lifetime cumulative pause budget (early escape
+// from waitBucket). Either way the orchestrator treats it as TRANSIENT and defers to the
+// NEXT invocation instead of recording a permanent failure:
+// a mid-scan exhaustion resets that unit to `pending` with NO errors row (the §3 skip
+// predicate only skips `done` units, so a later run retries it); a repo/branch discovery
+// exhaustion logs a JSONL requeue event only (discovery re-runs every invocation anyway);
+// and an owner-resolution exhaustion ends the run cleanly WITHOUT starting one (no phantom
+// run row). --plan, which has no DB, instead counts a repo/branch discovery escape into its
+// failure totals (a plan-mode OWNER-discovery escape stays fatal — plan mode has nothing to
+// requeue into). Only NON-throttle errors at those sites are recorded or fatal — the
+// remediation here is time, then re-run.
 export class ThrottleExhausted extends Error {
   readonly endpoint: string;
   constructor(endpoint: string) {
     super(
-      `rate-limit throttling persisted beyond retries for ${endpoint} — wait for the rate-limit window to reset, then re-run; a resumed run skips already-completed units`,
+      `rate-limit throttling persisted beyond the retry/pause budget for ${endpoint} — wait for the rate-limit window to reset, then re-run; a resumed run skips already-completed units`,
     );
     this.name = "ThrottleExhausted";
     this.endpoint = endpoint;
@@ -75,7 +82,8 @@ export const SPAWN_KILL_GRACE_MS = 2_000;
 
 // structural (not the DOM/Bun-specific reader): the Bun subprocess reader is a superset, so a
 // minimal read/cancel shape accepts it without dragging in lib.dom's incompatible declaration.
-interface StreamReader {
+// EXPORTED (with readCapped) for the byte-cap unit tests; realSpawn is the only runtime caller.
+export interface StreamReader {
   read(): Promise<{ done?: boolean; value?: Uint8Array }>;
   cancel(reason?: unknown): Promise<void>;
 }
@@ -83,7 +91,7 @@ interface StreamReader {
 // Stream-read with a BYTE cap enforced per chunk — the process is killed the moment the cap
 // is crossed, so an oversized response can never be fully buffered first. Takes the READER
 // (not the stream) so the kill-escalation path can cancel it from outside.
-async function readCapped(reader: StreamReader, cap: number, onExceed: () => void): Promise<string> {
+export async function readCapped(reader: StreamReader, cap: number, onExceed: () => void): Promise<string> {
   const chunks: Uint8Array[] = [];
   let total = 0;
   for (;;) {
@@ -101,51 +109,86 @@ async function readCapped(reader: StreamReader, cap: number, onExceed: () => voi
   return Buffer.concat(chunks).toString("utf8");
 }
 
-const realSpawn: SpawnFn = async (bin, args, opts) => {
-  const proc = Bun.spawn({
-    cmd: [bin, ...args],
-    env: opts.env,
-    cwd: opts.cwd,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const outReader = proc.stdout.getReader();
-  const errReader = proc.stderr.getReader();
-  const kill = (): void => {
-    try {
-      proc.kill();
-    } catch {
-      // already exited
-    }
-    // Escalation fires UNCONDITIONALLY after the grace (all steps are no-ops on a clean
-    // exit): SIGKILL cannot be trapped, and cancelling the readers unblocks readCapped even
-    // when a surviving grandchild still holds the inherited pipes open.
-    const escalate = setTimeout(() => {
+// Factory so the byte cap is injectable for tests (shipping 110MB through a real child to
+// exercise the cap would be pure test tax); realSpawn — the production SpawnFn — is
+// makeRealSpawn(MAX_SPAWN_OUTPUT_BYTES).
+export function makeRealSpawn(cap: number): SpawnFn {
+  return async (bin, args, opts) => {
+    const proc = Bun.spawn({
+      cmd: [bin, ...args],
+      env: opts.env,
+      cwd: opts.cwd,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const outReader = proc.stdout.getReader();
+    const errReader = proc.stderr.getReader();
+    const kill = (): void => {
       try {
-        proc.kill(9); // SIGKILL
+        proc.kill();
       } catch {
         // already exited
       }
-      try {
-        process.kill(-proc.pid, 9); // group kill, when the child leads a group
-      } catch {
-        // not a group leader / already gone
-      }
-      outReader.cancel().catch(() => {});
-      errReader.cancel().catch(() => {});
-      proc.unref();
-    }, SPAWN_KILL_GRACE_MS);
-    escalate.unref?.();
+      // Escalation fires UNCONDITIONALLY after the grace (all steps are no-ops on a clean
+      // exit): SIGKILL cannot be trapped, and cancelling the readers unblocks readCapped even
+      // when a surviving grandchild still holds the inherited pipes open.
+      const escalate = setTimeout(() => {
+        try {
+          proc.kill(9); // SIGKILL
+        } catch {
+          // already exited
+        }
+        try {
+          process.kill(-proc.pid, 9); // group kill, when the child leads a group
+        } catch {
+          // not a group leader / already gone
+        }
+        outReader.cancel().catch(() => {});
+        errReader.cancel().catch(() => {});
+        proc.unref();
+      }, SPAWN_KILL_GRACE_MS);
+      escalate.unref?.();
+    };
+    opts.signal?.onAbort(kill);
+    return joinSpawnOutcome(
+      readCapped(outReader, cap, kill),
+      readCapped(errReader, cap, kill),
+      proc.exited,
+    );
   };
-  opts.signal?.onAbort(kill);
-  const [stdout, stderr, exitCode] = await Promise.all([
-    readCapped(outReader, MAX_SPAWN_OUTPUT_BYTES, kill),
-    readCapped(errReader, MAX_SPAWN_OUTPUT_BYTES, kill),
-    proc.exited,
-  ]);
+}
+
+// Merge the two reader outcomes with the child's exit — NOT fail-fast: a byte-cap rejection
+// fires kill() while the child is still dying, and callers treat the spawn promise's
+// settlement as "the child is gone" (they may delete its working directory immediately).
+// Capture the TEMPORALLY FIRST reader error as it lands (a later, secondary failure must not
+// replace the original diagnostic), hold every outcome until the exit promise has resolved,
+// THEN rethrow it. NOTE the direct child's exit is the strongest guarantee available: a
+// descendant that survives the best-effort group kill could in principle still write
+// afterwards — that residue is the startup sweep's job. EXPORTED for tests: deterministic
+// two-failure ordering needs injected promises (a real child cannot produce two
+// distinguishable reader errors on demand).
+export async function joinSpawnOutcome(
+  stdoutP: Promise<string>,
+  stderrP: Promise<string>,
+  exited: Promise<number>,
+): Promise<SpawnResult> {
+  let firstErr: unknown;
+  let failed = false;
+  const capture = (p: Promise<string>): Promise<string> =>
+    p.catch((e: unknown) => {
+      if (!failed) {
+        failed = true;
+        firstErr = e;
+      }
+      return "";
+    });
+  const [stdout, stderr, exitCode] = await Promise.all([capture(stdoutP), capture(stderrP), exited]);
+  if (failed) throw firstErr;
   return { exitCode, stdout, stderr };
-};
+}
+const realSpawn: SpawnFn = makeRealSpawn(MAX_SPAWN_OUTPUT_BYTES);
 
 // ---- sanitized env (allowlist construction — dropped vars are simply never copied) --------
 type Env = Record<string, string | undefined>;
@@ -650,8 +693,15 @@ export class GithubClient {
   // Race a spawn against the wall-clock deadline. A REAL timer (never the injectable fake
   // clock — sleepImpl would resolve instantly under tests and expire every spawn) aborts the
   // signal, so the impl kills the child, and yields an EMPTY-stdout nonzero result that the
-  // callers' existing no-HTTP-response transient path retries under MAX_ATTEMPTS. The loser
-  // promise gets a no-op catch so a late rejection (e.g. the byte cap) is never unhandled.
+  // callers' existing no-HTTP-response transient path retries under MAX_ATTEMPTS. After the
+  // deadline fires, the return additionally WAITS for the spawned promise to settle — callers
+  // (cloneShallow, introspectVersion) delete the child's working directory the moment this
+  // returns, and a SIGTERMed-but-not-yet-dead child could still be writing into that tree.
+  // The wait is BOUNDED by the kill-escalation grace + margin so an impl that never settles
+  // (or a wedged kill) cannot convert the deadline into a hang — on a timeout the caller's
+  // semaphore slot is held up to that long extra, the deliberate price of race-free cleanup.
+  // The loser promise gets a no-op catch so a late rejection (e.g. the byte cap) is never
+  // unhandled.
   private async spawnBounded(
     bin: string,
     args: string[],
@@ -664,22 +714,37 @@ export class GithubClient {
       onAbort(cb) { if (aborted) cb(); else killers.push(cb); },
     };
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<SpawnResult>((resolve) => {
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    // Both the deadline and the settle-fallback timers stay REF'D: they are actively
+    // awaited, and by the settle-wait the escalation may have unref'd every other handle —
+    // an unref'd awaited timer would let a standalone CLI process drain its event loop and
+    // exit MID-AWAIT, skipping the caller's cleanup and the run's report finalization.
+    // Neither can leak: both are cleared in the finally below.
+    const deadline = new Promise<void>((resolve) => {
       timer = setTimeout(() => {
+        timedOut = true;
         aborted = true;
         for (const kill of killers) kill();
-        resolve({ exitCode: 124, stdout: "", stderr: `spawn timed out after ${this.spawnTimeoutMs}ms: ${bin}` });
+        resolve();
       }, this.spawnTimeoutMs);
-      // a pending deadline must never pin the event loop by itself (a real child's handle
-      // already holds it open while the race is live) — so a leaked timer stays harmless.
-      timer.unref?.();
     });
     try {
       const spawned = this.spawn(bin, args, { ...opts, signal });
       spawned.catch(() => {});
-      return await Promise.race([spawned, deadline]);
+      const settled = spawned.then(() => undefined, () => undefined);
+      await Promise.race([settled, deadline]);
+      // the flag (not race order) decides: a kill that settles the spawn in the same tick as
+      // the deadline must still be reported as a timeout, not as the child's own exit.
+      if (!timedOut) return spawned;
+      const gaveUp = new Promise<void>((resolve) => {
+        settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
+      });
+      await Promise.race([settled, gaveUp]);
+      return { exitCode: 124, stdout: "", stderr: `spawn timed out after ${this.spawnTimeoutMs}ms: ${bin}` };
     } finally {
       clearTimeout(timer);
+      clearTimeout(settleTimer);
     }
   }
 
@@ -1117,8 +1182,14 @@ export class GithubClient {
       return { dir: dest, headSha: rev.stdout.trim() };
     } catch (e) {
       // a failed/timed-out clone can leave a multi-GB partial tree — reclaim it NOW rather
-      // than at the next run's startup sweep (the caller only cleans up on success).
-      rmSync(runDir, { recursive: true, force: true });
+      // than at the next run's startup sweep (the caller only cleans up on success). The
+      // cleanup is BEST-EFFORT: force only suppresses ENOENT, and an EACCES/EBUSY here must
+      // not replace the actionable git error (a stuck tree is the next sweep's problem).
+      try {
+        rmSync(runDir, { recursive: true, force: true });
+      } catch {
+        // the original error propagates below
+      }
       throw e;
     }
   }

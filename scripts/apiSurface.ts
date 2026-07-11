@@ -426,7 +426,14 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
       // atomic surface + '__complete__' marker (durable success record, even for zero rows)
       db.writeApiSurface({ packageName, version, versionSource, rows: surface.rows });
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      // BEST-EFFORT: a throw here would REPLACE the primary error (finally-throw semantics),
+      // recording a useless fs error instead of the extraction/inspection failure. A stuck
+      // tree is reclaimed by the next run's startup sweep.
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // the primary outcome (success or the original error) wins
+      }
     }
   } catch (e) {
     // per-version REGISTRY failure → version-keyed errors row (§5.E/§8) + the live JSONL event

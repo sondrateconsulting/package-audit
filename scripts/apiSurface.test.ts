@@ -10,7 +10,7 @@ import {
 } from "./apiSurface.ts";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync, linkSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 // ---- pure helpers ---------------------------------------------------------------------------
 describe("assertExtractedTreeSafe — post-extraction ground-truth sweep", () => {
@@ -492,6 +492,42 @@ describe("introspectVersion — integration (real system tar)", () => {
     expect(ev?.["version"]).toBe("1.0.0");
     expect(String(ev?.["error"])).toContain("integrity");
     db.close();
+  });
+
+  test("a temp-dir cleanup failure never masks the original extraction error", async () => {
+    // rmSync's force only suppresses ENOENT — an EACCES from the cleanup walk must not
+    // replace the actionable extraction error in the recorded errors row (finally-throw
+    // semantics would otherwise swallow the primary error).
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const tgz = buildTgz([{ name: "package.json", content: `{"name":"expo"}` }]);
+    const packument = JSON.stringify({
+      versions: { "1.0.0": { dist: { tarball: "https://registry.example.com/expo/-/expo-1.0.0.tgz", integrity: `sha512-${createHash("sha512").update(tgz).digest("base64")}` } } },
+    });
+    const runId = seedRun(db);
+    const { fetchImpl } = mockRegistry(packument, tgz);
+    let runDir = "";
+    const spawnImpl = async (_bin: string, args: string[]) => {
+      const extractRoot = args[args.indexOf("-C") + 1]!;
+      runDir = dirname(extractRoot);
+      chmodSync(runDir, 0o555); // cleanup cannot unlink pkg.tgz → rmSync throws EACCES
+      return { exitCode: 2, stdout: "", stderr: "ORIGINAL_TAR_FAILURE" };
+    };
+    const client = new GithubClient({ githubHost: "github.com", tempRoot: TMP, spawnImpl });
+    try {
+      await introspectVersion({
+        client, db, runId, packageName: "expo", registryUrl: "https://registry.example.com",
+        registryAuthEnvVar: null, version: "1.0.0", versionSource: "lockfile", fetchImpl,
+      });
+      const err = db.read(`SELECT message FROM errors WHERE run_id='${runId}'`).get() as { message: string };
+      expect(err.message).toContain("tar extraction failed");
+      expect(err.message).toContain("ORIGINAL_TAR_FAILURE");
+    } finally {
+      if (runDir !== "") {
+        chmodSync(runDir, 0o755);
+        rmSync(runDir, { recursive: true, force: true }); // don't leak the blocked tree into TMP
+      }
+      db.close();
+    }
   });
 
   test("an off-origin tarball URL is rejected as an error", async () => {

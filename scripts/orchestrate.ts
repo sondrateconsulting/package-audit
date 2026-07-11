@@ -27,13 +27,17 @@ import { logLine } from "./log.ts";
 
 // ---- per-unit read helpers ------------------------------------------------------------------
 // API reader: SHA-pinned raw fetch (≤100MB) for blob entries; non-blobs (submodule/symlink) and
-// failures return null. SHA-pinned reads are served from api_cache with zero network on re-read.
+// ordinary per-file failures return null (file treated as absent). A ThrottleExhausted RETHROWS:
+// the unit was never fully read, so it must reach processRepo's requeue catch (§4) — degrading
+// it to null would mark a partially-read head `done` and the §3 skip predicate would skip it
+// forever. SHA-pinned reads are served from api_cache with zero network on re-read.
 function apiReader(client: GithubClient, org: string, repo: string, commitSha: string) {
   return async (path: string, entry: TreeEntry): Promise<string | null> => {
     if (entry.type !== "blob") return null;
     try {
       return await client.fetchFileRaw(org, repo, path, commitSha);
-    } catch {
+    } catch (e) {
+      if (e instanceof ThrottleExhausted) throw e;
       return null;
     }
   };
@@ -117,7 +121,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories });
 
   try {
-    await runScan(db, client, config, configHash, args, trackedNames, preflight.githubLogin);
+    await runScan(db, client, config, configHash, args, preflight.githubLogin);
   } finally {
     db.close();
   }
@@ -146,7 +150,7 @@ export function runSummaryText(runId: string, s: ReportSummary, errorCount: numb
 // starting a run — is pinned here (a run started on throttle would leave a phantom run row).
 export async function runScan(
   db: AuditDb, client: GithubClient, config: Config, configHash: string,
-  args: OrchestrateArgs, trackedNames: string[], personalLogin: string | null,
+  args: OrchestrateArgs, personalLogin: string | null,
 ): Promise<void> {
   // §0 startup: sweep stale temp dirs from a prior crash.
   client.sweepStaleTempDirs();
@@ -160,6 +164,11 @@ export async function runScan(
     return; // clean exit; the caller closes the db. No run started, nothing to report.
   }
   const { owners, source } = resolved;
+
+  // tracked names derive from config.packages EVERYWHERE (run metadata here, the §5.E
+  // reconciliation slice inside reconcileIntrospection) — a separately-passed list could
+  // drift from the config that supplies each package's registry coordinates.
+  const trackedNames = config.packages.map((p) => p.name);
 
   // §3 run lifecycle: start or resume.
   const { runId, resumed } = db.startRun({
@@ -190,7 +199,7 @@ export async function runScan(
   }
 
   // §5.E introspection reconciliation over the run's reportable slice.
-  await reconcileIntrospection(db, client, config, runId, trackedNames);
+  await reconcileIntrospection(db, client, config, runId);
 
   // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at).
   db.completeRun(runId);
@@ -464,8 +473,11 @@ interface SliceRow {
 }
 
 // Exported for the introspection-observability tests (scripted client + real in-memory DB);
-// main() is its only runtime caller.
-export async function reconcileIntrospection(db: AuditDb, client: GithubClient, config: Config, runId: string, trackedNames: string[]): Promise<void> {
+// runScan is its only runtime caller. The slice filter derives from config.packages — the
+// single source of truth for registry coordinates — so a stale dependency row for a package
+// no longer in the config is simply never selected (it cannot reach the pkgConfig lookups).
+export async function reconcileIntrospection(db: AuditDb, client: GithubClient, config: Config, runId: string): Promise<void> {
+  const trackedNames = config.packages.map((p) => p.name);
   const rows = db
     .read(
       `SELECT df.organization, df.repository, df.branch, df.commit_sha, df.package_name,

@@ -342,7 +342,7 @@ describe("introspection-failure observability (fail-soft, README log vocabulary)
     globalThis.fetch = failingFetch;
     try {
       const events = await captureJsonl(async () => {
-        await reconcileIntrospection(db, client, testConfig(root), runId, ["expo"]); // must not throw
+        await reconcileIntrospection(db, client, testConfig(root), runId); // must not throw
       });
       const ev = events.find((e) => e["event"] === "introspection");
       expect(ev).toBeDefined();
@@ -351,6 +351,37 @@ describe("introspection-failure observability (fail-soft, README log vocabulary)
       const row = db.read(`SELECT scope, package_name, message FROM errors WHERE run_id = ?`).get(runId) as { scope: string; package_name: string; message: string };
       expect(row.scope).toBe("introspection");
       expect(row.message).toContain("packument fetch failed");
+    } finally {
+      globalThis.fetch = prevFetch;
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a scanned dependency row for a package absent from config.packages is ignored (no crash, no fetch)", async () => {
+    // reconciliation's slice must derive from config.packages (the single source of truth for
+    // registry coordinates) — a stale row from a prior run's different config must be skipped,
+    // not dereferenced into a reportless TypeError at the final pipeline stage.
+    const root = mkdtempSync(join(tmpdir(), "reconcile-rogue-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const now = nowIso();
+    const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned" });
+    // a RESOLVED version for a package no current config entry can supply a registry for
+    db.upsertDependencyFinding({
+      runId, ...unit, dateFetched: now, packageName: "rogue", dependencyKey: "rogue", dependencyType: "dependencies",
+      manifestPath: "package.json", manifestLine: 5, manifestPermalink: "https://github.com/org-a/svc/blob/abc123def/package.json#L5",
+      declaredVersion: "^1.0.0", lockfilePath: "bun.lock", lockfileKind: "bun", lockfileLines: null, lockfilePermalink: null,
+      resolvedVersion: "1.2.3", resolvedVersionSource: "lockfile",
+    });
+    const client = makeClient(root, async () => { throw new Error("no spawn expected"); });
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = (async () => { throw new Error("no fetch expected"); }) as unknown as typeof fetch;
+    try {
+      await reconcileIntrospection(db, client, testConfig(root), runId); // must not throw
+      const rows = db.read(`SELECT message FROM errors WHERE run_id = ?`).all(runId) as Array<{ message: string }>;
+      expect(rows).toEqual([]); // ignored entirely: no error rows, no introspection attempts
     } finally {
       globalThis.fetch = prevFetch;
       db.close();
@@ -542,6 +573,28 @@ describe("processRepo throttle requeue (§4)", () => {
     expect(errs[0]!.message).toMatch(/boom/);
     db.close();
   });
+
+  test("a ThrottleExhausted during a unit's CONTENT fetch requeues the unit — never a silent done", async () => {
+    // the api reader degrades ordinary per-file failures to null (file treated as absent),
+    // but a throttle is different: the unit was never fully read, and marking it done would
+    // let the §3 skip predicate skip this head FOREVER with silently missing findings.
+    const scanConfig = {
+      ...(config as unknown as Record<string, unknown>),
+      githubHost: "github.com",
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [],
+    } as unknown as Config;
+    const { db, runId } = openRun();
+    const client = {
+      listBranchHeads: async () => [liveHead],
+      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      fetchFileRaw: async () => { throw new ThrottleExhausted("core bucket"); },
+    } as unknown as GithubClient;
+    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("pending"); // requeued: a later run re-reads the head
+    expect(db.read("SELECT message FROM errors").all().length).toBe(0);
+    db.close();
+  });
 });
 
 describe("processRepo branch-discovery throttle (§4, site c)", () => {
@@ -627,7 +680,7 @@ describe("runScan owner-discovery throttle (§4, site a — consumer wiring)", (
       sweepStaleTempDirs: () => [],
       listOrgMemberships: async () => { throw new ThrottleExhausted("core bucket"); },
     } as unknown as GithubClient;
-    await runScan(db, client, config, "hash", noArgs, ["expo"], null); // must not throw
+    await runScan(db, client, config, "hash", noArgs, null); // must not throw
     const runs = db.read("SELECT COUNT(*) AS n FROM runs").get() as { n: number };
     expect(runs.n).toBe(0); // startRun was never reached — no run, no report
     db.close();

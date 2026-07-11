@@ -7,8 +7,8 @@ import {
   GithubClient, GithubApiError, ThrottleExhausted, MAX_PAGES, MAX_PAUSE_MS, SPAWN_TIMEOUT_MS, MAX_TOTAL_PAUSE_MS, SPAWN_KILL_GRACE_MS,
   parseGhApiOutput, parseLinkNext, nextEndpointFromLink, parseRetryAfterMs,
   classifyRest, classifyGraphql, encodeContentsPath, mapRestRepo, filterSortCapRepos,
-  buildGhEnv, buildGitEnv, buildTarEnv,
-  type SpawnFn, type SpawnResult, type RepoInfo, type SpawnAbortSignal,
+  buildGhEnv, buildGitEnv, buildTarEnv, readCapped, makeRealSpawn, joinSpawnOutcome,
+  type SpawnFn, type SpawnResult, type RepoInfo, type SpawnAbortSignal, type StreamReader,
 } from "./github.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import { AuditDb } from "./db.ts";
@@ -598,6 +598,72 @@ describe("throttle wait clamping (§4 hardening)", () => {
   });
 });
 
+describe("readCapped spawn-output byte cap (§4/§5.C)", () => {
+  // readCapped gates EVERY gh/git/tar spawn's output at MAX_SPAWN_OUTPUT_BYTES — a fake
+  // reader exercises the cap directly (a real 110MB subprocess would be pure test tax).
+  const bytes = (n: number): Uint8Array => new Uint8Array(n);
+  const scripted = (reads: Array<{ done?: boolean; value?: Uint8Array }>): { reader: StreamReader; readsIssued: () => number } => {
+    let i = 0;
+    return {
+      reader: { read: async () => reads[i++] ?? { done: true }, cancel: async () => {} },
+      readsIssued: () => i,
+    };
+  };
+
+  test("kills the process the moment the cap is crossed and stops reading", async () => {
+    let exceeded = 0;
+    const { reader, readsIssued } = scripted([{ value: bytes(2) }, { value: bytes(2) }, { value: bytes(2) }]);
+    await expect(readCapped(reader, 3, () => { exceeded++; })).rejects.toThrow(/spawn output exceeds 3 bytes/);
+    expect(exceeded).toBe(1); // the kill fired exactly once
+    expect(readsIssued()).toBe(2); // the crossing read was the LAST read — nothing buffered past it
+  });
+
+  test("a final done+value chunk is kept (Bun readers may deliver the last chunk with done)", async () => {
+    const { reader } = scripted([{ done: true, value: new TextEncoder().encode("abc") }]);
+    expect(await readCapped(reader, 3, () => { throw new Error("must not exceed"); })).toBe("abc");
+  });
+
+  test("a final done+value chunk is still cap-checked", async () => {
+    let exceeded = 0;
+    const { reader } = scripted([{ done: true, value: new TextEncoder().encode("abc") }]);
+    await expect(readCapped(reader, 2, () => { exceeded++; })).rejects.toThrow(/spawn output exceeds 2 bytes/);
+    expect(exceeded).toBe(1);
+  });
+});
+
+describe("joinSpawnOutcome (reader/exit merge)", () => {
+  const after = <T,>(ms: number, fn: () => T): Promise<T> =>
+    new Promise((resolve, reject) => setTimeout(() => {
+      try { resolve(fn()); } catch (e) { reject(e); }
+    }, ms));
+
+  test("the TEMPORALLY FIRST reader error wins, regardless of stream", async () => {
+    // stderr fails first, stdout fails later — the earlier error is the diagnostic that
+    // must surface (a later, secondary failure must not replace it).
+    const stdoutP = after(25, (): string => { throw new Error("SECOND"); });
+    const stderrP = after(5, (): string => { throw new Error("FIRST"); });
+    await expect(joinSpawnOutcome(stdoutP, stderrP, after(30, () => 1))).rejects.toThrow(/FIRST/);
+  });
+
+  test("a reader error is HELD until the child has exited", async () => {
+    let exited = false;
+    const exitP = after(40, () => { exited = true; return 137; });
+    const stdoutP = after(5, (): string => { throw new Error("cap"); });
+    try {
+      await joinSpawnOutcome(stdoutP, Promise.resolve(""), exitP);
+      throw new Error("expected rejection");
+    } catch (e) {
+      expect((e as Error).message).toBe("cap");
+      expect(exited).toBe(true); // the throw waited for proc.exited
+    }
+  });
+
+  test("a clean run composes stdout/stderr/exitCode", async () => {
+    expect(await joinSpawnOutcome(Promise.resolve("out"), Promise.resolve("err"), Promise.resolve(0)))
+      .toEqual({ exitCode: 0, stdout: "out", stderr: "err" });
+  });
+});
+
 describe("spawn wall-clock deadline (§4 hardening)", () => {
   // a poisoned endpoint can hang by PACING the response instead of via headers — every
   // spawn must carry a kill deadline so one wedged child cannot hold its semaphore slot
@@ -612,11 +678,12 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
     let kills = 0;
     const client = new GithubClient({
       githubHost: "github.com",
-      spawnImpl: (_bin, _args, opts) => {
-        signals.push(opts.signal);
-        opts.signal?.onAbort(() => { kills++; }); // stands in for realSpawn's proc.kill()
-        return new Promise<SpawnResult>(() => {}); // trickling server: never settles
-      },
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => {
+          signals.push(opts.signal);
+          // stands in for realSpawn: the kill settles the spawn promise (readers cancelled)
+          opts.signal?.onAbort(() => { kills++; resolve({ exitCode: 137, stdout: "", stderr: "killed" }); });
+        }),
       sleepImpl: async (ms) => { sleeps.push(ms); },
       env: { HOME: "/home/u", PATH: "/bin" },
       binPaths: BINS,
@@ -634,10 +701,11 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
     let signal: SpawnAbortSignal | undefined;
     const client = new GithubClient({
       githubHost: "github.com",
-      spawnImpl: (_bin, _args, opts) => {
-        signal = opts.signal;
-        return new Promise<SpawnResult>(() => {});
-      },
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => {
+          signal = opts.signal;
+          opts.signal?.onAbort(() => resolve({ exitCode: 137, stdout: "", stderr: "killed" }));
+        }),
       env: { HOME: "/home/u", PATH: "/bin" },
       binPaths: BINS,
       tempRoot: TEST_TMP,
@@ -655,10 +723,11 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
     let signal: SpawnAbortSignal | undefined;
     const client = new GithubClient({
       githubHost: "github.com",
-      spawnImpl: (_bin, _args, opts) => {
-        signal = opts.signal;
-        return new Promise<SpawnResult>(() => {});
-      },
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => {
+          signal = opts.signal;
+          opts.signal?.onAbort(() => resolve({ exitCode: 137, stdout: "", stderr: "killed" }));
+        }),
       env: { HOME: "/home/u", PATH: "/bin" },
       binPaths: BINS,
       tempRoot: TEST_TMP,
@@ -675,6 +744,67 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
     const { client } = makeClient([ok(http(200, {}, `{"ok":1}`))]);
     const res = await client.restGet("rate_limit");
     expect(res.body).toBe(`{"ok":1}`);
+  });
+
+  test("a timed-out spawn returns only after the killed child settles (no cleanup race)", async () => {
+    // cloneShallow/introspectVersion delete the child's working directory the moment the
+    // spawn call returns — so a timed-out spawn must not return while the (SIGTERMed but
+    // not yet dead) child can still be writing into that tree.
+    let settled = false;
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => {
+          opts.signal?.onAbort(() => {
+            setTimeout(() => { settled = true; resolve({ exitCode: 137, stdout: "", stderr: "killed" }); }, 50);
+          });
+        }),
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      spawnTimeoutMs: 15,
+    });
+    const res = await client.git(["--version"]);
+    expect(res.stderr).toMatch(/timed out/);
+    expect(settled).toBe(true); // the child had settled BEFORE the caller got control back
+  });
+
+  test("a spawn impl that never settles after the kill still returns once the escalation grace has passed", async () => {
+    // the settle-wait must be BOUNDED: a wedged kill (or a fake that never resolves) cannot
+    // convert the deadline into a hang. The fallback fires after SPAWN_KILL_GRACE_MS + margin.
+    const start = Date.now();
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: () => new Promise<SpawnResult>(() => {}), // never settles, even when killed
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      spawnTimeoutMs: 15,
+    });
+    const res = await client.git(["--version"]);
+    expect(res.stderr).toMatch(/timed out/);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeGreaterThanOrEqual(SPAWN_KILL_GRACE_MS); // waited out the escalation
+    expect(elapsed).toBeLessThan(SPAWN_KILL_GRACE_MS + 4_000); // ...but stayed bounded
+  }, 8_000);
+
+  test("a spawn impl that REJECTS after the kill still yields the synthetic timeout result", async () => {
+    // a byte-cap rejection landing during the settle-wait is a settlement, not a hang —
+    // the caller still gets the timeout result and the late rejection is never unhandled.
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((_resolve, reject) => {
+          opts.signal?.onAbort(() => setTimeout(() => reject(new Error("cap exceeded late")), 20));
+        }),
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      spawnTimeoutMs: 15,
+    });
+    const res = await client.git(["--version"]);
+    expect(res.exitCode).toBe(124);
+    expect(res.stderr).toMatch(/timed out/);
   });
 });
 
@@ -697,6 +827,31 @@ describe("cloneShallow temp-dir cleanup on failure", () => {
     await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/rev-parse/);
     expect(cloneRunDirs(root)).toEqual([]);
     rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a cleanup failure never masks the original clone error", async () => {
+    // rmSync's force only suppresses ENOENT — an EACCES/EBUSY from the cleanup walk must not
+    // replace the actionable git error (which carries git's stderr). The stuck tree is the
+    // next run's startup sweep's problem; the ORIGINAL error is the operator's diagnostic.
+    const root = mkdtempSync(join(tmpdir(), "clone-mask-"));
+    let cloneDest = "";
+    const spawnImpl: SpawnFn = async (_bin, args) => {
+      cloneDest = args[args.length - 1]!; // clone dest is the final argv token
+      mkdirSync(cloneDest, { recursive: true });
+      writeFileSync(join(cloneDest, "partial"), "x");
+      chmodSync(cloneDest, 0o555); // cleanup cannot unlink `partial` → rmSync throws EACCES
+      return { exitCode: 128, stdout: "", stderr: "ORIGINAL_GIT_FAILURE" };
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl,
+      env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: root,
+    });
+    try {
+      await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/ORIGINAL_GIT_FAILURE/);
+    } finally {
+      if (cloneDest !== "") chmodSync(cloneDest, 0o755);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -748,11 +903,54 @@ describe("spawn kill escalation (§4 hardening)", () => {
     expect(res.exitCode).not.toBe(0);
     expect(await waitFor(() => existsSync(pidFile), 2000)).toBe(true);
     const shPid = Number(readFileSync(pidFile, "utf8").trim());
-    expect(alive(shPid)).toBe(true); // survived the trapped SIGTERM
-    // only the SIGKILL escalation (grace after the SIGTERM) can reap this child.
-    expect(await waitFor(() => !alive(shPid), SPAWN_KILL_GRACE_MS + 4000)).toBe(true);
+    // the child trapped the deadline's SIGTERM, so only the SIGKILL escalation can reap it —
+    // and git() must NOT settle until that has happened: callers delete the child's working
+    // directory the moment the call returns, which would race a still-writing child.
+    expect(await waitFor(() => !alive(shPid), 500)).toBe(true);
     rmSync(dir, { recursive: true, force: true });
   }, 12_000);
+
+  test("a byte-cap rejection is held until the child has actually exited (no cleanup race)", async () => {
+    // realSpawn must not settle — even by REJECTING — while the child is still alive:
+    // callers treat settlement as "the child is gone" and immediately delete its working
+    // directory. A SIGTERM-trapping child that spews past the cap forces the full
+    // cap → kill → SIGKILL-escalation → exit sequence before the rejection may surface.
+    const dir = mkdtempSync(join(tmpdir(), "cap-hold-"));
+    const pidFile = join(dir, "pid");
+    const script = join(dir, "spewer");
+    writeFileSync(script, `#!/bin/sh\ntrap '' TERM\necho $$ > ${pidFile}\nhead -c 256 /dev/zero\nsleep 300 &\nwait\n`);
+    chmodSync(script, 0o755);
+    const spawn = makeRealSpawn(64);
+    try {
+      await expect(spawn(script, [], { env: { PATH: "/bin:/usr/bin" } })).rejects.toThrow(/spawn output exceeds 64 bytes/);
+      const shPid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(alive(shPid)).toBe(false); // the rejection arrived AFTER the child died
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  test("a standalone run survives the settle-wait even when nothing else holds the event loop", async () => {
+    // the settle-wait window is exactly when every other handle may already be unref'd —
+    // if the awaited timers were unref'd too, a standalone CLI process would drain its
+    // event loop and exit MID-AWAIT (skipping cleanup and report finalization). exitCode
+    // starts at 3 and only the post-await line resets it, so an early drain fails loudly.
+    const dir = mkdtempSync(join(tmpdir(), "settle-ref-"));
+    const runner = join(dir, "runner.ts");
+    writeFileSync(runner, [
+      `import { GithubClient } from ${JSON.stringify(join(import.meta.dir, "github.ts"))};`,
+      `process.exitCode = 3; // stays 3 if the event loop drains mid-await`,
+      `const client = new GithubClient({ githubHost: "github.com", spawnImpl: () => new Promise(() => {}), env: { HOME: "/tmp", PATH: "/bin:/usr/bin" }, binPaths: { gh: "/bin/echo", git: "/bin/echo", tar: "/bin/echo" }, tempRoot: ${JSON.stringify(dir)}, spawnTimeoutMs: 50 });`,
+      `const res = await client.git(["--version"]);`,
+      `if (res.stderr.includes("timed out")) process.exitCode = 0;`,
+    ].join("\n"));
+    const proc = Bun.spawn({ cmd: [process.execPath, runner], stdout: "pipe", stderr: "pipe" });
+    const killer = setTimeout(() => proc.kill(9), 20_000);
+    const code = await proc.exited;
+    clearTimeout(killer);
+    expect(code).toBe(0); // completed the post-timeout code — the loop was held through the wait
+    rmSync(dir, { recursive: true, force: true });
+  }, 25_000);
 
   test("the process can exit despite a pipe-holding grandchild (abandoned loser cannot pin the loop)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "kill-exit-"));

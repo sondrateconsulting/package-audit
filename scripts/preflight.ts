@@ -70,6 +70,7 @@ const MIN_BUN: Version = [1, 1, 0]; // bun:sqlite + shell/glob features required
 export interface PreflightDeps {
   bunVersion?: string; // defaults to Bun.version
   fetchImpl?: (url: string) => Promise<{ ok: boolean; status: number }>;
+  registryFetchTimeoutMs?: number; // registry-probe deadline (default FETCH_TIMEOUT_MS)
   env?: Record<string, string | undefined>;
 }
 
@@ -144,7 +145,7 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
   // only DNS/TLS/connect failures are fatal.
   const fetchImpl = deps.fetchImpl ?? (async (url: string) => {
     // deadline: a wedged registry must fail the probe, not hang preflight (§5.E hardening)
-    const res = await fetch(url, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    const res = await fetch(url, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(deps.registryFetchTimeoutMs ?? FETCH_TIMEOUT_MS) });
     return { ok: res.ok, status: res.status };
   });
   for (const registryUrl of new Set(config.packages.map((p) => p.registryUrl))) {
