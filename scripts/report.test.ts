@@ -512,5 +512,14 @@ describe("parseLockfileLines — corrupted self-produced data degrades to null, 
     expect(parseLockfileLines('{"a":1}')).toBeNull(); // parseable but not an array
     expect(parseLockfileLines('["10","11"]')).toBeNull(); // array of non-numbers
     expect(parseLockfileLines("42")).toBeNull(); // parseable but not an array
+    expect(parseLockfileLines("[1.5]")).toBeNull(); // number-typed but not an integer line ref
+    expect(parseLockfileLines("[1e400]")).toBeNull(); // parses to Infinity (typeof "number") — rejected
+    expect(parseLockfileLines("[10, 2.5]")).toBeNull(); // one bad element rejects the whole array
+    expect(parseLockfileLines("[0]")).toBeNull(); // 0 is not a 1-based line number
+    expect(parseLockfileLines("[-3]")).toBeNull(); // negative
+    expect(parseLockfileLines("[9007199254740993]")).toBeNull(); // > MAX_SAFE_INTEGER (unsafe)
+  });
+  test("a valid positive safe-integer array parses (including large in-range values)", () => {
+    expect(parseLockfileLines("[1, 42, 999999]")).toEqual([1, 42, 999999]);
   });
 });

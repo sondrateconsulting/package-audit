@@ -521,6 +521,62 @@ describe("ArtifactBundle — cross-kind manifest adoption (export + dossier shar
     expect(artifacts.map((a) => a.path)).toEqual(["expo-dossier.html", "usage_findings.csv"]); // neither . nor .. adopted
   });
 
+  test("a tampered manifest with a null entry or the reserved manifest.json name doesn't crash or poison", () => {
+    const out = nextOutputDir();
+    const exports = new ArtifactBundle(out, "export");
+    exports.write("usage_findings.csv", "a,b\r\n");
+    exports.finalize({ runId: "run-1" });
+    const mpath = join(out, XRAY_DIR_NAME, "manifest.json");
+    const m = JSON.parse(readFileSync(mpath, "utf8")) as { artifacts: unknown[] };
+    m.artifacts.push(null); // null array element — must be skipped, not dereferenced (would throw)
+    m.artifacts.push({ path: "manifest.json", kind: "export", sha256: "0".repeat(64), bytes: 1 }); // reserved name
+    writeFileSync(mpath, JSON.stringify(m));
+
+    const dossiers = new ArtifactBundle(out, "dossier");
+    dossiers.write("expo-dossier.html", "<html/>");
+    const { artifacts } = dossiers.finalize({ runId: "run-1" }); // must not throw on the null entry
+    // manifest.json is never adopted as an artifact row (its integrity stays self-defined); only the
+    // legit two entries remain
+    expect(artifacts.map((a) => a.path)).toEqual(["expo-dossier.html", "usage_findings.csv"]);
+  });
+
+  test("a manifest whose JSON root is bare `null` (or non-object) is ignored, not crashed", () => {
+    const out = nextOutputDir();
+    const exports = new ArtifactBundle(out, "export");
+    exports.write("usage_findings.csv", "a,b\r\n");
+    exports.finalize({ runId: "run-1" });
+    writeFileSync(join(out, XRAY_DIR_NAME, "manifest.json"), "null"); // valid JSON, but not an object
+
+    const dossiers = new ArtifactBundle(out, "dossier");
+    dossiers.write("expo-dossier.html", "<html/>");
+    const { artifacts, swept } = dossiers.finalize({ runId: "run-1" }); // must NOT throw (null.formatVersion)
+    expect(artifacts.map((a) => a.path)).toEqual(["expo-dossier.html"]); // null root adopts nothing
+    expect(swept).toEqual(["usage_findings.csv"]); // the now-unmanifested export sweeps
+  });
+
+  test("adopted entries with a non-safe-integer `bytes` or non-64-hex sha256 are rejected (no poison)", () => {
+    const out = nextOutputDir();
+    const exports = new ArtifactBundle(out, "export");
+    exports.write("usage_findings.csv", "a,b\r\n");
+    exports.finalize({ runId: "run-1" });
+    writeFileSync(join(out, XRAY_DIR_NAME, "evil1.csv"), "x");
+    writeFileSync(join(out, XRAY_DIR_NAME, "evil2.csv"), "x");
+    // hand-write the JSON so `bytes:1e400` survives as a number literal (JSON.parse → Infinity, which
+    // would reserialize as bytes:null); evil2 has a non-hex sha256.
+    writeFileSync(
+      join(out, XRAY_DIR_NAME, "manifest.json"),
+      `{"formatVersion":1,"runId":"run-1","artifacts":[` +
+        `{"path":"evil1.csv","kind":"export","sha256":"${"0".repeat(64)}","bytes":1e400},` +
+        `{"path":"evil2.csv","kind":"export","sha256":"nothex","bytes":5}]}`,
+    );
+
+    const dossiers = new ArtifactBundle(out, "dossier");
+    dossiers.write("expo-dossier.html", "<html/>");
+    const { artifacts } = dossiers.finalize({ runId: "run-1" });
+    expect(artifacts.map((a) => a.path)).toEqual(["expo-dossier.html"]); // neither poisoned entry adopted
+    expect(artifacts.every((a) => Number.isSafeInteger(a.bytes) && a.bytes >= 0)).toBe(true);
+  });
+
   test("a DIFFERENT runId is a wholesale replacement: the other kind's stale artifacts die", () => {
     const out = nextOutputDir();
     const exports = new ArtifactBundle(out, "export");

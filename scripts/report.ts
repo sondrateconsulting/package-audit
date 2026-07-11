@@ -198,7 +198,10 @@ export function parseLockfileLines(json: string | null): number[] | null {
   if (json === null) return null;
   try {
     const v: unknown = JSON.parse(json);
-    return Array.isArray(v) && v.every((n) => typeof n === "number") ? (v as number[]) : null;
+    // Line refs are 1-based POSITIVE SAFE integers (the report schema's contract); reject a corrupted
+    // cell holding NaN/Infinity/floats/0/negatives/unsafe integers (all still `typeof "number"`) so
+    // the report never carries a malformed line number.
+    return Array.isArray(v) && v.every((n) => Number.isSafeInteger(n) && (n as number) > 0) ? (v as number[]) : null;
   } catch {
     return null;
   }

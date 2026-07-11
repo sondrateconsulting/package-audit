@@ -43,21 +43,50 @@
 // (Pasting into a NON-CommonMark renderer such as Slack mrkdwn is out of scope — see the module
 // header; that grammar's `<url|label>` and escaping rules differ and are not what this produces.)
 
-const NEWLINES = /\r\n|[\r\n]/g;
-const INLINE_ACTIVE = /[`[\]()!<>|]/g;
+import { stripBidiControls } from "./htmlEscape.ts";
 
+const NEWLINES = /\r\n|[\r\n]/g;
+// `&` is escaped so a numeric/entity reference cannot survive into the paste: CommonMark decodes
+// `&#x202E;` (etc.) to its character OUTSIDE a code span, which would reconstitute a stripped bidi
+// override or other control from literal text. `\&` renders as a literal `&`, so the reference stays
+// inert text. (Entities can't recreate markdown STRUCTURE per CommonMark §6.2, but they can recreate
+// a character, so stripping raw controls is not enough on its own.)
+const INLINE_ACTIVE = /[&`[\]()!<>|]/g;
+
+// The copy-as-markdown mirror is plain text with no `unicode-bidi:isolate` field to contain a
+// hostile RTL/override control (the HTML side has that CSS; markdown has no styling), so mdCell
+// strips the raw bidi controls up front AND escapes `&` (above) so an entity-encoded one can't be
+// decoded back — a value can neither form a link/image/HTML construct nor visually reorder the paste.
 export const mdCell = (value: string): string =>
-  value
+  stripBidiControls(value)
     .replaceAll("\\", "\\\\")
     .replaceAll(INLINE_ACTIVE, (c) => `\\${c}`)
     .replaceAll(NEWLINES, " ");
+
+// A trusted absolute https URL (an evidence permalink) is emitted as an ANGLE-BRACKET autolink, so
+// a path containing `(` / `)` — e.g. a Next.js route group `src/(auth)/x.ts` — keeps a CORRECT link
+// destination. mdCell would backslash-escape the parens, and GFM RETAINS those backslashes INSIDE an
+// autolinked bare URL, silently pointing the link at the wrong file. Bidi controls are stripped
+// FIRST, then the stripped value must be `https://` FOLLOWED BY a real host character — not `/`, `?`,
+// `#`, whitespace, `<`/`>`, or backtick — and must contain none of those anywhere. So a hostless
+// `https://`, a query/fragment-only `https://?x`, or a value whose only "host" was a bidi control all
+// fall back to escaped inline TEXT and never become a link (buildPermalink emits a well-formed URL;
+// the fallback is defense-in-depth for a malformed/tampered value).
+export const mdUrl = (url: string): string => {
+  const clean = stripBidiControls(url);
+  return /^https:\/\/[^\s/<>`?#]/.test(clean) && !/[\s<>`]/.test(clean) ? `<${clean}>` : mdCell(url);
+};
 
 // Markdown CODE SPAN — dynamic fence, literal content. Code spans are literal in CommonMark, so
 // mdCell's backslash escaping would corrupt them; instead the fence is one backtick longer than
 // the longest run inside (space-padded, the CommonMark rule), so a hostile snippet can never close
 // the span early and smuggle live markdown — e.g. a link — into the copied text.
 export const mdCode = (value: string): string => {
-  const flat = value.replaceAll(NEWLINES, " ");
+  // Strip raw bidi controls even inside code spans: CommonMark code spans render content literally
+  // but do NOT bidi-isolate it, so a hostile U+202E in a snippet would still reorder the copied line
+  // in the destination renderer (the HTML side isolates via `code { unicode-bidi:isolate }` CSS,
+  // which is not carried into a paste). Entities are inert here (§6.2: not decoded in code spans).
+  const flat = stripBidiControls(value).replaceAll(NEWLINES, " ");
   if (flat === "") return "` `"; // the closest representable span — an empty one is not a span at all
   const longest = flat.match(/`+/g)?.reduce((max, run) => Math.max(max, run.length), 0) ?? 0;
   const fence = "`".repeat(longest + 1);

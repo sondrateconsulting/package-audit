@@ -240,24 +240,43 @@ export class ArtifactBundle {
   // this generation is the new truth for its own kind — and an entry whose file has vanished
   // is dropped (the manifest must describe what is actually on disk).
   private adoptableEntries(runId: string): ArtifactRecord[] {
-    let parsed: { formatVersion?: unknown; runId?: unknown; artifacts?: unknown };
+    let root: unknown;
     try {
-      parsed = JSON.parse(readFileSync(join(this.dir, MANIFEST_NAME), "utf8")) as typeof parsed;
+      root = JSON.parse(readFileSync(join(this.dir, MANIFEST_NAME), "utf8"));
     } catch {
       return []; // absent or torn manifest → nothing to adopt, everything unmanifested sweeps
     }
+    // A tampered manifest can be ANY valid JSON — including bare `null` (JSON.parse succeeds), which
+    // would throw on the field access below. Require a non-null, non-array object root first.
+    if (root === null || typeof root !== "object" || Array.isArray(root)) return [];
+    const parsed = root as { formatVersion?: unknown; runId?: unknown; artifacts?: unknown };
     if (parsed.formatVersion !== XRAY_FORMAT_VERSION || parsed.runId !== runId) return [];
     if (!Array.isArray(parsed.artifacts)) return [];
     const adopted: ArtifactRecord[] = [];
-    for (const e of parsed.artifacts as Array<Record<string, unknown>>) {
-      if (typeof e["path"] !== "string" || typeof e["sha256"] !== "string" || typeof e["bytes"] !== "number") continue;
-      const kind = e["kind"];
+    for (const e of parsed.artifacts) {
+      // A tampered manifest can hold anything: null/non-object array elements (dereferencing them
+      // would throw and fail the whole finalize) are skipped before any field access.
+      if (e === null || typeof e !== "object") continue;
+      const rec = e as Record<string, unknown>;
+      // `bytes` must be a non-negative SAFE integer: a tampered `bytes:1e400` is `typeof "number"`
+      // (Infinity) and would reserialize as `bytes:null`, poisoning the new manifest. sha256 must be
+      // the 64-hex digest shape it is written as.
+      if (
+        typeof rec["path"] !== "string" ||
+        typeof rec["sha256"] !== "string" ||
+        !/^[0-9a-f]{64}$/.test(rec["sha256"] as string) ||
+        typeof rec["bytes"] !== "number" ||
+        !Number.isSafeInteger(rec["bytes"]) ||
+        (rec["bytes"] as number) < 0
+      )
+        continue;
+      const kind = rec["kind"];
       if (kind === this.kind || (kind !== "export" && kind !== "dossier")) continue;
-      const name = e["path"];
-      // A prior manifest is data on disk; a tampered `path` (e.g. `../secret`) must never reach
-      // join()/lstat — validate it against the SAME flat-name grammar fresh writes use, and skip
-      // (never throw: one bad entry can't fail the whole finalize) anything outside it.
-      if (name === "." || name === ".." || !NAME_GRAMMAR.test(name)) continue;
+      const name = rec["path"];
+      // A prior manifest is data on disk; a tampered `path` must never reach join()/lstat or poison
+      // the new manifest — validate it against the SAME rules fresh writes use (flat-name grammar,
+      // no `.`/`..`, and NOT the reserved manifest.json name), and skip (never throw) anything else.
+      if (name === "." || name === ".." || !NAME_GRAMMAR.test(name) || collisionKey(name) === MANIFEST_NAME) continue;
       if (this.nameKeys.has(collisionKey(name))) continue; // this generation rewrote it
       let st;
       try {
@@ -266,7 +285,7 @@ export class ArtifactBundle {
         continue; // vanished since the last generation
       }
       if (!st.isFile()) continue;
-      adopted.push(Object.freeze({ path: name, kind, sha256: e["sha256"], bytes: e["bytes"] }));
+      adopted.push(Object.freeze({ path: name, kind, sha256: rec["sha256"], bytes: rec["bytes"] }));
     }
     return adopted;
   }

@@ -1,5 +1,5 @@
 import { expect, test, describe } from "bun:test";
-import { mdCell, mdCode, mdTable } from "./markdownEscape.ts";
+import { mdCell, mdCode, mdTable, mdUrl } from "./markdownEscape.ts";
 
 describe("mdCell — inline markdown escape-by-construction", () => {
   test("a hostile image cannot form a live `![](url)` juncture", () => {
@@ -33,6 +33,28 @@ describe("mdCell — inline markdown escape-by-construction", () => {
     expect(mdCell("a\r\nb")).toBe("a b"); // CRLF
     expect(mdCell("a\nb")).toBe("a b"); // LF
     expect(mdCell("a\rb")).toBe("a b"); // lone CR — the /\r?\n/ regex used to miss this
+  });
+
+  test("Unicode bidi/direction control characters are stripped (Trojan-Source spoofing)", () => {
+    // RLO/LRO/PDF/isolates are invisible and reorder the VISUAL order of the pasted line without
+    // changing logical order; the plain-text markdown mirror has no unicode-bidi:isolate field, so
+    // mdCell removes them. Legitimate text (no standalone controls) is untouched.
+    expect(mdCell("a\u202Eb\u202Cc")).toBe("abc"); // RLO … PDF
+    expect(mdCell("\u2066spoof\u2069")).toBe("spoof"); // LRI … PDI
+    expect(mdCell("re\u200Eact-native")).toBe("react-native"); // LRM inside an identifier
+    expect(mdCell("a\u061Cb")).toBe("ab"); // ALM (U+061C) — a Bidi_Control, also stripped
+    expect(mdCell("plain-name")).toBe("plain-name"); // no controls → unchanged
+  });
+
+  test("an ENTITY-encoded control can't be reconstituted: `&` is escaped so it stays inert text", () => {
+    // stripBidiControls removes RAW controls, but a CommonMark renderer would decode `&#x202E;`
+    // back into U+202E outside a code span — so `&` is escaped to keep the reference literal.
+    expect(mdCell("&#x202E;evil")).toBe("\\&#x202E;evil");
+    expect(mdCell("A & B")).toBe("A \\& B"); // GFM renders \& as a literal &
+  });
+
+  test("mdCode strips raw bidi controls too (code spans do not bidi-isolate across renderers)", () => {
+    expect(mdCode("a\u202Eb")).toBe("`ab`"); // hostile U+202E inside a snippet is removed
   });
 
   test("plain identifiers pass through unchanged (no over-escaping of - . _ * @ #)", () => {
@@ -81,6 +103,26 @@ describe("mdCell — documented residual: bare mentions/URLs pass as literal, un
   });
   test("an @mention / #ref stays literal", () => {
     expect(mdCell("@acme/team #42")).toBe("@acme/team #42");
+  });
+});
+
+describe("mdUrl — trusted https permalinks autolink correctly (paren-safe)", () => {
+  test("an https URL with parens becomes an angle-bracket autolink with the CORRECT destination", () => {
+    // Next.js route-group paths (`src/(auth)/x.ts`) are common; mdCell would escape the parens and
+    // GFM keeps `\(`/`\)` inside a bare autolink, pointing the link at the wrong file. `<url>` doesn't.
+    expect(mdUrl("https://github.com/o/r/blob/sha/src/(auth)/x.ts#L1")).toBe("<https://github.com/o/r/blob/sha/src/(auth)/x.ts#L1>");
+  });
+  test("a non-https or malformed URL falls back to escaped inline text — never becomes a link", () => {
+    expect(mdUrl("javascript:alert(1)")).toBe(mdCell("javascript:alert(1)")); // scheme not https → escaped text
+    expect(mdUrl("https://x y")).toBe(mdCell("https://x y")); // whitespace → not a clean autolink
+    expect(mdUrl("https://")).toBe(mdCell("https://")); // hostless → NOT `<https://>` (which CommonMark would still link)
+    expect(mdUrl("https:///x")).toBe(mdCell("https:///x")); // empty host (leading /) → fallback
+    expect(mdUrl("https://?x")).toBe(mdCell("https://?x")); // query-only, no host → fallback (not a link)
+    expect(mdUrl("https://#x")).toBe(mdCell("https://#x")); // fragment-only, no host → fallback
+    expect(mdUrl("https://\u202E")).toBe(mdCell("https://\u202E")); // a bidi control can't count as the host → fallback
+  });
+  test("raw bidi controls are stripped from the autolinked URL (no spoofing via a tampered permalink)", () => {
+    expect(mdUrl("https://evil\u202E.com/x")).toBe("<https://evil.com/x>");
   });
 });
 

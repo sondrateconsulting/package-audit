@@ -17,3 +17,15 @@ const ESCAPES: Readonly<Record<string, string>> = {
 export function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (ch) => ESCAPES[ch]!);
 }
+
+// Every Unicode Bidi_Control codepoint (Trojan-Source class): the marks ALM/LRM/RLM, the
+// embedding/override pair LRE…RLO + PDF, and the isolates LRI…FSI + PDI. These are invisible and
+// reorder the VISUAL order of surrounding text without changing its logical order — a spoofing
+// vector in prose that is not wrapped in a `unicode-bidi:isolate` field (the dossier's evidence
+// code/loc/branchnote spans ARE isolated; auto-generated observation prose and the copy-as-markdown
+// mirrors are not, so those strip the controls instead). Stripping is safe: legitimate RTL scripts
+// carry their own strong directionality via the LETTERS, never these standalone control codepoints.
+const BIDI_CONTROLS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+export function stripBidiControls(value: string): string {
+  return value.replace(BIDI_CONTROLS, "");
+}

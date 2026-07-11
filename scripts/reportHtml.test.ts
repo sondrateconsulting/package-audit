@@ -134,7 +134,11 @@ const syntheticPkg = (units: DossierUnit[], over: Partial<DossierPackage> = {}):
 // gains `unicode-bidi:isolate` in the shared PAGE_CSS (so all three goldens shift), and (2) the CLI
 // usage location cell is wrapped in a `<span class="loc">` (a markup change, dossier golden only).
 // Both isolate hostile RTL branch/repo/file names; no data change and the markup was always inert.
-const GOLDEN_DOSSIER_SHA256 = "ab174249db384ec8d98861a5d2915cb2d71f71bae8b764a57d5ceced87b0a76e";
+// PRE-LAUNCH RE-PIN (comprehensive hardening, sanctioned): the EVIDENCE copy-markdown permalink is
+// now emitted as a `<https://…>` angle-bracket autolink (was a bare URL through mdCell) so a path
+// with `(`/`)` keeps a correct link destination. Copy-markdown `<template>` bytes only (dossier
+// golden); the visible dossier HTML permalink (permalinkAnchor) is byte-unchanged.
+const GOLDEN_DOSSIER_SHA256 = "ef784e8cca60ddf3c16e2b069959485846cd7a44fedbe09ddf9f53940f4d502c";
 const GOLDEN_EMPTY_SHA256 = "dbf98a9aa63bc94212e930355cc8fcc87e28804080caa55ead1299fc6eda9a34";
 
 describe("renderDossier — determinism and golden bytes", () => {
@@ -374,6 +378,51 @@ describe("copy-as-markdown: hostile identifiers cannot inject links/images (H1)"
       expect(md).not.toContain(BEACON); // and the intact payload never appears
     });
   }
+});
+
+describe("bidi controls in a hostile export name are neutralized in observation prose + copied markdown", () => {
+  const RLO = "\u202E"; // right-to-left override — reorders the visual order of surrounding text
+  function bidiPkg(): DossierPackage {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+      trackedPackages: ["evil"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
+    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true });
+    const use = (exportName: string, file: string, line: number) =>
+      db.upsertUsageFinding({
+        runId, ...main, packageName: "evil", dependencyKey: "evil", usageType: "named-import", exportName,
+        context: "", filePath: file, lineNumber: line,
+        permalink: `https://github.com/org-a/svc/blob/${main.commitSha}/${file}#L${line}`, snippet: "x", foundAt: T0,
+      });
+    // dominant export name carrying an RLO — reaches the observations "dominant-export" sentence
+    use(`use${RLO}State`, "src/a.ts", 1);
+    use(`use${RLO}State`, "src/b.ts", 2);
+    use(`use${RLO}State`, "src/c.ts", 3);
+    use("plain", "src/d.ts", 4);
+    db.completeRun(runId);
+    const report = buildReport(db, db.getRun(runId)!);
+    db.close();
+    return report.packages[0]!;
+  }
+  const html = renderDossier(bidiPkg(), FIXED_CTX);
+
+  test("the observations HTML prose carries no bidi control (unlike the CSS-isolated code spans)", () => {
+    const start = html.indexOf('id="observations"');
+    const section = html.slice(start, html.indexOf("</section>", start));
+    // the <template> markdown mirror lives in this section too; both the visible <li> prose and the
+    // copied markdown must be free of the raw RLO
+    expect(section).not.toContain(RLO);
+    expect(section).toContain("useState"); // the value survives with the control removed
+  });
+  test("the surface + observations copy-markdown mirrors strip the bidi control", () => {
+    for (const id of ["surface", "observations"]) {
+      const md = templateMd(html, id);
+      expect(md).not.toContain(RLO);
+      expect(md).toContain("useState");
+    }
+  });
 });
 
 describe("dossierFilename — sanitization against the artifact name grammar", () => {

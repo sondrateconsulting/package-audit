@@ -22,8 +22,8 @@
 // visible band — never a silent undercount.
 
 import { createHash } from "node:crypto";
-import { escapeHtml } from "./htmlEscape.ts";
-import { mdCell, mdCode, mdTable } from "./markdownEscape.ts";
+import { escapeHtml, stripBidiControls } from "./htmlEscape.ts";
+import { mdCell, mdCode, mdTable, mdUrl } from "./markdownEscape.ts";
 import { deriveFacts, tryEvaluateObservations, type Observation } from "./observations.ts";
 
 // ---- input types (structural mirror of the §7 report object) ---------------------------------
@@ -825,7 +825,7 @@ function renderEvidence(m: DossierModel): string {
       const printRows = shown.map((s, i) => renderSiteRow(g, s, i, false)).join("\n");
       mdParts.push(
         `### ${mdCell(g.label)} — ${plural(g.headlineCount, "usage site")} (${m.scopeLabel}), ${g.totalCount} total`,
-        ...shown.map((s) => `- ${mdCode(s.snippet)} — ${mdCell(s.repo)} ${mdCell(s.file)}:${s.line} @ ${s.shortSha} — ${mdCell(s.permalink)}`),
+        ...shown.map((s) => `- ${mdCode(s.snippet)} — ${mdCell(s.repo)} ${mdCell(s.file)}:${s.line} @ ${s.shortSha} — ${mdUrl(s.permalink)}`),
         ...(g.sites.length > EVIDENCE_CAP ? [`- … showing ${EVIDENCE_CAP} of ${g.sites.length} evidence rows`] : []),
       );
       return (
@@ -843,10 +843,12 @@ function renderEvidence(m: DossierModel): string {
 
 function renderObservations(observations: readonly Observation[]): string {
   if (observations.length === 0) return "";
-  // o.text embeds attacker-controlled identifiers (e.g. the dominant export name); the markdown
-  // mirror escapes it exactly as the HTML side escapes it below, so a paste can't inject a link.
+  // o.text embeds attacker-controlled identifiers (e.g. the dominant export name). Unlike the
+  // evidence code/loc spans, this prose is NOT wrapped in a unicode-bidi:isolate field, so a hostile
+  // RTL/override control could reorder the whole sentence — strip the bidi controls on both sides.
+  // (mdCell strips them too, and additionally neutralizes markdown link/image formers for the paste.)
   const md = observations.map((o) => `- ${mdCell(o.text)}`).join("\n");
-  const items = observations.map((o) => `<li>${esc(o.text)}</li>`).join("\n");
+  const items = observations.map((o) => `<li>${esc(stripBidiControls(o.text))}</li>`).join("\n");
   return `<section id="observations" aria-labelledby="h-observations"><h2 id="h-observations">What this means</h2>${copyControl("observations", md)}<ul>\n${items}\n</ul></section>`;
 }
 
