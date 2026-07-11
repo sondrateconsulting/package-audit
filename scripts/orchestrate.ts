@@ -11,7 +11,7 @@ import { readdirSync, lstatSync, readFileSync, existsSync, rmSync } from "node:f
 import { join, dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
-import { GithubClient, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchHead } from "./github.ts";
+import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchHead } from "./github.ts";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseArgs, ORCHESTRATE_HELP, ORCHESTRATE_USAGE, type OrchestrateArgs } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -26,19 +26,22 @@ import type { CliTermSet } from "./cliScanner.ts";
 import { logLine } from "./log.ts";
 
 // ---- per-unit read helpers ------------------------------------------------------------------
-// API reader: SHA-pinned raw fetch (≤100MB) for blob entries; non-blobs (submodule/symlink) and
-// ordinary per-file failures return null (file treated as absent). A ThrottleExhausted RETHROWS:
-// the unit was never fully read, so it must reach processRepo's requeue catch (§4) — degrading
-// it to null would mark a partially-read head `done` and the §3 skip predicate would skip it
-// forever. SHA-pinned reads are served from api_cache with zero network on re-read.
+// API reader: SHA-pinned raw fetch (≤100MB) for blob entries. Non-blobs (submodule/symlink)
+// and a 404 return null — the one genuinely-benign miss (the tree listed a path the contents
+// API no longer serves, e.g. a force-push race), where skipping the file is correct. EVERY
+// other failure RETHROWS: the unit was never fully read, and degrading to null would mark a
+// partially-read head `done` (the §3 skip predicate then skips it forever) with its findings
+// silently under-reported. A ThrottleExhausted reaches processRepo's requeue catch (§4,
+// pending); a fatal GithubApiError (SSO/permission 403, exhausted no-response) lands as a
+// visible scan error. SHA-pinned reads are served from api_cache with zero network on re-read.
 function apiReader(client: GithubClient, org: string, repo: string, commitSha: string) {
   return async (path: string, entry: TreeEntry): Promise<string | null> => {
     if (entry.type !== "blob") return null;
     try {
       return await client.fetchFileRaw(org, repo, path, commitSha);
     } catch (e) {
-      if (e instanceof ThrottleExhausted) throw e;
-      return null;
+      if (e instanceof GithubApiError && e.status === 404) return null;
+      throw e;
     }
   };
 }

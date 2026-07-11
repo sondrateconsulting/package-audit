@@ -595,6 +595,72 @@ describe("processRepo throttle requeue (§4)", () => {
     expect(db.read("SELECT message FROM errors").all().length).toBe(0);
     db.close();
   });
+
+  test("a FATAL error during a unit's content fetch marks the unit error — never a silent done", async () => {
+    // an SSO/permission 403 (or an exhausted no-response failure) on a per-file read is NOT
+    // "file absent": completing the unit would permanently under-report its dependencies
+    // with zero trace. It must land as a visible scan error (retried at the next head).
+    const scanConfig = {
+      ...(config as unknown as Record<string, unknown>),
+      githubHost: "github.com",
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [],
+    } as unknown as Config;
+    const { db, runId } = openRun();
+    const client = {
+      listBranchHeads: async () => [liveHead],
+      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      fetchFileRaw: async () => { throw new GithubApiError("HTTP 403 (permission/forbidden) (repos/o/r/contents/package.json)", { status: 403 }); },
+    } as unknown as GithubClient;
+    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("error");
+    const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all() as Array<{ message: string }>;
+    expect(errs.length).toBe(1);
+    expect(errs[0]!.message).toMatch(/403/);
+    db.close();
+  });
+
+  test("a status-0 (no-HTTP-response) content-fetch failure also lands as a unit error", async () => {
+    // pins that the benign degradation is BY STATUS (404 only), not by message shape — an
+    // exhausted no-response failure (network plumbing, spawn timeout 124) must fail loud.
+    const scanConfig = {
+      ...(config as unknown as Record<string, unknown>),
+      githubHost: "github.com",
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [],
+    } as unknown as Config;
+    const { db, runId } = openRun();
+    const client = {
+      listBranchHeads: async () => [liveHead],
+      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      fetchFileRaw: async () => { throw new GithubApiError("gh api produced no HTTP response: spawn timed out", { status: 0 }); },
+    } as unknown as GithubClient;
+    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("error");
+    expect(db.read("SELECT message FROM errors WHERE scope='scan'").all().length).toBe(1);
+    db.close();
+  });
+
+  test("a 404 during a unit's content fetch stays benign (file treated as absent, unit done)", async () => {
+    // the one genuinely-absent case: the tree listed a blob the contents API no longer
+    // serves at that path (e.g. a force-push race) — skipping the file is correct.
+    const scanConfig = {
+      ...(config as unknown as Record<string, unknown>),
+      githubHost: "github.com",
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [],
+    } as unknown as Config;
+    const { db, runId } = openRun();
+    const client = {
+      listBranchHeads: async () => [liveHead],
+      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      fetchFileRaw: async () => { throw new GithubApiError("HTTP 404 (repos/o/r/contents/package.json)", { status: 404 }); },
+    } as unknown as GithubClient;
+    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("done");
+    expect(db.read("SELECT message FROM errors").all().length).toBe(0);
+    db.close();
+  });
 });
 
 describe("processRepo branch-discovery throttle (§4, site c)", () => {
