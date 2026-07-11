@@ -20,7 +20,7 @@
 // operator's own output directory could simply delete files itself.
 
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 
@@ -41,7 +41,9 @@ export class ArtifactWriteError extends Error {
 export const XRAY_DIR_NAME = "xray";
 
 // The report-format version embedded in the manifest (and by the artifacts themselves).
-// Bumping this is the ONE sanctioned way golden files change.
+// Bumping this is the ONE sanctioned way golden files change. (The pre-launch addition of
+// per-entry `kind` tags was deliberately absorbed into v1 — no manifest had shipped yet;
+// after launch, any manifest-shape change bumps this.)
 export const XRAY_FORMAT_VERSION = 1;
 
 // Injectable failure seam for the crash-behavior tests; production always uses node:fs.
@@ -118,15 +120,25 @@ export function writeFileAtomic(
   }
 }
 
+// The xray/ bundle is shared by SEPARATE commands (`export` writes CSV/JSONL, `report --html`
+// writes dossiers), so every manifest entry is tagged with the KIND that produced it. A
+// generation finalizing kind K replaces ALL kind-K entries (stale K-artifacts die) and ADOPTS
+// the other kinds' entries verbatim — but only when the existing manifest carries the SAME
+// runId and formatVersion; otherwise the whole previous generation is stale and everything
+// unmanifested is swept. This keeps "stale dossiers from removed packages die" true without
+// one command's sweep destroying the other command's artifacts.
+export type ArtifactKind = "export" | "dossier";
+
 export interface ArtifactRecord {
   readonly path: string; // filename relative to the xray/ directory (flat by contract)
+  readonly kind: ArtifactKind;
   readonly sha256: string;
   readonly bytes: number;
 }
 
 export interface BundleResult {
   manifestPath: string;
-  artifacts: ArtifactRecord[];
+  artifacts: ArtifactRecord[]; // the full manifest content: this generation's + adopted entries
   swept: string[]; // unmanifested filenames removed from xray/, sorted
 }
 
@@ -160,14 +172,16 @@ function assertArtifactName(name: string): void {
 export class ArtifactBundle {
   private readonly outputDir: string;
   private readonly dir: string;
+  private readonly kind: ArtifactKind;
   private readonly records: ArtifactRecord[] = [];
   private readonly nameKeys = new Set<string>();
   private readonly names = new Set<string>();
   private finalized = false;
 
-  constructor(outputDir: string) {
+  constructor(outputDir: string, kind: ArtifactKind) {
     this.outputDir = outputDir;
     this.dir = join(outputDir, XRAY_DIR_NAME);
+    this.kind = kind;
   }
 
   // The sweep-confinement precondition: xray/ must be a REAL directory. A symlinked xray/
@@ -204,6 +218,7 @@ export class ArtifactBundle {
     writeFileAtomic(join(this.dir, name), content, [this.outputDir]);
     const record: ArtifactRecord = Object.freeze({
       path: name,
+      kind: this.kind,
       sha256: createHash("sha256").update(content, "utf8").digest("hex"),
       bytes: Buffer.byteLength(content, "utf8"),
     });
@@ -213,6 +228,38 @@ export class ArtifactBundle {
     return record;
   }
 
+  // Adoption input: the previous generation's manifest, IF it is coherent with this one
+  // (parseable, same formatVersion, same runId). Only OTHER kinds' entries are candidates —
+  // this generation is the new truth for its own kind — and an entry whose file has vanished
+  // is dropped (the manifest must describe what is actually on disk).
+  private adoptableEntries(runId: string): ArtifactRecord[] {
+    let parsed: { formatVersion?: unknown; runId?: unknown; artifacts?: unknown };
+    try {
+      parsed = JSON.parse(readFileSync(join(this.dir, MANIFEST_NAME), "utf8")) as typeof parsed;
+    } catch {
+      return []; // absent or torn manifest → nothing to adopt, everything unmanifested sweeps
+    }
+    if (parsed.formatVersion !== XRAY_FORMAT_VERSION || parsed.runId !== runId) return [];
+    if (!Array.isArray(parsed.artifacts)) return [];
+    const adopted: ArtifactRecord[] = [];
+    for (const e of parsed.artifacts as Array<Record<string, unknown>>) {
+      if (typeof e["path"] !== "string" || typeof e["sha256"] !== "string" || typeof e["bytes"] !== "number") continue;
+      const kind = e["kind"];
+      if (kind === this.kind || (kind !== "export" && kind !== "dossier")) continue;
+      const name = e["path"];
+      if (this.nameKeys.has(collisionKey(name))) continue; // this generation rewrote it
+      let st;
+      try {
+        st = lstatSync(join(this.dir, name));
+      } catch {
+        continue; // vanished since the last generation
+      }
+      if (!st.isFile()) continue;
+      adopted.push(Object.freeze({ path: name, kind, sha256: e["sha256"], bytes: e["bytes"] }));
+    }
+    return adopted;
+  }
+
   // Write manifest.json (LAST), then sweep unmanifested files inside xray/ ONLY. The sweep
   // removes regular files and symlinks (unlinked, never followed) and leaves directories in
   // place — it is flat by construction, never recursive.
@@ -220,7 +267,9 @@ export class ArtifactBundle {
     if (this.finalized) throw new Error("bundle already finalized");
     this.finalized = true;
     this.ensureRealDir();
-    const artifacts = [...this.records].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    const artifacts = [...this.records, ...this.adoptableEntries(meta.runId)].sort((a, b) =>
+      a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+    );
     const manifest = { formatVersion: XRAY_FORMAT_VERSION, runId: meta.runId, artifacts };
     const manifestPath = join(this.dir, MANIFEST_NAME);
     writeFileAtomic(manifestPath, JSON.stringify(manifest, null, 2) + "\n", [this.outputDir]);
@@ -234,7 +283,7 @@ export class ArtifactBundle {
     // (No realpath-containment on victims: assertContained FOLLOWS symlinks, and the whole
     // point is to unlink a stale link itself without ever following it. Entries are readdir
     // basenames — including legal-but-odd POSIX names like `old\artifact` — swept normally.)
-    const keepKeys = new Set<string>([...this.names].map(collisionKey).concat(MANIFEST_NAME));
+    const keepKeys = new Set<string>(artifacts.map((a) => collisionKey(a.path)).concat(collisionKey(MANIFEST_NAME)));
     const swept: string[] = [];
     for (const entry of readdirSync(this.dir)) {
       if (keepKeys.has(collisionKey(entry))) continue;
