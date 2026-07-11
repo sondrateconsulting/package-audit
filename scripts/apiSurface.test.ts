@@ -6,8 +6,11 @@ import {
   parseSRI, verifyIntegrity, selectVersionDist, resolveRangeToVersion, encodePackageNameForUrl,
   introspectVersion, fetchPackument, inflateBounded, assertExtractedTreeSafe,
   readBodyCapped, FETCH_TIMEOUT_MS, MAX_PACKUMENT_BYTES, isValidPackageName,
-  IntrospectionError, matchPatternTemplates, MAX_PATTERN_MATCHES, type FetchFn, type Packument,
+  IntrospectionError, matchPatternTemplates, MAX_PATTERN_MATCHES, inspectExtracted,
+  MAX_PKG_JSON_BYTES, MAX_EXACT_EXPORTS, MAX_BIN_NAMES, MAX_SURFACE_ROWS, MAX_NAME_BYTES,
+  type FetchFn, type Packument,
 } from "./apiSurface.ts";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync, linkSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -403,6 +406,20 @@ function seedRun(db: AuditDb): string {
   }).runId;
 }
 
+// Materialize a `package/` tree under TMP for direct inspectExtracted() coverage (nested paths ok).
+let pkgCounter = 0;
+function writePackage(files: Array<{ name: string; content: string }>): string {
+  const root = join(TMP, `pkg-${pkgCounter++}`, "package");
+  for (const f of files) {
+    const abs = join(root, f.name);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, f.content);
+  }
+  return root;
+}
+// Test-only reach-in to seed a stale-epoch marker the public API refuses to create.
+const rawDb = (db: AuditDb): Database => (db as unknown as { db: Database }).db;
+
 describe("introspectVersion — integration (real system tar)", () => {
   const makePackument = (tgz: Uint8Array): string =>
     JSON.stringify({
@@ -690,6 +707,45 @@ describe("introspectVersion — integration (real system tar)", () => {
     db.close();
   });
 
+  // ---- §D re-export CORRECTNESS (fail-open + wrong-dir bugs the review found) --------------
+  test("re-export through a directory index resolves nested specifiers against the OPENED file's dir (§D2)", async () => {
+    // `./index.d.ts` → `export * from "./dir"` opens `dir/index.d.ts`; its own `export * from
+    // "./secret"` MUST resolve `dir/secret.d.ts` (the opened file's directory), NOT the root
+    // decoy `./secret.d.ts`. The old follower recorded the REQUESTED specifier ('dir'), not the
+    // file it OPENED ('dir/index.d.ts'), so nested relatives resolved one directory too high.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", types: "./index.d.ts" }) },
+        { name: "index.d.ts", content: `export * from "./dir";` },
+        { name: "dir/index.d.ts", content: `export * from "./secret";` },
+        { name: "dir/secret.d.ts", content: `export declare const dirSecret: number;` },
+        { name: "secret.d.ts", content: `export declare const rootDecoy: number;` }, // wrong-dir target
+      ],
+      db,
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(true);
+    const names = (db.read("SELECT export_name FROM package_api_surface WHERE export_kind='named'").all() as Array<{ export_name: string }>).map((r) => r.export_name);
+    expect(names).toContain("dirSecret"); // resolved against dir/ (the canonical opened path)
+    expect(names).not.toContain("rootDecoy"); // NOT root ./secret.d.ts
+    db.close();
+  });
+
+  test("a `.js` re-export specifier resolves to the adjacent .d.ts (§D3 extension substitution)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", types: "./index.d.ts" }) },
+        { name: "index.d.ts", content: `export * from "./m.js";` }, // runtime specifier
+        { name: "m.d.ts", content: `export declare const fromM: number;` }, // its declaration
+      ],
+      db,
+    );
+    const names = (db.read("SELECT export_name FROM package_api_surface WHERE export_kind='named'").all() as Array<{ export_name: string }>).map((r) => r.export_name);
+    expect(names).toContain("fromM");
+    db.close();
+  });
+
   test("verifies via dist.shasum when dist.integrity is absent", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = seedRun(db);
@@ -855,6 +911,62 @@ describe("introspectVersion — integration (real system tar)", () => {
     db.close();
   });
 
+  test("§7 surface epoch: a STALE-epoch marker is re-inspected; the fresh current-epoch marker then short-circuits", async () => {
+    // A package audited by the OLD, buggy resolver left a bare '__complete__' marker (no epoch).
+    // hasCompletionMarker must treat it as ABSENT so the fixed resolver re-audits the version.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    rawDb(db)
+      .query(
+        `INSERT INTO package_api_surface (package_name, version, version_source, export_name, export_kind, source, introspected_at)
+         VALUES ('expo', '1.0.0', 'lockfile', '', '__complete__', '__complete__', '2024-01-01T00:00:00.000Z')`,
+      )
+      .run();
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false); // stale epoch → treated as absent
+
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", types: "./index.d.ts" }) },
+        { name: "index.d.ts", content: `export declare const reaudited: number;` },
+      ],
+      db,
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(true); // re-inspected → fresh current-epoch marker
+    const names = (db.read("SELECT export_name FROM package_api_surface WHERE export_kind='named'").all() as Array<{ export_name: string }>).map((r) => r.export_name);
+    expect(names).toEqual(["reaudited"]);
+
+    // now the current-epoch marker short-circuits (no network work).
+    let called = false;
+    const runId = seedRun(db);
+    const client = new GithubClient({ githubHost: "github.com", tempRoot: TMP });
+    await introspectVersion({
+      client, db, runId, packageName: "expo", registryUrl: "https://registry.example.com",
+      registryAuthEnvVar: null, version: "1.0.0", versionSource: "lockfile",
+      fetchImpl: async () => { called = true; throw new Error("should not fetch"); },
+    });
+    expect(called).toBe(false);
+    db.close();
+  });
+
+  test("a thin-barrel chain over the parse-file budget is fail-closed: NO marker + errors row (§7)", async () => {
+    // 4 barrels + a shared child = 5 parses; inject maxParseFiles=3 → DtsLimitError → errors row.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await run(
+      [
+        { name: "package.json", content: JSON.stringify({ name: "expo", exports: { "./a": "./a.js", "./b": "./b.js", "./c": "./c.js", "./d": "./d.js" } }) },
+        { name: "child.d.ts", content: `export declare const fromChild: number;` },
+        { name: "a.d.ts", content: `export * from "./child";` },
+        { name: "b.d.ts", content: `export * from "./child";` },
+        { name: "c.d.ts", content: `export * from "./child";` },
+        { name: "d.d.ts", content: `export * from "./child";` },
+      ],
+      db,
+      { inspectCaps: { maxParseFiles: 3 } },
+    );
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    expect((db.read("SELECT message FROM errors").get() as { message: string }).message).toContain("parsed .d.ts files");
+    db.close();
+  });
+
   test("fetchPackument (exported for the orchestrator) parses, and fails closed on non-JSON / non-object", async () => {
     const mk = (body: string): FetchFn => async () => ({
       status: 200, ok: true, headers: { get: () => null },
@@ -877,6 +989,118 @@ describe("introspectVersion — integration (real system tar)", () => {
     // both packument and tarball are on registry.example.com → auth sent to that host only
     expect(new Set(authHosts)).toEqual(new Set(["registry.example.com"]));
     db.close();
+  });
+});
+
+// ---- §7 cardinality / size caps (direct inspectExtracted coverage) ---------------------------
+describe("inspectExtracted — §7 cardinality / size caps (fail-closed)", () => {
+  test("the exported cap constants hold their documented defaults", () => {
+    expect(MAX_PKG_JSON_BYTES).toBe(4 * 1024 * 1024);
+    expect(MAX_EXACT_EXPORTS).toBe(16_384);
+    expect(MAX_BIN_NAMES).toBe(4096);
+    expect(MAX_SURFACE_ROWS).toBe(65_536);
+    expect(MAX_NAME_BYTES).toBe(1024);
+  });
+
+  test("package.json over the byte cap throws BEFORE parse; just-under is accepted", () => {
+    const root = writePackage([{ name: "package.json", content: JSON.stringify({ name: "expo", _pad: "x".repeat(400) }) }]);
+    expect(() => inspectExtracted(root, { maxPkgJsonBytes: 50 })).toThrow(IntrospectionError);
+    expect(() => inspectExtracted(root, { maxPkgJsonBytes: 10_000 })).not.toThrow();
+  });
+
+  test("exact export subpaths over the cap throw; at-cap is fine", () => {
+    const exports: Record<string, string> = {};
+    for (let i = 0; i < 3; i++) exports[`./e${i}`] = `./e${i}.d.ts`;
+    const root = writePackage([{ name: "package.json", content: JSON.stringify({ name: "expo", exports }) }]);
+    expect(() => inspectExtracted(root, { maxExactExports: 2 })).toThrow(IntrospectionError); // 3 > 2
+    expect(() => inspectExtracted(root, { maxExactExports: 3 })).not.toThrow(); // 3 == cap
+  });
+
+  test("bin names over the cap throw; at-cap is fine", () => {
+    const bin: Record<string, string> = { a: "./a.js", b: "./b.js", c: "./c.js" };
+    const root = writePackage([{ name: "package.json", content: JSON.stringify({ name: "expo", bin }) }]);
+    expect(() => inspectExtracted(root, { maxBinNames: 2 })).toThrow(IntrospectionError); // 3 > 2
+    expect(() => inspectExtracted(root, { maxBinNames: 3 })).not.toThrow();
+  });
+
+  test("an over-long name (routes through pushRow) throws; at-cap is fine", () => {
+    const longName = "b".repeat(40);
+    const root = writePackage([{ name: "package.json", content: JSON.stringify({ name: "expo", bin: { [longName]: "./c.js" } }) }]);
+    expect(() => inspectExtracted(root, { maxNameBytes: 10 })).toThrow(IntrospectionError); // 40 > 10
+    expect(() => inspectExtracted(root, { maxNameBytes: 40 })).not.toThrow();
+  });
+
+  test("total surface rows over the cap throw; at-cap is fine", () => {
+    const root = writePackage([
+      { name: "package.json", content: JSON.stringify({ name: "expo", types: "./index.d.ts" }) },
+      { name: "index.d.ts", content: `export declare const a: 1; export declare const b: 2; export declare const c: 3;` },
+    ]);
+    expect(() => inspectExtracted(root, { maxSurfaceRows: 2 })).toThrow(IntrospectionError); // 3 rows > 2
+    expect(() => inspectExtracted(root, { maxSurfaceRows: 3 })).not.toThrow();
+  });
+});
+
+// ---- §7 parse budgets (multi-dimensional, injectable — no 256MiB inputs) ----------------------
+describe("inspectExtracted — §7 parse budgets", () => {
+  test("a .d.ts over the per-file byte cap throws (checked BEFORE createSourceFile)", () => {
+    const root = writePackage([
+      { name: "package.json", content: JSON.stringify({ name: "expo", types: "./index.d.ts" }) },
+      { name: "index.d.ts", content: `export declare const a: 1;`.padEnd(200, " ") },
+    ]);
+    expect(() => inspectExtracted(root, { maxParseFileBytes: 50 })).toThrow(/\.d\.ts file exceeds 50 bytes/);
+    expect(() => inspectExtracted(root, { maxParseFileBytes: 10_000 })).not.toThrow();
+  });
+
+  test("ALIAS memoization: non-canonical subpath aliases of ONE .d.ts parse it once and SUCCEED under maxParseFiles=1", () => {
+    // `.//index.js`, `./d/../index.js`, `././index.js` all canonicalize to index.d.ts. A broken
+    // (non-canonical) memo would parse it 3× and blow maxParseFiles=1; canonical memoization
+    // collapses the three subpath aliases to a SINGLE parse, so even a 1-parse budget succeeds.
+    const root = writePackage([
+      {
+        name: "package.json",
+        content: JSON.stringify({ name: "expo", exports: { "./a": ".//index.js", "./b": "./d/../index.js", "./c": "././index.js" } }),
+      },
+      { name: "index.d.ts", content: `export declare function shared(): void;` },
+    ]);
+    let surface!: ReturnType<typeof inspectExtracted>;
+    expect(() => { surface = inspectExtracted(root, { maxParseFiles: 1 }); }).not.toThrow();
+    expect(surface.rows.map((r) => r.exportName)).toContain("shared"); // parsed once, did NOT fail closed
+  });
+
+  test("THIN-BARREL exhaustion: many distinct barrels over maxParseFiles fail closed; at-cap passes", () => {
+    const files = [
+      { name: "package.json", content: JSON.stringify({ name: "expo", exports: { "./a": "./a.js", "./b": "./b.js", "./c": "./c.js", "./d": "./d.js" } }) },
+      { name: "child.d.ts", content: `export declare const fromChild: number;` },
+    ];
+    for (const n of ["a", "b", "c", "d"]) files.push({ name: `${n}.d.ts`, content: `export * from "./child";` });
+    const root = writePackage(files);
+    expect(() => inspectExtracted(root, { maxParseFiles: 3 })).toThrow(/parsed \.d\.ts files exceed 3/); // 4 barrels + child = 5
+    expect(() => inspectExtracted(root, { maxParseFiles: 5 })).not.toThrow(); // child memoized → exactly 5
+  });
+
+  test("the global cumulative parsed-BYTES budget fails closed independent of file count", () => {
+    const big = `export declare const x: 1;`.padEnd(400, " ");
+    const root = writePackage([
+      { name: "package.json", content: JSON.stringify({ name: "expo", exports: { "./a": "./a.js", "./b": "./b.js" } }) },
+      { name: "a.d.ts", content: big },
+      { name: "b.d.ts", content: big },
+    ]);
+    // each file is under the per-file cap and the count cap, but together exceed the byte budget.
+    expect(() => inspectExtracted(root, { maxParseFileBytes: 10_000, maxParseFiles: 10, maxTotalParseBytes: 500 })).toThrow(/total parsed \.d\.ts bytes exceed 500/);
+    expect(() => inspectExtracted(root, { maxParseFileBytes: 10_000, maxParseFiles: 10, maxTotalParseBytes: 10_000 })).not.toThrow();
+  });
+
+  test("a MAX_FOLLOW_FILES+1 barrel chain THROWS (proves the silent-truncation fix)", () => {
+    const files = [
+      { name: "package.json", content: JSON.stringify({ name: "expo", types: "./index.d.ts" }) },
+      { name: "index.d.ts", content: `export * from "./b1";` },
+    ];
+    for (let i = 1; i <= 4; i++) {
+      files.push({ name: `b${i}.d.ts`, content: i < 4 ? `export * from "./b${i + 1}";` : `export declare const leaf: number;` });
+    }
+    const root = writePackage(files);
+    expect(() => inspectExtracted(root, { maxFollowFiles: 3 })).toThrow(/follow limit 3 exceeded/); // 4 follows > 3
+    expect(() => inspectExtracted(root, { maxFollowFiles: 4 })).not.toThrow();
   });
 });
 

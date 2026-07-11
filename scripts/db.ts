@@ -23,6 +23,18 @@ function fail(msg: string): never {
 // Bump when the schema changes; older on-disk versions run the §3 migration.
 export const SCHEMA_VERSION = 2;
 
+// §7 SURFACE-CACHE EPOCH. Bumped when the introspection LOGIC changes (resolver correctness, parse
+// bounds) so a package audited by an OLDER, buggier resolver does NOT keep its stale '__complete__'
+// marker forever (hasCompletionMarker short-circuits BEFORE inspection, and even --fresh preserves
+// package_api_surface). The epoch is stamped into the marker row's `source` column (no DDL change,
+// so no destructive v2→v3 table migration): a marker whose stored epoch != this constant is treated
+// as ABSENT → the version is re-inspected under the current resolver, and writeApiSurface REPLACES
+// the version's whole row set. Start at 2 so every pre-epoch marker (source='__complete__') misses.
+export const SURFACE_SCHEMA_VERSION = 2;
+const COMPLETION_KIND = "__complete__";
+// The marker row's `source` value: identifies the marker AND carries the surface epoch.
+const markerSource = (epoch: number): string => `${COMPLETION_KIND}@${epoch}`;
+
 export const nowIso = (): string => new Date().toISOString();
 
 // §3: ALL persisted timestamps use ONE canonical fixed-width ISO-8601 UTC form so that
@@ -830,21 +842,24 @@ export class AuditDb {
   // so a partial/crashed introspection leaves NO marker and is re-attempted. The write REPLACES
   // the version's whole row set: a marker-less partial introspection may have left rows that
   // are no longer in the new surface, and upserting over them would orphan stale exports.
+  // §7 EPOCH: a marker counts ONLY when its stored surface epoch (in `source`) equals the current
+  // SURFACE_SCHEMA_VERSION — a stale-epoch marker (an OLD resolver's, or a pre-epoch bare
+  // '__complete__') is treated as ABSENT, so this version is re-inspected under the current logic.
   hasCompletionMarker(packageName: string, version: string): boolean {
     return (
       this.db
         .query(
           `SELECT 1 AS x FROM package_api_surface
-           WHERE package_name = ? AND version = ? AND export_name = '' AND export_kind = '__complete__'`,
+           WHERE package_name = ? AND version = ? AND export_name = '' AND export_kind = ? AND source = ?`,
         )
-        .get(packageName, version) !== null
+        .get(packageName, version, COMPLETION_KIND, markerSource(SURFACE_SCHEMA_VERSION)) !== null
     );
   }
 
   writeApiSurface(input: ApiSurfaceInput): void {
     for (const r of input.rows) {
-      if ((r.exportKind as string) === "__complete__")
-        fail(`writeApiSurface rows must not contain the '__complete__' marker — db.ts appends it`);
+      if ((r.exportKind as string) === COMPLETION_KIND)
+        fail(`writeApiSurface rows must not contain the '${COMPLETION_KIND}' marker — db.ts appends it`);
     }
     const now = nowIso();
     const insert = this.db.query(
@@ -856,12 +871,14 @@ export class AuditDb {
          introspected_at = excluded.introspected_at`,
     );
     this.db.transaction(() => {
+      // REPLACE the version's whole row set (drops any stale-epoch / marker-less partial rows) …
       this.db
         .query(`DELETE FROM package_api_surface WHERE package_name = ? AND version = ?`)
         .run(input.packageName, input.version);
       for (const r of input.rows)
         insert.run(input.packageName, input.version, input.versionSource, r.exportName, r.exportKind, r.source, now);
-      insert.run(input.packageName, input.version, input.versionSource, "", "__complete__", "__complete__", now);
+      // … then stamp the marker LAST with the CURRENT surface epoch in `source` (§7).
+      insert.run(input.packageName, input.version, input.versionSource, "", COMPLETION_KIND, markerSource(SURFACE_SCHEMA_VERSION), now);
     })();
   }
 }

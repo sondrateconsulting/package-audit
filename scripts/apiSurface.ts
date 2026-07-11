@@ -17,9 +17,12 @@ import type { AuditDb, ApiSurfaceRow, ResolvedVersionSource } from "./db.ts";
 import { parseJsoncObject } from "./jsonc.ts";
 import {
   resolveTypeTargets, typeTargetToDts, binNames, exportsSubpathKeys, resolveSubpath,
-  resolvePatternTargetTemplates, hasVersionedExportCondition, type PkgJson,
+  resolvePatternTargetTemplates, hasVersionedExportCondition, declarationCandidates, type PkgJson,
 } from "./exportsResolve.ts";
-import { enumerateDtsExports, joinRelative, type DtsResolver } from "./dtsExports.ts";
+import {
+  enumerateDtsExports, joinRelative, createParseBudget,
+  type DtsResolver, type DtsResolved, type ParseBudget, type ParseBudgetOptions,
+} from "./dtsExports.ts";
 import { maxSatisfying } from "./semver.ts";
 import { scanTarball } from "./tarScan.ts";
 // Re-exported so callers (and tests) get the same fail-closed name validator the fetch layer uses.
@@ -220,6 +223,7 @@ export interface IntrospectOptions {
   fetchTimeoutMs?: number; // wall-clock deadline per hop/body read (default FETCH_TIMEOUT_MS)
   packument?: Packument; // optional pre-fetched packument (the orchestrator caches per package)
   maxPatternMatches?: number; // §5.E #6a cap on distinct wildcard-export matches (default MAX_PATTERN_MATCHES)
+  inspectCaps?: InspectCaps; // §7 parse-budget / cardinality overrides (tests inject tiny caps)
 }
 
 const realFetch: FetchFn = (url, init) =>
@@ -318,6 +322,18 @@ const MAX_PATTERN_FILES = 20_000; // aligns with tarScan MAX_ENTRIES
 export const MAX_PATTERN_MATCHES = 4096;
 const DECL_OR_SOURCE_FILE_RE = /\.(d\.[cm]?ts|tsx?|mts|cts)$/;
 
+// §7 cardinality / size caps for attacker-controlled package.json metadata. `inspectExtracted`
+// enumerates exports/bins/subpaths with no bound beyond the 100MB archive cap, so a hostile
+// manifest could amplify into millions of rows / names. These caps are GENEROUS vs real packages;
+// every breach is fail-closed (IntrospectionError → no marker), never a silent truncation.
+export const MAX_PKG_JSON_BYTES = 4 * 1024 * 1024;
+export const MAX_EXACT_EXPORTS = 16_384;
+export const MAX_BIN_NAMES = 4096;
+export const MAX_SURFACE_ROWS = 65_536;
+export const MAX_NAME_BYTES = 1024;
+// Per-specifier declaration probes for a followed re-export (§D3 extension substitution + legacy).
+const MAX_REEXPORT_CANDIDATES = 16;
+
 // Turn a raw target TEMPLATE (containing '*') into an ANCHORED RegExp: literal parts are regex-
 // escaped, the FIRST '*' becomes a NAMED capture `(?<cap>[\s\S]+?)`, and every LATER '*' becomes a
 // named backref `\k<cap>`. Named (not numbered) backrefs avoid the `\1`+digit ambiguity; `[\s\S]`
@@ -377,9 +393,58 @@ function listDeclarationFiles(packageRoot: string, cap: number): string[] {
   return out;
 }
 
-function inspectExtracted(packageRoot: string, caps: { maxPatternMatches?: number } = {}): ExtractedSurface {
+// §7: canonical (segment-collapsed) package-relative path — the memo key that dedupes a file
+// reached via any subpath alias (`.//x`, `./d/../x`) OR any re-export barrel so it is parsed at
+// most once. The extracted tree is proven symlink-free (assertExtractedTreeSafe), so a plain
+// join-collapse equals the realpath here; '/' separators are normalized for a stable key.
+function canonicalRel(packageRoot: string, rel: string): string {
+  const abs = join(packageRoot, rel.replace(/^\.\//, ""));
+  return relative(packageRoot, abs).split(sep).join("/");
+}
+
+// §D3: bounded declaration candidates for a followed runtime re-export specifier. Reuses the SAME
+// extension-substitution logic exportsResolve.declarationCandidates uses (`./m.js`→`m.d.ts`,
+// `.mjs`→`.d.mts`, `.cjs`→`.d.cts`, `.ts/.tsx` source, extensionless→`.d.ts`/`/index.d.ts`),
+// unioned with the legacy `.d.mts/.d.cts/base` probes, deduped and capped per specifier.
+function reexportCandidates(base: string): string[] {
+  const out: string[] = [];
+  const push = (c: string): void => {
+    if (c !== "" && !out.includes(c) && out.length < MAX_REEXPORT_CANDIDATES) out.push(c);
+  };
+  for (const c of declarationCandidates(base)) push(c);
+  for (const c of [`${base}.d.ts`, `${base}.d.mts`, `${base}.d.cts`, `${base}/index.d.ts`, base]) push(c);
+  return out;
+}
+
+// Injectable caps for direct testing: the wildcard-match cap, the cardinality/size caps, AND the
+// shared parse-budget overrides. Small values let tests exercise every boundary (alias-memoization,
+// barrel exhaustion, cardinality overflow) deterministically without building multi-MB inputs; each
+// defaults to its exported constant so production behaviour is unchanged.
+export interface InspectCaps extends ParseBudgetOptions {
+  maxPatternMatches?: number;
+  maxPkgJsonBytes?: number;
+  maxExactExports?: number;
+  maxBinNames?: number;
+  maxSurfaceRows?: number;
+  maxNameBytes?: number;
+}
+
+// EXPORTED for §7 direct testing. Enumerates the .d.ts export surface + bin names from an extracted
+// package, fail-closed on any cardinality/parse-budget breach (throws → no marker written).
+export function inspectExtracted(packageRoot: string, caps: InspectCaps = {}): ExtractedSurface {
+  // Effective §7 caps (each defaults to its exported constant; overridable for deterministic tests).
+  const maxPkgJsonBytes = caps.maxPkgJsonBytes ?? MAX_PKG_JSON_BYTES;
+  const maxExactExports = caps.maxExactExports ?? MAX_EXACT_EXPORTS;
+  const maxBinNames = caps.maxBinNames ?? MAX_BIN_NAMES;
+  const maxSurfaceRows = caps.maxSurfaceRows ?? MAX_SURFACE_ROWS;
+  const maxNameBytes = caps.maxNameBytes ?? MAX_NAME_BYTES;
+
   const pkgText = readContained(packageRoot, "package.json");
   if (pkgText === null) throw new IntrospectionError("package/package.json not found in tarball");
+  // §7 size cap: a multi-MB manifest is rejected BEFORE parse/enumeration (bounds JSON + downstream
+  // regex/DB work on attacker-controlled metadata).
+  if (Buffer.byteLength(pkgText, "utf8") > maxPkgJsonBytes)
+    throw new IntrospectionError(`package.json exceeds ${maxPkgJsonBytes} bytes`);
   let pkg: PkgJson;
   try {
     pkg = parseJsoncObject(pkgText).value as PkgJson;
@@ -397,14 +462,28 @@ function inspectExtracted(packageRoot: string, caps: { maxPatternMatches?: numbe
 
   const rows: ApiSurfaceRow[] = [];
   const seen = new Set<string>(); // dedup export rows across import+require targets
+  // §7 shared parse budget (per-file byte cap, global parse-count + parsed-bytes budgets, canonical
+  // memo, follow/per-file caps) threaded through EVERY collectFromDts AND the re-export follower.
+  const budget: ParseBudget = createParseBudget(caps);
 
-  // dtsExports resolver: map a relative `export * from './x'` to its declaration text, trying the
-  // usual .d.ts resolution candidates. Paths are package-relative (dtsExports uses joinRelative).
-  const resolver: DtsResolver = (spec, fromFile): string | null => {
+  // §7 EVERY row creation routes through pushRow → fail-closed on an over-long name or a row-count
+  // breach (a hostile manifest cannot amplify into an unbounded surface before the DB write).
+  const pushRow = (row: ApiSurfaceRow): void => {
+    if (Buffer.byteLength(row.exportName, "utf8") > maxNameBytes)
+      throw new IntrospectionError(`export name exceeds ${maxNameBytes} bytes`);
+    if (rows.length + 1 > maxSurfaceRows)
+      throw new IntrospectionError(`surface rows exceed ${maxSurfaceRows}`);
+    rows.push(row);
+  };
+
+  // dtsExports resolver: map a relative `export * from './x'` to its declaration text AND the
+  // CANONICAL path of the file OPENED (§D2 — subsequent nested relatives resolve against THAT path,
+  // not the requested specifier). Paths are package-relative (dtsExports uses joinRelative).
+  const resolver: DtsResolver = (spec, fromFile): DtsResolved | null => {
     const base = joinRelative(fromFile, spec);
-    for (const cand of [`${base}.d.ts`, `${base}.d.mts`, `${base}.d.cts`, `${base}/index.d.ts`, base]) {
+    for (const cand of reexportCandidates(base)) {
       const text = readContained(packageRoot, cand);
-      if (text !== null) return text;
+      if (text !== null) return { text, canonicalPath: canonicalRel(packageRoot, cand) };
     }
     return null;
   };
@@ -412,11 +491,13 @@ function inspectExtracted(packageRoot: string, caps: { maxPatternMatches?: numbe
   const collectFromDts = (dtsRel: string): void => {
     const dts = readContained(packageRoot, dtsRel);
     if (dts === null) return;
-    for (const exp of enumerateDtsExports(dts, dtsRel.replace(/^\.\//, ""), resolver)) {
+    // canonical rootPath = the shared memo key (dedupes aliases + barrels against one parse).
+    const canonical = canonicalRel(packageRoot, dtsRel);
+    for (const exp of enumerateDtsExports(dts, canonical, resolver, budget)) {
       const key = `${exp.kind}\0${exp.name}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      rows.push({ exportName: exp.name, exportKind: exp.kind, source: dtsRel });
+      pushRow({ exportName: exp.name, exportKind: exp.kind, source: dtsRel });
     }
   };
 
@@ -430,15 +511,19 @@ function inspectExtracted(packageRoot: string, caps: { maxPatternMatches?: numbe
   }
 
   // exact `exports` subpaths ('./config' …) are part of the FULL public surface (§5.E), each
-  // resolved under both modes and unioned.
-  for (const subpath of exportsSubpathKeys(pkg).exact) {
+  // resolved under both modes and unioned. §7: the KEY count is capped (a hostile manifest with
+  // millions of exact subpaths would otherwise drive unbounded resolution/parse work).
+  const subpathKeys = exportsSubpathKeys(pkg);
+  if (subpathKeys.exact.length > maxExactExports)
+    throw new IntrospectionError(`too many exact export subpaths (> ${maxExactExports}) — fail closed`);
+  for (const subpath of subpathKeys.exact) {
     for (const target of resolveSubpath(pkg, subpath).targets) collectFromDts(typeTargetToDts(target));
   }
 
   // '*'-pattern `exports` subpaths (§5.E #6a): resolve each pattern's raw target TEMPLATE under
   // both modes, map to its .d.ts form, and match against a bounded declaration-file listing of the
   // extracted tree — so a decoy that hides real surface behind a wildcard export is still audited.
-  const patternKeys = exportsSubpathKeys(pkg).patterns;
+  const patternKeys = subpathKeys.patterns;
   if (patternKeys.length > 0) {
     if (patternKeys.length > MAX_PATTERN_KEYS)
       throw new IntrospectionError(`too many pattern export keys (> ${MAX_PATTERN_KEYS}) — fail closed`);
@@ -456,12 +541,16 @@ function inspectExtracted(packageRoot: string, caps: { maxPatternMatches?: numbe
     }
   }
 
-  // bin names (§5.G) — the cli-bin surface, deduped
-  for (const bin of binNames(pkg)) {
+  // bin names (§5.G) — the cli-bin surface, deduped. §7: the bin COUNT is capped (also bounds the
+  // downstream CLI matcher work, whose hostile-bin count is bounded HERE).
+  const bins = binNames(pkg);
+  if (bins.length > maxBinNames)
+    throw new IntrospectionError(`too many bin names (> ${maxBinNames}) — fail closed`);
+  for (const bin of bins) {
     const key = `cli-bin\0${bin}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    rows.push({ exportName: bin, exportKind: "cli-bin", source: "package.json#bin" });
+    pushRow({ exportName: bin, exportKind: "cli-bin", source: "package.json#bin" });
   }
   return { rows };
 }
@@ -562,7 +651,7 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
       // reject the version if the extracted tree contains any symlink or non-regular member.
       assertExtractedTreeSafe(extractRoot);
       // npm tarballs root everything under `package/`.
-      const surface = inspectExtracted(join(extractRoot, "package"), { maxPatternMatches: opts.maxPatternMatches });
+      const surface = inspectExtracted(join(extractRoot, "package"), { maxPatternMatches: opts.maxPatternMatches, ...opts.inspectCaps });
       // atomic surface + '__complete__' marker (durable success record, even for zero rows)
       db.writeApiSurface({ packageName, version, versionSource, rows: surface.rows });
     } finally {

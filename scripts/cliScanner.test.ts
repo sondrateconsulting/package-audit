@@ -125,6 +125,28 @@ describe("scanCli — shell / Dockerfile / workflow / Makefile", () => {
   });
 });
 
+describe("deriveTerms — precompiled bare matchers (§7)", () => {
+  test("bareMatchers is compiled once per exec/bare term and matches like bareTokenRegex", () => {
+    const d = deriveTerms({ packageName: "expo", name: "expo", binNames: ["expo-cli"] });
+    expect(d.bareMatchers.length).toBe(d.execAndBareTerms.size); // one per exec/bare term
+    expect(d.bareMatchers.some((re) => re.test("expo start"))).toBe(true);
+    expect(d.bareMatchers.some((re) => re.test("expo-cli run"))).toBe(true);
+    // boundary-aware: a longer word must NOT match (behaviour-identical to bareTokenRegex)
+    expect(d.bareMatchers.some((re) => re.test("run-export-thing"))).toBe(false);
+  });
+  test("a scoped name contributes only its bins as bare matchers (never the scoped specifier)", () => {
+    const d = deriveTerms({ packageName: "@scope/pkg", name: "@scope/pkg", binNames: ["mycli"] });
+    expect(d.bareMatchers.length).toBe(1); // just the bin
+    expect(d.bareMatchers[0]!.test("mycli run")).toBe(true);
+  });
+  test("a reused precompiled matcher is stateless across commands (no /g lastIndex leak)", () => {
+    const d = deriveTerms({ packageName: "expo", name: "expo", binNames: [] });
+    const re = d.bareMatchers[0]!;
+    expect(re.test("expo a")).toBe(true);
+    expect(re.test("expo a")).toBe(true); // second call: same result, no lastIndex advance
+  });
+});
+
 describe("scanCli — determinism + shape", () => {
   test("two scripts invoking the package on distinct keys are distinct rows (context in identity)", () => {
     const p = `{ "scripts": { "a": "expo build", "b": "expo test" } }`;
