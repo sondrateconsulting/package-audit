@@ -7,6 +7,7 @@
   "scripts": {
     "audit": "bun run scripts/orchestrate.ts",
     "report": "bun run scripts/report.ts",
+    "compare": "bun run scripts/compare.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
