@@ -8,6 +8,7 @@ import {
   readBodyCapped, FETCH_TIMEOUT_MS, MAX_PACKUMENT_BYTES, isValidPackageName,
   IntrospectionError, matchPatternTemplates, MAX_PATTERN_MATCHES, inspectExtracted,
   MAX_PKG_JSON_BYTES, MAX_EXACT_EXPORTS, MAX_BIN_NAMES, MAX_SURFACE_ROWS, MAX_NAME_BYTES,
+  registryBasePrefix, isSafeArtifactPath,
   type FetchFn, type Packument,
 } from "./apiSurface.ts";
 import { Database } from "bun:sqlite";
@@ -149,6 +150,54 @@ describe("selectVersionDist + resolveRangeToVersion + encodePackageNameForUrl", 
     // gets all slashes encoded so none leak as literal registry-URL path separators.
     expect(encodePackageNameForUrl("@a/b/c")).toBe("@a%2Fb%2Fc");
     expect(encodePackageNameForUrl("@scope/pkg")).toBe("@scope%2Fpkg");
+  });
+});
+
+// ---- §5.E finding #8: artifact-path confused-deputy (origin-AND-base-path policy) -------------
+describe("registryBasePrefix — operator-derived base path with a segment boundary", () => {
+  test("yields '/' for a root registry (npmjs), with or without a trailing slash", () => {
+    expect(registryBasePrefix("https://registry.npmjs.org")).toBe("/");
+    expect(registryBasePrefix("https://registry.npmjs.org/")).toBe("/");
+  });
+  test("yields '/api/npm/team/' for a based registry, normalizing trailing slashes", () => {
+    expect(registryBasePrefix("https://artifactory.corp/api/npm/team")).toBe("/api/npm/team/");
+    expect(registryBasePrefix("https://artifactory.corp/api/npm/team/")).toBe("/api/npm/team/");
+    expect(registryBasePrefix("https://artifactory.corp/api/npm/team///")).toBe("/api/npm/team/");
+  });
+  test("the trailing slash is a segment boundary: a sibling 'team-evil' does NOT match", () => {
+    // startsWith without the boundary would admit /api/npm/team-evil/... — the trailing '/' closes it.
+    const base = registryBasePrefix("https://artifactory.corp/api/npm/team"); // "/api/npm/team/"
+    expect("/api/npm/team-evil/pkg/-/pkg-1.0.0.tgz".startsWith(base)).toBe(false);
+    expect(isSafeArtifactPath(new URL("https://artifactory.corp/api/npm/team-evil/pkg/-/pkg-1.0.0.tgz"), base)).toBe(false);
+  });
+});
+
+describe("isSafeArtifactPath — HARDENED artifact-path predicate (startsWith is NOT enough)", () => {
+  const BASED = "/api/npm/team/";
+  test("accepts legit under-base tarball paths (flat, scoped-with-literal-slash, and root registry)", () => {
+    expect(isSafeArtifactPath(new URL("https://artifactory.corp/api/npm/team/expo/-/expo-1.0.0.tgz"), BASED)).toBe(true);
+    expect(isSafeArtifactPath(new URL("https://artifactory.corp/api/npm/team/@scope/pkg/-/pkg-1.0.0.tgz"), BASED)).toBe(true);
+    expect(isSafeArtifactPath(new URL("https://registry.npmjs.org/expo/-/expo-1.0.0.tgz"), "/")).toBe(true);
+  });
+  test("rejects an off-base same-origin path (the confused-deputy target)", () => {
+    expect(isSafeArtifactPath(new URL("https://artifactory.corp/api/admin/status?probe=1"), BASED)).toBe(false);
+  });
+  test("rejects a MATRIX-PARAM traversal '..;/' — startsWith is true, so startsWith-only would WRONGLY accept it", () => {
+    const u = new URL("https://artifactory.corp/api/npm/team/..;/admin");
+    expect(u.pathname.startsWith(BASED)).toBe(true); // the bypass: prefix still matches
+    expect(isSafeArtifactPath(u, BASED)).toBe(false); // the hardened predicate rejects it
+  });
+  test("rejects ENCODED path separators %2f/%2F/%5c/%5C — startsWith-only would WRONGLY accept them", () => {
+    const enc = new URL("https://artifactory.corp/api/npm/team/..%2f..%2fadmin");
+    expect(enc.pathname.startsWith(BASED)).toBe(true);
+    expect(isSafeArtifactPath(enc, BASED)).toBe(false);
+    expect(isSafeArtifactPath(new URL("https://artifactory.corp/api/npm/team/..%2F..%2Fadmin"), BASED)).toBe(false);
+    expect(isSafeArtifactPath(new URL("https://artifactory.corp/api/npm/team/x%5c..%5cadmin"), BASED)).toBe(false);
+    expect(isSafeArtifactPath(new URL("https://artifactory.corp/api/npm/team/x%5C..%5Cadmin"), BASED)).toBe(false);
+  });
+  test("rejects a percent-encoded dot-dot segment reaching above the base", () => {
+    // %2e%2e normalizes off-base via the URL parser; either way it must fail closed.
+    expect(isSafeArtifactPath(new URL("https://artifactory.corp/api/npm/team/%2e%2e/admin"), BASED)).toBe(false);
   });
 });
 
@@ -893,6 +942,108 @@ describe("introspectVersion — integration (real system tar)", () => {
     expect((db.read("SELECT message FROM errors").get() as { message: string }).message).toContain("off-origin redirect");
     db.close();
   });
+
+  // ---- §5.E finding #8: same-origin artifact-path confused-deputy (origin passes; base must too) ----
+  // A based private registry (auth env set). The bearer token must reach ONLY safe under-base
+  // artifact paths — never a same-origin off-base/traversal-bypass path the packument steers us to.
+  const BASED_REGISTRY = "https://artifactory.corp/api/npm/team";
+  const UNDER_BASE_TGZ = "https://artifactory.corp/api/npm/team/expo/-/expo-1.0.0.tgz";
+  // Drive introspectVersion against a based registry with auth, recording the pathname of EVERY
+  // auth-bearing request. `tarballUrl` is the packument's dist.tarball; `redirectLocation`, when
+  // set, is a 302 Location served for the (under-base, safe) .tgz fetch.
+  const runBasedArtifact = async (
+    db: AuditDb,
+    opts: { tarballUrl: string; redirectLocation?: string },
+  ): Promise<{ authPaths: string[]; errorMessage: string | undefined }> => {
+    const runId = seedRun(db);
+    const tgz = buildTgz([{ name: "package.json", content: `{"name":"expo"}` }]);
+    const packument = JSON.stringify({
+      versions: { "1.0.0": { dist: { tarball: opts.tarballUrl, integrity: `sha512-${createHash("sha512").update(tgz).digest("base64")}` } } },
+    });
+    const authPaths: string[] = [];
+    const fetchImpl: FetchFn = async (url, init) => {
+      if (init.headers["Authorization"] !== undefined) authPaths.push(new URL(url).pathname);
+      if (url.endsWith(".tgz")) {
+        if (opts.redirectLocation !== undefined)
+          return { status: 302, ok: false, headers: { get: (n: string) => (n.toLowerCase() === "location" ? opts.redirectLocation! : null) }, arrayBuffer: async () => new ArrayBuffer(0), text: async () => "" };
+        return { status: 200, ok: true, headers: { get: () => null }, arrayBuffer: async () => tgz.buffer.slice(tgz.byteOffset, tgz.byteOffset + tgz.byteLength) as ArrayBuffer, text: async () => "" };
+      }
+      return { status: 200, ok: true, headers: { get: () => null }, arrayBuffer: async () => new ArrayBuffer(0), text: async () => packument }; // packument hop
+    };
+    const client = new GithubClient({ githubHost: "github.com", tempRoot: TMP });
+    await introspectVersion({
+      client, db, runId, packageName: "expo",
+      registryUrl: BASED_REGISTRY, registryAuthEnvVar: "TOKEN", env: { TOKEN: "secret-bearer" },
+      version: "1.0.0", versionSource: "lockfile", fetchImpl,
+    });
+    return { authPaths, errorMessage: (db.read("SELECT message FROM errors").get() as { message: string } | undefined)?.message };
+  };
+
+  test("a same-origin dist.tarball OUTSIDE the registry base is rejected; token never sent off-base", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { authPaths, errorMessage } = await runBasedArtifact(db, { tarballUrl: "https://artifactory.corp/api/admin/status?probe=1" });
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    expect(errorMessage).toMatch(/base|artifact|path/i);
+    expect(authPaths).not.toContain("/api/admin/status"); // the confused-deputy GET never fired
+    db.close();
+  });
+
+  test("a same-origin 302 redirect OUTSIDE the base is rejected; token never sent to the off-base path", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { authPaths, errorMessage } = await runBasedArtifact(db, { tarballUrl: UNDER_BASE_TGZ, redirectLocation: "https://artifactory.corp/api/admin/status" });
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    expect(errorMessage).toMatch(/redirect/i);
+    expect(errorMessage).toMatch(/base|artifact|path/i);
+    expect(authPaths).not.toContain("/api/admin/status");
+    db.close();
+  });
+
+  test("MATRIX-PARAM bypass '..;/admin' in dist.tarball is rejected (startsWith-only would WRONGLY follow it)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { authPaths, errorMessage } = await runBasedArtifact(db, { tarballUrl: "https://artifactory.corp/api/npm/team/..;/admin" });
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    expect(errorMessage).toMatch(/base|artifact|path/i);
+    expect(authPaths).not.toContain("/api/npm/team/..;/admin"); // the token never reached the matrix-param path
+    db.close();
+  });
+
+  test("ENCODED-SLASH bypass '..%2f..%2fadmin' in dist.tarball is rejected (startsWith-only would WRONGLY follow it)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { authPaths, errorMessage } = await runBasedArtifact(db, { tarballUrl: "https://artifactory.corp/api/npm/team/..%2f..%2fadmin" });
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    expect(errorMessage).toMatch(/base|artifact|path/i);
+    expect(authPaths).not.toContain("/api/npm/team/..%2f..%2fadmin");
+    db.close();
+  });
+
+  test("MATRIX-PARAM bypass via a same-origin 302 redirect is rejected on the hop (startsWith-only would follow it)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { authPaths, errorMessage } = await runBasedArtifact(db, { tarballUrl: UNDER_BASE_TGZ, redirectLocation: "https://artifactory.corp/api/npm/team/..;/admin" });
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    expect(errorMessage).toMatch(/base|artifact|path/i);
+    expect(authPaths).not.toContain("/api/npm/team/..;/admin");
+    db.close();
+  });
+
+  test("ENCODED-SLASH bypass via a same-origin 302 redirect is rejected on the hop (startsWith-only would follow it)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { authPaths, errorMessage } = await runBasedArtifact(db, { tarballUrl: UNDER_BASE_TGZ, redirectLocation: "https://artifactory.corp/api/npm/team/..%2f..%2fadmin" });
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    expect(errorMessage).toMatch(/base|artifact|path/i);
+    expect(authPaths).not.toContain("/api/npm/team/..%2f..%2fadmin");
+    db.close();
+  });
+
+  test("GREEN: a normal under-base tarball on a BASED registry still audits; token reaches ONLY under-base paths", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { authPaths, errorMessage } = await runBasedArtifact(db, { tarballUrl: UNDER_BASE_TGZ });
+    expect(errorMessage).toBeUndefined();
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(true);
+    // the bearer token was attached ONLY to the packument + the under-base tarball, nowhere else.
+    expect(authPaths.sort()).toEqual(["/api/npm/team/expo", "/api/npm/team/expo/-/expo-1.0.0.tgz"]);
+    db.close();
+  });
+
   test("dedup: a version with an existing marker does no network work", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     db.writeApiSurface({ packageName: "expo", version: "1.0.0", versionSource: "lockfile", rows: [] });
@@ -1150,6 +1301,57 @@ describe("fetchPackument — a hostile package name is rejected before any reque
       fetchImpl: recordingFetch(calls),
     });
     expect(calls).toEqual(["https://r.example/npm/team/expo"]);
+  });
+});
+
+describe("fetchPackument — bearer-token policy for scoped names + redirects (finding #8)", () => {
+  // records the Authorization header seen per request URL (null when the token was NOT attached)
+  const authRecordingFetch =
+    (calls: { url: string; auth: string | null }[]): FetchFn =>
+    async (url, init) => {
+      calls.push({ url, auth: init.headers["Authorization"] ?? null });
+      return { status: 200, ok: true, headers: { get: () => null }, arrayBuffer: async () => new ArrayBuffer(0), text: async () => `{"versions":{}}` };
+    };
+
+  test("a SCOPED package on a private registry KEEPS its bearer token (the %2F scope slash must not drop auth)", async () => {
+    // Regression guard: the artifact-path policy rejects %2F (correct for attacker-controlled
+    // tarball paths), but the packument URL for a scoped name legitimately encodes the scope slash
+    // as %2F. The token MUST still attach here, or every scoped package 401s on a private registry.
+    const calls: { url: string; auth: string | null }[] = [];
+    await fetchPackument({
+      packageName: "@scope/pkg",
+      registryUrl: "https://r.example/npm/team",
+      registryAuthEnvVar: "TOKEN",
+      env: { TOKEN: "secret-bearer" },
+      fetchImpl: authRecordingFetch(calls),
+    });
+    expect(calls).toEqual([{ url: "https://r.example/npm/team/@scope%2Fpkg", auth: "Bearer secret-bearer" }]);
+  });
+
+  test("a same-origin packument redirect is followed WITHOUT the token (confused-deputy closed)", async () => {
+    const calls: { url: string; auth: string | null }[] = [];
+    const redirectingFetch: FetchFn = async (url, init) => {
+      calls.push({ url, auth: init.headers["Authorization"] ?? null });
+      if (url === "https://r.example/npm/team/expo")
+        return {
+          status: 302,
+          ok: false,
+          headers: { get: (n: string) => (n.toLowerCase() === "location" ? "https://r.example/api/admin?probe=1" : null) },
+          arrayBuffer: async () => new ArrayBuffer(0),
+          text: async () => "",
+        };
+      return { status: 200, ok: true, headers: { get: () => null }, arrayBuffer: async () => new ArrayBuffer(0), text: async () => `{"versions":{}}` };
+    };
+    await fetchPackument({
+      packageName: "expo",
+      registryUrl: "https://r.example/npm/team",
+      registryAuthEnvVar: "TOKEN",
+      env: { TOKEN: "secret-bearer" },
+      fetchImpl: redirectingFetch,
+    });
+    // the initial pinned path carries the token; the same-origin redirect to /api/admin does NOT.
+    expect(calls[0]).toEqual({ url: "https://r.example/npm/team/expo", auth: "Bearer secret-bearer" });
+    expect(calls[1]).toEqual({ url: "https://r.example/api/admin?probe=1", auth: null });
   });
 });
 

@@ -145,6 +145,49 @@ export function encodePackageNameForUrl(name: string): string {
   return name.startsWith("@") ? name.replace(/\//g, "%2F") : name;
 }
 
+// ---- artifact-path policy (§5.E finding #8, pure) -------------------------------------------
+// The registry BASE PATH, derived ONLY from operator config (never packument data): the registry
+// URL's pathname with trailing slashes collapsed to a single trailing '/'. Yields '/' for a root
+// registry (npmjs) and '/api/npm/team/' for a based one. The trailing slash is a free segment
+// boundary — '/api/npm/team-evil/...' does NOT startsWith '/api/npm/team/'.
+export function registryBasePrefix(registryUrl: string): string {
+  return new URL(registryUrl).pathname.replace(/\/+$/, "") + "/";
+}
+
+// HARDENED artifact-path predicate (§5.E finding #8). A bare startsWith gate is NOT fail-closed:
+// downstream servers apply their OWN path normalization AFTER this check, so a same-origin path
+// that startsWith the base can still resolve above/outside it via a normalization differential.
+// Returns true ONLY when ALL hold:
+//   1. pathname startsWith basePrefix (the segment-bounded base check), AND
+//   2. the RAW pathname carries no encoded path separator — %2f/%2F (some servers decode to '/')
+//      or %5c/%5C (to '\') — which WHATWG `new URL` preserves un-decoded here, AND
+//   3. the pathname carries no ';' matrix parameter (Java/Tomcat/Jetty strip '..;/' → '../'), AND
+//   4. every segment AFTER basePrefix, once decodeURIComponent-ed, is neither '.' nor '..' and
+//      contains no '/' or '\' (defense against any residual normalization differential).
+// Legit npm tarball paths ('/<pkg>/-/...', scoped '/@scope/pkg/-/...') never contain %2f or ';',
+// so false-positive risk is minimal; failing closed on a rare percent-encoded-slash path is the
+// governing decision.
+export function isSafeArtifactPath(u: URL, basePrefix: string): boolean {
+  const path = u.pathname;
+  if (!path.startsWith(basePrefix)) return false;
+  if (/%2f|%5c/i.test(path)) return false; // encoded path separators a downstream server may decode
+  if (path.includes(";")) return false; // matrix parameters (…;/ folds to ../ on some stacks)
+  const rest = path.slice(basePrefix.length);
+  if (rest === "") return false; // must name an artifact UNDER the base, not the base itself
+  for (const seg of rest.split("/")) {
+    if (seg === "") continue; // incidental empty segment (e.g. a doubled slash) is not a traversal
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(seg);
+    } catch {
+      return false; // malformed percent-encoding fails closed
+    }
+    if (decoded === "." || decoded === "..") return false;
+    if (decoded.includes("/") || decoded.includes("\\")) return false;
+  }
+  return true;
+}
+
 // ---- fetch layer (injectable) ---------------------------------------------------------------
 export type FetchFn = (url: string, init: { headers: Record<string, string>; redirect: "manual"; signal?: AbortSignal }) => Promise<{
   status: number;
@@ -229,13 +272,21 @@ export interface IntrospectOptions {
 const realFetch: FetchFn = (url, init) =>
   fetch(url, { headers: init.headers, redirect: init.redirect, signal: init.signal }) as unknown as ReturnType<FetchFn>;
 
-// Fetch a URL following redirects MANUALLY, re-verifying the per-hop origin and attaching the
-// bearer token ONLY on hops whose origin equals the registry origin (never carrying it across a
-// redirect to a different origin). Accept-Encoding: identity so the .tgz gzip bytes are not
-// transparently decoded (SRI is over those exact bytes, and system tar needs them).
+// Fetch a URL following redirects MANUALLY, re-verifying the per-hop origin AND base path and
+// attaching the bearer token ONLY on hops whose origin equals the registry origin AND whose path
+// is a safe under-base artifact path (never carrying it across a redirect to a different origin,
+// nor to a same-origin off-base/traversal path — §5.E finding #8). Accept-Encoding: identity so
+// the .tgz gzip bytes are not transparently decoded (SRI is over those exact bytes, and system
+// tar needs them).
 async function fetchFollowing(
   startUrl: string,
   registryOrigin: string,
+  // The token attaches only to a same-origin URL this predicate AUTHORIZES; the tarball passes a
+  // safe-artifact-path check, the packument passes its exact pinned path (which may carry the one
+  // legitimate scope-slash %2F). rejectOffPolicyRedirect hard-rejects a same-origin off-policy 302
+  // (tarball) vs following it token-less (packument) — both fail-closed for the bearer token.
+  isAuthorizedPath: (u: URL) => boolean,
+  rejectOffPolicyRedirect: boolean,
   authToken: string | null,
   fetchImpl: FetchFn,
   wantBytes: boolean,
@@ -246,9 +297,13 @@ async function fetchFollowing(
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new IntrospectionError(`fetchTimeoutMs must be >= 1 (got ${timeoutMs})`);
   let current = startUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const sameOrigin = new URL(current).origin === registryOrigin;
+    const target = new URL(current);
+    // §5.E finding #8: origin-only is a confused-deputy hole — the token attaches ONLY to a
+    // same-origin path the caller's policy AUTHORIZES (tarball: a safe under-base artifact path;
+    // packument: exactly its pinned path, which legitimately carries the scope-slash %2F).
+    const authorized = target.origin === registryOrigin && isAuthorizedPath(target);
     const headers: Record<string, string> = { "Accept-Encoding": "identity" };
-    if (authToken !== null && sameOrigin) headers["Authorization"] = `Bearer ${authToken}`;
+    if (authToken !== null && authorized) headers["Authorization"] = `Bearer ${authToken}`;
     // per-hop deadline: covers connect/headers on the real fetch; body reads carry their own.
     let res: Awaited<ReturnType<FetchFn>>;
     try {
@@ -266,6 +321,13 @@ async function fetchFollowing(
       // ever fetches registry-origin resources, and this closes an off-origin exfiltration path.
       if (next.origin !== registryOrigin)
         throw new IntrospectionError(`off-origin redirect to ${next.origin} (registry is ${registryOrigin})`);
+      // §5.E finding #8: for the tarball (rejectOffPolicyRedirect=true) a SAME-origin redirect to
+      // an off-base / traversal-bypass path is REJECTED before the hop — a hostile 302 must not
+      // steer the token to an authenticated non-artifact path (blind confused-deputy GET). The
+      // packument (rejectOffPolicyRedirect=false) still follows a same-origin redirect but WITHOUT
+      // the token, since isAuthorizedPath only matches its exact pinned path — also fail-closed.
+      if (rejectOffPolicyRedirect && !isAuthorizedPath(next))
+        throw new IntrospectionError(`non-artifact redirect to ${next.pathname} (outside registry artifact policy)`);
       current = next.href;
       continue;
     }
@@ -625,10 +687,17 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
     const dist = selectVersionDist(packument, version);
     if (dist === null) throw new IntrospectionError(`version ${version} not present in packument`);
     // §5.E: the tarball origin MUST equal the registry origin (prevents off-origin token leaks).
+    // KEEP this origin check FIRST — a test asserts the 'origin' message on an off-origin tarball.
     if (new URL(dist.tarball).origin !== registryOrigin)
       throw new IntrospectionError(`tarball origin ${new URL(dist.tarball).origin} != registry ${registryOrigin}`);
+    // §5.E finding #8: origin alone is a confused-deputy hole — the tarball must ALSO be a safe
+    // under-base artifact path. A hostile packument setting dist.tarball to a same-origin
+    // authenticated non-artifact path (or a traversal-bypass of the base) is rejected fail-closed.
+    const basePrefix = registryBasePrefix(registryUrl);
+    if (!isSafeArtifactPath(new URL(dist.tarball), basePrefix))
+      throw new IntrospectionError(`tarball path ${new URL(dist.tarball).pathname} is outside the registry base ${basePrefix} or is not an artifact path`);
 
-    const { bytes } = await fetchFollowing(dist.tarball, registryOrigin, authToken, fetchImpl, true, opts.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
+    const { bytes } = await fetchFollowing(dist.tarball, registryOrigin, (u) => isSafeArtifactPath(u, basePrefix), true, authToken, fetchImpl, true, opts.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
     verifyIntegrity(bytes, dist.integrity, dist.shasum); // BEFORE extraction
 
     const scan = scanTarball(bytes, (b) => inflateBounded(b));
@@ -712,7 +781,12 @@ export async function fetchPackument(req: PackumentRequest): Promise<Packument> 
   const expectedPath = baseUrl.pathname.replace(/\/+$/, "") + "/" + encodePackageNameForUrl(req.packageName);
   if (target.origin !== baseUrl.origin || target.search !== "" || target.hash !== "" || target.pathname !== expectedPath)
     throw new IntrospectionError(`refusing off-target packument URL for ${req.packageName}`);
-  const { text } = await fetchFollowing(url, registryOrigin, authToken, fetchImpl, false, req.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
+  // §5.E finding #8: the packument token attaches ONLY to this exact pinned path (which for a
+  // scoped name legitimately carries the single scope-slash %2F — the artifact-path policy would
+  // wrongly reject that). A same-origin redirect is followed WITHOUT the token (path no longer
+  // matches), closing the confused-deputy without breaking scoped fetches on private registries.
+  const isPackumentPath = (u: URL): boolean => u.origin === baseUrl.origin && u.pathname === expectedPath;
+  const { text } = await fetchFollowing(url, registryOrigin, isPackumentPath, false, authToken, fetchImpl, false, req.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
