@@ -21,6 +21,10 @@ export const KNOWN_OPERATOR_ERRORS: ReadonlySet<string> = new Set([
   "ThrottleExhausted", // github.ts (§4)
   "IntrospectionError", // apiSurface.ts (§5.E)
   "ReadOnlyViolation", // readOnlyGuard.ts (§0/§6)
+  "ArtifactWriteError", // artifactWrite.ts (operator-facing ONLY: artifact-name collisions —
+  //                       config-triggerable when two tracked packages sanitize/alias to one
+  //                       dossier filename — and a symlinked xray/ dir; lifecycle bugs there
+  //                       are plain Errors and keep their stacks)
 ]);
 
 export function isKnownOperatorError(e: unknown): e is Error {

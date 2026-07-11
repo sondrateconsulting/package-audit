@@ -12,6 +12,7 @@ import { EmptyOwnersError } from "./ownerResolve.ts";
 import { DbError } from "./db.ts";
 import { GithubApiError, ThrottleExhausted } from "./github.ts";
 import { IntrospectionError } from "./apiSurface.ts";
+import { ArtifactWriteError } from "./artifactWrite.ts";
 
 const OPTS = { command: "orchestrate", usage: ORCHESTRATE_USAGE };
 
@@ -41,6 +42,7 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       new PreflightError("x"), new EmptyOwnersError("x"), new DbError("x"),
       new GithubApiError("x"), new ThrottleExhausted("graphql"),
       new IntrospectionError("x"), new ReadOnlyViolation("READ-ONLY VIOLATION: x"),
+      new ArtifactWriteError("x"),
     ];
     expect(new Set(instances.map((e) => e.name))).toEqual(new Set(KNOWN_OPERATOR_ERRORS));
     for (const e of instances) expect(isKnownOperatorError(e)).toBe(true);

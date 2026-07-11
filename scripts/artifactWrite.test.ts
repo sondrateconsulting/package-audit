@@ -1,0 +1,435 @@
+import { expect, test, describe, afterAll } from "bun:test";
+import { createHash } from "node:crypto";
+import {
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ReadOnlyViolation } from "./readOnlyGuard.ts";
+import {
+  ArtifactBundle, ArtifactWriteError, XRAY_DIR_NAME, XRAY_FORMAT_VERSION, writeFileAtomic,
+} from "./artifactWrite.ts";
+
+// artifactWrite takes EXPLICIT containment roots (unlike AuditDb.open's hardcoded ./data|./output),
+// so tests run against disposable temp dirs — no repo-tree writes to clean up beyond TEST_ROOT.
+const TEST_ROOT = mkdtempSync(join(tmpdir(), "artifact-write-test-"));
+afterAll(() => rmSync(TEST_ROOT, { recursive: true, force: true }));
+let dirCounter = 0;
+const nextOutputDir = (): string => {
+  const dir = join(TEST_ROOT, `out-${dirCounter++}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+};
+
+const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
+
+describe("writeFileAtomic", () => {
+  test("writes exact bytes and leaves no temp sibling", () => {
+    const dir = nextOutputDir();
+    const path = join(dir, "a.json");
+    writeFileAtomic(path, '{"x":1}\n', [dir]);
+    expect(readFileSync(path, "utf8")).toBe('{"x":1}\n');
+    expect(readdirSync(dir)).toEqual(["a.json"]);
+  });
+
+  test("creates missing parent directories inside the contained root", () => {
+    const dir = nextOutputDir();
+    const path = join(dir, "xray", "a.txt");
+    writeFileAtomic(path, "hello", [dir]);
+    expect(readFileSync(path, "utf8")).toBe("hello");
+  });
+
+  test("overwrites an existing artifact atomically (rename, not truncate-then-write)", () => {
+    const dir = nextOutputDir();
+    const path = join(dir, "a.txt");
+    writeFileAtomic(path, "first", [dir]);
+    writeFileAtomic(path, "second", [dir]);
+    expect(readFileSync(path, "utf8")).toBe("second");
+    expect(readdirSync(dir)).toEqual(["a.txt"]);
+  });
+
+  test("rejects a target outside the contained roots (§0)", () => {
+    const dir = nextOutputDir();
+    expect(() => writeFileAtomic(join(TEST_ROOT, "escape.txt"), "x", [dir])).toThrow(ReadOnlyViolation);
+    expect(existsSync(join(TEST_ROOT, "escape.txt"))).toBe(false);
+  });
+
+  test("a failing rename never leaves a truncated destination and cleans its temp", () => {
+    const dir = nextOutputDir();
+    const path = join(dir, "a.txt");
+    writeFileAtomic(path, "intact", [dir]);
+    const boom = new Error("rename exploded");
+    expect(() =>
+      writeFileAtomic(path, "replacement", [dir], {
+        renameSync: () => {
+          throw boom;
+        },
+      }),
+    ).toThrow(boom);
+    expect(readFileSync(path, "utf8")).toBe("intact"); // old artifact untouched
+    expect(readdirSync(dir)).toEqual(["a.txt"]); // temp cleaned up
+  });
+
+  test("a failing write never creates the destination", () => {
+    const dir = nextOutputDir();
+    const path = join(dir, "b.txt");
+    expect(() =>
+      writeFileAtomic(path, "x", [dir], {
+        writeFileSync: () => {
+          throw new Error("disk full");
+        },
+      }),
+    ).toThrow("disk full");
+    expect(existsSync(path)).toBe(false);
+  });
+});
+
+describe("ArtifactBundle — write + manifest", () => {
+  test("write() lands the artifact under <outputDir>/xray and returns {path, sha256, bytes}", () => {
+    const out = nextOutputDir();
+    const bundle = new ArtifactBundle(out);
+    const rec = bundle.write("expo-dossier.html", "<html>hi</html>");
+    expect(rec).toEqual({ path: "expo-dossier.html", sha256: sha256("<html>hi</html>"), bytes: 15 });
+    expect(readFileSync(join(out, XRAY_DIR_NAME, "expo-dossier.html"), "utf8")).toBe("<html>hi</html>");
+  });
+
+  test("byte counts are UTF-8 bytes, not code units", () => {
+    const out = nextOutputDir();
+    const bundle = new ArtifactBundle(out);
+    const rec = bundle.write("emoji.txt", "é🙂");
+    expect(rec.bytes).toBe(Buffer.byteLength("é🙂", "utf8"));
+  });
+
+  test("finalize() writes manifest.json LAST with sorted entries, run id and format version", () => {
+    const out = nextOutputDir();
+    const bundle = new ArtifactBundle(out);
+    bundle.write("z.csv", "a,b\n");
+    bundle.write("a.jsonl", '{"x":1}\n');
+    expect(existsSync(join(out, XRAY_DIR_NAME, "manifest.json"))).toBe(false); // not before finalize
+    const result = bundle.finalize({ runId: "run-1" });
+    const manifest = JSON.parse(readFileSync(join(out, XRAY_DIR_NAME, "manifest.json"), "utf8")) as {
+      runId: string;
+      formatVersion: number;
+      artifacts: Array<{ path: string; sha256: string; bytes: number }>;
+    };
+    expect(manifest.runId).toBe("run-1");
+    expect(manifest.formatVersion).toBe(XRAY_FORMAT_VERSION);
+    expect(manifest.artifacts.map((a) => a.path)).toEqual(["a.jsonl", "z.csv"]); // sorted by path
+    expect(manifest.artifacts[1]).toEqual({ path: "z.csv", sha256: sha256("a,b\n"), bytes: 4 });
+    expect(result.manifestPath).toBe(join(out, XRAY_DIR_NAME, "manifest.json"));
+  });
+
+  test("finalize() is byte-deterministic across identical bundles", () => {
+    const build = (): string => {
+      const out = nextOutputDir();
+      const bundle = new ArtifactBundle(out);
+      bundle.write("b.txt", "bee");
+      bundle.write("a.txt", "ay");
+      bundle.finalize({ runId: "run-x" });
+      return readFileSync(join(out, XRAY_DIR_NAME, "manifest.json"), "utf8");
+    };
+    expect(build()).toBe(build());
+  });
+
+  test("duplicate artifact names within one bundle are a named error", () => {
+    const out = nextOutputDir();
+    const bundle = new ArtifactBundle(out);
+    bundle.write("a.txt", "one");
+    expect(() => bundle.write("a.txt", "two")).toThrow(ArtifactWriteError);
+  });
+
+  test("name-SHAPE violations are producer bugs: plain Error, nothing lands", () => {
+    const out = nextOutputDir();
+    const bundle = new ArtifactBundle(out);
+    const badShapes = [
+      "../evil.txt", "a/b.txt", "a\\b.txt", "", ".", "..",
+      "manifest.json", "MANIFEST.JSON", // reserved (case-insensitively)
+      "caf\u00e9.txt", // outside the ASCII grammar — kills the Unicode-aliasing class at the root
+      "manife\u017ft.json", // U+017F long s — folds to "manifest" on case-folding filesystems
+      "sp ace.txt", // space is outside the grammar too
+    ];
+    for (const bad of badShapes) {
+      let caught: unknown;
+      try {
+        bundle.write(bad, "x");
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught).not.toBeInstanceOf(ArtifactWriteError); // bug, not operator condition
+    }
+    expect(existsSync(join(out, XRAY_DIR_NAME))).toBe(false); // nothing landed, dir never created
+    expect(existsSync(join(TEST_ROOT, "evil.txt"))).toBe(false);
+  });
+
+  test("names that alias case-insensitively collide loudly (operator-facing)", () => {
+    const out = nextOutputDir();
+    const bundle = new ArtifactBundle(out);
+    bundle.write("A.txt", "upper"); // npm legacy names genuinely differ only by case
+    expect(() => bundle.write("a.txt", "lower")).toThrow(ArtifactWriteError);
+  });
+
+  test("returned records are frozen — a caller cannot falsify the manifest", () => {
+    const out = nextOutputDir();
+    const bundle = new ArtifactBundle(out);
+    const rec = bundle.write("a.txt", "content");
+    expect(Object.isFrozen(rec)).toBe(true);
+    expect(() => {
+      (rec as { path: string }).path = "manifest.json";
+    }).toThrow(TypeError);
+  });
+
+  test("write after finalize and double finalize are lifecycle BUGS — plain Error, stack kept", () => {
+    const out = nextOutputDir();
+    const bundle = new ArtifactBundle(out);
+    bundle.write("a.txt", "x");
+    bundle.finalize({ runId: "r" });
+    for (const call of [() => bundle.write("b.txt", "y"), () => bundle.finalize({ runId: "r" })]) {
+      let caught: unknown;
+      try {
+        call();
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught).not.toBeInstanceOf(ArtifactWriteError); // NOT operator-facing/message-only
+      expect((caught as Error).message).toContain("already finalized");
+    }
+  });
+
+  test("a PERSISTENT temp collision exhausts its attempts loudly, renaming nothing", () => {
+    const dir = nextOutputDir();
+    const path = join(dir, "a.txt");
+    writeFileAtomic(path, "intact", [dir]);
+    let renames = 0;
+    expect(() =>
+      writeFileAtomic(path, "never", [dir], {
+        writeFileSync: () => {
+          const err = new Error("EEXIST") as Error & { code: string };
+          err.code = "EEXIST";
+          throw err;
+        },
+        renameSync: () => {
+          renames++;
+        },
+      }),
+    ).toThrow(/after 16 attempts/);
+    expect(renames).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe("intact");
+  });
+
+  test("a dot basename (parent-directory write) is a producer bug, rejected up front", () => {
+    const dir = nextOutputDir();
+    mkdirSync(join(dir, "sub"));
+    // raw strings — join() would lexically collapse the dot components away
+    for (const bad of [`${dir}/sub/..`, `${dir}/sub/.`]) {
+      expect(() => writeFileAtomic(bad, "x", [dir])).toThrow(/real file basename/);
+    }
+    // a trailing-slash root path fails closed too (its PARENT escapes the containment root)
+    expect(() => writeFileAtomic(dir + "/", "x", [dir])).toThrow(ReadOnlyViolation);
+    expect(readdirSync(dir).sort()).toEqual(["sub"]); // no sibling temp of the root appeared
+  });
+
+  test("a lexical ..-detour path cannot make mkdir create directories outside the root", () => {
+    const dir = nextOutputDir();
+    // Resolves INSIDE dir (probe/.. cancels), but a lexical recursive mkdir would create
+    // TEST_ROOT/probe as a side effect. The canonical-parent fix must not.
+    const detour = `${dir}/../probe/../${dir.split("/").pop()!}/a.txt`;
+    writeFileAtomic(detour, "content", [dir]);
+    expect(readFileSync(join(dir, "a.txt"), "utf8")).toBe("content");
+    expect(existsSync(join(TEST_ROOT, "probe"))).toBe(false);
+  });
+
+  test("a temp-name collision retries with the next candidate (exclusive create)", () => {
+    const dir = nextOutputDir();
+    const path = join(dir, "a.txt");
+    let calls = 0;
+    writeFileAtomic(path, "content", [dir], {
+      writeFileSync: (p, data, opts) => {
+        calls++;
+        if (calls === 1) {
+          const err = new Error("EEXIST: file already exists") as Error & { code: string };
+          err.code = "EEXIST";
+          throw err;
+        }
+        writeFileSync(p, data, opts);
+      },
+    });
+    expect(calls).toBe(2);
+    expect(readFileSync(path, "utf8")).toBe("content");
+    expect(readdirSync(dir)).toEqual(["a.txt"]); // no stray temp from the collided candidate
+  });
+});
+
+describe("ArtifactBundle — symlink hostility", () => {
+  test("a symlinked xray/ root is refused before anything is written or swept", () => {
+    const out = nextOutputDir();
+    mkdirSync(join(out, "operator-dir"));
+    writeFileSync(join(out, "operator-dir", "precious.txt"), "keep me");
+    symlinkSync(join(out, "operator-dir"), join(out, XRAY_DIR_NAME));
+
+    const bundle = new ArtifactBundle(out);
+    expect(() => bundle.write("a.html", "<html/>")).toThrow(ArtifactWriteError);
+    expect(readFileSync(join(out, "operator-dir", "precious.txt"), "utf8")).toBe("keep me");
+    expect(readdirSync(join(out, "operator-dir"))).toEqual(["precious.txt"]); // nothing landed there
+  });
+
+  test("a terminal symlink at the artifact path is REPLACED, never followed", () => {
+    const out = nextOutputDir();
+    const xray = join(out, XRAY_DIR_NAME);
+    mkdirSync(xray, { recursive: true });
+    writeFileSync(join(out, "run-77.json"), '{"history":true}');
+    symlinkSync(join("..", "run-77.json"), join(xray, "expo-dossier.html")); // points INSIDE outputDir
+
+    const bundle = new ArtifactBundle(out);
+    bundle.write("expo-dossier.html", "<html/>");
+    expect(readFileSync(join(out, "run-77.json"), "utf8")).toBe('{"history":true}'); // NOT clobbered
+    expect(lstatSync(join(xray, "expo-dossier.html")).isSymbolicLink()).toBe(false); // link replaced
+    expect(readFileSync(join(xray, "expo-dossier.html"), "utf8")).toBe("<html/>");
+  });
+
+  test("a terminal symlink pointing OUTSIDE the roots fails closed", () => {
+    const out = nextOutputDir();
+    const xray = join(out, XRAY_DIR_NAME);
+    mkdirSync(xray, { recursive: true });
+    const outside = join(TEST_ROOT, "outside-target.txt");
+    symlinkSync(outside, join(xray, "evil.html"));
+
+    const bundle = new ArtifactBundle(out);
+    expect(() => bundle.write("evil.html", "payload")).toThrow(ReadOnlyViolation);
+    expect(existsSync(outside)).toBe(false); // nothing written through the link
+  });
+});
+
+describe("ArtifactBundle — sweep confinement", () => {
+  test("finalize() sweeps unmanifested files INSIDE xray/ only; outputDir history survives", () => {
+    const out = nextOutputDir();
+    const xray = join(out, XRAY_DIR_NAME);
+    mkdirSync(xray, { recursive: true });
+    // stale artifacts from a previous generation + a crashed write's temp file
+    writeFileSync(join(xray, "removed-package-dossier.html"), "stale");
+    writeFileSync(join(xray, ".tmp-crashed-123"), "partial");
+    // DECOYS in the manifest-OWNED directory's PARENT: report history + an operator file.
+    // outputDir accumulates run-*.json by design — a flat sweep would delete it (E2).
+    writeFileSync(join(out, "run-77.json"), '{"history":true}');
+    writeFileSync(join(out, "latest.json"), '{"latest":true}');
+    writeFileSync(join(out, "operator-notes.txt"), "keep me");
+
+    const bundle = new ArtifactBundle(out);
+    bundle.write("expo-dossier.html", "<html/>");
+    const { swept } = bundle.finalize({ runId: "run-2" });
+
+    expect(swept).toEqual([".tmp-crashed-123", "removed-package-dossier.html"]); // production-sorted
+    expect(existsSync(join(xray, "removed-package-dossier.html"))).toBe(false);
+    expect(existsSync(join(xray, ".tmp-crashed-123"))).toBe(false);
+    // survivors: the fresh artifact, the manifest, and EVERYTHING outside xray/
+    expect(readFileSync(join(xray, "expo-dossier.html"), "utf8")).toBe("<html/>");
+    expect(existsSync(join(xray, "manifest.json"))).toBe(true);
+    expect(readFileSync(join(out, "run-77.json"), "utf8")).toBe('{"history":true}');
+    expect(readFileSync(join(out, "latest.json"), "utf8")).toBe('{"latest":true}');
+    expect(readFileSync(join(out, "operator-notes.txt"), "utf8")).toBe("keep me");
+  });
+
+  test("sweep unlinks a symlink itself and NEVER follows it out of xray/", () => {
+    const out = nextOutputDir();
+    const xray = join(out, XRAY_DIR_NAME);
+    mkdirSync(xray, { recursive: true });
+    writeFileSync(join(out, "target.txt"), "outside");
+    symlinkSync(join(out, "target.txt"), join(xray, "sneaky-link"));
+
+    const bundle = new ArtifactBundle(out);
+    bundle.write("index.html", "<html/>");
+    const { swept } = bundle.finalize({ runId: "run-3" });
+
+    expect(swept).toEqual(["sneaky-link"]);
+    expect(existsSync(join(xray, "sneaky-link"))).toBe(false); // link removed
+    expect(readFileSync(join(out, "target.txt"), "utf8")).toBe("outside"); // target untouched
+  });
+
+  test("sweep unlinks a symlink-to-DIRECTORY itself (lstat, not stat) and never recurses into it", () => {
+    const out = nextOutputDir();
+    const xray = join(out, XRAY_DIR_NAME);
+    mkdirSync(xray, { recursive: true });
+    mkdirSync(join(out, "linked-dir"));
+    writeFileSync(join(out, "linked-dir", "inside.txt"), "keep");
+    symlinkSync(join(out, "linked-dir"), join(xray, "dir-link"));
+
+    const bundle = new ArtifactBundle(out);
+    bundle.write("index.html", "<html/>");
+    const { swept } = bundle.finalize({ runId: "run-5" });
+
+    expect(swept).toEqual(["dir-link"]); // a stat()-based check would have skipped it as a directory
+    expect(existsSync(join(xray, "dir-link"))).toBe(false);
+    expect(readFileSync(join(out, "linked-dir", "inside.txt"), "utf8")).toBe("keep"); // target untouched
+  });
+
+  test("sweep leaves directories inside xray/ in place (files only, never recursive)", () => {
+    const out = nextOutputDir();
+    const xray = join(out, XRAY_DIR_NAME);
+    mkdirSync(join(xray, "operator-subdir"), { recursive: true });
+    writeFileSync(join(xray, "operator-subdir", "note.txt"), "keep");
+
+    const bundle = new ArtifactBundle(out);
+    bundle.write("index.html", "<html/>");
+    const { swept } = bundle.finalize({ runId: "run-4" });
+
+    expect(swept).toEqual([]);
+    expect(readFileSync(join(xray, "operator-subdir", "note.txt"), "utf8")).toBe("keep");
+  });
+
+  test("sweep keeps entries by CASE-INSENSITIVE key — an overwritten stale case-variant is never self-swept", () => {
+    const out = nextOutputDir();
+    const xray = join(out, XRAY_DIR_NAME);
+    mkdirSync(xray, { recursive: true });
+    // A previous generation left EXPO-dossier.html. On a case-insensitive filesystem, writing
+    // expo-dossier.html OVERWRITES that entry but readdir keeps the ORIGINAL spelling — an
+    // exact-match keep-set would then sweep our own fresh artifact.
+    writeFileSync(join(xray, "EXPO-dossier.html"), "stale");
+
+    const bundle = new ArtifactBundle(out);
+    bundle.write("expo-dossier.html", "<html>fresh</html>");
+    const { swept } = bundle.finalize({ runId: "run-6" });
+
+    expect(swept).toEqual([]); // same key → kept on BOTH sensitive and insensitive filesystems
+    expect(readFileSync(join(xray, "expo-dossier.html"), "utf8")).toBe("<html>fresh</html>");
+  });
+
+  test("sweep removes a stale file whose name contains a backslash (legal POSIX basename)", () => {
+    const out = nextOutputDir();
+    const xray = join(out, XRAY_DIR_NAME);
+    mkdirSync(xray, { recursive: true });
+    writeFileSync(join(xray, "old\\artifact"), "stale");
+
+    const bundle = new ArtifactBundle(out);
+    bundle.write("index.html", "<html/>");
+    const { swept } = bundle.finalize({ runId: "run-7" });
+
+    expect(swept).toEqual(["old\\artifact"]);
+    expect(existsSync(join(xray, "old\\artifact"))).toBe(false);
+  });
+
+  test("a DANGLING xray/ symlink gets the operator-facing error, not a raw EEXIST", () => {
+    const out = nextOutputDir();
+    symlinkSync(join(out, "does-not-exist"), join(out, XRAY_DIR_NAME));
+    const bundle = new ArtifactBundle(out);
+    expect(() => bundle.write("a.html", "<html/>")).toThrow(ArtifactWriteError);
+  });
+
+  test("a second generation with fewer packages sweeps exactly the dropped dossier", () => {
+    const out = nextOutputDir();
+    const first = new ArtifactBundle(out);
+    first.write("expo-dossier.html", "<html>expo</html>");
+    first.write("@expo__vector-icons-dossier.html", "<html>icons</html>");
+    first.write("index.html", "<html>index</html>");
+    first.finalize({ runId: "run-a" });
+
+    const second = new ArtifactBundle(out);
+    second.write("expo-dossier.html", "<html>expo v2</html>");
+    second.write("index.html", "<html>index v2</html>");
+    const { swept } = second.finalize({ runId: "run-b" });
+
+    expect(swept).toEqual(["@expo__vector-icons-dossier.html"]);
+    const survivors = readdirSync(join(out, XRAY_DIR_NAME)).sort();
+    expect(survivors).toEqual(["expo-dossier.html", "index.html", "manifest.json"]);
+  });
+});
