@@ -32,18 +32,16 @@ The finished run writes `output/run-<run_id>.json` and `output/latest.json`. A l
 
 ### HTML dossier (`report --html`)
 
-*Planned surface — lands before launch; not in this build yet.* Renders the run as a self-contained, editorial HTML dossier — the leadership-readable version of the JSON report.
-<!-- TODO: finalize after implementation -->
+`bun run report --html` additionally renders one self-contained HTML dossier per tracked package plus an `index.html` into `output/xray/`: an executive sentence, five decision cards, a usage-sorted API-surface table, a repo×export matrix, and collapsible permalinked evidence drawers — default-branch headline metrics, printable, light + dark themes, no external resources. `--run-id <id>` renders a historical run's dossiers.
+<!-- hero screenshot for the README is captured from the flagship dossier in the launch phase (P4) -->
 
 ### Data exports (`export`)
 
-*Planned surface — lands before launch; not in this build yet.* Emits CSV/JSONL extracts of the findings for spreadsheets and downstream pipelines.
-<!-- TODO: finalize after implementation -->
+`bun run export` writes run-scoped CSV + JSONL snapshots of the four findings tables (plus a `manifest.json`) into `output/xray/` — the same run-selection and snapshot semantics as the report, portable into Sheets, Excel, DuckDB, and jq. `--run-id <id>` exports a historical run; `--raw` is a loudly-labeled full-table forensic dump. The column-by-column contract is [EXPORTS.md](EXPORTS.md) (sync-tested against the writers). See [Analyze the exports](#analyze-the-exports) below.
 
 ### Run comparison (`compare`)
 
-*Planned surface — lands before launch; not in this build yet.* Diffs two runs: usage sites gained and lost, versions moved, repos entering or leaving scope.
-<!-- TODO: finalize after implementation -->
+`bun run compare <runA> <runB>` prints a deterministic run-diff as one JSON line: usage sites added and removed per export, repos entering and leaving — headline counts scoped to default branches, with all-branch detail. Note: `--fresh` erases run history, so runs from before a `--fresh` cannot be compared; keep the data directory if you want trends.
 
 ## Prerequisites
 
@@ -63,6 +61,64 @@ Checked at startup with actionable errors (nothing here is silently assumed):
 - **SAML/SSO orgs:** until the token is SSO-authorized (`gh auth refresh`), an org may 403 on content — or be silently *omitted from enumeration entirely*, under-reporting discovery. SSO failures are classified distinctly in the report's `errors` array with the remediation named.
 - **Private registries:** per-package `registryAuthEnvVar` names an env var holding a bearer token. The token is sent only to that registry's origin, never logged, never cached, and never read from any scanned repo's `.npmrc`.
 - GitHub Enterprise: set `githubHost`; every call runs through `GH_HOST` (API paths are never hand-built).
+
+## Analyze the exports
+
+The exports are a data layer, not just files. Every recipe below runs **verbatim** from the
+repo root after a `bun run export` — and CI executes them against a synthetic fixture with a
+pinned DuckDB, with an identifier sync-test tying them to the export column registry, so
+they can't silently rot.
+
+Top exports by usage sites:
+
+```sql
+SELECT export_name, COUNT(*) AS usage_sites
+FROM 'output/xray/usage_findings.csv'
+WHERE usage_type <> 'cli' AND export_name <> ''
+GROUP BY export_name
+ORDER BY usage_sites DESC, export_name
+LIMIT 10;
+```
+
+Most-coupled repositories (distinct exports × usage sites):
+
+```sql
+SELECT organization || '/' || repository AS repo,
+       COUNT(DISTINCT export_name) AS distinct_exports,
+       COUNT(*) AS usage_sites
+FROM 'output/xray/usage_findings.csv'
+GROUP BY repo
+ORDER BY usage_sites DESC, repo
+LIMIT 10;
+```
+
+Resolved versions across the estate:
+
+```sql
+SELECT resolved_version, COUNT(*) AS declarations
+FROM 'output/xray/dependency_findings.csv'
+WHERE resolved_version IS NOT NULL
+GROUP BY resolved_version
+ORDER BY declarations DESC, resolved_version;
+```
+
+Published exports nobody imports (per the scanned slice):
+
+```sql
+SELECT s.export_name
+FROM 'output/xray/package_api_surface.csv' s
+LEFT JOIN 'output/xray/usage_findings.csv' u
+  ON u.export_name = s.export_name AND u.package_name = s.package_name
+WHERE u.export_name IS NULL AND s.export_kind <> 'cli-bin'
+GROUP BY s.export_name
+ORDER BY s.export_name;
+```
+
+Usage-type breakdown with jq:
+
+```sh
+jq -s 'group_by(.usage_type) | map({usage_type: .[0].usage_type, sites: length})' output/xray/usage_findings.jsonl
+```
 
 ## Configuration
 
