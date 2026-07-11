@@ -23,6 +23,7 @@
 
 import { createHash } from "node:crypto";
 import { escapeHtml } from "./htmlEscape.ts";
+import { mdCell, mdCode, mdTable } from "./markdownEscape.ts";
 import { deriveFacts, tryEvaluateObservations, type Observation } from "./observations.ts";
 
 // ---- input types (structural mirror of the §7 report object) ---------------------------------
@@ -586,25 +587,8 @@ function copyControl(sectionId: string, markdown: string): string {
   );
 }
 
-const mdCell = (value: string): string => value.replaceAll("\\", "\\\\").replaceAll("|", "\\|").replaceAll(/\r?\n/g, " ");
-// Markdown CODE SPAN — dynamic fence, literal content. Code spans are literal in CommonMark, so
-// mdCell's backslash escaping would corrupt them; instead the fence is one backtick longer than
-// the longest run inside (space-padded, the CommonMark rule), so a hostile snippet can never
-// close the span early and smuggle live markdown — e.g. a link — into the copied text.
-const mdCode = (value: string): string => {
-  const flat = value.replace(/\r\n|[\r\n]/g, " ");
-  if (flat === "") return "` `"; // the closest representable span — an empty one is not a span at all
-  const longest = flat.match(/`+/g)?.reduce((max, run) => Math.max(max, run.length), 0) ?? 0;
-  const fence = "`".repeat(longest + 1);
-  // Pad ONLY when CommonMark needs it: a backtick edge would merge with the fence, and space
-  // edges need sacrificial padding (the renderer strips one space per side when content begins
-  // AND ends with a space). Unconditional padding would ADD spaces to plain content (the
-  // stripping rule skips all-space spans and single-sided spaces).
-  const pad = flat.startsWith("`") || flat.endsWith("`") || flat.startsWith(" ") || flat.endsWith(" ") ? " " : "";
-  return `${fence}${pad}${flat}${pad}${fence}`;
-};
-const mdTable = (header: readonly string[], rows: ReadonlyArray<readonly string[]>): string =>
-  [`| ${header.map(mdCell).join(" | ")} |`, `| ${header.map(() => "---").join(" | ")} |`, ...rows.map((r) => `| ${r.map(mdCell).join(" | ")} |`)].join("\n");
+// mdCell / mdCode / mdTable — the copy-as-markdown escapers — live in markdownEscape.ts, shared
+// with indexHtml.ts so the two "copy as markdown" mirrors can never drift apart in safety.
 
 // ---- dossier sections ---------------------------------------------------------------------------
 
@@ -857,7 +841,9 @@ function renderEvidence(m: DossierModel): string {
 
 function renderObservations(observations: readonly Observation[]): string {
   if (observations.length === 0) return "";
-  const md = observations.map((o) => `- ${o.text}`).join("\n");
+  // o.text embeds attacker-controlled identifiers (e.g. the dominant export name); the markdown
+  // mirror escapes it exactly as the HTML side escapes it below, so a paste can't inject a link.
+  const md = observations.map((o) => `- ${mdCell(o.text)}`).join("\n");
   const items = observations.map((o) => `<li>${esc(o.text)}</li>`).join("\n");
   return `<section id="observations" aria-labelledby="h-observations"><h2 id="h-observations">What this means</h2>${copyControl("observations", md)}<ul>\n${items}\n</ul></section>`;
 }
@@ -930,7 +916,7 @@ export function renderDossierDetailed(pkg: DossierPackage, ctx: DossierContext):
 
   const sentence = execSentence(m);
   const header =
-    `<header id="exec"><p class="meta">package usage dossier</p>${copyControl("exec", sentence)}<h1 class="exec">${esc(sentence)}</h1>` +
+    `<header id="exec"><p class="meta">package usage dossier</p>${copyControl("exec", mdCell(sentence))}<h1 class="exec">${esc(sentence)}</h1>` +
     `<p class="meta num">run ${esc(ctx.runId)} · generated ${esc(ctx.generatedAt)} · headline scope: ${esc(m.scopeLabel)}</p></header>`;
   const body = [
     header,

@@ -126,7 +126,11 @@ const syntheticPkg = (units: DossierUnit[], over: Partial<DossierPackage> = {}):
 // count, matrix branch-column relabel, versions-card semver restriction, row-id separator '.',
 // markdown code-span fencing, bidi isolation CSS. Absorbed without a formatVersion bump under the
 // pre-public-launch rule; post-launch output changes require bumping XRAY_FORMAT_VERSION.
-const GOLDEN_DOSSIER_SHA256 = "620bcf2bfb53c000dda5cb18870ad0db27d4ae38a23a5e906a356c7cf3d88321";
+// PRE-LAUNCH RE-PIN (H1 fix, sanctioned): the copy-as-markdown mirrors (exec/observations/cards/
+// surface/matrix/evidence) now backslash-escape inline link/image/HTML formers, so `<template>`
+// bytes shift (e.g. `(default branches)` → `\(default branches\)`, which GFM renders identically).
+// Copy-markdown only; the visible dossier is byte-unchanged. Verified escaping-only before re-pin.
+const GOLDEN_DOSSIER_SHA256 = "8bc3aa41ac2f81d4f6c85705057faf27fb332ae602eef1efc64b09a21894536d";
 const GOLDEN_EMPTY_SHA256 = "e67b530b1415a6e1e44730abf0ac9124c06feb19a3e48a9853862fa962d71248";
 
 describe("renderDossier — determinism and golden bytes", () => {
@@ -317,6 +321,55 @@ describe("adversarial fixture — hostile snippets, paths, branch names (escape-
   test("hostile branch name in the 'on:' annotation renders escaped", () => {
     expect(html).toContain("on: dev&quot;&gt;&lt;img src=x onerror=alert(2)&gt;");
   });
+});
+
+describe("copy-as-markdown: hostile identifiers cannot inject links/images (H1)", () => {
+  // An attacker-controlled export name (ES2022 arbitrary-string export) carrying a live
+  // markdown image must never survive into ANY copy-as-markdown mirror as a live
+  // `![alt](url)` / `[text](url)` — otherwise pasting the "evidence" into a CommonMark/GFM
+  // renderer (e.g. a GitHub issue) auto-loads a tracking beacon or renders a disguised phishing link.
+  const BEACON = "![beacon](https://evil.example/x.png)";
+  const JUNCTURE = "](https://evil.example/x.png)"; // the link/image-forming sequence that must be broken
+
+  function hostileExportPkg(): DossierPackage {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+      trackedPackages: ["evil"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
+    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true });
+    const use = (exportName: string, file: string, line: number) =>
+      db.upsertUsageFinding({
+        runId, ...main, packageName: "evil", dependencyKey: "evil", usageType: "named-import", exportName,
+        context: "", filePath: file, lineNumber: line,
+        permalink: `https://github.com/org-a/svc/blob/${main.commitSha}/${file}#L${line}`,
+        snippet: "import { x } from 'evil';", foundAt: T0,
+      });
+    // BEACON dominates usage (3 sites vs 1) so it leads the surface/evidence lists AND fires the
+    // observations "dominant-export" rule (distinctExportsUsed >= 2, >= 50% share) with itself.
+    use(BEACON, "src/a.ts", 1);
+    use(BEACON, "src/b.ts", 2);
+    use(BEACON, "src/c.ts", 3);
+    use("plain", "src/d.ts", 4);
+    db.completeRun(runId);
+    const report = buildReport(db, db.getRun(runId)!);
+    db.close();
+    return (report.packages as DossierPackage[])[0]!;
+  }
+
+  const html = renderDossier(hostileExportPkg(), FIXED_CTX);
+
+  // The hostile export name reaches every one of these copy mirrors: surface + matrix as a
+  // table cell/header, evidence as a drawer heading, observations as the dominant-export sentence.
+  for (const id of ["surface", "matrix", "evidence", "observations"]) {
+    test(`the ${id} markdown mirror neutralizes a hostile export-name image`, () => {
+      const md = templateMd(html, id);
+      expect(md).toContain("beacon"); // the value is preserved, not silently dropped
+      expect(md).not.toContain(JUNCTURE); // ...but the live image/link juncture is broken
+      expect(md).not.toContain(BEACON); // and the intact payload never appears
+    });
+  }
 });
 
 describe("dossierFilename — sanitization against the artifact name grammar", () => {

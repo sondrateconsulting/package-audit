@@ -8,6 +8,7 @@
 // anyway).
 
 import { escapeHtml } from "./htmlEscape.ts";
+import { mdCell } from "./markdownEscape.ts";
 import {
   computeDossierModel,
   dossierFilename,
@@ -23,8 +24,7 @@ const esc = escapeHtml;
 const num = (v: number): string => esc(String(v));
 const plural = (count: number, singular: string, pluralForm?: string): string =>
   `${count} ${count === 1 ? singular : (pluralForm ?? `${singular}s`)}`;
-
-const mdCell = (value: string): string => value.replaceAll("\\", "\\\\").replaceAll("|", "\\|").replaceAll(/\r?\n/g, " ");
+// mdCell (the copy-as-markdown escaper) is shared with reportHtml.ts via markdownEscape.ts.
 
 interface IndexRow {
   readonly name: string;

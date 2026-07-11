@@ -47,6 +47,30 @@ const OPTS = { formatVersion: 1 };
 // re-pass bidi-isolation rule moved these bytes. Same sanction rule as reportHtml.test.ts.
 const GOLDEN_INDEX_SHA256 = "a1168b3e556cb1fd4c2450b7abf4f851898bfa16b8e3aa1b41dbe6b7f79fe661";
 
+describe("renderIndex — copy-as-markdown neutralizes a hostile value through the real render path", () => {
+  // Package names are validated and versionsSeen is the valid-semver slice, so a payload cannot
+  // reach here through buildReport in practice — but the index mirror must still be inert by
+  // construction (shared mdCell), not merely by upstream validation. Drive a hostile version
+  // straight into a package (computeDossierModel passes versionsSeen through) and prove the
+  // packages-md mirror cannot form a live image/link juncture.
+  test("a hostile version string cannot inject a markdown image into packages-md", () => {
+    const base = fixtureReport();
+    const BEACON = "![v](https://evil.example/x.png)";
+    const poisoned: DossierReport = {
+      ...base,
+      packages: base.packages.map((p, i) => (i === 0 ? { ...p, versionsSeen: [BEACON] } : p)),
+    };
+    const html = renderIndex(poisoned, OPTS);
+    const open = `<template id="packages-md">`;
+    const start = html.indexOf(open);
+    const md = html
+      .slice(start + open.length, html.indexOf("</template>", start))
+      .replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", '"').replaceAll("&#39;", "'").replaceAll("&amp;", "&");
+    expect(md).toContain("evil.example"); // the poisoned value survives (not silently dropped)
+    expect(md).not.toContain("](https://evil.example/x.png)"); // ...but the image/link juncture is broken
+  });
+});
+
 describe("renderIndex", () => {
   const report = fixtureReport();
   const html = renderIndex(report, OPTS);
