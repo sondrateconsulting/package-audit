@@ -128,6 +128,8 @@ Every field is documented in [config.schema.json](config.schema.json) (your edit
 
 **stdout is pure JSONL during audit and plan runs** — one structured event per line, safe to pipe. Vocabulary: `config`, `preflight`, `owners`, `run`, `rescan-branch`, `cli-terms`, `plan`, `plan-summary`, `unit` (actions `scanned`, `skip-current`, `skip-cutoff`, `error`), `discovery`, `introspection`, `warning` (emitted when `--fresh` drops completed runs), `done`.
 
+The presentation commands emit their own events: `report --html` writes one `dossier` line per package (`observations: emitted|omitted` makes the fallback visible) plus a `dossier-summary`; `export` writes one `export` line per artifact plus an `export-summary` (and a `warning` under `--raw`). Note `output/xray/` holds one run's artifacts at a time — regenerating either surface for a different run sweeps the other's stale files (re-run it with the same `--run-id`; the database keeps everything).
+
 **Mid-run `"action":"error"`, `"event":"discovery"`, and `"event":"introspection"` lines are fail-soft**: the failure (a branch scan, a repo/branch listing for one owner, or a registry packument/tarball/bin-discovery step for one package version) is recorded in the report's `errors` array and the run continues — one unreachable repo or registry hiccup never kills an org-wide audit. Org-scoped `discovery` lines (a whole owner's repo listing failed) carry no `repo` field; branch-scoped ones do. `introspection` lines are package-scoped (`packageName`, plus `version` when the failure is version-specific). The human-readable end-of-run summary prints to **stderr**.
 
 ## Report anatomy

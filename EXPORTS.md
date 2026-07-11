@@ -41,6 +41,11 @@ multiple runs and configurations — never treat a raw dump as any single run's 
 | `runs.csv` / `.jsonl` | the selected run's metadata row |
 | `manifest.json` | `{formatVersion, runId, artifacts:[{path, kind, sha256, bytes}]}` — written **last**; artifacts in `xray/` not listed in a coherent manifest are swept by the next generation |
 
+`xray/` holds ONE run's artifacts at a time: exports and dossiers of the **same** run coexist
+(each command adopts the other's manifest entries), but generating either surface for a
+*different* run sweeps the other surface's now-stale files. Re-run the other command with the
+same `--run-id` to regenerate them — the database still has everything.
+
 ## Format rules
 
 **CSV** (RFC 4180): header row of column names; `\r\n` row endings including a trailing one;
