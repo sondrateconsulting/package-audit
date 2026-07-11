@@ -13,6 +13,10 @@ describe("parseVersion", () => {
   test("null when no version present", () => {
     expect(parseVersion("no numbers here")).toBeNull();
   });
+  test("null for a bare number without a dotted minor (major.minor are required)", () => {
+    expect(parseVersion("just 2")).toBeNull();
+    expect(parseVersion("bun 2")).toBeNull();
+  });
 });
 
 describe("meetsMinimum — FULL tuple compare", () => {

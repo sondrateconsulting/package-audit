@@ -29,7 +29,8 @@ export interface PreflightReport {
 export type Version = [number, number, number];
 
 // Extract the FIRST dotted numeric tuple from a version string (`git version 2.45.1` →
-// [2,45,1]; `1.3.14` → [1,3,14]). Missing minor/patch default to 0. null when none present.
+// [2,45,1]; `1.3.14` → [1,3,14]). Missing patch defaults to 0; major and minor are REQUIRED —
+// a string without at least `X.Y` (even one carrying a bare number) returns null.
 export function parseVersion(text: string): Version | null {
   const m = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(text);
   if (m === null) return null;
@@ -141,8 +142,8 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
     throw new PreflightError(`gh api rate_limit failed (network to ${config.githubHost}?): ${(e as Error).message}`);
   }
 
-  // 5b. registry reachability — ANY HTTP response counts (private registries may 401 a probe);
-  // only DNS/TLS/connect failures are fatal.
+  // 8. registry reachability (runs LAST, after the gh checks) — ANY HTTP response counts
+  // (private registries may 401 a probe); only DNS/TLS/connect failures are fatal.
   const fetchImpl = deps.fetchImpl ?? (async (url: string) => {
     // deadline: a wedged registry must fail the probe, not hang preflight (§5.E hardening)
     const res = await fetch(url, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(deps.registryFetchTimeoutMs ?? FETCH_TIMEOUT_MS) });
