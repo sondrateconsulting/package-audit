@@ -1,10 +1,10 @@
-import { expect, test, describe } from "bun:test";
+import { expect, test, describe, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso } from "./db.ts";
-import { buildNotReportableNotice, buildReport, runReport } from "./report.ts";
+import { buildNotReportableNotice, buildReport, emitDossiers, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
 import type { Config } from "./config.ts";
 
@@ -329,5 +329,90 @@ describe("runReport zero-write on a missing database", () => {
     expect(notice.reason).toContain("run `bun run audit` first");
     expect(readdirSync(root)).toEqual([]); // no output dir materialized
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("report --html wiring (emitDossiers + runReport integration)", () => {
+  const config = (root: string): Config => ({
+    concurrency: { branches: 1, organizations: 1, repositories: 1 },
+    cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
+    includeArchived: false, includeForks: false, includePersonalNamespace: false,
+    maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],
+    packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+    paths: { sqlitePath: join(root, "data", "audit.db"), outputDir: join(root, "output") },
+  });
+
+  test("emitDossiers writes one dossier per package + index + manifest, with visible observation status", () => {
+    const db = mem();
+    const run = seed(db);
+    const report = buildReport(db, run);
+    const out = mkdtempSync(join(tmpdir(), "dossier-wire-"));
+    const chunks: string[] = [];
+    const spy = spyOn(process.stdout, "write").mockImplementation(((c: unknown) => {
+      chunks.push(String(c));
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      const { dossiers, swept } = emitDossiers(report, out);
+      expect(dossiers).toBe(1);
+      expect(swept).toEqual([]);
+      const xray = join(out, "xray");
+      const files = readdirSync(xray).sort();
+      expect(files).toEqual(["expo-dossier.html", "index.html", "manifest.json"]);
+      const manifest = JSON.parse(readFileSync(join(xray, "manifest.json"), "utf8"));
+      expect(manifest.runId).toBe(run.runId);
+      expect(manifest.artifacts.every((a: any) => a.kind === "dossier")).toBe(true);
+      // the dossier itself carries the escaped evidence, never a raw script breakout
+      const html = readFileSync(join(xray, "expo-dossier.html"), "utf8");
+      expect(html).toContain("registerRootComponent");
+    } finally {
+      spy.mockRestore();
+      rmSync(out, { recursive: true, force: true });
+      db.close();
+    }
+    const events = chunks.join("").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l));
+    const dossierEvents = events.filter((e) => e.event === "dossier");
+    expect(dossierEvents.length).toBe(1);
+    expect(dossierEvents[0].package).toBe("expo");
+    expect(["emitted", "omitted"]).toContain(dossierEvents[0].observations);
+    const summary = events.filter((e) => e.event === "dossier-summary");
+    expect(summary.length).toBe(1);
+    expect(summary[0].dossiers).toBe(1);
+  });
+
+  test("runReport --html renders dossiers end-to-end from a file database (read-only open)", () => {
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-html-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const root = mkdtempSync(join(tmpdir(), "report-html-"));
+    const chunks: string[] = [];
+    const spy = spyOn(process.stdout, "write").mockImplementation(((c: unknown) => {
+      chunks.push(String(c));
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      seed(db);
+      db.close();
+      const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
+      const { line } = runReport(cfg, null, { html: true });
+      expect(line).toContain("dossier(s) + index");
+      const xray = join(root, "output", "xray");
+      expect(readdirSync(xray).sort()).toEqual(["expo-dossier.html", "index.html", "manifest.json"]);
+      // and WITHOUT --html nothing dossier-ish is produced on a fresh outputDir
+      const root2 = mkdtempSync(join(tmpdir(), "report-nohtml-"));
+      try {
+        const cfg2: Config = { ...config(root2), paths: { sqlitePath, outputDir: join(root2, "output") } };
+        runReport(cfg2, null, {});
+        expect(existsSync(join(root2, "output", "xray"))).toBe(false);
+      } finally {
+        rmSync(root2, { recursive: true, force: true });
+      }
+    } finally {
+      spy.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
   });
 });

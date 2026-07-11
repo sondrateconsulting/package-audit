@@ -10,7 +10,10 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
-import { writeFileAtomic } from "./artifactWrite.ts";
+import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
+import { dossierFilename, renderDossierDetailed, type DossierContext } from "./reportHtml.ts";
+import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
+import { logLine } from "./log.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
 import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -260,7 +263,38 @@ export function buildNotReportableNotice(runIdArg: string | null, missingDbPath?
 // AuditDb.open would create data/audit.db (create:true) and the emit path would mkdir outputDir;
 // a first report must touch NOTHING and just say so. So we exist-check before opening: a missing
 // database short-circuits with the notReportable notice and zero filesystem effect.
-export function runReport(config: Config, runIdArg: string | null): { line: string } {
+// `report --html` (T3-T6): render one self-contained dossier per tracked package plus the
+// index, through the ArtifactBundle (kind "dossier" — export artifacts of the SAME run are
+// adopted, never swept). One JSONL event per dossier (T7), with the observations fallback
+// VISIBLE (observations: "emitted"|"omitted"), then a dossier-summary event. Pure function of
+// the report object; the caller already holds it, so no re-query can disagree with run-<id>.json.
+export function emitDossiers(report: EmittedReport, outputDir: string): { dossiers: number; swept: string[] } {
+  const ctx: DossierContext = {
+    runId: report.runId,
+    generatedAt: report.generatedAt,
+    config: report.config,
+    summary: report.summary,
+    formatVersion: XRAY_FORMAT_VERSION,
+  };
+  const bundle = new ArtifactBundle(outputDir, "dossier");
+  let dossiers = 0;
+  for (const pkg of report.packages) {
+    const { html, observationsStatus, observationCount } = renderDossierDetailed(pkg as Parameters<typeof renderDossierDetailed>[0], ctx);
+    const name = dossierFilename((pkg as { name: string }).name);
+    const record = bundle.write(name, html);
+    dossiers++;
+    logLine({
+      event: "dossier", package: (pkg as { name: string }).name, path: join(outputDir, XRAY_DIR_NAME, record.path),
+      bytes: record.bytes, observations: observationsStatus, observationCount,
+    });
+  }
+  bundle.write(INDEX_FILENAME, renderIndex(report as Parameters<typeof renderIndex>[0], { formatVersion: XRAY_FORMAT_VERSION }));
+  const { swept } = bundle.finalize({ runId: report.runId });
+  logLine({ event: "dossier-summary", runId: report.runId, dossiers, index: join(outputDir, XRAY_DIR_NAME, INDEX_FILENAME), swept });
+  return { dossiers, swept };
+}
+
+export function runReport(config: Config, runIdArg: string | null, opts: { html?: boolean } = {}): { line: string } {
   const sqlitePath = config.paths.sqlitePath;
   // :memory: folds into the missing-db notice: a fresh in-memory database can never hold a
   // completed run, and openReadOnly (below) rightly refuses to open one.
@@ -285,8 +319,14 @@ export function runReport(config: Config, runIdArg: string | null): { line: stri
       return { line: `${JSON.stringify(notice)}\n` };
     }
 
-    const runPath = emitReportDetailed(db, run, outputDir, { alsoLatest: runIdArg === null }).path;
-    return { line: `report written: ${runPath}${runIdArg === null ? " (+ latest.json)" : ""}\n` };
+    const emitted = emitReportDetailed(db, run, outputDir, { alsoLatest: runIdArg === null });
+    if (opts.html === true) {
+      const { dossiers } = emitDossiers(emitted.report, outputDir);
+      return {
+        line: `report written: ${emitted.path}${runIdArg === null ? " (+ latest.json)" : ""} — ${dossiers} dossier(s) + index in ${join(outputDir, XRAY_DIR_NAME)}\n`,
+      };
+    }
+    return { line: `report written: ${emitted.path}${runIdArg === null ? " (+ latest.json)" : ""}\n` };
   } finally {
     db.close();
   }
@@ -302,7 +342,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     return;
   }
   const { config } = await loadConfig(argv);
-  process.stdout.write(runReport(config, rargs.runId).line);
+  process.stdout.write(runReport(config, rargs.runId, { html: rargs.html }).line);
 }
 
 // Atomic (temp+rename) and SYNC — the old Bun.write here discarded its Promise, a latent
