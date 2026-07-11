@@ -397,7 +397,7 @@ export function mapReadOnlyOpenError(e: unknown, path: string): unknown {
   if (code === "SQLITE_READONLY_RECOVERY")
     return new DbError(
       `database at ${path} has a WAL needing writable recovery (a previous writer crashed) — ` +
-        "run `bun run audit` or `bun run report` once, then retry",
+        "run `bun run audit` once (the only writable command), then retry",
     );
   if (code.startsWith("SQLITE_BUSY"))
     return new DbError(`database at ${path} is busy — an audit appears to be in progress; retry when it finishes`);

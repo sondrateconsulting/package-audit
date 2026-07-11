@@ -1038,13 +1038,21 @@ function buildV2Db(path: string): void {
   raw.close();
 }
 
-// Test-only AuditDb view over an existing raw connection — lets the CRITICAL round-trip test
-// build the "before" report from the UNMIGRATED v2 database with the real buildReport (opening
-// it through AuditDb.open would migrate it first). Same deliberate reach-in as `raw` above.
-function viewOver(rawDb: Database): AuditDb {
-  const view = Object.create(AuditDb.prototype) as AuditDb;
-  (view as unknown as { db: Database }).db = rawDb;
-  return view;
+// A v3 twin of the v2 fixture: identical logical data, built independently with raw SQL
+// (v2 schema + the additive ALTER + a v3 stamp — no db.ts migration code involved; note this
+// mirrors the migration's ALTER mechanism rather than a fresh-CREATE column order, which is
+// fine because the report never reads run_unit_head positionally). The
+// CRITICAL round-trip test compares the MIGRATED v2 database's report byte-for-byte against
+// this twin's: migration must be indistinguishable from having stored the data natively (with
+// is_default_branch NULL, exactly the migration backfill). The report format itself now carries
+// isDefaultBranch, so a pre-migration "before" report is no longer constructible — the twin IS
+// the before-equivalent baseline.
+function buildV3TwinDb(path: string): void {
+  buildV2Db(path);
+  const raw = new Database(path, { strict: true });
+  raw.exec("ALTER TABLE run_unit_head ADD COLUMN is_default_branch INTEGER");
+  raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  raw.close();
 }
 
 // Explicit v2 column projections (stable order) — deliberately NOT SELECT *: the migration
@@ -1074,20 +1082,25 @@ const V2_PROJECTIONS: Record<string, string> = {
 };
 
 describe("migration — v2 → v3 (version-stepped, CRITICAL round-trip)", () => {
-  test("real v2 data opens under v3: everything preserved, old run's report byte-identical", () => {
+  test("real v2 data opens under v3: everything preserved, old run's report byte-identical to a native-v3 twin", () => {
     const path = nextFile();
     buildV2Db(path);
 
-    // Baseline from the UNMIGRATED v2 database (precondition-checked).
+    // Baseline projections from the UNMIGRATED v2 database (precondition-checked).
     const rawBefore = new Database(path, { strict: true });
     expect((rawBefore.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
     const v2Cols = (rawBefore.query("PRAGMA table_info(run_unit_head)").all() as Array<{ name: string }>).map((c) => c.name);
     expect(v2Cols).not.toContain("is_default_branch");
-    const before = viewOver(rawBefore);
     const beforeProjections = new Map<string, unknown[]>();
     for (const [table, sql] of Object.entries(V2_PROJECTIONS)) beforeProjections.set(table, rawBefore.query(sql).all());
-    const beforeReport = JSON.stringify(buildReport(before, before.getRun("v2-run")!), null, 2);
     rawBefore.close();
+
+    // The report baseline: identical data stored NATIVELY in v3 shape (see buildV3TwinDb).
+    const twinPath = nextFile();
+    buildV3TwinDb(twinPath);
+    const twin = AuditDb.open({ sqlitePath: twinPath });
+    const expectedReport = JSON.stringify(buildReport(twin, twin.getRun("v2-run")!), null, 2);
+    twin.close();
 
     // Migrate by opening through the production path.
     const db = AuditDb.open({ sqlitePath: path });
@@ -1106,9 +1119,10 @@ describe("migration — v2 → v3 (version-stepped, CRITICAL round-trip)", () =>
       expect(r.query("PRAGMA foreign_key_check").all()).toEqual([]);
       // v2 running runs are NOT failed by the additive step (that is the LEGACY boundary rule).
       expect(db.getRun("v2-running")?.status).toBe("running");
-      // The old run's report is byte-identical through the migration.
+      // The old run's report is byte-identical to the natively-stored twin's.
       const afterReport = JSON.stringify(buildReport(db, db.getRun("v2-run")!), null, 2);
-      expect(afterReport).toBe(beforeReport);
+      expect(afterReport).toBe(expectedReport);
+      expect(afterReport).toContain('"isDefaultBranch": null'); // pre-v3 rows render as unknown
     } finally {
       db.close();
     }

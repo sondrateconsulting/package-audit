@@ -99,6 +99,12 @@ export const usageByRepoSchema = z
     organization: z.string().describe("GitHub owner (org, or the personal login when includePersonalNamespace scanned it)"),
     repository: z.string().describe("Repository name"),
     branch: z.string().describe("Branch name"),
+    isDefaultBranch: z
+      .boolean()
+      .nullable()
+      .describe(
+        "Tri-state (§5.B): true/false when discovery recorded whether this is the repo's default branch; null on pre-v3 runs (unknown — renderers show it as its own state, never as false)",
+      ),
     commitSha: z.string().describe("The snapshot head this run REPORTED for the unit (run_unit_head) — all evidence below is pinned to it"),
     dateFetched: isoUtc.describe("MAX over the unit's dependency/usage timestamps"),
     declarations: z.array(declarationSchema),

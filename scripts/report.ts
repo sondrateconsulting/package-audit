@@ -9,8 +9,8 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
-import { AuditDb, type RunRecord } from "./db.ts";
-import { assertContained } from "./readOnlyGuard.ts";
+import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
+import { writeFileAtomic } from "./artifactWrite.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
 import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -30,7 +30,10 @@ interface UsageRowDb {
   package_name: string; dependency_key: string; usage_type: string; export_name: string;
   context: string; file_path: string; line_number: number; permalink: string; snippet: string; found_at: string;
 }
-interface HeadRow { organization: string; repository: string; branch: string; commit_sha: string; status: string }
+interface HeadRow {
+  organization: string; repository: string; branch: string; commit_sha: string; status: string;
+  is_default_branch: number | null; // 1/0/NULL — NULL = unknown (pre-v3 run rows)
+}
 
 function unitKey(o: string, r: string, b: string, c: string): string {
   return `${o}\0${r}\0${b}\0${c}`;
@@ -60,15 +63,29 @@ export interface EmittedReport {
   summary: ReportSummary;
 }
 
-// Build the whole §7 report object for a run from SQLite alone.
-export function buildReport(db: AuditDb, run: RunRecord): EmittedReport {
+// Build the whole §7 report object for a run from SQLite alone. Works on the read-only handle;
+// the whole build runs inside ONE deferred read transaction so its multiple statements see a
+// single coherent snapshot even while a live audit commits concurrently.
+export function buildReport(db: AuditDbReader, run: RunRecord): EmittedReport {
+  return db.readTransaction(() => buildReportInner(db, run));
+}
+
+function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   const runId = run.runId;
   const tracked = JSON.stringify(run.trackedPackages);
 
   // scanned snapshot heads for this run (skipped-cutoff carry commit_sha='' and no findings).
-  const heads = db.read(`SELECT organization, repository, branch, commit_sha, status FROM run_unit_head WHERE run_id = ?`).all(runId) as HeadRow[];
+  const heads = db.read(`SELECT organization, repository, branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ?`).all(runId) as HeadRow[];
   const scannedHeads = heads.filter((h) => h.status === "scanned");
   const scannedKeys = new Set(scannedHeads.map((h) => unitKey(h.organization, h.repository, h.branch, h.commit_sha)));
+  // Tri-state default-branch flag per scanned unit (§5.B): true/false from v3 runs, null for
+  // pre-v3 rows — the renderer shows null as its own "(default branch unknown)" state.
+  const defaultFlags = new Map<string, boolean | null>(
+    scannedHeads.map((h) => [
+      unitKey(h.organization, h.repository, h.branch, h.commit_sha),
+      h.is_default_branch === null ? null : h.is_default_branch === 1,
+    ]),
+  );
 
   // findings joined through the immutable snapshot, filtered to tracked_packages.
   const depRows = (db.read(
@@ -89,7 +106,7 @@ export function buildReport(db: AuditDb, run: RunRecord): EmittedReport {
   const packages = run.trackedPackages
     .slice()
     .sort(cmp)
-    .map((name) => buildPackage(db, name, depRows, usageRows, scannedKeys));
+    .map((name) => buildPackage(db, name, depRows, usageRows, scannedKeys, defaultFlags));
 
   const errors = (db.read(
     `SELECT scope, organization, repository, branch, package_name, version, message, occurred_at, id
@@ -125,7 +142,10 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
   };
 }
 
-function buildPackage(db: AuditDb, name: string, depRows: DepRow[], usageRows: UsageRowDb[], scannedKeys: Set<string>) {
+function buildPackage(
+  db: AuditDbReader, name: string, depRows: DepRow[], usageRows: UsageRowDb[],
+  scannedKeys: Set<string>, defaultFlags: Map<string, boolean | null>,
+) {
   const deps = depRows.filter((d) => d.package_name === name);
   const usage = usageRows.filter((u) => u.package_name === name);
 
@@ -155,14 +175,14 @@ function buildPackage(db: AuditDb, name: string, depRows: DepRow[], usageRows: U
 
   const usageByRepo = [...unitMap.values()]
     .sort((a, b) => cmp(a.organization, b.organization) || cmp(a.repository, b.repository) || cmp(a.branch, b.branch) || cmp(a.commitSha, b.commitSha))
-    .map((unit) => buildUnit(unit, deps, usage));
+    .map((unit) => buildUnit(unit, deps, usage, defaultFlags.get(unitKey(unit.organization, unit.repository, unit.branch, unit.commitSha)) ?? null));
 
   return { name, versionsSeen, apiSurface, usageByRepo };
 }
 
 function buildUnit(
   unit: { organization: string; repository: string; branch: string; commitSha: string },
-  deps: DepRow[], usage: UsageRowDb[],
+  deps: DepRow[], usage: UsageRowDb[], isDefaultBranch: boolean | null,
 ) {
   const inUnit = <T extends { organization: string; repository: string; branch: string; commit_sha: string }>(r: T): boolean =>
     r.organization === unit.organization && r.repository === unit.repository && r.branch === unit.branch && r.commit_sha === unit.commitSha;
@@ -196,7 +216,7 @@ function buildUnit(
     .map((u) => ({ file: u.file_path, line: u.line_number, context: u.context, permalink: u.permalink, snippet: u.snippet }))
     .sort((a, b) => cmp(a.file, b.file) || a.line - b.line || cmp(a.context, b.context));
 
-  return { organization: unit.organization, repository: unit.repository, branch: unit.branch, commitSha: unit.commitSha, dateFetched, declarations, apiUsage, cliUsage };
+  return { organization: unit.organization, repository: unit.repository, branch: unit.branch, isDefaultBranch, commitSha: unit.commitSha, dateFetched, declarations, apiUsage, cliUsage };
 }
 
 // Emit a run's report files into outputDir (§7). Writes run-<id>.json always; the DEFAULT
@@ -205,7 +225,7 @@ function buildUnit(
 // object, so the caller's done-event counters and human summary derive from the EXACT emitted
 // report (never a separate re-query that could disagree with run-<id>.json).
 export function emitReportDetailed(
-  db: AuditDb, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean },
+  db: AuditDbReader, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean },
 ): { path: string; report: EmittedReport } {
   mkdirSync(outputDir, { recursive: true });
   const report = buildReport(db, run);
@@ -242,13 +262,17 @@ export function buildNotReportableNotice(runIdArg: string | null, missingDbPath?
 // database short-circuits with the notReportable notice and zero filesystem effect.
 export function runReport(config: Config, runIdArg: string | null): { line: string } {
   const sqlitePath = config.paths.sqlitePath;
-  if (sqlitePath !== ":memory:" && !existsSync(sqlitePath)) {
+  // :memory: folds into the missing-db notice: a fresh in-memory database can never hold a
+  // completed run, and openReadOnly (below) rightly refuses to open one.
+  if (sqlitePath === ":memory:" || !existsSync(sqlitePath)) {
     // Exit 0 (main() returns normally): notReportable is a well-formed, successful answer on the
     // stdout JSONL contract — consumers branch on the parsed `notReportable` field, not the exit
     // code — and this matches the exit-0 behavior of the DB-present notReportable cases below.
     return { line: `${JSON.stringify(buildNotReportableNotice(runIdArg, sqlitePath))}\n` };
   }
-  const db = AuditDb.open({ sqlitePath });
+  // CV5: report is a pure READ — it must never create, migrate, or write the database. A
+  // too-old schema renders the actionable "run `bun run audit` once to migrate" DbError.
+  const db = AuditDb.openReadOnly({ sqlitePath });
   try {
     const run = runIdArg !== null ? db.getRun(runIdArg) : db.latestReportableRun();
     const outputDir = config.paths.outputDir;
@@ -281,9 +305,11 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   process.stdout.write(runReport(config, rargs.runId).line);
 }
 
+// Atomic (temp+rename) and SYNC — the old Bun.write here discarded its Promise, a latent
+// fire-and-forget that could lose the report on a fast exit. §0 containment lives inside
+// writeFileAtomic (roots = [outputDir], the same contract as before).
 function writeJson(path: string, outputDir: string, value: unknown): void {
-  assertContained(path, [outputDir]); // §0 write containment
-  Bun.write(path, JSON.stringify(value, null, 2) + "\n");
+  writeFileAtomic(path, JSON.stringify(value, null, 2) + "\n", [outputDir]);
 }
 
 if (import.meta.main) {

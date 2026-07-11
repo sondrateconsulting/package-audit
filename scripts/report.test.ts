@@ -1,5 +1,6 @@
 import { expect, test, describe } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso } from "./db.ts";
@@ -88,6 +89,28 @@ describe("buildReport (§7)", () => {
     const a = JSON.stringify(buildReport(db, run));
     const b = JSON.stringify(buildReport(db, run));
     expect(a).toBe(b);
+    db.close();
+  });
+
+  test("units carry the tri-state isDefaultBranch from run_unit_head (true/false/null)", () => {
+    const db = mem();
+    const run = seed(db); // seed's unit writes isDefaultBranch: null
+    const mk = (repository: string, isDefaultBranch: boolean | null): void => {
+      db.upsertDependencyFinding({
+        runId: run.runId, organization: "org-a", repository, branch: "main", commitSha: `sha-${repository}`,
+        dateFetched: "2026-01-01T00:00:00.000Z", packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
+        manifestPath: "package.json", manifestLine: 1, manifestPermalink: `https://github.com/org-a/${repository}/blob/sha/package.json#L1`,
+        declaredVersion: "^50.0.0",
+      });
+      db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository, branch: "main", commitSha: `sha-${repository}`, status: "scanned", isDefaultBranch });
+    };
+    mk("r-default", true);
+    mk("r-feature", false);
+    const report = buildReport(db, run) as any;
+    const flags = Object.fromEntries(
+      report.packages[0].usageByRepo.map((u: any) => [u.repository, u.isDefaultBranch]),
+    );
+    expect(flags).toEqual({ svc: null, "r-default": true, "r-feature": false });
     db.close();
   });
 
@@ -251,18 +274,60 @@ describe("runReport zero-write on a missing database", () => {
 
   // Contrast case: when the database OPENS but holds no completed run, report must still write
   // the notice to output/latest.json — proving the missing-db guard only short-circuits the
-  // genuinely-absent case and does not suppress a real (if empty) report. An in-memory DB is a
-  // real, empty database that opens without hitting §0 write-containment (which pins a FILE db to
-  // ./data|./output and so rules out a temp-dir file db here); the notReportable branch is
-  // identical regardless of DB backing, and outputDir stays a real temp dir we can assert on.
+  // genuinely-absent case and does not suppress a real (if empty) report. runReport now opens
+  // READ-ONLY (CV5), which refuses :memory:, so the empty DB must be a real FILE — and §0
+  // write-containment pins file DBs to ./data|./output relative to CWD, hence the db.test.ts
+  // TEST_ROOT idiom here (created and removed carefully so fresh checkouts stay pristine).
   test("DB opens but no completed run: writes the notice to latest.json, no run file", () => {
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-${process.pid}-${Math.random().toString(36).slice(2)}`;
     const root = mkdtempSync(join(tmpdir(), "report-emptydb-"));
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      AuditDb.open({ sqlitePath }).close(); // a real, empty, cleanly-closed v3 database
+      const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
+      const { line } = runReport(cfg, null);
+      expect(JSON.parse(line).reason).toBe("no completed reportable run yet");
+      expect(readdirSync(join(root, "output"))).toEqual(["latest.json"]); // only latest.json, no run-<id>.json
+      const written = JSON.parse(readFileSync(join(root, "output", "latest.json"), "utf8"));
+      expect(notReportableSchema.safeParse(written).success).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test("a too-old (v2) file database is refused through runReport with the migrate-first error", () => {
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-v2-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const root = mkdtempSync(join(tmpdir(), "report-v2db-"));
+    try {
+      // Minimal v2-stamped file with audit tables: enough for openReadOnly's version gate,
+      // which fires BEFORE any table/column inspection needs to succeed.
+      const sqlitePath = join(dbRoot, "audit.db");
+      AuditDb.open({ sqlitePath }).close(); // create a real v3 db…
+      const bump = new Database(sqlitePath, { strict: true });
+      bump.exec("PRAGMA user_version = 2"); // …then stamp it old
+      bump.close();
+      const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
+      expect(() => runReport(cfg, null)).toThrow(/run `bun run audit` once to migrate/);
+      expect(existsSync(join(root, "output"))).toBe(false); // refused before any artifact write
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test(":memory: sqlitePath folds into the missing-db notice (nothing to read, nothing written)", () => {
+    const root = mkdtempSync(join(tmpdir(), "report-mem-"));
     const cfg: Config = { ...config(root), paths: { sqlitePath: ":memory:", outputDir: join(root, "output") } };
     const { line } = runReport(cfg, null);
-    expect(JSON.parse(line).reason).toBe("no completed reportable run yet");
-    expect(readdirSync(join(root, "output"))).toEqual(["latest.json"]); // only latest.json, no run-<id>.json
-    const written = JSON.parse(readFileSync(join(root, "output", "latest.json"), "utf8"));
-    expect(notReportableSchema.safeParse(written).success).toBe(true);
+    const notice = JSON.parse(line);
+    expect(notice.notReportable).toBe(true);
+    expect(notice.reason).toContain("run `bun run audit` first");
+    expect(readdirSync(root)).toEqual([]); // no output dir materialized
     rmSync(root, { recursive: true, force: true });
   });
 });
