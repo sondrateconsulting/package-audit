@@ -2,10 +2,11 @@ import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyBranchPlan, discoverCliTerms, discoverOwnerRepos, planSummaryText, processRepo, reconcileIntrospection, runPlan, runSummaryText } from "./orchestrate.ts";
-import { GithubClient, type BranchHead, type RepoInfo, type SpawnFn } from "./github.ts";
+import { classifyBranchPlan, discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText } from "./orchestrate.ts";
+import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type RepoInfo, type SpawnFn } from "./github.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import type { Config } from "./config.ts";
+import type { OrchestrateArgs } from "./args.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
 
@@ -485,5 +486,150 @@ describe("planSummaryText", () => {
     expect(text).toContain("12 past the per-repo cap (25)");
     expect(text).toContain("expo");
     expect(text).toMatch(/Discovery errors:\s+0\b/);
+  });
+});
+
+// ---- §4 throttle-requeue policy (sites a-d: owner discovery, repo discovery, branch ----------
+// ---- discovery, per-unit scan) ----------------------------------------------------------------
+
+const repo: RepoInfo = {
+  name: "r", organization: "o", defaultBranch: "main",
+  pushedAt: "2026-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false,
+};
+const liveHead: BranchHead = {
+  name: "main", oid: "a".repeat(40), committedDate: "2026-01-01T00:00:00Z", treeOid: "b".repeat(40),
+};
+// frozen: these 9 tests share one config; freezing forbids accidental cross-test mutation.
+const config = Object.freeze({
+  cutoffDate: "2000-01-01", maxBranchesPerRepo: 10, maxReposPerOrg: 10,
+  includeArchived: true, includeForks: true, includePersonalNamespace: false,
+  organizations: null, excludeOrganizations: [],
+}) as unknown as Config;
+const KEY: WorkUnitKey = { configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "main" };
+
+// only the methods each function touches before the injected failure fires.
+const fakeClient = (failure: Error): GithubClient =>
+  ({
+    listBranchHeads: async () => [liveHead],
+    fetchTreeRecursive: async () => { throw failure; },
+  }) as unknown as GithubClient;
+
+const openRun = (): { db: AuditDb; runId: string } => {
+  const db = AuditDb.open({ sqlitePath: ":memory:" });
+  const { runId } = db.startRun({
+    configHash: "hash", effectiveOwners: ["o"], ownersSource: "discovered",
+    trackedPackages: ["expo"], cutoffDate: "2000-01-01", githubHost: "github.com",
+  });
+  return { db, runId };
+};
+
+describe("processRepo throttle requeue (§4)", () => {
+  test("ThrottleExhausted puts the unit back to PENDING with no permanent error row", async () => {
+    const { db, runId } = openRun();
+    await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), config, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("pending"); // a later run retries it
+    const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all();
+    expect(errs.length).toBe(0);
+    db.close();
+  });
+
+  test("a GithubApiError still lands as a permanent ERROR with an errors row", async () => {
+    const { db, runId } = openRun();
+    await processRepo(db, fakeClient(new GithubApiError("boom", { endpoint: "x" })), config, runId, "hash", "o", repo, [], new Set());
+    expect(db.getUnit(KEY)?.status).toBe("error");
+    const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all() as Array<{ message: string }>;
+    expect(errs.length).toBe(1);
+    expect(errs[0]!.message).toMatch(/boom/);
+    db.close();
+  });
+});
+
+describe("processRepo branch-discovery throttle (§4, site c)", () => {
+  // client whose branch discovery (listBranchHeads) fails with the injected error.
+  const branchDiscoveryFails = (failure: Error): GithubClient =>
+    ({ listBranchHeads: async () => { throw failure; } }) as unknown as GithubClient;
+
+  test("ThrottleExhausted is transient — no permanent discovery errors row", async () => {
+    const { db, runId } = openRun();
+    await processRepo(db, branchDiscoveryFails(new ThrottleExhausted("graphql bucket")), config, runId, "hash", "o", repo, [], new Set());
+    const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all();
+    expect(errs.length).toBe(0); // re-discovered next run, not a hard failure
+    db.close();
+  });
+
+  test("a GithubApiError still records a permanent discovery errors row", async () => {
+    const { db, runId } = openRun();
+    await processRepo(db, branchDiscoveryFails(new GithubApiError("branch boom", { endpoint: "x" })), config, runId, "hash", "o", repo, [], new Set());
+    const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all() as Array<{ message: string }>;
+    expect(errs.length).toBe(1);
+    expect(errs[0]!.message).toMatch(/branch discovery failed.*branch boom/);
+    db.close();
+  });
+});
+
+describe("processOwner repo-discovery throttle (§4, site b)", () => {
+  const repoDiscoveryFails = (failure: Error): GithubClient =>
+    ({ listOrgRepos: async () => { throw failure; } }) as unknown as GithubClient;
+
+  test("ThrottleExhausted is transient — no permanent discovery errors row", async () => {
+    const { db, runId } = openRun();
+    await processOwner(db, repoDiscoveryFails(new ThrottleExhausted("core bucket")), config, runId, "hash", "o", null, [], new Set());
+    const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all();
+    expect(errs.length).toBe(0);
+    db.close();
+  });
+
+  test("a GithubApiError still records a permanent discovery errors row", async () => {
+    const { db, runId } = openRun();
+    await processOwner(db, repoDiscoveryFails(new GithubApiError("repo boom", { endpoint: "x" })), config, runId, "hash", "o", null, [], new Set());
+    const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all() as Array<{ message: string }>;
+    expect(errs.length).toBe(1);
+    expect(errs[0]!.message).toMatch(/repo discovery failed.*repo boom/);
+    db.close();
+  });
+});
+
+describe("resolveOwnersWithDiscovery owner-membership throttle (§4, site a)", () => {
+  test("ThrottleExhausted returns null so the run ends cleanly (no crash)", async () => {
+    const client = { listOrgMemberships: async () => { throw new ThrottleExhausted("core bucket"); } } as unknown as GithubClient;
+    expect(await resolveOwnersWithDiscovery(client, config, null)).toBeNull();
+  });
+
+  test("a GithubApiError propagates (a genuine failure still crashes the run)", async () => {
+    const client = { listOrgMemberships: async () => { throw new GithubApiError("membership boom", { endpoint: "x" }); } } as unknown as GithubClient;
+    await expect(resolveOwnersWithDiscovery(client, config, null)).rejects.toThrow(/membership boom/);
+  });
+
+  test("success resolves the discovered owners", async () => {
+    const client = { listOrgMemberships: async () => ["org-a", "org-b"] } as unknown as GithubClient;
+    const resolved = await resolveOwnersWithDiscovery(client, config, null);
+    expect(resolved?.owners).toEqual(["org-a", "org-b"]);
+    expect(resolved?.source).toBe("discovered");
+  });
+
+  test("an empty owner set still throws (fatal, NOT swallowed as a transient throttle)", async () => {
+    // configured-but-empty: the throttle catch rethrows every non-ThrottleExhausted error, so
+    // resolveEffectiveOwners' EmptyOwnersError must propagate — a regression that swallowed it
+    // (returning null) would silently end the run with no remediation message.
+    const emptyConfig = { ...(config as object), organizations: [] } as unknown as Config;
+    const client = { listOrgMemberships: async () => [] } as unknown as GithubClient;
+    await expect(resolveOwnersWithDiscovery(client, emptyConfig, null)).rejects.toThrow();
+  });
+});
+
+describe("runScan owner-discovery throttle (§4, site a — consumer wiring)", () => {
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+
+  test("a throttle during owner discovery ends cleanly WITHOUT starting a run (no phantom run row)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // sweepStaleTempDirs runs first; owner discovery then throttles, so nothing else is reached.
+    const client = {
+      sweepStaleTempDirs: () => [],
+      listOrgMemberships: async () => { throw new ThrottleExhausted("core bucket"); },
+    } as unknown as GithubClient;
+    await runScan(db, client, config, "hash", noArgs, ["expo"], null); // must not throw
+    const runs = db.read("SELECT COUNT(*) AS n FROM runs").get() as { n: number };
+    expect(runs.n).toBe(0); // startRun was never reached — no run, no report
+    db.close();
   });
 });
