@@ -126,7 +126,7 @@ Every field is documented in [config.schema.json](config.schema.json) (your edit
 
 ## Reading a run
 
-**stdout is pure JSONL during audit and plan runs** — one structured event per line, safe to pipe. Vocabulary: `config`, `preflight`, `owners`, `run`, `rescan-branch`, `cli-terms`, `plan`, `plan-summary`, `unit` (actions `scanned`, `skip-current`, `skip-cutoff`, `error`), `discovery`, `introspection`, `warning` (emitted when `--fresh` drops completed runs), `done`.
+**stdout is pure JSONL during audit and plan runs** — one structured event per line, safe to pipe. Vocabulary: `config`, `preflight`, `owners`, `run`, `rescan-branch`, `cli-terms`, `plan`, `plan-summary`, `unit` (actions `scanned`, `skip-current`, `skip-cutoff`, `error`, `requeue-throttle`), `discovery`, `introspection`, `warning` (emitted when `--fresh` drops completed runs), `owner-discovery-throttled`, `done`. When GitHub rate-limiting persists past the retry budget, throttled work is **deferred, not failed**: a `unit` or `discovery` line carries `action` `requeue-throttle`, and an `owner-discovery-throttled` event carries `action` `retry-next-run` — the affected units are finished on the next run (a resumed run skips already-scanned units).
 
 The presentation commands emit their own events: `report --html` writes one `dossier` line per package (`observations: emitted|omitted` makes the fallback visible) plus a `dossier-summary`; `export` writes one `export` line per artifact plus an `export-summary` (and a `warning` under `--raw`). Note `output/xray/` holds one run's artifacts at a time — regenerating either surface for a different run sweeps the other's stale files (re-run it with the same `--run-id`; the database keeps everything).
 
