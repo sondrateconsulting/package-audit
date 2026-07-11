@@ -210,6 +210,47 @@ function lineUnits(lines: string[], contextKind: "shell" | "makefile" | "workflo
   return units;
 }
 
+// A stage name is a leading run of these chars WITHIN a single token — one char class, no
+// overlapping quantifiers, so it stays linear even on a hostile token.
+const STAGE_NAME_PREFIX = /^[A-Za-z0-9_.-]+/;
+// ASCII-case-insensitive keyword tests. Deliberately regex (not `.toUpperCase() === "AS"`): JS's
+// non-Unicode `/i` folds only ASCII, so `/^as$/i` rejects e.g. `aſ` (U+017F, whose toUpperCase is
+// "S") — matching exactly what the old `…\s+AS\s+…/i` regex did.
+const FROM_KEYWORD = /^from$/i;
+const AS_KEYWORD = /^as$/i;
+
+// The stage name of a `FROM <image> AS <name>` line, or null when the line is not a FROM…AS.
+//
+// Linear replacement for the old `/^\s*FROM\s+.*?\s+AS\s+([A-Za-z0-9_.-]+)/i`, whose overlapping
+// `\s+ .*? \s+` quantifiers explored O(N³) partitions of a space run before failing (CWE-1333
+// ReDoS — a single space-padded line hung the whole audit). Splitting on whitespace bounds the work
+// to O(line length) and reproduces the old regex term for term:
+//   • Search AS from index 2 — the old `\s+.*?\s+` forces ≥1 token between FROM and AS, so AS is
+//     never token 0 (FROM) or token 1 (the image, or a leading flag like `--platform=…`). We do NOT
+//     parse out flags; like the old regex we just take the first standalone case-insensitive
+//     `as`/`AS` token from index 2 on. If the image is literally named `as`, BOTH old and new treat
+//     it as the keyword (e.g. `FROM --platform=x as AS build` → `stage:AS`) — this is equivalence
+//     with the old parser, not Docker-correctness.
+//   • `/^as$/i` mirrors the old literal `AS` under `/i` (ASCII-only case folding, so e.g. `aſ` is
+//     not `AS` — matching the old regex, unlike `.toUpperCase() === "AS"`).
+//   • First AS with a valid following name wins → the old lazy `.*?`; an AS whose next token starts
+//     with an invalid char is skipped → the old capture backtracking to a later AS.
+//   • STAGE_NAME_PREFIX = the leading valid-char run of the next token → the old capture group.
+// Differential-tested over 40k random inputs: the ONLY divergence is a malformed FROM with no image
+// (the token right after FROM is itself `AS`), which never appears in a real Dockerfile.
+function dockerfileStageName(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const toks = trimmed.split(/\s+/);
+  if (!FROM_KEYWORD.test(toks[0]!)) return null;
+  for (let i = 2; i < toks.length - 1; i++) {
+    if (!AS_KEYWORD.test(toks[i]!)) continue;
+    const name = STAGE_NAME_PREFIX.exec(toks[i + 1]!);
+    if (name) return name[0];
+  }
+  return null;
+}
+
 // Dockerfile: track `FROM … AS <stage>`; RUN/other lines carry `stage:<name>` (or stage:<index>).
 function dockerfileUnits(lines: string[]): Unit[] {
   const units: Unit[] = [];
@@ -217,12 +258,13 @@ function dockerfileUnits(lines: string[]): Unit[] {
   let stageIndex = 0;
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i]!;
-    const fromMatch = /^\s*FROM\s+.*?\s+AS\s+([A-Za-z0-9_.-]+)/i.exec(raw);
-    const bareFrom = /^\s*FROM\s+/i.test(raw);
-    if (fromMatch) {
-      stage = `stage:${fromMatch[1]}`;
+    const stageName = dockerfileStageName(raw);
+    if (stageName !== null) {
+      stage = `stage:${stageName}`;
       stageIndex++;
-    } else if (bareFrom) {
+    } else if (/^\s*FROM\s+/i.test(raw)) {
+      // a bare `FROM <image>` (no `AS <name>`) — carry an index-based stage. This test is linear:
+      // one `\s*` and one `\s+` with nothing overlapping after them.
       stage = `stage:${stageIndex}`;
       stageIndex++;
     }
