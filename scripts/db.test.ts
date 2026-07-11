@@ -2,7 +2,7 @@ import { expect, test, describe, afterAll } from "bun:test";
 import { Database } from "bun:sqlite";
 import { rmSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { AuditDb, DbError, SCHEMA_VERSION, nowIso, type RunInput } from "./db.ts";
+import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, nowIso, type RunInput } from "./db.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 
 // File-backed tests must live under ./data (§0 write containment is enforced by AuditDb.open).
@@ -675,7 +675,8 @@ describe("package_api_surface (§5.E durable introspection)", () => {
     expect(rows.length).toBe(3); // 2 rows + marker
     const marker = rows.find((r) => r["export_kind"] === "__complete__")!;
     expect(marker["export_name"]).toBe("");
-    expect(marker["source"]).toBe("__complete__");
+    // §7 epoch: the marker's `source` carries the current surface schema version.
+    expect(marker["source"]).toBe(`__complete__@${SURFACE_SCHEMA_VERSION}`);
 
     db.writeApiSurface({ packageName: "empty-pkg", version: "1.0.0", versionSource: "range-resolved", rows: [] });
     expect(db.hasCompletionMarker("empty-pkg", "1.0.0")).toBe(true);
@@ -739,6 +740,65 @@ describe("package_api_surface (§5.E durable introspection)", () => {
         rows: [{ exportName: "", exportKind: "__complete__" as never, source: "x" }],
       }),
     ).toThrow(DbError);
+    db.close();
+  });
+});
+
+describe("package_api_surface — §7 surface-cache epoch", () => {
+  test("SURFACE_SCHEMA_VERSION starts at 2 so every pre-epoch marker misses", () => {
+    expect(SURFACE_SCHEMA_VERSION).toBe(2);
+  });
+
+  test("a stale-epoch marker is treated as ABSENT; the current epoch short-circuits", () => {
+    const db = mem();
+    // a legacy bare '__complete__' marker (no epoch), as an OLD resolver would have written it.
+    raw(db)
+      .query(
+        `INSERT INTO package_api_surface (package_name, version, version_source, export_name, export_kind, source, introspected_at)
+         VALUES ('expo', '1.0.0', 'lockfile', '', '__complete__', '__complete__', '2024-01-01T00:00:00.000Z')`,
+      )
+      .run();
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(false);
+    // a DIFFERENT stale epoch ('@1') also misses.
+    raw(db)
+      .query(
+        `INSERT INTO package_api_surface (package_name, version, version_source, export_name, export_kind, source, introspected_at)
+         VALUES ('expo', '2.0.0', 'lockfile', '', '__complete__', '__complete__@1', '2024-01-01T00:00:00.000Z')`,
+      )
+      .run();
+    expect(db.hasCompletionMarker("expo", "2.0.0")).toBe(false);
+    // writeApiSurface stamps the CURRENT epoch → short-circuits.
+    db.writeApiSurface({ packageName: "expo", version: "1.0.0", versionSource: "lockfile", rows: [] });
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(true);
+    db.close();
+  });
+
+  test("re-inspection REPLACES a stale-epoch marker + rows (no stale marker/row survives)", () => {
+    const db = mem();
+    raw(db)
+      .query(
+        `INSERT INTO package_api_surface (package_name, version, version_source, export_name, export_kind, source, introspected_at)
+         VALUES ('expo', '1.0.0', 'lockfile', 'staleExport', 'named', 'old.d.ts', '2024-01-01T00:00:00.000Z')`,
+      )
+      .run();
+    raw(db)
+      .query(
+        `INSERT INTO package_api_surface (package_name, version, version_source, export_name, export_kind, source, introspected_at)
+         VALUES ('expo', '1.0.0', 'lockfile', '', '__complete__', '__complete__', '2024-01-01T00:00:00.000Z')`,
+      )
+      .run();
+    db.writeApiSurface({
+      packageName: "expo",
+      version: "1.0.0",
+      versionSource: "lockfile",
+      rows: [{ exportName: "fresh", exportKind: "named", source: "new.d.ts" }],
+    });
+    const markers = raw(db)
+      .query("SELECT source FROM package_api_surface WHERE export_kind='__complete__'")
+      .all() as Array<{ source: string }>;
+    expect(markers).toEqual([{ source: `__complete__@${SURFACE_SCHEMA_VERSION}` }]); // exactly one, current epoch
+    const named = (raw(db).query("SELECT export_name FROM package_api_surface WHERE export_kind='named'").all() as Array<{ export_name: string }>).map((r) => r.export_name);
+    expect(named).toEqual(["fresh"]); // stale row replaced
     db.close();
   });
 });

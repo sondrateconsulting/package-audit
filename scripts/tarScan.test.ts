@@ -5,7 +5,7 @@ import { expect, test, describe } from "bun:test";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { parseTarEntries, validateEntries, scanTarball, type TarEntry } from "./tarScan.ts";
 
-// ---- a minimal tar builder (checksums are not validated by the scanner) --------------------
+// ---- a minimal tar builder (writes a valid ustar checksum, which the scanner now validates) --
 const BLOCK = 512;
 function octal(n: number, len: number): string {
   return n.toString(8).padStart(len - 1, "0") + "\0";
@@ -16,6 +16,15 @@ interface BuildEntry {
   data?: Uint8Array;
   size?: number; // override (defaults to data length)
   prefix?: string;
+}
+// Standard ustar checksum: zero the 8-byte checksum field to spaces, sum all 512 header bytes,
+// then write the octal sum ("NNNNNN  ") at offset 148. Real tarballs carry this and the scanner
+// now validates it per-header, so the mock must produce it too — a builder fix, not a weakening.
+function writeChecksum(h: Uint8Array, off: number): void {
+  for (let i = off + 148; i < off + 156; i++) h[i] = 0x20;
+  let sum = 0;
+  for (let i = off; i < off + BLOCK; i++) sum += h[i]!;
+  h.set(new TextEncoder().encode(sum.toString(8).padStart(6, "0") + "  ").subarray(0, 8), off + 148);
 }
 function header(e: BuildEntry): Uint8Array {
   const h = new Uint8Array(BLOCK);
@@ -31,6 +40,7 @@ function header(e: BuildEntry): Uint8Array {
   put("ustar\0", 257, 6);
   put("00", 263, 2);
   if (e.prefix) put(e.prefix, 345, 155);
+  writeChecksum(h, 0);
   return h;
 }
 function buildTar(entries: BuildEntry[]): Uint8Array {
@@ -223,10 +233,13 @@ describe("parseTarEntries — PAX and GNU long names", () => {
     a.set(bytes.slice(0, 12));
     return a;
   };
-  // A file header whose 12-byte size field is set from raw bytes (checksum is not validated).
+  // A file header whose 12-byte size field is set from raw bytes; the checksum is RECOMPUTED after
+  // the mutation so these tests still exercise the SIZE-parse path (a stale checksum would trip the
+  // new per-header checksum gate first, hiding the size-terminator behavior under test).
   const fileHeaderRawSize = (name: string, sizeBytes: readonly number[]): Uint8Array => {
     const h = header({ name, type: "0" });
     h.set(rawSizeField(sizeBytes), 124);
+    writeChecksum(h, 0);
     return h;
   };
   const dig = (s: string): number[] => [...s].map((c) => c.charCodeAt(0));
@@ -331,6 +344,45 @@ describe("parseTarEntries — PAX and GNU long names", () => {
   });
 });
 
+describe("parseTarEntries — ustar header checksum (§5.E)", () => {
+  const concat = (arrs: Uint8Array[]): Uint8Array => {
+    const out = new Uint8Array(arrs.reduce((n, a) => n + a.length, 0));
+    let off = 0;
+    for (const a of arrs) { out.set(a, off); off += a.length; }
+    return out;
+  };
+  test("a regular-file header with a corrupted checksum is rejected before its declared size can swallow a following symlink", () => {
+    // Finding #9: a bad-checksum '0' header carrying an over-declared size makes the walk advance
+    // past — and swallow as file "data" — the FOLLOWING valid symlink header. The real extractor
+    // rejects the bad header, resyncs, and materializes the hidden symlink; the pre-scan must not
+    // silently pass. Wiping the checksum field (bytes 148..155 → spaces) makes the stored cksum 0,
+    // matching no real header sum, so the gate must reject.
+    const file = header({ name: "package/readme", type: "0", size: 512 });
+    for (let i = 148; i < 156; i++) file[i] = 0x20;
+    const tar = concat([
+      header({ name: "package/", type: "5" }),
+      file, // its bogus size=512 would consume the NEXT block (the symlink header) as "data"
+      header({ name: "package/evil", type: "2" }), // the symlink an over-advance would hide
+      new Uint8Array(BLOCK), new Uint8Array(BLOCK),
+    ]);
+    const r = parseTarEntries(tar);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/checksum/);
+    expect(r.entries.some((e) => e.typeflag === "2")).toBe(false); // symlink never surfaced
+  });
+  test("a fully valid checksummed archive still parses ok:true (the gate does not flag real tarballs)", () => {
+    const tar = buildTar([
+      { name: "package/", type: "5" },
+      { name: "package/package.json", data: data(`{"name":"x"}`) },
+      { name: "package/index.d.ts", data: data("export const a=1;") },
+    ]);
+    const r = parseTarEntries(tar);
+    expect(r.ok).toBe(true);
+    expect(r.entries.map((e) => e.name)).toEqual(["package/", "package/package.json", "package/index.d.ts"]);
+    expect(r.entries[1]!.size).toBe(12);
+  });
+});
+
 describe("parseTarEntries — decompression-bomb caps", () => {
   test("rejects a member whose declared size exceeds the total cap", () => {
     const tar = buildTar([{ name: "package/huge", size: 200 * 1024 * 1024, data: data("x") }]);
@@ -341,6 +393,7 @@ describe("parseTarEntries — decompression-bomb caps", () => {
   test("rejects a base-256 (non-octal) size field fail-closed", () => {
     const tar = buildTar([{ name: "package/x", data: data("x") }]);
     tar[124] = 0x80; // set the base-256 high bit in the size field
+    writeChecksum(tar, 0); // recompute so this exercises the SIZE-parse path, not the checksum gate
     expect(parseTarEntries(tar).ok).toBe(false);
   });
 });

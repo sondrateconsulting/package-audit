@@ -40,6 +40,7 @@ interface DerivedTerms {
   scoped: boolean;
   runnerTerms: Set<string>; // dlx-family (npx/bunx/pnpm dlx/yarn dlx/bun x): {name} + bins
   execAndBareTerms: Set<string>; // pnpm/yarn exec + bare: unscoped {name} + bins
+  bareMatchers: RegExp[]; // §5.G/§7: bareTokenRegex compiled ONCE per exec/bare term (see below)
 }
 
 export function deriveTerms(t: CliTermSet): DerivedTerms {
@@ -47,7 +48,26 @@ export function deriveTerms(t: CliTermSet): DerivedTerms {
   const bins = t.binNames.filter((b) => b !== ""); // an empty bin name would make bareTokenRegex match everywhere
   const runnerTerms = new Set<string>([t.name, ...bins]);
   const execAndBareTerms = new Set<string>([...(scoped ? [] : [t.name]), ...bins]);
-  return { packageName: t.packageName, scoped, runnerTerms, execAndBareTerms };
+  // §7: PRECOMPILE the bare-token matchers once here instead of constructing a fresh RegExp per
+  // bin per command-unit inside commandInvokes. Behaviour-identical — bareTokenRegex has no `/g`,
+  // so `.test` is stateless and reusing the compiled RegExp cannot leak lastIndex across commands.
+  // The hostile bin COUNT is bounded upstream by MAX_BIN_NAMES (apiSurface §7).
+  const bareMatchers = [...execAndBareTerms].map(bareTokenRegex);
+  return { packageName: t.packageName, scoped, runnerTerms, execAndBareTerms, bareMatchers };
+}
+
+// §7: derive each unit's term sets ONCE, not per scanned file. scanCli is called per FILE with the
+// SAME termSets array reference for every file in a unit (unitPipeline.scanUnit), so caching on that
+// reference hoists derivation to once-per-unit without changing the caller. A WeakMap keeps it
+// GC-safe (no retained references once the unit's array is dropped).
+const derivedCache = new WeakMap<CliTermSet[], DerivedTerms[]>();
+function deriveAll(termSets: CliTermSet[]): DerivedTerms[] {
+  let derived = derivedCache.get(termSets);
+  if (derived === undefined) {
+    derived = termSets.map(deriveTerms);
+    derivedCache.set(termSets, derived);
+  }
+  return derived;
 }
 
 // A punctuation-aware BARE-token boundary (consult §5.G): a bare term must not substring-match
@@ -94,7 +114,7 @@ function commandInvokes(cmd: string, terms: DerivedTerms): boolean {
   for (const runner of EXEC_RUNNERS) {
     if (runnerTargets(cmd, runner).some((t) => terms.execAndBareTerms.has(t))) return true;
   }
-  for (const bare of terms.execAndBareTerms) if (bareTokenRegex(bare).test(cmd)) return true;
+  for (const re of terms.bareMatchers) if (re.test(cmd)) return true; // precompiled (§7)
   return false;
 }
 
@@ -124,7 +144,7 @@ export function scanCli(content: string, ctx: CliScanContext, termSets: CliTermS
   if (termSets.length === 0) return [];
   const kind = classifyFile(ctx.filePath);
   if (kind === "other") return [];
-  const derived = termSets.map(deriveTerms);
+  const derived = deriveAll(termSets); // §7: once per unit (cached on the termSets reference)
   const lines = content.split("\n");
 
   let units: Unit[];

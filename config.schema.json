@@ -84,7 +84,9 @@
           "name": {
             "type": "string",
             "minLength": 1,
-            "description": "The npm REGISTRY name — the single canonical identity for manifest/lockfile matching, API introspection, and reporting. npm-alias installs are detected at scan time."
+            "maxLength": 214,
+            "pattern": "^(@[A-Za-z0-9][A-Za-z0-9._~-]*/[A-Za-z0-9][A-Za-z0-9._~-]*|[A-Za-z0-9][A-Za-z0-9._~-]*)$",
+            "description": "The npm REGISTRY name — the single canonical identity for manifest/lockfile matching, API introspection, and reporting. A strict, fail-closed subset of npm names (uppercase allowed; exotic legacy punctuation and traversal/percent/query/fragment chars rejected) so the name can never reshape a registry URL (PROMPT.md §5.E); enforced identically at runtime. npm-alias installs are detected at scan time."
           },
           "registryUrl": {
             "type": ["string", "null"],

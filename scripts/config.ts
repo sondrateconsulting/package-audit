@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
+import { isValidPackageName } from "./packageName.ts";
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -170,6 +171,10 @@ function normalizePackages(o: Record<string, unknown>, env: Record<string, strin
     if (!isObject(entry)) fail(`each packages[] entry must be an object`);
     rejectUnknownKeys(entry, CONFIG_PACKAGE_KEYS, `$.packages[${i}]`);
     const name = reqString(entry, "name", "packages[]");
+    // Fail-closed at the boundary: a name that isn't a strictly valid npm package name could,
+    // once embedded in a registry URL, normalize to an off-target same-origin path/query and
+    // leak the registry bearer token (§5.E). Reject it before it ever reaches the fetch layer.
+    if (!isValidPackageName(name)) fail(`packages["${name}"].name is not a valid npm package name`);
     if (seen.has(name)) fail(`packages[].name must be UNIQUE across the array — duplicate: ${name}`);
     seen.add(name);
     const registryUrl = validateRegistryUrl(optString(entry, "registryUrl", DEFAULT_REGISTRY_URL), name);

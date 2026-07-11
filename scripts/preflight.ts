@@ -104,6 +104,13 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
   const tarVer = await client.tar(["--version"]);
   if (tarVer.exitCode !== 0) throw new PreflightError(`tar --version failed: ${tarVer.stderr.trim().slice(0, 200)}`);
   const tarFlavor = detectTarFlavor(tarVer.stdout);
+  // §5.E: the pre-extraction scan's resync/secure-symlink reasoning only holds for GNU tar and
+  // bsdtar/libarchive. A tar that is neither (e.g. busybox/toybox) could materialize a member the
+  // scan believed it rejected, so fail closed rather than extract with an unvetted implementation.
+  if (tarFlavor === "unknown")
+    throw new PreflightError(
+      `unsupported tar implementation (found '${tarVer.stdout.trim().slice(0, 80)}') — the §5.E pre-extraction scan requires GNU tar or bsdtar/libarchive. Remediate: install GNU tar or bsdtar (libarchive) and ensure it is first on PATH`,
+    );
 
   // 5. discovery scope evidence (only in discovery mode) + capture login
   const userRes = await client.restGet("user");
