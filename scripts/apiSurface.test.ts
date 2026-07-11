@@ -5,6 +5,7 @@ import { AuditDb } from "./db.ts";
 import {
   parseSRI, verifyIntegrity, selectVersionDist, resolveRangeToVersion, encodePackageNameForUrl,
   introspectVersion, fetchPackument, inflateBounded, assertExtractedTreeSafe,
+  readBodyCapped, FETCH_TIMEOUT_MS, MAX_PACKUMENT_BYTES,
   IntrospectionError, type FetchFn, type Packument,
 } from "./apiSurface.ts";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync, linkSync, chmodSync } from "node:fs";
@@ -203,6 +204,71 @@ function mockRegistry(packumentJson: string, tgz: Uint8Array): { fetchImpl: Fetc
   return { fetchImpl, authHosts };
 }
 
+describe("fetch timeouts + streamed byte caps (§5.E hardening)", () => {
+  test("FETCH_TIMEOUT_MS is 60s and MAX_PACKUMENT_BYTES is 50MB (independent literals)", () => {
+    expect(FETCH_TIMEOUT_MS).toBe(60_000);
+    expect(MAX_PACKUMENT_BYTES).toBe(52_428_800);
+  });
+
+  // a test-side deadline so a regression that REMOVES the implementation's deadline fails
+  // red in seconds instead of wedging the suite on an un-interruptible pending read.
+  const withTestDeadline = <T>(p: Promise<T>, ms: number): Promise<T> =>
+    Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error("test-deadline exceeded")), ms))]);
+
+  const neverEndingBody = (onCancel?: () => void): ReadableStream<Uint8Array> =>
+    new ReadableStream<Uint8Array>({
+      pull: () => new Promise<void>(() => {}),
+      cancel() { onCancel?.(); },
+    });
+
+  test("readBodyCapped aborts a never-ending body at the deadline and cancels the stream", async () => {
+    let cancelled = false;
+    await expect(withTestDeadline(readBodyCapped(neverEndingBody(() => { cancelled = true; }), 1024, 20, "test"), 5000))
+      .rejects.toThrow(/timed out/);
+    expect(cancelled).toBe(true); // the source was released, not just abandoned
+  });
+
+  test("readBodyCapped fails a chunked over-cap body INCREMENTALLY, not after buffering", async () => {
+    // no Content-Length anywhere in sight: the cap must trip per chunk as bytes arrive.
+    let pulls = 0;
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) { pulls++; c.enqueue(new Uint8Array(1024)); },
+      cancel() { cancelled = true; },
+    });
+    await expect(readBodyCapped(stream, 2500, 1000, "test")).rejects.toThrow(/exceeds/);
+    expect(pulls).toBeLessThanOrEqual(4); // stopped at the cap crossing — never drained the stream
+    expect(cancelled).toBe(true);
+  });
+
+  test("readBodyCapped returns concatenated bytes for a normal body", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new Uint8Array([1, 2])); c.enqueue(new Uint8Array([3])); c.close(); },
+    });
+    expect(Array.from(await readBodyCapped(stream, 10, 1000, "test"))).toEqual([1, 2, 3]);
+  });
+
+  test("fetchPackument aborts a never-ending packument body at the deadline (injected fetch)", async () => {
+    const signals: unknown[] = [];
+    const fetchImpl: FetchFn = async (_url, init) => {
+      signals.push(init.signal);
+      return {
+        status: 200, ok: true, headers: { get: () => null },
+        body: neverEndingBody(),
+        arrayBuffer: async () => new ArrayBuffer(0), text: async () => "",
+      };
+    };
+    await expect(withTestDeadline(fetchPackument({
+      packageName: "expo", registryUrl: "https://registry.example.com",
+      registryAuthEnvVar: null, fetchImpl, fetchTimeoutMs: 20,
+    }), 5000)).rejects.toThrow(/timed out/);
+    // the header-phase deadline: every hop must carry a live AbortSignal (the body-read
+    // deadline above cannot protect the connect/headers phase on the real fetch).
+    expect(signals.length).toBeGreaterThanOrEqual(1);
+    expect(signals.every((s) => s instanceof AbortSignal)).toBe(true);
+  });
+});
+
 const TMP = mkdtempSync(join(tmpdir(), "apisurf-"));
 afterAll(() => {
   try {
@@ -270,6 +336,40 @@ describe("introspectVersion — integration (real system tar)", () => {
       { export_name: "registerRootComponent", export_kind: "named" },
       { export_name: "AppConfig", export_kind: "type" },
     ]);
+    db.close();
+  });
+
+  test("consumes STREAMED bodies via the capped reader (never the buffer fallback), signal on every hop", async () => {
+    // the real fetch always has res.body: this pins that introspection actually takes the
+    // streamed/capped path — the buffer methods THROW, so any silent fallback fails loudly.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = seedRun(db);
+    const tgz = buildTgz([{ name: "package.json", content: JSON.stringify({ name: "expo" }) }]);
+    const packumentJson = makePackument(tgz);
+    const signals: unknown[] = [];
+    const streamOf = (bytes: Uint8Array): ReadableStream<Uint8Array> =>
+      new ReadableStream<Uint8Array>({ start(c) { c.enqueue(bytes); c.close(); } });
+    const fetchImpl: FetchFn = async (url, init) => {
+      signals.push(init.signal);
+      const isTarball = url.endsWith(".tgz");
+      return {
+        status: 200, ok: true, headers: { get: () => null },
+        body: streamOf(isTarball ? tgz : new TextEncoder().encode(packumentJson)),
+        arrayBuffer: async (): Promise<ArrayBuffer> => { throw new Error("buffer fallback must not be used"); },
+        text: async (): Promise<string> => { throw new Error("buffer fallback must not be used"); },
+      };
+    };
+    const client = new GithubClient({ githubHost: "github.com", tempRoot: TMP });
+    await introspectVersion({
+      client, db, runId, packageName: "expo",
+      registryUrl: "https://registry.example.com", registryAuthEnvVar: null,
+      version: "1.0.0", versionSource: "lockfile", fetchImpl,
+    });
+    const errs = db.read("SELECT message FROM errors").all() as Array<{ message: string }>;
+    expect(errs).toEqual([]); // a buffer-fallback throw or stream failure would land here
+    expect(db.hasCompletionMarker("expo", "1.0.0")).toBe(true);
+    expect(signals.length).toBeGreaterThanOrEqual(2); // packument + tarball hops
+    expect(signals.every((s) => s instanceof AbortSignal)).toBe(true);
     db.close();
   });
 

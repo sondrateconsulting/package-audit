@@ -6,6 +6,7 @@
 
 import type { GithubClient } from "./github.ts";
 import type { Config } from "./config.ts";
+import { FETCH_TIMEOUT_MS } from "./apiSurface.ts";
 
 export class PreflightError extends Error {
   constructor(message: string) {
@@ -142,7 +143,8 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
   // 5b. registry reachability — ANY HTTP response counts (private registries may 401 a probe);
   // only DNS/TLS/connect failures are fatal.
   const fetchImpl = deps.fetchImpl ?? (async (url: string) => {
-    const res = await fetch(url, { method: "GET", redirect: "manual" });
+    // deadline: a wedged registry must fail the probe, not hang preflight (§5.E hardening)
+    const res = await fetch(url, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     return { ok: res.ok, status: res.status };
   });
   for (const registryUrl of new Set(config.packages.map((p) => p.registryUrl))) {

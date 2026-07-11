@@ -29,6 +29,12 @@ export class IntrospectionError extends Error {
 
 const MAX_TARBALL_BYTES = 100 * 1024 * 1024; // registry tarball hard cap, COMPRESSED (§5.C/§5.E)
 const MAX_REDIRECTS = 5;
+// §5.E hardening: the registry is untrusted — a trickling or never-ending response must not
+// hang the serial introspection stage, and a chunked (no Content-Length) body must not be
+// buffered past its cap. Every fetch carries this wall-clock deadline (connect through body),
+// and bodies are stream-read with the cap enforced per chunk (mirrors github.ts readCapped).
+export const FETCH_TIMEOUT_MS = 60_000;
+export const MAX_PACKUMENT_BYTES = 50 * 1024 * 1024; // large packages ship multi-MB packuments
 // UNCOMPRESSED cap: a registry .tgz is untrusted, and a decompression bomb (a tiny .tgz that
 // inflates to gigabytes) must not exhaust memory. node:zlib enforces maxOutputLength INCREMENTALLY
 // and throws before the cap is exceeded (Bun.gunzipSync has no such cap). Set above tarScan's
@@ -129,13 +135,49 @@ export function encodePackageNameForUrl(name: string): string {
 }
 
 // ---- fetch layer (injectable) ---------------------------------------------------------------
-export type FetchFn = (url: string, init: { headers: Record<string, string>; redirect: "manual" }) => Promise<{
+export type FetchFn = (url: string, init: { headers: Record<string, string>; redirect: "manual"; signal?: AbortSignal }) => Promise<{
   status: number;
   ok: boolean;
   headers: { get(name: string): string | null };
+  // present on the real fetch (and stream-aware mocks): read via readBodyCapped so the byte
+  // cap trips incrementally; the buffer methods below are the legacy-mock fallback.
+  body?: ReadableStream<Uint8Array> | null;
   arrayBuffer(): Promise<ArrayBuffer>;
   text(): Promise<string>;
 }>;
+
+// Stream-read a response body with the cap enforced PER CHUNK and a single wall-clock deadline
+// for the whole read — a trickling registry can neither out-buffer the cap nor stall forever.
+export async function readBodyCapped(
+  body: ReadableStream<Uint8Array>,
+  cap: number,
+  timeoutMs: number,
+  what: string,
+): Promise<Uint8Array> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new IntrospectionError(`${what} body read timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer.unref?.(); // a pending deadline must never pin the event loop by itself
+  });
+  try {
+    for (;;) {
+      const readP = reader.read();
+      readP.catch(() => {}); // a post-deadline rejection must not become unhandled
+      const { done, value } = await Promise.race([readP, deadline]);
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) throw new IntrospectionError(`${what} exceeds ${cap} bytes`);
+      chunks.push(value);
+    }
+    return new Uint8Array(Buffer.concat(chunks));
+  } finally {
+    clearTimeout(timer);
+    reader.cancel().catch(() => {}); // release the stream on every exit (no-op when done)
+  }
+}
 
 export interface IntrospectOptions {
   client: GithubClient;
@@ -148,10 +190,12 @@ export interface IntrospectOptions {
   versionSource: ResolvedVersionSource;
   env?: Record<string, string | undefined>;
   fetchImpl?: FetchFn;
+  fetchTimeoutMs?: number; // wall-clock deadline per hop/body read (default FETCH_TIMEOUT_MS)
   packument?: Packument; // optional pre-fetched packument (the orchestrator caches per package)
 }
 
-const realFetch: FetchFn = (url, init) => fetch(url, { headers: init.headers, redirect: init.redirect }) as unknown as ReturnType<FetchFn>;
+const realFetch: FetchFn = (url, init) =>
+  fetch(url, { headers: init.headers, redirect: init.redirect, signal: init.signal }) as unknown as ReturnType<FetchFn>;
 
 // Fetch a URL following redirects MANUALLY, re-verifying the per-hop origin and attaching the
 // bearer token ONLY on hops whose origin equals the registry origin (never carrying it across a
@@ -163,13 +207,15 @@ async function fetchFollowing(
   authToken: string | null,
   fetchImpl: FetchFn,
   wantBytes: boolean,
+  timeoutMs: number,
 ): Promise<{ bytes: Uint8Array; text: string }> {
   let current = startUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const sameOrigin = new URL(current).origin === registryOrigin;
     const headers: Record<string, string> = { "Accept-Encoding": "identity" };
     if (authToken !== null && sameOrigin) headers["Authorization"] = `Bearer ${authToken}`;
-    const res = await fetchImpl(current, { headers, redirect: "manual" });
+    // per-hop deadline: covers connect/headers on the real fetch; body reads carry their own.
+    const res = await fetchImpl(current, { headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
       if (loc === null) throw new IntrospectionError(`redirect ${res.status} without Location`);
@@ -193,11 +239,20 @@ async function fetchFollowing(
         if (Number.isNaN(len) || len > MAX_TARBALL_BYTES)
           throw new IntrospectionError(`invalid/oversized tarball content-length: ${lenHeader}`);
       }
-      const bytes = new Uint8Array(await res.arrayBuffer());
+      const bytes = res.body != null
+        ? await readBodyCapped(res.body, MAX_TARBALL_BYTES, timeoutMs, "tarball")
+        : new Uint8Array(await res.arrayBuffer()); // legacy-mock fallback (no stream)
       if (bytes.length > MAX_TARBALL_BYTES) throw new IntrospectionError(`tarball exceeds ${MAX_TARBALL_BYTES} bytes`);
       return { bytes, text: "" };
     }
-    return { bytes: new Uint8Array(), text: await res.text() };
+    if (res.body != null) {
+      const raw = await readBodyCapped(res.body, MAX_PACKUMENT_BYTES, timeoutMs, "packument");
+      return { bytes: new Uint8Array(), text: new TextDecoder().decode(raw) };
+    }
+    const text = await res.text(); // legacy-mock fallback (post-hoc cap; the real path streams)
+    if (Buffer.byteLength(text, "utf8") > MAX_PACKUMENT_BYTES)
+      throw new IntrospectionError(`packument exceeds ${MAX_PACKUMENT_BYTES} bytes`);
+    return { bytes: new Uint8Array(), text };
   }
   throw new IntrospectionError(`too many redirects fetching ${redactUrl(startUrl)}`);
 }
@@ -344,7 +399,7 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
     if (new URL(dist.tarball).origin !== registryOrigin)
       throw new IntrospectionError(`tarball origin ${new URL(dist.tarball).origin} != registry ${registryOrigin}`);
 
-    const { bytes } = await fetchFollowing(dist.tarball, registryOrigin, authToken, fetchImpl, true);
+    const { bytes } = await fetchFollowing(dist.tarball, registryOrigin, authToken, fetchImpl, true, opts.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
     verifyIntegrity(bytes, dist.integrity, dist.shasum); // BEFORE extraction
 
     const scan = scanTarball(bytes, (b) => inflateBounded(b));
@@ -388,6 +443,7 @@ export interface PackumentRequest {
   registryAuthEnvVar: string | null;
   env?: Record<string, string | undefined>;
   fetchImpl?: FetchFn;
+  fetchTimeoutMs?: number; // wall-clock deadline per hop/body read (default FETCH_TIMEOUT_MS)
 }
 
 // Fetch + parse a package's packument. EXPORTED for the orchestrator: the §5.E range-resolution
@@ -401,7 +457,7 @@ export async function fetchPackument(req: PackumentRequest): Promise<Packument> 
   const registryOrigin = new URL(req.registryUrl).origin;
   const base = req.registryUrl.replace(/\/+$/, "");
   const url = `${base}/${encodePackageNameForUrl(req.packageName)}`;
-  const { text } = await fetchFollowing(url, registryOrigin, authToken, fetchImpl, false);
+  const { text } = await fetchFollowing(url, registryOrigin, authToken, fetchImpl, false, req.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
