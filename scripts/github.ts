@@ -456,6 +456,19 @@ export function parseRetryAfterMs(value: string | undefined, nowMs: number): num
 // positive evidence (Retry-After header or the documented abuse wording); otherwise fatal.
 const SECONDARY_BODY_RE = /secondary rate limit|abuse detection|abuse rate limit/i;
 
+// Shared §4 PRIMARY-window computation (REST + GraphQL): reset epoch + skew, floored at
+// nowMs+1s, clamped at nowMs+MAX_PAUSE_MS. ONE site, so the four embedded constants
+// (CLOCK_SKEW_MS, the 60s no-header fallback, the 1s floor, MAX_PAUSE_MS) can never
+// silently desync between the two classifiers.
+function primaryUntilMs(headers: Record<string, string>, nowMs: number): number {
+  const resetSec = Number(headers["x-ratelimit-reset"] ?? "0");
+  const untilMs = Number.isFinite(resetSec) && resetSec > 0 ? resetSec * 1000 + CLOCK_SKEW_MS : nowMs + 60_000;
+  return Math.min(Math.max(untilMs, nowMs + 1000), nowMs + MAX_PAUSE_MS);
+}
+// Retry-After, parsed then clamped — the §4 secondary-throttle wait wherever it appears.
+const retryAfterClampedMs = (headers: Record<string, string>, nowMs: number): number | null =>
+  clampPauseMs(parseRetryAfterMs(headers["retry-after"], nowMs));
+
 export function classifyRest(
   status: number,
   headers: Record<string, string>,
@@ -467,14 +480,11 @@ export function classifyRest(
     // PRIMARY is keyed on remaining==0, NOT the status code (§4). Checking it BEFORE the SSO
     // header is safe: a genuine SSO/permission 403 is not consuming the last request of the
     // window, so it arrives with nonzero remaining and falls through to the fatal branches.
-    if (headers["x-ratelimit-remaining"] === "0") {
-      const resetSec = Number(headers["x-ratelimit-reset"] ?? "0");
-      const untilMs = Number.isFinite(resetSec) && resetSec > 0 ? resetSec * 1000 + CLOCK_SKEW_MS : nowMs + 60_000;
-      return { kind: "primary", untilMs: Math.min(Math.max(untilMs, nowMs + 1000), nowMs + MAX_PAUSE_MS) };
-    }
+    if (headers["x-ratelimit-remaining"] === "0")
+      return { kind: "primary", untilMs: primaryUntilMs(headers, nowMs) };
     if (headers["x-github-sso"] !== undefined)
       return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso). Remediate: gh auth refresh (see README § Authentication)" };
-    const retryAfter = clampPauseMs(parseRetryAfterMs(headers["retry-after"], nowMs));
+    const retryAfter = retryAfterClampedMs(headers, nowMs);
     if (retryAfter !== null) return { kind: "secondary", waitMs: retryAfter };
     if (status === 429 || SECONDARY_BODY_RE.test(body)) return { kind: "secondary", waitMs: null };
     return { kind: "fatal", status, ssoRequired: false, message: `HTTP ${status} (permission/forbidden)` };
@@ -493,11 +503,7 @@ export function classifyGraphql(
   bodyErrors: GraphqlErrorEntry[],
   nowMs: number,
 ): Classification {
-  const primaryFromHeaders = (): Classification => {
-    const resetSec = Number(headers["x-ratelimit-reset"] ?? "0");
-    const untilMs = Number.isFinite(resetSec) && resetSec > 0 ? resetSec * 1000 + CLOCK_SKEW_MS : nowMs + 60_000;
-    return { kind: "primary", untilMs: Math.min(Math.max(untilMs, nowMs + 1000), nowMs + MAX_PAUSE_MS) };
-  };
+  const primaryFromHeaders = (): Classification => ({ kind: "primary", untilMs: primaryUntilMs(headers, nowMs) });
   // SSO enforcement is ALWAYS fatal, never a retryable throttle — short-circuit on an error
   // status BEFORE the RATE_LIMITED body branch, so even a (hypothetical) 403 carrying both an
   // x-github-sso header and a RATE_LIMITED body stays fatal.
@@ -508,7 +514,7 @@ export function classifyGraphql(
   const rateLimited = bodyErrors.some((e) => e.type === "RATE_LIMITED");
   if (rateLimited) {
     if (headers["x-ratelimit-remaining"] === "0") return primaryFromHeaders();
-    return { kind: "secondary", waitMs: clampPauseMs(parseRetryAfterMs(headers["retry-after"], nowMs)) };
+    return { kind: "secondary", waitMs: retryAfterClampedMs(headers, nowMs) };
   }
   if (status === 403 || status === 429) {
     // §4's GraphQL 403 disambiguation (SSO already handled above): a documented permission
@@ -519,7 +525,7 @@ export function classifyGraphql(
       return { kind: "fatal", status, ssoRequired: false, message: text };
     if (headers["x-ratelimit-remaining"] === "0") return primaryFromHeaders();
     if (headers["retry-after"] !== undefined || SECONDARY_BODY_RE.test(text) || status === 429)
-      return { kind: "secondary", waitMs: clampPauseMs(parseRetryAfterMs(headers["retry-after"], nowMs)) };
+      return { kind: "secondary", waitMs: retryAfterClampedMs(headers, nowMs) };
     return { kind: "fatal", status, ssoRequired: false, message: text || `HTTP ${status}` };
   }
   if (status >= 500) return { kind: "transient" };
@@ -887,6 +893,18 @@ export class GithubClient {
     }
   }
 
+  // §4: the FINAL attempt's classification must not arm the bucket — the call is about to
+  // throw, and a residual pause would tax the next (possibly honest) call for free. ONE site
+  // for the guard so restGet and graphql can never drift apart. Callers compute untilMs
+  // eagerly; on the final attempt that spends one extra this.now() read and one discarded
+  // backoffWait computation (both pure — the injected test clocks only advance on sleep).
+  private armBucketPause(bucket: Bucket, attempt: number, untilMs: number): void {
+    if (attempt < MAX_ATTEMPTS - 1) bucket.pausedUntilMs = Math.max(bucket.pausedUntilMs, untilMs);
+  }
+
+  // MUST stay PURE (no state, no jitter, no counters): armBucketPause callers evaluate it
+  // even on the final attempt and discard the result — a side effect here would silently
+  // start taxing that discarded call.
   private backoffWait(kind: "secondary" | "transient", attempt: number, waitMs: number | null): number {
     if (waitMs !== null) return waitMs;
     const base = kind === "secondary" ? SECONDARY_BASE_WAIT_MS : TRANSIENT_BASE_WAIT_MS;
@@ -944,17 +962,12 @@ export class GithubClient {
       }
       if (cls.kind === "fatal")
         throw new GithubApiError(`${cls.message} (${endpoint})`, { status: cls.status, endpoint, ssoRequired: cls.ssoRequired });
-      // the FINAL attempt's classification must not arm the bucket: this call is about to
-      // throw, and the residual pause would tax the next (possibly honest) call for free.
       if (cls.kind === "primary") {
-        if (attempt < MAX_ATTEMPTS - 1)
-          this.core.pausedUntilMs = Math.max(this.core.pausedUntilMs, cls.untilMs);
+        this.armBucketPause(this.core, attempt, cls.untilMs);
         continue;
       }
-      if (attempt < MAX_ATTEMPTS - 1) {
-        const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-        this.core.pausedUntilMs = Math.max(this.core.pausedUntilMs, this.now() + waitMs);
-      }
+      const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
+      this.armBucketPause(this.core, attempt, this.now() + waitMs);
     }
     throw new ThrottleExhausted(endpoint);
   }
@@ -1026,16 +1039,12 @@ export class GithubClient {
       if (cls.kind === "ok") return body.data;
       if (cls.kind === "fatal")
         throw new GithubApiError(`graphql: ${cls.message}`, { status: cls.status, endpoint: "graphql", ssoRequired: cls.ssoRequired });
-      // same no-residual-arm rule as restGet: the final attempt must not tax the next call.
       if (cls.kind === "primary") {
-        if (attempt < MAX_ATTEMPTS - 1)
-          this.graphqlBucket.pausedUntilMs = Math.max(this.graphqlBucket.pausedUntilMs, cls.untilMs);
+        this.armBucketPause(this.graphqlBucket, attempt, cls.untilMs);
         continue;
       }
-      if (attempt < MAX_ATTEMPTS - 1) {
-        const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-        this.graphqlBucket.pausedUntilMs = Math.max(this.graphqlBucket.pausedUntilMs, this.now() + waitMs);
-      }
+      const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
+      this.armBucketPause(this.graphqlBucket, attempt, this.now() + waitMs);
     }
     throw new ThrottleExhausted("graphql");
   }
