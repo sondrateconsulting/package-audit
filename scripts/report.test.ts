@@ -19,8 +19,8 @@ function seed(db: AuditDb) {
   });
   const now = nowIso();
   const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
-  db.upsertRunUnitHead({ runId, ...unit, status: "scanned" });
-  db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "old", commitSha: "", status: "skipped-cutoff" });
+  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null });
+  db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null });
   db.upsertDependencyFinding({
     runId, ...unit, dateFetched: now, packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
     manifestPath: "package.json", manifestLine: 5, manifestPermalink: "https://github.com/org-a/svc/blob/abc123def/package.json#L5",
@@ -101,7 +101,7 @@ describe("buildReport (§7)", () => {
       manifestPath: "package.json", manifestLine: 3, manifestPermalink: "https://github.com/org-a/svc2/blob/def456/package.json#L3",
       declaredVersion: "^49.0.0", resolvedVersion: "49.0.0", resolvedVersionSource: "lockfile",
     });
-    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456", status: "scanned" });
+    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456", status: "scanned", isDefaultBranch: null });
     const report = buildReport(db, run) as any;
     const pkg = report.packages[0];
     expect(pkg.versionsSeen).toEqual(["49.0.0", "50.0.7"]); // both present, semver-sorted

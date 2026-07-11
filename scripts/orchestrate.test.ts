@@ -329,7 +329,7 @@ describe("introspection-failure observability (fail-soft, README log vocabulary)
     const runId = startRun(db);
     const now = nowIso();
     const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
-    db.upsertRunUnitHead({ runId, ...unit, status: "scanned" });
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null });
     // no lockfile + unresolved registry range → the §5.E range-resolution path needs the packument
     db.upsertDependencyFinding({
       runId, ...unit, dateFetched: now, packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",

@@ -341,7 +341,7 @@ export async function processRepo(
     const key: WorkUnitKey = { configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch: h.name };
     db.enqueueUnit(key, runId);
     db.setUnitStatus(key, { status: "skipped", runId, lastCommitSha: "", lastCommitDate: h.committedDate });
-    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff" });
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: null });
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-cutoff" });
   }
   // plan.pastCap: after-cutoff past the cap → retain prior state, not surfaced this run.
@@ -352,7 +352,7 @@ export async function processRepo(
     // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is
     // reused (skip-as-current) — still upsert run_unit_head for THIS run so the report includes it.
     if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
-      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned" });
+      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: null });
       db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
       logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
       continue;
@@ -440,7 +440,7 @@ async function processUnit(
       db.insertError({ runId, scope: "introspection", packageName: s.packageName, version: s.rawSpec, message: skipMessage });
       logLine({ event: "introspection", packageName: s.packageName, version: s.rawSpec, error: skipMessage });
     }
-    db.upsertRunUnitHead({ runId, organization: loc.organization, repository: loc.repository, branch: loc.branch, commitSha: loc.commitSha, status: "scanned" });
+    db.upsertRunUnitHead({ runId, organization: loc.organization, repository: loc.repository, branch: loc.branch, commitSha: loc.commitSha, status: "scanned", isDefaultBranch: null });
 
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: commitSha, action: "scanned", deps: result.dependencyFindings.length, usage: result.usageFindings.length, cli: result.cliFindings.length });
     return commitSha;
