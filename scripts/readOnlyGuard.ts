@@ -38,6 +38,11 @@ const SHORT_VALUE = new Set(["-X", "-f", "-F", "-H", "-q", "-t", "-p"]);
 const GH_BARE_SHORT = new Set(["-i"]);
 // First path segment allowlist. "user/orgs" ⊂ "user"; "orgs/<org>/repos" ⊂ "orgs" (§5.A).
 const GH_API_FIRST_SEGMENT = new Set(["repos", "orgs", "user", "rate_limit", "graphql"]);
+// GitHub canonicalizes the Link rel="next" for `orgs/<login>/repos` to the NUMERIC
+// `organizations/<id>/repos` form, which pagination recomposes into a relative endpoint
+// (§5.A). ONLY that exact whole-path shape is allowed — every other organizations/*
+// resource stays denied. (\d in JS regex is exactly [0-9]; no unicode digits.)
+const GH_ORG_ID_REPOS = /^organizations\/\d+\/repos$/;
 
 // Normalize BOTH `--flag=value` and attached short forms (`-XDELETE`, `-X=DELETE`,
 // `-fbody=x`) into separate tokens so no attached-value form dodges a `--flag value`
@@ -147,6 +152,11 @@ function assertGhEndpointAllowed(endpoint: string): void {
     if (seg === "." || seg === "..") deny(`gh api path traversal in ${endpoint}`);
   }
   const first = segments[0] ?? "";
+  if (first === "organizations") {
+    // whole-path match (not first-segment): the numeric pagination shape and nothing else.
+    if (!GH_ORG_ID_REPOS.test(pathOnly)) deny(`gh api endpoint ${endpoint}`);
+    return;
+  }
   if (!GH_API_FIRST_SEGMENT.has(first)) deny(`gh api endpoint ${endpoint}`);
 }
 

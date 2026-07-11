@@ -68,6 +68,32 @@ describe("assertReadOnlyGh — token-disclosure / host-override hardening", () =
     throws(() => assertReadOnlyGh(["auth", "status", "--hostname=github.com"])));
 });
 
+describe("assertReadOnlyGh — organizations pagination endpoint (§5.A)", () => {
+  // GitHub Link rel="next" URLs canonicalize `orgs/<login>/repos` to the numeric
+  // `organizations/<id>/repos` form — ONLY that exact shape may pass.
+  test("numeric organizations/<id>/repos pagination endpoint passes", () =>
+    ok(() => assertReadOnlyGh(["api", "-i", "organizations/143746735/repos?per_page=100&page=2&type=all"])));
+  test("query-less organizations/<id>/repos passes (a Link URL may carry no query)", () =>
+    ok(() => assertReadOnlyGh(["api", "-i", "organizations/143746735/repos"])));
+  test("non-numeric org id is rejected", () =>
+    throws(() => assertReadOnlyGh(["api", "-i", "organizations/wftgitsas/repos?per_page=100&page=2&type=all"])));
+  test("mixed alphanumeric org id is rejected", () =>
+    throws(() => assertReadOnlyGh(["api", "-i", "organizations/143746735x/repos"])));
+  test("a non-repos organizations resource is rejected", () =>
+    throws(() => assertReadOnlyGh(["api", "-i", "organizations/143746735/members"])));
+  test("extra segments after repos are rejected", () =>
+    throws(() => assertReadOnlyGh(["api", "-i", "organizations/143746735/repos/extra"])));
+  test("bare organizations is rejected", () => throws(() => assertReadOnlyGh(["api", "organizations"])));
+  test("organizations/<id> without repos is rejected", () =>
+    throws(() => assertReadOnlyGh(["api", "organizations/143746735"])));
+  test("empty org id is rejected", () => throws(() => assertReadOnlyGh(["api", "organizations//repos"])));
+  test("a trailing slash is rejected (exact shape only)", () =>
+    throws(() => assertReadOnlyGh(["api", "organizations/143746735/repos/"])));
+  // pins the LEADING regex anchor: a suffix-only match must not allow a nested decoy path.
+  test("a nested decoy prefix is rejected", () =>
+    throws(() => assertReadOnlyGh(["api", "organizations/9/x/organizations/123/repos"])));
+});
+
 describe("assertReadOnlyGh — extra bypass vectors", () => {
   test("short cluster -iXDELETE is rejected", () => throws(() => assertReadOnlyGh(["api", "-iXDELETE", "repos/o/r"])));
   test("non-allowlisted endpoint reposXYZ", () => throws(() => assertReadOnlyGh(["api", "reposXYZ/o/r"])));
