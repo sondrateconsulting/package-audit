@@ -953,14 +953,24 @@ describe("spawn kill escalation (§4 hardening)", () => {
     // starts at 3 and only the post-await line resets it, so an early drain fails loudly.
     const dir = mkdtempSync(join(tmpdir(), "settle-ref-"));
     const runner = join(dir, "runner.ts");
+    // Paths reach the child via env, not string-interpolated into the generated
+    // source — building code from JSON.stringify'd values trips CodeQL's
+    // js/bad-code-sanitization and is a fragile way to escape a string literal.
     writeFileSync(runner, [
-      `import { GithubClient } from ${JSON.stringify(join(import.meta.dir, "github.ts"))};`,
+      `const ghModule = process.env.GH_MODULE, runDir = process.env.RUN_DIR;`,
+      `if (!ghModule || !runDir) throw new Error("runner env not set");`,
+      `const { GithubClient } = await import(ghModule);`,
       `process.exitCode = 3; // stays 3 if the event loop drains mid-await`,
-      `const client = new GithubClient({ githubHost: "github.com", spawnImpl: () => new Promise(() => {}), env: { HOME: "/tmp", PATH: "/bin:/usr/bin" }, binPaths: { gh: "/bin/echo", git: "/bin/echo", tar: "/bin/echo" }, tempRoot: ${JSON.stringify(dir)}, spawnTimeoutMs: 50 });`,
+      `const client = new GithubClient({ githubHost: "github.com", spawnImpl: () => new Promise(() => {}), env: { HOME: "/tmp", PATH: "/bin:/usr/bin" }, binPaths: { gh: "/bin/echo", git: "/bin/echo", tar: "/bin/echo" }, tempRoot: runDir, spawnTimeoutMs: 50 });`,
       `const res = await client.git(["--version"]);`,
       `if (res.stderr.includes("timed out")) process.exitCode = 0;`,
     ].join("\n"));
-    const proc = Bun.spawn({ cmd: [process.execPath, runner], stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn({
+      cmd: [process.execPath, runner],
+      env: { ...process.env, GH_MODULE: join(import.meta.dir, "github.ts"), RUN_DIR: dir },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     const killer = setTimeout(() => proc.kill(9), 20_000);
     const code = await proc.exited;
     clearTimeout(killer);
@@ -972,13 +982,23 @@ describe("spawn kill escalation (§4 hardening)", () => {
     const dir = mkdtempSync(join(tmpdir(), "kill-exit-"));
     const { script } = makeTrappingScript(dir);
     const runner = join(dir, "runner.ts");
+    // Paths reach the child via env, not string-interpolated into the generated
+    // source (see the settle-wait runner above) — keeps CodeQL's
+    // js/bad-code-sanitization quiet and the escaping robust.
     writeFileSync(runner, [
-      `import { GithubClient } from ${JSON.stringify(join(import.meta.dir, "github.ts"))};`,
-      `const client = new GithubClient({ githubHost: "github.com", binPaths: { gh: "/bin/echo", git: ${JSON.stringify(script)}, tar: "/bin/echo" }, env: { HOME: "/tmp", PATH: "/bin:/usr/bin" }, tempRoot: ${JSON.stringify(dir)}, spawnTimeoutMs: ${SPAWN_DEADLINE} });`,
+      `const ghModule = process.env.GH_MODULE, gitBin = process.env.GIT_BIN, runDir = process.env.RUN_DIR;`,
+      `if (!ghModule || !gitBin || !runDir) throw new Error("runner env not set");`,
+      `const { GithubClient } = await import(ghModule);`,
+      `const client = new GithubClient({ githubHost: "github.com", binPaths: { gh: "/bin/echo", git: gitBin, tar: "/bin/echo" }, env: { HOME: "/tmp", PATH: "/bin:/usr/bin" }, tempRoot: runDir, spawnTimeoutMs: ${SPAWN_DEADLINE} });`,
       `const res = await client.git(["--version"]);`,
       `if (res.exitCode === 0) throw new Error("expected a timed-out result");`,
     ].join("\n"));
-    const proc = Bun.spawn({ cmd: [process.execPath, runner], stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn({
+      cmd: [process.execPath, runner],
+      env: { ...process.env, GH_MODULE: join(import.meta.dir, "github.ts"), GIT_BIN: script, RUN_DIR: dir },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     const killer = setTimeout(() => proc.kill(9), 20_000); // backstop: a pinned loop never exits
     const code = await proc.exited;
     clearTimeout(killer);
