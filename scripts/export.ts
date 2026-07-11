@@ -301,7 +301,15 @@ function collectRunScoped(db: AuditDbReader, run: RunRecord): ExportSnapshot[] {
        WHERE package_name IN (SELECT value FROM json_each(?))
        ORDER BY ${orderByClause(PACKAGE_API_SURFACE_ORDER_BY)}`,
     ).all(tracked) as PackageApiSurfaceExportRow[]
-  ).filter((r) => r.export_kind !== "__complete__" && versionsSeen.get(r.package_name)?.has(r.version) === true);
+  ).filter(
+    (r) =>
+      r.export_kind !== "__complete__" &&
+      versionsSeen.get(r.package_name)?.has(r.version) === true &&
+      // Mirror report.ts: only versions whose introspection COMPLETED (marker present) are
+      // surface data — a markerless row set (legacy migration preserves rows without
+      // backfilling markers) is a partial capture, not an export.
+      db.hasCompletionMarker(r.package_name, r.version),
+  );
 
   // runs export = exactly the selected run's row.
   const runs = db.read(`SELECT ${selectList(RUNS_COLUMNS)} FROM runs WHERE run_id = ?`).all(run.runId) as RunsExportRow[];

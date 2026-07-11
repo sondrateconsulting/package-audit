@@ -17,8 +17,9 @@ JSON report:
   Rows are **never** selected by `findings.run_id` — that column is last-writer bookkeeping,
   not run ownership.
 - `package_api_surface` is sliced to the run's `versionsSeen` (the distinct, valid-semver
-  resolved versions over the run's own dependency rows) for tracked packages, with the
-  internal `__complete__` marker rows excluded.
+  resolved versions over the run's own dependency rows) for tracked packages, restricted to
+  versions whose introspection **completed** (the same completion-marker rule the report
+  applies), with the internal `__complete__` marker rows themselves excluded.
 - `runs` contains exactly the selected run's row.
 
 Run selection: `--run-id <id>`, or the latest completed reportable run by default.

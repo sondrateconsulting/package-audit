@@ -511,3 +511,50 @@ describe("head-join discrimination (dual-review round 1)", () => {
     }
   });
 });
+
+// ---- codex re-pass regression (2026-07-11, F5) ---------------------------------------------------
+// The run-scoped api-surface slice must require the '__complete__' introspection marker per
+// (package, version), mirroring report.ts — a markerless row set (reachable via legacy
+// migration, which preserves rows without backfilling markers) must not be exported as if the
+// introspection had completed.
+describe("api-surface export requires the completion marker (F5)", () => {
+  test("markerless version rows are excluded from the run-scoped surface export", () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const rawDb = (db as unknown as { db: import("bun:sqlite").Database }).db;
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "aaa111" };
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true });
+    for (const version of ["1.0.0", "2.0.0"]) {
+      db.upsertDependencyFinding({
+        runId, ...unit, dateFetched: "2026-01-01T00:00:00.000Z", packageName: "expo", dependencyKey: version === "1.0.0" ? "expo" : "expo-alias",
+        dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 5,
+        manifestPermalink: "https://github.com/org-a/svc/blob/aaa111/package.json#L5",
+        declaredVersion: `^${version}`, lockfilePath: "bun.lock", lockfileKind: "bun", lockfileLines: [1],
+        lockfilePermalink: "https://github.com/org-a/svc/blob/aaa111/bun.lock#L1",
+        resolvedVersion: version, resolvedVersionSource: "lockfile",
+      });
+      db.writeApiSurface({ packageName: "expo", version, versionSource: "lockfile", rows: [
+        { exportName: "thing", exportKind: "named", source: "index.d.ts" },
+      ] });
+    }
+    // Strip 2.0.0's completion marker — the legacy-migration shape (rows preserved, no marker).
+    rawDb.exec(`DELETE FROM package_api_surface WHERE version = '2.0.0' AND export_kind = '__complete__'`);
+    db.completeRun(runId);
+    const run = db.getRun(runId)!;
+
+    const out = mkdtempSync(join(tmpdir(), "export-f5-"));
+    try {
+      exportRun(db, run, out, { raw: false });
+      const lines = readFileSync(join(out, "xray", "package_api_surface.jsonl"), "utf8").trim().split("\n").filter((l) => l.length > 0);
+      const versions = lines.map((l) => (JSON.parse(l) as { version: string }).version);
+      expect(versions).toContain("1.0.0");
+      expect(versions).not.toContain("2.0.0"); // markerless — introspection never completed
+    } finally {
+      rmSync(out, { recursive: true, force: true });
+      db.close();
+    }
+  });
+});
