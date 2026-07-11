@@ -1022,9 +1022,13 @@ function buildV2Db(path: string): void {
     VALUES (21, 'v2-run', 'org-a', 'repo', 'main', 'sha1', 'expo', 'expo', 'named-import', 'registerRootComponent', '',
     'index.js', 1, 'https://github.com/org-a/repo/blob/sha1/index.js#L1',
     'import { registerRootComponent } from "expo"', '2026-01-01T00:20:00.000Z')`);
+  // The marker carries the CURRENT surface epoch (§7): this fixture models a v2 database
+  // written by the current pre-v3 code, whose markers are epoch-stamped. (A PRE-epoch bare
+  // '__complete__' marker deliberately reads as ABSENT — that shape has its own tests — and
+  // using it here would silently drain the round-trip twin's apiSurface coverage.)
   raw.exec(`INSERT INTO package_api_surface (id, package_name, version, version_source, export_name, export_kind, source, introspected_at) VALUES
     (31, 'expo', '50.0.0', 'lockfile', 'registerRootComponent', 'named', 'build/Expo.d.ts', '2026-01-01T00:15:00.000Z'),
-    (35, 'expo', '50.0.0', 'lockfile', '', '__complete__', '__complete__', '2026-01-01T00:15:00.000Z')`);
+    (35, 'expo', '50.0.0', 'lockfile', '', '__complete__', '__complete__@${SURFACE_SCHEMA_VERSION}', '2026-01-01T00:15:00.000Z')`);
   raw.exec(`INSERT INTO run_unit_head VALUES
     ('v2-run', 'org-a', 'repo', 'main', 'sha1', 'scanned'),
     ('v2-run', 'org-a', 'repo', 'stale', '', 'skipped-cutoff')`);
