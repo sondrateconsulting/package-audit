@@ -79,7 +79,10 @@ function resolveSubpathUnder(exports: unknown, subpath: string, conditions: Set<
     if (subpath.startsWith(prefix) && subpath.endsWith(suffix) && subpath.length >= prefix.length + suffix.length) {
       const captured = subpath.slice(prefix.length, subpath.length - suffix.length);
       const rawTarget = resolveConditional(map[key], conditions);
-      const target = typeof rawTarget === "string" ? rawTarget.replace("*", captured) : null;
+      // Node's PACKAGE_TARGET_RESOLVE substitutes EVERY '*' in the target (global). The
+      // function replacer inserts `captured` verbatim — `captured` is untrusted and a string
+      // replacement would re-expand $&/$$/$` special patterns (matching Node's own impl).
+      const target = typeof rawTarget === "string" ? rawTarget.replace(/\*/g, () => captured) : null;
       if (best === null || prefix.length > best.prefixLen) best = { target, prefixLen: prefix.length };
     }
   }
@@ -160,7 +163,12 @@ function typesVersionsRemap(pkg: PkgJson, basePath: string): string | null {
         const suffix = pattern.slice(star + 1);
         if (rel.startsWith(prefix) && rel.endsWith(suffix)) {
           const captured = rel.slice(prefix.length, rel.length - suffix.length);
-          return normalizeRel((targets[0] as string).replace("*", captured));
+          // TypeScript substitutes only the FIRST '*' in the target (unlike Node exports
+          // above, which is global). A manual splice is TS-faithful AND inserts `captured`
+          // verbatim — a string-arg .replace would re-expand $&/$$/$` from untrusted input.
+          const tgt = targets[0] as string;
+          const si = tgt.indexOf("*");
+          return normalizeRel(si < 0 ? tgt : tgt.slice(0, si) + captured + tgt.slice(si + 1));
         }
       }
     }

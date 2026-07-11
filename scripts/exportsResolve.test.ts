@@ -62,6 +62,20 @@ describe("resolveTypeTargets — no exports fallback", () => {
     const withExports = { ...pkg, exports: { types: "./exports.d.ts" } };
     expect(resolveTypeTargets(withExports)).toEqual(["./exports.d.ts"]);
   });
+  test("typesVersions remap inserts the captured path literally — no $-replacement expansion", () => {
+    // `captured` derives from untrusted package.json types/typings; a string-arg .replace
+    // would re-expand $&/$$/$` tokens against the matched '*'. The remap must insert verbatim.
+    const pkg = { typesVersions: { ">=0": { "*": ["./ts/*"] } }, types: "./a$&b.d.ts" };
+    expect(resolveTypeTargets(pkg)).toEqual(["./ts/a$&b.d.ts"]);
+    const pkg2 = { typesVersions: { ">=0": { "*": ["./ts/*"] } }, types: "./c$$d.d.ts" };
+    expect(resolveTypeTargets(pkg2)).toEqual(["./ts/c$$d.d.ts"]);
+  });
+  test("typesVersions remap substitutes only the FIRST star (TypeScript-faithful)", () => {
+    // TS's typesVersions/paths substitution fills only the first '*' in the target; a
+    // pathological multi-star target keeps later stars literal (unresolvable, exactly as TS).
+    const pkg = { typesVersions: { ">=0": { "*": ["./ts/*/*"] } }, types: "./index.d.ts" };
+    expect(resolveTypeTargets(pkg)).toEqual(["./ts/index.d.ts/*"]);
+  });
 });
 
 describe("resolveSubpath — subpath mapping (§5.F)", () => {
@@ -79,6 +93,18 @@ describe("resolveSubpath — subpath mapping (§5.F)", () => {
     };
     expect(resolveSubpath(pkg, "./features/x").targets).toEqual(["./dts/features/x.d.ts"]);
     expect(resolveSubpath(pkg, "./other").targets).toEqual(["./dts/other.d.ts"]);
+  });
+  test("pattern target substitutes EVERY star (Node exports semantics)", () => {
+    // Node's PACKAGE_TARGET_RESOLVE replaces ALL '*' in the target with the capture,
+    // "including if it contains any / separators" — not just the first.
+    const pkg = { exports: { "./*": { types: "./dist/*/index-*.d.ts" } } };
+    expect(resolveSubpath(pkg, "./foo").targets).toEqual(["./dist/foo/index-foo.d.ts"]);
+  });
+  test("captured trailer with $-replacement tokens is inserted literally", () => {
+    // '$' is a legal subpath char; a string-arg .replace re-expands $&/$$ — must not.
+    const pkg = { exports: { "./*": { types: "./dist/*.d.ts" } } };
+    expect(resolveSubpath(pkg, "./a$&b").targets).toEqual(["./dist/a$&b.d.ts"]);
+    expect(resolveSubpath(pkg, "./c$$d").targets).toEqual(["./dist/c$$d.d.ts"]);
   });
   test("private (null target) subpath is unresolved", () => {
     const pkg = { exports: { ".": "./index.js", "./secret": null } };

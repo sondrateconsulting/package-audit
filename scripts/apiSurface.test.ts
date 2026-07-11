@@ -141,6 +141,12 @@ describe("selectVersionDist + resolveRangeToVersion + encodePackageNameForUrl", 
     expect(encodePackageNameForUrl("@scope/pkg")).toBe("@scope%2Fpkg");
     expect(encodePackageNameForUrl("expo")).toBe("expo");
   });
+  test("encodePackageNameForUrl encodes EVERY slash (defense-in-depth for malformed names)", () => {
+    // A valid scoped name has exactly one slash → unchanged; a malformed multi-slash name
+    // gets all slashes encoded so none leak as literal registry-URL path separators.
+    expect(encodePackageNameForUrl("@a/b/c")).toBe("@a%2Fb%2Fc");
+    expect(encodePackageNameForUrl("@scope/pkg")).toBe("@scope%2Fpkg");
+  });
 });
 
 // ---- checksummed tar builder (so REAL system tar extracts it) --------------------------------

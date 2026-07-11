@@ -129,9 +129,11 @@ export function resolveRangeToVersion(packument: Packument, range: string): stri
 }
 
 // SLASH-only encoding of a scoped package name for the packument URL: `@scope/name` →
-// `@scope%2Fname` (NOT full encodeURIComponent, which would also encode the `@`).
+// `@scope%2Fname` (NOT full encodeURIComponent, which would also encode the `@`). Encode
+// EVERY slash (global): a valid scoped name has exactly one, but a malformed name must not
+// leave later slashes as literal URL path separators.
 export function encodePackageNameForUrl(name: string): string {
-  return name.startsWith("@") ? name.replace("/", "%2F") : name;
+  return name.startsWith("@") ? name.replace(/\//g, "%2F") : name;
 }
 
 // ---- fetch layer (injectable) ---------------------------------------------------------------
