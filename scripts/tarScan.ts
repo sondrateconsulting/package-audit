@@ -59,6 +59,28 @@ function parseOctal(buf: Uint8Array, offset: number, length: number): number {
   return s === "" ? 0 : parseInt(s, 8);
 }
 
+// Validate a 512-byte ustar/GNU header's stored checksum (8 bytes at offset+148). tar computes it
+// by treating that field as 8 ASCII spaces (0x20) then summing every header byte; historically
+// some writers summed bytes as SIGNED, so a header is accepted if EITHER the unsigned or the
+// signed sum matches (GNU/libarchive compatibility). A non-octal/NaN stored value fails closed.
+// WHY per-header: without this, a corrupt regular-file ('0') header carrying an over-declared size
+// makes the walk advance past — and swallow as file "data" — a FOLLOWING valid symlink ('2')
+// header, so scanTarball returns ok:true. The real extractor (bsdtar/libarchive) REJECTS the
+// bad-checksum header, RESYNCHRONIZES to the next valid header, and materializes that hidden
+// symlink — a parser/extractor disagreement that bypasses the promised pre-extraction rejection.
+function checksumMatches(buf: Uint8Array, offset: number): boolean {
+  const stored = parseOctal(buf, offset + 148, 8);
+  if (Number.isNaN(stored)) return false;
+  let unsigned = 0;
+  let signed = 0;
+  for (let i = 0; i < BLOCK; i++) {
+    const byte = i >= 148 && i < 156 ? 0x20 : buf[offset + i]!; // checksum field itself = spaces
+    unsigned += byte;
+    signed += byte < 128 ? byte : byte - 256;
+  }
+  return stored === unsigned || stored === signed;
+}
+
 function isZeroBlock(buf: Uint8Array, offset: number): boolean {
   for (let i = offset; i < offset + BLOCK; i++) if (buf[i] !== 0) return false;
   return true;
@@ -121,6 +143,10 @@ export function parseTarEntries(tar: Uint8Array): ScanResult {
 
   while (offset + BLOCK <= tar.length) {
     if (isZeroBlock(tar, offset)) break; // end-of-archive marker
+    // Validate EVERY 512-byte header's checksum (regular entries AND PAX 'x'/'g' + GNU 'L'/'K'
+    // meta headers) BEFORE trusting any of its fields — fail-closed on the parser/extractor
+    // resync disagreement described on checksumMatches.
+    if (!checksumMatches(tar, offset)) return fail("tar header checksum mismatch", entries, totalBytes);
     const name0 = readCString(tar, offset, 100);
     const prefix = readCString(tar, offset + 345, 155);
     const headerSize = parseOctal(tar, offset + 124, 12);

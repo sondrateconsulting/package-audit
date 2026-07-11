@@ -53,6 +53,30 @@ describe("hasReadOrgScope", () => {
   });
 });
 
+describe("runPreflight — unsupported tar implementation (§5.E)", () => {
+  // The §5.E pre-extraction scan's resync/secure-symlink reasoning only holds for GNU tar and
+  // bsdtar/libarchive. A `tar` that is neither (detectTarFlavor → "unknown") must fail preflight
+  // rather than let a divergent extractor materialize a member the scan believed it rejected.
+  const config = {
+    githubHost: "github.com", organizations: ["org-a"],
+    packages: [{ name: "expo", registryUrl: "https://registry.example.com", registryAuthEnvVar: null }],
+  } as unknown as Config;
+
+  test("rejects when tar is neither GNU nor bsdtar/libarchive", async () => {
+    const stubClient = {
+      gh: async () => ({ exitCode: 0, stdout: "gh version 2.95.0", stderr: "" }),
+      git: async () => ({ exitCode: 0, stdout: "git version 2.45.1", stderr: "" }),
+      tar: async () => ({ exitCode: 0, stdout: "toybox tar (busybox)", stderr: "" }),
+      restGet: async () => ({ body: JSON.stringify({ login: "u" }), headers: {} }),
+      rateLimit: async () => ({ resources: { core: { remaining: 100 }, graphql: { remaining: 100 } } }),
+    } as unknown as GithubClient;
+    // fetchImpl injected so the (never-reached) registry probe can't touch the network
+    await expect(
+      runPreflight(stubClient, config, { fetchImpl: async () => ({ ok: true, status: 200 }) }),
+    ).rejects.toThrow(/unsupported tar/);
+  });
+});
+
 describe("runPreflight registry probe deadline (§5.E hardening)", () => {
   // every prior test injects deps.fetchImpl, which bypasses the DEFAULT fetch closure — the
   // one carrying the AbortSignal.timeout deadline. This exercises the real closure against a
