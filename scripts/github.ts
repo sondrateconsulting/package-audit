@@ -213,17 +213,38 @@ type Env = Record<string, string | undefined>;
 // is pinned separately below.
 // No TMPDIR (an inherited value could redirect child scratch writes outside the contained
 // roots) and no USER/LOGNAME (unneeded) — children fall back to the OS default temp.
+// §H3/H4 transport env carried by BOTH gh and git children (enterprise flaky-VPN + TLS-inspection):
+// an env-delivered proxy or CA bundle is common in corporate setups, and silently stripping it
+// breaks every call against the proxy or the intercepting TLS root — surfacing mid-run on the
+// first truncated-tree clone rather than at preflight. Proxy family carries both cases
+// (Go-based gh reads UPPERCASE, libcurl/git reads lowercase — copy whichever is set). SSL_CERT_FILE/
+// SSL_CERT_DIR are the OpenSSL cert pointers gh (Go) and curl honor. DBUS_SESSION_BUS_ADDRESS +
+// XDG_RUNTIME_DIR reach the OS keyring: gh needs it for stored auth, and git needs it too because
+// its pinned credential helper spawns `gh auth git-credential`. None of these can redirect a WRITE
+// or inject git config (that stays pinned below) — they are auth/transport-critical ONLY.
+const TRANSPORT_PASSTHROUGH = [
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+  "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+  "SSL_CERT_FILE", "SSL_CERT_DIR",
+  "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
+] as const;
+// libcurl/git-only CA-bundle pointers — git-over-https honors these; the Go-based gh ignores them.
+const GIT_CA_PASSTHROUGH = ["GIT_SSL_CAINFO", "GIT_SSL_CAPATH", "CURL_CA_BUNDLE"] as const;
+
 const GH_PASSTHROUGH = [
   "HOME", "PATH",
   "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
   "GH_CONFIG_DIR", "XDG_CONFIG_HOME",
+  ...TRANSPORT_PASSTHROUGH,
 ] as const;
 // git's env ALSO carries the gh auth passthroughs: the pinned credential helper runs
-// `gh auth git-credential` as a child of git, so token/config-dir auth must survive.
+// `gh auth git-credential` as a child of git, so token/config-dir auth must survive. Plus the
+// libcurl CA pointers, since git-over-https (not gh) does the TLS clone against a custom root.
 const GIT_PASSTHROUGH = [
   "HOME", "PATH",
   "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
   "GH_CONFIG_DIR", "XDG_CONFIG_HOME",
+  ...TRANSPORT_PASSTHROUGH, ...GIT_CA_PASSTHROUGH,
 ] as const;
 const TAR_PASSTHROUGH = ["HOME", "PATH"] as const;
 

@@ -488,6 +488,11 @@ describe("sanitized env construction", () => {
     HOME: "/home/u", PATH: "/bin", GH_TOKEN: "tok", GH_DEBUG: "api", GIT_ASKPASS: "/evil",
     GIT_SSH_COMMAND: "evil", TAR_OPTIONS: "--evil", GH_CONFIG_DIR: "/cfg", XDG_CONFIG_HOME: "/xdg",
     EMPTY: "",
+    // §H3/H4 transport env (T10): proxy family (both cases), OpenSSL + libcurl CA pointers, keyring.
+    HTTPS_PROXY: "http://proxy:8080", https_proxy: "http://lc-proxy:8080", NO_PROXY: "localhost", ALL_PROXY: "socks5://p",
+    SSL_CERT_FILE: "/etc/ssl/corp.pem", SSL_CERT_DIR: "/etc/ssl/certs",
+    GIT_SSL_CAINFO: "/etc/ssl/git-ca.pem", GIT_SSL_CAPATH: "/etc/ssl/gitdir", CURL_CA_BUNDLE: "/etc/ssl/curl.pem",
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus", XDG_RUNTIME_DIR: "/run/user/1000",
   };
   test("gh env: pins + auth passthrough, no debug/askpass leakage", () => {
     const env = buildGhEnv(base, "ghe.corp.com");
@@ -498,6 +503,19 @@ describe("sanitized env construction", () => {
     expect(env["GH_CONFIG_DIR"]).toBe("/cfg"); // auth state passthrough
     expect(env["GH_DEBUG"]).toBeUndefined();
     expect(env["GIT_ASKPASS"]).toBeUndefined();
+    // §H3/H4 (T10): proxy family (upper AND lower), OpenSSL cert pointers, keyring DBus/runtime survive
+    expect(env["HTTPS_PROXY"]).toBe("http://proxy:8080");
+    expect(env["https_proxy"]).toBe("http://lc-proxy:8080");
+    expect(env["NO_PROXY"]).toBe("localhost");
+    expect(env["ALL_PROXY"]).toBe("socks5://p");
+    expect(env["SSL_CERT_FILE"]).toBe("/etc/ssl/corp.pem");
+    expect(env["SSL_CERT_DIR"]).toBe("/etc/ssl/certs");
+    expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBe("unix:path=/run/user/1000/bus");
+    expect(env["XDG_RUNTIME_DIR"]).toBe("/run/user/1000");
+    // git/curl-only CA pointers are NOT copied into gh's env (the Go-based gh ignores them)
+    expect(env["GIT_SSL_CAINFO"]).toBeUndefined();
+    expect(env["GIT_SSL_CAPATH"]).toBeUndefined();
+    expect(env["CURL_CA_BUNDLE"]).toBeUndefined();
   });
   test("git env: ALL config pinned; injection vectors never copied; gh auth survives for the helper", () => {
     const env = buildGitEnv(base, "/tmp/x/gitconfig");
@@ -511,12 +529,29 @@ describe("sanitized env construction", () => {
     // config-dir auth must survive for private clones
     expect(env["GH_TOKEN"]).toBe("tok");
     expect(env["GH_CONFIG_DIR"]).toBe("/cfg");
+    // §H3/H4 (T10): git does the actual TLS clone, so it ALSO carries the transport env AND the
+    // libcurl CA pointers, plus DBus/runtime for the `gh auth git-credential` keyring child.
+    expect(env["HTTPS_PROXY"]).toBe("http://proxy:8080");
+    expect(env["https_proxy"]).toBe("http://lc-proxy:8080");
+    expect(env["NO_PROXY"]).toBe("localhost");
+    expect(env["ALL_PROXY"]).toBe("socks5://p");
+    expect(env["SSL_CERT_FILE"]).toBe("/etc/ssl/corp.pem");
+    expect(env["SSL_CERT_DIR"]).toBe("/etc/ssl/certs");
+    expect(env["GIT_SSL_CAINFO"]).toBe("/etc/ssl/git-ca.pem");
+    expect(env["GIT_SSL_CAPATH"]).toBe("/etc/ssl/gitdir");
+    expect(env["CURL_CA_BUNDLE"]).toBe("/etc/ssl/curl.pem");
+    expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBe("unix:path=/run/user/1000/bus");
+    expect(env["XDG_RUNTIME_DIR"]).toBe("/run/user/1000");
   });
-  test("tar env: TAR_OPTIONS never copied; empty base values not copied", () => {
+  test("tar env: TAR_OPTIONS never copied; empty base values not copied; no transport env leaks", () => {
     const env = buildTarEnv(base);
     expect(env["TAR_OPTIONS"]).toBeUndefined();
     expect(env["EMPTY"]).toBeUndefined();
     expect(env["PATH"]).toBe("/bin");
+    // tar extracts a locally-fetched tarball — it does no network, so proxy/CA/keyring env never leaks in
+    expect(env["HTTPS_PROXY"]).toBeUndefined();
+    expect(env["SSL_CERT_FILE"]).toBeUndefined();
+    expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBeUndefined();
   });
 });
 
