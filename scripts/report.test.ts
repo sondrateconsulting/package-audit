@@ -8,7 +8,7 @@ import { downgradeToFaithfulV2 } from "./testFixtures.ts";
 import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
 import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
-import type { Config } from "./config.ts";
+import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
 
@@ -726,7 +726,7 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
 // entrypoint materialized a migrated data/audit.db + a stub output/latest.json on first run).
 describe("runReport zero-write on a missing database", () => {
   const config = (root: string): Config => ({
-    concurrency: { branches: 1, organizations: 1, repositories: 1 },
+    concurrency: { branches: 1, organizations: 1, repositories: 1 }, timeouts: DEFAULT_TIMEOUTS,
     cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
     includeArchived: false, includeForks: false, includePersonalNamespace: false,
     maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],
@@ -818,7 +818,7 @@ describe("runReport zero-write on a missing database", () => {
 
 describe("report --html wiring (emitDossiers + runReport integration)", () => {
   const config = (root: string): Config => ({
-    concurrency: { branches: 1, organizations: 1, repositories: 1 },
+    concurrency: { branches: 1, organizations: 1, repositories: 1 }, timeouts: DEFAULT_TIMEOUTS,
     cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
     includeArchived: false, includeForks: false, includePersonalNamespace: false,
     maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],

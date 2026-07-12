@@ -27,7 +27,7 @@ import { readdirSync, lstatSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
-import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchSnapshot, type BranchDiscoveryOutcome } from "./github.ts";
+import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchSnapshot, type BranchDiscoveryOutcome, type SpawnDeadlines } from "./github.ts";
 import { planRepoBranches, planPolicyDiagnostics, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
 import { PolicyMatchError, type CompiledBranchPolicy, type RepoPolicyCoverage } from "./branchPolicy.ts";
 import { RepoPolicyMatchError, type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
@@ -116,6 +116,19 @@ export function walkClone(root: string): TreeEntry[] {
 }
 
 // ---- coordinator ----------------------------------------------------------------------------
+// T11: config timeouts are SECONDS; the github client wants per-category MS deadlines. One
+// conversion, shared by the preflight/plan/scan clients so every spawn in a run carries the
+// same operator-tuned deadlines. Excluded from config_hash (it never changes WHAT is scanned).
+export function githubDeadlines(config: Config): SpawnDeadlines {
+  return {
+    controlApiMs: config.timeouts.controlApiSeconds * 1000,
+    bulkApiMs: config.timeouts.bulkApiSeconds * 1000,
+    cloneMs: config.timeouts.cloneSeconds * 1000,
+    tarMs: config.timeouts.tarSeconds * 1000,
+    probeMs: config.timeouts.probeSeconds * 1000,
+  };
+}
+
 // argv is injectable (defaulting to the process argv) so the entrypoint tests can drive the
 // REAL dispatch — help short-circuit, --plan's stop-before-DB early return — in-process.
 export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
@@ -127,6 +140,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const { config, configHash, branchPolicy, repositoryPolicy } = await loadConfig(argv);
   const runtime: AuditRuntime = { config, configHash, branchPolicy, repositoryPolicy };
   const trackedNames = config.packages.map((p) => p.name);
+  const timeouts = githubDeadlines(config);
 
   logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
   // §5 configured fan-out widths. Emitted for both audit and --plan; in --plan runPlan traverses
@@ -138,14 +152,14 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
 
   // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
   // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls).
-  const preflightClient = new GithubClient({ githubHost: config.githubHost });
+  const preflightClient = new GithubClient({ githubHost: config.githubHost, timeouts });
   const preflight = await runPreflight(preflightClient, config);
   logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
 
   // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
   // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
   if (args.plan) {
-    const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories });
+    const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories, timeouts });
     await runPlan(planClient, runtime, preflight.githubLogin);
     return;
   }
@@ -153,7 +167,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   // Only AFTER preflight passes do we touch the database (open/migrate/--fresh) and build the
   // caching client for the scan.
   const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath, fresh: args.fresh, purgeCache: args.purgeCache });
-  const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories });
+  const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories, timeouts });
 
   try {
     await runScan(db, client, runtime, args, preflight.githubLogin);

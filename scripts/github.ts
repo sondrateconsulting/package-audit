@@ -922,6 +922,27 @@ const TRANSIENT_BASE_WAIT_MS = 2_000;
 // expiry the child is killed and the empty result flows into the transient retry path.
 export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
 
+// T11 per-category defaults (ms). control-API is deliberately tighter than the bulk/clone/tar
+// budgets: a quick auth/version/rate-limit/listing call has no reason to hang 15 min, but a raw
+// blob/recursive-tree read, a shallow clone, or a tarball extract over a slow-but-live VPN link
+// legitimately can — so those keep the 15-min budget while control drops to 5 min. probe is the
+// short reachability deadline used by the T2 connectivity gate. Each category resolves as
+// `timeouts.<cat> ?? spawnTimeoutMs ?? DEFAULT` (config seconds are converted to ms by the caller).
+export const DEFAULT_CONTROL_API_TIMEOUT_MS = 5 * 60 * 1000;
+export const DEFAULT_BULK_API_TIMEOUT_MS = SPAWN_TIMEOUT_MS;
+export const DEFAULT_CLONE_TIMEOUT_MS = SPAWN_TIMEOUT_MS;
+export const DEFAULT_TAR_TIMEOUT_MS = SPAWN_TIMEOUT_MS;
+export const DEFAULT_PROBE_TIMEOUT_MS = 10 * 1000;
+
+// Per-category wall-clock kill deadlines (ms) resolved once in the constructor.
+export interface SpawnDeadlines {
+  controlApiMs: number;
+  bulkApiMs: number;
+  cloneMs: number;
+  tarMs: number;
+  probeMs: number;
+}
+
 export interface GithubClientOptions {
   githubHost: string;
   db?: AuditDb | null; // api_cache home; null disables caching
@@ -929,7 +950,12 @@ export interface GithubClientOptions {
   spawnImpl?: SpawnFn;
   sleepImpl?: (ms: number) => Promise<void>;
   nowImpl?: () => number;
-  spawnTimeoutMs?: number; // wall-clock kill deadline per spawn (default SPAWN_TIMEOUT_MS)
+  // UNIFORM per-spawn deadline (ms): a single knob applied to EVERY category. Kept for tests and
+  // as a back-compat override; production passes the per-category `timeouts` below instead.
+  spawnTimeoutMs?: number;
+  // Per-category deadline overrides (ms). Each category resolves to
+  // `timeouts.<cat> ?? spawnTimeoutMs ?? DEFAULT_<CAT>` (T11).
+  timeouts?: Partial<SpawnDeadlines>;
   env?: Env;
   binPaths?: { gh: string; git: string; tar: string };
   tempRoot?: string; // default realpath(os.tmpdir()); pkg-audit-* dirs live directly under it
@@ -958,7 +984,7 @@ export class GithubClient {
   private readonly spawn: SpawnFn;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
-  private readonly spawnTimeoutMs: number;
+  private readonly deadlines: SpawnDeadlines;
   private readonly bins: { gh: string; git: string; tar: string };
   private readonly ghEnv: Record<string, string>;
   private readonly baseEnv: Env;
@@ -979,12 +1005,26 @@ export class GithubClient {
     this.spawn = opts.spawnImpl ?? realSpawn;
     this.sleep = opts.sleepImpl ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.now = opts.nowImpl ?? Date.now;
-    this.spawnTimeoutMs = opts.spawnTimeoutMs ?? SPAWN_TIMEOUT_MS;
-    // fail-fast knob validation: 0/negative here does NOT mean "unlimited" — a zero-slot
-    // semaphore hangs the first acquire forever (no exception, and the spawn deadline never
-    // covers semaphore queueing), and a nonpositive deadline instantly expires every spawn.
-    if (!Number.isFinite(this.spawnTimeoutMs) || this.spawnTimeoutMs < 1)
-      throw new Error(`spawnTimeoutMs must be >= 1 (got ${this.spawnTimeoutMs}) — a nonpositive deadline instantly times out every spawn`);
+    // fail-fast knob validation: 0/negative does NOT mean "unlimited" — a nonpositive deadline
+    // instantly expires every spawn (and the spawn deadline never covers semaphore queueing).
+    // Validate the uniform knob first (preserving its message), then every RESOLVED per-category
+    // deadline, so a bad `timeouts` override can't slip a nonpositive value past the gate.
+    if (opts.spawnTimeoutMs !== undefined && (!Number.isFinite(opts.spawnTimeoutMs) || opts.spawnTimeoutMs < 1))
+      throw new Error(`spawnTimeoutMs must be >= 1 (got ${opts.spawnTimeoutMs}) — a nonpositive deadline instantly times out every spawn`);
+    const t = opts.timeouts ?? {};
+    const resolveDeadline = (cat: keyof SpawnDeadlines, dflt: number): number => {
+      const ms = t[cat] ?? opts.spawnTimeoutMs ?? dflt;
+      if (!Number.isFinite(ms) || ms < 1)
+        throw new Error(`timeouts.${cat} must be >= 1 (got ${ms}) — a nonpositive deadline instantly times out every spawn`);
+      return ms;
+    };
+    this.deadlines = {
+      controlApiMs: resolveDeadline("controlApiMs", DEFAULT_CONTROL_API_TIMEOUT_MS),
+      bulkApiMs: resolveDeadline("bulkApiMs", DEFAULT_BULK_API_TIMEOUT_MS),
+      cloneMs: resolveDeadline("cloneMs", DEFAULT_CLONE_TIMEOUT_MS),
+      tarMs: resolveDeadline("tarMs", DEFAULT_TAR_TIMEOUT_MS),
+      probeMs: resolveDeadline("probeMs", DEFAULT_PROBE_TIMEOUT_MS),
+    };
     const concurrency = opts.concurrency ?? 8;
     if (!Number.isFinite(concurrency) || concurrency < 1)
       throw new Error(`concurrency must be >= 1 (got ${concurrency}) — a zero-slot semaphore hangs the first acquire forever`);
@@ -1014,8 +1054,9 @@ export class GithubClient {
   private async spawnBounded(
     bin: string,
     args: string[],
-    opts: { env: Record<string, string>; cwd?: string },
+    opts: { env: Record<string, string>; cwd?: string; deadlineMs: number },
   ): Promise<SpawnResult> {
+    const deadlineMs = opts.deadlineMs;
     let aborted = false;
     const killers: Array<() => void> = [];
     const signal: SpawnAbortSignal = {
@@ -1036,7 +1077,7 @@ export class GithubClient {
         aborted = true;
         for (const kill of killers) kill();
         resolve();
-      }, this.spawnTimeoutMs);
+      }, deadlineMs);
     });
     try {
       const spawned = this.spawn(bin, args, { ...opts, signal });
@@ -1064,7 +1105,7 @@ export class GithubClient {
       // hold-until-exit window: a synthetic 124 would misclassify it as a transient
       // no-response and re-drive the oversized request through every retry.
       if (spawnRejected) throw spawnRejection;
-      return { exitCode: 124, stdout: "", stderr: `spawn timed out after ${this.spawnTimeoutMs}ms: ${bin}` };
+      return { exitCode: 124, stdout: "", stderr: `spawn timed out after ${deadlineMs}ms: ${bin}` };
     } finally {
       clearTimeout(timer);
       clearTimeout(settleTimer);
@@ -1077,13 +1118,15 @@ export class GithubClient {
   // subprocesses" holds for every path. `gh()` is the BARE form (no rate-limit bucket): it counts
   // against the cap but is not pause-aware. The pause-aware, bucketed path is ghBucketedAttempt
   // below (restGet/graphql), which arms any throttle pause INSIDE the lease so the slot is never
-  // released into an about-to-open pause window.
-  async gh(args: string[]): Promise<SpawnResult> {
+  // released into an about-to-open pause window. `deadlineMs` selects the per-category spawn budget
+  // (T11); it defaults to the control-API budget — the only bare-gh callers (preflight, listings)
+  // are all control-plane.
+  async gh(args: string[], deadlineMs: number = this.deadlines.controlApiMs): Promise<SpawnResult> {
     assertSpawnAllowed(this.bins.gh, args);
     assertReadOnlyGh(args);
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
+      return await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv, deadlineMs });
     } finally {
       release();
     }
@@ -1110,7 +1153,7 @@ export class GithubClient {
   // re-loops (waitBucket sleeps it out, or ThrottleExhausted terminates the loop for an unfunded
   // budget-overflow tail — so the loop always makes progress).
   private async ghBucketedAttempt<T>(
-    args: string[], bucket: Bucket,
+    args: string[], bucket: Bucket, deadlineMs: number,
     analyze: (res: SpawnResult, now: number) => { outcome: T; pauseUntilMs: number | null },
   ): Promise<T> {
     assertSpawnAllowed(this.bins.gh, args);
@@ -1122,7 +1165,7 @@ export class GithubClient {
         continue;  // re-loop: acquireRespectingPause sleeps the window, re-acquires, re-checks
       }
       try {
-        const res = await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
+        const res = await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv, deadlineMs });
         const now = this.now();
         const { outcome, pauseUntilMs } = analyze(res, now);
         if (pauseUntilMs !== null) this.armBucketPause(bucket, pauseUntilMs, now);
@@ -1159,6 +1202,9 @@ export class GithubClient {
     // gitconfig, so plan mode truly writes nothing and leaks no pkg-audit-gitcfg-* dir.
     const isVersionProbe = args.length === 1 && args[0] === "--version";
     const env = buildGitEnv(this.baseEnv, isVersionProbe ? devNull : this.ensureGitConfig());
+    // A `clone` may pull a large tree over a slow-but-live link (the clone budget); every other git
+    // op here (rev-parse, --version) is a fast local command on the control budget (T11).
+    const deadlineMs = args[0] === "clone" ? this.deadlines.cloneMs : this.deadlines.controlApiMs;
     // Count the clone against the GLOBAL in-flight cap (§4/§5.6): under fan-out a clone per branch-unit
     // would otherwise reach the composed organizations×branches degree and blow temp-dir/fd/memory.
     // Acquire HERE (not inside spawnBounded, which gh already wraps — a second acquire there would
@@ -1166,7 +1212,7 @@ export class GithubClient {
     // REST/GraphQL quota, so it sits OUTSIDE the rate-limit buckets — only the subprocess cap bounds it.
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded(this.bins.git, args, { env, cwd });
+      return await this.spawnBounded(this.bins.git, args, { env, cwd, deadlineMs });
     } finally {
       release();
     }
@@ -1230,7 +1276,7 @@ export class GithubClient {
     // this level, never inside spawnBounded (gh already wraps it → double-acquire deadlock at 1).
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded(this.bins.tar, args, { env: buildTarEnv(this.baseEnv) });
+      return await this.spawnBounded(this.bins.tar, args, { env: buildTarEnv(this.baseEnv), deadlineMs: this.deadlines.tarMs });
     } finally {
       release();
     }
@@ -1345,9 +1391,12 @@ export class GithubClient {
     return HEX_OBJECT_ID_RE.test(ref); // same as isSha — a sha-shaped ?ref= pins an immutable object
   }
 
-  async restGet(endpoint: string, opts: { accept?: string; immutable?: boolean; noStore?: boolean } = {}): Promise<HttpResponse> {
+  async restGet(endpoint: string, opts: { accept?: string; immutable?: boolean; noStore?: boolean; bulk?: boolean } = {}): Promise<HttpResponse> {
     const accept = opts.accept ?? "";
     const immutable = opts.immutable === true && GithubClient.endpointIsShaPinned(endpoint);
+    // Raw content reads (blob/file/recursive-tree) are BULK: a large body on a slow-but-live link
+    // gets the longer deadline. Everything else (listings, rate_limit, user, metadata) is control.
+    const deadlineMs = opts.bulk === true ? this.deadlines.bulkApiMs : this.deadlines.controlApiMs;
     const key = this.cacheKey(endpoint);
     // `noStore` fully opts OUT of the conditional cache: no read, no If-None-Match, no persist. The
     // cache stores body+ETag but NOT the Link header, so a paginated page served from a 304 that
@@ -1377,7 +1426,7 @@ export class GithubClient {
       | { kind: "truncated"; exitCode: number; stderr: string }
       | { kind: "retry" };
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      const outcome = await this.ghBucketedAttempt<RestOutcome>(args, this.core, (res, now) => {
+      const outcome = await this.ghBucketedAttempt<RestOutcome>(args, this.core, deadlineMs, (res, now) => {
         const parsed = parseGhApiOutput(res.stdout);
         // no HTTP response at all (network/auth plumbing failure; diagnostics on stderr)
         if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
@@ -1442,8 +1491,8 @@ export class GithubClient {
     throw new ThrottleExhausted(endpoint);
   }
 
-  async restGetJson(endpoint: string, opts: { immutable?: boolean } = {}): Promise<unknown> {
-    const res = await this.restGet(endpoint, { immutable: opts.immutable });
+  async restGetJson(endpoint: string, opts: { immutable?: boolean; bulk?: boolean } = {}): Promise<unknown> {
+    const res = await this.restGet(endpoint, { immutable: opts.immutable, bulk: opts.bulk });
     try {
       return JSON.parse(res.body);
     } catch {
@@ -1515,7 +1564,7 @@ export class GithubClient {
       | { kind: "no-response"; stderr: string }
       | { kind: "retry" };
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      const outcome = await this.ghBucketedAttempt<GqlOutcome>(args, this.graphqlBucket, (res, now) => {
+      const outcome = await this.ghBucketedAttempt<GqlOutcome>(args, this.graphqlBucket, this.deadlines.controlApiMs, (res, now) => {
         const parsed = parseGhApiOutput(res.stdout);
         if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
         // DELIBERATELY no broad restGet-style nonzero-exit truncation guard: gh exits 1 BY DESIGN after
@@ -1784,7 +1833,9 @@ export class GithubClient {
   async fetchTreeRecursive(org: string, repo: string, treeOid: string): Promise<TreeResponse> {
     const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(treeOid)}?recursive=1`;
     const immutable = GithubClient.isSha(treeOid);
-    const res = await this.restGet(endpoint, { immutable });
+    // Recursive-tree reads are BULK: a large tree body on a slow-but-live link gets the longer
+    // deadline (T11), same as the raw file/blob fetches below.
+    const res = await this.restGet(endpoint, { immutable, bulk: true });
     try {
       // Unreachable through restGet (its contract is exact-200), so this is DELIBERATE
       // defense-in-depth: a partial 206 body parsed here would read as a complete tree, and
@@ -1812,7 +1863,7 @@ export class GithubClient {
 
   async fetchFileRaw(org: string, repo: string, path: string, refSha: string): Promise<string> {
     const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/contents/${encodeContentsPath(path)}?ref=${encodeURIComponent(refSha)}`;
-    const res = await this.restGet(endpoint, { accept: RAW_ACCEPT, immutable: GithubClient.isSha(refSha) });
+    const res = await this.restGet(endpoint, { accept: RAW_ACCEPT, immutable: GithubClient.isSha(refSha), bulk: true });
     return res.body;
   }
 
@@ -1823,7 +1874,7 @@ export class GithubClient {
 
   async fetchBlobRaw(org: string, repo: string, blobSha: string): Promise<string> {
     const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(blobSha)}`;
-    const res = await this.restGet(endpoint, { accept: RAW_ACCEPT, immutable: GithubClient.isSha(blobSha) });
+    const res = await this.restGet(endpoint, { accept: RAW_ACCEPT, immutable: GithubClient.isSha(blobSha), bulk: true });
     return res.body;
   }
 

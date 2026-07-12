@@ -2,7 +2,7 @@ import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
+import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, githubDeadlines, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
 import type { TreeEntry } from "./unitPipeline.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
@@ -10,7 +10,7 @@ import { compileRepositoryPolicy, RepoPolicyMatchError } from "./repositoryPolic
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type RepoInfo, type SpawnFn } from "./github.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { Aborter } from "./boundedPool.ts";
-import type { Config } from "./config.ts";
+import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
 import type { OrchestrateArgs } from "./args.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
@@ -163,7 +163,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       maxReposPerOrg: null,
       maxBranchesPerRepo: 25,
       cutoffDate: "2024-01-01",
-      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
       excludeDirGlobs: [],
       paths: { sqlitePath: join(root, "never-created.db"), outputDir: root },
@@ -201,7 +201,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     const config: Config = {
       githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [], excludeRepositories: [], includePersonalNamespace: false,
       includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
-      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
       excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
     };
@@ -237,7 +237,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [],
       excludeRepositories: ["org-a/legacy-*"], // case-insensitive → matches "org-a/Legacy-API"
       includePersonalNamespace: false, includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
-      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
       excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
     };
@@ -301,7 +301,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       githubHost: "github.com", organizations: [...OWNERS], excludeOrganizations: [], branches: null, excludeBranches: [],
       excludeRepositories: ["*/legacy-*"], // cross-org, case-insensitive
       includePersonalNamespace: false, includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
-      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
       excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
     };
@@ -333,7 +333,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
 const testConfig = (root: string, maxBranchesPerRepo = 25): Config => ({
   githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [], excludeRepositories: [], includePersonalNamespace: false,
   includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo, cutoffDate: "2024-01-01",
-  concurrency: { organizations: 1, repositories: 1, branches: 1 },
+  concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
   packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
   excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
 });
@@ -352,6 +352,15 @@ async function captureJsonl(fn: () => Promise<unknown>): Promise<Array<Record<st
   }
   return chunks.join("").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
 }
+
+describe("githubDeadlines (T11 config seconds → client ms)", () => {
+  test("maps each spawn category from seconds to ms; heartbeat (not a spawn deadline) is omitted", () => {
+    const root = mkdtempSync(join(tmpdir(), "deadlines-"));
+    const cfg: Config = { ...testConfig(root), timeouts: { controlApiSeconds: 1, bulkApiSeconds: 2, cloneSeconds: 3, tarSeconds: 4, probeSeconds: 5, heartbeatSeconds: 6 } };
+    expect(githubDeadlines(cfg)).toEqual({ controlApiMs: 1000, bulkApiMs: 2000, cloneMs: 3000, tarMs: 4000, probeMs: 5000 });
+    rmSync(root, { recursive: true, force: true });
+  });
+});
 
 describe("runPlan cache-less client guard (--plan zero-write)", () => {
   test("rejects a caching (db-backed) client before any discovery call", async () => {

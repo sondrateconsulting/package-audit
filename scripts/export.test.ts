@@ -10,7 +10,7 @@ import {
   EXPORT_HELP, EXPORT_REGISTRY, EXPORT_TABLE_NAMES, RAW_EXPORT_WARNING,
   buildNotExportableNotice, exportRun, main, parseExportArgs, runExport,
 } from "./export.ts";
-import type { Config } from "./config.ts";
+import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
 
 // Bundle containment roots are caller-provided (unlike AuditDb's hardcoded ./data|./output), so
 // exportRun tests run entirely against disposable temp output dirs + :memory: databases.
@@ -135,7 +135,7 @@ function seedTwoRuns(db: AuditDb): { oldRun: RunRecord; newRun: RunRecord } {
 }
 
 const config = (sqlitePath: string, outputDir: string): Config => ({
-  concurrency: { branches: 1, organizations: 1, repositories: 1 },
+  concurrency: { branches: 1, organizations: 1, repositories: 1 }, timeouts: DEFAULT_TIMEOUTS,
   cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
   includeArchived: false, includeForks: false, includePersonalNamespace: false,
   maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],

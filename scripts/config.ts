@@ -34,6 +34,18 @@ export interface Concurrency {
   branches: number;
 }
 
+// Per-category spawn + liveness deadlines, in SECONDS (§3 resilience — T11). Operational tuning
+// only: like `concurrency`, EXCLUDED from config_hash so raising a timeout never orphans
+// resumable work. Every field is optional in the file; omitted fields fall back to DEFAULT_TIMEOUTS.
+export interface Timeouts {
+  controlApiSeconds: number; // gh auth/version/rate_limit/user, GraphQL, listings — quick control calls
+  bulkApiSeconds: number; // raw content GETs (file/blob/recursive-tree) — large, slow-link tolerant
+  cloneSeconds: number; // git clone fallback
+  tarSeconds: number; // registry tarball extraction
+  probeSeconds: number; // T2 connectivity probe (wired in the outage-lifecycle PR)
+  heartbeatSeconds: number; // liveness heartbeat cadence (orchestrate, not a spawn deadline)
+}
+
 export interface Config {
   githubHost: string;
   organizations: string[] | null; // null = discover; [] = configured-empty; [..] = allowlist
@@ -54,6 +66,7 @@ export interface Config {
   excludeRepositories: string[];
   cutoffDate: string; // YYYY-MM-DD
   concurrency: Concurrency;
+  timeouts: Timeouts;
   packages: PackageConfig[];
   excludeDirGlobs: string[];
   paths: { sqlitePath: string; outputDir: string };
@@ -83,6 +96,18 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // config_hash, so defaulting/tuning it never changes the hash or orphans resumable work.
 const DEFAULT_CONCURRENCY = { organizations: 3, repositories: 8, branches: 4 } as const;
 const MAX_CONCURRENCY = 64;
+
+// T11 defaults (seconds). control-API is deliberately tighter than bulk: a quick auth/version/
+// rate-limit call has no reason to hang 15 min, but a raw blob/recursive-tree read over a slow VPN
+// legitimately can — so bulk keeps the pre-T11 15-min budget while control drops to 5 min.
+export const DEFAULT_TIMEOUTS: Timeouts = {
+  controlApiSeconds: 300,
+  bulkApiSeconds: 900,
+  cloneSeconds: 900,
+  tarSeconds: 900,
+  probeSeconds: 10,
+  heartbeatSeconds: 30,
+};
 
 // ---- input helpers (validate at the boundary; never trust external JSON) -----------------
 const isObject = (v: unknown): v is Record<string, unknown> =>
@@ -175,9 +200,12 @@ function optStringArray(o: Record<string, unknown>, key: string, dflt: string[])
 export const CONFIG_ROOT_KEYS = [
   "$schema", "githubHost", "organizations", "excludeOrganizations", "includePersonalNamespace",
   "includeForks", "includeArchived", "maxReposPerOrg", "maxBranchesPerRepo", "branches",
-  "excludeBranches", "excludeRepositories", "cutoffDate", "concurrency", "packages", "excludeDirGlobs", "paths",
+  "excludeBranches", "excludeRepositories", "cutoffDate", "concurrency", "timeouts", "packages", "excludeDirGlobs", "paths",
 ] as const;
 export const CONFIG_CONCURRENCY_KEYS = ["organizations", "repositories", "branches"] as const;
+export const CONFIG_TIMEOUTS_KEYS = [
+  "controlApiSeconds", "bulkApiSeconds", "cloneSeconds", "tarSeconds", "probeSeconds", "heartbeatSeconds",
+] as const;
 export const CONFIG_PATHS_KEYS = ["sqlitePath", "outputDir"] as const;
 export const CONFIG_PACKAGE_KEYS = ["name", "registryUrl", "registryAuthEnvVar"] as const;
 
@@ -347,6 +375,32 @@ function normalizeConcurrency(o: Record<string, unknown>): Concurrency {
   return { organizations: read("organizations"), repositories: read("repositories"), branches: read("branches") };
 }
 
+// timeouts is OPTIONAL and per-field defaulted: an operator may override just one knob (e.g.
+// bulkApiSeconds on a slow VPN) and inherit the rest. An absent `timeouts` block yields all
+// defaults. Each present field must be a positive integer (a nonpositive deadline would instantly
+// expire every spawn — the github client also fail-fast validates this, but reject it here first
+// with a config-shaped error).
+function normalizeTimeouts(o: Record<string, unknown>): Timeouts {
+  const raw = o["timeouts"];
+  if (raw === undefined || raw === null) return { ...DEFAULT_TIMEOUTS };
+  if (!isObject(raw)) fail(`timeouts must be an object`);
+  rejectUnknownKeys(raw, CONFIG_TIMEOUTS_KEYS, "$.timeouts");
+  const read = (k: keyof Timeouts): number => {
+    const v = raw[k];
+    if (v === undefined || v === null) return DEFAULT_TIMEOUTS[k];
+    if (!isPosInt(v)) fail(`timeouts.${k} must be a positive integer (seconds)`);
+    return v as number;
+  };
+  return {
+    controlApiSeconds: read("controlApiSeconds"),
+    bulkApiSeconds: read("bulkApiSeconds"),
+    cloneSeconds: read("cloneSeconds"),
+    tarSeconds: read("tarSeconds"),
+    probeSeconds: read("probeSeconds"),
+    heartbeatSeconds: read("heartbeatSeconds"),
+  };
+}
+
 function normalizePaths(o: Record<string, unknown>): { sqlitePath: string; outputDir: string } {
   const p = o["paths"];
   if (!isObject(p)) fail(`paths must be an object`);
@@ -404,6 +458,7 @@ export function validateAndNormalize(raw: unknown, env: Record<string, string | 
     excludeRepositories: normalizeExcludeRepositories(o),
     cutoffDate,
     concurrency: normalizeConcurrency(o),
+    timeouts: normalizeTimeouts(o),
     packages: normalizePackages(o, env),
     excludeDirGlobs: optStringArray(o, "excludeDirGlobs", DEFAULT_EXCLUDE_DIR_GLOBS),
     paths: normalizePaths(o),
@@ -424,8 +479,9 @@ function canonicalize(value: unknown): unknown {
 }
 
 // The SCAN/REPORT-DEFINING projection. Arrays whose ORDER does not change what is scanned are
-// sorted/deduped so reordering the file does not churn the hash. `concurrency` and `paths` are
-// DELIBERATELY excluded (speed / storage location only), preserving resumability across tuning.
+// sorted/deduped so reordering the file does not churn the hash. `concurrency`, `timeouts`, and
+// `paths` are DELIBERATELY excluded (speed / deadlines / storage location only), preserving
+// resumability across tuning — raising a timeout never orphans in-flight resumable work.
 export function computeConfigHash(config: Config): string {
   // Branch policy is scan-defining, so a CONFIGURED policy must change the hash. But a policy-FREE config
   // (branches omitted → null, excludeBranches omitted → []) scans exactly what it scanned before this

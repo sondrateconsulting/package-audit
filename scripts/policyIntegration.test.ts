@@ -24,7 +24,7 @@ import { buildReport } from "./report.ts";
 import { exportRun } from "./export.ts";
 import { buildCompare } from "./compare.ts";
 import type { OrchestrateArgs } from "./args.ts";
-import type { Config } from "./config.ts";
+import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
 
 const NO_ARGS: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
 
@@ -33,7 +33,7 @@ const mkConfig = (root: string, over: Partial<Config> = {}): Config => ({
   githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [],
   branches: null, excludeBranches: [], excludeRepositories: [], includePersonalNamespace: false, includeForks: false, includeArchived: false,
   maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
-  concurrency: { organizations: 1, repositories: 1, branches: 1 },
+  concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
   packages: [], excludeDirGlobs: [],
   paths: { sqlitePath: ":memory:", outputDir: root },
   ...over,

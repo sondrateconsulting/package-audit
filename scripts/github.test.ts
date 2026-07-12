@@ -5,11 +5,13 @@ import { tmpdir, devNull } from "node:os";
 import { join, dirname } from "node:path";
 import {
   GithubClient, GithubApiError, ThrottleExhausted, MAX_PAGES, MAX_PAUSE_MS, SPAWN_TIMEOUT_MS, MAX_TOTAL_PAUSE_MS, SPAWN_KILL_GRACE_MS,
+  DEFAULT_CONTROL_API_TIMEOUT_MS, DEFAULT_BULK_API_TIMEOUT_MS, DEFAULT_CLONE_TIMEOUT_MS, DEFAULT_TAR_TIMEOUT_MS, DEFAULT_PROBE_TIMEOUT_MS,
   parseGhApiOutput, parseLinkNext, nextEndpointFromLink, parseRetryAfterMs,
   classifyRest, classifyGraphql, parseGraphqlEnvelope, parseTreeResponse, encodeContentsPath, mapRestRepo, filterSortCapRepos,
   buildGhEnv, buildGitEnv, buildTarEnv, readCapped, makeRealSpawn, joinSpawnOutcome,
   type SpawnFn, type SpawnResult, type RepoInfo, type SpawnAbortSignal, type StreamReader,
 } from "./github.ts";
+import { DEFAULT_TIMEOUTS } from "./config.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import { AuditDb } from "./db.ts";
 import { compileRepositoryPolicy } from "./repositoryPolicy.ts";
@@ -1772,6 +1774,77 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
     const base = { githubHost: "github.com", env: { HOME: "/tmp", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP };
     expect(() => new GithubClient({ ...base, concurrency: Number.NaN })).toThrow(/concurrency must be >= 1/);
     expect(() => new GithubClient({ ...base, spawnTimeoutMs: Number.NaN })).toThrow(/spawnTimeoutMs must be >= 1/);
+  });
+});
+
+describe("per-category spawn deadlines (T11)", () => {
+  // A never-settling spawn whose kill resolves an empty nonzero result (mirrors the deadline
+  // tests above). The synthetic 124 stderr names the deadline that actually fired, so we can
+  // assert WHICH category routed the call without depending on wall-clock timing. Backoff sleeps
+  // are instant so the retry loop finishes fast.
+  const stall = (timeouts: Partial<{ controlApiMs: number; bulkApiMs: number; cloneMs: number; tarMs: number; probeMs: number }>) =>
+    new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => {
+          opts.signal?.onAbort(() => resolve({ exitCode: 137, stdout: "", stderr: "killed" }));
+        }),
+      sleepImpl: async () => {},
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      timeouts,
+    });
+
+  test("a control call (rate_limit) times out on controlApiMs, never the bulk budget", async () => {
+    const client = stall({ controlApiMs: 11, bulkApiMs: 9_000_000 });
+    await expect(client.restGet("rate_limit")).rejects.toThrow(/spawn timed out after 11ms/);
+  });
+  test("a bulk raw-blob read times out on bulkApiMs, never the control budget", async () => {
+    const client = stall({ controlApiMs: 9_000_000, bulkApiMs: 12 });
+    await expect(client.fetchBlobRaw("o", "r", "a".repeat(40))).rejects.toThrow(/spawn timed out after 12ms/);
+  });
+  test("a bulk raw-file read times out on bulkApiMs, never the control budget", async () => {
+    const client = stall({ controlApiMs: 9_000_000, bulkApiMs: 17 });
+    await expect(client.fetchFileRaw("o", "r", "src/index.ts", "a".repeat(40))).rejects.toThrow(/spawn timed out after 17ms/);
+  });
+  test("a bulk recursive-tree read times out on bulkApiMs", async () => {
+    const client = stall({ controlApiMs: 9_000_000, bulkApiMs: 13 });
+    await expect(client.fetchTreeRecursive("o", "r", "a".repeat(40))).rejects.toThrow(/spawn timed out after 13ms/);
+  });
+  test("a tar spawn times out on tarMs", async () => {
+    const client = stall({ controlApiMs: 9_000_000, tarMs: 14 });
+    const res = await client.tar(["--version"]);
+    expect(res.stderr).toMatch(/spawn timed out after 14ms/);
+  });
+  test("a clone times out on cloneMs, never the control budget", async () => {
+    const client = stall({ controlApiMs: 9_000_000, cloneMs: 15 });
+    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/spawn timed out after 15ms/);
+  });
+  test("the uniform spawnTimeoutMs override still applies to every category (back-compat)", async () => {
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => { opts.signal?.onAbort(() => resolve({ exitCode: 137, stdout: "", stderr: "killed" })); }),
+      env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP, spawnTimeoutMs: 16,
+    });
+    const res = await client.tar(["--version"]);
+    expect(res.stderr).toMatch(/spawn timed out after 16ms/);
+  });
+  test("a per-category override < 1 (or NaN) is rejected at construction like the uniform knob", () => {
+    const base = { githubHost: "github.com", env: { HOME: "/tmp", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP };
+    expect(() => new GithubClient({ ...base, timeouts: { cloneMs: 0 } })).toThrow(/timeouts\.cloneMs must be >= 1/);
+    expect(() => new GithubClient({ ...base, timeouts: { bulkApiMs: Number.NaN } })).toThrow(/timeouts\.bulkApiMs must be >= 1/);
+  });
+  test("the client's ms defaults stay in lockstep with config's second defaults (no silent drift)", () => {
+    // Two independent default sources — config.ts seconds vs github.ts ms — must agree, since a
+    // GithubClient built without an orchestrate-supplied `timeouts` (tests, or a future direct
+    // caller) falls back to the github.ts constants while operators reason in config seconds.
+    expect(DEFAULT_TIMEOUTS.controlApiSeconds * 1000).toBe(DEFAULT_CONTROL_API_TIMEOUT_MS);
+    expect(DEFAULT_TIMEOUTS.bulkApiSeconds * 1000).toBe(DEFAULT_BULK_API_TIMEOUT_MS);
+    expect(DEFAULT_TIMEOUTS.cloneSeconds * 1000).toBe(DEFAULT_CLONE_TIMEOUT_MS);
+    expect(DEFAULT_TIMEOUTS.tarSeconds * 1000).toBe(DEFAULT_TAR_TIMEOUT_MS);
+    expect(DEFAULT_TIMEOUTS.probeSeconds * 1000).toBe(DEFAULT_PROBE_TIMEOUT_MS);
   });
 });
 
