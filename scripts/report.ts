@@ -2,7 +2,7 @@
 //   bun run scripts/report.ts [--config <path>] [--run-id <id>] [--html]
 // Default (no --run-id): the latest COMPLETED run with non-empty tracked_packages; also overwrites
 // <outputDir>/latest.json. A --run-id writes its JSON report ONLY to <outputDir>/run-<id>.json (never latest.json).
-// Findings are joined through the IMMUTABLE run_unit_head snapshot (never findings.run_id) filtered
+// Findings are joined through the per-run run_unit_head snapshot (never findings.run_id) filtered
 // to runs.tracked_packages, and EVERY emitted array has a total, stable sort key so the output is
 // byte-reproducible.
 

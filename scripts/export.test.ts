@@ -317,7 +317,7 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
 });
 
 describe("exportRun --raw (forensic full-table dump)", () => {
-  test("every row verbatim (markers, stale versions, all runs), raw- names, warning event, RAW stderr banner", async () => {
+  test("every row (markers, stale versions, all runs), raw- names, warning event, RAW stderr banner", async () => {
     const db = mem();
     const { oldRun, newRun } = seedTwoRuns(db);
     const out = nextOutputDir();
