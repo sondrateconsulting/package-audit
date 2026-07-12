@@ -49,6 +49,8 @@ class BufferedWriter {
   private drainArmed = false;
   private dropped = 0;
   private waiters: Array<() => void> = []; // flushLogs() promises awaiting a fully-flushed channel
+  private hookClosed = false; // the sink fired its async close hook (works even without isClosed())
+  private disposed = false; // swapped out by setLogSink/resetLogSink — must not touch the sink again
 
   constructor(
     private readonly sink: LogSink,
@@ -59,18 +61,20 @@ class BufferedWriter {
     this.sink.onClose?.(() => this.onClosed());
   }
 
+  // The channel is unusable if the sink reports it OR it fired its async onClose hook — so a sink
+  // that implements ONLY onClose (no isClosed) still un-hangs a pending flush.
   private get closed(): boolean {
-    return this.sink.isClosed?.() === true;
+    return this.hookClosed || this.sink.isClosed?.() === true;
   }
 
-  write(line: string, droppable: boolean): void {
+  write(line: string, droppable: boolean, terminal: boolean): void {
     // A dead channel (EPIPE) can deliver nothing — no-op, so a run that keeps logging after the pipe
     // died neither grows memory unboundedly nor pretends to buffer for a delivery that can't happen.
-    if (this.closed) return;
+    if (this.closed || this.disposed) return;
     // Preserve ordering: anything already buffered (or a paused sink) queues this line behind it.
     // Only a clear channel (not paused AND nothing buffered) writes straight through.
     if (!this.paused && this.buffer.length === 0) this.pushToSink(line);
-    else this.enqueue(line, droppable);
+    else this.enqueue(line, droppable, terminal);
   }
 
   private pushToSink(line: string): void {
@@ -80,15 +84,27 @@ class BufferedWriter {
     }
   }
 
-  private enqueue(line: string, droppable: boolean): void {
-    if (this.buffer.length >= this.maxBuffered) {
-      // Strict memory bound. Shed the OLDEST droppable telemetry (retry/throttle/heartbeat) first;
-      // if the whole backlog is lifecycle events, shed the oldest of THOSE too rather than grow
-      // without limit — the SQLite DB / report is the source of truth, stdout is live telemetry.
-      // Either way count the drop so heartbeat/done `suppressed` reflects it.
+  private enqueue(line: string, droppable: boolean, terminal: boolean): void {
+    // Terminal events (done/plan-summary/…) BYPASS the bound: there are only a handful per run, so
+    // admitting them a few over the cap keeps memory bounded while guaranteeing they ship AND never
+    // evict a counted line (which would leave their own inline suppressed count stale).
+    if (this.buffer.length >= this.maxBuffered && !terminal) {
       const i = this.buffer.findIndex((p) => p.droppable);
-      this.buffer.splice(i >= 0 ? i : 0, 1);
-      this.dropped++;
+      if (i >= 0) {
+        // there is droppable telemetry to shed — drop the OLDEST of it, keep the incoming line.
+        this.buffer.splice(i, 1);
+        this.dropped++;
+      } else if (droppable) {
+        // the whole backlog is lifecycle AND the incoming line is itself droppable telemetry — drop
+        // the INCOMING line rather than evict a lifecycle event (no priority inversion).
+        this.dropped++;
+        return;
+      } else {
+        // all lifecycle, incoming is lifecycle too — shed the oldest to stay strictly bounded (the
+        // SQLite DB / report is the source of truth; stdout is live telemetry). Count the drop.
+        this.buffer.splice(0, 1);
+        this.dropped++;
+      }
     }
     this.buffer.push({ line, droppable });
   }
@@ -98,12 +114,14 @@ class BufferedWriter {
     this.drainArmed = true;
     this.sink.onDrain(() => {
       this.drainArmed = false;
+      if (this.disposed) return; // a swapped-away writer must not flush stale lines on a late drain
       this.paused = false;
       this.flushBuffer();
     });
   }
 
   private flushBuffer(): void {
+    if (this.disposed) return;
     // The channel died while we were paused, so no 'drain' will ever come — abandon the buffered
     // lines (undeliverable) AND un-latch `paused` so subsequent writes take the no-op fast path
     // instead of re-buffering. flushLogs() then resolves instead of hanging.
@@ -124,20 +142,24 @@ class BufferedWriter {
   // Called by the sink owner when the channel dies ASYNCHRONOUSLY (an 'error' event with no drain to
   // follow) so a flushLogs() already awaiting a paused/buffered writer resolves instead of hanging.
   onClosed(): void {
+    this.hookClosed = true;
     this.flushBuffer();
   }
 
   // Resolve when the buffer is drained AND the sink is accepting again. A clear channel resolves at
-  // once; a paused/buffered one resolves on the next drain; a dead one resolves immediately (nothing
-  // to deliver). REUSABLE — never permanently closes the writer.
+  // once; a paused/buffered one resolves on the next drain; a dead/disposed one resolves immediately
+  // (nothing to deliver). REUSABLE — never permanently closes the writer.
   flush(): Promise<void> {
     this.flushBuffer();
-    if (this.closed || (!this.paused && this.buffer.length === 0)) return Promise.resolve();
+    if (this.disposed || this.closed || (!this.paused && this.buffer.length === 0)) return Promise.resolve();
     return new Promise<void>((resolve) => this.waiters.push(resolve));
   }
 
-  // Swapping the sink (setLogSink/resetLogSink) must not strand a pending flush on the abandoned writer.
+  // Swapping the sink (setLogSink/resetLogSink) must not strand a pending flush on the abandoned
+  // writer, nor let a late drain flush its stale backlog through the replaced sink.
   dispose(): void {
+    this.disposed = true;
+    this.buffer.length = 0;
     this.resolveWaiters();
   }
 
@@ -216,13 +238,15 @@ export function loggerStats(): { dropped: number } {
 // forwarded) so the timestamp can be neither forged nor duplicated — the format is pinned in
 // log.test.ts and every capture helper strips it before asserting on the other fields.
 // `droppable` marks pure telemetry (retry/throttle/heartbeat) the writer may shed under sustained
-// backpressure; lifecycle/unit/terminal events default to non-droppable and are never dropped.
-export function logLine(event: Record<string, unknown>, opts?: { droppable?: boolean }): void {
+// backpressure; lifecycle/unit events default to non-droppable and are never dropped. `terminal`
+// marks the run's final event (done/plan-summary) — it bypasses the buffer bound so it is never
+// evicted and its own inline counters stay exact.
+export function logLine(event: Record<string, unknown>, opts?: { droppable?: boolean; terminal?: boolean }): void {
   // bump FIRST so the heartbeat sampler counts this write even if serialization below throws.
   activitySeq++;
   const line: Record<string, unknown> = { ts: new Date().toISOString() };
   for (const key of Object.keys(event)) if (key !== "ts") line[key] = event[key];
-  writer.write(JSON.stringify(line) + "\n", opts?.droppable === true);
+  writer.write(JSON.stringify(line) + "\n", opts?.droppable === true, opts?.terminal === true);
 }
 
 // Awaited by every entrypoint's finally so buffered events (above all the terminal `done`/summary

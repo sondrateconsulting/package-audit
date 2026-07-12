@@ -86,6 +86,9 @@ export class RunProgress {
   unitDone(): void {
     this.unitsDone += 1;
     this.heartbeat?.setUnitsDone(this.unitsDone);
+    // the unit is finished — clear the target so a heartbeat in the gap before the next unit (or
+    // during the next repository's branch discovery) doesn't keep naming this branch as "current".
+    this.heartbeat?.setTarget(null);
   }
 }
 
@@ -413,7 +416,7 @@ export async function runScan(
   // T7: fold the run-scoped retry/throttle churn into the terminal event. `done` is a TERMINAL,
   // non-droppable line; the outer finally awaits flushLogs() so it (and its counters) always ship.
   const { retryTotal, suppressed } = reporter.counters();
-  logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount, retryTotal, suppressed });
+  logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount, retryTotal, suppressed }, { terminal: true });
   process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path, warnings));
 }
 
@@ -1144,7 +1147,7 @@ export async function runPlan(
   const warnings = emitPolicyWarnings(branchPolicy, coverages);
 
   const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, repositoriesExcluded, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, excludedByDeny, excludedByAllow, defaultBranchPolicyOverrides, discoveryErrors };
-  logLine({ event: "plan-summary", ...totals, ...reporter.counters() });
+  logLine({ event: "plan-summary", ...totals, ...reporter.counters() }, { terminal: true });
   process.stderr.write(planSummaryText(config, totals, warnings));
   return totals;
 }

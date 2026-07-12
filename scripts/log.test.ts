@@ -320,6 +320,88 @@ describe("stdout backpressure writer (T7)", () => {
     }
   });
 
+  test("a droppable line drops ITSELF (never evicts a lifecycle event) when the backlog is all lifecycle", () => {
+    const f = fakeSink();
+    setLogSink(f.sink, 2);
+    const before = loggerStats().dropped;
+    try {
+      logLine({ event: "a" }); // straight through
+      f.pause();
+      logLine({ event: "b" }); // sink, pause
+      logLine({ event: "u1" }); // buffer [u1] (lifecycle)
+      logLine({ event: "u2" }); // buffer [u1,u2] full, all lifecycle
+      logLine({ event: "hb" }, { droppable: true }); // full + incoming droppable → drops ITSELF, keeps u1/u2
+      expect(loggerStats().dropped).toBe(before + 1);
+      f.resume();
+      const events = f.received.map(evName);
+      expect(events).toContain("u1"); // lifecycle preserved (no priority inversion)
+      expect(events).toContain("u2");
+      expect(events).not.toContain("hb"); // the droppable telemetry self-dropped
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("a terminal event bypasses the bound — never evicted, admitted over-cap, everything delivered in order", () => {
+    const f = fakeSink();
+    setLogSink(f.sink, 2);
+    const before = loggerStats().dropped;
+    try {
+      logLine({ event: "a" });
+      f.pause();
+      logLine({ event: "b" }); // sink, pause
+      logLine({ event: "u1" }); // buffer [u1]
+      logLine({ event: "u2" }); // buffer [u1,u2] full
+      logLine({ event: "done" }, { terminal: true }); // bypasses bound → [u1,u2,done], evicts nothing
+      expect(loggerStats().dropped).toBe(before);
+      f.resume();
+      expect(f.received.map(evName)).toEqual(["a", "b", "u1", "u2", "done"]);
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("a sink with onClose but NO isClosed still un-hangs a pending flushLogs on async close", async () => {
+    const received: string[] = [];
+    let accept = true;
+    const closeRef: { cb: (() => void) | null } = { cb: null };
+    const sink: LogSink = { write: (l) => { received.push(l); return accept; }, onDrain: () => {}, onClose: (cb) => { closeRef.cb = cb; } };
+    setLogSink(sink);
+    try {
+      logLine({ event: "a" });
+      accept = false;
+      logLine({ event: "b" }); // sink, pause
+      logLine({ event: "c" }); // buffered
+      let resolved = false;
+      const p = flushLogs().then(() => {
+        resolved = true;
+      });
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+      closeRef.cb?.(); // async death signalled ONLY via onClose (no isClosed)
+      await p; // must resolve, not hang
+      expect(resolved).toBe(true);
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("swapping the sink stops a late drain on the old sink from flushing stale BUFFERED lines", () => {
+    const f1 = fakeSink();
+    setLogSink(f1.sink);
+    logLine({ event: "a" }); // straight through
+    f1.pause();
+    logLine({ event: "b" }); // reaches sink, pauses
+    logLine({ event: "stale" }); // BUFFERED on writer 1
+    const f2 = fakeSink();
+    setLogSink(f2.sink); // disposes writer 1 (buffer cleared, waiters resolved)
+    logLine({ event: "new" }); // writer 2
+    f1.resume(); // a LATE drain on the OLD sink — must NOT flush the abandoned "stale" line
+    expect(f1.received.map(evName)).toEqual(["a", "b"]); // "stale" was abandoned by dispose
+    expect(f2.received.map(evName)).toEqual(["new"]);
+    resetLogSink();
+  });
+
   test("a synchronous EPIPE from stdout degrades logging to a no-op (never crashes the run)", () => {
     resetLogSink(); // use the real process.stdout default sink
     const spy = spyOn(process.stdout, "write").mockImplementation((() => {

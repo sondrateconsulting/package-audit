@@ -677,13 +677,14 @@ describe("RunProgress (T8: phase/unit-start events + heartbeat plumbing)", () =>
     expect(hb.calls).toEqual(["target:org-a/svc@main"]);
   });
 
-  test("unitDone advances a running counter into the heartbeat", () => {
+  test("unitDone advances a running counter into the heartbeat AND clears the completed target", () => {
     const hb = fakeHeartbeat();
     const p = new RunProgress(hb.controller, false);
     p.unitDone();
     p.unitDone();
     p.unitDone();
-    expect(hb.calls).toEqual(["units:1", "units:2", "units:3"]);
+    // each completed unit ticks unitsDone and clears the target (no unit is in flight until the next start)
+    expect(hb.calls).toEqual(["units:1", "target:null", "units:2", "target:null", "units:3", "target:null"]);
   });
 
   test("a null heartbeat makes the liveness updates no-ops while events still emit", async () => {

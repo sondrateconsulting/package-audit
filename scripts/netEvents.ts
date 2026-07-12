@@ -85,7 +85,9 @@ export function createNetworkReporter(opts: NetworkReporterOptions = {}): Networ
       }
     },
     counters(): { retryTotal: number; suppressed: number } {
-      return { retryTotal, suppressed: rateLimited + (loggerDropped() - baselineDropped) };
+      // clamp the writer-drop delta at 0: if the process-lifetime dropped counter is ever RESET
+      // below the baseline (only reachable via test-only resetLogSink), never report a negative.
+      return { retryTotal, suppressed: rateLimited + Math.max(0, loggerDropped() - baselineDropped) };
     },
   };
 }
