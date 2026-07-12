@@ -11,6 +11,7 @@ import {
   buildNotExportableNotice, exportRun, main, parseExportArgs, runExport,
 } from "./export.ts";
 import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
+import { parseEvents } from "./testEvents.test.ts";
 
 // Bundle containment roots are caller-provided (unlike AuditDb's hardcoded ./data|./output), so
 // exportRun tests run entirely against disposable temp output dirs + :memory: databases.
@@ -255,7 +256,7 @@ describe("exportRun — run-scoped snapshot (default)", () => {
     const { newRun } = seedTwoRuns(db);
     const out = nextOutputDir();
     const { out: stdout, err } = await capture(() => exportRun(db, newRun, out, { raw: false }));
-    const events = stdout.split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
+    const events = parseEvents(stdout); // T6: asserts + strips the ts each logLine event carries
     expect(events).toHaveLength(10);
     expect(events.every((e) => e["event"] === "export")).toBe(true);
     expect(events.map((e) => `${e["table"]}.${e["format"]}`)).toEqual([
@@ -410,7 +411,7 @@ describe("exportRun --raw (forensic full-table dump)", () => {
     const out = nextOutputDir();
     const { result, out: stdout, err } = await capture(() => exportRun(db, newRun, out, { raw: true }));
 
-    const events = stdout.split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
+    const events = parseEvents(stdout); // T6: asserts + strips the ts each logLine event carries
     expect(events[0]).toEqual({ ...RAW_EXPORT_WARNING });
     expect(events.filter((e) => e["event"] === "warning")).toHaveLength(1);
 

@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, chmodSync }
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, githubDeadlines, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
+import { parseEvents } from "./testEvents.test.ts";
 import type { TreeEntry } from "./unitPipeline.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
@@ -350,7 +351,7 @@ async function captureJsonl(fn: () => Promise<unknown>): Promise<Array<Record<st
   } finally {
     spy.mockRestore();
   }
-  return chunks.join("").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
+  return parseEvents(chunks.join("")); // T6: asserts + strips the ts each logLine event carries
 }
 
 describe("githubDeadlines (T11 config seconds → client ms)", () => {

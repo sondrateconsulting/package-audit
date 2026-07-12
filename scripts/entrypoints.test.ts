@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { main as orchestrateMain } from "./orchestrate.ts";
 import { main as reportMain } from "./report.ts";
 import { ORCHESTRATE_HELP, REPORT_HELP } from "./args.ts";
+import { activeHeartbeats } from "./heartbeat.ts";
 
 // Capture BOTH streams while `fn` runs (help text and JSONL go to stdout; summaries to stderr).
 async function captureStreams(fn: () => Promise<void>): Promise<{ out: string; err: string }> {
@@ -165,6 +166,41 @@ describe("orchestrate main() --plan (offline shims — the zero-write early retu
       // ... and no pkg-audit-* temp dirs appeared (the git probe runs config-less by design)
       const tmpAfter = readdirSync(realpathSync(tmpdir())).filter((n) => n.startsWith("pkg-audit-"));
       expect(tmpAfter.filter((n) => !tmpBefore.has(n))).toEqual([]);
+    } finally {
+      rmSync(fx.root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("orchestrate main() heartbeat lifecycle (T6 — no dangling timer)", () => {
+  test("the run-scoped heartbeat is started and cleared on the normal exit path", async () => {
+    const fx = makeFixture();
+    try {
+      const before = activeHeartbeats();
+      await captureStreams(() => inFixture(fx, () => orchestrateMain(["--plan", "--config", fx.configPath])));
+      // started before preflight, cleared in the ONE outer finally → active-count is balanced
+      expect(activeHeartbeats()).toBe(before);
+    } finally {
+      rmSync(fx.root, { recursive: true, force: true });
+    }
+  });
+
+  test("the heartbeat is cleared even when the run THROWS (error exit path)", async () => {
+    const fx = makeFixture();
+    try {
+      const before = activeHeartbeats();
+      await expect(
+        captureStreams(() =>
+          inFixture(fx, async () => {
+            // preflight's registry-reachability probe now fails AFTER the heartbeat has started
+            globalThis.fetch = (async () => {
+              throw new Error("connect ECONNREFUSED");
+            }) as unknown as typeof fetch;
+            await orchestrateMain(["--config", fx.configPath]);
+          }),
+        ),
+      ).rejects.toThrow();
+      expect(activeHeartbeats()).toBe(before); // the outer finally stopped it despite the throw
     } finally {
       rmSync(fx.root, { recursive: true, force: true });
     }

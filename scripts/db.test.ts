@@ -6,6 +6,7 @@ import { basename, join } from "node:path";
 import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, assertOwnedDatabase, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, migrateV3toV4, normalizeCheck, nowIso, tableShapesAt, type RunInput, type RunUnitHeadInput, extractChecks } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
+import { parseEvents } from "./testEvents.test.ts";
 
 // File-backed tests must live under ./data (§0 write containment is enforced by AuditDb.open).
 const TEST_ROOT = `./data/.dbtest-${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -1654,7 +1655,7 @@ function captureStdout(fn: () => void): Array<Record<string, unknown>> {
   } finally {
     spy.mockRestore();
   }
-  return chunks.join("").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
+  return parseEvents(chunks.join("")); // T6: asserts + strips the ts each logLine event carries
 }
 
 describe("--fresh / --purge-cache", () => {

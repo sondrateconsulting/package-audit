@@ -13,6 +13,23 @@
 // after another — they never interleave. This is NOT a kernel-level >PIPE_BUF atomicity claim (a lone
 // >64KB write to a pipe shared with an INDEPENDENT process could still be split by the OS); it is the
 // in-process guarantee that the JSONL a consumer parses is always whole lines. Enforced by log.test.ts.
+
+// Monotonic activity counter, bumped on EVERY write. The run-scoped liveness heartbeat samples it
+// to distinguish a genuine quiet stretch (nothing logged since its last tick) from active work, so
+// it only speaks up when the run would otherwise be silent (§3 resilience — T6).
+let activitySeq = 0;
+export function logActivitySeq(): number {
+  return activitySeq;
+}
+
+// logLine OWNS `ts` (ISO-8601 UTC, ALWAYS the first key). H1/L2: every audit/plan stdout event is
+// timestamped so a stalled run stays legible in the log. A caller-supplied `ts` is ignored (never
+// forwarded) so the timestamp can be neither forged nor duplicated — the format is pinned in
+// log.test.ts and every capture helper strips it before asserting on the other fields.
 export function logLine(event: Record<string, unknown>): void {
-  process.stdout.write(JSON.stringify(event) + "\n");
+  // bump FIRST so the heartbeat sampler counts this write even if serialization below throws.
+  activitySeq++;
+  const line: Record<string, unknown> = { ts: new Date().toISOString() };
+  for (const key of Object.keys(event)) if (key !== "ts") line[key] = event[key];
+  process.stdout.write(JSON.stringify(line) + "\n");
 }

@@ -46,6 +46,7 @@ import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
 import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
 import { logLine } from "./log.ts";
+import { startHeartbeat } from "./heartbeat.ts";
 
 // The values that TOGETHER define one coherent scan/plan: the config, its hash, and the compiled
 // branch + repository policies. Threaded as ONE object through runScan/processOwner/processRepo/runPlan
@@ -150,29 +151,40 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   // once no matter how organizations×branches compose. Set-vocabulary event (documented in README).
   logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
 
-  // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
-  // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls).
-  const preflightClient = new GithubClient({ githubHost: config.githubHost, timeouts });
-  const preflight = await runPreflight(preflightClient, config);
-  logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
-
-  // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
-  // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
-  if (args.plan) {
-    const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories, timeouts });
-    await runPlan(planClient, runtime, preflight.githubLogin);
-    return;
-  }
-
-  // Only AFTER preflight passes do we touch the database (open/migrate/--fresh) and build the
-  // caching client for the scan.
-  const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath, fresh: args.fresh, purgeCache: args.purgeCache });
-  const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories, timeouts });
-
+  // T6: run-scoped liveness heartbeat — started BEFORE preflight and stopped in ONE outer finally
+  // that spans the preflight, --plan, and full-scan paths AND any thrown error, so a slow or wedged
+  // run is legible on stdout and the ref'd timer never dangles past the run.
+  const heartbeat = startHeartbeat({ intervalMs: config.timeouts.heartbeatSeconds * 1000 });
   try {
-    await runScan(db, client, runtime, args, preflight.githubLogin);
+    // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
+    // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls).
+    heartbeat.setPhase("preflight");
+    const preflightClient = new GithubClient({ githubHost: config.githubHost, timeouts });
+    const preflight = await runPreflight(preflightClient, config);
+    logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
+
+    // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
+    // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
+    if (args.plan) {
+      heartbeat.setPhase("plan");
+      const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories, timeouts });
+      await runPlan(planClient, runtime, preflight.githubLogin);
+      return;
+    }
+
+    // Only AFTER preflight passes do we touch the database (open/migrate/--fresh) and build the
+    // caching client for the scan.
+    heartbeat.setPhase("scan");
+    const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath, fresh: args.fresh, purgeCache: args.purgeCache });
+    const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories, timeouts });
+
+    try {
+      await runScan(db, client, runtime, args, preflight.githubLogin);
+    } finally {
+      db.close();
+    }
   } finally {
-    db.close();
+    heartbeat.stop();
   }
 }
 
