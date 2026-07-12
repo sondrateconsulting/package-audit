@@ -2,8 +2,9 @@ import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, githubDeadlines, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
+import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, githubDeadlines, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, RunProgress, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
 import { parseEvents } from "./testEvents.test.ts";
+import type { HeartbeatController } from "./heartbeat.ts";
 import type { TreeEntry } from "./unitPipeline.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
@@ -647,6 +648,52 @@ describe("runPlan org-level discovery failure (fail-soft continue)", () => {
   });
 });
 
+describe("RunProgress (T8: phase/unit-start events + heartbeat plumbing)", () => {
+  function fakeHeartbeat(): { controller: HeartbeatController; calls: string[] } {
+    const calls: string[] = [];
+    const controller: HeartbeatController = {
+      setPhase: (p) => calls.push(`phase:${p}`),
+      setTarget: (t) => calls.push(`target:${t}`),
+      setUnitsDone: (n) => calls.push(`units:${n}`),
+      tick: () => {},
+      stop: () => {},
+    };
+    return { controller, calls };
+  }
+
+  test("phase emits a `phase` event AND updates the heartbeat", async () => {
+    const hb = fakeHeartbeat();
+    const events = await captureJsonl(async () => new RunProgress(hb.controller, false).phase("scan"));
+    expect(events).toContainEqual({ event: "phase", phase: "scan" });
+    expect(hb.calls).toEqual(["phase:scan"]);
+  });
+
+  test("startUnit emits a unit action:start AND points the heartbeat at the target", async () => {
+    const hb = fakeHeartbeat();
+    const events = await captureJsonl(async () => new RunProgress(hb.controller, false).startUnit("org-a", "svc", "main", "abc"));
+    expect(events).toContainEqual({ event: "unit", org: "org-a", repo: "svc", branch: "main", commit: "abc", action: "start" });
+    expect(hb.calls).toEqual(["target:org-a/svc@main"]);
+  });
+
+  test("unitDone advances a running counter into the heartbeat", () => {
+    const hb = fakeHeartbeat();
+    const p = new RunProgress(hb.controller, false);
+    p.unitDone();
+    p.unitDone();
+    p.unitDone();
+    expect(hb.calls).toEqual(["units:1", "units:2", "units:3"]);
+  });
+
+  test("a null heartbeat makes the liveness updates no-ops while events still emit", async () => {
+    const events = await captureJsonl(async () => {
+      const p = new RunProgress(null, false);
+      p.phase("report");
+      p.unitDone(); // no heartbeat → no throw
+    });
+    expect(events).toContainEqual({ event: "phase", phase: "report" });
+  });
+});
+
 describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-cap untouched)", () => {
   // defaultBranch is REQUIRED and explicit: inferring it (a hardcoded "main", or "the first head")
   // would make a fixture agree with whatever the code resolved and hide a default-resolution defect.
@@ -685,7 +732,9 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
 
     const events = await captureJsonl(async () => {
-      await processRepo(db, client, rt(testConfig(root, 1), "h"), runId, "org-a", repo, [], new Set());
+      // --verbose-units so the per-unit skip lines are emitted (the default rolls them into repo-done);
+      // this test pins the skip-current/skip-cutoff CLASSIFICATION, so it wants the per-unit view.
+      await processRepo(db, client, rt(testConfig(root, 1), "h"), runId, "org-a", repo, [], new Set(), new Set(), undefined, undefined, new RunProgress(null, true));
     });
 
     // run_unit_head: stale → skipped-cutoff (empty sha), main+dev → scanned at their live heads with
@@ -775,6 +824,73 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     ).rejects.toThrow(/scheduled twice/);
     // a DISTINCT repo in the SAME shared set is unaffected (no false positive — different canonical key)
     await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", { ...repo, name: "other" }, [], new Set(), shared));
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("T8 default: per-unit skip lines are ROLLED UP into one repo-done (no --verbose-units)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wiring-rollup-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const key = (branch: string): WorkUnitKey => ({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch });
+    // main + dev pre-seeded done at their live heads → both take the §3 skip-current (reused) path;
+    // stale is pre-cutoff → skip-cutoff. Default (non-verbose) progress rolls all three into repo-done.
+    db.enqueueUnit(key("main"), runId);
+    db.setUnitStatus(key("main"), { status: "done", runId, lastCommitSha: hexOid("o-main"), lastCommitDate: "2025-06-01T00:00:00Z" });
+    db.enqueueUnit(key("dev"), runId);
+    db.setUnitStatus(key("dev"), { status: "done", runId, lastCommitSha: hexOid("o-dev"), lastCommitDate: "2025-05-01T00:00:00Z" });
+    const client = makeClient(root, async () => ({ exitCode: 0, stderr: "", stdout: graphqlHeads([
+      { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+      { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
+      { name: "stale", oid: hexOid("o-stale"), date: "2023-06-01T00:00:00Z" },
+    ], "main") }));
+    const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+
+    const events = await captureJsonl(async () => {
+      await processRepo(db, client, rt(testConfig(root, 1), "h"), runId, "org-a", repo, [], new Set()); // default progress: verboseUnits=false
+    });
+
+    // no per-unit skip-current/skip-cutoff lines by default…
+    const unitActions = events.filter((e) => e["event"] === "unit").map((e) => e["action"]);
+    expect(unitActions).not.toContain("skip-current");
+    expect(unitActions).not.toContain("skip-cutoff");
+    // …exactly one repo-done rollup with the true tally
+    const rollups = events.filter((e) => e["event"] === "repo-done");
+    expect(rollups).toHaveLength(1);
+    expect(rollups[0]).toEqual({ event: "repo-done", org: "org-a", repo: "svc", scanned: 0, reused: 2, skippedCutoff: 1, errored: 0, deferred: 0 });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("T8 scanned units emit a unit action:start + scanned, and a repo-done rollup counts them", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wiring-start-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const client = makeClient(root, async (_bin, args) =>
+      args.some((a) => a === "graphql")
+        ? { exitCode: 0, stderr: "", stdout: graphqlHeads([
+            { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+            { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
+          ], "main") }
+        : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+
+    const events = await captureJsonl(async () => {
+      await processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set());
+    });
+
+    const starts = events.filter((e) => e["event"] === "unit" && e["action"] === "start").map((e) => e["branch"]).sort();
+    const scans = events.filter((e) => e["event"] === "unit" && e["action"] === "scanned").map((e) => e["branch"]).sort();
+    expect(starts).toEqual(["dev", "main"]); // a start precedes each real scan
+    expect(scans).toEqual(["dev", "main"]);
+    const rollups = events.filter((e) => e["event"] === "repo-done");
+    expect(rollups[0]).toEqual({ event: "repo-done", org: "org-a", repo: "svc", scanned: 2, reused: 0, skippedCutoff: 0, errored: 0, deferred: 0 });
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -900,7 +1016,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], "dev") };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
     const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy, repositoryPolicy: compileRepositoryPolicy([]) };
     let thrown: unknown = null;
     await captureJsonl(async () => {
@@ -952,7 +1068,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
     const client = makeClient(root, async () =>
       ({ exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` }));
-    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
     const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [] }, repositoryPolicy: throwingRepoPolicy };
     let thrown: unknown = null;
     await captureJsonl(async () => {
@@ -1197,7 +1313,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-  const noArgsT7: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const noArgsT7: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
   const policyWarnEvents = (events: Array<Record<string, unknown>>) => events.filter((e) => e["event"] === "policy-warning");
 
   test("runPlan emits an unmatched-pattern warning (before plan-summary) for a deny pattern that matched no branch", async () => {
@@ -1821,7 +1937,7 @@ describe("resolveOwnersWithDiscovery owner-membership throttle (§4, site a)", (
 });
 
 describe("runScan owner-discovery throttle (§4, site a — consumer wiring)", () => {
-  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
 
   test("a throttle during owner discovery ends cleanly WITHOUT starting a run (no phantom run row)", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
@@ -2058,7 +2174,7 @@ describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations
       const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
   const twoOwnerConfig = (root: string) => ({ ...testConfig(root, 25), organizations: ["org-a", "org-b"], concurrency: { organizations: 2, repositories: 2, branches: 1 } });
   const runStatus = (db: AuditDb): string | undefined => (db.read(`SELECT status FROM runs`).get() as { status: string } | null)?.status ?? undefined;
   const scannedOrgs = (db: AuditDb): string[] =>

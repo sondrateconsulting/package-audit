@@ -26,7 +26,7 @@ import { buildCompare } from "./compare.ts";
 import type { OrchestrateArgs } from "./args.ts";
 import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
 
-const NO_ARGS: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+const NO_ARGS: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
 
 // A full Config, policy fields overridable per scenario. packages default []: no registry fetch.
 const mkConfig = (root: string, over: Partial<Config> = {}): Config => ({
