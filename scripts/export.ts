@@ -422,9 +422,9 @@ export function buildNotExportableNotice(runIdArg: string | null, missingDbPath?
 // The export flow minus argv/config parsing — guards mirror runReport verbatim. Invariant:
 // running `export` before any `audit` is a pure no-op — a missing (or :memory:) database
 // short-circuits with the notExportable notice BEFORE any open, mkdir, or bundle write, so
-// the filesystem is untouched. Unlike report (which persists its notice as latest.json),
-// export writes notices to stdout ONLY: the xray/ bundle holds manifested artifacts, and a
-// notice is not one.
+// the filesystem is untouched. Unlike report — which, when the database exists but has no
+// completed run, persists that notice to latest.json (or run-<id>.json under --run-id) — export
+// writes notices to stdout ONLY: the xray/ bundle holds manifested artifacts, and a notice is not one.
 export function runExport(config: Config, opts: { runId: string | null; raw: boolean }): { line: string } {
   const sqlitePath = config.paths.sqlitePath;
   if (sqlitePath === ":memory:" || !existsSync(sqlitePath)) {

@@ -100,8 +100,8 @@ export interface DossierReport {
 
 // ---- constants --------------------------------------------------------------------------------
 
-// Rank cap for evidence drawers and the CLI table (CEO addendum 1): top-N rows, honest totals,
-// standing pointer to the full exports.
+// Rank cap for evidence drawers and the CLI table (CEO addendum 1): top-N rows with honest
+// totals; the evidence drawers additionally carry a standing pointer to the full exports.
 export const EVIDENCE_CAP = 25;
 // Matrix overflow rule: beyond this many attributed export columns, keep the top
 // (MATRIX_MAX_EXPORT_COLUMNS - 1) by usage plus one "other" rollup column. The "(whole-module)"
