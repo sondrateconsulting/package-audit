@@ -1,0 +1,74 @@
+import { expect, test, describe } from "bun:test";
+import { createNetworkReporter, type NetworkEvent } from "./netEvents.ts";
+
+// Drive the reporter with a frozen clock + capturing emit so the token bucket and counters are
+// fully deterministic (no real logLine, no wall clock).
+function harness(opts: { refillPerSec?: number; burst?: number } = {}) {
+  let clockMs = 0;
+  const emitted: Array<{ e: Record<string, unknown>; droppable: boolean }> = [];
+  let loggerDropped = 0;
+  const reporter = createNetworkReporter({
+    nowMs: () => clockMs,
+    emit: (e, o) => emitted.push({ e, droppable: o?.droppable === true }),
+    loggerDropped: () => loggerDropped,
+    refillPerSec: opts.refillPerSec,
+    burst: opts.burst,
+  });
+  return {
+    reporter,
+    emitted,
+    advance: (ms: number) => {
+      clockMs += ms;
+    },
+    setLoggerDropped: (n: number) => {
+      loggerDropped = n;
+    },
+  };
+}
+
+const retry = (attempt: number): NetworkEvent => ({ kind: "retry", reason: "no-response", endpoint: "x", attempt, maxAttempts: 6, nextWaitMs: 1000 });
+
+describe("network reporter flood control + counters (T7)", () => {
+  test("emits the first candidate, rate-limits the rest, counts every attempt + suppression", () => {
+    const h = harness(); // burst 1, refill 1/s, clock frozen at 0 → only the first token exists
+    h.reporter.emit(retry(0));
+    h.reporter.emit(retry(1));
+    h.reporter.emit(retry(2));
+    expect(h.emitted).toHaveLength(1);
+    expect(h.emitted[0]!.e).toMatchObject({ event: "retry", reason: "no-response", attempt: 0, maxAttempts: 6, nextWaitMs: 1000 });
+    expect(h.emitted[0]!.droppable).toBe(true); // droppable so backpressure can shed it too
+    expect(h.reporter.counters().retryTotal).toBe(3); // every attempt counted
+    expect(h.reporter.counters().suppressed).toBe(2); // two rate-limited
+  });
+
+  test("a refilled token lets another line through after the cadence elapses", () => {
+    const h = harness();
+    h.reporter.emit(retry(0)); // emit (consumes the token)
+    h.reporter.emit(retry(1)); // suppressed
+    h.advance(1000); // one token refills at 1/s
+    h.reporter.emit(retry(2)); // emit
+    expect(h.emitted).toHaveLength(2);
+    expect(h.reporter.counters()).toEqual({ retryTotal: 3, suppressed: 1 });
+  });
+
+  test("throttle is rate-limited + droppable; spawn-timeout is ALWAYS emitted (never dropped)", () => {
+    const h = harness();
+    h.reporter.emit({ kind: "throttle", bucket: "core", waitKind: "primary", waitMs: 5000, untilMs: 5000, attempt: 0 }); // emit (token)
+    h.reporter.emit({ kind: "throttle", bucket: "core", waitKind: "secondary", waitMs: 1000, untilMs: 1000, attempt: 1 }); // suppressed
+    h.reporter.emit({ kind: "spawn-timeout", bin: "gh", ms: 900_000 }); // ALWAYS
+    h.reporter.emit({ kind: "spawn-timeout", bin: "git", ms: 900_000 }); // ALWAYS
+    expect(h.emitted.map((x) => x.e["event"])).toEqual(["throttle", "spawn-timeout", "spawn-timeout"]);
+    expect(h.emitted[0]!.e).toMatchObject({ event: "throttle", bucket: "core", kind: "primary", untilMs: 5000 });
+    expect(h.emitted[0]!.droppable).toBe(true);
+    expect(h.emitted[1]!.droppable).toBe(false); // spawn-timeout is not droppable
+    expect(h.reporter.counters()).toEqual({ retryTotal: 0, suppressed: 1 }); // only the secondary throttle
+  });
+
+  test("suppressed folds in the stdout writer's backpressure drops", () => {
+    const h = harness();
+    h.reporter.emit(retry(0)); // emit
+    h.reporter.emit(retry(1)); // rate-limit suppressed (1)
+    h.setLoggerDropped(4); // the writer shed 4 droppable lines under backpressure
+    expect(h.reporter.counters().suppressed).toBe(1 + 4);
+  });
+});

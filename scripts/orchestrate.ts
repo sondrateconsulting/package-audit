@@ -45,8 +45,9 @@ import { introspectVersion, fetchPackument, resolveRangeToVersion, type Packumen
 import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
 import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
-import { logLine } from "./log.ts";
+import { logLine, flushLogs } from "./log.ts";
 import { startHeartbeat } from "./heartbeat.ts";
+import { createNetworkReporter, type NetworkReporter } from "./netEvents.ts";
 
 // The values that TOGETHER define one coherent scan/plan: the config, its hash, and the compiled
 // branch + repository policies. Threaded as ONE object through runScan/processOwner/processRepo/runPlan
@@ -151,15 +152,19 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   // once no matter how organizations×branches compose. Set-vocabulary event (documented in README).
   logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
 
+  // T7: ONE run-scoped network-event reporter (rate-limiter + counters), shared by the preflight,
+  // plan, and scan clients so retry/throttle counting is global across the whole run (codex).
+  const reporter = createNetworkReporter();
   // T6: run-scoped liveness heartbeat — started BEFORE preflight and stopped in ONE outer finally
   // that spans the preflight, --plan, and full-scan paths AND any thrown error, so a slow or wedged
-  // run is legible on stdout and the ref'd timer never dangles past the run.
-  const heartbeat = startHeartbeat({ intervalMs: config.timeouts.heartbeatSeconds * 1000 });
+  // run is legible on stdout and the ref'd timer never dangles past the run. It carries the T7
+  // retryTotal/suppressed counters so a quiet-but-retrying run still shows the churn.
+  const heartbeat = startHeartbeat({ intervalMs: config.timeouts.heartbeatSeconds * 1000, extra: () => reporter.counters() });
   try {
     // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
     // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls).
     heartbeat.setPhase("preflight");
-    const preflightClient = new GithubClient({ githubHost: config.githubHost, timeouts });
+    const preflightClient = new GithubClient({ githubHost: config.githubHost, timeouts, events: (e) => reporter.emit(e) });
     const preflight = await runPreflight(preflightClient, config);
     logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
 
@@ -167,7 +172,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
     if (args.plan) {
       heartbeat.setPhase("plan");
-      const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories, timeouts });
+      const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories, timeouts, events: (e) => reporter.emit(e) });
       await runPlan(planClient, runtime, preflight.githubLogin);
       return;
     }
@@ -176,15 +181,18 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     // caching client for the scan.
     heartbeat.setPhase("scan");
     const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath, fresh: args.fresh, purgeCache: args.purgeCache });
-    const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories, timeouts });
+    const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories, timeouts, events: (e) => reporter.emit(e) });
 
     try {
-      await runScan(db, client, runtime, args, preflight.githubLogin);
+      await runScan(db, client, runtime, args, preflight.githubLogin, reporter);
     } finally {
       db.close();
     }
   } finally {
+    // Stop the heartbeat BEFORE flushing (codex): no new lines should enter the buffer during the
+    // final drain, and the terminal `done` line must not be left buffered at process exit.
     heartbeat.stop();
+    await flushLogs();
   }
 }
 
@@ -226,6 +234,10 @@ function emitPolicyWarnings(branchPolicy: CompiledBranchPolicy, coverages: reado
 export async function runScan(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime,
   args: OrchestrateArgs, personalLogin: string | null,
+  // T7: the run-scoped reporter supplies the retryTotal/suppressed counters folded into the `done`
+  // event. Optional (defaults to a fresh reporter → zeros) so the many direct runScan tests are
+  // unaffected; production always injects the same reporter the clients emit through.
+  reporter: NetworkReporter = createNetworkReporter(),
 ): Promise<void> {
   const { config, configHash } = runtime;
   // §0 startup: sweep stale temp dirs from a prior crash.
@@ -361,7 +373,10 @@ export async function runScan(
   const emitted = emitReportDetailed(db, completedRun, config.paths.outputDir, { alsoLatest: true });
   const summary = emitted.report.summary;
   const errorCount = emitted.report.errors.length;
-  logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount });
+  // T7: fold the run-scoped retry/throttle churn into the terminal event. `done` is a TERMINAL,
+  // non-droppable line; the outer finally awaits flushLogs() so it (and its counters) always ship.
+  const { retryTotal, suppressed } = reporter.counters();
+  logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount, retryTotal, suppressed });
   process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path, warnings));
 }
 

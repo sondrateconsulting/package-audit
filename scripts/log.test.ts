@@ -1,5 +1,6 @@
 import { expect, test, describe, spyOn } from "bun:test";
-import { logLine, logActivitySeq } from "./log.ts";
+import { logLine, logActivitySeq, flushLogs, loggerStats, setLogSink, resetLogSink, type LogSink } from "./log.ts";
+import { stripTs } from "./testEvents.test.ts";
 
 // Capture the raw stdout lines logLine writes (NOT ts-stripped — this file pins the ts itself).
 function capture(fn: () => void): string[] {
@@ -100,5 +101,151 @@ describe("logLine — one atomic write per event (§6/§8 observability)", () =>
     const obj = JSON.parse(line.slice(0, -1)) as Record<string, unknown>;
     expect(Object.keys(obj)[0]).toBe("ts"); // ts first (T6)
     expect(obj["event"]).toBe("done");
+  });
+});
+
+// A controllable sink standing in for process.stdout: write() returns `accept`, and a paused sink
+// records lines it received (a real stream queues the chunk that triggered backpressure) while the
+// writer holds SUBSEQUENT lines. resume() flips accept and fires the stored one-shot drain.
+function fakeSink() {
+  const received: string[] = [];
+  let accept = true;
+  let closed = false;
+  let drainCb: (() => void) | null = null;
+  const sink: LogSink = {
+    write: (line) => {
+      if (closed) return true;
+      received.push(line);
+      return accept;
+    },
+    onDrain: (cb) => {
+      drainCb = cb;
+    },
+    isClosed: () => closed,
+  };
+  return {
+    sink,
+    received,
+    pause: () => {
+      accept = false;
+    },
+    resume: () => {
+      accept = true;
+      const cb = drainCb;
+      drainCb = null;
+      if (cb) cb();
+    },
+    close: () => {
+      closed = true;
+    },
+  };
+}
+const evName = (line: string): unknown => stripTs(JSON.parse(line) as Record<string, unknown>)["event"];
+
+describe("stdout backpressure writer (T7)", () => {
+  test("clear channel writes straight through (no buffering overhead)", () => {
+    const f = fakeSink();
+    setLogSink(f.sink);
+    try {
+      logLine({ event: "a" });
+      logLine({ event: "b" });
+      expect(f.received.map(evName)).toEqual(["a", "b"]);
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("buffers behind a backpressured sink and flushes on drain, in order", () => {
+    const f = fakeSink();
+    setLogSink(f.sink);
+    try {
+      logLine({ event: "a" }); // straight through
+      f.pause();
+      logLine({ event: "b" }); // reaches the sink, gets backpressure → writer pauses
+      logLine({ event: "c" }); // buffered
+      logLine({ event: "d" }); // buffered
+      expect(f.received.map(evName)).toEqual(["a", "b"]);
+      f.resume(); // drain → flush the buffer
+      expect(f.received.map(evName)).toEqual(["a", "b", "c", "d"]);
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("over the bound, sheds only OLDEST droppable telemetry; keeps lifecycle events + order", () => {
+    const f = fakeSink();
+    setLogSink(f.sink, 2); // tiny buffer bound so the drop path is cheap
+    const before = loggerStats().dropped;
+    try {
+      logLine({ event: "unit" }); // straight through
+      f.pause();
+      logLine({ event: "sink-full" }); // reaches sink, pauses the writer
+      logLine({ event: "retry" }, { droppable: true }); // buffer [retry]
+      logLine({ event: "throttle" }, { droppable: true }); // buffer [retry, throttle]
+      logLine({ event: "done" }); // buffer full → drop OLDEST droppable (retry); enqueue done
+      expect(loggerStats().dropped).toBe(before + 1);
+      f.resume();
+      const events = f.received.map(evName);
+      expect(events).toContain("done"); // lifecycle event kept
+      expect(events).toContain("throttle"); // only the OLDEST droppable was shed
+      expect(events).not.toContain("retry"); // droppable telemetry shed
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("flushLogs resolves only after the buffer drains", async () => {
+    const f = fakeSink();
+    setLogSink(f.sink);
+    try {
+      logLine({ event: "a" });
+      f.pause();
+      logLine({ event: "b" }); // sink, pause
+      logLine({ event: "c" }); // buffered
+      let resolved = false;
+      const p = flushLogs().then(() => {
+        resolved = true;
+      });
+      await Promise.resolve(); // let any already-settled microtask run
+      expect(resolved).toBe(false); // still buffered
+      f.resume(); // drain flushes c and resolves the waiter
+      await p;
+      expect(resolved).toBe(true);
+      expect(f.received.map(evName)).toEqual(["a", "b", "c"]);
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("flushLogs resolves (does not hang) if the pipe dies while the writer is paused", async () => {
+    const f = fakeSink();
+    setLogSink(f.sink);
+    try {
+      logLine({ event: "a" });
+      f.pause();
+      logLine({ event: "b" }); // reaches sink, pauses the writer
+      logLine({ event: "c" }); // buffered, waiting for a drain that will never come
+      f.close(); // the consumer went away
+      await flushLogs(); // must resolve by abandoning the buffer, not wait forever
+      expect(f.received.map(evName)).toEqual(["a", "b"]); // c was abandoned, but we didn't hang
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("a synchronous EPIPE from stdout degrades logging to a no-op (never crashes the run)", () => {
+    resetLogSink(); // use the real process.stdout default sink
+    const spy = spyOn(process.stdout, "write").mockImplementation((() => {
+      const e = new Error("write EPIPE") as NodeJS.ErrnoException;
+      e.code = "EPIPE";
+      throw e;
+    }) as typeof process.stdout.write);
+    try {
+      expect(() => logLine({ event: "x" })).not.toThrow();
+      expect(() => logLine({ event: "y" })).not.toThrow(); // stays a no-op after the pipe closed
+    } finally {
+      spy.mockRestore();
+      resetLogSink(); // clears the EPIPE flag so later tests get a clean channel
+    }
   });
 });

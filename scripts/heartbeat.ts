@@ -40,7 +40,9 @@ export interface HeartbeatOptions {
 
 export function startHeartbeat(opts: HeartbeatOptions): HeartbeatController {
   const nowMs = opts.nowMs ?? Date.now;
-  const emit = opts.emit ?? logLine;
+  // heartbeats are pure telemetry: mark them DROPPABLE so the stdout backpressure buffer sheds them
+  // (not lifecycle events) under a sustained slow consumer (T7).
+  const emit = opts.emit ?? ((e: Record<string, unknown>) => logLine(e, { droppable: true }));
   const activity = opts.activitySeq ?? logActivitySeq;
   // Default timers are REF'D on purpose (codex): an unref'd awaited heartbeat would let a
   // standalone CLI drain its event loop and exit mid-await, skipping cleanup/finalization.

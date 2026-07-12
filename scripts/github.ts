@@ -16,6 +16,7 @@ import type { DiscoveryFailure } from "./discovery.ts";
 import { isIsoInstant } from "./isoDate.ts";
 import { logLine } from "./log.ts";
 import { classifyRepository, type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
+import type { NetworkEvent } from "./netEvents.ts";
 
 // ---- errors -----------------------------------------------------------------------------
 // Non-retryable API failure (404, permission, SSO enforcement, poisoned redirect, …) — the
@@ -977,6 +978,10 @@ export interface GithubClientOptions {
   // Per-category deadline overrides (ms). Each category resolves to
   // `timeouts.<cat> ?? spawnTimeoutMs ?? DEFAULT_<CAT>` (T11).
   timeouts?: Partial<SpawnDeadlines>;
+  // T7: sink for retry/throttle/spawn-timeout visibility. Injected (not a logLine import) so the
+  // client stays decoupled from the coordinator and the single-spawn chokepoint is unaffected. The
+  // run-scoped reporter owns rate-limiting + counters; a bare no-op default keeps tests silent.
+  events?: (e: NetworkEvent) => void;
   env?: Env;
   binPaths?: { gh: string; git: string; tar: string };
   tempRoot?: string; // default realpath(os.tmpdir()); pkg-audit-* dirs live directly under it
@@ -1006,6 +1011,7 @@ export class GithubClient {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
   private readonly deadlines: SpawnDeadlines;
+  private readonly emitEvent: (e: NetworkEvent) => void;
   private readonly bins: { gh: string; git: string; tar: string };
   private readonly ghEnv: Record<string, string>;
   private readonly baseEnv: Env;
@@ -1046,6 +1052,7 @@ export class GithubClient {
       tarMs: resolveDeadline("tarMs", DEFAULT_TAR_TIMEOUT_MS),
       probeMs: resolveDeadline("probeMs", DEFAULT_PROBE_TIMEOUT_MS),
     };
+    this.emitEvent = opts.events ?? (() => {});
     const concurrency = opts.concurrency ?? 8;
     if (!Number.isFinite(concurrency) || concurrency < 1)
       throw new Error(`concurrency must be >= 1 (got ${concurrency}) — a zero-slot semaphore hangs the first acquire forever`);
@@ -1126,6 +1133,9 @@ export class GithubClient {
       // hold-until-exit window: a synthetic 124 would misclassify it as a transient
       // no-response and re-drive the oversized request through every retry.
       if (spawnRejected) throw spawnRejection;
+      // T7: a spawn timeout is its OWN event (not always a retry — auth/version/tar terminate; the
+      // CALLER decides whether a retry follows). Rare and load-bearing, so never rate-limited.
+      this.emitEvent({ kind: "spawn-timeout", bin, ms: deadlineMs });
       return { exitCode: 124, stdout: "", stderr: `spawn timed out after ${deadlineMs}ms: ${bin}` };
     } finally {
       clearTimeout(timer);
@@ -1445,7 +1455,7 @@ export class GithubClient {
       | { kind: "fatal"; status: number; ssoRequired: boolean; message: string }
       | { kind: "no-response"; stderr: string }
       | { kind: "truncated"; exitCode: number; stderr: string }
-      | { kind: "retry" };
+      | { kind: "retry"; event: NetworkEvent };
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       const outcome = await this.ghBucketedAttempt<RestOutcome>(args, this.core, deadlineMs, (res, now) => {
         const parsed = parseGhApiOutput(res.stdout);
@@ -1466,11 +1476,26 @@ export class GithubClient {
         if (cls.kind === "fatal") return { outcome: { kind: "fatal", status: cls.status, ssoRequired: cls.ssoRequired, message: cls.message }, pauseUntilMs: null };
         // primary → pause until the reset epoch; secondary/transient → now + backoff. Arming from
         // this pauseUntilMs happens inside the lease (ghBucketedAttempt), before the slot is released.
-        const pauseUntilMs = cls.kind === "primary" ? cls.untilMs : now + this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-        return { outcome: { kind: "retry" }, pauseUntilMs };
+        // Build the matching T7 telemetry (throttle for a rate-limit pause, retry for a 5xx service
+        // retry) and hand it back so the caller emits it OUTSIDE the lease only if a retry follows.
+        if (cls.kind === "primary") {
+          const event: NetworkEvent = { kind: "throttle", bucket: this.core.label, waitKind: "primary", waitMs: Math.max(0, cls.untilMs - now), untilMs: cls.untilMs, attempt };
+          return { outcome: { kind: "retry", event }, pauseUntilMs: cls.untilMs };
+        }
+        const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
+        const untilMs = now + waitMs;
+        const event: NetworkEvent = cls.kind === "secondary"
+          ? { kind: "throttle", bucket: this.core.label, waitKind: "secondary", waitMs, untilMs, attempt }
+          : { kind: "retry", reason: "http-5xx", endpoint, attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs: waitMs };
+        return { outcome: { kind: "retry", event }, pauseUntilMs: untilMs };
       });
       if (outcome.kind === "no-response") {
-        if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
+        if (attempt < MAX_ATTEMPTS - 1) {
+          const nextWaitMs = this.backoffWait("transient", attempt, null);
+          this.emitEvent({ kind: "retry", reason: "no-response", endpoint, attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs });
+          await this.sleep(nextWaitMs);
+          continue;
+        }
         throw new GithubApiError(`gh api produced no HTTP response: ${outcome.stderr.trim().slice(0, 300)}`, { endpoint });
       }
       if (outcome.kind === "not-modified") {
@@ -1507,7 +1532,10 @@ export class GithubClient {
       }
       if (outcome.kind === "fatal")
         throw new GithubApiError(`${outcome.message} (${endpoint})`, { status: outcome.status, endpoint, ssoRequired: outcome.ssoRequired });
-      // outcome.kind === "retry": pause already armed inside the lease; loop again (next acquire waits it out).
+      // outcome.kind === "retry": pause already armed inside the lease. Emit its telemetry OUTSIDE the
+      // lease — only when a retry actually follows (not the final attempt about to ThrottleExhausted) —
+      // then loop again (the next acquire waits out the armed pause).
+      if (attempt < MAX_ATTEMPTS - 1) this.emitEvent(outcome.event);
     }
     throw new ThrottleExhausted(endpoint);
   }
@@ -1583,7 +1611,7 @@ export class GithubClient {
       | { kind: "ok"; data: unknown; malformed: string | null; status: number; exitCode: number; stderr: string }
       | { kind: "fatal"; status: number; ssoRequired: boolean; message: string }
       | { kind: "no-response"; stderr: string }
-      | { kind: "retry" };
+      | { kind: "retry"; event: NetworkEvent };
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       const outcome = await this.ghBucketedAttempt<GqlOutcome>(args, this.graphqlBucket, this.deadlines.controlApiMs, (res, now) => {
         const parsed = parseGhApiOutput(res.stdout);
@@ -1601,11 +1629,26 @@ export class GithubClient {
         if (cls.kind === "ok")
           return { outcome: { kind: "ok", data: env.data, malformed: env.malformed, status: parsed.status, exitCode: res.exitCode, stderr: res.stderr }, pauseUntilMs: null };
         if (cls.kind === "fatal") return { outcome: { kind: "fatal", status: cls.status, ssoRequired: cls.ssoRequired, message: cls.message }, pauseUntilMs: null };
-        const pauseUntilMs = cls.kind === "primary" ? cls.untilMs : now + this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-        return { outcome: { kind: "retry" }, pauseUntilMs };
+        // Build the matching T7 telemetry (throttle for a rate-limit pause, retry for a 5xx service
+        // retry) and hand it back so the caller emits it OUTSIDE the lease only if a retry follows.
+        if (cls.kind === "primary") {
+          const event: NetworkEvent = { kind: "throttle", bucket: this.graphqlBucket.label, waitKind: "primary", waitMs: Math.max(0, cls.untilMs - now), untilMs: cls.untilMs, attempt };
+          return { outcome: { kind: "retry", event }, pauseUntilMs: cls.untilMs };
+        }
+        const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
+        const untilMs = now + waitMs;
+        const event: NetworkEvent = cls.kind === "secondary"
+          ? { kind: "throttle", bucket: this.graphqlBucket.label, waitKind: "secondary", waitMs, untilMs, attempt }
+          : { kind: "retry", reason: "http-5xx", endpoint: "graphql", attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs: waitMs };
+        return { outcome: { kind: "retry", event }, pauseUntilMs: untilMs };
       });
       if (outcome.kind === "no-response") {
-        if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
+        if (attempt < MAX_ATTEMPTS - 1) {
+          const nextWaitMs = this.backoffWait("transient", attempt, null);
+          this.emitEvent({ kind: "retry", reason: "no-response", endpoint: "graphql", attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs });
+          await this.sleep(nextWaitMs);
+          continue;
+        }
         throw new GithubApiError(`gh api graphql produced no HTTP response: ${outcome.stderr.trim().slice(0, 300)}`, { endpoint: "graphql" });
       }
       if (outcome.kind === "fatal")
@@ -1629,7 +1672,10 @@ export class GithubClient {
         }
         return outcome.data;
       }
-      // outcome.kind === "retry": pause already armed inside the lease; loop again (next acquire waits it out).
+      // outcome.kind === "retry": pause already armed inside the lease. Emit its telemetry OUTSIDE the
+      // lease — only when a retry actually follows (not the final attempt about to ThrottleExhausted) —
+      // then loop again (the next acquire waits out the armed pause).
+      if (attempt < MAX_ATTEMPTS - 1) this.emitEvent(outcome.event);
     }
     throw new ThrottleExhausted("graphql");
   }

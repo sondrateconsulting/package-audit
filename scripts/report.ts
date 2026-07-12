@@ -14,7 +14,7 @@ import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
 import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
-import { logLine } from "./log.ts";
+import { logLine, flushLogs } from "./log.ts";
 import { isPolicyExcluded, isDefaultOverride, assertRunUnitHeadSound, policyStatusOrThrow } from "./policyDisposition.ts";
 import { assertNever } from "./assertNever.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
@@ -534,7 +534,11 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     return;
   }
   const { config } = await loadConfig(argv);
-  process.stdout.write(runReport(config, rargs.runId, { html: rargs.html }).line);
+  const rendered = runReport(config, rargs.runId, { html: rargs.html });
+  // T7: runReport emits dossier events via logLine (buffered under a slow stdout consumer); drain
+  // them before the summary line so ordering holds and nothing is left buffered at exit.
+  await flushLogs();
+  process.stdout.write(rendered.line);
 }
 
 // Atomic (temp+rename) and SYNC — the old Bun.write here discarded its Promise, a latent

@@ -15,6 +15,7 @@ import { DEFAULT_TIMEOUTS } from "./config.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import { AuditDb } from "./db.ts";
 import { compileRepositoryPolicy } from "./repositoryPolicy.ts";
+import type { NetworkEvent } from "./netEvents.ts";
 
 const NO_DENY = compileRepositoryPolicy([]); // empty denylist: filterSortCapRepos behaves as pre-feature
 
@@ -1880,6 +1881,63 @@ describe("per-category spawn deadlines (T11)", () => {
     expect(DEFAULT_TIMEOUTS.cloneSeconds * 1000).toBe(DEFAULT_CLONE_TIMEOUT_MS);
     expect(DEFAULT_TIMEOUTS.tarSeconds * 1000).toBe(DEFAULT_TAR_TIMEOUT_MS);
     expect(DEFAULT_TIMEOUTS.probeSeconds * 1000).toBe(DEFAULT_PROBE_TIMEOUT_MS);
+  });
+});
+
+describe("network event emission (T7)", () => {
+  // gh api -i wire format: status line + headers, blank line, body. The client parses this exactly
+  // as it parses real gh output, so these drive the real retry/throttle classification.
+  const wire = (status: number, headers: Record<string, string>, body = ""): string => {
+    const head = [`HTTP/2.0 ${status} X`, ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`)].join("\r\n");
+    return `${head}\r\n\r\n${body}`;
+  };
+
+  test("emits a retry{reason:no-response} on each transient no-response attempt (not the final throw)", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient(Array<SpawnResult>(6).fill(err("")), { events: (e) => events.push(e) });
+    await expect(client.restGet("rate_limit")).rejects.toThrow(/no HTTP response/);
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(5); // MAX_ATTEMPTS-1 — the final attempt throws, no retry follows
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "no-response", endpoint: "rate_limit", attempt: 0, maxAttempts: 6 });
+  });
+
+  test("emits a retry{reason:http-5xx} on a transient 5xx that then recovers", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient([ok(wire(503, {}, "")), ok(wire(200, {}, `{"ok":1}`))], { events: (e) => events.push(e) });
+    await client.restGet("rate_limit");
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "http-5xx", endpoint: "rate_limit", attempt: 0 });
+  });
+
+  test("emits a throttle{kind:primary} when a 403 primary rate-limit is hit", async () => {
+    const events: NetworkEvent[] = [];
+    const reset = String(1_000_000_000 + 60); // 60s ahead of the fake clock (1_000_000_000_000 ms)
+    const { client } = makeClient(
+      [ok(wire(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": reset }, "{}")), ok(wire(200, {}, `{"ok":1}`))],
+      { events: (e) => events.push(e) },
+    );
+    await client.restGet("rate_limit");
+    const throttles = events.filter((e) => e.kind === "throttle");
+    expect(throttles).toHaveLength(1);
+    expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "core", waitKind: "primary" });
+  });
+
+  test("emits a spawn-timeout when a child outruns its deadline", async () => {
+    const events: NetworkEvent[] = [];
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => { opts.signal?.onAbort(() => resolve({ exitCode: 137, stdout: "", stderr: "killed" })); }),
+      sleepImpl: async () => {},
+      env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP,
+      timeouts: { tarMs: 15 },
+      events: (e) => events.push(e),
+    });
+    await client.tar(["--version"]); // times out at 15ms
+    const st = events.filter((e) => e.kind === "spawn-timeout");
+    expect(st.length).toBeGreaterThanOrEqual(1);
+    expect(st[0]).toMatchObject({ kind: "spawn-timeout", bin: BINS.tar, ms: 15 });
   });
 });
 

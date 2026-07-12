@@ -15,7 +15,7 @@ import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
 import { ArtifactBundle, XRAY_DIR_NAME } from "./artifactWrite.ts";
 import { toCsv, type CsvCell } from "./csvWrite.ts";
 import { parseSemver } from "./semver.ts";
-import { logLine } from "./log.ts";
+import { logLine, flushLogs } from "./log.ts";
 import { assertRunUnitHeadSound } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -515,7 +515,11 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     return;
   }
   const { config } = await loadConfig(argv);
-  process.stdout.write(runExport(config, { runId: eargs.runId, raw: eargs.raw }).line);
+  const rendered = runExport(config, { runId: eargs.runId, raw: eargs.raw });
+  // T7: runExport emits per-artifact events via logLine (buffered under a slow stdout consumer);
+  // drain them before the summary line so ordering holds and nothing is left buffered at exit.
+  await flushLogs();
+  process.stdout.write(rendered.line);
 }
 
 if (import.meta.main) {
