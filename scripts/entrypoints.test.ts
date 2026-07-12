@@ -148,6 +148,9 @@ describe("orchestrate main() --plan (offline shims — the zero-write early retu
       expect(summary["owners"]).toEqual(["pkg-audit-test-org-that-cannot-exist"]);
       expect(summary["reposDiscovered"]).toBe(0);
       expect(summary["discoveryErrors"]).toBe(0);
+      // T7: plan-summary is plan mode's TERMINAL event, so it carries the reporter counters (M2)
+      expect(summary["retryTotal"]).toBe(0);
+      expect(summary["suppressed"]).toBe(0);
       // policy diagnostics are present and zero on a no-repos plan
       expect(summary["excludedByDeny"]).toBe(0);
       expect(summary["excludedByAllow"]).toBe(0);

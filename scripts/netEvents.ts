@@ -42,11 +42,16 @@ export function createNetworkReporter(opts: NetworkReporterOptions = {}): Networ
   let rateLimited = 0;
   let tokens = burst;
   let lastRefillMs = now();
+  // This reporter is RUN-SCOPED; the writer's dropped counter is process-lifetime. Snapshot it at
+  // creation so `suppressed` reports the drops SINCE this run started, not any inherited from an
+  // earlier in-process run (tests / the entrypoint harness reuse the process).
+  const baselineDropped = loggerDropped();
 
   // Global burst/refill token bucket: true = a flood candidate (retry/throttle) may emit now.
   const takeToken = (): boolean => {
     const t = now();
-    tokens = Math.min(burst, tokens + ((t - lastRefillMs) / 1000) * refillPerSec);
+    // clamp the elapsed delta at 0 so a backward wall-clock correction (NTP) can never DRAIN tokens.
+    tokens = Math.min(burst, tokens + (Math.max(0, t - lastRefillMs) / 1000) * refillPerSec);
     lastRefillMs = t;
     if (tokens >= 1) {
       tokens -= 1;
@@ -80,7 +85,7 @@ export function createNetworkReporter(opts: NetworkReporterOptions = {}): Networ
       }
     },
     counters(): { retryTotal: number; suppressed: number } {
-      return { retryTotal, suppressed: rateLimited + loggerDropped() };
+      return { retryTotal, suppressed: rateLimited + (loggerDropped() - baselineDropped) };
     },
   };
 }

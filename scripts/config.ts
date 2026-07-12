@@ -387,7 +387,9 @@ function normalizeTimeouts(o: Record<string, unknown>): Timeouts {
   rejectUnknownKeys(raw, CONFIG_TIMEOUTS_KEYS, "$.timeouts");
   const read = (k: keyof Timeouts): number => {
     const v = raw[k];
-    if (v === undefined || v === null) return DEFAULT_TIMEOUTS[k];
+    // OMIT a field for its default; a present field must be a positive integer (the schema declares
+    // each field `integer`, so per-field null is rejected — only the whole `timeouts` may be null).
+    if (v === undefined) return DEFAULT_TIMEOUTS[k];
     if (!isPosInt(v)) fail(`timeouts.${k} must be a positive integer (seconds)`);
     return v as number;
   };

@@ -98,6 +98,10 @@ describe("timeouts (T11) — defaults, per-field override, validation, hash excl
     expect(() => norm({ ...baseRaw(), timeouts: { tarSeconds: 1.5 } })).toThrow(/timeouts\.tarSeconds must be a positive integer/);
     expect(() => norm({ ...baseRaw(), timeouts: 5 })).toThrow(/timeouts must be an object/);
   });
+  test("the whole timeouts object may be null (= all defaults), but a per-field null is rejected", () => {
+    expect(norm({ ...baseRaw(), timeouts: null }).timeouts).toEqual(DEFAULT_TIMEOUTS); // whole-object null OK
+    expect(() => norm({ ...baseRaw(), timeouts: { probeSeconds: null } })).toThrow(/timeouts\.probeSeconds must be a positive integer/); // per-field null rejected (schema says integer)
+  });
   test("an unknown timeouts key is rejected with a did-you-mean hint", () => {
     expect(() => norm({ ...baseRaw(), timeouts: { probeSecond: 5 } }))
       .toThrow(/unknown config key \$\.timeouts\.probeSecond — did you mean "probeSeconds"\?/);

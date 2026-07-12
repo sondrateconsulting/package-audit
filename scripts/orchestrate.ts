@@ -74,6 +74,9 @@ export class RunProgress {
   ) {}
   phase(p: string): void {
     this.heartbeat?.setPhase(p);
+    // a new phase means no specific unit is in flight — clear the stale target so a heartbeat during
+    // reconciliation/report doesn't keep naming the last-scanned branch as "current".
+    this.heartbeat?.setTarget(null);
     logLine({ event: "phase", phase: p });
   }
   startUnit(org: string, repo: string, branch: string, commit: string): void {
@@ -199,7 +202,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     if (args.plan) {
       heartbeat.setPhase("plan");
       const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories, timeouts, events: (e) => reporter.emit(e) });
-      await runPlan(planClient, runtime, preflight.githubLogin);
+      await runPlan(planClient, runtime, preflight.githubLogin, reporter);
       return;
     }
 
@@ -1053,7 +1056,13 @@ export interface PlanTotals {
   readonly defaultBranchPolicyOverrides: number;
   readonly discoveryErrors: number;
 }
-export async function runPlan(client: GithubClient, runtime: AuditRuntime, personalLogin: string): Promise<PlanTotals> {
+export async function runPlan(
+  client: GithubClient, runtime: AuditRuntime, personalLogin: string,
+  // T7: plan-summary is plan mode's TERMINAL event (there is no `done`), so it carries the reporter's
+  // retryTotal/suppressed — a short plan that retried and finished before any heartbeat would
+  // otherwise lose the accounting. Optional (defaults to a fresh reporter → zeros) for direct tests.
+  reporter: NetworkReporter = createNetworkReporter(),
+): Promise<PlanTotals> {
   const { config, branchPolicy, repositoryPolicy } = runtime;
   // Warning parity: the empty-allowlist warning is emitted at mode entry, unconditionally, exactly as in
   // runScan — so --plan and the real run produce identical policy-warning events for the same config.
@@ -1135,7 +1144,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   const warnings = emitPolicyWarnings(branchPolicy, coverages);
 
   const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, repositoriesExcluded, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, excludedByDeny, excludedByAllow, defaultBranchPolicyOverrides, discoveryErrors };
-  logLine({ event: "plan-summary", ...totals });
+  logLine({ event: "plan-summary", ...totals, ...reporter.counters() });
   process.stderr.write(planSummaryText(config, totals, warnings));
   return totals;
 }

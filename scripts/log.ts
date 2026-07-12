@@ -38,6 +38,7 @@ export interface LogSink {
   write(line: string): boolean; // false = backpressure (queue behind me until onDrain fires)
   onDrain(cb: () => void): void; // one-shot: fires when the sink can accept more
   isClosed?(): boolean; // the channel is gone (EPIPE) — no drain will ever come; abandon the buffer
+  onClose?(cb: () => void): void; // register a callback the sink fires when the channel dies async
 }
 
 const DEFAULT_MAX_BUFFERED_LINES = 10_000;
@@ -47,16 +48,27 @@ class BufferedWriter {
   private paused = false; // the sink returned false; we are waiting for a drain
   private drainArmed = false;
   private dropped = 0;
-  private waiters: Array<() => void> = []; // flushLogs() promises awaiting an empty buffer
+  private waiters: Array<() => void> = []; // flushLogs() promises awaiting a fully-flushed channel
 
   constructor(
     private readonly sink: LogSink,
     private readonly maxBuffered: number = DEFAULT_MAX_BUFFERED_LINES,
-  ) {}
+  ) {
+    // Wake this writer if the channel dies asynchronously (no 'drain' ever follows a broken pipe),
+    // so a flushLogs() awaiting a paused/buffered writer resolves instead of hanging forever.
+    this.sink.onClose?.(() => this.onClosed());
+  }
+
+  private get closed(): boolean {
+    return this.sink.isClosed?.() === true;
+  }
 
   write(line: string, droppable: boolean): void {
-    // Preserve ordering: anything already buffered (or a paused sink) means this line queues behind
-    // it. Only a clear channel (not paused AND nothing buffered) writes straight through.
+    // A dead channel (EPIPE) can deliver nothing — no-op, so a run that keeps logging after the pipe
+    // died neither grows memory unboundedly nor pretends to buffer for a delivery that can't happen.
+    if (this.closed) return;
+    // Preserve ordering: anything already buffered (or a paused sink) queues this line behind it.
+    // Only a clear channel (not paused AND nothing buffered) writes straight through.
     if (!this.paused && this.buffer.length === 0) this.pushToSink(line);
     else this.enqueue(line, droppable);
   }
@@ -70,13 +82,13 @@ class BufferedWriter {
 
   private enqueue(line: string, droppable: boolean): void {
     if (this.buffer.length >= this.maxBuffered) {
-      // shed the OLDEST droppable telemetry to stay bounded; keep lifecycle events + ordering.
+      // Strict memory bound. Shed the OLDEST droppable telemetry (retry/throttle/heartbeat) first;
+      // if the whole backlog is lifecycle events, shed the oldest of THOSE too rather than grow
+      // without limit — the SQLite DB / report is the source of truth, stdout is live telemetry.
+      // Either way count the drop so heartbeat/done `suppressed` reflects it.
       const i = this.buffer.findIndex((p) => p.droppable);
-      if (i >= 0) {
-        this.buffer.splice(i, 1);
-        this.dropped++;
-      }
-      // if nothing droppable is queued, enqueue anyway — lifecycle events are bounded in count.
+      this.buffer.splice(i >= 0 ? i : 0, 1);
+      this.dropped++;
     }
     this.buffer.push({ line, droppable });
   }
@@ -92,26 +104,41 @@ class BufferedWriter {
   }
 
   private flushBuffer(): void {
-    // If the channel died (EPIPE) while we were paused, no 'drain' will ever come — abandon the
-    // buffered lines rather than wait forever, so flushLogs() at finalize resolves instead of hanging.
-    if (this.sink.isClosed?.()) {
+    // The channel died while we were paused, so no 'drain' will ever come — abandon the buffered
+    // lines (undeliverable) AND un-latch `paused` so subsequent writes take the no-op fast path
+    // instead of re-buffering. flushLogs() then resolves instead of hanging.
+    if (this.closed) {
       this.buffer.length = 0;
+      this.paused = false;
       this.resolveWaiters();
       return;
     }
     while (!this.paused && this.buffer.length > 0) {
       this.pushToSink(this.buffer.shift()!.line);
     }
-    if (this.buffer.length === 0) this.resolveWaiters();
+    // A flush is complete only when the buffer is empty AND the sink is accepting again — a paused
+    // sink still holds our last written line in ITS own buffer, so we are not yet fully flushed.
+    if (!this.paused && this.buffer.length === 0) this.resolveWaiters();
   }
 
-  // Resolve when the buffer has drained. A clear/empty channel resolves immediately; a paused one
-  // resolves once 'drain' flushes the queue. REUSABLE — never permanently closes the writer, so an
-  // in-process caller that runs a second time keeps logging.
+  // Called by the sink owner when the channel dies ASYNCHRONOUSLY (an 'error' event with no drain to
+  // follow) so a flushLogs() already awaiting a paused/buffered writer resolves instead of hanging.
+  onClosed(): void {
+    this.flushBuffer();
+  }
+
+  // Resolve when the buffer is drained AND the sink is accepting again. A clear channel resolves at
+  // once; a paused/buffered one resolves on the next drain; a dead one resolves immediately (nothing
+  // to deliver). REUSABLE — never permanently closes the writer.
   flush(): Promise<void> {
     this.flushBuffer();
-    if (this.buffer.length === 0) return Promise.resolve();
+    if (this.closed || (!this.paused && this.buffer.length === 0)) return Promise.resolve();
     return new Promise<void>((resolve) => this.waiters.push(resolve));
+  }
+
+  // Swapping the sink (setLogSink/resetLogSink) must not strand a pending flush on the abandoned writer.
+  dispose(): void {
+    this.resolveWaiters();
   }
 
   private resolveWaiters(): void {
@@ -133,9 +160,9 @@ function isEpipe(e: unknown): boolean {
 // surfaces as an 'error' event OR a synchronous throw depending on platform; either way we flip to
 // a no-op that reports "accepted" so a closed consumer degrades logging instead of crashing the run.
 let stdoutClosed = false;
-process.stdout.on("error", (e: unknown) => {
-  if (isEpipe(e)) stdoutClosed = true;
-});
+// The current writer's wake callback (registered via onClose). Only one writer is active at a time,
+// so the latest registration wins — no listener leak across setLogSink/resetLogSink.
+let stdoutCloseCb: (() => void) | null = null;
 const DEFAULT_SINK: LogSink = {
   write: (line) => {
     if (stdoutClosed) return true;
@@ -153,16 +180,29 @@ const DEFAULT_SINK: LogSink = {
     process.stdout.once("drain", cb);
   },
   isClosed: () => stdoutClosed,
+  onClose: (cb) => {
+    stdoutCloseCb = cb;
+  },
 };
+
+// ANY stdout error (EPIPE from `… | head`, or otherwise) means the channel is unusable: mark it
+// closed AND wake the writer so a flushLogs() awaiting a paused/buffered writer resolves instead of
+// hanging forever (a broken pipe never emits 'drain'). Non-EPIPE errors degrade the same way.
+process.stdout.on("error", () => {
+  stdoutClosed = true;
+  stdoutCloseCb?.();
+});
 
 let writer = new BufferedWriter(DEFAULT_SINK);
 
-// Test seam: swap in a controllable sink (and an optional small buffer bound so the drop-droppable
-// path is cheap to exercise). resetLogSink restores the process.stdout sink.
+// Test seam: swap in a controllable sink (and an optional small buffer bound so the drop path is
+// cheap to exercise). Both dispose the outgoing writer so a pending flush is never stranded.
 export function setLogSink(sink: LogSink, maxBuffered?: number): void {
+  writer.dispose();
   writer = new BufferedWriter(sink, maxBuffered);
 }
 export function resetLogSink(): void {
+  writer.dispose();
   stdoutClosed = false; // restore a clean default channel (also clears a test-induced EPIPE)
   writer = new BufferedWriter(DEFAULT_SINK);
 }

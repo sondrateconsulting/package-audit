@@ -558,7 +558,10 @@ function mkdirCanonical(outputDir: string): void {
 }
 
 if (import.meta.main) {
-  main().catch((e) => {
+  main().catch(async (e) => {
+    // T7: drain any buffered dossier events before the hard exit, so a throw AFTER some events were
+    // emitted doesn't discard them (process.exit skips the natural stdout flush).
+    await flushLogs();
     process.stderr.write(renderFatal(e, { command: "report", usage: REPORT_USAGE }));
     process.exit(1);
   });

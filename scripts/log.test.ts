@@ -112,6 +112,7 @@ function fakeSink() {
   let accept = true;
   let closed = false;
   let drainCb: (() => void) | null = null;
+  let closeCb: (() => void) | null = null;
   const sink: LogSink = {
     write: (line) => {
       if (closed) return true;
@@ -122,6 +123,9 @@ function fakeSink() {
       drainCb = cb;
     },
     isClosed: () => closed,
+    onClose: (cb) => {
+      closeCb = cb;
+    },
   };
   return {
     sink,
@@ -137,6 +141,7 @@ function fakeSink() {
     },
     close: () => {
       closed = true;
+      closeCb?.(); // mimic the sink firing its async close notification (the real 'error' handler)
     },
   };
 }
@@ -228,6 +233,88 @@ describe("stdout backpressure writer (T7)", () => {
       f.close(); // the consumer went away
       await flushLogs(); // must resolve by abandoning the buffer, not wait forever
       expect(f.received.map(evName)).toEqual(["a", "b"]); // c was abandoned, but we didn't hang
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("over the bound with NO droppable lines, sheds the OLDEST lifecycle line (strict memory bound)", () => {
+    const f = fakeSink();
+    setLogSink(f.sink, 2); // tiny buffer bound
+    const before = loggerStats().dropped;
+    try {
+      logLine({ event: "a" }); // straight through
+      f.pause();
+      logLine({ event: "b" }); // sink, pause
+      logLine({ event: "u1" }); // buffer [u1] — all non-droppable lifecycle events
+      logLine({ event: "u2" }); // buffer [u1,u2]
+      logLine({ event: "u3" }); // buffer full → shed OLDEST (u1) → [u2,u3]
+      expect(loggerStats().dropped).toBe(before + 1);
+      f.resume();
+      const events = f.received.map(evName);
+      expect(events).not.toContain("u1"); // oldest lifecycle line shed to stay bounded
+      expect(events).toContain("u2");
+      expect(events).toContain("u3");
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("after the pipe dies while paused, further writes are no-ops (bounded, not buffered-then-discarded)", async () => {
+    const f = fakeSink();
+    setLogSink(f.sink, 5);
+    try {
+      logLine({ event: "a" });
+      f.pause();
+      logLine({ event: "b" }); // reaches sink, pauses
+      f.close(); // pipe dies WHILE paused (no drain will ever come)
+      for (let i = 0; i < 200; i++) logLine({ event: "unit", n: i }); // must NOT accumulate a backlog
+      await flushLogs(); // resolves (does not hang), nothing left to lose
+      expect(f.received.map(evName)).toEqual(["a", "b"]); // a dead pipe delivers nothing further
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("flushLogs waits for a paused sink to drain even when the buffer is empty (terminal line not lost)", async () => {
+    const f = fakeSink();
+    setLogSink(f.sink);
+    try {
+      logLine({ event: "a" });
+      f.pause();
+      logLine({ event: "done" }); // reaches the sink, returns false → paused, buffer EMPTY
+      let resolved = false;
+      const p = flushLogs().then(() => {
+        resolved = true;
+      });
+      await Promise.resolve();
+      expect(resolved).toBe(false); // must NOT resolve while the sink is still backpressured
+      f.resume(); // drain
+      await p;
+      expect(resolved).toBe(true);
+      expect(f.received.map(evName)).toEqual(["a", "done"]);
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("an ASYNC channel death wakes a flushLogs() already awaiting a paused/buffered writer", async () => {
+    const f = fakeSink();
+    setLogSink(f.sink);
+    try {
+      logLine({ event: "a" });
+      f.pause();
+      logLine({ event: "b" }); // sink, pause
+      logLine({ event: "c" }); // buffered
+      let resolved = false;
+      const p = flushLogs().then(() => {
+        resolved = true;
+      });
+      await Promise.resolve();
+      expect(resolved).toBe(false); // waiting on the paused/buffered writer
+      f.close(); // async death fires the sink's onClose → wakes the writer (no drain will come)
+      await p; // must resolve, not hang
+      expect(resolved).toBe(true);
     } finally {
       resetLogSink();
     }

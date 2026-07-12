@@ -71,4 +71,12 @@ describe("network reporter flood control + counters (T7)", () => {
     h.setLoggerDropped(4); // the writer shed 4 droppable lines under backpressure
     expect(h.reporter.counters().suppressed).toBe(1 + 4);
   });
+
+  test("suppressed is RUN-SCOPED: writer drops that predate the reporter aren't counted (in-process reuse)", () => {
+    let dropped = 5; // an earlier in-process run already dropped 5 lines
+    const reporter = createNetworkReporter({ nowMs: () => 0, emit: () => {}, loggerDropped: () => dropped });
+    expect(reporter.counters().suppressed).toBe(0); // 5 predate this reporter → excluded
+    dropped = 8; // 3 new drops during THIS run
+    expect(reporter.counters().suppressed).toBe(3); // delta only
+  });
 });

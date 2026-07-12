@@ -661,11 +661,13 @@ describe("RunProgress (T8: phase/unit-start events + heartbeat plumbing)", () =>
     return { controller, calls };
   }
 
-  test("phase emits a `phase` event AND updates the heartbeat", async () => {
+  test("phase emits a `phase` event, sets the heartbeat phase, AND clears the stale target", async () => {
     const hb = fakeHeartbeat();
     const events = await captureJsonl(async () => new RunProgress(hb.controller, false).phase("scan"));
     expect(events).toContainEqual({ event: "phase", phase: "scan" });
-    expect(hb.calls).toEqual(["phase:scan"]);
+    // a new phase means no unit is in flight — the target is cleared so heartbeats don't name a
+    // stale "current" branch during reconciliation/report.
+    expect(hb.calls).toEqual(["phase:scan", "target:null"]);
   });
 
   test("startUnit emits a unit action:start AND points the heartbeat at the target", async () => {
