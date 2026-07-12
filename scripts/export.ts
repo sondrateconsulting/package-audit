@@ -1,7 +1,7 @@
 // export.ts — deterministic, run-scoped snapshot exports of the four audit tables as CSV +
 // JSONL under <outputDir>/xray/, written through the manifest-managed ArtifactBundle. Entry:
 //   bun run scripts/export.ts [--config <path>] [--run-id <id>] [--raw] [--help]
-// The DEFAULT export is a RUN-SCOPED SNAPSHOT: findings join through the IMMUTABLE
+// The DEFAULT export is a RUN-SCOPED SNAPSHOT: findings join through the per-run
 // run_unit_head snapshot (never findings.run_id — a later run's upsert moves that column) and
 // filter to the run's tracked_packages, exactly like report.ts. `--raw` is the forensic
 // escape hatch: full tables, every row. Column order and row order per table are
@@ -31,7 +31,7 @@ Flags:
   --config <path>     Config file to load (for sqlitePath/outputDir). Config path precedence: --config <path> > CONFIG_PATH env > ./config.json
   --run-id <id>       Export that run's snapshot instead of the default (the latest
                       completed reportable run).
-  --raw               Forensic FULL-TABLE dump: every row verbatim, including completion
+  --raw               Forensic FULL-TABLE dump: every row, including completion
                       markers and rows from other runs/configs; artifacts are prefixed
                       raw-. The default run-scoped export is the supported contract.
   --help, -h          Show this help and exit.
@@ -261,7 +261,7 @@ function collectSnapshots(db: AuditDbReader, run: RunRecord, raw: boolean): read
 // DEFAULT scope — the load-bearing decision, inherited from report.ts VERBATIM: findings join
 // through run_unit_head (run_id = selected run, status='scanned', matching unit columns) and
 // filter to the run's tracked_packages. NEVER filter by findings.run_id: upserts move run_id
-// to the latest writer, but the head snapshot is immutable per run.
+// to the latest writer, but the head snapshot is per-run (stable once the run completes).
 function collectRunScoped(db: AuditDbReader, run: RunRecord): ExportSnapshot[] {
   const tracked = JSON.stringify(run.trackedPackages);
 

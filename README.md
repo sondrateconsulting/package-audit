@@ -184,7 +184,7 @@ They validate the same premise — that usage-level truth matters more than mani
 
 ### Does it trace function calls?
 
-No. It records import/require/re-export/CLI usage sites — import-level granularity, attributed to a specific export when the syntax names one (namespace, side-effect, and whole-module usage are recorded at package level). It does not build a call graph, so it can't tell you whether an imported function is invoked on a hot path or merely imported. Call-graph analysis is on the roadmap.
+No. It records import/require/re-export/CLI usage sites — import-level granularity, attributed to a specific export when the syntax names one (namespace, side-effect, re-export, and whole-module usage are recorded at package level). It does not build a call graph, so it can't tell you whether an imported function is invoked on a hot path or merely imported. Call-graph analysis is on the roadmap.
 
 ## Contributing
 

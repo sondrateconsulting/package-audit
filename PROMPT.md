@@ -480,7 +480,7 @@ Resumability rules:
   shared rows; without the filter, run R's report would leak the other config's packages.
   Because the snapshot is per-run and immutable,
   `report --run-id <id>` reconstructs "the state of the world as of that run" exactly — its
-  per-unit head selection is immutable, though a later same-commit rescan can still refresh the
+  per-unit head selection is stable once the run completes, though a later same-commit rescan can still refresh the
   selected findings' mutable fields — even after a later same-config run advances the head, and even across a config change
   (the snapshot disambiguates the multiple work_queue rows a branch can have across
   config_hashes). Default `report` uses the latest `status='completed'` live run's snapshot

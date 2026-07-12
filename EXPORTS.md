@@ -11,8 +11,8 @@ below are parsed by `scripts/exportsDoc.test.ts` and compared to the column regi
 The default export is the **selected run's view of the world** — the same semantics as the
 JSON report:
 
-- Finding rows (`dependency_findings`, `usage_findings`) are joined through the run's
-  immutable `run_unit_head` snapshot (`status='scanned'`, matching
+- Finding rows (`dependency_findings`, `usage_findings`) are joined through the run's own
+  `run_unit_head` snapshot (`status='scanned'`, matching
   organization/repository/branch/commit_sha) and filtered to the run's tracked packages.
   Rows are **never** selected by `findings.run_id` — that column is last-writer bookkeeping,
   not run ownership.

@@ -145,7 +145,8 @@ export interface BundleResult {
 // Artifact names are restricted to a flat ASCII grammar. This kills the entire
 // filesystem-aliasing class at the root: no Unicode normalization games (HFS+ re-spells NFC as
 // NFD in readdir), no exotic case-folding aliases (U+017F ſ folds to s on folding filesystems)
-// — every legal name round-trips readdir byte-identically everywhere. All real producers fit:
+// — every legal name is free of those Unicode-normalization and case-folding rewrites (plain ASCII
+// case-aliasing on case-insensitive filesystems is a separate axis the sweep handles). All real producers fit:
 // npm package names are URL-safe ASCII (scoped names sanitize '/' to '__' upstream), export
 // files and index.html are fixed ASCII.
 const NAME_GRAMMAR = /^[A-Za-z0-9@._~-]+$/;
