@@ -678,8 +678,9 @@ export class AuditDb {
           `database schema version ${userVersion} is older than this tool's ${SCHEMA_VERSION} — ` +
             "run `bun run audit` once to migrate it, then retry",
         );
-      // Schema sanity up front: a partial/foreign v3-stamped file must fail HERE with an
-      // actionable message, not later with a raw "no such table" mid-query.
+      // Schema sanity up front: a foreign file, or one missing an audit table or the v3
+      // is_default_branch column, must fail HERE with an actionable message, not later with a
+      // raw "no such table" (or "no such column") mid-query.
       for (const t of AUDIT_TABLES) {
         if (!tableExists(db, t))
           fail(`database is missing the ${t} table — run \`bun run audit\` once to repair it, then retry`);

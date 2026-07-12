@@ -26,7 +26,7 @@ Run selection: `--run-id <id>`, or the latest completed reportable run by defaul
 
 ## `--raw`: the forensic escape hatch
 
-`--raw` dumps the **full tables verbatim** — including introspection marker rows, rows from
+`--raw` dumps **every row of the four tables** — including introspection marker rows, rows from
 other runs and other configs, and rows superseded by later scans. Filenames gain a `raw-`
 prefix and the export emits a loud `warning` JSONL event. Raw dumps are for forensics; the
 run-scoped default is the supported contract. **Stale data warning:** raw rows may span
@@ -106,8 +106,8 @@ is an (organization, repository, branch, commit) the run scanned.
 Row order: `organization, repository, branch, commit_sha, package_name, dependency_key, dependency_type, manifest_path`
 
 Notes: `run_id` is the last run that (re)wrote the row — provenance, not ownership.
-`resolved_version_source` is `lockfile` or `range-resolved`; both may be null when no
-resolution was possible. `lockfile_lines` is a JSON array serialized as text.
+`resolved_version_source` is `lockfile` or `range-resolved`; it and `resolved_version` may both
+be null when no resolution was possible. `lockfile_lines` is a JSON array serialized as text.
 
 ## usage_findings
 

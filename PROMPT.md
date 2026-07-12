@@ -93,7 +93,7 @@ below).
                                        //   scanned repo's .npmrc
     }
   ],
-  "cutoffDate": "2024-01-01",          // ISO date; ignore branches with no commits since this
+  "cutoffDate": "2024-01-01",          // ISO date; ignore non-default branches with no commits since this
   "maxBranchesPerRepo": 25,
   "maxReposPerOrg": null,              // null = unlimited
   "includeArchived": false,
@@ -211,7 +211,7 @@ they are intentionally rebuilt EMPTY (their rows are non-reportable and regenera
 forced rescan), so the copy-before-drop rule does not apply to them.
 Schema evolution: track the schema version with `PRAGMA user_version`, migrated as a
 VERSION-STEPPED CHAIN — each step is ONE transaction that stamps its OWN target version
-(never the tool's current version), so a crash between steps leaves a valid intermediate
+(never the mutable SCHEMA_VERSION constant), so a crash between steps leaves a valid intermediate
 database the next open resumes from. Current chain: the LEGACY step below (quarantined to
 `user_version < 2` — its run-scoped reset is sound ONLY for pre-v2 databases and would
 destroy reportable data on any later version; it stamps exactly 2), then the additive
@@ -460,7 +460,7 @@ Resumability rules:
   non-default heads are kept; the repo's DEFAULT branch is always processed, §5.B) — is
   neither re-evaluated nor re-scanned this run; it simply retains its
   prior `done` state and historical findings/snapshot — this is intended, not an error (its
-  usage is genuinely stale), and it just isn't refreshed into new runs. A still-live branch
+  usage is genuinely stale), and it just isn't refreshed into new runs. A still-live non-default branch
   whose head fell BEFORE `cutoffDate` is DIFFERENT: §5.B DOES surface it and records it THIS
   run as `skipped-cutoff` in `run_unit_head` (commit_sha=''), so it stays per-run
   reproducible (§7's `branchesSkippedByCutoff`) — it is NOT left in this retain-prior-state
@@ -536,7 +536,7 @@ Resumability rules:
   any lock-taking statement), NO journal_mode pragma, NO DDL, NO migration, no directory
   creation. A database whose `user_version` is older than the tool refuses with an
   actionable "run `bun run audit` once to migrate" error (reads never migrate); newer
-  refuses with "upgrade the tool"; missing tables/columns are detected up front. Note a
+  refuses with "upgrade the tool"; missing tables and the v3 is_default_branch column are detected up front. Note a
   readonly WAL open may still create `-wal`/`-shm` sidecars beside the (path-contained)
   database file — the seam is no-DDL/no-write, not literally zero-filesystem-effect.
 
@@ -1246,7 +1246,7 @@ Acceptance checklist — the run is NOT complete until all are true:
 [ ] Every in-repo usage is attributed to a specific named export where one exists;
     usage types with no single binding (side-effect-import, reexport, namespace-import,
     an unresolved/private subpath) and CLI usage correctly carry export_name=''.
-[ ] Branches processed most-recent-first; none before cutoffDate inspected.
+[ ] Branches processed most-recent-first; no non-default branch before cutoffDate inspected.
 [ ] SQLite is the source of truth. A second run still performs the cheap discovery
     calls needed to detect change (paginated-REST repo discovery, per-repo branch-head
     GraphQL), but performs

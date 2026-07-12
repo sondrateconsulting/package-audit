@@ -1,4 +1,4 @@
-// cliErrors.ts — shared fatal-error rendering for the two entrypoints (§8). KNOWN operator-facing
+// cliErrors.ts — shared fatal-error rendering for the CLI entrypoints (§8). KNOWN operator-facing
 // failures (bad flags, invalid config, failed preflight, exhausted throttles, guard violations, …)
 // print their message WITHOUT a stack trace — a stack makes an expected condition read as a
 // crash. Most of these messages carry their remediation directly (auth/SSO/config/preflight/
@@ -23,7 +23,7 @@ export const KNOWN_OPERATOR_ERRORS: ReadonlySet<string> = new Set([
   "ReadOnlyViolation", // readOnlyGuard.ts (§0/§6)
   "ArtifactWriteError", // artifactWrite.ts (operator-facing ONLY: artifact-name collisions —
   //                       config-triggerable when two tracked packages sanitize/alias to one
-  //                       dossier filename — and a symlinked xray/ dir; lifecycle bugs there
+  //                       dossier filename — and a non-real xray/ dir (symlink or non-directory); lifecycle bugs there
   //                       are plain Errors and keep their stacks)
 ]);
 

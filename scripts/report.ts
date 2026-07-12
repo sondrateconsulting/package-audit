@@ -1,7 +1,7 @@
 // report.ts — §7 consolidated report, generated DETERMINISTICALLY from SQLite ALONE. Entry point:
-//   bun run scripts/report.ts [--config <path>] [--run-id <id>]
+//   bun run scripts/report.ts [--config <path>] [--run-id <id>] [--html]
 // Default (no --run-id): the latest COMPLETED run with non-empty tracked_packages; also overwrites
-// <outputDir>/latest.json. A --run-id writes ONLY <outputDir>/run-<id>.json (never latest.json).
+// <outputDir>/latest.json. A --run-id writes its JSON report ONLY to <outputDir>/run-<id>.json (never latest.json).
 // Findings are joined through the IMMUTABLE run_unit_head snapshot (never findings.run_id) filtered
 // to runs.tracked_packages, and EVERY emitted array has a total, stable sort key so the output is
 // byte-reproducible.
@@ -290,8 +290,9 @@ export function buildNotReportableNotice(runIdArg: string | null, missingDbPath?
 // `report --html` (T3-T6): render one self-contained dossier per tracked package plus the
 // index, through the ArtifactBundle (kind "dossier" — export artifacts of the SAME run are
 // adopted, never swept). One JSONL event per dossier (T7), with the observations fallback
-// VISIBLE (observations: "emitted"|"omitted"), then a dossier-summary event. Pure function of
-// the report object; the caller already holds it, so no re-query can disagree with run-<id>.json.
+// VISIBLE (observations: "emitted"|"omitted"), then a dossier-summary event. The rendered
+// dossier/index bytes are a pure function of the report object; the caller already holds it, so
+// no re-query can disagree with run-<id>.json.
 export function emitDossiers(report: EmittedReport, outputDir: string): { dossiers: number; swept: string[] } {
   const ctx: DossierContext = {
     runId: report.runId,

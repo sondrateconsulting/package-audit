@@ -4,7 +4,7 @@
 // The DEFAULT export is a RUN-SCOPED SNAPSHOT: findings join through the IMMUTABLE
 // run_unit_head snapshot (never findings.run_id — a later run's upsert moves that column) and
 // filter to the run's tracked_packages, exactly like report.ts. `--raw` is the forensic
-// escape hatch: full tables, every row verbatim. Column order and row order per table are
+// escape hatch: full tables, every row. Column order and row order per table are
 // pinned by the EXPORT REGISTRY below (the EXPORTS.md contract), so output is
 // byte-reproducible: no wall clock, env, or locale anywhere in the emit path.
 
@@ -40,7 +40,7 @@ Writes <table>.csv + <table>.jsonl for dependency_findings, package_api_surface,
 usage_findings into <outputDir>/xray/ through the manifest-managed artifact bundle; column
 order and row order per table are pinned by the export column registry (EXPORTS.md).`;
 
-// ---- argument parsing (local by design: args.ts stays untouched; same strict grammar) ----------
+// ---- argument parsing (local by design: the parser stays local, reusing args.ts run-id validation; same strict grammar) ----------
 export interface ExportArgs {
   readonly configPath: string | null; // explicit --config; null → resolve via env/default in config.ts
   readonly runId: string | null; // --run-id <id>; null → latest completed reportable run

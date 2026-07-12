@@ -4,8 +4,8 @@
 // Validation runs in TESTS (report.test.ts), never in the emit path — a schema bug must not be
 // able to fail a completed scan's report write (§7 determinism).
 //
-// DEPENDENCY JUSTIFICATION (§6 — minimize deps): zod is the repo's second npm package — a
-// devDependency, test-only (`typescript`, used for .d.ts AST parsing, is the sole runtime dep).
+// DEPENDENCY JUSTIFICATION (§6 — minimize deps): zod is one of the repo's two devDependencies
+// (with `@types/bun`) — test-only (`typescript`, used for .d.ts AST parsing, is the sole runtime dep).
 // Justification: a schema-as-docs contract for the report consumed by downstream tooling, with
 // validation errors that name the failing path — hand-rolling that (or maintaining prose docs
 // against a moving shape) is strictly worse. zod v4 is dependency-free and pinned exactly.

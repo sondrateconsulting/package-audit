@@ -114,7 +114,7 @@ export interface CompareSiteEntry {
   filePath: string;
   lineNumber: number;
   context: string;
-  permalink: string; // evidence from the NEWER side for added, the OLDER side for removed
+  permalink: string; // evidence from run B for added, run A for removed
   snippet: string;
 }
 
@@ -340,7 +340,7 @@ export function buildNotComparableNotice(cause: NotComparableCause): { notCompar
     case "missing-db":
       return { notComparable: true, reason: `no database at ${cause.path} — run \`bun run audit\` first` };
     case "missing-run":
-      // An id can vanish legitimately: --fresh drops the runs table, so pre---fresh runs are gone.
+      // An id can vanish legitimately: --fresh drops the runs table, so pre-`--fresh` runs are gone.
       return {
         notComparable: true,
         reason: `run ${cause.runId} not found or pre-migration (empty tracked_packages) — note: \`--fresh\` erases run history; runs from before a --fresh cannot be compared`,

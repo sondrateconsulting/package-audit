@@ -2,9 +2,10 @@
 // Evidence snippets are third-party source code — hostile by definition — so the renderer's
 // safety argument is structural: every dynamic value passes through THIS function, and dynamic
 // values are emitted ONLY into HTML element bodies or double-quoted attribute values (never into
-// script/style/comment/URL contexts — the dossier's single inline <script> is 100% static).
-// In those two contexts, escaping the five metacharacters below is sufficient; nothing else is
-// touched, so snippets stay byte-recognizable.
+// script/style/comment contexts — the dossier's single inline <script> is 100% static — and the
+// one URL-valued attribute, href, is separately constrained by reportHtml.ts to https:// permalinks
+// or intra-page #<slug> anchors). In those two contexts, escaping the five metacharacters below is
+// sufficient; nothing else is touched, so snippets stay byte-recognizable.
 
 const ESCAPES: Readonly<Record<string, string>> = {
   "&": "&amp;", // FIRST in spirit: the regex replaces per-character, so '&' never re-escapes

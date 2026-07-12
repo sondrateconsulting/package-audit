@@ -68,7 +68,8 @@ export const mdCell = (value: string): string =>
 // destination. mdCell would backslash-escape the parens, and GFM RETAINS those backslashes INSIDE an
 // autolinked bare URL, silently pointing the link at the wrong file. Bidi controls are stripped
 // FIRST, then the stripped value must be `https://` FOLLOWED BY a real host character — not `/`, `?`,
-// `#`, whitespace, `<`/`>`, or backtick — and must contain none of those anywhere. So a hostless
+// `#`, whitespace, `<`/`>`, or backtick — and must contain no whitespace, `<`/`>`, or backtick
+// anywhere (`/`, `?`, `#` stay allowed in the path/query). So a hostless
 // `https://`, a query/fragment-only `https://?x`, or a value whose only "host" was a bidi control all
 // fall back to escaped inline TEXT and never become a link (buildPermalink emits a well-formed URL;
 // the fallback is defense-in-depth for a malformed/tampered value).

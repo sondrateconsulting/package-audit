@@ -7,7 +7,7 @@
 // ESCAPE-BY-CONSTRUCTION (the safety argument, structural): every dynamic value passes through
 // htmlEscape.ts's ONE escapeHtml, and dynamic values are emitted ONLY into (a) element bodies,
 // (b) double-quoted id="..." attributes (slug grammar, see below), and (c) double-quoted
-// href="..." attributes of exactly two shapes — evidence permalinks that VALIDATE as https://
+// href="..." attributes of exactly two shapes — evidence permalinks that START WITH https://
 // (anything else renders as plain text, never a link) and intra-page "#<slug>" anchors. The one
 // inline <script> is the STATIC_SCRIPT constant — 100% static, zero interpolation — and the CSP
 // script-src hash is computed FROM that constant at module load, so the policy can never drift
@@ -28,7 +28,7 @@ import { deriveFacts, tryEvaluateObservations, type Observation } from "./observ
 
 // ---- input types (structural mirror of the §7 report object) ---------------------------------
 // Deliberately NOT imported from report.ts/reportSchema.ts: reportSchema is test-only by source
-// scan. These interfaces name only the fields the renderer consumes — a MINIMAL contract that the
+// scan. These interfaces name a selected subset of the report's fields — a MINIMAL contract that the
 // full emitted report (a superset with cli/declarations/dateFetched) stays assignable to. report.ts
 // types EmittedReport.packages as buildPackage's output precisely so that assignability is checked
 // at compile time (the emitDossiers render calls are the check); the tests additionally feed REAL
@@ -894,7 +894,7 @@ function renderEmptyBody(pkg: DossierPackage, ctx: DossierContext): string {
 
 export interface DossierRenderResult {
   readonly html: string;
-  readonly observationsStatus: "emitted" | "omitted"; // omitted = the rule set threw (CEO addendum 8 fallback)
+  readonly observationsStatus: "emitted" | "omitted"; // omitted = fact derivation or rule evaluation threw (CEO addendum 8 fallback)
   readonly observationCount: number;
 }
 

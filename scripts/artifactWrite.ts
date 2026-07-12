@@ -2,10 +2,10 @@
 // JSON, exports, dossiers). Two guarantees, both load-bearing for the launch contract:
 //   1. ATOMIC WRITES: every artifact is written to a same-directory temp file (created
 //      exclusively — O_EXCL) and renamed into place, so a PROCESS crash mid-write can never
-//      leave a plausible truncated artifact — only an unmanifested temp, which the next
-//      generation's sweep removes. (Scope: process-crash atomicity. No fsync by design, so a
-//      power/OS failure may still lose data the OS had not flushed.)
-//   2. CONFINED SWEEP: xray/ artifacts are bundle-managed — a manifest.json ({path, sha256,
+//      leave a plausible truncated artifact — only an unmanifested temp, which (for xray/
+//      bundle artifacts) the next generation's sweep removes. (Scope: process-crash atomicity.
+//      No fsync by design, so a power/OS failure may still lose data the OS had not flushed.)
+//   2. CONFINED SWEEP: xray/ artifacts are bundle-managed — a manifest.json ({path, kind, sha256,
 //      bytes} per artifact + run id + format version) is written LAST, and stale unmanifested
 //      files are swept ONLY inside <outputDir>/xray/. The sweep never reaches the parent
 //      outputDir BY GEOMETRY: outputDir accumulates run-<id>.json history and operator files by
@@ -14,8 +14,8 @@
 //
 // Concurrency posture (deliberate, per the manifest design): one bundle generation at a time.
 // Two concurrent generations over one xray/ are NOT serialized — a torn mix is DETECTABLE
-// (manifest hash mismatch), not prevented; the README documents the single-invocation
-// expectation. Likewise the sweep guards against PRE-EXISTING symlink tricks, not an attacker
+// (manifest hash mismatch), not prevented; a single generation at a time is the operator's
+// responsibility. Likewise the sweep guards against PRE-EXISTING symlink tricks, not an attacker
 // actively racing the sweep with directory swaps — a local process with write access to the
 // operator's own output directory could simply delete files itself.
 
@@ -40,7 +40,7 @@ export class ArtifactWriteError extends Error {
 // (dossiers, index, CSV/JSONL exports) and the ONLY directory the sweep may touch.
 export const XRAY_DIR_NAME = "xray";
 
-// The report-format version embedded in the manifest (and by the artifacts themselves).
+// The report-format version embedded in the manifest (and in the HTML artifacts).
 // Bumping this is the ONE sanctioned way golden files change. (The pre-launch addition of
 // per-entry `kind` tags was deliberately absorbed into v1 — no manifest had shipped yet;
 // after launch, any manifest-shape change bumps this.)
@@ -238,7 +238,7 @@ export class ArtifactBundle {
   // Adoption input: the previous generation's manifest, IF it is coherent with this one
   // (parseable, same formatVersion, same runId). Only OTHER kinds' entries are candidates —
   // this generation is the new truth for its own kind — and an entry whose file has vanished
-  // is dropped (the manifest must describe what is actually on disk).
+  // is dropped (the manifest must not reference a file that is absent from disk).
   private adoptableEntries(runId: string): ArtifactRecord[] {
     let root: unknown;
     try {

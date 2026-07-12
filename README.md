@@ -32,16 +32,16 @@ The finished run writes `output/run-<run_id>.json` and `output/latest.json`. A l
 
 ### HTML dossier (`report --html`)
 
-`bun run report --html` additionally renders one self-contained HTML dossier per tracked package plus an `index.html` into `output/xray/`: an executive sentence, five decision cards, a usage-sorted API-surface table, a repo×export matrix, and collapsible permalinked evidence drawers — default-branch headline metrics, printable, light + dark themes, no external resources. `--run-id <id>` renders a historical run's dossiers.
+`bun run report --html` additionally renders one self-contained HTML dossier per tracked package plus an `index.html` into `output/xray/`: an executive sentence, five decision cards, a usage-sorted API-surface table, a repo×export matrix, and collapsible permalinked evidence drawers — default-branch headline metrics (labeled all-branch fallback when attribution is unknown), printable, light + dark themes, no external resources. `--run-id <id>` renders a historical run's dossiers.
 <!-- hero screenshot for the README is captured from the flagship dossier in the launch phase (P4) -->
 
 ### Data exports (`export`)
 
-`bun run export` writes run-scoped CSV + JSONL snapshots of the four findings tables (plus a `manifest.json`) into `output/xray/` — the same run-selection and snapshot semantics as the report, portable into Sheets, Excel, DuckDB, and jq. `--run-id <id>` exports a historical run; `--raw` is a loudly-labeled full-table forensic dump. The column-by-column contract is [EXPORTS.md](EXPORTS.md) (sync-tested against the writers). See [Analyze the exports](#analyze-the-exports) below.
+`bun run export` writes run-scoped CSV + JSONL snapshots of the four audit tables (plus a `manifest.json`) into `output/xray/` — the same run-selection and snapshot semantics as the report, portable into Sheets, Excel, DuckDB, and jq. `--run-id <id>` exports a historical run; `--raw` is a loudly-labeled full-table forensic dump. The column-by-column contract is [EXPORTS.md](EXPORTS.md) (sync-tested against the writers). See [Analyze the exports](#analyze-the-exports) below.
 
 ### Run comparison (`compare`)
 
-`bun run compare <runA> <runB>` prints a deterministic run-diff as one JSON line: usage sites added and removed per export, repos entering and leaving — headline counts scoped to default branches, with all-branch detail. Note: `--fresh` erases run history, so runs from before a `--fresh` cannot be compared; keep the data directory if you want trends.
+`bun run compare <runA> <runB>` prints a deterministic run-diff as one JSON line: usage sites added and removed per export, repos entering and leaving — headline counts scoped to default branches when attribution is known (otherwise all branches, with an explicit note), plus all-branch detail. Note: `--fresh` erases run history, so runs from before a `--fresh` cannot be compared; keep the data directory if you want trends.
 
 ## Prerequisites
 
@@ -163,7 +163,7 @@ The full engineering spec — every guarantee above in normative detail — is [
 
 ### Why not Sourcegraph?
 
-If you already run Sourcegraph, its code search genuinely can measure org-wide usage, it is excellent at query-time exploration — ad-hoc "who uses this?" questions are its home turf — and Code Insights can chart usage over time on persistent dashboards. The difference is the shape of the answer: this is a run-to-completion operator instrument that produces a deterministic, permalinked evidence document plus portable data exports, with no server to operate and no licensing footprint. You run it, you keep a document and a dataset; nothing has to stay up for the answer to stay useful.
+If you already run Sourcegraph, its code search genuinely can measure org-wide usage; it is excellent at query-time exploration — ad-hoc "who uses this?" questions are its home turf — and Code Insights can chart usage over time on persistent dashboards. The difference is the shape of the answer: this is a run-to-completion operator instrument that produces a deterministic, permalinked evidence document plus portable data exports, with no server to operate and no licensing footprint. You run it, you keep a document and a dataset; nothing has to stay up for the answer to stay useful.
 
 ### Isn't this what Snyk or Dependabot does?
 

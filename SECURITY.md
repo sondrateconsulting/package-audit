@@ -10,7 +10,7 @@ This project ships from a rolling `main` branch. The tip of `main` is the suppor
 
 Use whichever private channel you prefer. You're welcome to report under a pseudonym or from an anonymous address:
 
-1. **GitHub private vulnerability reporting (preferred).** Use the **"Report a vulnerability"** button on this repository's advisories page ([direct link](https://github.com/sondrateconsulting/package-audit/security/advisories/new)). It keeps the report and the whole coordination thread confidential between you and the maintainers, and gives us a structured place to develop and publish the fix. If you don't see that option, use email.
+1. **GitHub private vulnerability reporting (preferred).** This repository has GitHub's private vulnerability reporting enabled — use the **"Report a vulnerability"** button on its advisories page ([direct link](https://github.com/sondrateconsulting/package-audit/security/advisories/new)). It keeps the report and the whole coordination thread confidential between you and the maintainers, and gives us a structured place to develop and publish the fix.
 2. **Email.** Write to **securityatsondrate.0ccgx@passmail.com**. Keep proof-of-concept material to the minimum needed to demonstrate the issue, don't include live credentials or third-party data, and ask for a PGP key first if you need to send anything sensitive.
 
 (RFC 9116 defines the machine-readable `security.txt` convention for advertising a disclosure contact; this policy is the project's canonical contact until the tool has a hosted origin to serve one from.)

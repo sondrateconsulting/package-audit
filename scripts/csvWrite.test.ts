@@ -55,7 +55,7 @@ describe("csvCell — OWASP formula-injection defense (string cells only)", () =
 
   test("leading-whitespace-then-trigger is neutralized (a first-byte-only check misses it)", () => {
     // Some spreadsheet imports trim a leading space and then evaluate the formula; neutralize any
-    // cell that begins with whitespace so ` =cmd|...` cannot slip through un-prefixed.
+    // cell whose first visible char after leading whitespace is `= + - @` so ` =cmd|...` cannot slip through un-prefixed.
     expect(csvCell(" =cmd|' /C calc'!A0")).toBe("' =cmd|' /C calc'!A0");
     expect(csvCell("  -2+5")).toBe("'  -2+5");
     expect(csvCell("\t\t=1+1")).toBe("'\t\t=1+1"); // leading tabs (no CR, so no RFC quoting)

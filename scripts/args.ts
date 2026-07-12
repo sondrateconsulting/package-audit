@@ -3,7 +3,7 @@
 // input. Entrypoint grammars (§8):
 //   bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
 //                                  [--rescan-branch <org>/<repo>@<branch>]...   # repeatable
-//   bun run scripts/report.ts      [--config <path>] [--run-id <id>]
+//   bun run scripts/report.ts      [--config <path>] [--run-id <id>] [--html]
 // `--help`/`-h` on either entrypoint wins over every other argument (even invalid ones), so a
 // confused operator can always reach the help text.
 
@@ -18,9 +18,9 @@ function fail(msg: string): never {
 }
 
 // Run ids are generated internally (randomUUID → hex + hyphens). A user-supplied run id (report's
-// `--run-id`, export's `--run-id`, compare's two positionals) is string-interpolated into a
-// `run-<id>.json` path template in report.ts, so validate it against a conservative grammar with no
-// path separators BEFORE it can reach a path or a query. This is defense in depth over
+// `--run-id`, export's `--run-id`, compare's two positionals) feeds a `run-<id>.json` path template
+// in report.ts (export and compare instead bind it into DB lookups), so validate it against a
+// conservative grammar with no path separators BEFORE it can reach a path or a query. This is defense in depth over
 // writeFileAtomic's §0 containment: a value like `../../xray/manifest` is rejected here outright.
 const RUN_ID_GRAMMAR = /^[A-Za-z0-9._-]+$/;
 export function assertRunId(value: string): string {

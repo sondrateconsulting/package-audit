@@ -52,7 +52,7 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
     // A NEW operator-facing error class must either join the registry (clean message, no stack)
     // or this exclusion list (deliberate decision, with the stack-dump consequence on record).
     // Naming constraint the regex relies on: error base classes must be named `Error` or `*Error`
-    // (all 11 current classes extend Error directly).
+    // (all 12 current classes extend Error directly).
     const EXCLUDED_NON_OPERATOR_ERRORS = new Set<string>([]);
     const declared = new Set<string>();
     for (const file of readdirSync(import.meta.dir)) {
