@@ -361,6 +361,26 @@ describe("stdout backpressure writer (T7)", () => {
     }
   });
 
+  test("a buffered terminal event is never evicted by later lifecycle lines (explicit invariant, for PR2 mid-run terminals)", () => {
+    const f = fakeSink();
+    setLogSink(f.sink, 2);
+    try {
+      logLine({ event: "a" }); // straight through
+      f.pause();
+      logLine({ event: "b" }); // sink, pause
+      logLine({ event: "degraded" }, { terminal: true }); // bypasses bound → buffer [degraded]
+      logLine({ event: "u1" }); // buffer [degraded, u1]
+      logLine({ event: "u2" }); // full → shed oldest NON-terminal (u1); the terminal is protected
+      f.resume();
+      const events = f.received.map(evName);
+      expect(events).toContain("degraded"); // terminal survived even though it was NOT the last line
+      expect(events).not.toContain("u1"); // oldest non-terminal shed instead
+      expect(events).toContain("u2");
+    } finally {
+      resetLogSink();
+    }
+  });
+
   test("a sink with onClose but NO isClosed still un-hangs a pending flushLogs on async close", async () => {
     const received: string[] = [];
     let accept = true;
@@ -400,6 +420,31 @@ describe("stdout backpressure writer (T7)", () => {
     expect(f1.received.map(evName)).toEqual(["a", "b"]); // "stale" was abandoned by dispose
     expect(f2.received.map(evName)).toEqual(["new"]);
     resetLogSink();
+  });
+
+  test("a sink whose write() synchronously disposes the writer does not arm a drain on the abandoned sink", () => {
+    const f2 = fakeSink();
+    let swapped = false;
+    const selfDisposing: LogSink = {
+      write: () => {
+        if (!swapped) {
+          swapped = true;
+          setLogSink(f2.sink); // synchronously dispose THIS writer mid-write, then report backpressure
+          return false;
+        }
+        return true;
+      },
+      onDrain: () => {
+        throw new Error("a disposed writer must not arm a drain on the abandoned sink");
+      },
+    };
+    setLogSink(selfDisposing);
+    try {
+      // the disposed guard in pushToSink must prevent arming a drain (onDrain throws if reached).
+      expect(() => logLine({ event: "x" })).not.toThrow();
+    } finally {
+      resetLogSink();
+    }
   });
 
   test("a synchronous EPIPE from stdout degrades logging to a no-op (never crashes the run)", () => {

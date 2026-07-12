@@ -79,4 +79,11 @@ describe("network reporter flood control + counters (T7)", () => {
     dropped = 8; // 3 new drops during THIS run
     expect(reporter.counters().suppressed).toBe(3); // delta only
   });
+
+  test("suppressed counts current drops when the writer was reset below the baseline (no drops lost)", () => {
+    let dropped = 5; // baseline captured at 5
+    const reporter = createNetworkReporter({ nowMs: () => 0, emit: () => {}, loggerDropped: () => dropped });
+    dropped = 3; // the writer was reset (below baseline) and has since dropped 3
+    expect(reporter.counters().suppressed).toBe(3); // count the current absolute drops, not clamp to 0
+  });
 });

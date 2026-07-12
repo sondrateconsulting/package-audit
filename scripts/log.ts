@@ -44,7 +44,7 @@ export interface LogSink {
 const DEFAULT_MAX_BUFFERED_LINES = 10_000;
 
 class BufferedWriter {
-  private readonly buffer: Array<{ line: string; droppable: boolean }> = [];
+  private readonly buffer: Array<{ line: string; droppable: boolean; terminal: boolean }> = [];
   private paused = false; // the sink returned false; we are waiting for a drain
   private drainArmed = false;
   private dropped = 0;
@@ -79,6 +79,9 @@ class BufferedWriter {
 
   private pushToSink(line: string): void {
     if (this.sink.write(line) === false) {
+      // sink.write() could (pathologically) have swapped/disposed this writer synchronously — if so,
+      // don't arm a drain on the abandoned sink.
+      if (this.disposed) return;
       this.paused = true;
       this.armDrain();
     }
@@ -89,10 +92,10 @@ class BufferedWriter {
     // admitting them a few over the cap keeps memory bounded while guaranteeing they ship AND never
     // evict a counted line (which would leave their own inline suppressed count stale).
     if (this.buffer.length >= this.maxBuffered && !terminal) {
-      const i = this.buffer.findIndex((p) => p.droppable);
-      if (i >= 0) {
+      const di = this.buffer.findIndex((p) => p.droppable);
+      if (di >= 0) {
         // there is droppable telemetry to shed — drop the OLDEST of it, keep the incoming line.
-        this.buffer.splice(i, 1);
+        this.buffer.splice(di, 1);
         this.dropped++;
       } else if (droppable) {
         // the whole backlog is lifecycle AND the incoming line is itself droppable telemetry — drop
@@ -100,13 +103,19 @@ class BufferedWriter {
         this.dropped++;
         return;
       } else {
-        // all lifecycle, incoming is lifecycle too — shed the oldest to stay strictly bounded (the
-        // SQLite DB / report is the source of truth; stdout is live telemetry). Count the drop.
-        this.buffer.splice(0, 1);
-        this.dropped++;
+        // all lifecycle, incoming is lifecycle too — shed the oldest NON-TERMINAL line to stay
+        // strictly bounded (the DB/report is the source of truth; stdout is live telemetry). A
+        // buffered TERMINAL event is never evicted — an explicit invariant, not one that relies on
+        // terminals being the last line (PR2 emits terminal events mid-run). All-terminal is
+        // unreachable in practice (terminals are bounded), so admit over-cap in that case.
+        const nonTerminalIdx = this.buffer.findIndex((p) => !p.terminal);
+        if (nonTerminalIdx >= 0) {
+          this.buffer.splice(nonTerminalIdx, 1);
+          this.dropped++;
+        }
       }
     }
-    this.buffer.push({ line, droppable });
+    this.buffer.push({ line, droppable, terminal });
   }
 
   private armDrain(): void {

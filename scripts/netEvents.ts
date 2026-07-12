@@ -85,9 +85,13 @@ export function createNetworkReporter(opts: NetworkReporterOptions = {}): Networ
       }
     },
     counters(): { retryTotal: number; suppressed: number } {
-      // clamp the writer-drop delta at 0: if the process-lifetime dropped counter is ever RESET
-      // below the baseline (only reachable via test-only resetLogSink), never report a negative.
-      return { retryTotal, suppressed: rateLimited + Math.max(0, loggerDropped() - baselineDropped) };
+      // Normally the writer's dropped counter is monotonic, so the delta since our baseline is the
+      // run-scoped drop count. If it is ever RESET below the baseline (only reachable via test-only
+      // resetLogSink), a negative delta means the baseline is stale — fall back to the writer's
+      // current absolute count rather than clamp the new drops away.
+      const cur = loggerDropped();
+      const drops = cur >= baselineDropped ? cur - baselineDropped : cur;
+      return { retryTotal, suppressed: rateLimited + drops };
     },
   };
 }
