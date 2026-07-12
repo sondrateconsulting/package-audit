@@ -113,7 +113,7 @@ be null when no resolution was possible. `lockfile_lines` is a JSON array serial
 
 One row per usage site. `export_name` is empty for whole-module usage (namespace,
 side-effect, whole-require, re-export) and for CLI invocations; `context` is set only for
-CLI usage (script name, Dockerfile stage, workflow kind).
+CLI usage (script name, Dockerfile stage, or file kind).
 
 | column | type |
 |---|---|

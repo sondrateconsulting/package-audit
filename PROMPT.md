@@ -26,7 +26,7 @@ every run as "continue the job," not "start over," unless the user passes `--fre
   Full hardened invocation (the §5.C clone fallback uses exactly this):
   `GIT_TERMINAL_PROMPT=0 git clone --depth 1
   --single-branch --branch <branch> --no-tags --no-recurse-submodules --template=
-  <url> <mktemp-dir>` — `--branch` fetches the prioritized non-default branch (§5.B),
+  <url> <mktemp-dir>` — `--branch` fetches the selected branch (§5.B),
   `--template=` blocks init.templateDir hooks, `GIT_TERMINAL_PROMPT=0` prevents
   credential-prompt hangs. Record `git rev-parse HEAD` so permalinks pin the fetched
   SHA. Never write inside a repo working tree.
@@ -479,8 +479,9 @@ Resumability rules:
   the SAME (org,repo,branch,commit) but track DIFFERENT packages, and findings there are
   shared rows; without the filter, run R's report would leak the other config's packages.
   Because the snapshot is per-run and immutable,
-  `report --run-id <id>` reconstructs "the state of the world as of that run" exactly,
-  even after a later same-config run advances the head, and even across a config change
+  `report --run-id <id>` reconstructs "the state of the world as of that run" exactly — its
+  per-unit head selection is immutable, though a later same-commit rescan can still refresh the
+  selected findings' mutable fields — even after a later same-config run advances the head, and even across a config change
   (the snapshot disambiguates the multiple work_queue rows a branch can have across
   config_hashes). Default `report` uses the latest `status='completed'` live run's snapshot
   (most recent by started_at, tie-break run_id DESC; non-empty `tracked_packages` —
@@ -950,9 +951,15 @@ Entrypoints:
     # --plan: preview scope (config validation, preflight, owner resolution, repo+branch
     #   discovery, would-scan counts) and exit BEFORE the DB is opened — zero writes,
     #   zero content/registry-artifact fetches. Rejects --fresh/--purge-cache/--rescan-branch.
-  bun run scripts/report.ts [--config <path>] [--run-id <id>] [--help]
+  bun run scripts/report.ts [--config <path>] [--run-id <id>] [--html] [--help]
     # default: latest completed run's snapshot (also refreshes latest.json); strict flags —
     #   unknown/valueless arguments are rejected, never silently defaulted
+    # --html: ALSO render one HTML dossier per tracked package + index into <outputDir>/xray/
+  bun run scripts/export.ts [--config <path>] [--run-id <id>] [--raw] [--help]
+    # run-scoped CSV/JSONL snapshots of the four audit tables into <outputDir>/xray/;
+    #   --raw: forensic full-table dump (every row, raw- prefixed)
+  bun run scripts/compare.ts <runIdA> <runIdB> [--config <path>] [--help]
+    # deterministic run-to-run usage diff (two COMPLETED run ids) — one JSON line on stdout
 
 The wrapper module (github.ts) is the ONLY place `Bun.spawn` touches `gh`/`git`/`tar`;
 each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
@@ -1173,6 +1180,8 @@ summary.
                                "cli": { "hasCli": true, "binNames": ["my-package"] } } }, // export_kind == 'cli-bin'
     "usageByRepo": [{
       "organization":"org-a","repository":"service-x","branch":"main",
+      "isDefaultBranch":true,                        // tri-state (§5.B): true/false, or null on
+                                                     //   pre-v3 runs (unknown — never rendered as false)
       "commitSha":"abc123","dateFetched":"2025-01-15T00:00:00Z",
       // a package can be declared in several sections/aliases of one manifest → a LIST:
       "declarations":[{"dependencyType":"dependencies","dependencyKey":"@myorg/my-package",

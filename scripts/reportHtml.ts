@@ -35,7 +35,7 @@ import { deriveFacts, tryEvaluateObservations, type Observation } from "./observ
 // buildReport output through the renderer.
 
 export interface DossierApiUsage {
-  readonly exportName: string; // '' = whole-module usage (namespace/side-effect/require/reexport)
+  readonly exportName: string; // '' = whole-module usage (namespace/side-effect/whole-require/reexport)
   readonly dependencyKey: string;
   readonly usageType: string;
   readonly file: string;

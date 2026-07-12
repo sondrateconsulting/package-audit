@@ -67,7 +67,8 @@ export const mdCell = (value: string): string =>
 // a path containing `(` / `)` — e.g. a Next.js route group `src/(auth)/x.ts` — keeps a CORRECT link
 // destination. mdCell would backslash-escape the parens, and GFM RETAINS those backslashes INSIDE an
 // autolinked bare URL, silently pointing the link at the wrong file. Bidi controls are stripped
-// FIRST, then the stripped value must be `https://` FOLLOWED BY a real host character — not `/`, `?`,
+// FIRST, then the stripped value must be `https://` FOLLOWED BY a non-delimiter character (a SYNTACTIC
+// delimiter check, not real host validation — e.g. `https://:` still passes) — not `/`, `?`,
 // `#`, whitespace, `<`/`>`, or backtick — and must contain no whitespace, `<`/`>`, or backtick
 // anywhere (`/`, `?`, `#` stay allowed in the path/query). So a hostless
 // `https://`, a query/fragment-only `https://?x`, or a value whose only "host" was a bidi control all

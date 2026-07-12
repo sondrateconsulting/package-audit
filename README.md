@@ -32,7 +32,7 @@ The finished run writes `output/run-<run_id>.json` and `output/latest.json`. A l
 
 ### HTML dossier (`report --html`)
 
-`bun run report --html` additionally renders one self-contained HTML dossier per tracked package plus an `index.html` into `output/xray/`: an executive sentence, five decision cards, a usage-sorted API-surface table, a repo×export matrix, and collapsible permalinked evidence drawers — default-branch headline metrics (labeled all-branch fallback when attribution is unknown), printable, light + dark themes, no external resources. `--run-id <id>` renders a historical run's dossiers.
+`bun run report --html` additionally renders one self-contained HTML dossier per tracked package plus an `index.html` into `output/xray/`: an executive sentence, five decision cards, a usage-sorted API-surface table, a repo×export matrix, and collapsible permalinked evidence drawers (a package with no usage in the scanned slice renders a coverage-only empty state instead) — default-branch headline metrics (labeled all-branch fallback when attribution is unknown), printable, light + dark themes, no external resources. `--run-id <id>` renders a historical run's dossiers.
 <!-- hero screenshot for the README is captured from the flagship dossier in the launch phase (P4) -->
 
 ### Data exports (`export`)
@@ -87,6 +87,7 @@ SELECT organization || '/' || repository AS repo,
        COUNT(DISTINCT export_name) AS distinct_exports,
        COUNT(*) AS usage_sites
 FROM 'output/xray/usage_findings.csv'
+WHERE export_name <> ''
 GROUP BY repo
 ORDER BY usage_sites DESC, repo
 LIMIT 10;
@@ -97,7 +98,7 @@ Resolved versions across the estate:
 ```sql
 SELECT resolved_version, COUNT(*) AS declarations
 FROM 'output/xray/dependency_findings.csv'
-WHERE resolved_version IS NOT NULL
+WHERE resolved_version IS NOT NULL AND resolved_version_source IS NOT NULL
 GROUP BY resolved_version
 ORDER BY declarations DESC, resolved_version;
 ```
@@ -139,7 +140,7 @@ The presentation commands emit their own events: `report --html` writes one `dos
 - `versionsSeen` lists only valid-semver resolved versions; non-registry specs (`git+`, `file:`, `workspace:`…) are excluded and logged as package-scoped skips in `errors` on the run that first scans them.
 - `apiSurface` keys are a **subset** of `versionsSeen`: only versions introspected to completion appear. For a **completed** run, a version missing from `apiSurface` has a recorded introspection *failure* (see `errors`) — never silently absent data. (A `--run-id` report of a still-running or failed run can be legitimately partial.) Surface enumeration is declaration-backed: a package that ships no resolvable type declarations can genuinely introspect to a small or empty surface.
 - `usageByRepo` is the **union** of dependency-declaration and usage units — a CLI-only package with no manifest declaration still appears.
-- `report --run-id <id>` pins each unit to the commit that run scanned (findings join through a per-run head snapshot), so later runs advancing branch heads never change it. One caveat: a forced same-commit `--rescan-branch` refreshes row details (timestamps, snippets) that older run ids read through the shared finding rows.
+- `report --run-id <id>` pins each unit to the commit that run scanned (findings join through a per-run head snapshot), so later runs advancing branch heads never change it. One caveat: a forced same-commit `--rescan-branch` can add or refresh the shared finding rows that older run ids read through — newly detected findings, plus updated row details (timestamps, snippets).
 - Reports are deterministic and byte-reproducible: same database, same run, same bytes.
 
 ## Exactly one runtime dependency

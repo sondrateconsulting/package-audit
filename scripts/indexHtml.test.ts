@@ -33,7 +33,7 @@ function fixtureReport(): DossierReport {
   db.completeRun(runId);
   const report = buildReport(db, db.getRun(runId)!) as unknown as DossierReport;
   db.close();
-  // Pin the two wall-clock-derived envelope fields so the index renders byte-identically
+  // Pin the two nondeterministic envelope fields so the index renders byte-identically
   // (renderIndex itself is pure — this is fixture stabilization, not renderer behavior).
   return { ...report, runId: "run-fixture", generatedAt: T0 };
 }

@@ -90,7 +90,7 @@ describe("RULES — per-rule predicate boundaries and template output", () => {
       "3 distinct versions of the package are present, spanning 2 major versions.",
     );
     expect(textOf("multi-major", facts({ majorVersionCount: 1 }))).toBeUndefined();
-    // singular form when only one version somehow spans... (guarded: needs >= 2 majors, so >= 2 versions)
+    // minimum plural boundary: >= 2 majors forces >= 2 versions, so the smallest case is 2 versions spanning 2 majors
     expect(textOf("multi-major", facts({ majorVersionCount: 2, versionsSeenCount: 2 }))).toBe(
       "2 distinct versions of the package are present, spanning 2 major versions.",
     );
@@ -169,7 +169,7 @@ describe("tryEvaluateObservations — the omit-on-throw containment", () => {
 
   test("a template throwing mid-evaluation is contained the same way", () => {
     // NaN-free facts but a hostile string field that a future template might .toLowerCase() —
-    // simulate a template bug directly with a getter on a field only templates read.
+    // simulate a bug directly with a getter that throws when a rule reads hotspotRepo mid-evaluation.
     const poisoned = Object.defineProperty({ ...facts() }, "hotspotRepo", {
       get() {
         throw new Error("template-time read");

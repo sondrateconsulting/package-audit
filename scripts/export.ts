@@ -48,7 +48,7 @@ export interface ExportArgs {
   readonly help: boolean; // --help/-h seen anywhere: print help, do nothing else
 }
 
-// Mirrors parseReportArgs exactly (help wins over invalid args; unknown flags REJECTED — a
+// Mirrors parseReportArgs' conventions (help wins over invalid args; unknown flags REJECTED — a
 // silently-ignored typo would fall through to the default export; `--flag=value` supported;
 // a detached value that looks like a flag is a missing value). ArgsError keeps renderFatal's
 // stack-free operator rendering without adding a new class to the cliErrors registry.
@@ -193,7 +193,7 @@ export const EXPORT_REGISTRY: Readonly<Record<ExportTableName, ExportTableSpec>>
 // wire types (TEXT→string, INTEGER→number, nullable → | null). The Equal<> assertions fail
 // `bun run typecheck` in BOTH drift directions: a registry column the row lacks, a row column
 // the registry lacks, or a type mismatch between them. The runtime half (export.test.ts) pins
-// the row aliases to the LIVE schema via PRAGMA table_info, closing the loop to SCHEMA_SQL.
+// the registry column names and order to the LIVE schema via PRAGMA table_info, closing the loop to SCHEMA_SQL.
 type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
 type Expect<T extends true> = T;
 type ColumnTs<T extends ExportColumnType> =
@@ -322,7 +322,7 @@ function collectRunScoped(db: AuditDbReader, run: RunRecord): ExportSnapshot[] {
   ];
 }
 
-// --raw: full-table forensic dump — every row verbatim, including '__complete__' markers and
+// --raw: full-table forensic dump — every row, including '__complete__' markers and
 // rows from other runs/configs. Same registry columns (ids stay excluded — storage detail
 // either way) and same total ORDER BY chains, so even the raw dump is byte-reproducible.
 function collectRaw(db: AuditDbReader): ExportSnapshot[] {

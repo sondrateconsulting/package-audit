@@ -3,12 +3,12 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 // The stdout JSONL is a CONTRACT: every `event`/`action` token the tool writes with logLine is
-// part of the machine-readable output a consumer switches on. This source scan makes the README
-// "Reading a run" vocabulary impossible to silently drift from the emitted literals — the missing
+// part of the machine-readable output a consumer switches on. This source scan requires every
+// emitted literal to appear (backticked) somewhere in the README — the missing
 // tripwire that let `owner-discovery-throttled` / `requeue-throttle` / `retry-next-run` go
 // undocumented (house precedent: EXPORTS.md↔registry, config.schema.json↔config.ts,
 // reportSchema↔db.ts). Scope note: this matches `event:`/`action:` object-literal keys in the
-// non-test sources; every such literal is a logLine token today, and any future one belongs in the
+// non-test sources; every such literal is an emitted stdout token today, and any future one belongs in the
 // contract too, so demanding it be documented is the intended invariant.
 
 const SCRIPTS_DIR = import.meta.dir;

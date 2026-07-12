@@ -100,7 +100,7 @@ export function writeFileAtomic(
         try {
           rmSync(candidate, { force: true });
         } catch {
-          // unmanifested — the next generation's sweep removes it
+          // unmanifested — (for xray/ bundle temps) the next generation's sweep removes it
         }
         throw e;
       }
@@ -114,7 +114,7 @@ export function writeFileAtomic(
     try {
       rmSync(temp, { force: true }); // best-effort; never mask the original failure
     } catch {
-      // the orphaned temp is unmanifested — the next generation's sweep removes it
+      // the orphaned temp is unmanifested — (for xray/ bundle temps) the next generation's sweep removes it
     }
     throw e;
   }

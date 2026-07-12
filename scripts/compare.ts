@@ -1,6 +1,6 @@
 // compare.ts — deterministic run-to-run diff of usage sites, computed from SQLite ALONE (the
 // §7 report's run-history counterpart). Entry point:
-//   bun run scripts/compare.ts <runIdA> <runIdB> [--config <path>]
+//   bun run scripts/compare.ts <runIdA> <runIdB> [--config <path>] [--help]
 // Both runs must be status='completed' with non-empty tracked_packages; anything less renders a
 // {"notComparable":…} notice on the stdout JSONL contract and exits 0 (consumers branch on the
 // parsed field, not the exit code — the runReport precedent).
@@ -130,7 +130,7 @@ export interface ComparePackageSummary {
   reposLeaving: number;
   addedTotal: number; // honest all-branch totals — the caps below never touch these
   removedTotal: number;
-  detailCapped?: true; // present only when a detail array hit COMPARE_DETAIL_CAP
+  detailCapped?: true; // present only when a detail array exceeded COMPARE_DETAIL_CAP
   defaultBranchDataIncomplete?: true; // present only under the pre-v3 NULL-flag fallback
   note?: string;
 }
