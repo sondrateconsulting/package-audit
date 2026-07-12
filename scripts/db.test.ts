@@ -1,8 +1,10 @@
-import { expect, test, describe, afterAll } from "bun:test";
+import { expect, test, describe, afterAll, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
-import { rmSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { rmSync, mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, nowIso, type RunInput } from "./db.ts";
+import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, mapReadOnlyOpenError, nowIso, type RunInput } from "./db.ts";
+import { buildReport } from "./report.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 
 // File-backed tests must live under ./data (§0 write containment is enforced by AuditDb.open).
@@ -282,7 +284,31 @@ describe("migration — legacy v1 → current", () => {
   test("pre-migration runs are NOT reportable (empty tracked_packages)", () => {
     expect(db.latestReportableRun()).toBeNull();
   });
+
+  test("the chain continues past v2: preserved heads gain is_default_branch = NULL (unknown)", () => {
+    const row = raw(db)
+      .query("SELECT is_default_branch FROM run_unit_head WHERE run_id='old-done'")
+      .get() as { is_default_branch: unknown };
+    expect(row.is_default_branch).toBeNull();
+  });
 });
+
+// Synchronous stdout JSONL capture (open() is sync — orchestrate.test.ts's helper is async).
+// Keeps the E3 fresh-drop warning out of the test runner's real stdout, and returns the
+// parsed events for the warning suites below.
+function captureStdout(fn: () => void): Array<Record<string, unknown>> {
+  const chunks: string[] = [];
+  const spy = spyOn(process.stdout, "write").mockImplementation(((chunk: unknown) => {
+    chunks.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write);
+  try {
+    fn();
+  } finally {
+    spy.mockRestore();
+  }
+  return chunks.join("").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
+}
 
 describe("--fresh / --purge-cache", () => {
   test("--fresh drops run-scoped data but preserves the caches", () => {
@@ -295,7 +321,10 @@ describe("--fresh / --purge-cache", () => {
     db1.completeRun(runId);
     db1.close();
 
-    const db2 = AuditDb.open({ sqlitePath: path, fresh: true });
+    let db2!: AuditDb;
+    captureStdout(() => {
+      db2 = AuditDb.open({ sqlitePath: path, fresh: true });
+    });
     expect(db2.getRun(runId)).toBeNull();
     const deps = (raw(db2).query("SELECT COUNT(*) AS n FROM dependency_findings").get() as { n: number }).n;
     expect(deps).toBe(0);
@@ -613,8 +642,8 @@ describe("errors + run_unit_head", () => {
   test("run_unit_head upserts per (run, unit); skipped-cutoff carries commit_sha=''", () => {
     const db = mem();
     rawRun(db, "r1", "running");
-    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "", status: "skipped-cutoff" });
-    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "sha2", status: "scanned" });
+    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null });
+    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "sha2", status: "scanned", isDefaultBranch: null });
     const rows = raw(db).query("SELECT commit_sha, status FROM run_unit_head").all() as Array<Record<string, unknown>>;
     expect(rows.length).toBe(1);
     expect(rows[0]!["commit_sha"]).toBe("sha2");
@@ -862,5 +891,501 @@ describe("misc", () => {
     expect(info.lastRun?.runId).toBe(runId);
     expect(db.resumeInfo("other-hash").lastRun).toBeNull();
     db.close();
+  });
+});
+
+// ---- v2 → v3 migration (version-stepped, §3) --------------------------------------------------
+// IMMUTABLE HISTORICAL FIXTURE: the exact v2 schema as shipped (pre-is_default_branch).
+// Never update this for later schema versions — it IS the contract the v2→v3 step migrates from.
+const V2_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS runs (
+  run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT,
+  config_hash TEXT NOT NULL,
+  effective_owners TEXT NOT NULL DEFAULT '[]',
+  owners_source TEXT NOT NULL DEFAULT 'discovered'
+    CHECK (owners_source IN ('configured','discovered')),
+  tracked_packages TEXT NOT NULL DEFAULT '[]',
+  cutoff_date TEXT NOT NULL DEFAULT '',
+  github_host TEXT NOT NULL DEFAULT 'github.com',
+  status TEXT NOT NULL CHECK (status IN ('running','completed','failed'))
+);
+CREATE TABLE IF NOT EXISTS work_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  config_hash TEXT NOT NULL,
+  created_run_id TEXT NOT NULL REFERENCES runs(run_id),
+  last_run_id TEXT NOT NULL REFERENCES runs(run_id),
+  scope TEXT NOT NULL CHECK (scope IN ('org','repo','branch')),
+  organization TEXT NOT NULL,
+  repository TEXT NOT NULL DEFAULT '',
+  branch TEXT NOT NULL DEFAULT '',
+  last_commit_sha TEXT NOT NULL DEFAULT '',
+  last_commit_date TEXT,
+  status TEXT NOT NULL CHECK (status IN ('pending','in_progress','done','skipped','error')),
+  error_message TEXT, updated_at TEXT NOT NULL,
+  CHECK ((scope='org'    AND repository='' AND branch='') OR
+         (scope='repo'   AND repository<>'' AND branch='') OR
+         (scope='branch' AND repository<>'' AND branch<>'')),
+  UNIQUE(config_hash, scope, organization, repository, branch)
+);
+CREATE TABLE IF NOT EXISTS dependency_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+  commit_sha TEXT NOT NULL, date_fetched TEXT NOT NULL,
+  package_name TEXT NOT NULL,
+  dependency_key TEXT NOT NULL,
+  dependency_type TEXT NOT NULL,
+  manifest_path TEXT NOT NULL, manifest_line INTEGER NOT NULL,
+  manifest_permalink TEXT NOT NULL, declared_version TEXT NOT NULL,
+  lockfile_path TEXT, lockfile_kind TEXT, lockfile_lines TEXT,
+  lockfile_permalink TEXT, resolved_version TEXT,
+  resolved_version_source TEXT,
+  UNIQUE(organization, repository, branch, commit_sha, package_name, dependency_key, dependency_type, manifest_path)
+);
+CREATE TABLE IF NOT EXISTS package_api_surface (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, package_name TEXT NOT NULL,
+  version TEXT NOT NULL,
+  version_source TEXT NOT NULL DEFAULT 'lockfile'
+    CHECK (version_source IN ('lockfile','range-resolved')),
+  export_name TEXT NOT NULL,
+  export_kind TEXT NOT NULL,
+  source TEXT NOT NULL, introspected_at TEXT NOT NULL,
+  UNIQUE(package_name, version, export_name, export_kind)
+);
+CREATE TABLE IF NOT EXISTS usage_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+  commit_sha TEXT NOT NULL, package_name TEXT NOT NULL,
+  dependency_key TEXT NOT NULL DEFAULT '',
+  usage_type TEXT NOT NULL,
+  export_name TEXT NOT NULL DEFAULT '',
+  context TEXT NOT NULL DEFAULT '',
+  file_path TEXT NOT NULL, line_number INTEGER NOT NULL,
+  permalink TEXT NOT NULL, snippet TEXT NOT NULL, found_at TEXT NOT NULL,
+  UNIQUE(organization, repository, branch, commit_sha, package_name, dependency_key, usage_type, file_path, line_number, export_name, context)
+);
+CREATE TABLE IF NOT EXISTS run_unit_head (
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+  commit_sha TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'scanned'
+    CHECK (status IN ('scanned','skipped-cutoff')),
+  PRIMARY KEY (run_id, organization, repository, branch)
+);
+CREATE TABLE IF NOT EXISTS api_cache (
+  method TEXT NOT NULL,
+  url TEXT NOT NULL,
+  variant_hash TEXT NOT NULL,
+  etag TEXT,
+  response_body TEXT, cached_at TEXT NOT NULL,
+  PRIMARY KEY (method, url, variant_hash)
+);
+CREATE TABLE IF NOT EXISTS errors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  scope TEXT NOT NULL,
+  organization TEXT, repository TEXT, branch TEXT,
+  package_name TEXT, version TEXT,
+  message TEXT NOT NULL,
+  occurred_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_usage_loc  ON usage_findings(organization, repository, branch, commit_sha);
+CREATE INDEX IF NOT EXISTS ix_usage_run  ON usage_findings(run_id);
+CREATE INDEX IF NOT EXISTS ix_dep_run    ON dependency_findings(run_id);
+CREATE INDEX IF NOT EXISTS ix_dep_loc    ON dependency_findings(organization, repository, branch, commit_sha);
+CREATE INDEX IF NOT EXISTS ix_err_run    ON errors(run_id);
+CREATE INDEX IF NOT EXISTS ix_wq_status  ON work_queue(config_hash, status);
+CREATE INDEX IF NOT EXISTS ix_ruh_loc    ON run_unit_head(organization, repository, branch, commit_sha);
+`;
+
+// Seed a REAL v2 database: a sentinel row in every owned table (the migration must preserve
+// every one of them — most importantly the four tables migrateLegacy would have destroyed).
+function buildV2Db(path: string): void {
+  const raw = new Database(path, { create: true, strict: true });
+  raw.exec(V2_SCHEMA_SQL);
+  raw.exec(`INSERT INTO runs VALUES
+    ('v2-run', '2026-01-01T00:00:00.000Z', '2026-01-01T01:00:00.000Z', 'h-v2', '["org-a"]', 'configured', '["expo"]', '2024-01-01', 'github.com', 'completed'),
+    ('v2-running', '2026-01-02T00:00:00.000Z', NULL, 'h-v2', '["org-a"]', 'configured', '["expo"]', '2024-01-01', 'github.com', 'running')`);
+  // Explicit NONCONTIGUOUS ids everywhere an id exists: a faulty rebuild that renumbers rows
+  // would otherwise survive projection equality (and the id-dependent tie-breaks with it).
+  raw.exec(`INSERT INTO work_queue (id, config_hash, created_run_id, last_run_id, scope, organization, repository, branch, last_commit_sha, last_commit_date, status, error_message, updated_at)
+    VALUES (7, 'h-v2', 'v2-run', 'v2-run', 'branch', 'org-a', 'repo', 'main', 'sha1', '2026-01-01T00:00:00.000Z', 'done', NULL, '2026-01-01T00:30:00.000Z')`);
+  raw.exec(`INSERT INTO dependency_findings (id, run_id, organization, repository, branch, commit_sha, date_fetched,
+    package_name, dependency_key, dependency_type, manifest_path, manifest_line, manifest_permalink,
+    declared_version, lockfile_path, lockfile_kind, lockfile_lines, lockfile_permalink, resolved_version, resolved_version_source)
+    VALUES (13, 'v2-run', 'org-a', 'repo', 'main', 'sha1', '2026-01-01T00:10:00.000Z', 'expo', 'expo', 'dependencies',
+    'package.json', 11, 'https://github.com/org-a/repo/blob/sha1/package.json#L11', '^50.0.0',
+    'bun.lock', 'bun', '[42]', 'https://github.com/org-a/repo/blob/sha1/bun.lock#L42', '50.0.0', 'lockfile')`);
+  raw.exec(`INSERT INTO usage_findings (id, run_id, organization, repository, branch, commit_sha, package_name,
+    dependency_key, usage_type, export_name, context, file_path, line_number, permalink, snippet, found_at)
+    VALUES (21, 'v2-run', 'org-a', 'repo', 'main', 'sha1', 'expo', 'expo', 'named-import', 'registerRootComponent', '',
+    'index.js', 1, 'https://github.com/org-a/repo/blob/sha1/index.js#L1',
+    'import { registerRootComponent } from "expo"', '2026-01-01T00:20:00.000Z')`);
+  // The marker carries the CURRENT surface epoch (§7): this fixture models a v2 database
+  // written by the current pre-v3 code, whose markers are epoch-stamped. (A PRE-epoch bare
+  // '__complete__' marker deliberately reads as ABSENT — that shape has its own tests — and
+  // using it here would silently drain the round-trip twin's apiSurface coverage.)
+  raw.exec(`INSERT INTO package_api_surface (id, package_name, version, version_source, export_name, export_kind, source, introspected_at) VALUES
+    (31, 'expo', '50.0.0', 'lockfile', 'registerRootComponent', 'named', 'build/Expo.d.ts', '2026-01-01T00:15:00.000Z'),
+    (35, 'expo', '50.0.0', 'lockfile', '', '__complete__', '__complete__@${SURFACE_SCHEMA_VERSION}', '2026-01-01T00:15:00.000Z')`);
+  raw.exec(`INSERT INTO run_unit_head VALUES
+    ('v2-run', 'org-a', 'repo', 'main', 'sha1', 'scanned'),
+    ('v2-run', 'org-a', 'repo', 'stale', '', 'skipped-cutoff')`);
+  raw.exec(`INSERT INTO api_cache VALUES ('GET', 'https://api.github.com/x', 'raw', 'W/"e1"', '{"a":1}', '2026-01-01T00:05:00.000Z')`);
+  // TWO error rows with the SAME occurred_at: the report's errors[] tie-breaks on id, so a
+  // renumbering rebuild would flip their order and fail the byte-identity comparison.
+  raw.exec(`INSERT INTO errors (id, run_id, scope, organization, repository, branch, package_name, version, message, occurred_at) VALUES
+    (43, 'v2-run', 'introspection', NULL, NULL, NULL, 'expo', '49.0.0', 'tarball fetch failed', '2026-01-01T00:25:00.000Z'),
+    (47, 'v2-run', 'introspection', NULL, NULL, NULL, 'expo', '48.0.0', 'packument fetch failed', '2026-01-01T00:25:00.000Z')`);
+  raw.exec("PRAGMA user_version = 2");
+  raw.close();
+}
+
+// A v3 twin of the v2 fixture: identical logical data, built independently with raw SQL
+// (v2 schema + the additive ALTER + a v3 stamp — no db.ts migration code involved; note this
+// mirrors the migration's ALTER mechanism rather than a fresh-CREATE column order, which is
+// fine because the report never reads run_unit_head positionally). The
+// CRITICAL round-trip test compares the MIGRATED v2 database's report byte-for-byte against
+// this twin's: migration must be indistinguishable from having stored the data natively (with
+// is_default_branch NULL, exactly the migration backfill). The report format itself now carries
+// isDefaultBranch, so a pre-migration "before" report is no longer constructible — the twin IS
+// the before-equivalent baseline.
+function buildV3TwinDb(path: string): void {
+  buildV2Db(path);
+  const raw = new Database(path, { strict: true });
+  raw.exec("ALTER TABLE run_unit_head ADD COLUMN is_default_branch INTEGER");
+  raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  raw.close();
+}
+
+// Explicit v2 column projections (stable order) — deliberately NOT SELECT *: the migration
+// legitimately adds is_default_branch, so preservation is asserted on the v2 columns exactly.
+const V2_PROJECTIONS: Record<string, string> = {
+  runs: `SELECT run_id, started_at, completed_at, config_hash, effective_owners, owners_source,
+         tracked_packages, cutoff_date, github_host, status FROM runs ORDER BY run_id`,
+  work_queue: `SELECT id, config_hash, created_run_id, last_run_id, scope, organization, repository,
+         branch, last_commit_sha, last_commit_date, status, error_message, updated_at
+         FROM work_queue ORDER BY id`,
+  dependency_findings: `SELECT id, run_id, organization, repository, branch, commit_sha, date_fetched,
+         package_name, dependency_key, dependency_type, manifest_path, manifest_line,
+         manifest_permalink, declared_version, lockfile_path, lockfile_kind, lockfile_lines,
+         lockfile_permalink, resolved_version, resolved_version_source
+         FROM dependency_findings ORDER BY id`,
+  usage_findings: `SELECT id, run_id, organization, repository, branch, commit_sha, package_name,
+         dependency_key, usage_type, export_name, context, file_path, line_number, permalink,
+         snippet, found_at FROM usage_findings ORDER BY id`,
+  package_api_surface: `SELECT id, package_name, version, version_source, export_name, export_kind,
+         source, introspected_at FROM package_api_surface ORDER BY id`,
+  run_unit_head: `SELECT run_id, organization, repository, branch, commit_sha, status
+         FROM run_unit_head ORDER BY run_id, organization, repository, branch`,
+  api_cache: `SELECT method, url, variant_hash, etag, response_body, cached_at
+         FROM api_cache ORDER BY method, url, variant_hash`,
+  errors: `SELECT id, run_id, scope, organization, repository, branch, package_name, version,
+         message, occurred_at FROM errors ORDER BY id`,
+};
+
+describe("migration — v2 → v3 (version-stepped, CRITICAL round-trip)", () => {
+  test("real v2 data opens under v3: everything preserved, old run's report byte-identical to a native-v3 twin", () => {
+    const path = nextFile();
+    buildV2Db(path);
+
+    // Baseline projections from the UNMIGRATED v2 database (precondition-checked).
+    const rawBefore = new Database(path, { strict: true });
+    expect((rawBefore.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
+    const v2Cols = (rawBefore.query("PRAGMA table_info(run_unit_head)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(v2Cols).not.toContain("is_default_branch");
+    const beforeProjections = new Map<string, unknown[]>();
+    for (const [table, sql] of Object.entries(V2_PROJECTIONS)) beforeProjections.set(table, rawBefore.query(sql).all());
+    rawBefore.close();
+
+    // The report baseline: identical data stored NATIVELY in v3 shape (see buildV3TwinDb).
+    const twinPath = nextFile();
+    buildV3TwinDb(twinPath);
+    const twin = AuditDb.open({ sqlitePath: twinPath });
+    const expectedReport = JSON.stringify(buildReport(twin, twin.getRun("v2-run")!), null, 2);
+    twin.close();
+
+    // Migrate by opening through the production path.
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      const r = raw(db);
+      expect((r.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+      // Every v2 row survives, byte-for-byte on the v2 columns.
+      for (const [table, sql] of Object.entries(V2_PROJECTIONS)) {
+        expect(r.query(sql).all()).toEqual(beforeProjections.get(table)!);
+      }
+      // The new column exists and is NULL (= unknown) on every migrated row — never 0.
+      const flags = r.query("SELECT is_default_branch FROM run_unit_head").all() as Array<{ is_default_branch: unknown }>;
+      expect(flags.length).toBe(2);
+      for (const f of flags) expect(f.is_default_branch).toBeNull();
+      // Referential integrity intact.
+      expect(r.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      // v2 running runs are NOT failed by the additive step (that is the LEGACY boundary rule).
+      expect(db.getRun("v2-running")?.status).toBe("running");
+      // The old run's report is byte-identical to the natively-stored twin's.
+      const migratedReport = buildReport(db, db.getRun("v2-run")!);
+      const afterReport = JSON.stringify(migratedReport, null, 2);
+      expect(afterReport).toBe(expectedReport);
+      expect(afterReport).toContain('"isDefaultBranch": null'); // pre-v3 rows render as unknown
+      // apiSurface must be POPULATED, not silently drained: the fixture's epoch-stamped completion
+      // marker is load-bearing. A bare/stale marker reads as ABSENT (§7 epoch), so the surface would
+      // empty out and the byte-identity above would still pass empty-vs-empty (both build from the
+      // same fixture) — asserting NOTHING. This positive check makes that regression fail (see 4d0b42d).
+      const migratedExpo = migratedReport.packages.find((p) => p.name === "expo");
+      expect(migratedExpo?.apiSurface["50.0.0"]?.exports).toContainEqual({ name: "registerRootComponent", kind: "named" });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("--fresh on a v2 database migrates cleanly (caches survive their own drop of run_unit_head)", () => {
+    const path = nextFile();
+    buildV2Db(path);
+    // --fresh drops run_unit_head while preserving the caches, so the v2→v3 step must recreate
+    // missing tables BEFORE its ALTER — this is the regression that would throw otherwise.
+    let db!: AuditDb;
+    captureStdout(() => {
+      db = AuditDb.open({ sqlitePath: path, fresh: true });
+    });
+    try {
+      const r = raw(db);
+      expect((r.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+      expect(db.getApiCache("GET", "https://api.github.com/x", "raw")?.etag).toBe('W/"e1"');
+      expect(db.hasCompletionMarker("expo", "50.0.0")).toBe(true);
+      expect(db.getRun("v2-run")).toBeNull(); // run-scoped data dropped, as --fresh promises
+      r.query("SELECT is_default_branch FROM run_unit_head").all(); // v3 shape (throws if missing)
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("--fresh drop-time warning (E3)", () => {
+  test("--fresh over completed runs emits ONE warning event with the dropped count", () => {
+    const path = nextFile();
+    const db1 = AuditDb.open({ sqlitePath: path });
+    db1.completeRun(db1.startRun(runInput()).runId);
+    db1.completeRun(db1.startRun(runInput({ configHash: "hash-2" })).runId);
+    db1.close();
+
+    let db2: AuditDb | null = null;
+    const events = captureStdout(() => {
+      db2 = AuditDb.open({ sqlitePath: path, fresh: true });
+    });
+    db2!.close();
+    const warnings = events.filter((e) => e["event"] === "warning");
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]!["reason"]).toBe("fresh-dropped-completed-runs");
+    expect(warnings[0]!["completedRunsDropped"]).toBe(2);
+    expect(String(warnings[0]!["message"])).toContain("unrecoverable");
+  });
+
+  test("--fresh over only failed/running runs is silent (nothing reportable was lost)", () => {
+    const path = nextFile();
+    const db1 = AuditDb.open({ sqlitePath: path });
+    db1.failRun(db1.startRun(runInput()).runId);
+    db1.close();
+    const events = captureStdout(() => {
+      AuditDb.open({ sqlitePath: path, fresh: true }).close();
+    });
+    expect(events.filter((e) => e["event"] === "warning")).toEqual([]);
+  });
+
+  test("--fresh on a brand-new database is silent (no runs table yet)", () => {
+    const events = captureStdout(() => {
+      AuditDb.open({ sqlitePath: nextFile(), fresh: true }).close();
+    });
+    expect(events.filter((e) => e["event"] === "warning")).toEqual([]);
+  });
+});
+
+describe("upsertRunUnitHead — is_default_branch tri-state", () => {
+  test("true → 1, false → 0, null → NULL; the conflict path updates it", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    const base = { runId: "r1", organization: "o", repository: "r", commitSha: "s", status: "scanned" as const };
+    db.upsertRunUnitHead({ ...base, branch: "main", isDefaultBranch: true });
+    db.upsertRunUnitHead({ ...base, branch: "dev", isDefaultBranch: false });
+    db.upsertRunUnitHead({ ...base, branch: "old", isDefaultBranch: null });
+    const flags = raw(db)
+      .query("SELECT branch, is_default_branch AS f FROM run_unit_head ORDER BY branch")
+      .all() as Array<{ branch: string; f: unknown }>;
+    expect(flags).toEqual([
+      { branch: "dev", f: 0 },
+      { branch: "main", f: 1 },
+      { branch: "old", f: null },
+    ]);
+    // conflict path: a later upsert of the SAME unit updates the flag (e.g. default moved)
+    db.upsertRunUnitHead({ ...base, branch: "dev", isDefaultBranch: true });
+    const dev = raw(db).query("SELECT is_default_branch AS f FROM run_unit_head WHERE branch='dev'").get() as { f: unknown };
+    expect(dev.f).toBe(1);
+    db.close();
+  });
+});
+
+describe("openReadOnly (CV5 read seam)", () => {
+  // A cleanly-written v3 database with one completed run, for the happy paths.
+  function buildV3Db(path: string): string {
+    const db = AuditDb.open({ sqlitePath: path });
+    const { runId } = db.startRun(runInput());
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
+    db.completeRun(runId);
+    db.close();
+    return runId;
+  }
+
+  test("reads a v3 database: getRun/read/readTransaction/hasCompletionMarker work", () => {
+    const path = nextFile();
+    const runId = buildV3Db(path);
+    const reader = AuditDb.openReadOnly({ sqlitePath: path });
+    try {
+      expect(reader.getRun(runId)?.status).toBe("completed");
+      expect(reader.latestReportableRun()?.runId).toBe(runId);
+      const heads = reader.read("SELECT branch, is_default_branch FROM run_unit_head").all();
+      expect(heads).toEqual([{ branch: "main", is_default_branch: 1 }]);
+      expect(reader.hasCompletionMarker("expo", "0.0.0")).toBe(false);
+      const inTx = reader.readTransaction(() => reader.read("SELECT COUNT(*) AS n FROM runs").get() as { n: number });
+      expect(inTx.n).toBe(1);
+    } finally {
+      reader.close();
+    }
+  });
+
+  test("the connection is truly read-only at the SQLite level, and the main file's bytes never change", () => {
+    const path = nextFile();
+    const runId = buildV3Db(path);
+    const hashBefore = createHash("sha256").update(readFileSync(path)).digest("hex");
+    const reader = AuditDb.openReadOnly({ sqlitePath: path });
+    try {
+      expect((raw(reader as AuditDb).query("PRAGMA busy_timeout").get() as { timeout: number }).timeout).toBe(5000);
+      expect(() => raw(reader as AuditDb).query("INSERT INTO errors (run_id, scope, message, occurred_at) VALUES (?, 'x', 'x', 'x')").run(runId)).toThrow();
+      reader.getRun(runId);
+    } finally {
+      reader.close();
+    }
+    expect(createHash("sha256").update(readFileSync(path)).digest("hex")).toBe(hashBefore);
+  });
+
+  test("a v2 database is refused with the migrate-first remediation (no migration attempted)", () => {
+    const path = nextFile();
+    buildV2Db(path);
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/run `bun run audit` once to migrate/);
+    // …and it really did NOT migrate:
+    const check = new Database(path, { readonly: true });
+    expect((check.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
+    check.close();
+  });
+
+  test("a NEWER-versioned database is refused with the upgrade-the-tool message", () => {
+    const path = nextFile();
+    buildV3Db(path);
+    const bump = new Database(path, { strict: true });
+    bump.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+    bump.close();
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/upgrade the tool/);
+  });
+
+  test("a v3-stamped file missing audit tables is refused up front, not mid-query", () => {
+    const path = nextFile();
+    const forged = new Database(path, { create: true, strict: true });
+    forged.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    forged.close();
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/missing the runs table/);
+  });
+
+  test(":memory: is refused (nothing to read), and containment applies to reads too", () => {
+    expect(() => AuditDb.openReadOnly({ sqlitePath: ":memory:" })).toThrow(DbError);
+    expect(() => AuditDb.openReadOnly({ sqlitePath: "/tmp/escape.db" })).toThrow(ReadOnlyViolation);
+  });
+
+  test("a missing file maps to the actionable run-audit-first error (SQLITE_CANTOPEN)", () => {
+    expect(() => AuditDb.openReadOnly({ sqlitePath: join(TEST_ROOT, "never-created.db") })).toThrow(
+      /cannot open database .* run `bun run audit` first/,
+    );
+  });
+
+  test("a reader coexists with a LIVE writer connection on the same WAL database", () => {
+    const path = nextFile();
+    const writer = AuditDb.open({ sqlitePath: path });
+    try {
+      const { runId } = writer.startRun(runInput());
+      writer.completeRun(runId);
+      // writer connection still open (live -wal/-shm) — the reader must see committed state
+      const reader = AuditDb.openReadOnly({ sqlitePath: path });
+      try {
+        expect(reader.getRun(runId)?.status).toBe("completed");
+        // …and later writer commits become visible to subsequent reads on the same reader
+        const second = writer.startRun(runInput({ configHash: "hash-2" })).runId;
+        writer.completeRun(second);
+        expect(reader.getRun(second)?.status).toBe("completed");
+      } finally {
+        reader.close();
+      }
+    } finally {
+      writer.close();
+    }
+  });
+
+  test("mapReadOnlyOpenError classifies by result-code family (recovery/busy/cantopen states are impractical to fabricate live)", () => {
+    const err = (code: unknown): Error & { code?: unknown } => Object.assign(new Error("x"), { code });
+    const msg = (e: unknown): string => (e as Error).message;
+    expect(msg(mapReadOnlyOpenError(err("SQLITE_READONLY_RECOVERY"), "p"))).toContain("writable recovery");
+    for (const busy of ["SQLITE_BUSY", "SQLITE_BUSY_RECOVERY", "SQLITE_BUSY_TIMEOUT", "SQLITE_BUSY_SNAPSHOT"]) {
+      const mapped = mapReadOnlyOpenError(err(busy), "p");
+      expect(mapped).toBeInstanceOf(DbError);
+      expect(msg(mapped)).toContain("audit appears to be in progress");
+    }
+    for (const cant of ["SQLITE_CANTOPEN", "SQLITE_CANTOPEN_ISDIR"]) {
+      expect(msg(mapReadOnlyOpenError(err(cant), "p"))).toContain("run `bun run audit` first");
+    }
+    // unknown codes and non-Error shapes pass through VERBATIM (never swallowed)
+    const raw = err("SQLITE_CORRUPT");
+    expect(mapReadOnlyOpenError(raw, "p")).toBe(raw);
+    const noCode = new Error("plain");
+    expect(mapReadOnlyOpenError(noCode, "p")).toBe(noCode);
+  });
+});
+
+describe("open — version check precedes the --fresh drop", () => {
+  test("a NEWER-versioned database is rejected by --fresh with all data intact", () => {
+    const path = nextFile();
+    const db1 = AuditDb.open({ sqlitePath: path });
+    db1.completeRun(db1.startRun(runInput()).runId);
+    db1.close();
+    const bump = new Database(path, { strict: true });
+    bump.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+    bump.close();
+
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true, purgeCache: true })).toThrow(/upgrade the tool/);
+    // nothing was dropped before the rejection
+    const check = new Database(path, { readonly: true });
+    const n = (check.query("SELECT COUNT(*) AS n FROM runs WHERE status='completed'").get() as { n: number }).n;
+    expect(n).toBe(1);
+    check.close();
+  });
+});
+
+describe("open — current-version self-heal repairs a missing v3 column", () => {
+  test("a v3-stamped database lacking is_default_branch is repaired by the writer open, preserving data", () => {
+    const path = nextFile();
+    const db1 = AuditDb.open({ sqlitePath: path });
+    const { runId } = db1.startRun(runInput());
+    db1.completeRun(runId);
+    db1.close();
+    // Forge the dead-end state: v3 stamp, v2-shaped run_unit_head (no is_default_branch).
+    const forge = new Database(path, { strict: true });
+    forge.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch");
+    forge.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    forge.close();
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/is_default_branch/);
+
+    // openReadOnly's remediation is "run bun run audit" — the writer open MUST actually fix it.
+    const db2 = AuditDb.open({ sqlitePath: path });
+    expect(db2.getRun(runId)?.status).toBe("completed"); // data preserved
+    db2.close();
+    const reader = AuditDb.openReadOnly({ sqlitePath: path }); // and reads work again
+    expect(reader.getRun(runId)?.status).toBe("completed");
+    reader.close();
   });
 });

@@ -1,9 +1,10 @@
-import { expect, test, describe } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { expect, test, describe, spyOn } from "bun:test";
+import { Database } from "bun:sqlite";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso } from "./db.ts";
-import { buildNotReportableNotice, buildReport, runReport } from "./report.ts";
+import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
 import type { Config } from "./config.ts";
 
@@ -19,8 +20,8 @@ function seed(db: AuditDb) {
   });
   const now = nowIso();
   const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
-  db.upsertRunUnitHead({ runId, ...unit, status: "scanned" });
-  db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "old", commitSha: "", status: "skipped-cutoff" });
+  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null });
+  db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null });
   db.upsertDependencyFinding({
     runId, ...unit, dateFetched: now, packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
     manifestPath: "package.json", manifestLine: 5, manifestPermalink: "https://github.com/org-a/svc/blob/abc123def/package.json#L5",
@@ -91,6 +92,28 @@ describe("buildReport (§7)", () => {
     db.close();
   });
 
+  test("units carry the tri-state isDefaultBranch from run_unit_head (true/false/null)", () => {
+    const db = mem();
+    const run = seed(db); // seed's unit writes isDefaultBranch: null
+    const mk = (repository: string, isDefaultBranch: boolean | null): void => {
+      db.upsertDependencyFinding({
+        runId: run.runId, organization: "org-a", repository, branch: "main", commitSha: `sha-${repository}`,
+        dateFetched: "2026-01-01T00:00:00.000Z", packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
+        manifestPath: "package.json", manifestLine: 1, manifestPermalink: `https://github.com/org-a/${repository}/blob/sha/package.json#L1`,
+        declaredVersion: "^50.0.0",
+      });
+      db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository, branch: "main", commitSha: `sha-${repository}`, status: "scanned", isDefaultBranch });
+    };
+    mk("r-default", true);
+    mk("r-feature", false);
+    const report = buildReport(db, run) as any;
+    const flags = Object.fromEntries(
+      report.packages[0].usageByRepo.map((u: any) => [u.repository, u.isDefaultBranch]),
+    );
+    expect(flags).toEqual({ svc: null, "r-default": true, "r-feature": false });
+    db.close();
+  });
+
   test("a version whose introspection FAILED (no marker) is omitted from apiSurface but kept in versionsSeen", () => {
     const db = mem();
     const run = seed(db);
@@ -101,7 +124,7 @@ describe("buildReport (§7)", () => {
       manifestPath: "package.json", manifestLine: 3, manifestPermalink: "https://github.com/org-a/svc2/blob/def456/package.json#L3",
       declaredVersion: "^49.0.0", resolvedVersion: "49.0.0", resolvedVersionSource: "lockfile",
     });
-    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456", status: "scanned" });
+    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456", status: "scanned", isDefaultBranch: null });
     const report = buildReport(db, run) as any;
     const pkg = report.packages[0];
     expect(pkg.versionsSeen).toEqual(["49.0.0", "50.0.7"]); // both present, semver-sorted
@@ -251,18 +274,252 @@ describe("runReport zero-write on a missing database", () => {
 
   // Contrast case: when the database OPENS but holds no completed run, report must still write
   // the notice to output/latest.json — proving the missing-db guard only short-circuits the
-  // genuinely-absent case and does not suppress a real (if empty) report. An in-memory DB is a
-  // real, empty database that opens without hitting §0 write-containment (which pins a FILE db to
-  // ./data|./output and so rules out a temp-dir file db here); the notReportable branch is
-  // identical regardless of DB backing, and outputDir stays a real temp dir we can assert on.
+  // genuinely-absent case and does not suppress a real (if empty) report. runReport now opens
+  // READ-ONLY (CV5), which refuses :memory:, so the empty DB must be a real FILE — and §0
+  // write-containment pins file DBs to ./data|./output relative to CWD, hence the db.test.ts
+  // TEST_ROOT idiom here (created and removed carefully so fresh checkouts stay pristine).
   test("DB opens but no completed run: writes the notice to latest.json, no run file", () => {
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-${process.pid}-${Math.random().toString(36).slice(2)}`;
     const root = mkdtempSync(join(tmpdir(), "report-emptydb-"));
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      AuditDb.open({ sqlitePath }).close(); // a real, empty, cleanly-closed v3 database
+      const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
+      const { line } = runReport(cfg, null);
+      expect(JSON.parse(line).reason).toBe("no completed reportable run yet");
+      expect(readdirSync(join(root, "output"))).toEqual(["latest.json"]); // only latest.json, no run-<id>.json
+      const written = JSON.parse(readFileSync(join(root, "output", "latest.json"), "utf8"));
+      expect(notReportableSchema.safeParse(written).success).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test("a too-old (v2) file database is refused through runReport with the migrate-first error", () => {
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-v2-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const root = mkdtempSync(join(tmpdir(), "report-v2db-"));
+    try {
+      // Minimal v2-stamped file with audit tables: enough for openReadOnly's version gate,
+      // which fires BEFORE any table/column inspection needs to succeed.
+      const sqlitePath = join(dbRoot, "audit.db");
+      AuditDb.open({ sqlitePath }).close(); // create a real v3 db…
+      const bump = new Database(sqlitePath, { strict: true });
+      bump.exec("PRAGMA user_version = 2"); // …then stamp it old
+      bump.close();
+      const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
+      expect(() => runReport(cfg, null)).toThrow(/run `bun run audit` once to migrate/);
+      expect(existsSync(join(root, "output"))).toBe(false); // refused before any artifact write
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test(":memory: sqlitePath folds into the missing-db notice (nothing to read, nothing written)", () => {
+    const root = mkdtempSync(join(tmpdir(), "report-mem-"));
     const cfg: Config = { ...config(root), paths: { sqlitePath: ":memory:", outputDir: join(root, "output") } };
     const { line } = runReport(cfg, null);
-    expect(JSON.parse(line).reason).toBe("no completed reportable run yet");
-    expect(readdirSync(join(root, "output"))).toEqual(["latest.json"]); // only latest.json, no run-<id>.json
-    const written = JSON.parse(readFileSync(join(root, "output", "latest.json"), "utf8"));
-    expect(notReportableSchema.safeParse(written).success).toBe(true);
+    const notice = JSON.parse(line);
+    expect(notice.notReportable).toBe(true);
+    expect(notice.reason).toContain("run `bun run audit` first");
+    expect(readdirSync(root)).toEqual([]); // no output dir materialized
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("report --html wiring (emitDossiers + runReport integration)", () => {
+  const config = (root: string): Config => ({
+    concurrency: { branches: 1, organizations: 1, repositories: 1 },
+    cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
+    includeArchived: false, includeForks: false, includePersonalNamespace: false,
+    maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],
+    packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+    paths: { sqlitePath: join(root, "data", "audit.db"), outputDir: join(root, "output") },
+  });
+
+  test("emitDossiers writes one dossier per package + index + manifest, with visible observation status", () => {
+    const db = mem();
+    const run = seed(db);
+    const report = buildReport(db, run);
+    const out = mkdtempSync(join(tmpdir(), "dossier-wire-"));
+    const chunks: string[] = [];
+    const spy = spyOn(process.stdout, "write").mockImplementation(((c: unknown) => {
+      chunks.push(String(c));
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      const { dossiers, swept } = emitDossiers(report, out);
+      expect(dossiers).toBe(1);
+      expect(swept).toEqual([]);
+      const xray = join(out, "xray");
+      const files = readdirSync(xray).sort();
+      expect(files).toEqual(["expo-dossier.html", "index.html", "manifest.json"]);
+      const manifest = JSON.parse(readFileSync(join(xray, "manifest.json"), "utf8"));
+      expect(manifest.runId).toBe(run.runId);
+      expect(manifest.artifacts.every((a: any) => a.kind === "dossier")).toBe(true);
+      // the dossier itself carries the escaped evidence, never a raw script breakout
+      const html = readFileSync(join(xray, "expo-dossier.html"), "utf8");
+      expect(html).toContain("registerRootComponent");
+    } finally {
+      spy.mockRestore();
+      rmSync(out, { recursive: true, force: true });
+      db.close();
+    }
+    const events = chunks.join("").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l));
+    const dossierEvents = events.filter((e) => e.event === "dossier");
+    expect(dossierEvents.length).toBe(1);
+    expect(dossierEvents[0].package).toBe("expo");
+    expect(["emitted", "omitted"]).toContain(dossierEvents[0].observations);
+    const summary = events.filter((e) => e.event === "dossier-summary");
+    expect(summary.length).toBe(1);
+    expect(summary[0].dossiers).toBe(1);
+  });
+
+  test("runReport --html renders dossiers end-to-end from a file database (read-only open)", () => {
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-html-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const root = mkdtempSync(join(tmpdir(), "report-html-"));
+    const chunks: string[] = [];
+    const spy = spyOn(process.stdout, "write").mockImplementation(((c: unknown) => {
+      chunks.push(String(c));
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      seed(db);
+      db.close();
+      const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
+      const { line } = runReport(cfg, null, { html: true });
+      expect(line).toContain("dossier(s) + index");
+      const xray = join(root, "output", "xray");
+      expect(readdirSync(xray).sort()).toEqual(["expo-dossier.html", "index.html", "manifest.json"]);
+      // and WITHOUT --html nothing dossier-ish is produced on a fresh outputDir
+      const root2 = mkdtempSync(join(tmpdir(), "report-nohtml-"));
+      try {
+        const cfg2: Config = { ...config(root2), paths: { sqlitePath, outputDir: join(root2, "output") } };
+        runReport(cfg2, null, {});
+        expect(existsSync(join(root2, "output", "xray"))).toBe(false);
+      } finally {
+        rmSync(root2, { recursive: true, force: true });
+      }
+    } finally {
+      spy.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+});
+
+// ---- dual-review round-2 regression (2026-07-11): raw outputDir mkdir must be canonical ----------
+// A config-accepted outputDir containing a `..` chain (canonical resolution lands INSIDE the
+// roots) must not cause recursive mkdir to create the chain's intermediate directories OUTSIDE
+// them: mkdirSync creates each component physically, so `out/../evil/../out/sub` would create
+// `evil/`. The emit path must mkdir the CANONICAL path only.
+test("emitReportDetailed: a ..-chain outputDir creates no directories outside its canonical root", async () => {
+  const { emitReportDetailed } = await import("./report.ts");
+  const tmp = mkdtempSync(join(tmpdir(), "report-esc-"));
+  try {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["o"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    db.completeRun(runId);
+    const run = db.getRun(runId)!;
+    const outputDir = `${tmp}/out/../evil/../out/sub`; // canonical: <tmp>/out/sub
+    emitReportDetailed(db, run, outputDir, { alsoLatest: false });
+    db.close();
+    expect(existsSync(join(tmp, "evil"))).toBe(false); // nothing outside the canonical root
+    expect(existsSync(join(tmp, "out", "sub", `run-${runId}.json`))).toBe(true);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+describe("buildReport — run-scope head-join discrimination (M7)", () => {
+  test("a finding whose run_id MOVED to a later run still appears in the older run's report", () => {
+    // Load-bearing invariant (mirrors export.test.ts / compare.test.ts): buildReport scopes findings
+    // through run_unit_head, NEVER findings.run_id. A finding's upsert OVERWRITES run_id (db.ts
+    // ON CONFLICT ... SET run_id = excluded.run_id), so a later run re-scanning the SAME commit
+    // steals the row's run_id. Run A's report must still contain the row via its immutable head
+    // snapshot; a `WHERE df/uf.run_id = ?` regression in report.ts drops it and fails here.
+    const db = mem();
+    const input = {
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered" as const,
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    };
+    const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "ccc333def4567" };
+    const usage = {
+      ...unit, packageName: "expo", dependencyKey: "expo", usageType: "named-import" as const,
+      exportName: "sharedExport", context: "", filePath: "src/shared.ts", lineNumber: 4,
+      permalink: "https://github.com/org-a/svc/blob/ccc333def4567/src/shared.ts#L4", snippet: "import { sharedExport } from 'expo';",
+      foundAt: "2026-01-01T00:00:00.000Z",
+    };
+    // A dependency finding on the SAME unit: buildReport joins dependency_findings and usage_findings
+    // through run_unit_head via SEPARATE queries, so the test must move BOTH — a regression that
+    // filters only ONE of the two on findings.run_id would otherwise slip through.
+    const dep = {
+      ...unit, dateFetched: "2026-01-01T00:00:00.000Z", packageName: "expo", dependencyKey: "expo",
+      dependencyType: "dependencies" as const, manifestPath: "package.json", manifestLine: 3,
+      manifestPermalink: "https://github.com/org-a/svc/blob/ccc333def4567/package.json#L3",
+      declaredVersion: "^50.0.0", resolvedVersion: "50.0.9", resolvedVersionSource: "lockfile" as const,
+    };
+    const { runId: rA } = db.startRun(input);
+    db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertUsageFinding({ runId: rA, ...usage });
+    db.upsertDependencyFinding({ runId: rA, ...dep });
+    db.completeRun(rA);
+    Bun.sleepSync(2);
+    const { runId: rB } = db.startRun(input);
+    db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertUsageFinding({ runId: rB, ...usage }); // same UNIQUE key → uf.run_id moves to rB
+    db.upsertDependencyFinding({ runId: rB, ...dep }); // same UNIQUE key → df.run_id moves to rB
+    db.completeRun(rB);
+
+    // Precondition: BOTH findings' run_ids really did move (otherwise this test discriminates nothing).
+    const movedU = db.read("SELECT run_id FROM usage_findings WHERE file_path = 'src/shared.ts'").get() as { run_id: string };
+    const movedD = db.read("SELECT run_id FROM dependency_findings WHERE manifest_path = 'package.json'").get() as { run_id: string };
+    expect(movedU.run_id).toBe(rB);
+    expect(movedD.run_id).toBe(rB);
+
+    const report = buildReport(db, db.getRun(rA)!);
+    const expo = report.packages.find((p) => p.name === "expo");
+    // usage_findings join (a uf.run_id regression drops this)
+    const files = expo?.usageByRepo.flatMap((u) => u.apiUsage.map((a) => a.file)) ?? [];
+    expect(files).toContain("src/shared.ts");
+    // dependency_findings join (a df.run_id regression drops this)
+    const versions = expo?.usageByRepo.flatMap((u) => u.declarations.map((d) => d.resolvedVersion)) ?? [];
+    expect(versions).toContain("50.0.9");
+    db.close();
+  });
+});
+
+describe("parseLockfileLines — corrupted self-produced data degrades to null, never throws (L5)", () => {
+  test("null passes through; a valid integer array parses", () => {
+    expect(parseLockfileLines(null)).toBeNull();
+    expect(parseLockfileLines("[10, 11]")).toEqual([10, 11]);
+    expect(parseLockfileLines("[]")).toEqual([]);
+  });
+  test("a corrupted cell (invalid JSON or wrong shape) degrades to null instead of throwing", () => {
+    expect(parseLockfileLines("not json")).toBeNull(); // would have thrown SyntaxError before the guard
+    expect(parseLockfileLines('{"a":1}')).toBeNull(); // parseable but not an array
+    expect(parseLockfileLines('["10","11"]')).toBeNull(); // array of non-numbers
+    expect(parseLockfileLines("42")).toBeNull(); // parseable but not an array
+    expect(parseLockfileLines("[1.5]")).toBeNull(); // number-typed but not an integer line ref
+    expect(parseLockfileLines("[1e400]")).toBeNull(); // parses to Infinity (typeof "number") — rejected
+    expect(parseLockfileLines("[10, 2.5]")).toBeNull(); // one bad element rejects the whole array
+    expect(parseLockfileLines("[0]")).toBeNull(); // 0 is not a 1-based line number
+    expect(parseLockfileLines("[-3]")).toBeNull(); // negative
+    expect(parseLockfileLines("[9007199254740993]")).toBeNull(); // > MAX_SAFE_INTEGER (unsafe)
+  });
+  test("a valid positive safe-integer array parses (including large in-range values)", () => {
+    expect(parseLockfileLines("[1, 42, 999999]")).toEqual([1, 42, 999999]);
   });
 });

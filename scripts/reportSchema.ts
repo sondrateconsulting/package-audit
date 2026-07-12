@@ -4,8 +4,8 @@
 // Validation runs in TESTS (report.test.ts), never in the emit path — a schema bug must not be
 // able to fail a completed scan's report write (§7 determinism).
 //
-// DEPENDENCY JUSTIFICATION (§6 — minimize deps): zod is the repo's second npm package — a
-// devDependency, test-only (`typescript`, used for .d.ts AST parsing, is the sole runtime dep).
+// DEPENDENCY JUSTIFICATION (§6 — minimize deps): zod is one of the repo's two devDependencies
+// (with `@types/bun`) — test-only (`typescript`, used for .d.ts AST parsing, is the sole runtime dep).
 // Justification: a schema-as-docs contract for the report consumed by downstream tooling, with
 // validation errors that name the failing path — hand-rolling that (or maintaining prose docs
 // against a moving shape) is strictly worse. zod v4 is dependency-free and pinned exactly.
@@ -99,6 +99,12 @@ export const usageByRepoSchema = z
     organization: z.string().describe("GitHub owner (org, or the personal login when includePersonalNamespace scanned it)"),
     repository: z.string().describe("Repository name"),
     branch: z.string().describe("Branch name"),
+    isDefaultBranch: z
+      .boolean()
+      .nullable()
+      .describe(
+        "Tri-state (§5.B): true/false when discovery recorded whether this is the repo's default branch; null on pre-v3 runs (unknown — renderers show it as its own state, never as false)",
+      ),
     commitSha: z.string().describe("The snapshot head this run REPORTED for the unit (run_unit_head) — all evidence below is pinned to it"),
     dateFetched: isoUtc.describe("MAX over the unit's dependency/usage timestamps"),
     declarations: z.array(declarationSchema),

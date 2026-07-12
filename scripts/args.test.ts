@@ -98,7 +98,13 @@ describe("parseArgs", () => {
 
 describe("parseReportArgs", () => {
   test("defaults with no args", () => {
-    expect(parseReportArgs([])).toEqual({ configPath: null, runId: null, help: false });
+    expect(parseReportArgs([])).toEqual({ configPath: null, runId: null, html: false, help: false });
+  });
+  test("--html is a bare boolean: set once, no value, no duplicates", () => {
+    expect(parseReportArgs(["--html"]).html).toBe(true);
+    expect(parseReportArgs(["--html", "--run-id", "r-1"])).toEqual({ configPath: null, runId: "r-1", html: true, help: false });
+    expect(() => parseReportArgs(["--html", "--html"])).toThrow(ArgsError);
+    expect(() => parseReportArgs(["--html=yes"])).toThrow(ArgsError);
   });
   test("--run-id with space and = forms", () => {
     expect(parseReportArgs(["--run-id", "r-1"]).runId).toBe("r-1");
@@ -116,6 +122,15 @@ describe("parseReportArgs", () => {
     expect(() => parseReportArgs(["--run-id"])).toThrow(ArgsError);
     expect(() => parseReportArgs(["--run-id="])).toThrow(ArgsError);
   });
+  test("rejects a --run-id with a path separator or traversal (it is interpolated into run-<id>.json)", () => {
+    // report.ts builds `run-${runId}.json`; a value with '/' or '..' must never reach that template.
+    expect(() => parseReportArgs(["--run-id", "../../xray/manifest"])).toThrow(/invalid run id/);
+    expect(() => parseReportArgs(["--run-id", "a/b"])).toThrow(/invalid run id/);
+    expect(() => parseReportArgs(["--run-id", ".."])).toThrow(/invalid run id/);
+    expect(() => parseReportArgs(["--run-id", "a b"])).toThrow(/invalid run id/);
+    // a real (randomUUID-shaped) run id is accepted unchanged
+    expect(parseReportArgs(["--run-id", "1f2e3d4c-5b6a-7089-90ab-cdef01234567"]).runId).toBe("1f2e3d4c-5b6a-7089-90ab-cdef01234567");
+  });
   test("rejects duplicate --run-id and duplicate --config", () => {
     expect(() => parseReportArgs(["--run-id", "a", "--run-id", "b"])).toThrow(ArgsError);
     expect(() => parseReportArgs(["--config", "/a", "--config", "/b"])).toThrow(ArgsError);
@@ -132,7 +147,7 @@ describe("help text", () => {
       expect(ORCHESTRATE_HELP).toContain(flag);
   });
   test("report help names every flag and the config precedence", () => {
-    for (const flag of ["--config", "--run-id", "--help"]) expect(REPORT_HELP).toContain(flag);
+    for (const flag of ["--config", "--run-id", "--html", "--help"]) expect(REPORT_HELP).toContain(flag);
     expect(REPORT_HELP).toContain("CONFIG_PATH");
   });
 });

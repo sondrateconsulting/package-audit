@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
+import { logLine } from "./log.ts";
 
 export class DbError extends Error {
   constructor(message: string) {
@@ -20,8 +21,20 @@ function fail(msg: string): never {
   throw new DbError(msg);
 }
 
-// Bump when the schema changes; older on-disk versions run the §3 migration.
-export const SCHEMA_VERSION = 2;
+// Bump when the schema changes; older on-disk versions run the §3 VERSION-STEPPED migration
+// chain — each step is one transaction that stamps its own target version, so a crash between
+// steps leaves a valid intermediate database that the next open resumes from.
+export const SCHEMA_VERSION = 3;
+// Every migration step stamps its own PINNED target version — never the mutable
+// SCHEMA_VERSION. (If a step stamped SCHEMA_VERSION, bumping the constant for v4 would make a
+// crash between the v2→v3 step and the future v3→v4 step leave a v3-SHAPED database stamped 4,
+// and every later open would skip the missing migration.)
+// migrateLegacy's target. The legacy migration is QUARANTINED to user_version < 2: it rebuilds
+// the run-scoped tables EMPTY (sound only for pre-v2 databases, whose findings are
+// non-reportable) — routing a v2+ database through it would DESTROY reportable data.
+const LEGACY_TARGET_VERSION = 2;
+// migrateV2toV3's target.
+const V3_TARGET_VERSION = 3;
 
 // §7 SURFACE-CACHE EPOCH. Bumped when the introspection LOGIC changes (resolver correctness, parse
 // bounds) so a package audited by an OLDER, buggier resolver does NOT keep its stale '__complete__'
@@ -187,6 +200,10 @@ export interface RunUnitHeadInput {
   branch: string;
   commitSha: string; // '' for skipped-cutoff branches (never scanned)
   status: UnitHeadStatus;
+  // Tri-state, REQUIRED (not optional — `undefined` must never silently become "not default"):
+  // true/false when discovery knew the repo's default branch, null = unknown. Pre-v3 rows are
+  // NULL by migration backfill; the report renders NULL as its own designed state, never as 0.
+  isDefaultBranch: boolean | null;
 }
 
 export interface ApiCacheEntry {
@@ -286,6 +303,7 @@ CREATE TABLE IF NOT EXISTS run_unit_head (
   commit_sha TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'scanned'
     CHECK (status IN ('scanned','skipped-cutoff')),
+  is_default_branch INTEGER,
   PRIMARY KEY (run_id, organization, repository, branch)
 );
 CREATE TABLE IF NOT EXISTS api_cache (
@@ -366,11 +384,37 @@ function addColumnIfMissing(db: Database, table: string, column: string, ddl: st
   if (!columnExists(db, table, column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
 }
 
-// ---- migration (§3: ONE transaction, run-scoped-reset) --------------------------------------
+// Translate the SQLite failure modes a READ-ONLY open can hit into actionable operator errors.
+// Classified by result code (never message text). SQLITE_READONLY_RECOVERY is matched exactly
+// (a crashed writer's WAL needs WRITABLE recovery — waiting won't help; the fix is one writable
+// open); the BUSY and CANTOPEN families are matched by PREFIX so extended variants
+// (SQLITE_BUSY_TIMEOUT, SQLITE_BUSY_SNAPSHOT, SQLITE_CANTOPEN_*) classify with their primary
+// code. Anything else is rethrown verbatim. Exported for direct unit tests — the recovery/busy
+// states are impractical to fabricate deterministically in a test fixture.
+export function mapReadOnlyOpenError(e: unknown, path: string): unknown {
+  const code = (e as { code?: unknown }).code;
+  if (typeof code !== "string") return e;
+  if (code === "SQLITE_READONLY_RECOVERY")
+    return new DbError(
+      `database at ${path} has a WAL needing writable recovery (a previous writer crashed) — ` +
+        "run `bun run audit` once (the only writable command), then retry",
+    );
+  if (code.startsWith("SQLITE_BUSY"))
+    return new DbError(`database at ${path} is busy — an audit appears to be in progress; retry when it finishes`);
+  if (code.startsWith("SQLITE_CANTOPEN"))
+    return new DbError(`cannot open database at ${path} — run \`bun run audit\` first`);
+  return e;
+}
+
+// ---- migrations (§3: version-stepped; each step ONE transaction stamping its target) --------
+// migrateLegacy — the pre-v2 (legacy) step, QUARANTINED to user_version < LEGACY_TARGET_VERSION.
 // Preserves the provenance tables (runs, run_unit_head) via additive ALTERs, preserves the
 // caches (api_cache rebuilt WITH row copy; package_api_surface via ALTER), rebuilds the
 // run-scoped tables EMPTY in their new shape, and marks every pre-existing 'running' run
 // failed so the startup resume rule can never select a pre-migration run as the live run.
+// ⚠️ NEVER route a v2+ database through this step: the run-scoped reset is sound ONLY for
+// legacy databases (whose findings are non-reportable) — on a v2 database it destroys
+// reportable data. It stamps exactly LEGACY_TARGET_VERSION; later steps take it from there.
 function migrateLegacy(db: Database): void {
   db.transaction(() => {
     // 1. Additive ALTERs on the PRESERVED tables first (§3 ordering). Every added NOT NULL
@@ -423,9 +467,28 @@ function migrateLegacy(db: Database): void {
     //    so it can never be resumed as the live run with tracked_packages='[]'.
     if (tableExists(db, "runs")) db.exec(`UPDATE runs SET status='failed' WHERE status='running'`);
 
-    // 5. New-shape CREATEs fill the emptied/missing tables + indexes, then stamp the version.
+    // 5. New-shape CREATEs fill the emptied/missing tables + indexes, then stamp THIS step's
+    //    target version (never SCHEMA_VERSION — the v2→v3 step still has to run; a crash
+    //    between the steps leaves a valid v2-stamped database the next open resumes from).
+    //    SCHEMA_SQL is the CURRENT schema, so freshly-created tables may already carry later
+    //    columns — harmless: later steps use addColumnIfMissing, and preserved tables (the ones
+    //    with data) get their new columns only from their own step's ALTER.
     db.exec(SCHEMA_SQL);
-    setUserVersion(db, SCHEMA_VERSION);
+    setUserVersion(db, LEGACY_TARGET_VERSION);
+  })();
+}
+
+// migrateV2toV3 — additive: run_unit_head gains nullable is_default_branch (INTEGER 1/0/NULL;
+// NULL = unknown). Existing v2 rows are backfilled NULL by construction (ALTER ADD COLUMN),
+// NEVER 0 — "unknown" and "not the default branch" are different report states. SCHEMA_SQL runs
+// FIRST: a `--fresh` drop on a v2 database removes run_unit_head while the preserved caches
+// keep the database non-empty, so this step must recreate missing tables (already v3-shaped)
+// before the ALTER can assume run_unit_head exists.
+function migrateV2toV3(db: Database): void {
+  db.transaction(() => {
+    db.exec(SCHEMA_SQL);
+    addColumnIfMissing(db, "run_unit_head", "is_default_branch", "INTEGER");
+    setUserVersion(db, V3_TARGET_VERSION);
   })();
 }
 
@@ -434,6 +497,19 @@ export interface OpenDbOptions {
   sqlitePath: string;
   fresh?: boolean;
   purgeCache?: boolean;
+}
+
+// The narrowed READ surface returned by AuditDb.openReadOnly — the read commands (report,
+// export, compare, --html) accept this instead of the full AuditDb, so a write call is a
+// compile-time error, not a runtime SQLITE_READONLY surprise. In-process discipline, not a
+// security boundary; a cast that bypasses it is a programming bug.
+export interface AuditDbReader {
+  read(sql: string): Statement;
+  readTransaction<T>(fn: () => T): T;
+  getRun(runId: string): RunRecord | null;
+  latestReportableRun(): RunRecord | null;
+  hasCompletionMarker(packageName: string, version: string): boolean;
+  close(): void;
 }
 
 export class AuditDb {
@@ -467,6 +543,15 @@ export class AuditDb {
     return this.db.query(trimmed);
   }
 
+  // Run `fn`'s reads inside ONE deferred transaction so a multi-statement build (report,
+  // export, compare) sees a single coherent snapshot even while a live audit commits between
+  // its statements (WAL readers never block the writer; without this, two sequential SELECTs
+  // can straddle a commit). Valid on read-only connections — a deferred BEGIN takes no write
+  // lock unless something inside writes, which the readonly mode then rejects.
+  readTransaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)() as T;
+  }
+
   close(): void {
     this.db.close();
   }
@@ -484,13 +569,20 @@ export class AuditDb {
       path = assertContained(resolved, roots);
     }
     // strict: throws on binding-count mismatches instead of silently binding NULLs.
+    // NOTE: `safeIntegers` is intentionally left OFF (the default). With it off, bun:sqlite returns
+    // JS `number` for INTEGER columns (not bigint), which the report/export/compare row typings
+    // (`… as { …: number }[]`) rely on. Turning it ON would silently mistype those and break
+    // JSON.stringify / numeric sort comparators / csvCell's number branch — revisit those cast sites
+    // first before ever enabling it.
     const db = new Database(path, { create: true, strict: true });
+    // busy_timeout FIRST — it is per-connection and must protect the very next statement
+    // (the WAL pragma takes a lock and would otherwise fail immediately under contention).
     // journal_mode is persistent (in the file header) but re-asserting is harmless;
-    // foreign_keys and busy_timeout are per-connection and must be set on every open.
-    // All three run OUTSIDE any transaction (journal_mode cannot change inside one).
+    // foreign_keys is per-connection too. All three run OUTSIDE any transaction
+    // (journal_mode cannot change inside one).
+    db.exec("PRAGMA busy_timeout = 5000;");
     db.exec("PRAGMA journal_mode = WAL;");
     db.exec("PRAGMA foreign_keys = ON;");
-    db.exec("PRAGMA busy_timeout = 5000;");
 
     const userVersion = readUserVersion(db);
     if (userVersion > SCHEMA_VERSION) {
@@ -499,13 +591,31 @@ export class AuditDb {
     }
 
     if (opts.fresh === true) {
+      // Count what --fresh erases INSIDE the drop transaction (a count taken outside could
+      // race a concurrent writer), but warn only AFTER the transaction commits — the warning
+      // must describe what actually happened, not what a rolled-back transaction intended.
+      // Completed runs are the operator-meaningful loss: their per-run reports
+      // (report --run-id) and any future run-to-run comparison history become unrecoverable.
+      let completedDropped = 0;
       db.transaction(() => {
+        if (tableExists(db, "runs")) {
+          const row = db.query(`SELECT COUNT(*) AS n FROM runs WHERE status='completed'`).get() as { n: number };
+          completedDropped = row.n;
+        }
         for (const t of FRESH_DROP_ORDER) db.exec(`DROP TABLE IF EXISTS ${t}`);
         if (opts.purgeCache === true) {
           db.exec("DROP TABLE IF EXISTS api_cache");
           db.exec("DROP TABLE IF EXISTS package_api_surface");
         }
       })();
+      if (completedDropped > 0) {
+        logLine({
+          event: "warning",
+          reason: "fresh-dropped-completed-runs",
+          completedRunsDropped: completedDropped,
+          message: `--fresh dropped ${completedDropped} completed run(s) — their run history (report --run-id, run-to-run comparison) is unrecoverable`,
+        });
+      }
     }
 
     const existing = AUDIT_TABLES.filter((t) => tableExists(db, t));
@@ -520,9 +630,66 @@ export class AuditDb {
         setUserVersion(db, SCHEMA_VERSION);
       })();
     } else if (userVersion < SCHEMA_VERSION) {
-      migrateLegacy(db);
+      // Version-stepped chain: the quarantined legacy step first (pre-v2 only), then each
+      // additive step gated on its own PINNED target. Every step stamps that target in its
+      // own transaction, so a crash mid-chain resumes cleanly on the next open.
+      if (userVersion < LEGACY_TARGET_VERSION) migrateLegacy(db);
+      if (readUserVersion(db) < V3_TARGET_VERSION) migrateV2toV3(db);
     } else {
-      db.exec(SCHEMA_SQL); // idempotent fill for any missing table/index
+      // Idempotent self-heal for a current-version database: recreate any missing
+      // table/index AND re-apply the additive column set transactionally. Without the
+      // column repair, a v3-stamped file missing is_default_branch would be a dead end —
+      // openReadOnly's "run `bun run audit`" remediation must actually fix it.
+      db.transaction(() => {
+        db.exec(SCHEMA_SQL);
+        addColumnIfMissing(db, "run_unit_head", "is_default_branch", "INTEGER");
+      })();
+    }
+    return new AuditDb(db);
+  }
+
+  // The read-command open seam (report/export/compare/--html): {readonly:true}, busy_timeout
+  // FIRST, then version + schema sanity checks — no journal_mode pragma (a write attempt on a
+  // readonly connection), no DDL, no migration, no mkdir. Callers exist-check the file BEFORE
+  // calling (the runReport precedent), so a missing file is their notice, not our error.
+  // NOT literally zero-filesystem-effect: SQLite may still create -wal/-shm sidecars for a
+  // WAL database when they are absent and the directory is writable — which is why the §0
+  // path containment applies to reads too (sidecars land beside the contained db file).
+  static openReadOnly(opts: { sqlitePath: string }): AuditDbReader {
+    if (opts.sqlitePath === ":memory:")
+      fail("openReadOnly cannot open :memory: — a fresh in-memory database has nothing to read");
+    const roots = [resolve("./data"), resolve("./output")];
+    const path = assertContained(opts.sqlitePath, roots);
+    let db: Database;
+    try {
+      // safeIntegers intentionally off — see the read-write open: INTEGER columns must stay JS
+      // `number` for the report/export/compare row casts.
+      db = new Database(path, { readonly: true, strict: true });
+    } catch (e) {
+      throw mapReadOnlyOpenError(e, path);
+    }
+    try {
+      db.exec("PRAGMA busy_timeout = 5000;"); // FIRST — protects every later lock-taking read
+      const userVersion = readUserVersion(db);
+      if (userVersion > SCHEMA_VERSION)
+        fail(`database schema version ${userVersion} is newer than this tool's ${SCHEMA_VERSION} — upgrade the tool`);
+      if (userVersion < SCHEMA_VERSION)
+        fail(
+          `database schema version ${userVersion} is older than this tool's ${SCHEMA_VERSION} — ` +
+            "run `bun run audit` once to migrate it, then retry",
+        );
+      // Schema sanity up front: a foreign file, or one missing an audit table or the v3
+      // is_default_branch column, must fail HERE with an actionable message, not later with a
+      // raw "no such table" (or "no such column") mid-query.
+      for (const t of AUDIT_TABLES) {
+        if (!tableExists(db, t))
+          fail(`database is missing the ${t} table — run \`bun run audit\` once to repair it, then retry`);
+      }
+      if (!columnExists(db, "run_unit_head", "is_default_branch"))
+        fail("database is missing the v3 is_default_branch column — run `bun run audit` once to migrate, then retry");
+    } catch (e) {
+      db.close();
+      throw e instanceof DbError ? e : mapReadOnlyOpenError(e, path);
     }
     return new AuditDb(db);
   }
@@ -794,15 +961,20 @@ export class AuditDb {
 
   // Per-run immutable snapshot row (§3 report-head invariant). Upserted both when a unit is
   // scanned and when it is skipped-as-current (same head), or skipped-cutoff (commit_sha='').
+  // is_default_branch maps true/false/null → 1/0/NULL (tri-state; NULL = unknown, §5.B).
   upsertRunUnitHead(h: RunUnitHeadInput): void {
     this.db
       .query(
-        `INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(run_id, organization, repository, branch)
-         DO UPDATE SET commit_sha = excluded.commit_sha, status = excluded.status`,
+         DO UPDATE SET commit_sha = excluded.commit_sha, status = excluded.status,
+           is_default_branch = excluded.is_default_branch`,
       )
-      .run(h.runId, h.organization, h.repository, h.branch, h.commitSha, h.status);
+      .run(
+        h.runId, h.organization, h.repository, h.branch, h.commitSha, h.status,
+        h.isDefaultBranch === null ? null : h.isDefaultBranch ? 1 : 0,
+      );
   }
 
   // ---- api_cache (§3 caching rules; REST-GET only — GraphQL is never cached) -----------------

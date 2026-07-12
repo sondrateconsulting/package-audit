@@ -58,5 +58,5 @@ function emptyRemediation(input: OwnerResolveInput, source: OwnersSource): strin
     if (!input.includePersonalNamespace) hints.push("an explicit `organizations: []` needs `includePersonalNamespace: true` to have any owner");
   }
   if (input.excludeOrganizations.length > 0) hints.push("`excludeOrganizations` may be removing every owner");
-  return `effective owner list is EMPTY (${source} mode). Likely causes: ${hints.join("; ")}. See README § Scoping your scan.`;
+  return `effective owner list is EMPTY (${source} mode). Likely causes: ${hints.join("; ")}. See README § Quickstart.`;
 }

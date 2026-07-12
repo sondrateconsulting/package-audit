@@ -28,7 +28,7 @@ describe("classifyBranchPlan (§5.B cutoff + cap)", () => {
       head("stale", "2023-12-31T23:59:59Z"), // before cutoff
       head("feature", "2025-04-01T10:00:00Z"), // past cap (cap=2)
     ];
-    const p = classifyBranchPlan(heads, "2024-01-01", 2);
+    const p = classifyBranchPlan(heads, "2024-01-01", 2, "");
     expect(p.cutoffSkipped.map((h) => h.name)).toEqual(["stale"]);
     expect(p.eligible.map((h) => h.name)).toEqual(["main", "dev"]);
     expect(p.pastCap.map((h) => h.name)).toEqual(["feature"]);
@@ -39,18 +39,58 @@ describe("classifyBranchPlan (§5.B cutoff + cap)", () => {
       head("b", "2023-02-01T00:00:00Z"),
       head("c", "2023-03-01T00:00:00Z"),
     ];
-    const p = classifyBranchPlan(heads, "2024-01-01", 1);
+    const p = classifyBranchPlan(heads, "2024-01-01", 1, "");
     expect(p.cutoffSkipped).toHaveLength(3); // cap never limits cutoff records
     expect(p.eligible).toHaveLength(0);
     expect(p.pastCap).toHaveLength(0);
   });
   test("a commit ON the cutoff date is eligible (skip is strictly before cutoffDate)", () => {
-    const p = classifyBranchPlan([head("edge", "2024-01-01T00:00:00Z")], "2024-01-01", 25);
+    const p = classifyBranchPlan([head("edge", "2024-01-01T00:00:00Z")], "2024-01-01", 25, "");
     expect(p.eligible.map((h) => h.name)).toEqual(["edge"]);
     expect(p.cutoffSkipped).toHaveLength(0);
   });
   test("empty input yields empty groups", () => {
-    expect(classifyBranchPlan([], "2024-01-01", 25)).toEqual({ cutoffSkipped: [], eligible: [], pastCap: [] });
+    expect(classifyBranchPlan([], "2024-01-01", 25, "main")).toEqual({ cutoffSkipped: [], eligible: [], pastCap: [] });
+  });
+});
+
+describe("classifyBranchPlan — the DEFAULT branch is always eligible (§5.B/CV2)", () => {
+  test("a default branch OLDER than the cutoff is eligible, never cutoff-skipped", () => {
+    const heads = [
+      head("feature", "2025-06-01T00:00:00Z"),
+      head("main", "2022-01-01T00:00:00Z"), // ancient default — dormant repo, active fork branches
+    ];
+    const p = classifyBranchPlan(heads, "2024-01-01", 25, "main");
+    expect(p.eligible.map((h) => h.name)).toEqual(["feature", "main"]);
+    expect(p.cutoffSkipped).toHaveLength(0);
+  });
+  test("a default branch beyond the cap position is eligible; the cap still bounds the rest", () => {
+    const heads = [
+      head("hotfix", "2025-06-01T00:00:00Z"),
+      head("dev", "2025-05-01T00:00:00Z"),
+      head("main", "2025-01-01T00:00:00Z"), // would be past-cap by recency alone (cap=2)
+      head("old-feature", "2024-06-01T00:00:00Z"),
+    ];
+    const p = classifyBranchPlan(heads, "2024-01-01", 2, "main");
+    expect(p.eligible.map((h) => h.name)).toEqual(["hotfix", "dev", "main"]); // input order kept
+    expect(p.pastCap.map((h) => h.name)).toEqual(["old-feature"]);
+  });
+  test("the cap counts NON-default branches only; the default appears exactly once", () => {
+    const heads = [
+      head("main", "2025-06-01T00:00:00Z"), // default AND newest
+      head("a", "2025-05-01T00:00:00Z"),
+      head("b", "2025-04-01T00:00:00Z"),
+      head("c", "2025-03-01T00:00:00Z"),
+    ];
+    const p = classifyBranchPlan(heads, "2024-01-01", 2, "main");
+    expect(p.eligible.map((h) => h.name)).toEqual(["main", "a", "b"]); // default + 2 non-default
+    expect(p.pastCap.map((h) => h.name)).toEqual(["c"]);
+  });
+  test("a defaultBranch not among the live heads changes nothing (no synthesis)", () => {
+    const heads = [head("dev", "2025-05-01T00:00:00Z"), head("stale", "2023-06-01T00:00:00Z")];
+    const p = classifyBranchPlan(heads, "2024-01-01", 25, "main");
+    expect(p.eligible.map((h) => h.name)).toEqual(["dev"]);
+    expect(p.cutoffSkipped.map((h) => h.name)).toEqual(["stale"]);
   });
 });
 
@@ -329,7 +369,7 @@ describe("introspection-failure observability (fail-soft, README log vocabulary)
     const runId = startRun(db);
     const now = nowIso();
     const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
-    db.upsertRunUnitHead({ runId, ...unit, status: "scanned" });
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null });
     // no lockfile + unresolved registry range → the §5.E range-resolution path needs the packument
     db.upsertDependencyFinding({
       runId, ...unit, dateFetched: now, packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
@@ -367,7 +407,7 @@ describe("introspection-failure observability (fail-soft, README log vocabulary)
     const runId = startRun(db);
     const now = nowIso();
     const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
-    db.upsertRunUnitHead({ runId, ...unit, status: "scanned" });
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true });
     // a RESOLVED version for a package no current config entry can supply a registry for
     db.upsertDependencyFinding({
       runId, ...unit, dateFetched: now, packageName: "rogue", dependencyKey: "rogue", dependencyType: "dependencies",
@@ -443,14 +483,19 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
     const key = (branch: string): WorkUnitKey => ({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch });
-    // pre-seed "main" as done AT the live head so the §3 skip-current path is taken (no scanUnit)
+    // pre-seed "main" AND "dev" as done AT their live heads so the §3 skip-current path is
+    // taken for both (no scanUnit; the scripted client only answers branch discovery)
     db.enqueueUnit(key("main"), runId);
     db.setUnitStatus(key("main"), { status: "done", runId, lastCommitSha: "o-main", lastCommitDate: "2025-06-01T00:00:00Z" });
+    db.enqueueUnit(key("dev"), runId);
+    db.setUnitStatus(key("dev"), { status: "done", runId, lastCommitSha: "o-dev", lastCommitDate: "2025-05-01T00:00:00Z" });
 
-    const client = // heads arrive newest-first; cap=1 → main eligible(current), dev past-cap, stale pre-cutoff
+    const client = // heads newest-first; cap=1 counts NON-default branches: main default-exempt
+    // (current), dev fills the cap (current), feat past-cap, stale pre-cutoff
     makeClient(root, async () => ({ exitCode: 0, stderr: "", stdout: graphqlHeads([
         { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
         { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+        { name: "feat", oid: "o-feat", date: "2025-04-01T00:00:00Z" },
         { name: "stale", oid: "o-stale", date: "2023-06-01T00:00:00Z" },
       ]) }));
     const repo: RepoInfo = { name: "svc", organization: "org-a", defaultBranch: "main", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
@@ -459,19 +504,56 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
       await processRepo(db, client, testConfig(root, 1), runId, "h", "org-a", repo, [], new Set());
     });
 
-    // run_unit_head: stale → skipped-cutoff (empty sha), main → scanned at the live head; dev absent
-    const headRows = db.read(`SELECT branch, commit_sha, status FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<{ branch: string; commit_sha: string; status: string }>;
+    // run_unit_head: stale → skipped-cutoff (empty sha), main+dev → scanned at their live
+    // heads with the REAL default-branch flag (1 for main, 0 otherwise); feat absent
+    const headRows = db.read(`SELECT branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
     expect(headRows).toEqual([
-      { branch: "main", commit_sha: "o-main", status: "scanned" },
-      { branch: "stale", commit_sha: "", status: "skipped-cutoff" },
+      { branch: "dev", commit_sha: "o-dev", status: "scanned", is_default_branch: 0 },
+      { branch: "main", commit_sha: "o-main", status: "scanned", is_default_branch: 1 },
+      { branch: "stale", commit_sha: "", status: "skipped-cutoff", is_default_branch: 0 },
     ]);
-    // work-queue state: stale skipped, main still done (reused), dev never enqueued (past cap)
+    // work-queue state: stale skipped, main+dev still done (reused), feat never enqueued (past cap)
     expect(db.getUnit(key("stale"))?.status).toBe("skipped");
     expect(db.getUnit(key("main"))?.status).toBe("done");
-    expect(db.getUnit(key("dev"))).toBeNull();
-    // live JSONL: one skip-cutoff, one skip-current, nothing else unit-scoped
+    expect(db.getUnit(key("dev"))?.status).toBe("done");
+    expect(db.getUnit(key("feat"))).toBeNull();
+    // live JSONL: one skip-cutoff, two skip-current, nothing else unit-scoped
     const actions = events.filter((e) => e["event"] === "unit").map((e) => `${e["branch"]}:${e["action"]}`).sort();
-    expect(actions).toEqual(["main:skip-current", "stale:skip-cutoff"]);
+    expect(actions).toEqual(["dev:skip-current", "main:skip-current", "stale:skip-cutoff"]);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("the SCANNED path writes the real is_default_branch too (processUnit, empty tree)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wiring-scan-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    // No pre-seeded work-queue rows → both branches go through processUnit's REAL scan.
+    // The scripted client serves branch discovery (GraphQL) and an EMPTY tree (REST), so the
+    // scan pipeline runs end-to-end with zero findings and the unit lands 'done'/'scanned'.
+    const client = makeClient(root, async (_bin, args) => {
+      const isGraphql = args.some((a) => a === "graphql");
+      if (isGraphql)
+        return { exitCode: 0, stderr: "", stdout: graphqlHeads([
+          { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
+          { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+        ]) };
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: false, tree: [] })}` };
+    });
+    const repo: RepoInfo = { name: "svc", organization: "org-a", defaultBranch: "main", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+
+    await captureJsonl(async () => {
+      await processRepo(db, client, testConfig(root, 25), runId, "h", "org-a", repo, [], new Set());
+    });
+
+    const headRows = db.read(`SELECT branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
+    expect(headRows).toEqual([
+      { branch: "dev", commit_sha: "o-dev", status: "scanned", is_default_branch: 0 },
+      { branch: "main", commit_sha: "o-main", status: "scanned", is_default_branch: 1 },
+    ]);
     db.close();
     rmSync(root, { recursive: true, force: true });
   });

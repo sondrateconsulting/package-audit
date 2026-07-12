@@ -3,7 +3,7 @@
 // input. Entrypoint grammars (§8):
 //   bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
 //                                  [--rescan-branch <org>/<repo>@<branch>]...   # repeatable
-//   bun run scripts/report.ts      [--config <path>] [--run-id <id>]
+//   bun run scripts/report.ts      [--config <path>] [--run-id <id>] [--html]
 // `--help`/`-h` on either entrypoint wins over every other argument (even invalid ones), so a
 // confused operator can always reach the help text.
 
@@ -15,6 +15,20 @@ export class ArgsError extends Error {
 }
 function fail(msg: string): never {
   throw new ArgsError(msg);
+}
+
+// Run ids are generated internally (randomUUID → hex + hyphens). A user-supplied run id (report's
+// `--run-id`, export's `--run-id`, compare's two positionals) feeds a `run-<id>.json` path template
+// in report.ts (export and compare instead bind it into DB lookups), so validate it against a
+// conservative grammar with no path separators BEFORE it can reach a path or a query. This is defense in depth over
+// writeFileAtomic's §0 containment: a value like `../../xray/manifest` is rejected here outright.
+const RUN_ID_GRAMMAR = /^[A-Za-z0-9._-]+$/;
+export function assertRunId(value: string): string {
+  // The grammar already excludes path separators, so no traversal is possible; the `.`/`..` reject
+  // is belt-and-suspenders against a run id that IS a path component.
+  if (!RUN_ID_GRAMMAR.test(value) || value === "." || value === "..")
+    throw new ArgsError(`invalid run id ${JSON.stringify(value)} — allowed characters are letters, digits, '.', '_', '-'`);
+  return value;
 }
 
 // ---- usage / help text ------------------------------------------------------------------------
@@ -43,7 +57,7 @@ Flags:
 The audit writes <outputDir>/run-<run_id>.json and <outputDir>/latest.json when it completes;
 a separate \`bun run report\` is only needed to re-emit a historical run (--run-id).`;
 
-export const REPORT_USAGE = "Usage: bun run scripts/report.ts [--config <path>] [--run-id <id>] [--help]";
+export const REPORT_USAGE = "Usage: bun run scripts/report.ts [--config <path>] [--run-id <id>] [--html] [--help]";
 
 export const REPORT_HELP = `package-audit report — re-emit the consolidated §7 report from SQLite alone
 
@@ -54,6 +68,9 @@ Flags:
   --run-id <id>       Emit run-<id>.json for that historical run (never touches latest.json).
                       Default (no --run-id): the latest completed reportable run; also
                       overwrites latest.json.
+  --html              ALSO render one self-contained HTML dossier per tracked package plus an
+                      index.html into <outputDir>/xray/ (manifest-managed; stale dossiers from
+                      removed packages are swept).
   --help, -h          Show this help and exit.
 
 Note: \`bun run audit\` already emits the report when a run completes — this entrypoint exists
@@ -172,19 +189,27 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
 export interface ReportArgs {
   readonly configPath: string | null; // explicit --config; null → resolve via env/default in config.ts
   readonly runId: string | null; // --run-id <id>; null → latest completed reportable run
+  readonly html: boolean; // --html: ALSO render the per-package HTML dossiers + index into <outputDir>/xray/
   readonly help: boolean;
 }
 
 // Strict parser for report.ts (§7). Unknown flags are REJECTED — a silently-ignored typo (e.g.
 // `--runid`) would fall through to the DEFAULT report and overwrite latest.json.
 export function parseReportArgs(argv: string[]): ReportArgs {
-  if (argv.some(isHelpFlag)) return { configPath: null, runId: null, help: true };
+  if (argv.some(isHelpFlag)) return { configPath: null, runId: null, html: false, help: true };
 
   let configPath: string | null = null;
   let runId: string | null = null;
+  let html = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
+    if (arg === "--html") {
+      if (html) fail("--html given more than once");
+      html = true;
+      continue;
+    }
     const { flag, attached } = splitFlag(arg);
+    if (flag === "--html") fail("--html takes no value"); // --html=x arrives here via splitFlag
     if (flag !== "--config" && flag !== "--run-id") fail(`unknown argument '${arg}'`);
     const value = requireValue(flag, attached, argv[i + 1]);
     if (attached === null) i++;
@@ -193,8 +218,8 @@ export function parseReportArgs(argv: string[]): ReportArgs {
       configPath = value;
     } else {
       if (runId !== null) fail("--run-id given more than once");
-      runId = value;
+      runId = assertRunId(value);
     }
   }
-  return { configPath, runId, help: false };
+  return { configPath, runId, html, help: false };
 }
