@@ -91,7 +91,7 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
   const auth = await client.gh(["auth", "status", "--hostname", config.githubHost]);
   if (auth.exitCode !== 0)
     throw new PreflightError(
-      `not authenticated to ${config.githubHost}. Remediate: gh auth login -h ${config.githubHost} (see README § Authentication)\n${auth.stderr.trim().slice(0, 300)}`,
+      `not authenticated to ${config.githubHost}. Remediate: gh auth login -h ${config.githubHost} (see README § What the gh token needs)\n${auth.stderr.trim().slice(0, 300)}`,
     );
 
   // 4. git >= 2.45.1 and tar present (+ flavor)
