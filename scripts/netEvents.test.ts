@@ -87,6 +87,24 @@ describe("network reporter flood control + counters (T7)", () => {
     expect(reporter.counters().suppressed).toBe(3); // count the current absolute drops, not clamp to 0
   });
 
+  // The token-bucket boundaries were only exercised at exact 0ms / 1000ms cadences (PR1 review —
+  // pr-test-analyzer). These pin the Math.min(burst,…) cap and the FULL-token (>=1) emit gate.
+  test("tokens clamp at `burst` after a long idle — a same-instant flood emits at most `burst`", () => {
+    const h = harness(); // burst 1, refill 1/s
+    h.advance(10_000); // 10s idle → WITHOUT the cap this would accrue ~10 tokens
+    for (let i = 0; i < 4; i++) h.reporter.emit(retry(i)); // burst+3 candidates at the same instant
+    expect(h.emitted).toHaveLength(1); // capped at burst(1); dropping Math.min would emit all 4
+    expect(h.reporter.counters().retryTotal).toBe(4);
+  });
+
+  test("a partial (sub-cadence) token does not emit — the gate is a FULL token (>=1, not >0)", () => {
+    const h = harness(); // burst 1, refill 1/s
+    h.reporter.emit(retry(0)); // consume the sole initial token → emits (tokens now 0)
+    h.advance(500); // half a cadence → 0.5 token accrued
+    h.reporter.emit(retry(1)); // 0.5 < 1 → suppressed; a `>0` gate would wrongly emit
+    expect(h.emitted).toHaveLength(1); // only the first
+  });
+
   // The elapsed delta is already clamped at 0 so a BACKWARD wall-clock correction (NTP) can't drain
   // tokens. But the refill BASELINE must also never retreat: if a backward reading moved lastRefillMs
   // earlier, the next forward reading would credit the whole (inflated) interval since that earlier

@@ -14,6 +14,8 @@ import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { Aborter } from "./boundedPool.ts";
 import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
 import type { OrchestrateArgs } from "./args.ts";
+import { setLogSink, resetLogSink, loggerStats, flushLogs, type LogSink } from "./log.ts";
+import type { NetworkReporter } from "./netEvents.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
 
@@ -2315,5 +2317,64 @@ describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations
     expect(db.read(`SELECT COUNT(*) AS n FROM run_unit_head WHERE organization='org-b' AND repository='r2'`).get()).toEqual({ n: 0 });
     db.close();
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+// The terminal `done` event was never asserted end-to-end: the only prior runScan call exits at the
+// owner-discovery-throttle early return, so its T7 retry/suppressed counters and its {terminal:true}
+// marking were unverified (PR1 review — pr-test-analyzer). Drive runScan to COMPLETION (empty repo
+// discovery → no tree scripting) and prove both, using a backpressured log sink so terminal delivery
+// is exercised, not merely observed on a clear channel.
+describe("runScan terminal `done` event (T7 counters + terminal delivery under backpressure)", () => {
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
+
+  test("`done` carries the reporter's retry/suppressed counters AND survives the buffer bound as terminal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "runscan-done-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // Empty repo discovery → runScan reaches completeRun + the `done` line with no branch/tree scripting.
+    const client = { sweepStaleTempDirs: () => [], listOrgRepos: async () => [] } as unknown as GithubClient;
+    // Bin-discovery packument fetch fails fast (discoverCliTerms is fail-soft) → no real network.
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => { throw new Error("offline test"); }) as unknown as typeof fetch);
+    // A reporter with NON-ZERO counters: the `done` line must fold them in.
+    const reporter: NetworkReporter = { emit: () => {}, counters: () => ({ retryTotal: 7, suppressed: 3 }) };
+    // A sink that accepts every line UNTIL the `reconciliation` phase, then backpressures (bound 1)
+    // so the following `report` phase line and the terminal `done` line contend for one buffer slot.
+    // resume() is a nested closure (like fakeSink) so it reads drainCb by its declared type.
+    function pauseAtReconcile() {
+      const received: string[] = [];
+      let paused = false;
+      let drainCb: (() => void) | null = null;
+      const sink: LogSink = {
+        write: (line) => {
+          received.push(line);
+          if (!paused && line.includes('"phase":"reconciliation"')) { paused = true; return false; }
+          return !paused;
+        },
+        onDrain: (cb) => { drainCb = cb; },
+      };
+      return { sink, received, resume: () => { paused = false; const cb = drainCb; drainCb = null; if (cb) cb(); } };
+    }
+    const s = pauseAtReconcile();
+    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
+    const before = loggerStats().dropped;
+    setLogSink(s.sink, 1); // bound 1: only a terminal event may exceed it
+    try {
+      await runScan(db, client, rt(testConfig(root), "hash"), noArgs, null, reporter, null);
+      s.resume(); // resume + drain the two buffered lines (report + terminal done)
+      await flushLogs();
+      const events = s.received.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const done = events.find((e) => e["event"] === "done");
+      expect(done).toBeDefined();
+      expect(done).toMatchObject({ retryTotal: 7, suppressed: 3 }); // counters wired (kills the counter-drop mutant)
+      // the non-terminal `report` phase line buffered ALONGSIDE done survived → done bypassed the bound
+      expect(events.some((e) => e["event"] === "phase" && e["phase"] === "report")).toBe(true);
+      expect(loggerStats().dropped - before).toBe(0); // terminal never evicted the lifecycle line (kills the terminal-drop mutant)
+    } finally {
+      resetLogSink();
+      errSpy.mockRestore();
+      fetchSpy.mockRestore();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -1,5 +1,6 @@
 import { expect, test, describe, spyOn } from "bun:test";
 import { logLine, logActivitySeq, flushLogs, loggerStats, setLogSink, resetLogSink, type LogSink } from "./log.ts";
+import { startHeartbeat } from "./heartbeat.ts";
 import { stripTs } from "./testEvents.test.ts";
 
 // Capture the raw stdout lines logLine writes (NOT ts-stripped — this file pins the ts itself).
@@ -512,6 +513,72 @@ describe("stdout channel closure surfaces a diagnostic (S1)", () => {
     } finally {
       outSpy.mockRestore();
       errSpy.mockRestore();
+      resetLogSink();
+    }
+  });
+});
+
+// Coverage the pre-existing backpressure suite left open (PR1 review — pr-test-analyzer):
+//   - the PRODUCTION default bound (every over-bound test shrinks it to 2, so 10_000 was unverified);
+//   - the REAL async process.stdout 'error' listener waking a PENDING flush (only the sync path ran);
+//   - heartbeat's DEFAULT emit droppable-marking (every heartbeat test injects its own emit).
+describe("backpressure writer — production-default + real-listener coverage (T7)", () => {
+  test("the DEFAULT buffer bound (no override) evicts exactly once past 10_000 buffered lines", () => {
+    const f = fakeSink();
+    setLogSink(f.sink); // NO maxBuffered override → the real DEFAULT_MAX_BUFFERED_LINES (10_000)
+    const before = loggerStats().dropped;
+    try {
+      f.pause();
+      logLine({ event: "latch" }); // reaches the sink, returns false → writer pauses; buffer still empty
+      for (let i = 0; i < 10_001; i++) logLine({ event: "tel", i }, { droppable: true }); // fill to 10_000, +1 sheds one
+      expect(loggerStats().dropped - before).toBe(1); // the REAL 10_000 bound shed exactly one (MAX_SAFE default → 0)
+    } finally {
+      resetLogSink();
+    }
+  });
+
+  test("the real async process.stdout 'error' wakes a PENDING flushLogs (not merely isClosed)", async () => {
+    resetLogSink(); // real default sink
+    const outSpy = spyOn(process.stdout, "write").mockImplementation((() => false) as typeof process.stdout.write); // always backpressure
+    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
+    try {
+      logLine({ event: "buffered" }); // sink returns false → writer pauses, arms a real once('drain') that never fires
+      let resolved = false;
+      const flush = flushLogs().then(() => { resolved = true; });
+      await Promise.resolve();
+      await Promise.resolve(); // let microtasks settle — the flush must still be pending
+      expect(resolved).toBe(false);
+      (process.stdout as NodeJS.EventEmitter).emit("error", Object.assign(new Error("EPIPE"), { code: "EPIPE" }));
+      await flush; // resolves ONLY via the async wake; would hang forever if stdoutCloseCb?.() were removed
+      expect(loggerStats().closed).toBe(true);
+      logLine({ event: "after" }); // no-op after closure
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+      (process.stdout as NodeJS.EventEmitter).removeAllListeners("drain"); // clean the leaked once('drain')
+      resetLogSink();
+    }
+  });
+
+  test("startHeartbeat's DEFAULT emit marks heartbeats DROPPABLE (self-shed, never evict lifecycle)", () => {
+    const f = fakeSink();
+    setLogSink(f.sink, 2); // tiny bound
+    const before = loggerStats().dropped;
+    try {
+      logLine({ event: "l0" }); // clear channel → straight to the sink
+      f.pause();
+      logLine({ event: "l1" }); // reaches the sink, returns false → writer pauses (l1 in sink, buffer empty)
+      logLine({ event: "l2" }); // buffered  [l2]
+      logLine({ event: "l3" }); // buffered  [l2, l3] → at bound
+      // Start the heartbeat AFTER those writes so lastSeen == current activity → this tick is "quiet".
+      const hb = startHeartbeat({ intervalMs: 1_000_000, setIntervalImpl: () => 0, clearIntervalImpl: () => {} });
+      hb.tick(); // DEFAULT emit → logLine(heartbeat, {droppable:true}); full+all-lifecycle+droppable → drops ITSELF
+      hb.stop();
+      f.resume();
+      const events = f.received.map((l) => stripTs(JSON.parse(l) as Record<string, unknown>)["event"]);
+      expect(events).toEqual(["l0", "l1", "l2", "l3"]); // lifecycle intact; a NON-droppable heartbeat would evict l2
+      expect(loggerStats().dropped - before).toBe(1); // exactly the heartbeat, self-shed
+    } finally {
       resetLogSink();
     }
   });
