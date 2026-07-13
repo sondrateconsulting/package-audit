@@ -98,7 +98,7 @@
         "bulkApiSeconds": { "type": "integer", "minimum": 1, "default": 900, "description": "Deadline for raw content reads (file/blob/recursive-tree GETs) — larger than control so a big read on a slow-but-live link is not a deterministic failure." },
         "cloneSeconds": { "type": "integer", "minimum": 1, "default": 900, "description": "Deadline for the hardened shallow git clone fallback." },
         "tarSeconds": { "type": "integer", "minimum": 1, "default": 900, "description": "Deadline for registry tarball extraction." },
-        "probeSeconds": { "type": "integer", "minimum": 1, "default": 10, "description": "Deadline for the connectivity/recovery probe." },
+        "probeSeconds": { "type": "integer", "minimum": 1, "default": 10, "description": "Deadline reserved for the connectivity/recovery probe (validated now; consumed by the outage-lifecycle work in a later PR)." },
         "heartbeatSeconds": { "type": "integer", "minimum": 1, "default": 30, "description": "Cadence of the liveness heartbeat emitted when the run is otherwise quiet (not a spawn deadline)." }
       }
     },

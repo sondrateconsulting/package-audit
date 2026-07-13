@@ -948,8 +948,9 @@ export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
 // budgets: a quick auth/version/rate-limit/listing call has no reason to hang 15 min, but a raw
 // blob/recursive-tree read, a shallow clone, or a tarball extract over a slow-but-live VPN link
 // legitimately can — so those keep the 15-min budget while control drops to 5 min. probe is the
-// short reachability deadline used by the T2 connectivity gate. Each category resolves as
-// `timeouts.<cat> ?? spawnTimeoutMs ?? DEFAULT` (config seconds are converted to ms by the caller).
+// short reachability deadline RESERVED for the T2 connectivity gate landing in a later PR in this
+// series — it is resolved and validated here but not yet consumed by any spawn call. Each category
+// resolves as `timeouts.<cat> ?? spawnTimeoutMs ?? DEFAULT` (config seconds → ms by the caller).
 export const DEFAULT_CONTROL_API_TIMEOUT_MS = 5 * 60 * 1000;
 export const DEFAULT_BULK_API_TIMEOUT_MS = SPAWN_TIMEOUT_MS;
 export const DEFAULT_CLONE_TIMEOUT_MS = SPAWN_TIMEOUT_MS;

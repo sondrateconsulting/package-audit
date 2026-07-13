@@ -7,7 +7,8 @@
 // stopped in ONE outer finally so it never outlives the run or dangles a timer.
 //
 // Single-thread caveat (documented, NOT engineered away): Bun is one JS thread, so a SYNCHRONOUS
-// burst — gunzip of a <=150MB tarball, a scanUnit pass, a big SQLite write — blocks the event loop
+// burst — gunzip of a tarball inflating to <=150MB (the compressed download itself is capped at
+// 100MB), a scanUnit pass, a big SQLite write — blocks the event loop
 // and the timer cannot fire during it. The heartbeat proves liveness at AWAIT boundaries only.
 import { logLine, logActivitySeq } from "./log.ts";
 

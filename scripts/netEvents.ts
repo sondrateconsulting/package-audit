@@ -5,11 +5,13 @@
 //   - counts EVERY retry attempt (retryTotal) and every suppressed candidate (suppressed);
 //   - rate-limits the retry/throttle flood to a global burst-1 / refill-1-per-second budget, so an
 //     operator sees the first event after a quiet window plus a trickle, never a wall of lines;
-//   - marks emitted retry/throttle lines DROPPABLE so the stdout backpressure buffer may shed them
-//     too under a slow consumer;
-//   - ALWAYS emits spawn-timeout (rare — up to ~15 min each — and individually load-bearing).
-// `suppressed` folds in BOTH this reporter's rate-limit drops and the writer's backpressure drops,
-// so the heartbeat/done counters tell the whole "telemetry was held back" story in one number.
+//   - marks emitted retry/throttle lines DROPPABLE so the stdout backpressure buffer sheds them
+//     FIRST under a slow consumer;
+//   - is never rate-limited for spawn-timeout (rare, and individually load-bearing) — though like any
+//     line it can still be shed if the stdout buffer is saturated entirely with non-droppable events.
+// `suppressed` folds in BOTH this reporter's rate-limit drops and the writer's backpressure drops
+// (which, when the backlog is all non-droppable, can include a lifecycle/unit line, not just
+// telemetry), so the heartbeat/done counters account for every held-back line in one number.
 
 import { logLine, loggerStats } from "./log.ts";
 
@@ -66,7 +68,9 @@ export function createNetworkReporter(opts: NetworkReporterOptions = {}): Networ
   return {
     emit(e: NetworkEvent): void {
       if (e.kind === "spawn-timeout") {
-        // never rate-limited or dropped: rare, and each is a ~15-min wedge worth surfacing.
+        // never rate-limited (rare, and each marks a child killed past its per-category,
+        // operator-configurable deadline — the actual ms is carried in the event); emitted
+        // non-droppable so the backpressure buffer sheds it only as a last resort.
         emit({ event: "spawn-timeout", bin: e.bin, ms: e.ms });
         return;
       }

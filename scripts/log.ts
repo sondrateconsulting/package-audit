@@ -27,10 +27,15 @@ export function logActivitySeq(): number {
 // writer would either block the audit loop or let the runtime's internal buffer grow unbounded.
 // This bounded buffer absorbs backpressure: while the sink accepts writes they go straight through
 // (zero overhead in the common case); once the sink signals backpressure we queue lines and flush
-// them on 'drain'. Only explicitly DROPPABLE telemetry (retry/throttle/heartbeat floods) is shed
-// when the queue exceeds its bound — every lifecycle/unit event is preserved, in order. A dead pipe
-// (EPIPE, e.g. `… | head`) degrades logging to a no-op instead of crashing. The finalize path
-// awaits flushLogs() so the terminal `done` event is never left buffered at exit.
+// them on 'drain'. Under a full buffer the shed order is: the OLDEST DROPPABLE telemetry
+// (retry/throttle/heartbeat) if any is queued; else, if the incoming line is itself droppable, that
+// incoming line; else the OLDEST non-terminal lifecycle/unit line — so the buffer stays strictly
+// bounded (the DB/report is the source of truth — stdout is live telemetry). Only TERMINAL events
+// (done/plan-summary) are never evicted for capacity. A dead pipe (EPIPE, e.g. `… | head`) degrades
+// logging to a no-op instead of crashing — see markStdoutClosed for the one-shot stderr trace it
+// leaves. The finalize path awaits flushLogs() so the terminal `done` event ships if the channel is
+// still alive at exit (a channel that dies mid-run can still lose it — capacity is guaranteed,
+// delivery is best-effort).
 
 // The sink is the seam that makes backpressure testable: the default wraps process.stdout; tests
 // inject a fake whose write()/drain they drive deterministically.
@@ -89,8 +94,9 @@ class BufferedWriter {
 
   private enqueue(line: string, droppable: boolean, terminal: boolean): void {
     // Terminal events (done/plan-summary/…) BYPASS the bound: there are only a handful per run, so
-    // admitting them a few over the cap keeps memory bounded while guaranteeing they ship AND never
-    // evict a counted line (which would leave their own inline suppressed count stale).
+    // admitting them a few over the cap keeps memory bounded while keeping them eligible to ship (a
+    // dead channel can still drop them — capacity is guaranteed, delivery is not) AND never evicting
+    // a counted line (which would leave their own inline suppressed count stale).
     if (this.buffer.length >= this.maxBuffered && !terminal) {
       const di = this.buffer.findIndex((p) => p.droppable);
       if (di >= 0) {
@@ -269,10 +275,12 @@ export function loggerStats(): { dropped: number; closed: boolean } {
 // timestamped so a stalled run stays legible in the log. A caller-supplied `ts` is ignored (never
 // forwarded) so the timestamp can be neither forged nor duplicated — the format is pinned in
 // log.test.ts and every capture helper strips it before asserting on the other fields.
-// `droppable` marks pure telemetry (retry/throttle/heartbeat) the writer may shed under sustained
-// backpressure; lifecycle/unit events default to non-droppable and are never dropped. `terminal`
-// marks the run's final event (done/plan-summary) — it bypasses the buffer bound so it is never
-// evicted and its own inline counters stay exact.
+// `droppable` marks pure telemetry (retry/throttle/heartbeat) the writer sheds FIRST under sustained
+// backpressure; lifecycle/unit events default to non-droppable and are shed only if the whole
+// backlog is non-droppable and the bound is hit (oldest non-terminal first) — see `dropped`, folded
+// into `suppressed`. `terminal` marks the run's final event (done/plan-summary) — it bypasses the
+// buffer bound so capacity never evicts it and its own inline counters stay exact (a dead channel
+// can still lose it — see markStdoutClosed).
 export function logLine(event: Record<string, unknown>, opts?: { droppable?: boolean; terminal?: boolean }): void {
   // bump FIRST so the heartbeat sampler counts this write even if serialization below throws.
   activitySeq++;

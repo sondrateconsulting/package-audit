@@ -414,7 +414,9 @@ export async function runScan(
   const summary = emitted.report.summary;
   const errorCount = emitted.report.errors.length;
   // T7: fold the run-scoped retry/throttle churn into the terminal event. `done` is a TERMINAL,
-  // non-droppable line; the outer finally awaits flushLogs() so it (and its counters) always ship.
+  // non-droppable line; the outer finally awaits flushLogs() so it (and its counters) ship whenever
+  // the stdout channel is still alive at exit (a channel that died mid-run leaves loggerStats().closed
+  // set and one stderr trace — delivery of `done` is best-effort, its capacity slot is guaranteed).
   const { retryTotal, suppressed } = reporter.counters();
   logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount, retryTotal, suppressed }, { terminal: true });
   process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path, warnings));
