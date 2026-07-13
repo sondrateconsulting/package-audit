@@ -1923,6 +1923,39 @@ describe("network event emission (T7)", () => {
     expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "core", waitKind: "primary" });
   });
 
+  // restGet and graphql share one arm-and-report helper (armAndReportRateLimit); it must carry the
+  // GRAPHQL endpoint/bucket labels on the graphql path, not the REST ones. (Previously REST-only.)
+  test("graphql emits retry{reason:no-response, endpoint:graphql} on each transient attempt (not the final throw)", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient(Array<SpawnResult>(6).fill(err("")), { events: (e) => events.push(e) });
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/no HTTP response/);
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(5); // MAX_ATTEMPTS-1
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "no-response", endpoint: "graphql", attempt: 0, maxAttempts: 6 });
+  });
+
+  test("graphql emits retry{reason:http-5xx, endpoint:graphql} on a transient 5xx that recovers", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient([ok(wire(503, {}, "")), ok(wire(200, {}, `{"data":{"x":1}}`))], { events: (e) => events.push(e) });
+    await client.graphql("query{x}", {});
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "http-5xx", endpoint: "graphql", attempt: 0 });
+  });
+
+  test("graphql emits throttle{bucket:graphql, waitKind:primary} on a primary rate-limit", async () => {
+    const events: NetworkEvent[] = [];
+    const reset = String(1_000_000_000 + 60); // 60s ahead of the fake clock
+    const { client } = makeClient(
+      [ok(wire(429, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": reset }, "{}")), ok(wire(200, {}, `{"data":{"x":1}}`))],
+      { events: (e) => events.push(e) },
+    );
+    await client.graphql("query{x}", {});
+    const throttles = events.filter((e) => e.kind === "throttle");
+    expect(throttles).toHaveLength(1);
+    expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "graphql", waitKind: "primary" });
+  });
+
   test("emits a spawn-timeout when a child outruns its deadline", async () => {
     const events: NetworkEvent[] = [];
     const client = new GithubClient({

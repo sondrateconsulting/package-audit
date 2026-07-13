@@ -10,6 +10,7 @@ import { tmpdir, devNull } from "node:os";
 import { join } from "node:path";
 import {
   assertReadOnlyGh, assertReadOnlyGit, assertReadOnlyTar, assertSpawnAllowed, assertContained,
+  type GitVerb,
 } from "./readOnlyGuard.ts";
 import type { AuditDb } from "./db.ts";
 import type { DiscoveryFailure } from "./discovery.ts";
@@ -1208,15 +1209,37 @@ export class GithubClient {
     }
   }
 
+  // Per-verb git spawn deadline (T11). Exhaustive over GitVerb: a `clone` may pull a large tree
+  // over a slow-but-live link (the clone budget), while rev-parse / show / --version are fast local
+  // commands on the tighter control budget. A new read verb added to the guard's allowlist forces
+  // a decision here (the `never` guard is a compile error) rather than silently taking control.
+  private gitDeadline(verb: GitVerb): number {
+    switch (verb) {
+      case "clone":
+        return this.deadlines.cloneMs;
+      case "rev-parse":
+      case "show":
+      case "--version":
+        return this.deadlines.controlApiMs;
+      default: {
+        const _exhaustive: never = verb;
+        return _exhaustive;
+      }
+    }
+  }
+
   async git(args: string[], cwd?: string): Promise<SpawnResult> {
     assertSpawnAllowed(this.bins.git, args);
-    assertReadOnlyGit(args);
+    // The guard both validates AND classifies: `verb` is the single source for the per-verb env
+    // and spawn-deadline decisions below (no re-derived `args[0] === …` string checks that could
+    // drift from the allowlist).
+    const verb = assertReadOnlyGit(args);
     // §0: git itself is the only process allowed to run with cwd inside a clone.
     if (cwd !== undefined) assertContained(cwd, [this.tempRoot]);
     // Clone DESTINATION containment lives HERE, not only in cloneShallow — the wrapper is the
     // chokepoint, so no caller can aim a hardened-looking clone outside the temp root. The
     // guard's grammar guarantees exactly two positionals: <url> <dest>.
-    if (args[0] === "clone") {
+    if (verb === "clone") {
       const positionals: string[] = [];
       for (let i = 1; i < args.length; i++) {
         const a = args[i]!;
@@ -1232,19 +1255,18 @@ export class GithubClient {
     // The `--version` probe (§2 preflight — also --plan's ONLY git invocation) needs no
     // credential helper: point its global config at devNull instead of materializing the temp
     // gitconfig, so plan mode truly writes nothing and leaks no pkg-audit-gitcfg-* dir.
-    const isVersionProbe = args.length === 1 && args[0] === "--version";
+    const isVersionProbe = verb === "--version";
     const env = buildGitEnv(this.baseEnv, isVersionProbe ? devNull : this.ensureGitConfig());
-    // A `clone` may pull a large tree over a slow-but-live link (the clone budget); every other git
-    // op here (rev-parse, --version) is a fast local command on the control budget (T11).
-    const deadlineMs = args[0] === "clone" ? this.deadlines.cloneMs : this.deadlines.controlApiMs;
     // Count the clone against the GLOBAL in-flight cap (§4/§5.6): under fan-out a clone per branch-unit
     // would otherwise reach the composed organizations×branches degree and blow temp-dir/fd/memory.
     // Acquire HERE (not inside spawnBounded, which gh already wraps — a second acquire there would
     // deadlock gh at concurrency 1). Bare slot (no bucket): a clone is network work but consumes no
     // REST/GraphQL quota, so it sits OUTSIDE the rate-limit buckets — only the subprocess cap bounds it.
+    // The per-verb deadline comes from the typed gitDeadline(verb) switch (clone → clone budget;
+    // rev-parse/show/--version → control), so a new read verb forces a routing decision (F-M).
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded(this.bins.git, args, { env, cwd, deadlineMs });
+      return await this.spawnBounded(this.bins.git, args, { env, cwd, deadlineMs: this.gitDeadline(verb) });
     } finally {
       release();
     }
@@ -1315,6 +1337,7 @@ export class GithubClient {
   }
 
   // ---- REST GET with cache + throttle handling ----
+
   private cacheKey(endpoint: string): string {
     // KEY EPOCH `gh3`: rows are statusless and survive --fresh, so every strengthening of cache
     // WRITE provenance quarantines all older rows by making their keys unreachable (--purge-cache
