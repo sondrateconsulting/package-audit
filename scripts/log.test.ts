@@ -449,6 +449,7 @@ describe("stdout backpressure writer (T7)", () => {
 
   test("a synchronous EPIPE from stdout degrades logging to a no-op (never crashes the run)", () => {
     resetLogSink(); // use the real process.stdout default sink
+    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
     const spy = spyOn(process.stdout, "write").mockImplementation((() => {
       const e = new Error("write EPIPE") as NodeJS.ErrnoException;
       e.code = "EPIPE";
@@ -459,7 +460,59 @@ describe("stdout backpressure writer (T7)", () => {
       expect(() => logLine({ event: "y" })).not.toThrow(); // stays a no-op after the pipe closed
     } finally {
       spy.mockRestore();
+      errSpy.mockRestore();
       resetLogSink(); // clears the EPIPE flag so later tests get a clean channel
+    }
+  });
+});
+
+// S1: a dead stdout channel silently discards buffered telemetry — including the terminal `done`
+// line — with the process still exiting 0. Without a signal on ANY channel, an operator can't tell
+// a clean finish from lost output. The writer degrades to a no-op (correct — EPIPE can deliver
+// nothing), but it must LEAVE A TRACE: exactly one best-effort stderr warning + a queryable
+// loggerStats().closed. The warning says telemetry "may be incomplete" (not that `done` definitely
+// failed — it may already have shipped before the channel died).
+describe("stdout channel closure surfaces a diagnostic (S1)", () => {
+  test("channel closure exposes loggerStats().closed and emits exactly one stderr warning", () => {
+    resetLogSink(); // real default sink, clean channel
+    const errs: string[] = [];
+    const errSpy = spyOn(process.stderr, "write").mockImplementation(((c: unknown) => {
+      errs.push(String(c));
+      return true;
+    }) as typeof process.stderr.write);
+    try {
+      expect(loggerStats().closed).toBe(false); // healthy channel reports open
+      // The REAL async channel-death path: the module's process.stdout 'error' listener.
+      (process.stdout as NodeJS.EventEmitter).emit("error", Object.assign(new Error("EPIPE"), { code: "EPIPE" }));
+      expect(loggerStats().closed).toBe(true); // now observable as closed
+      logLine({ event: "after-close" }); // a further write after closure must NOT re-warn (idempotent)
+      const warnings = errs.filter((l) => l.includes("stdout closed early"));
+      expect(warnings).toHaveLength(1); // exactly one warning across the whole closure, not per-write
+    } finally {
+      errSpy.mockRestore();
+      resetLogSink(); // clear the closed flag so later tests get a clean channel
+    }
+  });
+
+  test("a synchronous EPIPE also surfaces the same one-shot stderr warning", () => {
+    resetLogSink();
+    const errs: string[] = [];
+    const errSpy = spyOn(process.stderr, "write").mockImplementation(((c: unknown) => {
+      errs.push(String(c));
+      return true;
+    }) as typeof process.stderr.write);
+    const outSpy = spyOn(process.stdout, "write").mockImplementation((() => {
+      throw Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    }) as typeof process.stdout.write);
+    try {
+      logLine({ event: "x" }); // sync throw → markStdoutClosed → one warning
+      logLine({ event: "y" }); // already closed → no second warning
+      expect(errs.filter((l) => l.includes("stdout closed early"))).toHaveLength(1);
+      expect(loggerStats().closed).toBe(true);
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+      resetLogSink();
     }
   });
 });

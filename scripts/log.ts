@@ -178,8 +178,8 @@ class BufferedWriter {
     for (const r of w) r();
   }
 
-  stats(): { dropped: number } {
-    return { dropped: this.dropped };
+  stats(): { dropped: number; closed: boolean } {
+    return { dropped: this.dropped, closed: this.closed };
   }
 }
 
@@ -194,6 +194,33 @@ let stdoutClosed = false;
 // The current writer's wake callback (registered via onClose). Only one writer is active at a time,
 // so the latest registration wins — no listener leak across setLogSink/resetLogSink.
 let stdoutCloseCb: (() => void) | null = null;
+
+// Both channel-death paths — a SYNCHRONOUS EPIPE throw from write() and the ASYNC 'error' event —
+// funnel through here so the degrade-to-no-op is never FULLY silent (S1). It flips closed ONCE,
+// wakes any writer awaiting a drain that a broken pipe will never send (so flushLogs() resolves
+// instead of hanging), and leaves a single best-effort trace on stderr — otherwise a run whose
+// stdout consumer dies mid-stream discards its buffered telemetry (up to and including the terminal
+// `done` line) while still exiting 0, with no signal on ANY channel. Idempotent: the stdoutClosed
+// guard means repeated errors and every subsequent write warn at most once per channel. The wording
+// says telemetry MAY be incomplete — `done` might have shipped before the pipe died, so we must not
+// claim it definitely failed.
+function markStdoutClosed(): void {
+  if (stdoutClosed) return;
+  stdoutClosed = true;
+  try {
+    process.stderr.write(
+      "[pkg-audit] stdout closed early — live JSONL telemetry (possibly including the terminal event) may be incomplete for this run\n",
+    );
+  } catch {
+    // stderr is gone too; nothing left but to keep degrading to a no-op.
+  }
+  stdoutCloseCb?.();
+}
+
+// Default sink: process.stdout with EPIPE routed through markStdoutClosed. The reader closing the
+// pipe (`… | head`) surfaces as an 'error' event OR a synchronous throw depending on platform;
+// either way we flip to a no-op that reports "accepted" so a closed consumer degrades logging
+// (with one stderr trace) instead of crashing the run.
 const DEFAULT_SINK: LogSink = {
   write: (line) => {
     if (stdoutClosed) return true;
@@ -201,7 +228,7 @@ const DEFAULT_SINK: LogSink = {
       return process.stdout.write(line);
     } catch (e) {
       if (isEpipe(e)) {
-        stdoutClosed = true;
+        markStdoutClosed();
         return true;
       }
       throw e;
@@ -216,13 +243,9 @@ const DEFAULT_SINK: LogSink = {
   },
 };
 
-// ANY stdout error (EPIPE from `… | head`, or otherwise) means the channel is unusable: mark it
-// closed AND wake the writer so a flushLogs() awaiting a paused/buffered writer resolves instead of
-// hanging forever (a broken pipe never emits 'drain'). Non-EPIPE errors degrade the same way.
-process.stdout.on("error", () => {
-  stdoutClosed = true;
-  stdoutCloseCb?.();
-});
+// ANY stdout error (EPIPE from `… | head`, or otherwise) means the channel is unusable — degrade
+// the same way (mark closed, warn once, wake the writer).
+process.stdout.on("error", () => markStdoutClosed());
 
 let writer = new BufferedWriter(DEFAULT_SINK);
 
@@ -238,7 +261,7 @@ export function resetLogSink(): void {
   writer = new BufferedWriter(DEFAULT_SINK);
 }
 
-export function loggerStats(): { dropped: number } {
+export function loggerStats(): { dropped: number; closed: boolean } {
   return writer.stats();
 }
 
