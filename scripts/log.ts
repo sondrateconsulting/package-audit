@@ -14,6 +14,8 @@
 // >64KB write to a pipe shared with an INDEPENDENT process could still be split by the OS); it is the
 // in-process guarantee that the JSONL a consumer parses is always whole lines. Enforced by log.test.ts.
 
+import { writeSync } from "node:fs";
+
 // Monotonic activity counter, bumped on EVERY write. The run-scoped liveness heartbeat samples it
 // to distinguish a genuine quiet stretch (nothing logged since its last tick) from active work, so
 // it only speaks up when the run would otherwise be silent (§3 resilience — T6).
@@ -213,12 +215,18 @@ let stdoutCloseCb: (() => void) | null = null;
 function markStdoutClosed(): void {
   if (stdoutClosed) return;
   stdoutClosed = true;
+  // Use a SYNCHRONOUS fd write, not process.stderr.write: when stdout and stderr are the SAME
+  // closed pipe (`… 2>&1 | head`), a stream write emits an ASYNCHRONOUS 'error' (EPIPE) that
+  // escapes this try/catch and, unhandled, would exit the process non-zero — silently regressing
+  // the exit code of a run whose consumer merely truncated the pipe. writeSync throws EPIPE
+  // SYNCHRONOUSLY (caught here), leaving the exit code untouched.
   try {
-    process.stderr.write(
+    writeSync(
+      2,
       "[pkg-audit] stdout closed early — live JSONL telemetry (possibly including the terminal event) may be incomplete for this run\n",
     );
   } catch {
-    // stderr is gone too; nothing left but to keep degrading to a no-op.
+    // stderr is gone too (or the fd write failed) — nothing left but to keep degrading to a no-op.
   }
   stdoutCloseCb?.();
 }
