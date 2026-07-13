@@ -52,7 +52,10 @@ export function createNetworkReporter(opts: NetworkReporterOptions = {}): Networ
     const t = now();
     // clamp the elapsed delta at 0 so a backward wall-clock correction (NTP) can never DRAIN tokens.
     tokens = Math.min(burst, tokens + (Math.max(0, t - lastRefillMs) / 1000) * refillPerSec);
-    lastRefillMs = t;
+    // Advance the baseline forward-only: a backward reading must NOT move it earlier, or the next
+    // forward reading would credit the whole inflated interval since that earlier point and
+    // over-grant tokens (emitting telemetry the budget never earned).
+    if (t > lastRefillMs) lastRefillMs = t;
     if (tokens >= 1) {
       tokens -= 1;
       return true;

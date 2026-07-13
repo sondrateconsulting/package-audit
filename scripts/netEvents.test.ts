@@ -86,4 +86,19 @@ describe("network reporter flood control + counters (T7)", () => {
     dropped = 3; // the writer was reset (below baseline) and has since dropped 3
     expect(reporter.counters().suppressed).toBe(3); // count the current absolute drops, not clamp to 0
   });
+
+  // The elapsed delta is already clamped at 0 so a BACKWARD wall-clock correction (NTP) can't drain
+  // tokens. But the refill BASELINE must also never retreat: if a backward reading moved lastRefillMs
+  // earlier, the next forward reading would credit the whole (inflated) interval since that earlier
+  // point — over-granting tokens and emitting telemetry the budget never actually earned.
+  test("a backward clock correction never over-credits tokens after recovery (monotonic baseline)", () => {
+    const h = harness(); // burst 1, refill 1/s, baseline lastRefillMs = 0, tokens = 1
+    h.reporter.emit(retry(0)); // consumes the sole initial token → emits
+    h.advance(-2000); // wall clock jumps 2s backward
+    h.reporter.emit(retry(1)); // no token → suppressed; must NOT retreat the refill baseline to -2000
+    h.advance(2001); // clock recovers to +1ms past the ORIGINAL baseline
+    h.reporter.emit(retry(2)); // only ~1ms of real time elapsed since baseline → still under one token → suppressed
+    expect(h.emitted).toHaveLength(1); // ONLY the first; a retreated baseline would credit ~2s and emit a 2nd
+    expect(h.reporter.counters().retryTotal).toBe(3);
+  });
 });
