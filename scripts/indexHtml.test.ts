@@ -1,6 +1,6 @@
 import { expect, test, describe } from "bun:test";
 import { createHash } from "node:crypto";
-import { AuditDb } from "./db.ts";
+import { AuditDb, type RunOutcome } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
 import { STATIC_SCRIPT, dossierFilename, type DossierReport, type DossierUnit } from "./reportHtml.ts";
@@ -48,7 +48,9 @@ const OPTS = { formatVersion: XRAY_FORMAT_VERSION };
 // re-pass bidi-isolation rule moved these bytes. Same sanction rule as reportHtml.test.ts.
 // PRE-LAUNCH RE-PIN (M4 bidi fix): `.branchnote` gains `unicode-bidi:isolate` in the shared
 // PAGE_CSS, shifting the index bytes too. CSS-only.
-const GOLDEN_INDEX_SHA256 = "f0083ae7cee2dcfff907b64d7d3b9650e5c5556ab06de81f9e41968add38ca40";
+// PRE-LAUNCH RE-PIN (§3.1b runOutcome banner, sanctioned): the shared PAGE_CSS gains `.run-banner`
+// rules + a `--danger` variable; this fixture is a COMPLETE run so no banner renders — CSS-only.
+const GOLDEN_INDEX_SHA256 = "9236d0978dd7f8f0fe0474a94acb06be79011d42b908982bd558dd925be950bf";
 
 describe("renderIndex — copy-as-markdown neutralizes a hostile value through the real render path", () => {
   // Package names are validated and versionsSeen is the valid-semver slice, so a payload cannot
@@ -134,6 +136,7 @@ describe("renderIndex — edge states", () => {
     packages,
     summary: { repositoriesScanned: 0, branchesScanned: 0, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
     scanScope: { excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "complete" },
+    runOutcome: { outcome: "complete", coverageComplete: true }, // complete → no banner (default)
   });
 
   test("no tracked packages: a designed empty table state", () => {
@@ -209,5 +212,23 @@ describe("renderIndex — edge states", () => {
   test("INDEX_FILENAME matches the artifact name grammar", () => {
     expect(INDEX_FILENAME).toBe("index.html");
     expect(INDEX_FILENAME).toMatch(/^[A-Za-z0-9@._~-]+$/);
+  });
+
+  // §3.1b: the index page must flag a partial/failed run so `report --run-id <partial> --html` is
+  // not mistaken for a complete audit.
+  const reportWith = (outcome: RunOutcome | null, coverageComplete: boolean | null): DossierReport =>
+    ({ ...baseReport([]), runOutcome: { outcome, coverageComplete } });
+  test("a COMPLETE run's index renders NO banner element", () => {
+    expect(renderIndex(reportWith("complete", true), OPTS)).not.toContain('<p class="run-banner');
+  });
+  test("a PARTIAL run's index renders the partial banner naming the outcome", () => {
+    const html = renderIndex(reportWith("partial-deferred", false), OPTS);
+    expect(html).toContain('<p class="run-banner partial"');
+    expect(html).toContain("Partial run (partial-deferred)");
+  });
+  test("a legacy-unknown run's index renders the muted coverage-unknown note", () => {
+    const html = renderIndex(reportWith("legacy-unknown", null), OPTS);
+    expect(html).toContain('<p class="run-banner unknown"');
+    expect(html).toContain("Coverage unknown");
   });
 });

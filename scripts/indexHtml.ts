@@ -12,6 +12,7 @@ import { mdCell } from "./markdownEscape.ts";
 import {
   computeDossierModel,
   dossierFilename,
+  renderOutcomeBanner,
   renderShell,
   type DossierPackage,
   type DossierReport,
@@ -147,6 +148,7 @@ export function renderIndex(report: DossierReport, opts: { formatVersion: number
   const html =
     `<header id="exec"><p class="meta">package usage x-ray</p><h1 class="exec">Package usage dossiers — ${esc(plural(rows.length, "tracked package"))}.</h1>` +
     `<p class="meta num">run ${esc(report.runId)} · generated ${esc(report.generatedAt)} · ${esc(receipts)}</p></header>` +
+    renderOutcomeBanner(report.runOutcome) + // §3.1b: flag a partial/failed run at the top of the index
     `<main>${renderScanScope(report)}<section id="packages" aria-labelledby="h-packages"><h2 id="h-packages">Tracked packages</h2>` +
     `<button class="copy" type="button" aria-live="polite" data-copy-target="packages">copy as markdown</button>` +
     `<template id="packages-md">${esc(md)}</template>${body}</section></main>` +

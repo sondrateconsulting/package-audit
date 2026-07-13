@@ -24,6 +24,9 @@ import { createHash } from "node:crypto";
 import { escapeHtml, stripBidiControls } from "./htmlEscape.ts";
 import { mdCell, mdCode, mdTable, mdUrl } from "./markdownEscape.ts";
 import { deriveFacts, tryEvaluateObservations, type Observation } from "./observations.ts";
+// Type-only: RunOutcome is the canonical enum on the DB layer (not report.ts) — the mirror below
+// carries it verbatim so the banner names the exact outcome. Erased at build; no runtime coupling.
+import type { RunOutcome } from "./db.ts";
 
 // ---- input types (structural mirror of the §7 report object) ---------------------------------
 // Deliberately NOT imported from report.ts/reportSchema.ts: reportSchema is test-only by source
@@ -109,11 +112,18 @@ export interface ScanScope {
   // requires a v4-native run with at least one recorded head.
   readonly provenance: "complete" | "pre-upgrade";
 }
+// §3.1b run coverage, the subset the HTML banner needs (structural mirror of report.ts's
+// RunOutcomeBlock — the full block, incl. discovery counters + units, is a superset and assigns in).
+export interface DossierRunOutcome {
+  readonly outcome: RunOutcome | null;
+  readonly coverageComplete: boolean | null;
+}
 export interface DossierContext {
   readonly runId: string;
   readonly generatedAt: string;
   readonly config: DossierConfig;
   readonly summary: DossierSummary;
+  readonly runOutcome: DossierRunOutcome;
   readonly formatVersion: number;
 }
 // The top-level report shape indexHtml.ts consumes (same structural-mirror rationale).
@@ -124,6 +134,7 @@ export interface DossierReport {
   readonly packages: readonly DossierPackage[];
   readonly summary: DossierSummary;
   readonly scanScope: ScanScope;
+  readonly runOutcome: DossierRunOutcome;
 }
 
 // ---- constants --------------------------------------------------------------------------------
@@ -513,9 +524,9 @@ const plural = (count: number, singular: string, pluralForm?: string): string =>
 // ids) and once inside a .print-drawer block (display:none on screen, block in print; no ids, so
 // ids stay unique). That keeps drawers native on screen and complete on paper.
 const PAGE_CSS = `
-:root { color-scheme: light dark; --bg:#faf9f6; --ink:#1c1b19; --muted:#6b675f; --accent:#a34808; --hairline:#dcd8cf; --card:#ffffff; --code-bg:#f1efe9; }
+:root { color-scheme: light dark; --bg:#faf9f6; --ink:#1c1b19; --muted:#6b675f; --accent:#a34808; --hairline:#dcd8cf; --card:#ffffff; --code-bg:#f1efe9; --danger:#b3261e; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg:#171614; --ink:#e8e5de; --muted:#98938a; --accent:#e08a4a; --hairline:#37342f; --card:#1f1d1a; --code-bg:#24221e; }
+  :root { --bg:#171614; --ink:#e8e5de; --muted:#98938a; --accent:#e08a4a; --hairline:#37342f; --card:#1f1d1a; --code-bg:#24221e; --danger:#f2b8b5; }
 }
 * { box-sizing: border-box; }
 body { margin:0 auto; max-width:72rem; padding:2.5rem 1.5rem 4rem; background:var(--bg); color:var(--ink);
@@ -528,6 +539,8 @@ h3.subhead { font-size:.95rem; letter-spacing:.03em; text-transform:uppercase; c
 .meta, .cap, .pointer, .note { color:var(--muted); font-size:.85rem; }
 .num { font-variant-numeric: tabular-nums; }
 .band { border-left:3px solid var(--accent); background:var(--card); padding:.6rem .9rem; margin:1rem 0; font-size:.9rem; }
+.run-banner { border:1px solid var(--danger); border-left-width:4px; background:var(--card); color:var(--danger); padding:.7rem 1rem; margin:1.2rem 0 0; font-size:.92rem; font-weight:600; }
+.run-banner.unknown { border-color:var(--muted); color:var(--muted); }
 .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(13rem,1fr)); gap:1rem; }
 .card { background:var(--card); border:1px solid var(--hairline); padding:1rem 1.1rem; }
 .card h3 { margin:0 0 .5rem; font-size:.78rem; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); font-weight:600; }
@@ -570,7 +583,7 @@ button.copy[data-copied]::after { content:" — copied"; }
 .print-drawer { display:none; }
 footer { margin-top:3.5rem; border-top:1px solid var(--hairline); padding-top:.8rem; color:var(--muted); font-size:.8rem; }
 @media print {
-  :root { color-scheme: light; --bg:#ffffff; --ink:#111111; --muted:#555555; --accent:#8a3d06; --hairline:#cccccc; --card:#ffffff; --code-bg:#f2f2f2; }
+  :root { color-scheme: light; --bg:#ffffff; --ink:#111111; --muted:#555555; --accent:#8a3d06; --hairline:#cccccc; --card:#ffffff; --code-bg:#f2f2f2; --danger:#a11208; }
   /* paper cannot click: expand each evidence link to its actual URL */
   .print-drawer a[href]::after, td a[href]::after { content:" (" attr(href) ")"; font-size:.85em; word-break:break-all; }
   body { max-width:none; padding:0; font-size:12px; }
@@ -905,6 +918,44 @@ function renderFooter(ctx: DossierContext): string {
   return `<footer>package usage x-ray · report-format version ${num(ctx.formatVersion)} · run ${esc(ctx.runId)} · generated ${esc(ctx.generatedAt)}${policyReceipt}</footer>`;
 }
 
+// §3.1b coverage banner: a run that did NOT fully cover the estate must be visibly distinguishable
+// from a complete one in the HTML (a `report --run-id <partial-run> --html` otherwise looks done).
+// Returns "" for a complete run (no banner); a muted "coverage unknown" note for a migrated
+// (legacy-unknown) run; and a prominent partial/failed banner otherwise. Text is static per outcome
+// (no user input) but escaped anyway; the class is a fixed literal. Pure → byte-deterministic.
+function outcomeBannerContent(outcome: RunOutcome | null): { cls: "partial" | "unknown"; text: string } {
+  switch (outcome) {
+    case "complete":
+      return { cls: "unknown", text: "" }; // unreachable — renderOutcomeBanner guards complete first
+    case "legacy-unknown":
+      return { cls: "unknown", text: "Coverage unknown — this report is from a run migrated before coverage tracking; treat completeness as unverified." };
+    case "partial-deferred":
+    case "partial-degraded":
+    case "partial-budget":
+      return { cls: "partial", text: `⚠ Partial run (${outcome}) — some units were not scanned. This report reflects INCOMPLETE coverage; re-run to complete the estate.` };
+    case "fatal":
+      // coverageComplete may be true (discovery finished) or false; either way an unrecoverable stop
+      // means scanning did not complete — say UNVERIFIED, don't assert a specific coverage state.
+      return { cls: "partial", text: "⚠ Failed run (fatal) — this run ended in an unrecoverable error before completing; treat coverage as unverified." };
+    case "legacy-failed":
+      return { cls: "partial", text: "⚠ Failed run (migrated) — this run did not complete; treat coverage as unverified." };
+    case null:
+      return { cls: "partial", text: "⚠ Unfinalized run — this run never finalized; treat coverage as unverified." };
+    default: {
+      const _exhaustive: never = outcome;
+      return { cls: "partial", text: `Run outcome: ${String(_exhaustive)}` };
+    }
+  }
+}
+export function renderOutcomeBanner(ro: DossierRunOutcome): string {
+  if (ro.outcome === "complete") return ""; // a fully-covered run needs no banner
+  const { cls, text } = outcomeBannerContent(ro.outcome);
+  // A partial/failed run is a data-integrity WARNING → role="alert" (assertive); the migrated
+  // "coverage unknown" note is informational → role="status" (polite).
+  const role = cls === "partial" ? "alert" : "status";
+  return `<p class="run-banner ${cls}" role="${role}">${esc(text)}</p>`;
+}
+
 // The designed EMPTY state: coverage receipts, never "not coupled" —
 // scanning is fail-open and caps/cutoff bound the scanned slice, so absence of findings is a
 // statement about the slice, not the estate.
@@ -918,6 +969,7 @@ function renderEmptyBody(pkg: DossierPackage, ctx: DossierContext): string {
   return (
     `<header id="exec"><p class="meta">package usage dossier</p><h1 class="exec">${esc(sentence)}</h1>` +
     `<p class="meta num">${esc(receipts)}</p></header>` +
+    renderOutcomeBanner(ctx.runOutcome) + // §3.1b: flag partial/failed coverage even on an empty dossier
     `<main><section id="coverage" aria-labelledby="h-coverage"><h2 id="h-coverage">What was scanned</h2>` +
     `<p>Detection is scoped to the scanned slice: repositories and branches admitted by this run's configuration ` +
     `(cutoff ${esc(ctx.config.cutoffDate)}, host ${esc(ctx.config.githubHost)}). A finding requires the package to be declared, imported, ` +
@@ -960,6 +1012,7 @@ export function renderDossierDetailed(pkg: DossierPackage, ctx: DossierContext):
     `<p class="meta num">run ${esc(ctx.runId)} · generated ${esc(ctx.generatedAt)} · headline scope: ${esc(m.scopeLabel)}</p></header>`;
   const body = [
     header,
+    renderOutcomeBanner(ctx.runOutcome), // §3.1b: partial/failed coverage is flagged above the fold
     "<main>",
     renderBands(m),
     renderCards(m),

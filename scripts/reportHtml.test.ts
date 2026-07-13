@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AuditDb } from "./db.ts";
+import { AuditDb, type RunOutcome } from "./db.ts";
 import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import { buildReport } from "./report.ts";
 import { ArtifactBundle, ArtifactWriteError } from "./artifactWrite.ts";
@@ -48,6 +48,7 @@ const FIXED_CTX: DossierContext = {
   generatedAt: T0,
   config: { cutoffDate: "2024-01-01", githubHost: "github.com", organizations: ["org-a"] },
   summary: { repositoriesScanned: 2, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+  runOutcome: { outcome: "complete", coverageComplete: true }, // a complete run → no banner (default)
   formatVersion: XRAY_FORMAT_VERSION,
 };
 
@@ -139,8 +140,58 @@ const syntheticPkg = (units: DossierUnit[], over: Partial<DossierPackage> = {}):
 // now emitted as a `<https://…>` angle-bracket autolink (was a bare URL through mdCell) so a path
 // with `(`/`)` keeps a correct link destination. Copy-markdown `<template>` bytes only (dossier
 // golden); the visible dossier HTML permalink (permalinkAnchor) is byte-unchanged.
-const GOLDEN_DOSSIER_SHA256 = "1b82113ec0f20fdfb49475f0457dd2c294a5d211bdb4da874ec019b123fac93a";
-const GOLDEN_EMPTY_SHA256 = "36ccb2eccf26d98e30bf1c10a0337c6b78cd9a8f1ea6466a5c880c2e9010e97c";
+// PRE-LAUNCH RE-PIN (§3.1b runOutcome banner, sanctioned): the shared PAGE_CSS gains `.run-banner`
+// rules + a `--danger` theme variable (so ALL THREE goldens shift by the CSS bytes). These fixtures
+// are COMPLETE runs (FIXED_CTX.runOutcome.outcome='complete'), so no banner is rendered into the
+// body — the only delta is the new CSS. Verified CSS-only before re-pin.
+const GOLDEN_DOSSIER_SHA256 = "405f93d9f4081f3a2a9eb4b88e186eeb4cf82c85a0abe7ccd475f1460139f1df";
+const GOLDEN_EMPTY_SHA256 = "9231d974c9da6bcb9d8ae4d261a2c598fcd467f53d914abd74937faddc81fde9";
+
+describe("renderOutcomeBanner (§3.1b coverage banner in the dossier)", () => {
+  const ctxWith = (outcome: RunOutcome | null, coverageComplete: boolean | null): DossierContext =>
+    ({ ...FIXED_CTX, runOutcome: { outcome, coverageComplete } });
+  const dossierFor = (outcome: RunOutcome | null): string => renderDossier(fixturePackages()[0]!, ctxWith(outcome, outcome === "complete" ? true : false));
+
+  test("a COMPLETE run renders NO banner element (the .run-banner CSS rule is always present)", () => {
+    expect(dossierFor("complete")).not.toContain('<p class="run-banner');
+  });
+  test("a PARTIAL run renders a prominent partial banner naming the outcome + re-run guidance", () => {
+    const html = dossierFor("partial-deferred");
+    expect(html).toContain('<p class="run-banner partial"');
+    expect(html).toContain("Partial run (partial-deferred)");
+    expect(html).toContain("re-run to complete the estate");
+  });
+  test("a fatal run renders an assertive failed banner (unverified coverage, role=alert)", () => {
+    const html = dossierFor("fatal");
+    expect(html).toContain("Failed run (fatal)");
+    expect(html).toContain("treat coverage as unverified"); // must NOT overclaim "incomplete"
+    expect(html).toContain('role="alert"'); // a data-integrity warning is assertive
+  });
+  test("a legacy-failed run renders the migrated-failed banner (unverified coverage)", () => {
+    const html = renderDossier(fixturePackages()[0]!, ctxWith("legacy-failed", null));
+    expect(html).toContain('<p class="run-banner partial"');
+    expect(html).toContain("Failed run (migrated)");
+    expect(html).toContain("treat coverage as unverified");
+  });
+  test("an unfinalized (null-outcome) run renders the unverified banner", () => {
+    const html = renderDossier(fixturePackages()[0]!, ctxWith(null, null));
+    expect(html).toContain("Unfinalized run");
+    expect(html).toContain("treat coverage as unverified");
+  });
+  test("the migrated legacy-unknown note is polite (role=status), not an alert", () => {
+    expect(dossierFor("legacy-unknown")).toContain('role="status"');
+  });
+  test("a legacy-unknown run renders the muted 'coverage unknown' note", () => {
+    const html = dossierFor("legacy-unknown");
+    expect(html).toContain('<p class="run-banner unknown"');
+    expect(html).toContain("Coverage unknown");
+  });
+  test("the EMPTY-state dossier ALSO carries the banner for a partial run", () => {
+    const html = renderDossier(fixturePackages()[1]!, ctxWith("partial-budget", false)); // left-pad: zero findings
+    expect(html).toContain('<p class="run-banner partial"');
+    expect(html).toContain("partial-budget");
+  });
+});
 
 describe("renderDossier — determinism and golden bytes", () => {
   test("double-render byte equality (same DB, two builds, two renders)", () => {

@@ -536,6 +536,7 @@ export function emitDossiers(report: EmittedReport, outputDir: string): { dossie
     generatedAt: report.generatedAt,
     config: report.config,
     summary: report.summary,
+    runOutcome: report.runOutcome, // §3.1b: the banner flags a partial/failed run's HTML
     formatVersion: report.formatVersion,
   };
   const bundle = new ArtifactBundle(outputDir, "dossier");
