@@ -13,7 +13,9 @@ import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchHead } from "./github.ts";
 import { planRepoBranches, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
-import { PolicyMatchError, type CompiledBranchPolicy } from "./branchPolicy.ts";
+import { PolicyMatchError, type CompiledBranchPolicy, type PolicyCoverage } from "./branchPolicy.ts";
+import { discovered, discoveryFailed, type DiscoveryOutcome } from "./discovery.ts";
+import { computeUnmatchedWarnings, isEmptyAllowlist, policyWarningLines, type PolicyWarning } from "./policyWarnings.ts";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseArgs, ORCHESTRATE_HELP, ORCHESTRATE_USAGE, type OrchestrateArgs } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -145,7 +147,9 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
 // §8 step 7's "concise human-readable summary": stderr only — stdout stays pure JSONL. The
 // counters are the report's own §7 summary block (the imported ReportSummary type), labels
 // matching the report field names.
-export function runSummaryText(runId: string, s: ReportSummary, errorCount: number, reportPath: string): string {
+export function runSummaryText(
+  runId: string, s: ReportSummary, errorCount: number, reportPath: string, warnings: readonly PolicyWarning[] = [],
+): string {
   return [
     "",
     `AUDIT COMPLETE — run ${runId}`,
@@ -156,8 +160,20 @@ export function runSummaryText(runId: string, s: ReportSummary, errorCount: numb
     `  Usage findings:         ${s.totalUsageFindings}`,
     `  Errors recorded:        ${errorCount} (fail-soft; details in the report's errors[])`,
     `  Report:                 ${reportPath} (+ latest.json)`,
+    ...policyWarningLines(warnings),
     "",
   ].join("\n");
+}
+
+// Compute AND emit the §8 unmatched-pattern warnings, then return the FULL advisory array for the
+// summary. Shared by runScan and runPlan so their warning sets can never drift (run/plan parity is a
+// load-bearing property). The unmatched events are logged here (pure set-difference over the coverage
+// collected during discovery — no glob runs); the empty-allowlist event is emitted separately at mode
+// entry, and re-listed first in the returned array for the human summary.
+function emitPolicyWarnings(branchPolicy: CompiledBranchPolicy, coverages: readonly PolicyCoverage[]): PolicyWarning[] {
+  const unmatched = computeUnmatchedWarnings(branchPolicy, coverages);
+  for (const w of unmatched) logLine({ event: "policy-warning", ...w });
+  return [...(isEmptyAllowlist(branchPolicy) ? [{ kind: "empty-allowlist" } as const] : []), ...unmatched];
 }
 
 // The full scan lifecycle (§0/§1/§3/§5/§8), after preflight opened the db + caching client.
@@ -170,6 +186,10 @@ export async function runScan(
   const { config, configHash } = runtime;
   // §0 startup: sweep stale temp dirs from a prior crash.
   client.sweepStaleTempDirs();
+
+  // §8: the empty-allowlist warning is UNCONDITIONAL — emit it at mode entry so it fires even if the
+  // run then early-returns on an owner-discovery throttle. Retained for the end-of-run summary.
+  if (isEmptyAllowlist(runtime.branchPolicy)) logLine({ event: "policy-warning", kind: "empty-allowlist" });
 
   // §1 effective owner resolution (discovery runs every invocation). A throttle here is
   // TRANSIENT (§4): end the run cleanly and let the next invocation re-discover, rather than
@@ -213,14 +233,18 @@ export async function runScan(
   // fail-closed at match time) is a GLOBAL config defect — never a per-repo soft error — so it
   // ABORTS the whole run: mark the run failed (excluded from latest selection) and rethrow the
   // ORIGINAL operator-facing error unchanged (it is registered in KNOWN_OPERATOR_ERRORS).
+  const coverages: PolicyCoverage[] = [];
   try {
     for (const owner of owners) {
-      await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen);
+      coverages.push(...(await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen)));
     }
   } catch (e) {
     if (e instanceof PolicyMatchError) db.failRun(runId);
     throw e;
   }
+
+  // §8: emit the unmatched-pattern warnings (before completeRun/done) and build the summary array.
+  const warnings = emitPolicyWarnings(runtime.branchPolicy, coverages);
 
   // §5.E introspection reconciliation over the run's reportable slice.
   await reconcileIntrospection(db, client, config, runId);
@@ -235,7 +259,7 @@ export async function runScan(
   const summary = emitted.report.summary;
   const errorCount = emitted.report.errors.length;
   logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount });
-  process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path));
+  process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path, warnings));
 }
 
 // ---- owner resolution + branch classification (shared by the run and --plan paths) -----------
@@ -280,67 +304,83 @@ export async function resolveOwnersWithDiscovery(
 export async function processOwner(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, personalLogin: string | null, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-): Promise<void> {
+): Promise<PolicyCoverage[]> {
   const isPersonal = runtime.config.includePersonalNamespace && owner === personalLogin;
-  const kept = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
-  for (const repo of kept) {
-    await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen);
+  const outcome = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
+  if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
+  // Collect each successfully-discovered repo's coverage (null = its branch discovery failed) so the
+  // run-level §8 warning finalizer sees exactly the patterns exercised against real branches.
+  const coverages: PolicyCoverage[] = [];
+  for (const repo of outcome.items) {
+    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen);
+    if (cov !== null) coverages.push(cov);
   }
+  return coverages;
 }
 
 // §5.A run-path repo discovery for one owner, fail-soft: a failure records the DB error row AND
-// emits the matching JSONL `discovery` event (org-scoped — no `repo` field), then yields [] so
-// the owner loop simply moves on. A ThrottleExhausted is TRANSIENT (§4): discovery re-runs next
-// invocation, so it logs a requeue event and yields [] with NO permanent errors row. Exported
-// for tests (scripted client + real in-memory DB); processOwner is its only runtime caller. The
-// --plan twin lives in runPlan, deliberately separate — plan mode has no DB and counts failures
-// into its totals instead.
+// emits the matching JSONL `discovery` event (org-scoped — no `repo` field), then returns a FAILED
+// DiscoveryOutcome so the owner loop simply moves on (§9). A ThrottleExhausted is TRANSIENT (§4):
+// discovery re-runs next invocation, so it logs a requeue event and returns a failed outcome with NO
+// permanent errors row. Exported for tests (scripted client + real in-memory DB); processOwner is its
+// only runtime caller. The --plan twin lives in runPlan, deliberately separate — plan mode has no DB
+// and counts failures into its totals instead.
 export async function discoverOwnerRepos(
   db: AuditDb, client: GithubClient, config: Config, runId: string, owner: string, isPersonal: boolean,
-): Promise<RepoInfo[]> {
+): Promise<DiscoveryOutcome<RepoInfo>> {
   let repos: RepoInfo[];
   try {
     repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
   } catch (e) {
     // §4: a throttle during repo discovery is TRANSIENT — no permanent errors row (discovery
-    // re-runs next invocation). Any other error is a permanent discovery failure.
+    // re-runs next invocation). Any other error is a permanent discovery failure. Either way the
+    // outcome is a FAILURE (never a genuinely-empty owner) — the caller must not treat it as "done".
     if (e instanceof ThrottleExhausted) {
       logLine({ event: "discovery", org: owner, action: "requeue-throttle", message: (e as Error).message });
-      return [];
+      return discoveryFailed("throttled");
     }
     const message = `repo discovery failed: ${(e as Error).message}`;
     db.insertError({ runId, scope: "discovery", organization: owner, message });
     logLine({ event: "discovery", org: owner, error: message });
-    return [];
+    return discoveryFailed("failed");
   }
-  return filterSortCapRepos(repos, {
+  return discovered(filterSortCapRepos(repos, {
     includeArchived: config.includeArchived, includeForks: config.includeForks, maxReposPerOrg: config.maxReposPerOrg,
-  });
+  }));
 }
 
-// Discover a repo's branches, apply the cutoff + cap, and process/skip each branch unit (§5.B/§3).
-// Exported for the wiring tests (scripted client + real in-memory DB) — the throttle-requeue
-// policy in the catches below must stay pinned; processOwner is its only runtime caller.
-export async function processRepo(
-  db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
-  owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-): Promise<void> {
-  const { config, configHash, branchPolicy } = runtime;
-  let heads: BranchHead[];
+// Branch-head discovery for ONE repo as a typed outcome (§9) — extracted so both the run (here) and
+// T11 consume the SAME failed-vs-genuinely-empty distinction. Same fail-soft policy: a throttle
+// requeues with no errors row (transient); any other error records a permanent discovery-failure row.
+export async function discoverBranchHeads(
+  db: AuditDb, client: GithubClient, runId: string, repo: RepoInfo,
+): Promise<DiscoveryOutcome<BranchHead>> {
   try {
-    heads = await client.listBranchHeads(repo.organization, repo.name);
+    return discovered(await client.listBranchHeads(repo.organization, repo.name));
   } catch (e) {
-    // §4: a throttle during branch discovery is TRANSIENT — no permanent errors row (the
-    // next run re-discovers). Any other error is a permanent discovery failure.
     if (e instanceof ThrottleExhausted) {
       logLine({ event: "discovery", org: repo.organization, repo: repo.name, action: "requeue-throttle", message: (e as Error).message });
-      return;
+      return discoveryFailed("throttled");
     }
     const message = `branch discovery failed: ${(e as Error).message}`;
     db.insertError({ runId, scope: "discovery", organization: repo.organization, repository: repo.name, message });
     logLine({ event: "discovery", org: repo.organization, repo: repo.name, error: message });
-    return;
+    return discoveryFailed("failed");
   }
+}
+
+// Discover a repo's branches, apply policy + cutoff + cap, and process/skip each branch unit
+// (§5.B/§3/§8). Returns the repo's policy COVERAGE on a successful discovery (folded into the run's
+// §8 warnings), or null when branch discovery failed/throttled. Exported for the wiring tests;
+// processOwner is its only runtime caller.
+export async function processRepo(
+  db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
+  owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+): Promise<PolicyCoverage | null> {
+  const { config, configHash, branchPolicy } = runtime;
+  const outcome = await discoverBranchHeads(db, client, runId, repo);
+  if (!outcome.ok) return null; // failed/throttled — this repo isn't "discovered"; contributes no coverage
+  const heads = outcome.items;
   // Classify the WHOLE repo up-front (policy → cutoff/cap) via the ONE shared planner. This runs
   // OUTSIDE the discovery catch and BEFORE any per-branch write, so a malformed-glob PolicyMatchError
   // aborts before this repo is half-classified (runScan then fails the run and rethrows).
@@ -419,6 +459,7 @@ export async function processRepo(
       }
     }
   }
+  return plan.coverage; // a SUCCESSFULLY-discovered repo (even if empty) — folds into the run's §8 warnings
 }
 
 // Scan ONE branch unit: fetch the tree (clone fallback on truncation), run the §5.C-H pipeline,
@@ -677,6 +718,9 @@ export interface PlanTotals {
 }
 export async function runPlan(client: GithubClient, runtime: AuditRuntime, personalLogin: string): Promise<PlanTotals> {
   const { config, branchPolicy } = runtime;
+  // §8 parity: the empty-allowlist warning is emitted at mode entry, unconditionally, exactly as in
+  // runScan — so --plan and the real run produce identical policy-warning events for the same config.
+  if (isEmptyAllowlist(branchPolicy)) logLine({ event: "policy-warning", kind: "empty-allowlist" });
   // The zero-write contract is enforced, not assumed: a caching client would write api_cache rows
   // into the DB during discovery. This is an internal contract violation (a bug, not an operator
   // error), so a plain Error with a stack is the right rendering.
@@ -684,6 +728,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 
   let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, branchesExcludedByPolicy = 0, discoveryErrors = 0;
+  const coverages: PolicyCoverage[] = []; // per successfully-discovered repo, for the §8 warning finalizer
   for (const owner of owners) {
     const isPersonal = config.includePersonalNamespace && owner === personalLogin;
     let repos: RepoInfo[];
@@ -712,6 +757,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
       // branchesEligible counts toScan (default + within-cap after-cutoff); policy-excluded is its own
       // disjoint bucket. A malformed-glob PolicyMatchError propagates FATAL (no DB to mark; main exits 1).
       const p = planRepoBranches(heads, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
+      coverages.push(p.coverage); // this repo was discovered successfully (even if empty) — §8 coverage
       branchesEligible += p.toScan.length;
       branchesSkippedByCutoff += p.cutoffSkipped.length;
       branchesPastCap += p.pastCap.length;
@@ -724,16 +770,21 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
     }
   }
 
+  // §8: emit the unmatched-pattern warnings (before plan-summary) — identical to runScan's set.
+  const warnings = emitPolicyWarnings(branchPolicy, coverages);
+
   const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, discoveryErrors };
   logLine({ event: "plan-summary", ...totals });
-  process.stderr.write(planSummaryText(config, totals));
+  process.stderr.write(planSummaryText(config, totals, warnings));
   return totals;
 }
 
 // The human-facing plan block goes to STDERR so stdout stays pure JSONL for pipes/agents.
 // The param names only the three config fields the text actually reads (interface segregation —
 // tests can pass the narrow literal instead of forging a full Config).
-export function planSummaryText(config: Pick<Config, "cutoffDate" | "maxBranchesPerRepo" | "packages">, t: PlanTotals): string {
+export function planSummaryText(
+  config: Pick<Config, "cutoffDate" | "maxBranchesPerRepo" | "packages">, t: PlanTotals, warnings: readonly PolicyWarning[] = [],
+): string {
   const lines = [
     "",
     "PLAN — preview only: no database opened, nothing scanned, nothing written",
@@ -743,6 +794,7 @@ export function planSummaryText(config: Pick<Config, "cutoffDate" | "maxBranches
     `                        ${t.branchesSkippedByCutoff} skipped by cutoff (< ${config.cutoffDate}) · ${t.branchesPastCap} past the per-repo cap (${config.maxBranchesPerRepo}) · ${t.branchesExcludedByPolicy} excluded by branch policy`,
     `  Packages tracked:     ${config.packages.map((p) => p.name).join(", ")}`,
     `  Discovery errors:     ${t.discoveryErrors}`,
+    ...policyWarningLines(warnings),
     `  Next:                 bun run audit   (narrow scope first via "organizations" in the config if this is broader than intended)`,
     "",
   ];

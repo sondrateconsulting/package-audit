@@ -90,6 +90,38 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap (§1/§12)", 
   });
 });
 
+describe("planRepoBranches — coverage sweep (§8/§12)", () => {
+  test("coverage unions every pattern that matched ANY raw head; unmatched patterns are absent", () => {
+    const policy = compileBranchPolicy(null, ["feat-a", "nope*"]); // deny feat-a; 'nope*' matches nothing
+    const p = planRepoBranches(HEADS, policy, "2024-01-01", 25, "main");
+    expect(p.coverage.excludeBranches).toEqual(["feat-a"]); // 'nope*' matched no head → absent
+    expect(p.coverage.branches).toEqual([]); // unrestricted include
+  });
+
+  test("coverage includes a matched head from EVERY disposition bucket (default / to-scan / cutoff / past-cap)", () => {
+    const heads = [
+      head("main", "2025-06-01T00:00:00Z"),
+      head("recent1", "2025-05-01T00:00:00Z"),
+      head("recent2", "2025-04-01T00:00:00Z"),
+      head("stale", "2023-01-01T00:00:00Z"),
+    ];
+    const policy = compileBranchPolicy(["main", "recent1", "recent2", "stale"], []); // allowlist = all four
+    const p = planRepoBranches(heads, policy, "2024-01-01", 1, "main"); // cap=1 (non-default)
+    expect(p.toScan.map((d) => d.head.name)).toEqual(["main", "recent1"]); // default + one slot
+    expect(p.pastCap.map((d) => d.head.name)).toEqual(["recent2"]);
+    expect(p.cutoffSkipped.map((d) => d.head.name)).toEqual(["stale"]);
+    // the sweep runs over EVERY raw head regardless of bucket, so every allow pattern matched
+    expect(p.coverage.branches.slice().sort()).toEqual(["main", "recent1", "recent2", "stale"]);
+  });
+
+  test("a SHADOWED malformed glob (never the winner, invoked ONLY by coverage) fails fast (§12)", () => {
+    // deny ['main' exact, 'z*' throwing]. For head 'main' the winner is the exact 'main' — z* is never
+    // invoked for classification — but the coverage sweep DOES call z*.match('main') and it throws.
+    const policy = rawPolicy(null, [cp("main", new Bun.Glob("main")), cp("z*", throwingGlob(new Error("shadowed")))]);
+    expect(() => planRepoBranches([head("main", "2025-01-01T00:00:00Z")], policy, "2024-01-01", 25, "main")).toThrow(PolicyMatchError);
+  });
+});
+
 describe("policyAttribution — RAW policy → persisted (status, pattern) pair (§3)", () => {
   test("excluded-by-deny carries the matched pattern", () => {
     const r: PolicyResult = { kind: "excluded-by-deny", matchedPattern: "release/*" };

@@ -204,7 +204,7 @@ const testConfig = (root: string, maxBranchesPerRepo = 25): Config => ({
 });
 
 // Capture stdout JSONL lines emitted during `fn`, returned parsed.
-async function captureJsonl(fn: () => Promise<void>): Promise<Array<Record<string, unknown>>> {
+async function captureJsonl(fn: () => Promise<unknown>): Promise<Array<Record<string, unknown>>> {
   const chunks: string[] = [];
   const spy = spyOn(process.stdout, "write").mockImplementation(((chunk: unknown) => {
     chunks.push(String(chunk));
@@ -269,7 +269,7 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
     }).runId;
 
-  test("a failing owner records the DB error row AND the org-scoped JSONL discovery event, then yields []", async () => {
+  test("a failing owner records the DB error row AND the org-scoped JSONL discovery event, then yields a failed outcome", async () => {
     const root = mkdtempSync(join(tmpdir(), "own-disc-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startRun(db);
@@ -280,7 +280,7 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
       kept = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-a", false);
     });
 
-    expect(kept).toEqual([]); // fail-soft: the owner loop simply moves on
+    expect(kept).toEqual({ ok: false, reason: "failed" }); // fail-soft: a permanent-failure outcome, no partial items
     const disc = events.find((e) => e["event"] === "discovery");
     expect(disc).toBeDefined();
     expect(disc?.["org"]).toBe("org-a");
@@ -312,8 +312,8 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
     const events = await captureJsonl(async () => {
       const keptA = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-a", false);
       const keptB = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-b", false);
-      expect(keptA).toEqual([]);
-      expect(keptB.map((r) => r.name)).toEqual(["svc"]); // archived repo filtered by config
+      expect(keptA).toEqual({ ok: false, reason: "failed" }); // permanent discovery failure
+      expect(keptB.ok && keptB.items.map((r) => r.name)).toEqual(["svc"]); // archived repo filtered by config
     });
     expect(events.filter((e) => e["event"] === "discovery")).toHaveLength(1); // only org-a's failure
     db.close();
@@ -331,7 +331,7 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
       });
 
     const kept = await discoverOwnerRepos(db, client, testConfig(root), runId, "rvo", true);
-    expect(kept).toEqual([]);
+    expect(kept).toEqual({ ok: true, items: [] }); // discovered, genuinely empty
     expect(calls).toHaveLength(1);
     expect(calls[0]!.join(" ")).toContain("user/repos?affiliation=owner");
     db.close();
@@ -745,6 +745,140 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     expect(totals?.branchesExcludedByPolicy).toBe(1); // dev denied — NOT counted eligible or cutoff
     expect(totals?.branchesSkippedByCutoff).toBe(0);
     expect(totals?.branchesPastCap).toBe(0);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // ---- §8 policy warnings (T7) ----
+  // A client serving one org repo (svc) + the given branch heads + an empty tree (so a scanned unit
+  // runs to zero findings). Distinguishes the GraphQL head query, the git-trees fetch, and the repo list.
+  const fullClient = (root: string, heads: Array<{ name: string; oid: string; date: string }>): GithubClient =>
+    makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads(heads) };
+      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: false, tree: [] })}` };
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+  const noArgsT7: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const policyWarnEvents = (events: Array<Record<string, unknown>>) => events.filter((e) => e["event"] === "policy-warning");
+
+  test("runPlan emits an unmatched-pattern warning (before plan-summary) for a deny pattern that matched no branch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "warn-plan-"));
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["release/*"], packages: [] };
+    const events = await captureJsonl(async () => { await runPlan(fullClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }]), rt(config, "h"), "rvo"); });
+    expect(policyWarnEvents(events)).toEqual([{ event: "policy-warning", kind: "unmatched-pattern", direction: "deny", pattern: "release/*" }]);
+    expect(events.findIndex((e) => e["event"] === "policy-warning")).toBeLessThan(events.findIndex((e) => e["event"] === "plan-summary"));
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("unmatched warnings are SUPPRESSED when zero repos were discovered (branch discovery failed)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "warn-suppress-"));
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["release/*"], packages: [] };
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 1, stderr: "gh: boom", stdout: "" }; // branch discovery FAILS
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    const events = await captureJsonl(async () => { await runPlan(client, rt(config, "h"), "rvo"); });
+    expect(policyWarnEvents(events)).toEqual([]); // suppressed
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a SUCCESSFUL but EMPTY discovery (zero heads) does NOT suppress — only a FAILURE does", async () => {
+    const root = mkdtempSync(join(tmpdir(), "warn-empty-"));
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["release/*"], packages: [] };
+    const events = await captureJsonl(async () => { await runPlan(fullClient(root, []), rt(config, "h"), "rvo"); }); // discovered, empty
+    expect(policyWarnEvents(events)).toEqual([{ event: "policy-warning", kind: "unmatched-pattern", direction: "deny", pattern: "release/*" }]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("branches:[] emits empty-allowlist EVEN on the owner-discovery-throttle early return (unconditional)", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const config = { ...testConfig("/tmp", 25), organizations: null, branches: [], packages: [] };
+    const client = { sweepStaleTempDirs: () => [], listOrgMemberships: async () => { throw new ThrottleExhausted("core bucket"); } } as unknown as GithubClient;
+    const events = await captureJsonl(async () => { await runScan(db, client, rt(config, "h"), noArgsT7, null); });
+    expect(policyWarnEvents(events)).toEqual([{ event: "policy-warning", kind: "empty-allowlist" }]);
+    expect(db.read("SELECT COUNT(*) AS n FROM runs").get()).toEqual({ n: 0 }); // no run started
+    db.close();
+  });
+
+  test("branches:[] emits empty-allowlist EXACTLY ONCE on a normally-completing run (not double-counted)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "warn-empty-once-"));
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], branches: [], packages: [] };
+    const events = await captureJsonl(async () => { await runPlan(fullClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }]), rt(config, "h"), "rvo"); });
+    const emptyAllow = events.filter((e) => e["event"] === "policy-warning" && e["kind"] === "empty-allowlist");
+    expect(emptyAllow).toEqual([{ event: "policy-warning", kind: "empty-allowlist" }]); // once (at entry), never re-emitted at finalize
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("the SAME pattern in allow AND deny yields TWO direction-specific warnings end-to-end", async () => {
+    const root = mkdtempSync(join(tmpdir(), "warn-both-"));
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], branches: ["shared"], excludeBranches: ["shared"], packages: [] };
+    // only 'main' (default) is discovered — 'shared' matches nothing in either list
+    const events = await captureJsonl(async () => { await runPlan(fullClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }]), rt(config, "h"), "rvo"); });
+    expect(policyWarnEvents(events)).toEqual([
+      { event: "policy-warning", kind: "unmatched-pattern", direction: "deny", pattern: "shared" },
+      { event: "policy-warning", kind: "unmatched-pattern", direction: "allow", pattern: "shared" },
+    ]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("runScan with a SHADOWED throwing coverage glob fails the run fatally, writing ZERO branch rows", async () => {
+    const root = mkdtempSync(join(tmpdir(), "warn-fatal-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
+    const badError = new Error("shadowed");
+    // deny ['main' exact winner, 'z*' throwing]: classification wins on the exact 'main', but the
+    // coverage sweep invokes z*.match('main') and throws — the run must fail with no branch rows.
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [{ pattern: "main", glob: new Bun.Glob("main") }, { pattern: "z*", glob: throwingGlob(badError) }] } };
+    let thrown: unknown = null;
+    await captureJsonl(async () => { thrown = await runScan(db, fullClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }]), runtime, noArgsT7, null).then(() => null, (e: unknown) => e); });
+    expect(thrown).toBeInstanceOf(PolicyMatchError);
+    expect((thrown as { cause?: unknown }).cause).toBe(badError); // the ORIGINAL error, unchanged
+    expect(db.read("SELECT COUNT(*) AS n FROM run_unit_head").get()).toEqual({ n: 0 });
+    const run = db.read("SELECT status FROM runs ORDER BY started_at DESC LIMIT 1").get() as { status: string };
+    expect(run.status).toBe("failed");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("--plan and the real run emit IDENTICAL ordered policy-warning arrays for the same discovered heads", async () => {
+    const root = mkdtempSync(join(tmpdir(), "warn-parity-"));
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["release/*", "wip"], packages: [] };
+    const heads = [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }];
+    const planEvents = await captureJsonl(async () => { await runPlan(fullClient(root, heads), rt(config, "h"), "rvo"); });
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runEvents = await captureJsonl(async () => { await runScan(db, fullClient(root, heads), rt(config, "h"), noArgsT7, null); });
+    db.close();
+    const expected = [
+      { event: "policy-warning", kind: "unmatched-pattern", direction: "deny", pattern: "release/*" },
+      { event: "policy-warning", kind: "unmatched-pattern", direction: "deny", pattern: "wip" },
+    ];
+    expect(policyWarnEvents(planEvents)).toEqual(expected);
+    expect(policyWarnEvents(runEvents)).toEqual(expected); // identical to --plan
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("runScan SUPPRESSES warnings when branch discovery fails for every repo (the null-coverage seam)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "warn-scan-suppress-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["release/*"], packages: [] };
+    // repo list OK, but branch discovery FAILS → processRepo returns null → coverages empty → suppressed
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 1, stderr: "gh: boom", stdout: "" };
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    const events = await captureJsonl(async () => { await runScan(db, client, rt(config, "h"), noArgsT7, null); });
+    expect(policyWarnEvents(events)).toEqual([]); // suppressed via runScan's null-coverage path
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("runScan does NOT suppress on a successful EMPTY repo (empty coverage still counts as discovered)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "warn-scan-empty-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["release/*"], packages: [] };
+    const events = await captureJsonl(async () => { await runScan(db, fullClient(root, []), rt(config, "h"), noArgsT7, null); });
+    expect(policyWarnEvents(events)).toEqual([{ event: "policy-warning", kind: "unmatched-pattern", direction: "deny", pattern: "release/*" }]);
+    db.close();
     rmSync(root, { recursive: true, force: true });
   });
 });

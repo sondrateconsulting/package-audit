@@ -4,7 +4,7 @@
 // consume a cap slot that an allowed older branch could have used (§12). Pure — no I/O, no DB.
 
 import type { BranchHead } from "./github.ts";
-import { classifyBranch, type CompiledBranchPolicy, type PolicyResult } from "./branchPolicy.ts";
+import { classifyBranch, coverageForName, type CompiledBranchPolicy, type PolicyResult, type PolicyCoverage } from "./branchPolicy.ts";
 import type { PolicyStatus } from "./db.ts";
 
 // §5.B classification, pure: heads arrive sorted committedDate DESC. The repo's DEFAULT branch
@@ -24,7 +24,7 @@ export interface BranchPlan {
   readonly pastCap: readonly BranchHead[];
 }
 export function classifyBranchPlan(
-  heads: BranchHead[], cutoffDate: string, maxBranchesPerRepo: number, defaultBranch: string,
+  heads: readonly BranchHead[], cutoffDate: string, maxBranchesPerRepo: number, defaultBranch: string,
 ): BranchPlan {
   const cutoffSkipped: BranchHead[] = [];
   const eligible: BranchHead[] = [];
@@ -59,23 +59,36 @@ export interface RepoBranchPlan {
   readonly cutoffSkipped: readonly BranchDecision[];
   readonly pastCap: readonly BranchDecision[];
   readonly policyExcluded: readonly BranchDecision[];
+  // The UNION over this repo's raw heads of every configured pattern that matched ≥1 head (§8 coverage,
+  // per list). Folded into the run-level warning finalizer: a configured pattern absent from EVERY
+  // discovered repo's coverage matched nothing and warrants an "unmatched-pattern" warning.
+  readonly coverage: PolicyCoverage;
 }
 
-// Classify every head — policy FIRST, then cutoff/cap over ONLY the policy-eligible set. classifyBranch
-// may throw PolicyMatchError (a malformed glob, fail-closed); this classifies the WHOLE repo up-front
-// so such a throw happens BEFORE any per-branch disposition is written, and callers must let it
-// propagate FATAL (never a per-repo/per-unit soft error — a denied branch must never be silently scanned).
+// Classify every head — policy FIRST, then cutoff/cap over ONLY the policy-eligible set. Also sweeps
+// coverage over EVERY raw head (§8/§12). classifyBranch and coverageForName may throw PolicyMatchError
+// (a malformed glob, fail-closed) — and coverage invokes patterns the WINNER matcher shadows, so a
+// shadowed malformed glob fails HERE. This runs the WHOLE repo up-front, before any per-branch write,
+// so such a throw aborts before this repo is half-classified; callers must let it propagate FATAL
+// (never a per-repo/per-unit soft error — a denied branch must never be silently scanned).
 export function planRepoBranches(
-  heads: BranchHead[],
+  heads: readonly BranchHead[],
   policy: CompiledBranchPolicy,
   cutoffDate: string,
   maxBranchesPerRepo: number,
   defaultBranch: string,
 ): RepoBranchPlan {
   const decisions = new Map<BranchHead, BranchDecision>();
+  const matchedInclude = new Set<string>();
+  const matchedExclude = new Set<string>();
   for (const head of heads) {
     const c = classifyBranch(policy, head.name, defaultBranch);
     decisions.set(head, { head, isDefaultBranch: c.isDefaultBranch, rawPolicyResult: c.rawPolicyResult });
+    // Coverage (§8): EVERY pattern that matched this head, both lists. Separate from the winner used
+    // above (which short-circuits) — so a pattern shadowed for classification is still exercised here.
+    const cov = coverageForName(policy, head.name);
+    for (const p of cov.branches) matchedInclude.add(p);
+    for (const p of cov.excludeBranches) matchedExclude.add(p);
   }
   // Stable-filter to the policy-eligible heads (order preserved), then cutoff/cap ONLY those. A
   // non-default excluded head is dropped here — before nonDefaultEligible can increment for it — so
@@ -89,7 +102,10 @@ export function planRepoBranches(
   }
   const plan = classifyBranchPlan(eligibleHeads, cutoffDate, maxBranchesPerRepo, defaultBranch);
   const decide = (hs: readonly BranchHead[]): BranchDecision[] => hs.map((h) => decisions.get(h)!);
-  return { toScan: decide(plan.eligible), cutoffSkipped: decide(plan.cutoffSkipped), pastCap: decide(plan.pastCap), policyExcluded };
+  return {
+    toScan: decide(plan.eligible), cutoffSkipped: decide(plan.cutoffSkipped), pastCap: decide(plan.pastCap),
+    policyExcluded, coverage: { branches: [...matchedInclude], excludeBranches: [...matchedExclude] },
+  };
 }
 
 // Map a branch's RAW policy decision to the persisted (policy_status, policy_matched_pattern) pair
