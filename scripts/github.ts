@@ -1102,7 +1102,11 @@ export class GithubClient {
     // list. A silently-dropped node or a silently-truncated pagination would understate it and delete
     // a live branch's row. So a malformed node, a missing/non-boolean hasNextPage, a hasNextPage=true
     // with no follow-up cursor, or a duplicate name across pages all THROW (→ discovery 'failed' →
-    // the repo is retained, never reconciled) rather than returning a partial list.
+    // the repo is retained, never reconciled) rather than returning a partial list. The guarantee is
+    // STRUCTURAL — every page followed to hasNextPage:false, every node well-formed. It rests on
+    // GitHub's own pagination contract (hasNextPage:false ⇒ no more refs); a hypothetical GitHub-side
+    // bug returning hasNextPage:false while omitting a live ref is outside this guard (and, if it ever
+    // occurred, is transient and self-healing — findings persist and the next run re-discovers).
     const seenNames = new Set<string>();
     let cursor: string | null = null;
     for (;;) {

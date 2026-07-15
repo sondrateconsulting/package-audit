@@ -172,7 +172,7 @@ export const summarySchema = z
     totalDependencyFindings: z.number().int().min(0),
     totalUsageFindings: z.number().int().min(0),
   })
-  .describe("Per-run DISJOINT disposition partition + finding totals, from the immutable run_unit_head snapshot. totalHeads = scanned + skippedByCutoff + excludedByPolicy + pastCap");
+  .describe("Per-run DISJOINT disposition partition + finding totals, from the immutable run_unit_head snapshot. The four disposition counts partition the RECORDED run_unit_head rows exactly once each (recordedRows = scanned + skippedByCutoff + excludedByPolicy + pastCap); they do NOT necessarily sum to every discovered branch — a branch whose scan errored or was throttled this run has no row and is in errors[] instead");
 
 export const policyBranchSchema = z.strictObject({
   organization: z.string(),

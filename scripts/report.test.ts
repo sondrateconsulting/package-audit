@@ -180,6 +180,23 @@ describe("buildReport (§7)", () => {
     db.close();
   });
 
+  test("§5 partition counts RECORDED disposition rows only — a scan-errored discovered branch is in errors[], not a bucket", () => {
+    const db = mem();
+    const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    // 'main' reached a terminal disposition (scanned). 'feature' was discovered + eligible but its scan
+    // ERRORED — it writes NO run_unit_head row (only an errors[] entry), so it is in no disposition bucket.
+    db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "main", commitSha: "sha-main", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T00:00:00Z" });
+    db.insertError({ runId, scope: "scan", organization: "org-a", repository: "svc", branch: "feature", message: "tree fetch failed" });
+    db.completeRun(runId);
+    const report = buildReport(db, db.getRun(runId)!) as any;
+    // the four-way partition sums to the RECORDED rows (1: main), NOT the 2 discovered branches
+    expect(report.summary).toMatchObject({ branchesScanned: 1, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0 });
+    expect(report.summary.branchesScanned + report.summary.branchesSkippedByCutoff + report.summary.branchesExcludedByPolicy + report.summary.branchesPastCap).toBe(1);
+    // 'feature' IS accounted for — in errors[] — so the two discovered heads are both represented across the report
+    expect(report.errors.some((e: any) => e.branch === "feature" && e.scope === "scan")).toBe(true);
+    db.close();
+  });
+
   test("a completed run with ZERO heads has unverifiable provenance → 'pre-upgrade', never a false 'complete'", () => {
     const db = mem();
     const { runId } = db.startRun({

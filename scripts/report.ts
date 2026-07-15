@@ -55,10 +55,14 @@ export interface ReportSummary {
   repositoriesScanned: number;
   branchesScanned: number;
   branchesSkippedByCutoff: number;
-  // Branch allow/deny (§5): the disjoint disposition partition —
-  //   totalHeads = branchesScanned + branchesSkippedByCutoff + branchesExcludedByPolicy + branchesPastCap.
-  // branchesScanned INCLUDES scanned default-override rows (they WERE scanned). branchesSkippedByCutoff
-  // is now GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket.
+  // Branch allow/deny (§5): the disjoint disposition partition. These four counts partition the
+  // run_unit_head rows this run RECORDED, exactly once each:
+  //   recordedRows = branchesScanned + branchesSkippedByCutoff + branchesExcludedByPolicy + branchesPastCap.
+  // They do NOT necessarily sum to every branch DISCOVERED: a discovered branch whose scan errored or was
+  // throttle-requeued this run writes no run_unit_head row (it is recorded in `errors[]` / re-attempted
+  // next run), so it belongs to no disposition bucket. branchesScanned INCLUDES scanned default-override
+  // rows (they WERE scanned). branchesSkippedByCutoff is GENUINE cutoff only (policy_status IS NULL) —
+  // policy exclusions are their own bucket.
   branchesExcludedByPolicy: number;
   branchesPastCap: number;
   totalDependencyFindings: number;

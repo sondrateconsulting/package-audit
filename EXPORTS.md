@@ -156,9 +156,11 @@ Row order: `package_name, version, export_kind, export_name`
 
 ## run_unit_head
 
-One row per branch the run discovered — the immutable per-run disposition snapshot. Unlike the
-findings tables, this exports EVERY disposition (the branch-policy columns live largely on the
-non-scanned rows). Scoped to the selected run only (`--raw` dumps all runs).
+One row per branch that reached a TERMINAL disposition this run — the immutable per-run disposition
+snapshot. Unlike the findings tables, this exports every disposition TYPE (scanned / skipped-cutoff /
+past-cap, plus the branch-policy columns that live largely on the non-scanned rows). A branch whose
+scan errored or was throttle-requeued this run has NO row here — it is recorded in the report's
+`errors[]` (and re-attempted on the next run). Scoped to the selected run only (`--raw` dumps all runs).
 
 | column | type |
 |---|---|

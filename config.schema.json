@@ -53,7 +53,7 @@
     "maxBranchesPerRepo": {
       "type": "integer",
       "minimum": 1,
-      "description": "Per-repo cap on after-cutoff branches, newest-commit first. Branches past the cap are not surfaced in a run."
+      "description": "Per-repo cap on after-cutoff branches, newest-commit first. Branches past the cap are recorded as past-cap in the report and exports (visible in scope), but are not scanned for findings this run."
     },
     "branches": {
       "type": ["array", "null"],

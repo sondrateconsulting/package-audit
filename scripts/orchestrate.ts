@@ -460,9 +460,13 @@ export async function processRepo(
     }
   }
   // §11 reconciliation: this repo was discovered COMPLETELY (ok:true, reached only past the early
-  // `!outcome.ok` return), so `heads` is the exact live branch set. Prune this run's stale run_unit_head
-  // rows — phantom branches a prior resume-invocation recorded that no longer exist. Scoped to this
-  // (run_id, org, repo); a failed/throttled repo never reaches here and is retained.
+  // `!outcome.ok` return; listBranchHeads fails closed on any structural incompleteness, so `heads` is
+  // the exact live branch set for THIS discovery snapshot). Prune this run's stale run_unit_head rows —
+  // phantom branches a prior resume-invocation recorded that no longer exist. Scoped to this
+  // (run_id, org, repo); a failed/throttled repo never reaches here and is retained. Reconciliation
+  // reflects the discovery-time snapshot: a branch deleted-then-recreated between discovery and here has
+  // its prior row pruned and is re-recorded on the next run — an accepted TOCTOU for this single-user
+  // tool (no permanent data loss; global findings persist, only the disposition row briefly lapses).
   const pruned = db.reconcileRunUnitHead(runId, repo.organization, repo.name, heads.map((h) => h.name));
   if (pruned > 0)
     logLine({ event: "reconciliation", target: "run_unit_head", runId, org: repo.organization, repo: repo.name, action: "prune-stale", pruned });
