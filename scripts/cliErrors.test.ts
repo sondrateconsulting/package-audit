@@ -53,7 +53,13 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
     // or this exclusion list (deliberate decision, with the stack-dump consequence on record).
     // Naming constraint the regex relies on: error base classes must be named `Error` or `*Error`
     // (all 12 current classes extend Error directly).
-    const EXCLUDED_NON_OPERATOR_ERRORS = new Set<string>([]);
+    const EXCLUDED_NON_OPERATOR_ERRORS = new Set<string>([
+      // branchPolicy.ts is a dependency leaf (it must not import ConfigError from config.ts), so
+      // it throws its own BranchPolicyError. loadConfig() ALWAYS catches it and re-throws as
+      // ConfigError before it can reach a CLI entrypoint, so it is never operator-facing directly.
+      // If it ever surfaced unwrapped that would be a bug, and the full stack is the right diagnostic.
+      "BranchPolicyError",
+    ]);
     const declared = new Set<string>();
     for (const file of readdirSync(import.meta.dir)) {
       if (!file.endsWith(".ts") || file.endsWith(".test.ts")) continue;

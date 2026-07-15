@@ -55,6 +55,18 @@
       "minimum": 1,
       "description": "Per-repo cap on after-cutoff branches, newest-commit first. Branches past the cap are not surfaced in a run."
     },
+    "branches": {
+      "type": ["array", "null"],
+      "items": { "type": "string", "minLength": 1 },
+      "default": null,
+      "description": "Branch-name allowlist — exact name or Bun glob. null/omitted = unrestricted (every branch eligible, subject to cutoff/cap). [] = nothing but the default branch is eligible. A non-empty array restricts eligibility to matching branches. The DEFAULT branch is always eligible regardless of this list. A leading '!' is rejected at runtime (glob negation is not supported). excludeBranches is applied first (deny wins)."
+    },
+    "excludeBranches": {
+      "type": ["array", "null"],
+      "items": { "type": "string", "minLength": 1 },
+      "default": [],
+      "description": "Branch-name denylist — exact name or Bun glob. Matching branches are excluded from scanning (recorded as policy-excluded), EXCEPT the default branch, which is always eligible. Deny wins over 'branches'. null = use the default (none). A leading '!' is rejected at runtime."
+    },
     "cutoffDate": {
       "type": "string",
       "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
@@ -69,7 +81,7 @@
       "properties": {
         "organizations": { "type": "integer", "minimum": 1 },
         "repositories": { "type": "integer", "minimum": 1 },
-        "branches": { "type": "integer", "minimum": 1 }
+        "branches": { "type": "integer", "minimum": 1, "description": "Per-repo branch fan-out concurrency (a parallelism limit — unrelated to the root-level 'branches' allow/deny list)." }
       }
     },
     "packages": {

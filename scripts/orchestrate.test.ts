@@ -126,6 +126,8 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       githubHost: "github.com",
       organizations: ["org-a"], // configured mode: no membership-discovery call
       excludeOrganizations: [],
+      branches: null,
+      excludeBranches: [],
       includePersonalNamespace: false,
       includeForks: false,
       includeArchived: false,
@@ -167,7 +169,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     let n = 0;
     const client = makeClient(root, async () => responses[Math.min(n++, responses.length - 1)]!);
     const config: Config = {
-      githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], includePersonalNamespace: false,
+      githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [], includePersonalNamespace: false,
       includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
       concurrency: { organizations: 1, repositories: 1, branches: 1 },
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
@@ -183,7 +185,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
 
 // Shared minimal Config for the guard/wiring tests below (single configured org, cap via arg).
 const testConfig = (root: string, maxBranchesPerRepo = 25): Config => ({
-  githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], includePersonalNamespace: false,
+  githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [], includePersonalNamespace: false,
   includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo, cutoffDate: "2024-01-01",
   concurrency: { organizations: 1, repositories: 1, branches: 1 },
   packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],

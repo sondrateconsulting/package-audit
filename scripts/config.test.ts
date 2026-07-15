@@ -40,6 +40,14 @@ describe("validateAndNormalize — happy path + defaults", () => {
     expect(norm({ ...baseRaw(), organizations: [] }).organizations).toEqual([]);
     expect(norm({ ...baseRaw(), organizations: null }).organizations).toBeNull();
   });
+  test("branches null (default) / [] / [..] normalize distinctly; excludeBranches defaults to []", () => {
+    expect(norm(baseRaw()).branches).toBeNull();
+    expect(norm(baseRaw()).excludeBranches).toEqual([]);
+    expect(norm({ ...baseRaw(), branches: [] }).branches).toEqual([]);
+    expect(norm({ ...baseRaw(), branches: ["main", "release/*"] }).branches).toEqual(["main", "release/*"]);
+    expect(norm({ ...baseRaw(), excludeBranches: null }).excludeBranches).toEqual([]);
+    expect(norm({ ...baseRaw(), excludeBranches: ["dependabot/*"] }).excludeBranches).toEqual(["dependabot/*"]);
+  });
   test("registryUrl trailing slash canonicalized in hash", () => {
     const a = hashOf({ ...baseRaw(), packages: [{ name: "x", registryUrl: "https://r.example.com/" }] });
     const b = hashOf({ ...baseRaw(), packages: [{ name: "x", registryUrl: "https://r.example.com" }] });
@@ -66,6 +74,13 @@ describe("validateAndNormalize — validation failures", () => {
     ["missing concurrency field", { ...baseRaw(), concurrency: { organizations: 3, repositories: 6 } }],
     ["missing paths", { ...baseRaw(), paths: undefined }],
     ["githubHost with scheme", { ...baseRaw(), githubHost: "https://gh.com" }],
+    ["empty-string branch pattern", { ...baseRaw(), branches: ["main", ""] }],
+    ["empty-string excludeBranch pattern", { ...baseRaw(), excludeBranches: [""] }],
+    ["leading-! branch pattern (negation unsupported)", { ...baseRaw(), branches: ["!main"] }],
+    ["leading-! excludeBranch pattern", { ...baseRaw(), excludeBranches: ["!release/*"] }],
+    ["branches not null and not array", { ...baseRaw(), branches: "main" }],
+    ["excludeBranches not an array", { ...baseRaw(), excludeBranches: "dependabot/*" }],
+    ["non-string branch element", { ...baseRaw(), branches: [123] }],
     ["non-object root", 42 as unknown as Record<string, unknown>],
   ];
   for (const [name, raw, env] of bad)
@@ -103,6 +118,22 @@ describe("computeConfigHash — determinism + scope", () => {
     expect(hashOf(baseRaw())).not.toBe(hashOf({ ...baseRaw(), cutoffDate: "2023-01-01" })));
   test("organizations null vs [] produce DIFFERENT hashes", () =>
     expect(hashOf({ ...baseRaw(), organizations: null })).not.toBe(hashOf({ ...baseRaw(), organizations: [] })));
+  test("branches null vs [] produce DIFFERENT hashes", () =>
+    expect(hashOf({ ...baseRaw(), branches: null })).not.toBe(hashOf({ ...baseRaw(), branches: [] })));
+  test("branches reorder/dupe does not change the hash", () => {
+    const a = hashOf({ ...baseRaw(), branches: ["a", "b"] });
+    const b = hashOf({ ...baseRaw(), branches: ["b", "a", "a"] });
+    expect(a).toBe(b);
+  });
+  test("excludeBranches reorder/dupe does not change the hash", () => {
+    const a = hashOf({ ...baseRaw(), excludeBranches: ["x", "y"] });
+    const b = hashOf({ ...baseRaw(), excludeBranches: ["y", "x", "x"] });
+    expect(a).toBe(b);
+  });
+  test("branches change DOES change the hash", () =>
+    expect(hashOf({ ...baseRaw(), branches: ["main"] })).not.toBe(hashOf({ ...baseRaw(), branches: ["develop"] })));
+  test("excludeBranches change DOES change the hash", () =>
+    expect(hashOf(baseRaw())).not.toBe(hashOf({ ...baseRaw(), excludeBranches: ["dependabot/*"] })));
   test("includeForks change DOES change the hash", () =>
     expect(hashOf(baseRaw())).not.toBe(hashOf({ ...baseRaw(), includeForks: true })));
   test("registryAuthEnvVar NAME participates but token VALUE does not", () => {
@@ -166,6 +197,20 @@ describe("loadConfig — file I/O", () => {
     expect(loaded.config.packages[0]!.name).toBe("expo");
     expect(loaded.configHash).toMatch(/^[0-9a-f]{64}$/);
     expect(loaded.configPath).toBe(p);
+  });
+  test("loadConfig compiles the branch policy onto LoadedConfig (canonical order)", async () => {
+    const p = join(dir, "policy.json");
+    writeFileSync(p, JSON.stringify({ ...baseRaw(), branches: ["release/*", "main"], excludeBranches: ["dependabot/*"] }));
+    const loaded = await loadConfig(["--config", p], {});
+    expect(loaded.branchPolicy.include?.map((c) => c.pattern)).toEqual(["main", "release/*"]);
+    expect(loaded.branchPolicy.exclude.map((c) => c.pattern)).toEqual(["dependabot/*"]);
+  });
+  test("loadConfig leaves branchPolicy.include null when branches is omitted (unrestricted)", async () => {
+    const p = join(dir, "nopolicy.json");
+    writeFileSync(p, JSON.stringify(baseRaw()));
+    const loaded = await loadConfig(["--config", p], {});
+    expect(loaded.branchPolicy.include).toBeNull();
+    expect(loaded.branchPolicy.exclude).toEqual([]);
   });
   test("missing file throws ConfigError", async () => {
     await expect(loadConfig(["--config", join(dir, "nope.json")], {})).rejects.toThrow(ConfigError);
@@ -364,7 +409,8 @@ describe("config.schema.json ↔ runtime sync", () => {
       githubHost: config.githubHost, organizations: config.organizations,
       excludeOrganizations: config.excludeOrganizations, includePersonalNamespace: config.includePersonalNamespace,
       includeForks: config.includeForks, includeArchived: config.includeArchived,
-      maxReposPerOrg: config.maxReposPerOrg, excludeDirGlobs: config.excludeDirGlobs,
+      maxReposPerOrg: config.maxReposPerOrg, branches: config.branches,
+      excludeBranches: config.excludeBranches, excludeDirGlobs: config.excludeDirGlobs,
     };
     const pkgRuntimeDefaults: Record<string, unknown> = {
       registryUrl: pkg.registryUrl, registryAuthEnvVar: pkg.registryAuthEnvVar,

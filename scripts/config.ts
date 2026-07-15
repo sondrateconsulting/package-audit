@@ -8,6 +8,8 @@ import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { isValidPackageName } from "./packageName.ts";
+import { sortedDedup } from "./patternCanonical.ts";
+import { compileBranchPolicy, BranchPolicyError, type CompiledBranchPolicy } from "./branchPolicy.ts";
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -40,6 +42,11 @@ export interface Config {
   includeArchived: boolean;
   maxReposPerOrg: number | null; // null = unlimited
   maxBranchesPerRepo: number;
+  // Branch-name allow/deny policy (exact name or Bun glob). null = unrestricted (every branch
+  // eligible); [] = nothing but the default branch eligible; [..] = allowlist. excludeBranches is
+  // a denylist that wins over `branches`; the default branch is NEVER excluded by policy.
+  branches: string[] | null;
+  excludeBranches: string[];
   cutoffDate: string; // YYYY-MM-DD
   concurrency: Concurrency;
   packages: PackageConfig[];
@@ -51,6 +58,9 @@ export interface LoadedConfig {
   config: Config;
   configHash: string;
   configPath: string;
+  // The compiled branch policy, built once here at load and threaded as the SINGLE instance
+  // through plan + scan (do not recompile downstream). A resumed run in another process recompiles.
+  branchPolicy: CompiledBranchPolicy;
 }
 
 const DEFAULT_GITHUB_HOST = "github.com";
@@ -97,8 +107,8 @@ function optStringArray(o: Record<string, unknown>, key: string, dflt: string[])
 // and excluded from config_hash (it never enters the hash projection).
 export const CONFIG_ROOT_KEYS = [
   "$schema", "githubHost", "organizations", "excludeOrganizations", "includePersonalNamespace",
-  "includeForks", "includeArchived", "maxReposPerOrg", "maxBranchesPerRepo", "cutoffDate",
-  "concurrency", "packages", "excludeDirGlobs", "paths",
+  "includeForks", "includeArchived", "maxReposPerOrg", "maxBranchesPerRepo", "branches",
+  "excludeBranches", "cutoffDate", "concurrency", "packages", "excludeDirGlobs", "paths",
 ] as const;
 export const CONFIG_CONCURRENCY_KEYS = ["organizations", "repositories", "branches"] as const;
 export const CONFIG_PATHS_KEYS = ["sqlitePath", "outputDir"] as const;
@@ -145,6 +155,40 @@ function normalizeOrganizations(o: Record<string, unknown>): string[] | null {
   if (v === undefined || v === null) return null; // discover mode
   if (!Array.isArray(v) || !v.every(isString)) fail(`organizations must be null or an array of strings`);
   return v as string[]; // [] = configured-empty (distinct from null); [..] = allowlist
+}
+
+// A branch-policy pattern (exact name or Bun glob) at index i of `listName`. Rejects a non-string,
+// an empty string, and any pattern starting with "!". Leading-"!" is Bun.Glob NEGATION; we reject
+// it as a deliberate POLICY-LANGUAGE restriction so `"!main"` can never be mistaken for "not main"
+// — git itself permits refs/heads/!main, so this is our rule, not git's. Documented consequence: a
+// literal branch named "!foo" cannot be listed. The value is rendered via JSON.stringify so a
+// control character in a pattern cannot corrupt the diagnostic. (Glob VALIDITY is not checked here:
+// Bun.Glob accepts malformed patterns like "[" at construction and fails only at match time, so
+// the policy engine fails closed on a match-time throw — see branchPolicy.ts.)
+function validateBranchPattern(v: unknown, listName: string, i: number): string {
+  if (!isString(v) || v.length === 0) fail(`${listName}[${i}] must be a non-empty string`);
+  const s = v as string;
+  if (s.startsWith("!"))
+    fail(`${listName}[${i}] must not start with "!" — glob negation is not supported; put branches to INCLUDE in "branches" and branches to EXCLUDE in "excludeBranches": ${JSON.stringify(s)}`);
+  return s;
+}
+
+// branches: null/omitted = unrestricted; [] = only the default branch eligible; [..] = allowlist.
+// The null-vs-[] distinction is meaningful and is preserved into the hash and the compiled policy.
+function normalizeBranches(o: Record<string, unknown>): string[] | null {
+  const v = o["branches"];
+  if (v === undefined || v === null) return null;
+  if (!Array.isArray(v)) fail(`branches must be null or an array of strings`);
+  return (v as unknown[]).map((el, i) => validateBranchPattern(el, "branches", i));
+}
+
+// excludeBranches: null/omitted = none ([]); [..] = denylist. null collapses to [] (an absent and
+// an explicit-empty denylist mean the same thing), mirroring excludeOrganizations.
+function normalizeExcludeBranches(o: Record<string, unknown>): string[] {
+  const v = o["excludeBranches"];
+  if (v === undefined || v === null) return [];
+  if (!Array.isArray(v)) fail(`excludeBranches must be an array of strings`);
+  return (v as unknown[]).map((el, i) => validateBranchPattern(el, "excludeBranches", i));
 }
 
 function validateRegistryUrl(url: string, pkgName: string): string {
@@ -256,6 +300,8 @@ export function validateAndNormalize(raw: unknown, env: Record<string, string | 
     includeArchived: optBool(o, "includeArchived", false),
     maxReposPerOrg,
     maxBranchesPerRepo,
+    branches: normalizeBranches(o),
+    excludeBranches: normalizeExcludeBranches(o),
     cutoffDate,
     concurrency: normalizeConcurrency(o),
     packages: normalizePackages(o, env),
@@ -277,8 +323,6 @@ function canonicalize(value: unknown): unknown {
   return value;
 }
 
-const sortedDedup = (a: string[]): string[] => [...new Set(a)].sort();
-
 // The SCAN/REPORT-DEFINING projection. Arrays whose ORDER does not change what is scanned are
 // sorted/deduped so reordering the file does not churn the hash. `concurrency` and `paths` are
 // DELIBERATELY excluded (speed / storage location only), preserving resumability across tuning.
@@ -292,6 +336,10 @@ export function computeConfigHash(config: Config): string {
     includeArchived: config.includeArchived,
     maxReposPerOrg: config.maxReposPerOrg,
     maxBranchesPerRepo: config.maxBranchesPerRepo,
+    // Branch policy is scan-defining. null (unrestricted) hashes distinctly from [] (only the
+    // default branch); reordering/duplicating patterns does not change the hash (shared canonicalizer).
+    branches: config.branches === null ? null : sortedDedup(config.branches),
+    excludeBranches: sortedDedup(config.excludeBranches),
     cutoffDate: config.cutoffDate,
     excludeDirGlobs: sortedDedup(config.excludeDirGlobs),
     // packages sorted by name (order does not change what is scanned; names are unique)
@@ -349,5 +397,16 @@ export async function loadConfig(
     return fail(`config file is not valid JSON (${configPath}): ${(e as Error).message}`);
   }
   const config = validateAndNormalize(raw, env);
-  return { config, configHash: computeConfigHash(config), configPath };
+  // Eagerly compile the branch policy here — the single load-time preparation boundary — so a
+  // malformed glob surfaces as a ConfigError before any run is created/resumed, never mid-run.
+  // (This is best-effort: Bun.Glob accepts some malformed patterns at construction; the policy
+  // engine fails closed on a match-time throw. See branchPolicy.ts.)
+  let branchPolicy: CompiledBranchPolicy;
+  try {
+    branchPolicy = compileBranchPolicy(config.branches, config.excludeBranches);
+  } catch (e) {
+    if (e instanceof BranchPolicyError) return fail(e.message);
+    throw e;
+  }
+  return { config, configHash: computeConfigHash(config), configPath, branchPolicy };
 }
