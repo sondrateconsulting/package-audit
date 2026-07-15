@@ -1116,16 +1116,13 @@ describe("graphql", () => {
 });
 
 describe("listBranchHeads (§5.B)", () => {
-  test("paginates with endCursor (omitted on first page), sorts committedDate DESC, skips non-commits", async () => {
+  test("paginates with endCursor (omitted on first page), sorts committedDate DESC", async () => {
     const page1 = {
       data: {
         repository: {
           refs: {
             pageInfo: { hasNextPage: true, endCursor: "CUR1" },
-            nodes: [
-              { name: "old", target: { oid: "o1", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t1" } } },
-              { name: "weird", target: {} }, // non-commit target — skipped
-            ],
+            nodes: [{ name: "old", target: { oid: "o1", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t1" } } }],
           },
         },
       },
@@ -1146,6 +1143,48 @@ describe("listBranchHeads (§5.B)", () => {
     expect(heads[0]!.treeOid).toBe("t2");
     expect(calls[0]!.args.some((a) => a.startsWith("endCursor="))).toBe(false); // first page omits it
     expect(calls[1]!.args).toContain("endCursor=CUR1");
+  });
+
+  // FAIL-CLOSED completeness (load-bearing for T11 reconciliation): an understated branch set would
+  // make the prune delete live branches, so a malformed node or a silently-truncated page must THROW
+  // (→ discovery 'failed' → the repo is retained, never reconciled) rather than return a partial list.
+  const refsPage = (over: Record<string, unknown>) =>
+    ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [], ...over } } } })));
+  test("a non-Commit / malformed node throws instead of being silently dropped", async () => {
+    const { client } = makeClient([refsPage({ nodes: [{ name: "weird", target: {} }] })]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed branch-head node/);
+  });
+  test("an EMPTY target string (oid/committedDate/tree.oid) is malformed — must not slip through as a valid head", async () => {
+    // an empty committedDate would classify as cutoff-skipped then trip the non-empty-date write
+    // invariant OUTSIDE the fail-soft path; an empty oid drives an invalid scan. Both must fail here.
+    for (const target of [
+      { oid: "", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } },
+      { oid: "o", committedDate: "", tree: { oid: "t" } },
+      { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "" } },
+    ]) {
+      const { client } = makeClient([refsPage({ nodes: [{ name: "x", target }] })]);
+      await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed branch-head node/);
+    }
+  });
+  test("hasNextPage=true with no follow-up cursor throws (would otherwise truncate silently)", async () => {
+    const { client } = makeClient([refsPage({ pageInfo: { hasNextPage: true, endCursor: null } })]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/no follow-up endCursor/);
+  });
+  test("a missing/non-boolean hasNextPage throws (cannot prove the page set is complete)", async () => {
+    const { client } = makeClient([refsPage({ pageInfo: { endCursor: null } })]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/hasNextPage missing\/non-boolean/);
+  });
+  test("a non-array nodes field throws (a page's branches cannot be treated as empty)", async () => {
+    const { client } = makeClient([refsPage({ nodes: null })]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/missing a nodes array/);
+  });
+  test("a duplicate branch name across pages throws (unstable pagination)", async () => {
+    const dup = { name: "main", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } };
+    const { client } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [dup] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [dup] } } } }))),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/duplicate branch/);
   });
   // same poisoned-pagination class as restGetPagedArray: the cursor chain must be bounded.
   const cursorPage = (cursor: string) =>

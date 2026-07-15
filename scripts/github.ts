@@ -1097,6 +1097,13 @@ export class GithubClient {
     // same poisoned-pagination bound as restGetPagedArray: a response controls the next
     // cursor, so a repeated or endless cursor chain must fail closed, not loop unbounded.
     const seenCursors = new Set<string>();
+    // FAIL-CLOSED completeness (load-bearing for T11 run_unit_head reconciliation, which prunes rows
+    // for branches ABSENT from this set): the returned name set must be the COMPLETE, exact branch
+    // list. A silently-dropped node or a silently-truncated pagination would understate it and delete
+    // a live branch's row. So a malformed node, a missing/non-boolean hasNextPage, a hasNextPage=true
+    // with no follow-up cursor, or a duplicate name across pages all THROW (→ discovery 'failed' →
+    // the repo is retained, never reconciled) rather than returning a partial list.
+    const seenNames = new Set<string>();
     let cursor: string | null = null;
     for (;;) {
       // loop-top cap = at most MAX_PAGES fetches, the same semantics as restGetPagedArray
@@ -1111,20 +1118,36 @@ export class GithubClient {
       const refs = data?.repository?.refs;
       if (refs === undefined || refs === null)
         throw new GithubApiError(`graphql returned no refs for ${org}/${repo}`, { endpoint: "graphql" });
-      for (const node of refs.nodes ?? []) {
+      if (!Array.isArray(refs.nodes))
+        throw new GithubApiError(`refs page missing a nodes array for ${org}/${repo}`, { endpoint: "graphql" });
+      for (const node of refs.nodes) {
         const n = node as { name?: string; target?: { oid?: string; committedDate?: string; tree?: { oid?: string } } };
-        if (n.name && n.target?.oid && n.target.committedDate && n.target.tree?.oid)
-          heads.push({ name: n.name, oid: n.target.oid, committedDate: n.target.committedDate, treeOid: n.target.tree.oid });
+        // Every refs/heads/* head is a complete Commit; a malformed/non-Commit node is anomalous and
+        // must not be silently skipped (see the completeness note above). Every field must be a
+        // NON-EMPTY string — an empty oid/date/tree.oid is malformed (an empty committedDate would
+        // otherwise classify as cutoff-skipped and then trip upsertRunUnitHead's non-empty-date
+        // invariant OUTSIDE the fail-soft discovery path, aborting the whole run).
+        if (typeof n.name !== "string" || n.name.length === 0 ||
+            typeof n.target?.oid !== "string" || n.target.oid.length === 0 ||
+            typeof n.target.committedDate !== "string" || n.target.committedDate.length === 0 ||
+            typeof n.target.tree?.oid !== "string" || n.target.tree.oid.length === 0)
+          throw new GithubApiError(`malformed branch-head node for ${org}/${repo}`, { endpoint: "graphql" });
+        if (seenNames.has(n.name))
+          throw new GithubApiError(`duplicate branch ${JSON.stringify(n.name)} across pages for ${org}/${repo}`, { endpoint: "graphql" });
+        seenNames.add(n.name);
+        heads.push({ name: n.name, oid: n.target.oid, committedDate: n.target.committedDate, treeOid: n.target.tree.oid });
       }
-      if (refs.pageInfo?.hasNextPage === true && typeof refs.pageInfo.endCursor === "string") {
-        const next = refs.pageInfo.endCursor;
-        if (seenCursors.has(next))
-          throw new GithubApiError(`refs pagination cursor cycle for ${org}/${repo}`, { endpoint: "graphql" });
-        seenCursors.add(next);
-        cursor = next;
-      } else {
-        break;
-      }
+      const pageInfo = refs.pageInfo;
+      if (typeof pageInfo?.hasNextPage !== "boolean")
+        throw new GithubApiError(`refs pageInfo.hasNextPage missing/non-boolean for ${org}/${repo}`, { endpoint: "graphql" });
+      if (!pageInfo.hasNextPage) break;
+      const next = pageInfo.endCursor;
+      if (typeof next !== "string" || next.length === 0)
+        throw new GithubApiError(`refs hasNextPage=true but no follow-up endCursor for ${org}/${repo}`, { endpoint: "graphql" });
+      if (seenCursors.has(next))
+        throw new GithubApiError(`refs pagination cursor cycle for ${org}/${repo}`, { endpoint: "graphql" });
+      seenCursors.add(next);
+      cursor = next;
     }
     return heads.sort((a, b) =>
       a.committedDate !== b.committedDate ? (a.committedDate < b.committedDate ? 1 : -1) : a.name < b.name ? -1 : 1,

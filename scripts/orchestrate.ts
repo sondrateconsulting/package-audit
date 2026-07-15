@@ -459,6 +459,14 @@ export async function processRepo(
       }
     }
   }
+  // §11 reconciliation: this repo was discovered COMPLETELY (ok:true, reached only past the early
+  // `!outcome.ok` return), so `heads` is the exact live branch set. Prune this run's stale run_unit_head
+  // rows — phantom branches a prior resume-invocation recorded that no longer exist. Scoped to this
+  // (run_id, org, repo); a failed/throttled repo never reaches here and is retained.
+  const pruned = db.reconcileRunUnitHead(runId, repo.organization, repo.name, heads.map((h) => h.name));
+  if (pruned > 0)
+    logLine({ event: "reconciliation", target: "run_unit_head", runId, org: repo.organization, repo: repo.name, action: "prune-stale", pruned });
+
   return plan.coverage; // a SUCCESSFULLY-discovered repo (even if empty) — folds into the run's §8 warnings
 }
 

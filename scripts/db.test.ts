@@ -1872,6 +1872,69 @@ describe("errors + run_unit_head", () => {
   });
 });
 
+describe("reconcileRunUnitHead (§11 stale-row prune)", () => {
+  const scanned = (db: AuditDb, runId: string, org: string, repo: string, branch: string): void =>
+    db.upsertRunUnitHead({ runId, organization: org, repository: repo, branch, commitSha: `sha-${branch}`, status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+  const branchesOf = (db: AuditDb, runId: string, org: string, repo: string): string[] =>
+    (db.read("SELECT branch FROM run_unit_head WHERE run_id=? AND organization=? AND repository=? ORDER BY branch").all(runId, org, repo) as Array<{ branch: string }>).map((r) => r.branch);
+
+  test("prunes branches absent from the discovered set, keeps the rest; returns the prune count", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    for (const b of ["a", "b", "c"]) scanned(db, "r1", "o", "repo", b);
+    expect(db.reconcileRunUnitHead("r1", "o", "repo", ["a", "b"])).toBe(1); // c pruned
+    expect(branchesOf(db, "r1", "o", "repo")).toEqual(["a", "b"]);
+    db.close();
+  });
+
+  test("NEVER touches another run_id / repository / organization", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    rawRun(db, "r2", "running");
+    scanned(db, "r1", "o", "repo", "x");
+    scanned(db, "r2", "o", "repo", "x");          // other run
+    scanned(db, "r1", "o", "other-repo", "x");    // other repo
+    scanned(db, "r1", "other-org", "repo", "x");  // other org, SAME repo name
+    expect(db.reconcileRunUnitHead("r1", "o", "repo", [])).toBe(1); // only (r1,o,repo,x)
+    expect(branchesOf(db, "r1", "o", "repo")).toEqual([]);
+    expect(branchesOf(db, "r2", "o", "repo")).toEqual(["x"]);
+    expect(branchesOf(db, "r1", "o", "other-repo")).toEqual(["x"]);
+    expect(branchesOf(db, "r1", "other-org", "repo")).toEqual(["x"]);
+    db.close();
+  });
+
+  test("an empty discovered set prunes ALL of the scope's rows (the last branch was deleted)", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    scanned(db, "r1", "o", "repo", "a");
+    scanned(db, "r1", "o", "repo", "b");
+    expect(db.reconcileRunUnitHead("r1", "o", "repo", [])).toBe(2);
+    expect(branchesOf(db, "r1", "o", "repo")).toEqual([]);
+    db.close();
+  });
+
+  test("is idempotent: a second reconcile with the same live set prunes nothing (returns 0)", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    for (const b of ["a", "b", "c"]) scanned(db, "r1", "o", "repo", b);
+    expect(db.reconcileRunUnitHead("r1", "o", "repo", ["a"])).toBe(2);
+    expect(db.reconcileRunUnitHead("r1", "o", "repo", ["a"])).toBe(0);
+    expect(branchesOf(db, "r1", "o", "repo")).toEqual(["a"]);
+    db.close();
+  });
+
+  test("branch names with quotes, backslashes, slashes, commas, and Unicode survive JSON membership", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    const weird = ['feat/"quote"', "back\\slash", "dir/sub/leaf", "ünïcödé-π", "a,b"];
+    for (const b of weird) scanned(db, "r1", "o", "repo", b);
+    scanned(db, "r1", "o", "repo", "stale");
+    expect(db.reconcileRunUnitHead("r1", "o", "repo", weird)).toBe(1); // ONLY "stale" pruned — every weird name is kept
+    expect(branchesOf(db, "r1", "o", "repo").sort()).toEqual([...weird].sort());
+    db.close();
+  });
+});
+
 describe("api_cache", () => {
   test("variant_hash separates JSON-vs-raw reads of one URL", () => {
     const db = mem();

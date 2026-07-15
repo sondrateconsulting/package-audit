@@ -1906,12 +1906,15 @@ export class AuditDb {
       );
   }
 
-  // Per-run immutable snapshot row (§3 report-head invariant). Upserted for EVERY discovered branch:
-  // scanned, skip-as-current (same head, scanned), cutoff-skipped, past-cap, and policy-excluded
-  // (commit_sha='' for every non-scanned disposition). is_default_branch maps true/false/null →
-  // 1/0/NULL (tri-state; NULL = unknown, §5.B). The ON CONFLICT ALWAYS overwrites all six mutable
-  // columns from `excluded` (never COALESCE) so a re-upsert in a later same-run attempt clears stale
-  // policy/date/status in every direction (§6 transition matrix).
+  // Per-run immutable snapshot row (§3 report-head invariant). Upserted for a discovered branch in
+  // each disposition: scanned, skip-as-current (same head, scanned), cutoff-skipped, past-cap, and
+  // policy-excluded (commit_sha='' for every non-scanned disposition). NOTE: a scanned row is written
+  // only when its scan SUCCEEDS this invocation — a throttled/errored scan writes no row (so the set of
+  // rows written is NOT every discovered branch; reconcileRunUnitHead therefore keys on the live-name
+  // set, not on rows-written). is_default_branch maps true/false/null → 1/0/NULL (tri-state; NULL =
+  // unknown, §5.B). The ON CONFLICT ALWAYS overwrites all six mutable columns from `excluded` (never
+  // COALESCE) so a re-upsert in a later same-run attempt clears stale policy/date/status in every
+  // direction (§6 transition matrix).
   upsertRunUnitHead(h: RunUnitHeadInput): void {
     assertRunUnitHeadInvariants(h); // fail-closed at the single write chokepoint (§3 row mapping)
     this.db
@@ -1932,6 +1935,26 @@ export class AuditDb {
         h.isDefaultBranch === null ? null : h.isDefaultBranch ? 1 : 0,
         h.policyStatus, h.policyMatchedPattern, h.scannedCommitDate,
       );
+  }
+
+  // §11 reconciliation (schema-neutral): after a repo's branches are COMPLETELY re-discovered
+  // (DiscoveryOutcome ok:true, which listBranchHeads guarantees is the exact live set), prune this
+  // run's run_unit_head rows for branches no longer present — the phantom rows a resume leaves when a
+  // branch is deleted between invocations. Scoped to (run_id, org, repo): it can NEVER touch another
+  // run or another repo, and the sole caller (processRepo) reaches it only on successful discovery, so
+  // a failed/throttled repo is retained, never pruned (a transient failure must not delete a live
+  // branch). `discoveredBranches` is the COMPLETE live-name keep-set (all discovered heads, every
+  // disposition) — NOT merely rows rewritten this invocation, so a live branch whose scan failed this
+  // attempt keeps its prior row. Returns the number of rows pruned.
+  reconcileRunUnitHead(runId: string, organization: string, repository: string, discoveredBranches: readonly string[]): number {
+    const res = this.db
+      .query(
+        `DELETE FROM run_unit_head
+         WHERE run_id = ? AND organization = ? AND repository = ?
+           AND branch NOT IN (SELECT value FROM json_each(?))`,
+      )
+      .run(runId, organization, repository, JSON.stringify(discoveredBranches));
+    return res.changes;
   }
 
   // ---- api_cache (§3 caching rules; REST-GET only — GraphQL is never cached) -----------------

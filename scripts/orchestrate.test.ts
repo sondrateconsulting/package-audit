@@ -924,6 +924,57 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
+
+  // ---- §11 stale-row reconciliation ----
+  const staleHead = (db: AuditDb, runId: string, branch: string, over: Partial<Parameters<AuditDb["upsertRunUnitHead"]>[0]> = {}): void =>
+    db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch, commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T00:00:00Z", ...over });
+
+  test("§11: a resumed repo prunes rows for branches deleted since a prior invocation, and logs it once", async () => {
+    const root = mkdtempSync(join(tmpdir(), "recon-prune-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    staleHead(db, runId, "deleted"); // a prior invocation recorded it; this discovery no longer sees it
+    const client = scanClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }]);
+    const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(headRowsOf(db, runId).map((r) => (r as { branch: string }).branch)).toEqual(["main"]); // 'deleted' pruned
+    expect(events.filter((e) => e["event"] === "reconciliation")).toEqual([
+      { event: "reconciliation", target: "run_unit_head", runId, org: "org-a", repo: "svc", action: "prune-stale", pruned: 1 },
+    ]);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("§11: a FAILED branch discovery skips reconciliation — prior rows are RETAINED (transient failure != deletion)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "recon-fail-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    staleHead(db, runId, "ghost");
+    const failClient = makeClient(root, async (_bin, args) =>
+      args.some((a) => a === "graphql") ? { exitCode: 1, stderr: "gh: boom", stdout: "" } : { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: false, tree: [] })}` });
+    const events = await captureJsonl(() => processRepo(db, failClient, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(headRowsOf(db, runId).map((r) => (r as { branch: string }).branch)).toEqual(["ghost"]); // retained, NOT pruned
+    expect(events.some((e) => e["event"] === "reconciliation")).toBe(false); // no prune ran
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("§11: a still-live branch whose scan FAILS keeps its prior row (keep-set is live NAMES, not rows written)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "recon-scanfail-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    staleHead(db, runId, "main", { commitSha: "old-sha", status: "scanned", isDefaultBranch: true, scannedCommitDate: "2025-05-01T00:00:00Z" });
+    // re-discovers main at a NEW commit, but the tree fetch (scan) FAILS → no new row written this attempt
+    const scanFailClient = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: "new-sha", date: "2025-06-01T00:00:00Z" }]) };
+      if (args.some((a) => a.includes("git/trees"))) return { exitCode: 1, stderr: "gh: tree boom", stdout: "" };
+      return { exitCode: 0, stderr: "", stdout: "HTTP/2.0 200 X\r\n\r\n[]" };
+    });
+    await captureJsonl(() => processRepo(db, scanFailClient, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    // main is in the live keep-set → NOT pruned; its PRIOR row survives (the failed scan wrote no replacement)
+    expect(headRowsOf(db, runId).find((r) => (r as { branch: string }).branch === "main")).toMatchObject({ branch: "main", status: "scanned", sha: "old-sha" });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
 });
 
 describe("runSummaryText", () => {
