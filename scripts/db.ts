@@ -24,13 +24,18 @@ function fail(msg: string): never {
 // Bump when the schema changes; older on-disk versions run the §3 VERSION-STEPPED migration
 // chain — each step is one transaction that stamps its own target version, so a crash between
 // steps leaves a valid intermediate database that the next open resumes from.
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 // Every migration step stamps its own PINNED target version — never the mutable
-// SCHEMA_VERSION. (If a step stamped SCHEMA_VERSION, bumping the constant for v4 would make a
-// crash between the v2→v3 step and the future v3→v4 step leave a v3-SHAPED database stamped 4,
-// and every later open would skip the missing migration.)
+// SCHEMA_VERSION. (If a step stamped SCHEMA_VERSION, bumping the constant would make a crash
+// between two steps leave an intermediate-SHAPED database stamped at the new version, and every
+// later open would skip the missing migration.)
 // migrateV2toV3's target.
 const V3_TARGET_VERSION = 3;
+// migrateV3toV4's target (branch allow/deny: run_unit_head gains policy_status/policy_matched_pattern/
+// scanned_commit_date and a WIDENED status CHECK). Unlike v2→v3 (additive), the CHECK widen needs a
+// TABLE REBUILD, and the migration classifies the on-disk shape first to reject an incompatible v4
+// (e.g. a sibling branch that also stamped 4 with a different run_unit_head) rather than adopting it.
+const V4_TARGET_VERSION = 4;
 
 // §0 OWNERSHIP PROOF. The OLDEST version this tool has ever stamped: db.ts shipped at
 // SCHEMA_VERSION = 2 in its first commit and has stamped >= 2 ever since. `PRAGMA user_version`
@@ -234,6 +239,25 @@ export interface ApiSurfaceInput {
   rows: ApiSurfaceRow[]; // export/bin rows only; db.ts appends the '__complete__' marker
 }
 
+// The run_unit_head column + constraint body (v4). Extracted so the v3→v4 REBUILD's scratch table
+// and SCHEMA_SQL share ONE definition — they cannot drift, and the post-migration fingerprint would
+// catch it if they did. Column ORDER here is load-bearing: the shape classifier compares the exact
+// ordered column set (see classifyRunUnitHead).
+const RUN_UNIT_HEAD_BODY = `
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+  commit_sha TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'scanned'
+    CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
+  is_default_branch INTEGER,
+  policy_status TEXT
+    CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+  policy_matched_pattern TEXT,
+  scanned_commit_date TEXT,
+  CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+  PRIMARY KEY (run_id, organization, repository, branch)
+`;
+
 // ---- schema (§3 SQL block, verbatim semantics) ---------------------------------------------
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS runs (
@@ -303,15 +327,7 @@ CREATE TABLE IF NOT EXISTS usage_findings (
   permalink TEXT NOT NULL, snippet TEXT NOT NULL, found_at TEXT NOT NULL,
   UNIQUE(organization, repository, branch, commit_sha, package_name, dependency_key, usage_type, file_path, line_number, export_name, context)
 );
-CREATE TABLE IF NOT EXISTS run_unit_head (
-  run_id TEXT NOT NULL REFERENCES runs(run_id),
-  organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
-  commit_sha TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'scanned'
-    CHECK (status IN ('scanned','skipped-cutoff')),
-  is_default_branch INTEGER,
-  PRIMARY KEY (run_id, organization, repository, branch)
-);
+CREATE TABLE IF NOT EXISTS run_unit_head (${RUN_UNIT_HEAD_BODY});
 CREATE TABLE IF NOT EXISTS api_cache (
   method TEXT NOT NULL,
   url TEXT NOT NULL,
@@ -377,8 +393,12 @@ function setUserVersion(db: Database, v: number): void {
   db.exec(`PRAGMA user_version = ${v}`);
 }
 
+// SQLite resolves table/column identifiers CASE-INSENSITIVELY, so these catalog checks must too:
+// a table physically named `RUN_UNIT_HEAD` still answers to `run_unit_head` in DROP/SELECT, and a
+// case-sensitive miss here would let a case-variant object bypass the compatibility gate and then be
+// dropped by `--fresh`.
 function tableExists(db: Database, name: string): boolean {
-  return db.query("SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name = ?").get(name) !== null;
+  return db.query("SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name = ? COLLATE NOCASE").get(name) !== null;
 }
 
 // SQLite reserves the LITERAL prefix `sqlite_` for its internal objects (sqlite_sequence,
@@ -587,7 +607,8 @@ export function isOwnedOrEmpty(db: Database): boolean {
 function columnExists(db: Database, table: string, column: string): boolean {
   if (!AUDIT_TABLE_SET.has(table)) fail(`columnExists called for unknown table ${table}`);
   const rows = db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  return rows.some((r) => r.name === column);
+  const target = column.toLowerCase();
+  return rows.some((r) => r.name.toLowerCase() === target); // column names resolve case-insensitively
 }
 
 function addColumnIfMissing(db: Database, table: string, column: string, ddl: string): void {
@@ -818,6 +839,418 @@ function migrateV2toV3(db: Database): void {
   })();
 }
 
+// ---- v3→v4: on-disk run_unit_head shape classification + migration (§3.1 branch allow/deny) ---
+// The shape fingerprint is STRUCTURAL, not a string match: PRAGMA table_info (columns + NOT NULL +
+// composite PK), PRAGMA foreign_key_list (the run_id→runs FK), the ix_ruh_loc index, and the FULL
+// set of CHECK constraints (paren-balanced, comment/quote-aware extraction — never a naive
+// first-fragment substring match, which a crafted foreign CHECK could satisfy). This is the v4
+// COLLISION DEFENSE: a sibling branch that also stamped user_version=4 with a different
+// run_unit_head/runs is classified `incompatible` and rejected — never adopted, and (because the
+// gate runs on a READ-ONLY preflight before any drop) never destroyed by --fresh.
+
+interface ColSpec { readonly name: string; readonly type: string; readonly notnull: 0 | 1; readonly pk: number; }
+// Ordered column specs per version. pk = 1-based position in the composite PRIMARY KEY, else 0. `type`
+// is validated too: e.g. an `is_default_branch TEXT` foreign column would store the bound integer as
+// '1' and break the report's strict `=== 1` check.
+const RUH_V4_COLSPEC: readonly ColSpec[] = [
+  { name: "run_id", type: "TEXT", notnull: 1, pk: 1 }, { name: "organization", type: "TEXT", notnull: 1, pk: 2 },
+  { name: "repository", type: "TEXT", notnull: 1, pk: 3 }, { name: "branch", type: "TEXT", notnull: 1, pk: 4 },
+  { name: "commit_sha", type: "TEXT", notnull: 1, pk: 0 }, { name: "status", type: "TEXT", notnull: 1, pk: 0 },
+  { name: "is_default_branch", type: "INTEGER", notnull: 0, pk: 0 }, { name: "policy_status", type: "TEXT", notnull: 0, pk: 0 },
+  { name: "policy_matched_pattern", type: "TEXT", notnull: 0, pk: 0 }, { name: "scanned_commit_date", type: "TEXT", notnull: 0, pk: 0 },
+];
+const RUH_V3_COLSPEC: readonly ColSpec[] = RUH_V4_COLSPEC.slice(0, 7); // through is_default_branch
+const RUH_V2_COLSPEC: readonly ColSpec[] = RUH_V4_COLSPEC.slice(0, 6); // through status (pre is_default_branch)
+
+// All pragma reads below use the table-valued pragma FUNCTIONS with a BOUND argument
+// (pragma_table_xinfo(?), pragma_foreign_key_list(?), …) rather than interpolating the table name
+// into `PRAGMA foo(name)`. An interpolated name is a SQL-injection vector when the name comes from
+// the catalog (e.g. a maliciously named child table in the inbound-FK scan).
+interface ColInfo { readonly name: string; readonly type: string; readonly notnull: number; readonly pk: number; readonly hidden: number; }
+// Columns via table_xinfo (NOT table_info) so GENERATED/hidden columns are visible: a foreign table
+// with our 10 ordinary columns plus an extra generated column, or a generated runs.outcome, must not
+// pass as ours. Names + declared types lowercased/uppercased for case-insensitive comparison.
+function tableXinfo(db: Database, table: string): ColInfo[] {
+  return (db.query('SELECT name, type, "notnull" AS nn, pk, hidden FROM pragma_table_xinfo(?)').all(table) as Array<{
+    name: string; type: string; nn: number; pk: number; hidden: number;
+  }>).map((r) => ({ name: r.name.toLowerCase(), type: (r.type ?? "").toUpperCase(), notnull: r.nn, pk: r.pk, hidden: r.hidden }));
+}
+// Every column must be ORDINARY (hidden === 0) AND match the spec by name / declared type / NOT NULL
+// / PK position.
+function colsMatch(actual: ColInfo[], spec: readonly ColSpec[]): boolean {
+  return actual.length === spec.length &&
+    actual.every((a) => a.hidden === 0) &&
+    spec.every((s, i) => actual[i]!.name === s.name && actual[i]!.type === s.type && actual[i]!.notnull === s.notnull && actual[i]!.pk === s.pk);
+}
+
+function foreignKeys(db: Database, table: string): Array<{ from: string; table: string; to: string }> {
+  return (db.query('SELECT "from" AS "from", "table" AS "table", "to" AS "to" FROM pragma_foreign_key_list(?)').all(table) as Array<{
+    from: string; table: string; to: string | null;
+  }>).map((r) => ({ from: r.from.toLowerCase(), table: r.table.toLowerCase(), to: (r.to ?? "").toLowerCase() }));
+}
+
+// ix_ruh_loc's state ON run_unit_head: "ok" = OUR index (non-UNIQUE, explicitly created, over exactly
+// organization/repository/branch/commit_sha); "absent" = repairable (recreate it); "wrong" = a
+// different index of that name (UNIQUE, or over different columns — which would even reject legitimate
+// re-scans), which is incompatible. pragma_index_list('run_unit_head') only lists indexes on that
+// table, so a same-named index on a DIFFERENT table reads as absent (the migration's CREATE INDEX
+// would then fail and roll back — fail-safe, not silent).
+function ruhIndexState(db: Database): "ok" | "absent" | "wrong" {
+  const list = db
+    .query("SELECT \"unique\" AS uniq, origin, partial FROM pragma_index_list('run_unit_head') WHERE name = 'ix_ruh_loc' COLLATE NOCASE")
+    .get() as { uniq: number; origin: string; partial: number } | null;
+  if (list === null) {
+    // Absent ON run_unit_head — but index names are schema-GLOBAL, so if an ix_ruh_loc exists on
+    // ANOTHER table, `CREATE INDEX IF NOT EXISTS ix_ruh_loc` would silently NO-OP, leaving us
+    // permanently without the index. That is not a repairable "absent" — it is incompatible.
+    const global = db.query("SELECT 1 FROM sqlite_schema WHERE type='index' AND name = 'ix_ruh_loc' COLLATE NOCASE").get();
+    return global === null ? "absent" : "wrong";
+  }
+  if (list.uniq !== 0 || list.origin !== "c" || list.partial !== 0) return "wrong"; // UNIQUE / auto / PARTIAL
+  // Columns IN ORDER (seqno), exactly (organization, repository, branch, commit_sha) — a reversed
+  // index has different query coverage.
+  const c = (db.query("SELECT name FROM pragma_index_info('ix_ruh_loc') ORDER BY seqno").all() as Array<{ name: string }>).map((r) =>
+    r.name.toLowerCase(),
+  );
+  return c.length === 4 && c[0] === "organization" && c[1] === "repository" && c[2] === "branch" && c[3] === "commit_sha" ? "ok" : "wrong";
+}
+
+// run_unit_head must carry NO unexpected dependent objects: a trigger, or any index other than the
+// PK autoindex (origin='pk') and our explicit ix_ruh_loc (origin='c'), would be SILENTLY dropped by
+// the rebuild's DROP (SCHEMA_SQL only recreates ix_ruh_loc). A table-level UNIQUE constraint's
+// autoindex (origin='u', NULL sql) is likewise unexpected — and would also wrongly reject legitimate
+// multi-branch upserts if adopted — so it is rejected via origin, not a sql-IS-NULL filter.
+function ruhHasUnexpectedDependents(db: Database): boolean {
+  const trig = db.query("SELECT COUNT(*) AS n FROM sqlite_schema WHERE type='trigger' AND tbl_name = 'run_unit_head' COLLATE NOCASE").get() as { n: number };
+  if (trig.n > 0) return true;
+  const idx = db.query("SELECT name, origin FROM pragma_index_list('run_unit_head')").all() as Array<{ name: string; origin: string }>;
+  return idx.some((r) => !(r.origin === "pk" || (r.origin === "c" && r.name.toLowerCase() === "ix_ruh_loc")));
+}
+
+// The composite primary key columns must all use BINARY (default) collation. A NOCASE PK would
+// conflate case-distinct branch/org/repo names and silently merge upserts. The PK autoindex
+// (origin='pk') records each key column's collation via pragma_index_xinfo.
+function ruhPkBinaryCollation(db: Database): boolean {
+  const pk = db.query("SELECT name FROM pragma_index_list('run_unit_head') WHERE origin='pk'").get() as { name: string } | null;
+  if (pk === null) return false; // no composite-PK autoindex — not our shape
+  const cols = db.query("SELECT coll FROM pragma_index_xinfo(?) WHERE key = 1").all(pk.name) as Array<{ coll: string | null }>;
+  return cols.length === 4 && cols.every((c) => (c.coll ?? "BINARY").toUpperCase() === "BINARY");
+}
+
+// Does ANY other table declare a foreign key REFERENCING `target`? A rebuild that DROPs `target` with
+// foreign_keys=ON would implicitly cascade/mutate those external rows, and foreign_key_check on the
+// rebuilt table cannot detect that loss — so an inbound FK makes the rebuild unsafe (reject).
+function hasInboundForeignKey(db: Database, target: string): boolean {
+  const t = target.toLowerCase();
+  const tables = (db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>).map(
+    (r) => r.name,
+  );
+  return tables.some((tbl) => tbl.toLowerCase() !== t && foreignKeys(db, tbl).some((fk) => fk.table === t));
+}
+
+// If sql[i] opens a quoted token ('…' string, "…"/`…`/[…] identifier), return the index just PAST
+// the closing quote (handling doubled '' / "" / `` escapes); else return i unchanged. Used to make
+// the CHECK scan and normalization quote-aware — a ')' or the text "CHECK" inside a string literal
+// or identifier must never be treated as SQL.
+function skipQuoted(sql: string, i: number): number {
+  const open = sql[i];
+  if (open !== "'" && open !== '"' && open !== "`" && open !== "[") return i;
+  const close = open === "[" ? "]" : open;
+  let j = i + 1;
+  for (; j < sql.length; j++) {
+    if (sql[j] !== close) continue;
+    if (open !== "[" && sql[j + 1] === close) {
+      j++; // doubled escape ('' / "" / ``) — consume both, stay inside
+      continue;
+    }
+    return j + 1; // past the closing quote
+  }
+  return sql.length; // unterminated — consume the rest
+}
+
+// Normalize a CHECK expression for set comparison: lowercase the UNQUOTED tokens and drop comments,
+// but preserve single-quoted string LITERALS (and quoted identifiers) verbatim — their case is
+// significant to SQLite's default BINARY comparison ('SCANNED' is a different value than 'scanned').
+function normalizeCheck(expr: string): string {
+  let out = "";
+  let i = 0;
+  const n = expr.length;
+  while (i < n) {
+    const c = expr[i]!;
+    if (c === "'" || c === '"' || c === "`" || c === "[") {
+      const end = skipQuoted(expr, i);
+      out += expr.slice(i, end); // verbatim (case-preserving)
+      i = end;
+    } else if (c === "-" && expr[i + 1] === "-") {
+      while (i < n && expr[i] !== "\n") i++;
+      out += " "; // comment -> a whitespace SEPARATOR (SQLite treats a comment as whitespace, so
+      //             `status/* */in` must normalize to `status in`, never `statusin`)
+    } else if (c === "/" && expr[i + 1] === "*") {
+      i += 2;
+      while (i < n && !(expr[i] === "*" && expr[i + 1] === "/")) i++;
+      i += 2;
+      out += " "; // comment -> whitespace separator (see above)
+    } else {
+      out += c.toLowerCase();
+      i++;
+    }
+  }
+  // Whitespace/punctuation-normalize. (Our expected literals contain no spaces or ( ) , so this
+  // never alters them; a foreign literal that it did alter would still be a different value set.)
+  return out.replace(/\s+/g, " ").replace(/\s*([(),])\s*/g, "$1").trim();
+}
+
+// Extract EVERY top-level CHECK(...) expression from a table's stored CREATE sql. Fully quote/
+// comment-aware: `CHECK (`, `)`, and quotes inside string literals or identifiers are ignored, so a
+// foreign table cannot smuggle the expected CHECK text through a DEFAULT string. Returns the set of
+// NORMALIZED bodies — a foreign CHECK with extra values or OR-clauses is thus distinguished.
+function extractChecks(sql: string): Set<string> {
+  const out = new Set<string>();
+  const n = sql.length;
+  let i = 0;
+  while (i < n) {
+    const c = sql[i]!;
+    if (c === "'" || c === '"' || c === "`" || c === "[") {
+      i = skipQuoted(sql, i);
+      continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      while (i < n && sql[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && sql[i + 1] === "*") {
+      i += 2;
+      while (i < n && !(sql[i] === "*" && sql[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    // A `check` keyword outside quotes, on a word boundary, followed by '('.
+    if ((c === "c" || c === "C") && sql.slice(i, i + 5).toLowerCase() === "check" && !/\w/.test(sql[i - 1] ?? " ")) {
+      // Skip whitespace AND comments between `check` and `(` — SQLite treats a comment as trivia, so
+      // `CHECK/* note */(...)` is a legal constraint we must still recognize.
+      let j = i + 5;
+      for (;;) {
+        if (j < n && /\s/.test(sql[j]!)) { j++; continue; }
+        if (sql[j] === "-" && sql[j + 1] === "-") { while (j < n && sql[j] !== "\n") j++; continue; }
+        if (sql[j] === "/" && sql[j + 1] === "*") { j += 2; while (j < n && !(sql[j] === "*" && sql[j + 1] === "/")) j++; j += 2; continue; }
+        break;
+      }
+      if (sql[j] === "(") {
+        let depth = 1;
+        let k = j + 1;
+        const start = k;
+        for (; k < n && depth > 0; ) {
+          const cc = sql[k]!;
+          if (cc === "'" || cc === '"' || cc === "`" || cc === "[") {
+            k = skipQuoted(sql, k);
+            continue;
+          }
+          if (cc === "-" && sql[k + 1] === "-") {
+            while (k < n && sql[k] !== "\n") k++;
+            continue;
+          }
+          if (cc === "/" && sql[k + 1] === "*") {
+            k += 2;
+            while (k < n && !(sql[k] === "*" && sql[k + 1] === "/")) k++;
+            k += 2;
+            continue;
+          }
+          if (cc === "(") depth++;
+          else if (cc === ")") depth--;
+          k++;
+        }
+        out.add(normalizeCheck(sql.slice(start, k - 1)));
+        i = k;
+        continue;
+      }
+    }
+    i++;
+  }
+  return out;
+}
+// Expected CHECK sets, normalized through the SAME function so our own spacing never matters.
+const RUH_V4_CHECKS = new Set([
+  normalizeCheck("status IN ('scanned','skipped-cutoff','past-cap')"),
+  normalizeCheck("policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')"),
+  normalizeCheck("policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL"),
+]);
+const RUH_V23_CHECKS = new Set([normalizeCheck("status IN ('scanned','skipped-cutoff')")]);
+const setEquals = (a: Set<string>, b: Set<string>): boolean => a.size === b.size && [...a].every((x) => b.has(x));
+
+function tableCreateSql(db: Database, table: string): string | null {
+  const row = db.query("SELECT sql FROM sqlite_schema WHERE type='table' AND name = ? COLLATE NOCASE").get(table) as
+    | { sql: string | null }
+    | null;
+  return row?.sql ?? null;
+}
+
+// The on-disk run_unit_head shape, classified for migration / read-only decisions. ONE shared
+// READ-ONLY check (no writes, no sentinel inserts — works on a read-only connection) so the open
+// preflight, openReadOnly, and the migration all agree.
+type RuhClass =
+  | { kind: "ours-v4" } //               exact v4 shape — accept
+  | { kind: "ours-v4-missing-index" } // v4 shape, ix_ruh_loc absent — repairable (recreate index)
+  | { kind: "exact-v3" } //             exact v3 shape — migrate via rebuild
+  | { kind: "exact-v2" } //             exact v2 shape (pre is_default_branch) — migrate via v2→v3→v4
+  | { kind: "absent" } //               run_unit_head does not exist (fresh, or post---fresh cache-only)
+  | { kind: "incompatible"; reason: string }; // anything else — reject
+
+function classifyRunUnitHead(db: Database): RuhClass {
+  // Sibling discriminator FIRST: a runs.outcome column is a foreign v4 regardless of run_unit_head.
+  // Read via table_xinfo so a GENERATED outcome column cannot evade the check.
+  if (tableExists(db, "runs") && tableXinfo(db, "runs").some((c) => c.name === "outcome"))
+    return {
+      kind: "incompatible",
+      reason: "the runs table has an 'outcome' column — a different v4 schema; use the matching tool build or a new database path",
+    };
+  if (!tableExists(db, "run_unit_head")) return { kind: "absent" };
+  const cols = tableXinfo(db, "run_unit_head");
+  const sql = tableCreateSql(db, "run_unit_head");
+  const checks = sql === null ? new Set<string>() : extractChecks(sql);
+  const fks = foreignKeys(db, "run_unit_head");
+  const fkOk = fks.length === 1 && fks[0]!.from === "run_id" && fks[0]!.table === "runs" && fks[0]!.to === "run_id";
+  if (!fkOk)
+    return { kind: "incompatible", reason: "run_unit_head lacks the exact run_id→runs(run_id) foreign key" };
+  // Unexpected triggers or extra secondary indexes would be SILENTLY dropped by the rebuild — refuse
+  // any recognized shape that carries them, rather than lose them.
+  if (ruhHasUnexpectedDependents(db))
+    return { kind: "incompatible", reason: "run_unit_head has an unexpected trigger or secondary index (a rebuild would drop it)" };
+  // The composite PK must exist and use BINARY collation (a NOCASE PK would conflate case-distinct
+  // keys). ruhPkBinaryCollation covers both "no composite PK" and "present but non-BINARY".
+  if (!ruhPkBinaryCollation(db))
+    return { kind: "incompatible", reason: "run_unit_head's composite primary key is missing or uses a non-BINARY collation" };
+  if (colsMatch(cols, RUH_V4_COLSPEC)) {
+    if (!setEquals(checks, RUH_V4_CHECKS))
+      return { kind: "incompatible", reason: "run_unit_head has the v4 columns but not the exact v4 CHECK set" };
+    const idx = ruhIndexState(db);
+    if (idx === "wrong")
+      return { kind: "incompatible", reason: "run_unit_head has an ix_ruh_loc index with the wrong definition (UNIQUE or wrong columns)" };
+    return idx === "ok" ? { kind: "ours-v4" } : { kind: "ours-v4-missing-index" };
+  }
+  // A recognized PREDECESSOR (v2/v3) with a wrong ix_ruh_loc would have that index SILENTLY dropped
+  // by the v3→v4 rebuild — reject it (the migration recreates only OUR ix_ruh_loc). "absent" is fine
+  // (the predecessor may legitimately lack it; the rebuild recreates it).
+  const predIdxWrong = ruhIndexState(db) === "wrong";
+  if (colsMatch(cols, RUH_V3_COLSPEC)) {
+    if (!setEquals(checks, RUH_V23_CHECKS))
+      return { kind: "incompatible", reason: "run_unit_head has the v3 columns but not the exact v3 CHECK set" };
+    if (predIdxWrong)
+      return { kind: "incompatible", reason: "run_unit_head (v3) has an ix_ruh_loc index with the wrong definition" };
+    return { kind: "exact-v3" };
+  }
+  if (colsMatch(cols, RUH_V2_COLSPEC)) {
+    if (!setEquals(checks, RUH_V23_CHECKS))
+      return { kind: "incompatible", reason: "run_unit_head has the v2 columns but not the exact v2 CHECK set" };
+    if (predIdxWrong)
+      return { kind: "incompatible", reason: "run_unit_head (v2) has an ix_ruh_loc index with the wrong definition" };
+    return { kind: "exact-v2" };
+  }
+  return { kind: "incompatible", reason: `run_unit_head has an unrecognized shape (${cols.length} columns)` };
+}
+
+// migrateV3toV4 — run_unit_head gains policy_status/policy_matched_pattern/scanned_commit_date and a
+// WIDENED status CHECK. SQLite cannot ALTER a CHECK, so this REBUILDS the table (unlike the additive
+// v2→v3). ONE transaction: atomic across crashes — there is NO committed interval where
+// run_unit_head is absent (a crash before commit restores the v3 table+rows+index+stamp; after
+// commit exposes complete v4). It classifies the on-disk shape FIRST and branches, so it never
+// blindly rebuilds (which would erase a physical-v4 table's new-column data or mask an incompatible
+// shape). foreign_keys stays ON: run_unit_head is a leaf child, safe to DROP (implicit child-row
+// delete cannot violate the outgoing ref to runs); toggling the pragma inside a transaction is a
+// no-op anyway.
+function migrateV3toV4(db: Database): void {
+  db.transaction(() => {
+    const cls = classifyRunUnitHead(db);
+    switch (cls.kind) {
+      case "ours-v4":
+      case "ours-v4-missing-index":
+        break; // physically v4 already (shape upgraded, stamp lagged): preserve every value, no rebuild
+      case "exact-v3":
+        // A DROP with foreign_keys=ON does an implicit child-row delete that would CASCADE to any
+        // external table referencing run_unit_head — silently mutating rows the later
+        // foreign_key_check cannot detect. Refuse to rebuild in that (unexpected) mixed shape.
+        if (hasInboundForeignKey(db, "run_unit_head"))
+          fail("run_unit_head has an inbound foreign key — refusing to rebuild it (a DROP would cascade to external rows)");
+        // Rebuild: new v4-shaped table, copy the 7 v3 columns EXPLICITLY (new columns default NULL;
+        // existing 'scanned'/'skipped-cutoff' status values remain valid under the v4 CHECK).
+        if (tableExists(db, "run_unit_head__v4_new"))
+          fail("migration scratch table run_unit_head__v4_new already exists — aborting rather than clobber it");
+        db.exec(`CREATE TABLE run_unit_head__v4_new (${RUN_UNIT_HEAD_BODY});`);
+        db.exec(
+          `INSERT INTO run_unit_head__v4_new
+             (run_id, organization, repository, branch, commit_sha, status, is_default_branch)
+           SELECT run_id, organization, repository, branch, commit_sha, status, is_default_branch
+           FROM run_unit_head`,
+        );
+        db.exec("DROP TABLE run_unit_head");
+        db.exec("ALTER TABLE run_unit_head__v4_new RENAME TO run_unit_head");
+        break;
+      case "absent":
+        break; // recognized post---fresh cache-only state: SCHEMA_SQL below creates run_unit_head at v4
+      case "exact-v2":
+        // migrateV2toV3 runs BEFORE this in the chain and converts a v2 table to v3, so reaching v4
+        // with a still-v2 shape is a migration-ordering bug — fail rather than silently rebuild.
+        fail("internal: migrateV3toV4 reached a v2-shaped run_unit_head (migrateV2toV3 did not run)");
+        break;
+      case "incompatible":
+        fail(`cannot migrate database to schema v4: ${cls.reason}`);
+    }
+    // Recreate ix_ruh_loc + any other missing object (idempotent) — AFTER the table-specific step so
+    // a rebuild's fresh table gets its index here.
+    db.exec(SCHEMA_SQL);
+    // Post-migration fingerprint + FK integrity before stamping: the migration MUST have produced
+    // OUR exact v4 shape, with no orphaned rows.
+    const after = classifyRunUnitHead(db);
+    if (after.kind !== "ours-v4")
+      fail(`v3→v4 migration did not produce the expected run_unit_head shape (got '${after.kind}')`);
+    const orphans = db.query(`PRAGMA foreign_key_check(run_unit_head)`).all();
+    if (orphans.length > 0)
+      fail(`v3→v4 migration left ${orphans.length} orphaned run_unit_head row(s) — aborting`);
+    setUserVersion(db, V4_TARGET_VERSION);
+  })();
+}
+
+// Throw (fail) if the on-disk shape is INCOMPATIBLE with its stamp — a foreign/sibling database that
+// must be neither adopted NOR destroyed. Runs on a READ-ONLY preflight handle (so a rejection cannot
+// checkpoint/mutate a WAL file); the caller owns the handle. Recognizes legitimate predecessors, so a
+// real v2/v3 database is NOT rejected: for stamp >= v4 only ours-v4 is allowed; for v2..v3 an
+// exact-v2/exact-v3 OR a physically-upgraded ours-v4 is allowed; below v2 the legacy step rebuilds
+// run_unit_head EMPTY, so its shape is not validated here (a runs.outcome sibling still is, via the
+// classifier's first check). This runs BEFORE --fresh precisely so a --fresh cannot destroy a foreign
+// database at any stamp.
+function assertOpenCompatible(db: Database, userVersion: number): void {
+  const reject = (why: string): never => fail(`refusing to open an incompatible database (stamped v${userVersion}): ${why}`);
+  // These cross-table invariants hold at EVERY stamp (including pre-v2), and must run BEFORE the
+  // legacy short-circuit AND before any --fresh drop, since --fresh runs before the migration:
+  // (a) a runs.outcome column is a foreign v4 (table_xinfo, so a GENERATED outcome is caught);
+  if (tableExists(db, "runs") && tableXinfo(db, "runs").some((c) => c.name === "outcome"))
+    reject("the runs table has an 'outcome' column — a different v4 schema; use the matching tool build or a new database path");
+  const ruhPresent = tableExists(db, "run_unit_head");
+  // (b) run_unit_head absent while runs is present is never a legitimate (atomic) post-fresh state;
+  if (!ruhPresent && tableExists(db, "runs"))
+    reject("run_unit_head is missing while the runs table is present");
+  // (c) an inbound FK into run_unit_head would make a --fresh DROP (or the rebuild) cascade to
+  //     external rows — reject before either can run.
+  if (ruhPresent && hasInboundForeignKey(db, "run_unit_head"))
+    reject("an external table has a foreign key into run_unit_head — a DROP would cascade to its rows");
+  // Below v2 the legacy step REBUILDS run_unit_head EMPTY, so its on-disk SHAPE is irrelevant and
+  // must NOT be validated (a pre-v2 head legitimately has an old shape); the invariants above ran.
+  if (userVersion < LEGACY_TARGET_VERSION) return;
+  if (!ruhPresent) return; // absent + runs also absent -> genuine fresh / post-fresh cache-only state
+  const cls = classifyRunUnitHead(db);
+  if (cls.kind === "incompatible") reject(cls.reason);
+  // Per-stamp allowed shapes, TIGHTENED: the transactional migration chain cannot produce a shape
+  // newer than its stamp, so e.g. a v3 stamp must not carry a v2 shape (that would skip migrateV2toV3
+  // and fail mid-migration — after --fresh already dropped the tables).
+  const okV4 = cls.kind === "ours-v4" || cls.kind === "ours-v4-missing-index";
+  const allowed =
+    userVersion >= V4_TARGET_VERSION
+      ? okV4
+      : userVersion >= V3_TARGET_VERSION
+        ? okV4 || cls.kind === "exact-v3"
+        : okV4 || cls.kind === "exact-v3" || cls.kind === "exact-v2"; // stamp 2
+  if (!allowed) reject(`run_unit_head shape '${cls.kind}' does not match the stamp`);
+}
+
 // ---- open ------------------------------------------------------------------------------------
 export interface OpenDbOptions {
   sqlitePath: string;
@@ -948,6 +1381,44 @@ export class AuditDb {
       // would already have rewritten a stranger's header. (:memory: needs no proof — a fresh
       // in-memory database is empty by construction and shares nothing with the filesystem.)
       assertOwnedDatabase(path);
+      // Read-only PREFLIGHT for an EXISTING file: classify + reject-if-incompatible through a
+      // READ-ONLY handle BEFORE opening read-write. A rejection therefore cannot mutate the file —
+      // opening a WAL database read-write and closing it can checkpoint (rewrite the main db,
+      // truncate -wal), which would break the zero-mutation guarantee. Fail CLOSED when read-only
+      // verification is impossible (a crashed writer's WAL can be unrecoverable read-only) rather
+      // than fall through to a writable open that could adopt or destroy an incompatible database.
+      // ACCEPTED LIMITATION (documented, not fixed): a concurrent process could replace the file
+      // between this read-only preflight and the writable open below (a TOCTOU window). This tool is
+      // single-user (one audit process per database), so concurrent modification of the same file
+      // mid-open is outside the threat model; closing it fully would require OS advisory file locking
+      // held across both opens, which is disproportionate here.
+      if (existsSync(path)) {
+        // One try covering BOTH the read-only open AND the reads: SQLite can defer WAL access and
+        // raise SQLITE_READONLY_RECOVERY at the first statement (readUserVersion), not just at open.
+        let ro: Database | null = null;
+        try {
+          ro = new Database(path, { readonly: true, strict: true });
+          ro.exec("PRAGMA busy_timeout = 5000;");
+          const uv = readUserVersion(ro);
+          if (uv > SCHEMA_VERSION)
+            fail(`database schema version ${uv} is newer than this tool's ${SCHEMA_VERSION} — upgrade the tool`);
+          assertOpenCompatible(ro, uv);
+        } catch (e) {
+          if (e instanceof DbError) throw e; // our own rejection (too-new / incompatible) — pass through
+          // A crashed-writer WAL needs WRITABLE recovery, which the read-only preflight cannot do, and
+          // mapReadOnlyOpenError's "run bun run audit" advice would LOOP here (this IS the audit
+          // writer). Give a non-looping remediation and stay fail-closed (we will NOT writable-recover
+          // a file we could not first verify as compatible).
+          if ((e as { code?: unknown }).code === "SQLITE_READONLY_RECOVERY")
+            fail(
+              `database at ${path} needs writable WAL recovery after a crashed writer, which cannot be verified read-only first — ` +
+                "recover it separately (e.g. `sqlite3 <path> \"PRAGMA wal_checkpoint(TRUNCATE)\"`) or use a fresh database path, then retry",
+            );
+          throw mapReadOnlyOpenError(e, path);
+        } finally {
+          if (ro !== null) ro.close();
+        }
+      }
     }
     // strict: throws on binding-count mismatches instead of silently binding NULLs.
     // NOTE: `safeIntegers` is intentionally left OFF (the default). With it off, bun:sqlite returns
@@ -958,6 +1429,9 @@ export class AuditDb {
     const db = new Database(path, { create: true, strict: true });
     // PRAGMAs, version ceiling and the ownership BACKSTOP under one fail-closed discipline —
     // see initWritableConnection (extracted so its failure contract is directly unit-testable).
+    // The compatibility gate already ran on the READ-ONLY preflight above, so an incompatible
+    // EXISTING database never reaches this writable open (and thus is never WAL-mutated or
+    // --fresh-dropped).
     const userVersion = initWritableConnection(db, path);
 
     if (opts.fresh === true) {
@@ -1002,14 +1476,14 @@ export class AuditDb {
       // There is no pre-v2 step: assertOwnedDatabase refuses a non-empty database stamped below
       // MIN_OWNED_VERSION rather than adopting and rebuilding it, so userVersion is >= 2 here.
       if (readUserVersion(db) < V3_TARGET_VERSION) migrateV2toV3(db);
+      if (readUserVersion(db) < V4_TARGET_VERSION) migrateV3toV4(db);
     } else {
-      // Idempotent self-heal for a current-version database: recreate any missing
-      // table/index AND re-apply the additive column set transactionally. Without the
-      // column repair, a v3-stamped file missing is_default_branch would be a dead end —
-      // openReadOnly's "run `bun run audit`" remediation must actually fix it.
+      // Current-version (v4) self-heal: the compatibility gate already verified the on-disk shape is
+      // ours-v4 (at worst missing only ix_ruh_loc), so recreating any missing table/index suffices.
+      // The v4 policy columns carry CHECKs and cannot be addColumn-repaired — which is exactly why
+      // an actually-incompatible v4 was REJECTED at the gate rather than silently "repaired" here.
       db.transaction(() => {
         db.exec(SCHEMA_SQL);
-        addColumnIfMissing(db, "run_unit_head", "is_default_branch", "INTEGER");
       })();
     }
     return new AuditDb(db);
@@ -1061,15 +1535,33 @@ export class AuditDb {
           `database schema version ${userVersion} is older than this tool's ${SCHEMA_VERSION} — ` +
             "run `bun run audit` once to migrate it, then retry",
         );
-      // Schema sanity up front: a file missing an audit table or the v3 is_default_branch
-      // column must fail HERE with an actionable message, not later with a raw
-      // "no such table" (or "no such column") mid-query.
+      // Schema sanity up front: a foreign file, or one missing an audit table or the expected v4
+      // run_unit_head shape, must fail HERE with an actionable message, not later with a raw "no
+      // such table"/"no such column" mid-query. openReadOnly cannot migrate, so it DISTINGUISHES an
+      // INCOMPATIBLE database (a different-build v4 — use the matching build or a new db path) from a
+      // merely under-repaired one (run `bun run audit` once). The stamp is == SCHEMA_VERSION here
+      // (both < and > are rejected above), so any non-ours-v4 shape is a genuine mismatch.
+      // The INCOMPATIBILITY discriminator runs FIRST — a foreign/sibling database (e.g. runs.outcome)
+      // must get the incompatible message even when it is ALSO missing an audit table, because "run
+      // bun run audit" cannot repair it (the writer open rejects the same file). Only after that do we
+      // give the missing-table repair advice for a genuinely under-repaired ours database.
+      const incompatible = (why: string): never =>
+        fail(`database is incompatible with this tool build (${why}) — use the matching tool build or a new database path`);
+      const cls = classifyRunUnitHead(db);
+      if (cls.kind === "incompatible") incompatible(cls.reason);
+      // The stamp is == SCHEMA_VERSION (4) here (older/newer both rejected above). Mirror the writer
+      // gate's cross-table + shape invariants BEFORE the missing-table advice, since "run bun run
+      // audit" cannot repair any of these (the writer open rejects the same file):
+      if (!tableExists(db, "run_unit_head") && tableExists(db, "runs"))
+        incompatible("run_unit_head is missing while the runs table is present");
+      if (tableExists(db, "run_unit_head") && hasInboundForeignKey(db, "run_unit_head"))
+        incompatible("an external table has a foreign key into run_unit_head"); // consistent with the writer gate
+      if (tableExists(db, "run_unit_head") && cls.kind !== "ours-v4" && cls.kind !== "ours-v4-missing-index")
+        incompatible(`run_unit_head shape '${cls.kind}'`);
       for (const t of AUDIT_TABLES) {
         if (!tableExists(db, t))
           fail(`database is missing the ${t} table — run \`bun run audit\` once to repair it, then retry`);
       }
-      if (!columnExists(db, "run_unit_head", "is_default_branch"))
-        fail("database is missing the v3 is_default_branch column — run `bun run audit` once to migrate, then retry");
     } catch (e) {
       db.close();
       throw e instanceof DbError ? e : mapReadOnlyOpenError(e, path);

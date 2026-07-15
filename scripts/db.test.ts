@@ -2276,7 +2276,11 @@ function buildV3TwinDb(path: string): void {
   buildV2Db(path);
   const raw = new Database(path, { strict: true });
   raw.exec("ALTER TABLE run_unit_head ADD COLUMN is_default_branch INTEGER");
-  raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  // LITERAL 3, never SCHEMA_VERSION: this is a native v3-shaped fixture. Stamping SCHEMA_VERSION
+  // would falsely claim the current version once the constant bumps (a v3-shaped table stamped v4
+  // is exactly what the compatibility gate rejects). Opening it drives the real v3→v4 migration,
+  // the same path the migrated-v2 database takes, so their reports stay byte-identical.
+  raw.exec("PRAGMA user_version = 3");
   raw.close();
 }
 
@@ -2446,8 +2450,9 @@ describe("upsertRunUnitHead — is_default_branch tri-state", () => {
 });
 
 describe("openReadOnly (CV5 read seam)", () => {
-  // A cleanly-written v3 database with one completed run, for the happy paths.
-  function buildV3Db(path: string): string {
+  // A cleanly-written CURRENT-version (v4) database with one completed run, for the happy paths
+  // (AuditDb.open fresh-creates at SCHEMA_VERSION, so this tracks the current schema, not v3).
+  function buildCurrentV4Db(path: string): string {
     const db = AuditDb.open({ sqlitePath: path });
     const { runId } = db.startRun(runInput());
     db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
@@ -2456,9 +2461,9 @@ describe("openReadOnly (CV5 read seam)", () => {
     return runId;
   }
 
-  test("reads a v3 database: getRun/read/readTransaction/hasCompletionMarker work", () => {
+  test("reads a current (v4) database: getRun/read/readTransaction/hasCompletionMarker work", () => {
     const path = nextFile();
-    const runId = buildV3Db(path);
+    const runId = buildCurrentV4Db(path);
     const reader = AuditDb.openReadOnly({ sqlitePath: path });
     try {
       expect(reader.getRun(runId)?.status).toBe("completed");
@@ -2475,7 +2480,7 @@ describe("openReadOnly (CV5 read seam)", () => {
 
   test("the connection is truly read-only at the SQLite level, and the main file's bytes never change", () => {
     const path = nextFile();
-    const runId = buildV3Db(path);
+    const runId = buildCurrentV4Db(path);
     const hashBefore = createHash("sha256").update(readFileSync(path)).digest("hex");
     const reader = AuditDb.openReadOnly({ sqlitePath: path });
     try {
@@ -2500,7 +2505,7 @@ describe("openReadOnly (CV5 read seam)", () => {
 
   test("a NEWER-versioned database is refused with the upgrade-the-tool message", () => {
     const path = nextFile();
-    buildV3Db(path);
+    buildCurrentV4Db(path);
     const bump = new Database(path, { strict: true });
     bump.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
     bump.close();
@@ -2638,31 +2643,399 @@ describe("open — version check precedes the --fresh drop", () => {
   });
 });
 
-describe("open — current-version self-heal repairs a missing v3 column", () => {
-  test("a v3-stamped database lacking is_default_branch is repaired by the writer open, preserving data", () => {
+describe("open — a corrupt v4 run_unit_head (missing a column) is REJECTED, never silently adopted", () => {
+  test("a v4-stamped db lacking a run_unit_head column is rejected by both opens, and --fresh does NOT destroy it", () => {
     const path = nextFile();
     const db1 = AuditDb.open({ sqlitePath: path });
     const { runId } = db1.startRun(runInput());
     db1.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
     db1.completeRun(runId);
     db1.close();
-    // Forge the dead-end state: v3 stamp, v2-shaped run_unit_head (no is_default_branch).
+    // Forge a corrupt shape: current stamp, run_unit_head missing a column. An atomic migration can
+    // never produce this, so the tool refuses it rather than guessing — the policy columns carry
+    // CHECKs and cannot be addColumn-repaired, so partial-v4 repair is deliberately unsupported
+    // (favouring the collision defence: anything not exactly ours-v4 is incompatible).
     const forge = new Database(path, { strict: true });
     forge.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch");
     forge.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     forge.close();
-    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/is_default_branch/);
+    // Read-only, writer, AND --fresh all reject it. Critically, --fresh rejects BEFORE dropping
+    // anything (the compatibility gate runs before the destructive path), so the data survives.
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/incompatible|not the expected v4 shape/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true, purgeCache: true })).toThrow(/incompatible/);
+    const check = new Database(path, { readonly: true });
+    expect((check.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n).toBe(1); // untouched
+    check.close();
+    expect(runId.length).toBeGreaterThan(0);
+  });
+});
 
-    // openReadOnly's remediation is "run bun run audit" — the writer open MUST actually fix it,
-    // by ALTER (rows ride through; the damaged-away value honestly reads NULL), never by a
-    // drop-and-recreate that would pass a column check while deleting the head rows.
-    const db2 = AuditDb.open({ sqlitePath: path });
-    expect(db2.getRun(runId)?.status).toBe("completed"); // data preserved
-    expect(raw(db2).query("SELECT branch, commit_sha, is_default_branch FROM run_unit_head").all())
-      .toEqual([{ branch: "main", commit_sha: "s", is_default_branch: null }]);
-    db2.close();
-    const reader = AuditDb.openReadOnly({ sqlitePath: path }); // and reads work again
-    expect(reader.getRun(runId)?.status).toBe("completed");
+describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data safety)", () => {
+  const RUH_V4_COLS = ["run_id","organization","repository","branch","commit_sha","status","is_default_branch","policy_status","policy_matched_pattern","scanned_commit_date"];
+  // Native v4 database (fresh-created at v4 by AuditDb.open) with one completed run + two heads.
+  function buildNativeV4(path: string): string {
+    const db = AuditDb.open({ sqlitePath: path });
+    const { runId } = db.startRun(runInput());
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false });
+    db.completeRun(runId);
+    db.close();
+    return runId;
+  }
+  const cols = (db: Database, t: string): string[] =>
+    (db.query(`PRAGMA table_info(${t})`).all() as Array<{ name: string }>).map((c) => c.name);
+  const uv = (db: Database): number => (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+
+  test("fresh-create is exactly ours-v4: 10 cols, status admits {scanned,skipped-cutoff,past-cap}, policy CHECKs enforced", () => {
+    const path = nextFile();
+    const db = AuditDb.open({ sqlitePath: path });
+    const r = raw(db);
+    expect(cols(r, "run_unit_head")).toEqual(RUH_V4_COLS);
+    expect(uv(r)).toBe(SCHEMA_VERSION);
+    const { runId } = db.startRun(runInput());
+    // past-cap accepted; a foreign status ('reused', a sibling value) rejected.
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status) VALUES ('${runId}','o','r','b1','past-cap')`)).not.toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status) VALUES ('${runId}','o','r','b2','reused')`)).toThrow();
+    // deny requires a matched pattern; a foreign policy_status rejected; a valid deny+pattern OK.
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status) VALUES ('${runId}','o','r','b3','skipped-cutoff','excluded-by-deny')`)).toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status,policy_matched_pattern) VALUES ('${runId}','o','r','b4','skipped-cutoff','excluded-by-deny','dep*')`)).not.toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status) VALUES ('${runId}','o','r','b5','skipped-cutoff','bogus')`)).toThrow();
+    db.close();
+  });
+
+  test("v3→v4 migration preserves rows + is_default_branch backfill, sets new columns NULL, survives reopen", () => {
+    const path = nextFile();
+    buildV3TwinDb(path); // native v3 (literal stamp 3)
+    const before = new Database(path, { readonly: true });
+    const beforeCount = (before.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n;
+    before.close();
+    const db = AuditDb.open({ sqlitePath: path }); // drives v3→v4
+    const r = raw(db);
+    expect(uv(r)).toBe(SCHEMA_VERSION);
+    expect(cols(r, "run_unit_head")).toEqual(RUH_V4_COLS);
+    const rows = r.query("SELECT is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date FROM run_unit_head").all() as Array<Record<string, unknown>>;
+    expect(rows.length).toBe(beforeCount); // every row preserved
+    for (const row of rows) {
+      expect(row.is_default_branch).toBeNull(); // v2/v3 backfill
+      expect(row.policy_status).toBeNull();
+      expect(row.policy_matched_pattern).toBeNull();
+      expect(row.scanned_commit_date).toBeNull();
+    }
+    db.close();
+    const reader = AuditDb.openReadOnly({ sqlitePath: path }); // still a valid v4
+    expect(reader.read("SELECT COUNT(*) AS n FROM run_unit_head").get()).toBeDefined();
     reader.close();
+  });
+
+  test("an incompatible sibling v4 (runs.outcome) is rejected by open / --fresh / --fresh+purge / read-only — data preserved", () => {
+    const path = nextFile();
+    buildNativeV4(path);
+    const forge = new Database(path, { strict: true });
+    forge.exec("ALTER TABLE runs ADD COLUMN outcome TEXT"); // a DIFFERENT v4 (sibling branch), still stamped 4
+    forge.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true, purgeCache: true })).toThrow(/incompatible/);
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/incompatible with this tool build/);
+    // NOTHING destroyed — the --fresh drops never ran (the gate rejects first).
+    const check = new Database(path, { readonly: true });
+    expect((check.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n).toBe(1);
+    expect(cols(check, "runs")).toContain("outcome");
+    check.close();
+  });
+
+  test("a v4 stamp on a v3-shaped run_unit_head is rejected (an atomic migration cannot produce it)", () => {
+    const path = nextFile();
+    buildV3TwinDb(path); // v3 shape, stamp 3
+    const forge = new Database(path, { strict: true });
+    forge.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`); // lie: stamp v4 on a v3 shape
+    forge.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible|not the expected v4 shape/);
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/incompatible|not the expected v4 shape/);
+  });
+
+  test("a physically-v4 database stamped v3 is stamped to v4 WITHOUT a rebuild — new-column values preserved", () => {
+    const path = nextFile();
+    buildNativeV4(path);
+    const forge = new Database(path, { strict: true });
+    forge.exec("UPDATE run_unit_head SET scanned_commit_date = '2024-05-05' WHERE branch='main'");
+    forge.exec("PRAGMA user_version = 3"); // lie the stamp back below v4
+    forge.close();
+    const db = AuditDb.open({ sqlitePath: path }); // migrateV3toV4 sees ours-v4 -> preserve, stamp 4
+    const r = raw(db);
+    expect(uv(r)).toBe(SCHEMA_VERSION);
+    expect((r.query("SELECT scanned_commit_date AS d FROM run_unit_head WHERE branch='main'").get() as { d: string }).d).toBe("2024-05-05");
+    db.close();
+  });
+
+  test("--fresh on a native v3 db: run data dropped, result is a clean writable v4", () => {
+    const path = nextFile();
+    buildV3TwinDb(path); // v3, stamp 3, with run_unit_head rows
+    const db = AuditDb.open({ sqlitePath: path, fresh: true });
+    const r = raw(db);
+    expect(uv(r)).toBe(SCHEMA_VERSION);
+    expect(cols(r, "run_unit_head")).toEqual(RUH_V4_COLS);
+    expect((r.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n).toBe(0); // run data gone
+    db.close();
+  });
+
+  test("a migration that aborts at the pre-swap guard leaves the v3 table + stamp untouched", () => {
+    const path = nextFile();
+    buildV3TwinDb(path); // v3, stamp 3
+    const forge = new Database(path, { strict: true });
+    forge.exec("CREATE TABLE run_unit_head__v4_new (x INTEGER)"); // pre-existing scratch -> migration aborts
+    forge.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/scratch table/);
+    const check = new Database(path, { readonly: true });
+    expect(uv(check)).toBe(3);
+    expect(cols(check, "run_unit_head")).not.toContain("policy_status");
+    check.close();
+  });
+
+  test("rollback AFTER the destructive swap: a post-rename failure restores the v3 rows, shape, and stamp", () => {
+    const path = nextFile();
+    buildV3TwinDb(path); // v3, stamp 3
+    const before = new Database(path, { readonly: true });
+    const beforeRows = (before.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n;
+    before.close();
+    const forge = new Database(path, { strict: true });
+    // Drop the real ix_ruh_loc index and squat its name with a TABLE, so SCHEMA_SQL's
+    // `CREATE INDEX ... ix_ruh_loc` fails AFTER the rebuild's DROP+RENAME already ran — proving the
+    // destructive swap is inside the rolled-back transaction.
+    forge.exec("DROP INDEX IF EXISTS ix_ruh_loc");
+    forge.exec("CREATE TABLE ix_ruh_loc (x INTEGER)");
+    forge.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow();
+    const check = new Database(path, { readonly: true });
+    expect(uv(check)).toBe(3); // stamp rolled back
+    expect(cols(check, "run_unit_head")).not.toContain("policy_status"); // rename rolled back -> still v3
+    expect((check.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n).toBe(beforeRows); // rows intact
+    check.close();
+  });
+
+  // Replace run_unit_head with a FOREIGN shape at stamp 4 (same audit tables otherwise) to probe the
+  // fingerprint's fail-closed properties.
+  function forgeRuh(path: string, ruhCreate: string): void {
+    buildNativeV4(path);
+    const f = new Database(path, { strict: true });
+    f.exec("PRAGMA foreign_keys = OFF;");
+    f.exec("DROP TABLE run_unit_head");
+    f.exec(ruhCreate);
+    f.exec("PRAGMA user_version = 4");
+    f.close();
+  }
+
+  test("CHECK tokenizer: a v4-shaped table whose status CHECK also admits 'reused' via an OR-clause is rejected", () => {
+    const path = nextFile();
+    forgeRuh(path, `CREATE TABLE run_unit_head (
+      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap') OR status IN ('reused')),
+      is_default_branch INTEGER,
+      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+      policy_matched_pattern TEXT, scanned_commit_date TEXT,
+      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      PRIMARY KEY (run_id, organization, repository, branch))`);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/incompatible/); // --fresh cannot destroy it
+  });
+
+  test("fingerprint: v4 columns + CHECKs but NO composite primary key is rejected (not silently adopted)", () => {
+    const path = nextFile();
+    forgeRuh(path, `CREATE TABLE run_unit_head (
+      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
+      is_default_branch INTEGER,
+      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+      policy_matched_pattern TEXT, scanned_commit_date TEXT,
+      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL))`); // no PRIMARY KEY
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+  });
+
+  test("case-insensitive gate: a runs.OUTCOME (uppercase) sibling column is still detected and rejected", () => {
+    const path = nextFile();
+    buildNativeV4(path);
+    const f = new Database(path, { strict: true });
+    f.exec("ALTER TABLE runs ADD COLUMN OUTCOME TEXT"); // uppercase — SQLite resolves names case-insensitively
+    f.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/incompatible/);
+  });
+
+  test("inbound FK: rebuild is refused when an external table references run_unit_head (a DROP would cascade)", () => {
+    const path = nextFile();
+    buildV3TwinDb(path); // v3, stamp 3 — would otherwise migrate
+    const f = new Database(path, { strict: true });
+    f.exec("PRAGMA foreign_keys = OFF;");
+    f.exec("CREATE TABLE ext (id INTEGER PRIMARY KEY, ruh TEXT REFERENCES run_unit_head(run_id) ON DELETE CASCADE)");
+    f.close();
+    // The read-only gate rejects this BEFORE --fresh/migration (so a --fresh cannot cascade-drop ext).
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/foreign key into run_unit_head/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/foreign key into run_unit_head/);
+    const check = new Database(path, { readonly: true });
+    expect(uv(check)).toBe(3); // untouched
+    check.close();
+  });
+
+  test("CHECK tokenizer: expected CHECK text hidden in a DEFAULT string does NOT satisfy the fingerprint", () => {
+    const path = nextFile();
+    forgeRuh(path, `CREATE TABLE run_unit_head (
+      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT 'CHECK (status IN (''scanned'',''skipped-cutoff'',''past-cap''))',
+      status TEXT NOT NULL DEFAULT 'scanned', is_default_branch INTEGER,
+      policy_status TEXT, policy_matched_pattern TEXT, scanned_commit_date TEXT,
+      PRIMARY KEY (run_id, organization, repository, branch))`); // NO real CHECKs — text is only in a default
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+  });
+
+  test("CHECK case: a status CHECK with UPPERCASE literal values is rejected (would break lowercase writes)", () => {
+    const path = nextFile();
+    forgeRuh(path, `CREATE TABLE run_unit_head (
+      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('SCANNED','SKIPPED-CUTOFF','PAST-CAP')),
+      is_default_branch INTEGER,
+      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+      policy_matched_pattern TEXT, scanned_commit_date TEXT,
+      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      PRIMARY KEY (run_id, organization, repository, branch))`);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+  });
+
+  test("fingerprint: a v4 table with an extra GENERATED column is rejected (table_xinfo, not table_info)", () => {
+    const path = nextFile();
+    forgeRuh(path, `CREATE TABLE run_unit_head (
+      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
+      is_default_branch INTEGER,
+      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+      policy_matched_pattern TEXT, scanned_commit_date TEXT,
+      extra TEXT GENERATED ALWAYS AS (branch) VIRTUAL,
+      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      PRIMARY KEY (run_id, organization, repository, branch))`);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+  });
+
+  test("gate: run_unit_head absent while runs is present (a partial v4) is rejected — --fresh cannot destroy runs", () => {
+    const path = nextFile();
+    buildNativeV4(path);
+    const f = new Database(path, { strict: true });
+    f.exec("PRAGMA foreign_keys = OFF;");
+    f.exec("DROP TABLE run_unit_head"); // runs survives -> NOT a real (atomic) post-fresh state
+    f.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible|missing while the runs/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/incompatible|missing while the runs/);
+    const check = new Database(path, { readonly: true });
+    expect((check.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n).toBe(1); // runs untouched
+    check.close();
+  });
+
+  test("index: a UNIQUE ix_ruh_loc (wrong definition) is rejected — not merely name-matched", () => {
+    const path = nextFile();
+    buildNativeV4(path);
+    const f = new Database(path, { strict: true });
+    f.exec("DROP INDEX ix_ruh_loc");
+    f.exec("CREATE UNIQUE INDEX ix_ruh_loc ON run_unit_head(organization, repository, branch, commit_sha)");
+    f.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+  });
+
+  test("dependent objects: a trigger on run_unit_head is rejected (a rebuild would silently drop it)", () => {
+    const path = nextFile();
+    buildV3TwinDb(path); // v3 -> would otherwise migrate
+    const f = new Database(path, { strict: true });
+    f.exec("CREATE TRIGGER trg AFTER INSERT ON run_unit_head BEGIN SELECT 1; END");
+    f.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible|unexpected trigger/);
+  });
+
+  test("gate: a v2-shaped run_unit_head stamped v3 is rejected (the chain would skip migrateV2toV3)", () => {
+    const path = nextFile();
+    buildV2Db(path); // v2 shape, stamp 2
+    const f = new Database(path, { strict: true });
+    f.exec("PRAGMA user_version = 3"); // lie: a v3 stamp on a v2 shape
+    f.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible|does not match the stamp/);
+  });
+
+  test("fingerprint: is_default_branch declared TEXT (wrong type) is rejected", () => {
+    const path = nextFile();
+    forgeRuh(path, `CREATE TABLE run_unit_head (
+      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
+      is_default_branch TEXT,
+      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+      policy_matched_pattern TEXT, scanned_commit_date TEXT,
+      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      PRIMARY KEY (run_id, organization, repository, branch))`);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+  });
+
+  test("fingerprint: an extra table-level UNIQUE constraint (its autoindex) is rejected", () => {
+    const path = nextFile();
+    forgeRuh(path, `CREATE TABLE run_unit_head (
+      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
+      is_default_branch INTEGER,
+      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+      policy_matched_pattern TEXT, scanned_commit_date TEXT,
+      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      UNIQUE(commit_sha),
+      PRIMARY KEY (run_id, organization, repository, branch))`);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+  });
+
+  test("fingerprint: a NOCASE primary-key collation is rejected (would conflate case-distinct keys)", () => {
+    const path = nextFile();
+    forgeRuh(path, `CREATE TABLE run_unit_head (
+      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
+      is_default_branch INTEGER,
+      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+      policy_matched_pattern TEXT, scanned_commit_date TEXT,
+      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      PRIMARY KEY (run_id, organization COLLATE NOCASE, repository, branch))`);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible|collation/);
+  });
+
+  test("index: an ix_ruh_loc on a DIFFERENT table (global name squat) is rejected, not treated as repairable-absent", () => {
+    const path = nextFile();
+    buildNativeV4(path);
+    const f = new Database(path, { strict: true });
+    f.exec("DROP INDEX ix_ruh_loc");
+    f.exec("CREATE INDEX ix_ruh_loc ON runs(config_hash)"); // squat the schema-global index name
+    f.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+  });
+
+  test("CHECK tokenizer: comments as trivia (CHECK/* */( and status/* */IN, no surrounding spaces) still classify as ours", () => {
+    const path = nextFile();
+    forgeRuh(path, `CREATE TABLE run_unit_head (
+      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK/* g1 */(status/* g2 */IN ('scanned','skipped-cutoff','past-cap')),
+      is_default_branch INTEGER,
+      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+      policy_matched_pattern TEXT, scanned_commit_date TEXT,
+      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      PRIMARY KEY (run_id, organization, repository, branch))`); // no ix_ruh_loc -> ours-v4-missing-index -> repaired
+    const db = AuditDb.open({ sqlitePath: path }); // accepted (comments are trivia) + self-heals the index
+    db.close();
+  });
+
+  test("openReadOnly: an inbound FK to run_unit_head is rejected — consistent with the writer gate", () => {
+    const path = nextFile();
+    buildNativeV4(path); // ours-v4, stamp 4
+    const f = new Database(path, { strict: true });
+    f.exec("PRAGMA foreign_keys = OFF;");
+    f.exec("CREATE TABLE ext (id INTEGER PRIMARY KEY, ruh TEXT REFERENCES run_unit_head(run_id))");
+    f.close();
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/incompatible|foreign key into run_unit_head/);
   });
 });
