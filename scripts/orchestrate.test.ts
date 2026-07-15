@@ -1,14 +1,25 @@
 import { expect, test, describe, spyOn } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyBranchPlan, discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText } from "./orchestrate.ts";
+import { discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime } from "./orchestrate.ts";
+import { classifyBranchPlan } from "./branchPlanner.ts";
+import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type RepoInfo, type SpawnFn } from "./github.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import type { Config } from "./config.ts";
 import type { OrchestrateArgs } from "./args.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
+
+// Build the AuditRuntime bundle from a Config — the branch policy is compiled from the config's own
+// branch lists, so the default (`branches: null, excludeBranches: []`) is unrestricted and behaves
+// exactly as before this feature. Tests exercising policy pass a config with populated lists.
+const rt = (config: Config, configHash = "hash"): AuditRuntime => ({
+  config,
+  configHash,
+  branchPolicy: compileBranchPolicy(config.branches, config.excludeBranches),
+});
 
 // Scripted client factory — every test client shares this boilerplate (offline binPaths, noop
 // sleep, tempRoot under the test dir) and differs ONLY in its spawn script and cache role.
@@ -140,11 +151,11 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       paths: { sqlitePath: join(root, "never-created.db"), outputDir: root },
     };
 
-    const totals = await runPlan(client, config, "rvo");
+    const totals = await runPlan(client, rt(config), "rvo");
     expect(totals).toEqual({
       owners: ["org-a"], ownersSource: "configured",
       reposDiscovered: 1, reposKept: 1,
-      branchesEligible: 1, branchesSkippedByCutoff: 1, branchesPastCap: 0, discoveryErrors: 0,
+      branchesEligible: 1, branchesSkippedByCutoff: 1, branchesPastCap: 0, branchesExcludedByPolicy: 0, discoveryErrors: 0,
     });
     // the zero-write contract: no db file, no gitconfig, no pkg-audit-* dir — nothing at all
     expect(readdirSync(root)).toEqual([]);
@@ -175,7 +186,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
       excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
     };
-    const totals = await runPlan(client, config, "rvo");
+    const totals = await runPlan(client, rt(config), "rvo");
     expect(totals.discoveryErrors).toBe(1);
     expect(totals.branchesEligible).toBe(0);
     expect(readdirSync(root)).toEqual([]);
@@ -214,7 +225,7 @@ describe("runPlan cache-less client guard (§8 --plan zero-write)", () => {
     let spawns = 0;
     // WRONG client for plan mode: it would cache into the DB
     const client = makeClient(root, async () => { spawns++; return { exitCode: 1, stderr: "never reached", stdout: "" }; }, { db });
-    await expect(runPlan(client, testConfig(root), "rvo")).rejects.toThrow(/cache-less/);
+    await expect(runPlan(client, rt(testConfig(root)), "rvo")).rejects.toThrow(/cache-less/);
     expect(spawns).toBe(0); // the guard fires before owner resolution / any gh call
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -233,7 +244,7 @@ describe("processRepo discovery-failure observability (fail-soft, README log voc
     const repo: RepoInfo = { name: "svc", organization: "org-a", defaultBranch: "main", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
 
     const events = await captureJsonl(async () => {
-      await processRepo(db, client, testConfig(root), runId, "h", "org-a", repo, [], new Set());
+      await processRepo(db, client, rt(testConfig(root), "h"), runId, "org-a", repo, [], new Set());
     });
 
     const disc = events.find((e) => e["event"] === "discovery");
@@ -371,7 +382,7 @@ describe("introspection-failure observability (fail-soft, README log vocabulary)
     const runId = startRun(db);
     const now = nowIso();
     const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
-    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     // no lockfile + unresolved registry range → the §5.E range-resolution path needs the packument
     db.upsertDependencyFinding({
       runId, ...unit, dateFetched: now, packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
@@ -409,7 +420,7 @@ describe("introspection-failure observability (fail-soft, README log vocabulary)
     const runId = startRun(db);
     const now = nowIso();
     const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
-    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     // a RESOLVED version for a package no current config entry can supply a registry for
     db.upsertDependencyFinding({
       runId, ...unit, dateFetched: now, packageName: "rogue", dependencyKey: "rogue", dependencyType: "dependencies",
@@ -456,7 +467,7 @@ describe("runPlan org-level discovery failure (fail-soft continue)", () => {
 
     let totals: Awaited<ReturnType<typeof runPlan>> | undefined;
     const events = await captureJsonl(async () => {
-      totals = await runPlan(client, config, "rvo");
+      totals = await runPlan(client, rt(config), "rvo");
     });
 
     expect(totals?.discoveryErrors).toBe(1);
@@ -503,25 +514,28 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     const repo: RepoInfo = { name: "svc", organization: "org-a", defaultBranch: "main", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
 
     const events = await captureJsonl(async () => {
-      await processRepo(db, client, testConfig(root, 1), runId, "h", "org-a", repo, [], new Set());
+      await processRepo(db, client, rt(testConfig(root, 1), "h"), runId, "org-a", repo, [], new Set());
     });
 
-    // run_unit_head: stale → skipped-cutoff (empty sha), main+dev → scanned at their live
-    // heads with the REAL default-branch flag (1 for main, 0 otherwise); feat absent
+    // run_unit_head: stale → skipped-cutoff (empty sha), main+dev → scanned at their live heads with
+    // the REAL default-branch flag (1 for main, 0 otherwise), and feat → a NEW past-cap row (T6: a
+    // past-cap branch is now recorded for report visibility, though its work queue stays untouched).
     const headRows = db.read(`SELECT branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
     expect(headRows).toEqual([
       { branch: "dev", commit_sha: "o-dev", status: "scanned", is_default_branch: 0 },
+      { branch: "feat", commit_sha: "", status: "past-cap", is_default_branch: 0 },
       { branch: "main", commit_sha: "o-main", status: "scanned", is_default_branch: 1 },
       { branch: "stale", commit_sha: "", status: "skipped-cutoff", is_default_branch: 0 },
     ]);
-    // work-queue state: stale skipped, main+dev still done (reused), feat never enqueued (past cap)
+    // work-queue state: stale skipped, main+dev still done (reused), feat never enqueued (past-cap
+    // retains prior queue state so a later cap-order promotion can reuse a done scan).
     expect(db.getUnit(key("stale"))?.status).toBe("skipped");
     expect(db.getUnit(key("main"))?.status).toBe("done");
     expect(db.getUnit(key("dev"))?.status).toBe("done");
     expect(db.getUnit(key("feat"))).toBeNull();
-    // live JSONL: one skip-cutoff, two skip-current, nothing else unit-scoped
+    // live JSONL: one skip-cutoff, two skip-current, one past-cap, nothing else unit-scoped
     const actions = events.filter((e) => e["event"] === "unit").map((e) => `${e["branch"]}:${e["action"]}`).sort();
-    expect(actions).toEqual(["dev:skip-current", "main:skip-current", "stale:skip-cutoff"]);
+    expect(actions).toEqual(["dev:skip-current", "feat:past-cap", "main:skip-current", "stale:skip-cutoff"]);
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -548,7 +562,7 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     const repo: RepoInfo = { name: "svc", organization: "org-a", defaultBranch: "main", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
 
     await captureJsonl(async () => {
-      await processRepo(db, client, testConfig(root, 25), runId, "h", "org-a", repo, [], new Set());
+      await processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set());
     });
 
     const headRows = db.read(`SELECT branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
@@ -557,6 +571,180 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
       { branch: "main", commit_sha: "o-main", status: "scanned", is_default_branch: 1 },
     ]);
     db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
+  const graphqlHeads = (nodes: Array<{ name: string; oid: string; date: string }>): string =>
+    `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: { refs: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: `t-${n.name}` } } })),
+    } } } })}`;
+  // heads via GraphQL, an EMPTY tree via REST so a scanned unit runs the pipeline to zero findings.
+  const scanClient = (root: string, nodes: Array<{ name: string; oid: string; date: string }>): GithubClient =>
+    makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads(nodes) };
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: false, tree: [] })}` };
+    });
+  const repo: RepoInfo = { name: "svc", organization: "org-a", defaultBranch: "main", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+  const startScanRun = (db: AuditDb): string =>
+    db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" }).runId;
+  const headRowsOf = (db: AuditDb, runId: string) =>
+    db.read(`SELECT branch, status, commit_sha AS sha, is_default_branch AS d, policy_status AS ps, policy_matched_pattern AS pat, scanned_commit_date AS scd FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId);
+  const key = (branch: string): WorkUnitKey => ({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch });
+  const throwingGlob = (thrown: unknown): Bun.Glob => ({ match() { throw thrown; } }) as unknown as Bun.Glob;
+  const badGlobError = new Error("bad glob"); // the exact injected cause — used to prove identity on rethrow
+  const throwingPolicy = { include: null, exclude: [{ pattern: "boom*", glob: throwingGlob(badGlobError) }] };
+
+  test("a denied NON-default branch persists as skipped-cutoff + policy attribution, and is never scanned", async () => {
+    const root = mkdtempSync(join(tmpdir(), "policy-deny-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const config = { ...testConfig(root, 25), excludeBranches: ["dev"] };
+    const client = scanClient(root, [
+      { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
+      { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+    ]);
+    await captureJsonl(() => processRepo(db, client, rt(config, "h"), runId, "org-a", repo, [], new Set()));
+    expect(headRowsOf(db, runId)).toEqual([
+      { branch: "dev", status: "skipped-cutoff", sha: "", d: 0, ps: "excluded-by-deny", pat: "dev", scd: "2025-05-01T00:00:00Z" },
+      { branch: "main", status: "scanned", sha: "o-main", d: 1, ps: null, pat: null, scd: "2025-06-01T00:00:00Z" },
+    ]);
+    expect(db.getUnit(key("dev"))?.status).toBe("skipped"); // enqueued but never scanned
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a denied DEFAULT branch is STILL scanned but records the policy counterfactual (the override)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "policy-default-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const config = { ...testConfig(root, 25), excludeBranches: ["main"] }; // deny the DEFAULT branch
+    const client = scanClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }]);
+    await captureJsonl(() => processRepo(db, client, rt(config, "h"), runId, "org-a", repo, [], new Set()));
+    expect(headRowsOf(db, runId)).toEqual([
+      { branch: "main", status: "scanned", sha: "o-main", d: 1, ps: "excluded-by-deny", pat: "main", scd: "2025-06-01T00:00:00Z" },
+    ]);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("processRepo propagates a PolicyMatchError — NOT swallowed by the fail-soft discovery catch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "policy-throw-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const client = scanClient(root, [{ name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" }]);
+    const runtime: AuditRuntime = { config: testConfig(root, 25), configHash: "h", branchPolicy: throwingPolicy };
+    await expect(processRepo(db, client, runtime, runId, "org-a", repo, [], new Set())).rejects.toThrow(PolicyMatchError);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("runScan marks the run FAILED on a PolicyMatchError and rethrows the original", async () => {
+    const root = mkdtempSync(join(tmpdir(), "policy-failrun-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // packages:[] so discoverCliTerms is a no-op (no registry fetch); the planner throws mid-run.
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" }]) };
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy };
+    let thrown: unknown = null;
+    await captureJsonl(async () => {
+      thrown = await runScan(db, client, runtime, noArgs, null).then(() => null, (e: unknown) => e);
+    });
+    // the ORIGINAL error is rethrown UNCHANGED (not re-wrapped): a PolicyMatchError carrying the
+    // exact injected cause instance — object identity, not just the class.
+    expect(thrown).toBeInstanceOf(PolicyMatchError);
+    expect((thrown as { cause?: unknown }).cause).toBe(badGlobError);
+    const run = db.read("SELECT status FROM runs ORDER BY started_at DESC LIMIT 1").get() as { status: string };
+    expect(run.status).toBe("failed"); // the run boundary marked it failed before rethrowing
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("an allow-list MISS persists as excluded-by-allow with a NULL pattern", async () => {
+    const root = mkdtempSync(join(tmpdir(), "policy-allow-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const config = { ...testConfig(root, 25), branches: ["main"] }; // allowlist: only main (+ the default)
+    const client = scanClient(root, [
+      { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
+      { name: "feat", oid: "o-feat", date: "2025-05-01T00:00:00Z" }, // not allowlisted → excluded-by-allow
+    ]);
+    await captureJsonl(() => processRepo(db, client, rt(config, "h"), runId, "org-a", repo, [], new Set()));
+    expect(headRowsOf(db, runId)).toEqual([
+      { branch: "feat", status: "skipped-cutoff", sha: "", d: 0, ps: "excluded-by-allow", pat: null, scd: "2025-05-01T00:00:00Z" },
+      { branch: "main", status: "scanned", sha: "o-main", d: 1, ps: null, pat: null, scd: "2025-06-01T00:00:00Z" },
+    ]);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a past-cap branch keeps its prior 'done' work-queue state (reusable on a later cap-order promotion)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pastcap-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    db.enqueueUnit(key("feat"), runId); // a prior run scanned feat to done@o-feat
+    db.setUnitStatus(key("feat"), { status: "done", runId, lastCommitSha: "o-feat", lastCommitDate: "2025-04-01T00:00:00Z" });
+    const client = scanClient(root, [ // cap=1: main default-exempt, dev fills the slot, feat past-cap
+      { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
+      { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+      { name: "feat", oid: "o-feat", date: "2025-04-01T00:00:00Z" },
+    ]);
+    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 1), "h"), runId, "org-a", repo, [], new Set()));
+    expect(headRowsOf(db, runId).find((r) => (r as { branch: string }).branch === "feat")).toMatchObject({ status: "past-cap", sha: "", ps: null });
+    const featUnit = db.getUnit(key("feat")); // work queue UNTOUCHED — the prior done scan survives
+    expect(featUnit?.status).toBe("done");
+    expect(featUnit?.lastCommitSha).toBe("o-feat");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("clone-fallback with a MOVED branch: both run_unit_head AND work_queue pin the clone HEAD's sha+date (P0)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-move-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    // discovery: main@o-main dated 2025-06-01. The tree is TRUNCATED → clone fallback, and the clone
+    // HEAD has MOVED to o-moved dated 2025-06-15 (branch advanced between discovery and the clone).
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }]) };
+      if (args[0] === "clone") { const dest = args[args.length - 1]!; mkdirSync(dest, { recursive: true }); writeFileSync(join(dest, "package.json"), "{}"); return { exitCode: 0, stderr: "", stdout: "" }; }
+      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: "o-moved\n" };
+      if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: true, tree: [] })}` }; // REST tree → truncated
+    });
+    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    // the durable row pins the SCANNED (clone) commit + its OWN date — never the stale discovered date
+    expect(headRowsOf(db, runId)).toEqual([
+      { branch: "main", status: "scanned", sha: "o-moved", d: 1, ps: null, pat: null, scd: "2025-06-15T09:00:00+00:00" },
+    ]);
+    const unit = db.getUnit(key("main")); // the work-queue pair matches (the P0 fix: no stale date)
+    expect(unit?.lastCommitSha).toBe("o-moved");
+    expect(unit?.lastCommitDate).toBe("2025-06-15T09:00:00+00:00");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("runPlan uses the SAME shared planner — a denied branch counts as excludedByPolicy, not eligible", async () => {
+    const root = mkdtempSync(join(tmpdir(), "plan-policy-"));
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["dev"], packages: [] };
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([
+        { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
+        { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+      ]) };
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    let totals: Awaited<ReturnType<typeof runPlan>> | undefined;
+    await captureJsonl(async () => { totals = await runPlan(client, rt(config, "h"), "rvo"); });
+    expect(totals?.branchesEligible).toBe(1); // main only
+    expect(totals?.branchesExcludedByPolicy).toBe(1); // dev denied — NOT counted eligible or cutoff
+    expect(totals?.branchesSkippedByCutoff).toBe(0);
+    expect(totals?.branchesPastCap).toBe(0);
     rmSync(root, { recursive: true, force: true });
   });
 });
@@ -590,7 +778,7 @@ describe("planSummaryText", () => {
     const text = planSummaryText(config, {
       owners: ["org-a", "org-b"], ownersSource: "discovered",
       reposDiscovered: 42, reposKept: 37,
-      branchesEligible: 210, branchesSkippedByCutoff: 58, branchesPastCap: 12, discoveryErrors: 0,
+      branchesEligible: 210, branchesSkippedByCutoff: 58, branchesPastCap: 12, branchesExcludedByPolicy: 3, discoveryErrors: 0,
     });
     expect(text).toContain("PLAN — preview only");
     expect(text).toContain("no database opened");
@@ -641,7 +829,7 @@ const openRun = (): { db: AuditDb; runId: string } => {
 describe("processRepo throttle requeue (§4)", () => {
   test("ThrottleExhausted puts the unit back to PENDING with no permanent error row", async () => {
     const { db, runId } = openRun();
-    await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), config, runId, "hash", "o", repo, [], new Set());
+    await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), rt(config, "hash"), runId, "o", repo, [], new Set());
     expect(db.getUnit(KEY)?.status).toBe("pending"); // a later run retries it
     const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all();
     expect(errs.length).toBe(0);
@@ -650,7 +838,7 @@ describe("processRepo throttle requeue (§4)", () => {
 
   test("a GithubApiError still lands as a permanent ERROR with an errors row", async () => {
     const { db, runId } = openRun();
-    await processRepo(db, fakeClient(new GithubApiError("boom", { endpoint: "x" })), config, runId, "hash", "o", repo, [], new Set());
+    await processRepo(db, fakeClient(new GithubApiError("boom", { endpoint: "x" })), rt(config, "hash"), runId, "o", repo, [], new Set());
     expect(db.getUnit(KEY)?.status).toBe("error");
     const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all() as Array<{ message: string }>;
     expect(errs.length).toBe(1);
@@ -674,7 +862,7 @@ describe("processRepo throttle requeue (§4)", () => {
       fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
       fetchFileRaw: async () => { throw new ThrottleExhausted("core bucket"); },
     } as unknown as GithubClient;
-    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    await processRepo(db, client, rt(scanConfig, "hash"), runId, "o", repo, [], new Set());
     expect(db.getUnit(KEY)?.status).toBe("pending"); // requeued: a later run re-reads the head
     expect(db.read("SELECT message FROM errors").all().length).toBe(0);
     db.close();
@@ -696,7 +884,7 @@ describe("processRepo throttle requeue (§4)", () => {
       fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
       fetchFileRaw: async () => { throw new GithubApiError("HTTP 403 (permission/forbidden) (repos/o/r/contents/package.json)", { status: 403 }); },
     } as unknown as GithubClient;
-    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    await processRepo(db, client, rt(scanConfig, "hash"), runId, "o", repo, [], new Set());
     expect(db.getUnit(KEY)?.status).toBe("error");
     const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all() as Array<{ message: string }>;
     expect(errs.length).toBe(1);
@@ -719,7 +907,7 @@ describe("processRepo throttle requeue (§4)", () => {
       fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
       fetchFileRaw: async () => { throw new GithubApiError("gh api produced no HTTP response: spawn timed out", { status: 0 }); },
     } as unknown as GithubClient;
-    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    await processRepo(db, client, rt(scanConfig, "hash"), runId, "o", repo, [], new Set());
     expect(db.getUnit(KEY)?.status).toBe("error");
     expect(db.read("SELECT message FROM errors WHERE scope='scan'").all().length).toBe(1);
     db.close();
@@ -740,7 +928,7 @@ describe("processRepo throttle requeue (§4)", () => {
       fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
       fetchFileRaw: async () => { throw new GithubApiError("HTTP 404 (repos/o/r/contents/package.json)", { status: 404 }); },
     } as unknown as GithubClient;
-    await processRepo(db, client, scanConfig, runId, "hash", "o", repo, [], new Set());
+    await processRepo(db, client, rt(scanConfig, "hash"), runId, "o", repo, [], new Set());
     expect(db.getUnit(KEY)?.status).toBe("done");
     expect(db.read("SELECT message FROM errors").all().length).toBe(0);
     db.close();
@@ -754,7 +942,7 @@ describe("processRepo branch-discovery throttle (§4, site c)", () => {
 
   test("ThrottleExhausted is transient — no permanent discovery errors row", async () => {
     const { db, runId } = openRun();
-    await processRepo(db, branchDiscoveryFails(new ThrottleExhausted("graphql bucket")), config, runId, "hash", "o", repo, [], new Set());
+    await processRepo(db, branchDiscoveryFails(new ThrottleExhausted("graphql bucket")), rt(config, "hash"), runId, "o", repo, [], new Set());
     const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all();
     expect(errs.length).toBe(0); // re-discovered next run, not a hard failure
     db.close();
@@ -762,7 +950,7 @@ describe("processRepo branch-discovery throttle (§4, site c)", () => {
 
   test("a GithubApiError still records a permanent discovery errors row", async () => {
     const { db, runId } = openRun();
-    await processRepo(db, branchDiscoveryFails(new GithubApiError("branch boom", { endpoint: "x" })), config, runId, "hash", "o", repo, [], new Set());
+    await processRepo(db, branchDiscoveryFails(new GithubApiError("branch boom", { endpoint: "x" })), rt(config, "hash"), runId, "o", repo, [], new Set());
     const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all() as Array<{ message: string }>;
     expect(errs.length).toBe(1);
     expect(errs[0]!.message).toMatch(/branch discovery failed.*branch boom/);
@@ -776,7 +964,7 @@ describe("processOwner repo-discovery throttle (§4, site b)", () => {
 
   test("ThrottleExhausted is transient — no permanent discovery errors row", async () => {
     const { db, runId } = openRun();
-    await processOwner(db, repoDiscoveryFails(new ThrottleExhausted("core bucket")), config, runId, "hash", "o", null, [], new Set());
+    await processOwner(db, repoDiscoveryFails(new ThrottleExhausted("core bucket")), rt(config, "hash"), runId, "o", null, [], new Set());
     const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all();
     expect(errs.length).toBe(0);
     db.close();
@@ -784,7 +972,7 @@ describe("processOwner repo-discovery throttle (§4, site b)", () => {
 
   test("a GithubApiError still records a permanent discovery errors row", async () => {
     const { db, runId } = openRun();
-    await processOwner(db, repoDiscoveryFails(new GithubApiError("repo boom", { endpoint: "x" })), config, runId, "hash", "o", null, [], new Set());
+    await processOwner(db, repoDiscoveryFails(new GithubApiError("repo boom", { endpoint: "x" })), rt(config, "hash"), runId, "o", null, [], new Set());
     const errs = db.read("SELECT message FROM errors WHERE scope='discovery'").all() as Array<{ message: string }>;
     expect(errs.length).toBe(1);
     expect(errs[0]!.message).toMatch(/repo discovery failed.*repo boom/);
@@ -830,7 +1018,7 @@ describe("runScan owner-discovery throttle (§4, site a — consumer wiring)", (
       sweepStaleTempDirs: () => [],
       listOrgMemberships: async () => { throw new ThrottleExhausted("core bucket"); },
     } as unknown as GithubClient;
-    await runScan(db, client, config, "hash", noArgs, null); // must not throw
+    await runScan(db, client, rt(config, "hash"), noArgs, null); // must not throw
     const runs = db.read("SELECT COUNT(*) AS n FROM runs").get() as { n: number };
     expect(runs.n).toBe(0); // startRun was never reached — no run, no report
     db.close();

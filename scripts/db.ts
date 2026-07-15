@@ -230,11 +230,12 @@ export interface RunUnitHeadInput {
   // stale values in every direction. Invariants enforced by assertRunUnitHeadInvariants.
   policyStatus: PolicyStatus | null; // null = no exclusion (the branch is policy-eligible)
   policyMatchedPattern: string | null; // non-empty ONLY when policyStatus === 'excluded-by-deny'
-  // The commit date (GitHub committedDate / cutoff_date family — second-precision ISO, stored RAW,
-  // NOT the nowIso millisecond form). scanned → the scanned commit's date; non-scanned → the
-  // discovered head date. Nullable in T5 only for the clone-fallback boundary where the scanned
-  // commit's date is not yet captured; a real date always accompanies the API-path scan.
-  scannedCommitDate: string | null;
+  // The commit date (GitHub committedDate / cutoff_date family — ISO with a UTC offset, stored RAW,
+  // NOT the nowIso millisecond form). scanned → the ACTUALLY-scanned commit's date (the clone HEAD's
+  // own date under the clone fallback); non-scanned → the discovered head date. REQUIRED non-null:
+  // every fresh upsert has a real date (the DB column stays nullable only for pre-v4 migrated rows,
+  // which the migration writes directly, never through this input). A runtime guard rejects ''/null.
+  scannedCommitDate: string;
 }
 
 export interface ApiCacheEntry {
@@ -1345,11 +1346,15 @@ export interface AuditDbReader {
 // Write-boundary invariants for run_unit_head (branch allow/deny §3 row mapping). The DB CHECKs are
 // necessary but NOT sufficient (e.g. the deny CHECK admits policy_matched_pattern=''); these guards
 // run at the single write chokepoint (upsertRunUnitHead), so no row that violates the §3 mapping is
-// ever persisted regardless of caller. All fail-fast. NOTE: T5 does NOT require a non-null
-// scanned_commit_date — the clone-fallback scan legitimately writes null until T6 captures the
-// scanned commit's own date.
+// ever persisted regardless of caller. All fail-fast. scanned_commit_date is REQUIRED non-null on
+// every fresh upsert (the clone fallback captures the clone HEAD's own date) — only pre-v4 migrated
+// rows carry NULL, and those are written directly by the migration, never through this input.
 function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   const where = `${h.organization}/${h.repository}@${h.branch}`;
+  // scanned_commit_date is REQUIRED on every fresh upsert (§4): the type enforces non-null, and this
+  // also rejects '' / a JS caller that bypassed the type — an empty date would poison the durable
+  // provenance and is indistinguishable from "unknown".
+  if (!h.scannedCommitDate) fail(`run_unit_head ${where}: a non-empty scanned_commit_date is required`);
   // Policy pattern (§2a / §3): a deny row MUST name a real, NON-EMPTY causing pattern (the deny CHECK
   // only enforces IS NOT NULL, and '' passes it). Every non-deny disposition carries NO pattern.
   if (h.policyStatus === "excluded-by-deny") {

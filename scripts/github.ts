@@ -1202,7 +1202,7 @@ export class GithubClient {
     return dir;
   }
 
-  async cloneShallow(org: string, repo: string, branch: string): Promise<{ dir: string; headSha: string }> {
+  async cloneShallow(org: string, repo: string, branch: string): Promise<{ dir: string; headSha: string; headCommittedDate: string }> {
     const runDir = this.makeRunTempDir();
     const dest = join(runDir, "clone");
     assertContained(dest, [this.tempRoot]); // §0: clone dest containment BEFORE spawning
@@ -1219,7 +1219,20 @@ export class GithubClient {
       const rev = await this.git(["rev-parse", "HEAD"], dest);
       if (rev.exitCode !== 0)
         throw new GithubApiError(`git rev-parse HEAD failed in ${dest}: ${rev.stderr.trim().slice(0, 300)}`, { endpoint: url });
-      return { dir: dest, headSha: rev.stdout.trim() };
+      // §4 (branch allow/deny): the ACTUAL scanned commit's date. The clone HEAD may be AHEAD of the
+      // GraphQL-discovered head (the branch moved between discovery and clone), so its date must be
+      // read from the clone — not reused from discovery. This exact argv is the ONLY `show` form
+      // readOnlyGuard permits (--no-patch/--no-notes/--no-show-signature suppress diff/notes/GPG; %cI
+      // is the strict-ISO committer date). A capture failure reclaims the tree via the catch below.
+      const dateRes = await this.git(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"], dest);
+      if (dateRes.exitCode !== 0)
+        throw new GithubApiError(`git show HEAD committer date failed in ${dest}: ${dateRes.stderr.trim().slice(0, 300)}`, { endpoint: url });
+      const headCommittedDate = dateRes.stdout.trim();
+      // Exactly one strict-ISO line, offset preserved verbatim (NOT normalized to Z/ms — this joins
+      // the committedDate/cutoff_date family). A garbled read would poison the durable scanned_commit_date.
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/.test(headCommittedDate))
+        throw new GithubApiError(`git show HEAD returned a non-ISO committer date in ${dest}: ${JSON.stringify(headCommittedDate.slice(0, 80))}`, { endpoint: url });
+      return { dir: dest, headSha: rev.stdout.trim(), headCommittedDate };
     } catch (e) {
       // a failed/timed-out clone can leave a multi-GB partial tree — reclaim it NOW rather
       // than at the next run's startup sweep (the caller only cleans up on success). The

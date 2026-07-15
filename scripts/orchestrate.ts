@@ -12,6 +12,8 @@ import { join, dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchHead } from "./github.ts";
+import { planRepoBranches, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
+import { PolicyMatchError, type CompiledBranchPolicy } from "./branchPolicy.ts";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseArgs, ORCHESTRATE_HELP, ORCHESTRATE_USAGE, type OrchestrateArgs } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -24,6 +26,15 @@ import { introspectVersion, fetchPackument, resolveRangeToVersion, type Packumen
 import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
 import { logLine } from "./log.ts";
+
+// The three values that TOGETHER define one coherent scan/plan: the config, its hash, and the
+// compiled branch policy. Threaded as ONE object through runScan/processOwner/processRepo/runPlan so
+// the policy can never be dropped or mismatched against its config (branch allow/deny §12).
+export interface AuditRuntime {
+  readonly config: Config;
+  readonly configHash: string;
+  readonly branchPolicy: CompiledBranchPolicy;
+}
 
 // ---- per-unit read helpers ------------------------------------------------------------------
 // API reader: SHA-pinned raw fetch (≤100MB) for blob entries. Non-blobs (submodule/symlink)
@@ -99,7 +110,8 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     process.stdout.write(ORCHESTRATE_HELP + "\n");
     return;
   }
-  const { config, configHash } = await loadConfig(argv);
+  const { config, configHash, branchPolicy } = await loadConfig(argv);
+  const runtime: AuditRuntime = { config, configHash, branchPolicy };
   const trackedNames = config.packages.map((p) => p.name);
 
   logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
@@ -114,7 +126,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
   if (args.plan) {
     const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories });
-    await runPlan(planClient, config, preflight.githubLogin);
+    await runPlan(planClient, runtime, preflight.githubLogin);
     return;
   }
 
@@ -124,7 +136,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories });
 
   try {
-    await runScan(db, client, config, configHash, args, preflight.githubLogin);
+    await runScan(db, client, runtime, args, preflight.githubLogin);
   } finally {
     db.close();
   }
@@ -152,9 +164,10 @@ export function runSummaryText(runId: string, s: ReportSummary, errorCount: numb
 // EXPORTED for tests: the site-(a) owner-discovery throttle contract — end cleanly WITHOUT
 // starting a run — is pinned here (a run started on throttle would leave a phantom run row).
 export async function runScan(
-  db: AuditDb, client: GithubClient, config: Config, configHash: string,
+  db: AuditDb, client: GithubClient, runtime: AuditRuntime,
   args: OrchestrateArgs, personalLogin: string | null,
 ): Promise<void> {
+  const { config, configHash } = runtime;
   // §0 startup: sweep stale temp dirs from a prior crash.
   client.sweepStaleTempDirs();
 
@@ -196,9 +209,17 @@ export async function runScan(
   const cliTermSets = await discoverCliTerms(db, client, config, runId);
   logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
 
-  // §5.A/§5.B discover + process, deterministically.
-  for (const owner of owners) {
-    await processOwner(db, client, config, runId, configHash, owner, personalLogin, cliTermSets, nonRegistrySkipSeen);
+  // §5.A/§5.B discover + process, deterministically. A PolicyMatchError (a malformed branch glob,
+  // fail-closed at match time) is a GLOBAL config defect — never a per-repo soft error — so it
+  // ABORTS the whole run: mark the run failed (excluded from latest selection) and rethrow the
+  // ORIGINAL operator-facing error unchanged (it is registered in KNOWN_OPERATOR_ERRORS).
+  try {
+    for (const owner of owners) {
+      await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen);
+    }
+  } catch (e) {
+    if (e instanceof PolicyMatchError) db.failRun(runId);
+    throw e;
   }
 
   // §5.E introspection reconciliation over the run's reportable slice.
@@ -250,49 +271,20 @@ export async function resolveOwnersWithDiscovery(
   }
 }
 
-// §5.B classification, pure: heads arrive sorted committedDate DESC. The repo's DEFAULT branch
-// (matched by name; known from §5.A discovery) is ALWAYS eligible — exempt from BOTH the cutoff
-// filter and the cap — so the default-branch view the report's headline metrics depend on is
-// never silently absent (CV2: a dormant default behind active feature branches, or one past the
-// cap, must still be scanned). Every OTHER still-live branch before cutoffDate is
-// `cutoffSkipped` (regardless of the cap); the after-cutoff survivors are `eligible` up to
-// maxBranchesPerRepo (the cap counts NON-default branches only, so a repo can yield cap+1
-// eligible units); older survivors past the cap are `pastCap` (they retain prior state and are
-// not surfaced this run). Order within each group preserves the input order. A defaultBranch
-// not among the live heads admits nothing — heads are never synthesized.
-export interface BranchPlan {
-  readonly cutoffSkipped: readonly BranchHead[];
-  readonly eligible: readonly BranchHead[];
-  readonly pastCap: readonly BranchHead[];
-}
-export function classifyBranchPlan(
-  heads: BranchHead[], cutoffDate: string, maxBranchesPerRepo: number, defaultBranch: string,
-): BranchPlan {
-  const cutoffSkipped: BranchHead[] = [];
-  const eligible: BranchHead[] = [];
-  const pastCap: BranchHead[] = [];
-  let nonDefaultEligible = 0;
-  for (const h of heads) {
-    if (h.name === defaultBranch) eligible.push(h);
-    else if (h.committedDate.slice(0, 10) < cutoffDate) cutoffSkipped.push(h);
-    else if (nonDefaultEligible < maxBranchesPerRepo) {
-      eligible.push(h);
-      nonDefaultEligible++;
-    } else pastCap.push(h);
-  }
-  return { cutoffSkipped, eligible, pastCap };
-}
+// Branch classification (policy → cutoff/cap) lives in ./branchPlanner.ts (the ONE shared planner
+// used by BOTH processRepo and runPlan, so their dispositions/counts can never diverge). Repo
+// discovery stays here.
 
 // Discover ONE owner's repos and process each (§5.A). EXPORTED for tests: the repo-discovery
 // throttle policy (inside discoverOwnerRepos) must stay pinned at this call boundary.
 export async function processOwner(
-  db: AuditDb, client: GithubClient, config: Config, runId: string, configHash: string,
+  db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, personalLogin: string | null, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
 ): Promise<void> {
-  const isPersonal = config.includePersonalNamespace && owner === personalLogin;
-  const kept = await discoverOwnerRepos(db, client, config, runId, owner, isPersonal);
+  const isPersonal = runtime.config.includePersonalNamespace && owner === personalLogin;
+  const kept = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
   for (const repo of kept) {
-    await processRepo(db, client, config, runId, configHash, owner, repo, cliTermSets, nonRegistrySkipSeen);
+    await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen);
   }
 }
 
@@ -330,9 +322,10 @@ export async function discoverOwnerRepos(
 // Exported for the wiring tests (scripted client + real in-memory DB) — the throttle-requeue
 // policy in the catches below must stay pinned; processOwner is its only runtime caller.
 export async function processRepo(
-  db: AuditDb, client: GithubClient, config: Config, runId: string, configHash: string,
+  db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
 ): Promise<void> {
+  const { config, configHash, branchPolicy } = runtime;
   let heads: BranchHead[];
   try {
     heads = await client.listBranchHeads(repo.organization, repo.name);
@@ -348,26 +341,61 @@ export async function processRepo(
     logLine({ event: "discovery", org: repo.organization, repo: repo.name, error: message });
     return;
   }
-  const plan = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
-  // Discovery KNOWS the default branch (§5.A), so every head row this run writes carries a
-  // definite true/false — NULL is reserved for pre-v3 rows where nothing ever recorded it.
-  const isDefault = (h: BranchHead): boolean => h.name === repo.defaultBranch;
-  for (const h of plan.cutoffSkipped) {
-    const key: WorkUnitKey = { configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch: h.name };
+  // Classify the WHOLE repo up-front (policy → cutoff/cap) via the ONE shared planner. This runs
+  // OUTSIDE the discovery catch and BEFORE any per-branch write, so a malformed-glob PolicyMatchError
+  // aborts before this repo is half-classified (runScan then fails the run and rethrows).
+  const plan = planRepoBranches(heads, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
+  // Discovery KNOWS the default branch (§5.A), so every head row this run writes carries a definite
+  // true/false — NULL is reserved for pre-v3 rows where nothing ever recorded it.
+  const keyFor = (branch: string): WorkUnitKey => ({ configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch });
+
+  // Policy-excluded (non-default, denied/allow-missed): a NEW skipped-cutoff row carrying the policy
+  // counterfactual, disambiguated in run_unit_head by policy_status. Treated like a cutoff skip for
+  // the work queue (enqueue + 'skipped'). commit_sha='' (never scanned); date = discovered head date.
+  for (const d of plan.policyExcluded) {
+    const h = d.head;
+    const key = keyFor(h.name);
+    const attr = policyAttribution(d.rawPolicyResult);
     db.enqueueUnit(key, runId);
     db.setUnitStatus(key, { status: "skipped", runId, lastCommitSha: "", lastCommitDate: h.committedDate });
-    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: isDefault(h), policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
+    logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-policy", policyStatus: attr.policyStatus });
+  }
+
+  // Cutoff-skipped (policy-eligible, before cutoff): policy null (an eligible non-default branch is
+  // by construction no-exclusion; the default is never cutoff-skipped).
+  for (const d of plan.cutoffSkipped) {
+    const h = d.head;
+    const key = keyFor(h.name);
+    db.enqueueUnit(key, runId);
+    db.setUnitStatus(key, { status: "skipped", runId, lastCommitSha: "", lastCommitDate: h.committedDate });
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: d.isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-cutoff" });
   }
-  // plan.pastCap: after-cutoff past the cap → retain prior state, not surfaced this run.
-  for (const h of plan.eligible) {
-    const key: WorkUnitKey = { configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch: h.name };
+
+  // Past-cap (policy-eligible, after cutoff, past the cap): record ONLY a run_unit_head row for report
+  // visibility — do NOT enqueue or touch the work queue, so a prior 'done' scan survives and a later
+  // run can promote this branch (cap-order shift) without a re-scan.
+  for (const d of plan.pastCap) {
+    const h = d.head;
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "past-cap", isDefaultBranch: d.isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
+    logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "past-cap" });
+  }
+
+  // To-scan (default + within-cap after-cutoff). Only the DEFAULT may carry a policy counterfactual
+  // (the override); a non-default to-scan branch is necessarily no-exclusion (asserted, fail-closed).
+  for (const d of plan.toScan) {
+    const h = d.head;
+    if (!d.isDefaultBranch && d.rawPolicyResult.kind !== "no-exclusion")
+      throw new Error(`internal: non-default scanned branch ${repo.organization}/${repo.name}@${h.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
+    const key = keyFor(h.name);
+    const attr = policyAttribution(d.rawPolicyResult); // (null, null) unless the default-branch override
     db.enqueueUnit(key, runId);
     const unit = db.getUnit(key);
-    // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is
-    // reused (skip-as-current) — still upsert run_unit_head for THIS run so the report includes it.
+    // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is reused
+    // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate.
     if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
-      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: isDefault(h), policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
+      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
       db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
       logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
       continue;
@@ -375,8 +403,8 @@ export async function processRepo(
 
     db.setUnitStatus(key, { status: "in_progress", runId });
     try {
-      const scannedCommit = await processUnit(db, client, config, runId, repo, h, cliTermSets, nonRegistrySkipSeen);
-      db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scannedCommit, lastCommitDate: h.committedDate, errorMessage: null });
+      const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
+      db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
     } catch (e) {
       if (e instanceof ThrottleExhausted) {
         // §4: throttle exhaustion is NOT a permanent unit failure — put the unit back to
@@ -397,20 +425,24 @@ export async function processRepo(
 // and WRITE every finding + the run_unit_head snapshot (single-writer).
 async function processUnit(
   db: AuditDb, client: GithubClient, config: Config, runId: string,
-  repo: RepoInfo, h: BranchHead, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-): Promise<string> {
+  repo: RepoInfo, decision: BranchDecision, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+): Promise<{ commitSha: string; committedDate: string }> {
+  const h = decision.head;
   const tree = await client.fetchTreeRecursive(repo.organization, repo.name, h.treeOid);
   let entries: TreeEntry[];
   let readFile: (path: string, entry: TreeEntry) => Promise<string | null>;
   let cloneDir: string | null = null;
-  // The ACTUAL scanned commit: the discovery head (h.oid) for the API path, or the clone's real
-  // HEAD for the fallback (the branch may have moved between GraphQL discovery and the clone; all
-  // findings/permalinks/run_unit_head must pin to what was truly scanned, §5.C).
+  // The ACTUAL scanned commit + its date: the discovery head (h.oid / h.committedDate) for the API
+  // path, or the clone's real HEAD for the fallback (the branch may have moved between GraphQL
+  // discovery and the clone; all findings/permalinks/run_unit_head AND the persisted
+  // scanned_commit_date must pin to what was truly scanned, §5.C/§4).
   let commitSha = h.oid;
+  let committedDate = h.committedDate;
   if (tree.truncated) {
     const cloned = await client.cloneShallow(repo.organization, repo.name, h.name);
     cloneDir = cloned.dir;
     commitSha = cloned.headSha;
+    committedDate = cloned.headCommittedDate;
     entries = walkClone(cloned.dir);
     readFile = cloneReader(cloned.dir);
   } else {
@@ -455,20 +487,20 @@ async function processUnit(
       db.insertError({ runId, scope: "introspection", packageName: s.packageName, version: s.rawSpec, message: skipMessage });
       logLine({ event: "introspection", packageName: s.packageName, version: s.rawSpec, error: skipMessage });
     }
-    // policy fields are wired in T6 (compute the BranchDecision + thread the compiled policy).
-    // scanned_commit_date: on the API path the scanned SHA is h.oid, so h.committedDate is its date.
-    // Under clone fallback the branch may have MOVED (loc.commitSha !== h.oid) and the scanned
-    // commit's own date is not captured yet — write null (honest "unknown") rather than a WRONG
-    // date; T6 captures the clone HEAD's commit date and tightens this to non-null.
+    // Scanned snapshot with policy attribution (§3): only the DEFAULT branch may carry a policy
+    // counterfactual (the override) — a non-default to-scan branch is no-exclusion, so map() yields
+    // (null, null). scanned_commit_date is the ACTUAL scanned commit's date (the clone HEAD's own
+    // date under fallback, never the possibly-stale discovered date).
+    const attr = policyAttribution(decision.rawPolicyResult);
     db.upsertRunUnitHead({
       runId, organization: loc.organization, repository: loc.repository, branch: loc.branch,
-      commitSha: loc.commitSha, status: "scanned", isDefaultBranch: h.name === repo.defaultBranch,
-      policyStatus: null, policyMatchedPattern: null,
-      scannedCommitDate: loc.commitSha === h.oid ? h.committedDate : null,
+      commitSha: loc.commitSha, status: "scanned", isDefaultBranch: decision.isDefaultBranch,
+      policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern,
+      scannedCommitDate: committedDate,
     });
 
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: commitSha, action: "scanned", deps: result.dependencyFindings.length, usage: result.usageFindings.length, cli: result.cliFindings.length });
-    return commitSha;
+    return { commitSha, committedDate };
   } finally {
     if (cloneDir !== null) {
       // the clone lives under a run temp dir (pkg-audit-*/clone) — remove that temp dir, but
@@ -640,16 +672,18 @@ export interface PlanTotals {
   readonly branchesEligible: number;
   readonly branchesSkippedByCutoff: number;
   readonly branchesPastCap: number;
+  readonly branchesExcludedByPolicy: number;
   readonly discoveryErrors: number;
 }
-export async function runPlan(client: GithubClient, config: Config, personalLogin: string): Promise<PlanTotals> {
+export async function runPlan(client: GithubClient, runtime: AuditRuntime, personalLogin: string): Promise<PlanTotals> {
+  const { config, branchPolicy } = runtime;
   // The zero-write contract is enforced, not assumed: a caching client would write api_cache rows
   // into the DB during discovery. This is an internal contract violation (a bug, not an operator
   // error), so a plain Error with a stack is the right rendering.
   if (client.cachesToDb) throw new Error("runPlan requires a cache-less client (db: null) — plan mode must not write api_cache");
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 
-  let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, discoveryErrors = 0;
+  let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, branchesExcludedByPolicy = 0, discoveryErrors = 0;
   for (const owner of owners) {
     const isPersonal = config.includePersonalNamespace && owner === personalLogin;
     let repos: RepoInfo[];
@@ -674,18 +708,23 @@ export async function runPlan(client: GithubClient, config: Config, personalLogi
         logLine({ event: "plan", org: repo.organization, repo: repo.name, error: `branch discovery failed: ${(e as Error).message}` });
         continue;
       }
-      const p = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
-      branchesEligible += p.eligible.length;
+      // The SAME shared planner the real run uses, so --plan and the run can never disagree (§5).
+      // branchesEligible counts toScan (default + within-cap after-cutoff); policy-excluded is its own
+      // disjoint bucket. A malformed-glob PolicyMatchError propagates FATAL (no DB to mark; main exits 1).
+      const p = planRepoBranches(heads, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
+      branchesEligible += p.toScan.length;
       branchesSkippedByCutoff += p.cutoffSkipped.length;
       branchesPastCap += p.pastCap.length;
+      branchesExcludedByPolicy += p.policyExcluded.length;
       logLine({
         event: "plan", org: repo.organization, repo: repo.name,
-        branchesEligible: p.eligible.length, branchesSkippedByCutoff: p.cutoffSkipped.length, branchesPastCap: p.pastCap.length,
+        branchesEligible: p.toScan.length, branchesSkippedByCutoff: p.cutoffSkipped.length,
+        branchesPastCap: p.pastCap.length, branchesExcludedByPolicy: p.policyExcluded.length,
       });
     }
   }
 
-  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, discoveryErrors };
+  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, discoveryErrors };
   logLine({ event: "plan-summary", ...totals });
   process.stderr.write(planSummaryText(config, totals));
   return totals;
@@ -701,7 +740,7 @@ export function planSummaryText(config: Pick<Config, "cutoffDate" | "maxBranches
     `  Owners (${t.ownersSource}):  ${t.owners.join(", ")}`,
     `  Repos:                ${t.reposDiscovered} discovered, ${t.reposKept} kept after archive/fork filters and caps`,
     `  Branches:             ${t.branchesEligible} eligible to scan (a real run may skip already-current ones)`,
-    `                        ${t.branchesSkippedByCutoff} skipped by cutoff (< ${config.cutoffDate}) · ${t.branchesPastCap} past the per-repo cap (${config.maxBranchesPerRepo})`,
+    `                        ${t.branchesSkippedByCutoff} skipped by cutoff (< ${config.cutoffDate}) · ${t.branchesPastCap} past the per-repo cap (${config.maxBranchesPerRepo}) · ${t.branchesExcludedByPolicy} excluded by branch policy`,
     `  Packages tracked:     ${config.packages.map((p) => p.name).join(", ")}`,
     `  Discovery errors:     ${t.discoveryErrors}`,
     `  Next:                 bun run audit   (narrow scope first via "organizations" in the config if this is broader than intended)`,

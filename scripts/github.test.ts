@@ -844,6 +844,20 @@ describe("cloneShallow temp-dir cleanup on failure", () => {
     expect(cloneRunDirs(root)).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
+  test("a clone whose date-capture (show) fails also cleans up", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
+    const { client } = makeClient([ok(""), ok("abc123def\n"), err("", "fatal: bad object", 128)], { tempRoot: root });
+    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/committer date failed/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("a non-ISO committer date is rejected and cleans up (a garbled read must not poison provenance)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
+    const { client } = makeClient([ok(""), ok("abc123def\n"), ok("not-a-date\n")], { tempRoot: root });
+    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/non-ISO committer date/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
 
   test("a cleanup failure never masks the original clone error", async () => {
     // rmSync's force only suppresses ENOENT — an EACCES/EBUSY from the cleanup walk must not
@@ -1156,13 +1170,15 @@ describe("listBranchHeads (§5.B)", () => {
 });
 
 describe("hardened clone (§0/§5.C)", () => {
-  test("emits exactly the hardened argv, pins git config, and records the fetched SHA", async () => {
+  test("emits exactly the hardened argv, pins git config, and records the fetched SHA + committer date", async () => {
     const { client, calls } = makeClient([
       ok(""), // clone
       ok("abc123def\n"), // rev-parse HEAD
+      ok("2025-06-01T12:34:56+00:00\n"), // show --format=%cI HEAD (the scanned commit's date)
     ]);
-    const { dir, headSha } = await client.cloneShallow("org-a", "repo-b", "release/1.x");
+    const { dir, headSha, headCommittedDate } = await client.cloneShallow("org-a", "repo-b", "release/1.x");
     expect(headSha).toBe("abc123def");
+    expect(headCommittedDate).toBe("2025-06-01T12:34:56+00:00"); // strict-ISO, offset preserved verbatim
     expect(dir.startsWith(TEST_TMP)).toBe(true);
     // a SUCCESSFUL clone must keep its run dir (the failure-only cleanup must not be a finally):
     // downstream walkClone/cloneReader read this dir, so deleting it would silently zero findings.
@@ -1187,6 +1203,11 @@ describe("hardened clone (§0/§5.C)", () => {
     const rev = calls[1]!;
     expect(rev.args).toEqual(["rev-parse", "HEAD"]);
     expect(rev.opts.cwd).toBe(dir); // §0: git itself may run with cwd inside the clone
+
+    const showDate = calls[2]!;
+    // the EXACT commit-date tuple readOnlyGuard permits — cwd inside the clone, no argv -C
+    expect(showDate.args).toEqual(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"]);
+    expect(showDate.opts.cwd).toBe(dir);
   });
   test("clone failure surfaces stderr as a GithubApiError", async () => {
     const { client } = makeClient([err("", "fatal: repository not found")]);

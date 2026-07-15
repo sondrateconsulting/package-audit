@@ -1862,8 +1862,8 @@ describe("errors + run_unit_head", () => {
   test("run_unit_head upserts per (run, unit); skipped-cutoff carries commit_sha=''", () => {
     const db = mem();
     rawRun(db, "r1", "running");
-    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
-    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "sha2", status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "sha2", status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const rows = raw(db).query("SELECT commit_sha, status FROM run_unit_head").all() as Array<Record<string, unknown>>;
     expect(rows.length).toBe(1);
     expect(rows[0]!["commit_sha"]).toBe("sha2");
@@ -2430,9 +2430,9 @@ describe("upsertRunUnitHead — is_default_branch tri-state", () => {
     const db = mem();
     rawRun(db, "r1", "running");
     const base = { runId: "r1", organization: "o", repository: "r", commitSha: "s", status: "scanned" as const };
-    db.upsertRunUnitHead({ ...base, branch: "main", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
-    db.upsertRunUnitHead({ ...base, branch: "dev", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
-    db.upsertRunUnitHead({ ...base, branch: "old", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ ...base, branch: "main", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    db.upsertRunUnitHead({ ...base, branch: "dev", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    db.upsertRunUnitHead({ ...base, branch: "old", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const flags = raw(db)
       .query("SELECT branch, is_default_branch AS f FROM run_unit_head ORDER BY branch")
       .all() as Array<{ branch: string; f: unknown }>;
@@ -2442,7 +2442,7 @@ describe("upsertRunUnitHead — is_default_branch tri-state", () => {
       { branch: "old", f: null },
     ]);
     // conflict path: a later upsert of the SAME unit updates the flag (e.g. default moved)
-    db.upsertRunUnitHead({ ...base, branch: "dev", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ ...base, branch: "dev", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const dev = raw(db).query("SELECT is_default_branch AS f FROM run_unit_head WHERE branch='dev'").get() as { f: unknown };
     expect(dev.f).toBe(1);
     db.close();
@@ -2634,20 +2634,20 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     db.close();
   });
 
-  test("a migration-like all-null row is fully populated by a subsequent upsert", () => {
+  test("a migration-like row with null policy/date columns is fully populated by a subsequent upsert", () => {
     const db = fresh();
-    seed(db, { isDefaultBranch: null, status: "scanned", commitSha: "s0", scannedCommitDate: null });
+    // Pre-v4 migrated rows are written DIRECTLY by the migration SQL (never through the non-null
+    // upsert input), so simulate one with a raw insert carrying the backfilled NULLs. A later run's
+    // upsert must then populate every column via excluded.* (never COALESCE onto the stale nulls).
+    raw(db)
+      .query(
+        `INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status,
+           is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date)
+         VALUES ('r1','o','r','b','s0','scanned',NULL,NULL,NULL,NULL)`,
+      )
+      .run();
     seed(db, { isDefaultBranch: true, status: "scanned", commitSha: "s1", policyStatus: "excluded-by-deny", policyMatchedPattern: "b", scannedCommitDate: "2025-09-09T00:00:00Z" });
     expect(rowOf(db)).toMatchObject({ d: 1, sha: "s1", ps: "excluded-by-deny", pat: "b", scd: "2025-09-09T00:00:00Z" });
-    db.close();
-  });
-
-  test("scanned_commit_date non-null → null IS cleared on re-upsert (proves excluded.*, not COALESCE, for the date column)", () => {
-    const db = fresh();
-    seed(db, { commitSha: "s", scannedCommitDate: "2025-05-05T00:00:00Z" });
-    expect(rowOf(db).scd).toBe("2025-05-05T00:00:00Z");
-    seed(db, { commitSha: "s", scannedCommitDate: null });
-    expect(rowOf(db).scd).toBeNull(); // a COALESCE on this column would keep the stale date and fail here
     db.close();
   });
 
@@ -2669,7 +2669,7 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
   // policy_status, policy_matched_pattern, scanned_commit_date). This is a WRITE-PATH superset of
   // the reachable same-run transitions (a real run's config+name fix a branch's policy, but the
   // write path must clear stale values in every direction regardless).
-  test("write-path overwrite matrix: any valid §3 state → any valid §3 state overwrites every mutable column (all 9×9 directions)", () => {
+  test("write-path overwrite matrix: any valid §3 state → any valid §3 state overwrites every mutable column (all 8×8 directions)", () => {
     const db = fresh();
     type State = Omit<RunUnitHeadInput, "runId" | "organization" | "repository" | "branch">;
     const states: ReadonlyArray<readonly [string, State]> = [
@@ -2677,7 +2677,6 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
       ["scan-default",  { status: "scanned",        commitSha: "sha-B", isDefaultBranch: true,  policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2025-02-02T00:00:00Z" }],
       ["scan-deny",     { status: "scanned",        commitSha: "sha-C", isDefaultBranch: true,  policyStatus: "excluded-by-deny",  policyMatchedPattern: "d*", scannedCommitDate: "2025-03-03T00:00:00Z" }],
       ["scan-allow",    { status: "scanned",        commitSha: "sha-D", isDefaultBranch: true,  policyStatus: "excluded-by-allow", policyMatchedPattern: null, scannedCommitDate: "2025-04-04T00:00:00Z" }],
-      ["scan-nulldate", { status: "scanned",        commitSha: "sha-E", isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: null }],
       ["cutoff",        { status: "skipped-cutoff", commitSha: "",      isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2019-01-01T00:00:00Z" }],
       ["past-cap",      { status: "past-cap",       commitSha: "",      isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2018-01-01T00:00:00Z" }],
       ["excl-deny",     { status: "skipped-cutoff", commitSha: "",      isDefaultBranch: false, policyStatus: "excluded-by-deny",  policyMatchedPattern: "x*", scannedCommitDate: "2017-01-01T00:00:00Z" }],
@@ -2703,15 +2702,6 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
   });
 
   // ---- scanned_commit_date is the GitHub commit-date family, stored RAW ----
-  test("scanned_commit_date null (clone-fallback boundary) is overwritten by a real date on re-upsert", () => {
-    const db = fresh();
-    seed(db, { commitSha: "s", scannedCommitDate: null });
-    expect(rowOf(db).scd).toBeNull();
-    seed(db, { commitSha: "s", scannedCommitDate: "2025-08-08T00:00:00Z" });
-    expect(rowOf(db).scd).toBe("2025-08-08T00:00:00Z");
-    db.close();
-  });
-
   test("scanned_commit_date is stored RAW — second-precision and offset-bearing commit forms round-trip verbatim", () => {
     const db = fresh();
     const zForm = "2025-06-01T12:34:56Z"; // GitHub committedDate form — NOT the nowIso millisecond form
@@ -2730,7 +2720,7 @@ describe("openReadOnly (CV5 read seam)", () => {
   function buildCurrentV4Db(path: string): string {
     const db = AuditDb.open({ sqlitePath: path });
     const { runId } = db.startRun(runInput());
-    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.completeRun(runId);
     db.close();
     return runId;
@@ -2952,8 +2942,8 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
   function buildNativeV4(path: string): string {
     const db = AuditDb.open({ sqlitePath: path });
     const { runId } = db.startRun(runInput());
-    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
-    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.completeRun(runId);
     db.close();
     return runId;

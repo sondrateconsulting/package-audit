@@ -60,8 +60,8 @@ function seed(db: AuditDb) {
   });
   const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
   const dev = { organization: "org-a", repository: "svc", branch: "dev", commitSha: "abc999def0000" };
-  db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
-  db.upsertRunUnitHead({ runId, ...dev, status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+  db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+  db.upsertRunUnitHead({ runId, ...dev, status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
   db.upsertDependencyFinding({
     runId, ...main, dateFetched: T0, packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
     manifestPath: "package.json", manifestLine: 5, manifestPermalink: "https://github.com/org-a/svc/blob/abc123def4567/package.json#L5",
@@ -280,8 +280,8 @@ describe("adversarial fixture — hostile snippets, paths, branch names (escape-
     });
     const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
     const hostileBranch = { organization: "org-a", repository: "svc", branch: `dev"><img src=x onerror=alert(2)>`, commitSha: "abc999def0000" };
-    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
-    db.upsertRunUnitHead({ runId, ...hostileBranch, status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    db.upsertRunUnitHead({ runId, ...hostileBranch, status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const use = (unit: typeof main, exportName: string, file: string, line: number, snippet: string, permalink?: string) =>
       db.upsertUsageFinding({
         runId, ...unit, packageName: "evil", dependencyKey: "evil", usageType: "named-import", exportName,
@@ -346,7 +346,7 @@ describe("copy-as-markdown: hostile identifiers cannot inject links/images (H1)"
       trackedPackages: ["evil"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
     const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
-    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const use = (exportName: string, file: string, line: number) =>
       db.upsertUsageFinding({
         runId, ...main, packageName: "evil", dependencyKey: "evil", usageType: "named-import", exportName,
@@ -389,7 +389,7 @@ describe("bidi controls in a hostile export name are neutralized in observation 
       trackedPackages: ["evil"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
     const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
-    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const use = (exportName: string, file: string, line: number) =>
       db.upsertUsageFinding({
         runId, ...main, packageName: "evil", dependencyKey: "evil", usageType: "named-import", exportName,
@@ -488,7 +488,7 @@ describe("partial state — versionsSeen entries missing from apiSurface", () =>
       manifestPath: "package.json", manifestLine: 3, manifestPermalink: "https://github.com/org-a/svc2/blob/def456abc7890/package.json#L3",
       declaredVersion: "^49.0.0", resolvedVersion: "49.0.0", resolvedVersionSource: "lockfile",
     });
-    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456abc7890", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456abc7890", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const report = buildReport(db, run);
     db.close();
     const html = renderDossier(report.packages[0]!, FIXED_CTX);
@@ -757,7 +757,7 @@ test("the CLI usage location cell is wrapped in .loc so a hostile repo/file name
     trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
   });
   const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
-  db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+  db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
   db.upsertUsageFinding({
     runId, ...main, packageName: "expo", dependencyKey: "expo", usageType: "cli", exportName: "",
     context: "npx expo", filePath: "scripts/‮lmth.evil", lineNumber: 1,

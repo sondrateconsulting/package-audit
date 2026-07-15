@@ -17,7 +17,7 @@ function fixtureReport(): DossierReport {
     trackedPackages: ["@expo/vector-icons", "left-pad"], cutoffDate: "2024-01-01", githubHost: "github.com",
   });
   const unit = { organization: "org-a", repository: "app", branch: "main", commitSha: "abc123def4567" };
-  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
   db.upsertDependencyFinding({
     runId, ...unit, dateFetched: T0, packageName: "@expo/vector-icons", dependencyKey: "@expo/vector-icons",
     dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 5,
