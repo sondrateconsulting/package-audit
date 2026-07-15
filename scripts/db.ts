@@ -1,7 +1,10 @@
 // db.ts — SQLite durability layer (§3): open/migrate the audit database, run lifecycle,
 // work-queue state, and prepared-statement upserts for every finding/cache/surface table.
-// SQLite is the source of truth. ALL timestamps are persisted in ONE canonical fixed-width
-// ISO-8601 UTC form (nowIso), so lexicographic ordering equals chronological ordering (§3/§7).
+// SQLite is the source of truth. Tool-generated timestamps (found_at/date_fetched/occurred_at) are
+// persisted in ONE canonical fixed-width ISO-8601 UTC form (nowIso), so lexicographic ordering equals
+// chronological ordering (§3/§7). Commit-date columns (cutoff_date, scanned_commit_date) instead hold
+// GitHub's committedDate form (second-precision, offset-bearing) verbatim — NOT the nowIso form — and
+// do NOT participate in the nowIso MAX/ordering invariant (see assertCanonicalTimestamp).
 // Single-writer: orchestrate.ts owns all writes; report.ts reads via the exposed handle.
 
 import { Database, type Statement } from "bun:sqlite";
@@ -61,9 +64,11 @@ const markerSource = (epoch: number): string => `${COMPLETION_KIND}@${epoch}`;
 
 export const nowIso = (): string => new Date().toISOString();
 
-// §3: ALL persisted timestamps use ONE canonical fixed-width ISO-8601 UTC form so that
-// lexicographic ordering equals chronological ordering (§7 relies on MAX over these).
-// db.ts is the write boundary, so caller-supplied timestamps are validated here.
+// §3: tool-GENERATED timestamps (found_at/date_fetched/occurred_at) use ONE canonical fixed-width
+// ISO-8601 UTC form so that lexicographic ordering equals chronological ordering (§7 relies on MAX
+// over these). db.ts is the write boundary, so caller-supplied tool timestamps are validated here.
+// (Commit-date columns cutoff_date/scanned_commit_date are the GitHub committedDate family — stored
+// raw, NOT validated here, and NOT part of this ordering invariant.)
 const CANONICAL_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 function assertCanonicalTimestamp(value: string, ctx: string): string {
   // Shape check first (fast reject), then a Date round-trip so a fixed-width-but-impossible
@@ -80,7 +85,11 @@ export type OwnersSource = "configured" | "discovered";
 export type RunStatus = "running" | "completed" | "failed";
 export type WorkScope = "org" | "repo" | "branch";
 export type WorkStatus = "pending" | "in_progress" | "done" | "skipped" | "error";
-export type UnitHeadStatus = "scanned" | "skipped-cutoff";
+export type UnitHeadStatus = "scanned" | "skipped-cutoff" | "past-cap";
+// The ORTHOGONAL, counterfactual policy decision for a branch (branch allow/deny). Computed for
+// EVERY discovered branch, including the default (whose scan is never blocked). NULL policy_status
+// (the third state) means "no exclusion" and is represented as `null`, not a member here.
+export type PolicyStatus = "excluded-by-deny" | "excluded-by-allow";
 export type DependencyType =
   | "dependencies" | "devDependencies" | "peerDependencies" | "optionalDependencies"
   | "overrides" | "resolutions";
@@ -209,12 +218,23 @@ export interface RunUnitHeadInput {
   organization: string;
   repository: string;
   branch: string;
-  commitSha: string; // '' for skipped-cutoff branches (never scanned)
+  commitSha: string; // '' for every NON-scanned disposition (skipped-cutoff / past-cap / policy-excluded)
   status: UnitHeadStatus;
   // Tri-state, REQUIRED (not optional — `undefined` must never silently become "not default"):
   // true/false when discovery knew the repo's default branch, null = unknown. Pre-v3 rows are
   // NULL by migration backfill; the report renders NULL as its own designed state, never as 0.
   isDefaultBranch: boolean | null;
+  // Branch allow/deny (v4). ALL THREE are REQUIRED, not optional — same rationale as
+  // isDefaultBranch: `undefined` must never silently become "no policy" / "no date". The upsert
+  // ALWAYS overwrites these (never COALESCE), so a re-upsert in a later same-run attempt clears
+  // stale values in every direction. Invariants enforced by assertRunUnitHeadInvariants.
+  policyStatus: PolicyStatus | null; // null = no exclusion (the branch is policy-eligible)
+  policyMatchedPattern: string | null; // non-empty ONLY when policyStatus === 'excluded-by-deny'
+  // The commit date (GitHub committedDate / cutoff_date family — second-precision ISO, stored RAW,
+  // NOT the nowIso millisecond form). scanned → the scanned commit's date; non-scanned → the
+  // discovered head date. Nullable in T5 only for the clone-fallback boundary where the scanned
+  // commit's date is not yet captured; a real date always accompanies the API-path scan.
+  scannedCommitDate: string | null;
 }
 
 export interface ApiCacheEntry {
@@ -1322,6 +1342,49 @@ export interface AuditDbReader {
   close(): void;
 }
 
+// Write-boundary invariants for run_unit_head (branch allow/deny §3 row mapping). The DB CHECKs are
+// necessary but NOT sufficient (e.g. the deny CHECK admits policy_matched_pattern=''); these guards
+// run at the single write chokepoint (upsertRunUnitHead), so no row that violates the §3 mapping is
+// ever persisted regardless of caller. All fail-fast. NOTE: T5 does NOT require a non-null
+// scanned_commit_date — the clone-fallback scan legitimately writes null until T6 captures the
+// scanned commit's own date.
+function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
+  const where = `${h.organization}/${h.repository}@${h.branch}`;
+  // Policy pattern (§2a / §3): a deny row MUST name a real, NON-EMPTY causing pattern (the deny CHECK
+  // only enforces IS NOT NULL, and '' passes it). Every non-deny disposition carries NO pattern.
+  if (h.policyStatus === "excluded-by-deny") {
+    if (h.policyMatchedPattern === null || h.policyMatchedPattern.length === 0)
+      fail(`run_unit_head ${where}: excluded-by-deny requires a non-empty policy_matched_pattern`);
+  } else if (h.policyMatchedPattern !== null) {
+    fail(`run_unit_head ${where}: policy_matched_pattern must be null unless excluded-by-deny (policy_status=${h.policyStatus ?? "null"})`);
+  }
+  // Cap disposition (§2 / §12): past-cap is a cutoff/cap outcome over the policy-ELIGIBLE set — policy
+  // is applied first, so an excluded branch never reaches the cap. A past-cap row never carries policy.
+  if (h.status === "past-cap" && h.policyStatus !== null)
+    fail(`run_unit_head ${where}: past-cap rows must have policy_status null (policy is applied before the cap)`);
+  // Default-branch override (§2, Premise 6): the ONLY way a policy-excluded branch is still scanned is
+  // the default-branch exemption. A scanned row bearing a policy_status MUST be the KNOWN default.
+  if (h.status === "scanned" && h.policyStatus !== null && h.isDefaultBranch !== true)
+    fail(`run_unit_head ${where}: a scanned row with a policy_status must be the default branch (is_default_branch=${h.isDefaultBranch ?? "null"})`);
+  // commit_sha ↔ scanned (§3): only a scanned row pins a real commit; every non-scanned disposition
+  // stores '' (the report/export joins on status='scanned' depend on this partition).
+  if (h.status === "scanned") {
+    if (h.commitSha === "") fail(`run_unit_head ${where}: a scanned row requires a non-empty commit_sha`);
+  } else if (h.commitSha !== "") {
+    fail(`run_unit_head ${where}: a ${h.status} row must have commit_sha='' (got ${JSON.stringify(h.commitSha)})`);
+  }
+  // Default is always scanned (§3, Premise 6): classifyBranchPlan always keeps the default in the
+  // eligible set, so a known-default branch is never cutoff-skipped or past-cap.
+  if (h.isDefaultBranch === true && h.status !== "scanned")
+    fail(`run_unit_head ${where}: the default branch is always scanned, never ${h.status}`);
+  // Non-default certainty for cap/policy exclusions (§3): past-cap and policy-excluded rows are, by
+  // construction, non-default branches that discovery KNEW about — so is_default_branch is a definite
+  // false, never null. (A plain cutoff-skip may still be null for a pre-v3/unknown row.)
+  const isPolicyExcludedSkip = h.status === "skipped-cutoff" && h.policyStatus !== null;
+  if ((h.status === "past-cap" || isPolicyExcludedSkip) && h.isDefaultBranch !== false)
+    fail(`run_unit_head ${where}: past-cap / policy-excluded rows must have is_default_branch=false (got ${h.isDefaultBranch ?? "null"})`);
+}
+
 export class AuditDb {
   private readonly db: Database;
 
@@ -1838,21 +1901,31 @@ export class AuditDb {
       );
   }
 
-  // Per-run immutable snapshot row (§3 report-head invariant). Upserted both when a unit is
-  // scanned and when it is skipped-as-current (same head), or skipped-cutoff (commit_sha='').
-  // is_default_branch maps true/false/null → 1/0/NULL (tri-state; NULL = unknown, §5.B).
+  // Per-run immutable snapshot row (§3 report-head invariant). Upserted for EVERY discovered branch:
+  // scanned, skip-as-current (same head, scanned), cutoff-skipped, past-cap, and policy-excluded
+  // (commit_sha='' for every non-scanned disposition). is_default_branch maps true/false/null →
+  // 1/0/NULL (tri-state; NULL = unknown, §5.B). The ON CONFLICT ALWAYS overwrites all six mutable
+  // columns from `excluded` (never COALESCE) so a re-upsert in a later same-run attempt clears stale
+  // policy/date/status in every direction (§6 transition matrix).
   upsertRunUnitHead(h: RunUnitHeadInput): void {
+    assertRunUnitHeadInvariants(h); // fail-closed at the single write chokepoint (§3 row mapping)
     this.db
       .query(
-        `INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO run_unit_head
+           (run_id, organization, repository, branch, commit_sha, status, is_default_branch,
+            policy_status, policy_matched_pattern, scanned_commit_date)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(run_id, organization, repository, branch)
          DO UPDATE SET commit_sha = excluded.commit_sha, status = excluded.status,
-           is_default_branch = excluded.is_default_branch`,
+           is_default_branch = excluded.is_default_branch,
+           policy_status = excluded.policy_status,
+           policy_matched_pattern = excluded.policy_matched_pattern,
+           scanned_commit_date = excluded.scanned_commit_date`,
       )
       .run(
         h.runId, h.organization, h.repository, h.branch, h.commitSha, h.status,
         h.isDefaultBranch === null ? null : h.isDefaultBranch ? 1 : 0,
+        h.policyStatus, h.policyMatchedPattern, h.scannedCommitDate,
       );
   }
 

@@ -356,7 +356,7 @@ export async function processRepo(
     const key: WorkUnitKey = { configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch: h.name };
     db.enqueueUnit(key, runId);
     db.setUnitStatus(key, { status: "skipped", runId, lastCommitSha: "", lastCommitDate: h.committedDate });
-    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: isDefault(h) });
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: isDefault(h), policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-cutoff" });
   }
   // plan.pastCap: after-cutoff past the cap → retain prior state, not surfaced this run.
@@ -367,7 +367,7 @@ export async function processRepo(
     // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is
     // reused (skip-as-current) — still upsert run_unit_head for THIS run so the report includes it.
     if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
-      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: isDefault(h) });
+      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: isDefault(h), policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
       db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
       logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
       continue;
@@ -455,7 +455,17 @@ async function processUnit(
       db.insertError({ runId, scope: "introspection", packageName: s.packageName, version: s.rawSpec, message: skipMessage });
       logLine({ event: "introspection", packageName: s.packageName, version: s.rawSpec, error: skipMessage });
     }
-    db.upsertRunUnitHead({ runId, organization: loc.organization, repository: loc.repository, branch: loc.branch, commitSha: loc.commitSha, status: "scanned", isDefaultBranch: h.name === repo.defaultBranch });
+    // policy fields are wired in T6 (compute the BranchDecision + thread the compiled policy).
+    // scanned_commit_date: on the API path the scanned SHA is h.oid, so h.committedDate is its date.
+    // Under clone fallback the branch may have MOVED (loc.commitSha !== h.oid) and the scanned
+    // commit's own date is not captured yet — write null (honest "unknown") rather than a WRONG
+    // date; T6 captures the clone HEAD's commit date and tightens this to non-null.
+    db.upsertRunUnitHead({
+      runId, organization: loc.organization, repository: loc.repository, branch: loc.branch,
+      commitSha: loc.commitSha, status: "scanned", isDefaultBranch: h.name === repo.defaultBranch,
+      policyStatus: null, policyMatchedPattern: null,
+      scannedCommitDate: loc.commitSha === h.oid ? h.committedDate : null,
+    });
 
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: commitSha, action: "scanned", deps: result.dependencyFindings.length, usage: result.usageFindings.length, cli: result.cliFindings.length });
     return commitSha;

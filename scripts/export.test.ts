@@ -74,7 +74,7 @@ function seedTwoRuns(db: AuditDb): { oldRun: RunRecord; newRun: RunRecord } {
   };
   const { runId: r1 } = db.startRun(input);
   const oldUnit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "aaa111" };
-  db.upsertRunUnitHead({ runId: r1, ...oldUnit, status: "scanned", isDefaultBranch: true });
+  db.upsertRunUnitHead({ runId: r1, ...oldUnit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
   db.upsertDependencyFinding({
     runId: r1, ...oldUnit, dateFetched: T1, packageName: "expo", dependencyKey: "expo",
     dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 3,
@@ -105,7 +105,7 @@ function seedTwoRuns(db: AuditDb): { oldRun: RunRecord; newRun: RunRecord } {
   Bun.sleepSync(2); // distinct started_at, so latestReportableRun deterministically picks run 2
   const { runId: r2 } = db.startRun(input);
   const newUnit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "bbb222" };
-  db.upsertRunUnitHead({ runId: r2, ...newUnit, status: "scanned", isDefaultBranch: true });
+  db.upsertRunUnitHead({ runId: r2, ...newUnit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
   db.upsertDependencyFinding({
     runId: r2, ...newUnit, dateFetched: T2, packageName: "expo", dependencyKey: "expo",
     dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 5,
@@ -518,12 +518,12 @@ describe("head-join discrimination (dual-review round 1)", () => {
       foundAt: T1,
     };
     const { runId: rA } = db.startRun(input);
-    db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     db.upsertUsageFinding({ runId: rA, ...finding });
     db.completeRun(rA);
     Bun.sleepSync(2);
     const { runId: rB } = db.startRun(input);
-    db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     db.upsertUsageFinding({ runId: rB, ...finding }); // same UNIQUE key → run_id moves to rB
     db.completeRun(rB);
 
@@ -557,7 +557,7 @@ describe("api-surface export requires the completion marker (F5)", () => {
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
     const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "aaa111" };
-    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     for (const version of ["1.0.0", "2.0.0"]) {
       db.upsertDependencyFinding({
         runId, ...unit, dateFetched: "2026-01-01T00:00:00.000Z", packageName: "expo", dependencyKey: version === "1.0.0" ? "expo" : "expo-alias",

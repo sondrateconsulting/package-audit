@@ -39,7 +39,7 @@ function startCompleted(db: AuditDb, trackedPackages: string[], configHash = "h"
 }
 
 function head(db: AuditDb, runId: string, unit: Unit, isDefaultBranch: boolean | null): void {
-  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch });
+  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
 }
 
 // One usage site seeded through the public upsert API. Defaults keep tests terse; the permalink

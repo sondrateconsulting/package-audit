@@ -20,8 +20,8 @@ function seed(db: AuditDb) {
   });
   const now = nowIso();
   const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
-  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null });
-  db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null });
+  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+  db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
   db.upsertDependencyFinding({
     runId, ...unit, dateFetched: now, packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
     manifestPath: "package.json", manifestLine: 5, manifestPermalink: "https://github.com/org-a/svc/blob/abc123def/package.json#L5",
@@ -102,7 +102,7 @@ describe("buildReport (§7)", () => {
         manifestPath: "package.json", manifestLine: 1, manifestPermalink: `https://github.com/org-a/${repository}/blob/sha/package.json#L1`,
         declaredVersion: "^50.0.0",
       });
-      db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository, branch: "main", commitSha: `sha-${repository}`, status: "scanned", isDefaultBranch });
+      db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository, branch: "main", commitSha: `sha-${repository}`, status: "scanned", isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     };
     mk("r-default", true);
     mk("r-feature", false);
@@ -124,7 +124,7 @@ describe("buildReport (§7)", () => {
       manifestPath: "package.json", manifestLine: 3, manifestPermalink: "https://github.com/org-a/svc2/blob/def456/package.json#L3",
       declaredVersion: "^49.0.0", resolvedVersion: "49.0.0", resolvedVersionSource: "lockfile",
     });
-    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456", status: "scanned", isDefaultBranch: null });
+    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456", status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     const report = buildReport(db, run) as any;
     const pkg = report.packages[0];
     expect(pkg.versionsSeen).toEqual(["49.0.0", "50.0.7"]); // both present, semver-sorted
@@ -478,13 +478,13 @@ describe("buildReport — run-scope head-join discrimination (M7)", () => {
       declaredVersion: "^50.0.0", resolvedVersion: "50.0.9", resolvedVersionSource: "lockfile" as const,
     };
     const { runId: rA } = db.startRun(input);
-    db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     db.upsertUsageFinding({ runId: rA, ...usage });
     db.upsertDependencyFinding({ runId: rA, ...dep });
     db.completeRun(rA);
     Bun.sleepSync(2);
     const { runId: rB } = db.startRun(input);
-    db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     db.upsertUsageFinding({ runId: rB, ...usage }); // same UNIQUE key → uf.run_id moves to rB
     db.upsertDependencyFinding({ runId: rB, ...dep }); // same UNIQUE key → df.run_id moves to rB
     db.completeRun(rB);

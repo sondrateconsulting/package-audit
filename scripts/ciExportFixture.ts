@@ -26,7 +26,10 @@ export function generateFixtureExports(outputDir: string): { runId: string } {
     ];
     for (const u of units) {
       const { isDefault, ...unit } = u;
-      db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: isDefault });
+      db.upsertRunUnitHead({
+        runId, ...unit, status: "scanned", isDefaultBranch: isDefault,
+        policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z",
+      });
       db.upsertDependencyFinding({
         runId, ...unit, dateFetched: T, packageName: "expo", dependencyKey: "expo",
         dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 11,

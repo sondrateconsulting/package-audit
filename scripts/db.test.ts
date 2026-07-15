@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { copyFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, nowIso, type RunInput } from "./db.ts";
+import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, nowIso, type RunInput, type RunUnitHeadInput } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 
@@ -1862,8 +1862,8 @@ describe("errors + run_unit_head", () => {
   test("run_unit_head upserts per (run, unit); skipped-cutoff carries commit_sha=''", () => {
     const db = mem();
     rawRun(db, "r1", "running");
-    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null });
-    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "sha2", status: "scanned", isDefaultBranch: null });
+    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "sha2", status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     const rows = raw(db).query("SELECT commit_sha, status FROM run_unit_head").all() as Array<Record<string, unknown>>;
     expect(rows.length).toBe(1);
     expect(rows[0]!["commit_sha"]).toBe("sha2");
@@ -2430,9 +2430,9 @@ describe("upsertRunUnitHead — is_default_branch tri-state", () => {
     const db = mem();
     rawRun(db, "r1", "running");
     const base = { runId: "r1", organization: "o", repository: "r", commitSha: "s", status: "scanned" as const };
-    db.upsertRunUnitHead({ ...base, branch: "main", isDefaultBranch: true });
-    db.upsertRunUnitHead({ ...base, branch: "dev", isDefaultBranch: false });
-    db.upsertRunUnitHead({ ...base, branch: "old", isDefaultBranch: null });
+    db.upsertRunUnitHead({ ...base, branch: "main", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ ...base, branch: "dev", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ ...base, branch: "old", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     const flags = raw(db)
       .query("SELECT branch, is_default_branch AS f FROM run_unit_head ORDER BY branch")
       .all() as Array<{ branch: string; f: unknown }>;
@@ -2442,9 +2442,284 @@ describe("upsertRunUnitHead — is_default_branch tri-state", () => {
       { branch: "old", f: null },
     ]);
     // conflict path: a later upsert of the SAME unit updates the flag (e.g. default moved)
-    db.upsertRunUnitHead({ ...base, branch: "dev", isDefaultBranch: true });
+    db.upsertRunUnitHead({ ...base, branch: "dev", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     const dev = raw(db).query("SELECT is_default_branch AS f FROM run_unit_head WHERE branch='dev'").get() as { f: unknown };
     expect(dev.f).toBe(1);
+    db.close();
+  });
+});
+
+describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary guards, transitions)", () => {
+  // Valid non-default scanned baseline; override per case. runId "r1" must exist for the FK.
+  const seed = (db: AuditDb, over: Partial<RunUnitHeadInput> = {}): void =>
+    db.upsertRunUnitHead({
+      runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "sha1",
+      status: "scanned", isDefaultBranch: false,
+      policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-01-01T00:00:00Z",
+      ...over,
+    });
+  const rowOf = (db: AuditDb, branch = "b"): Record<string, unknown> =>
+    raw(db)
+      .query(
+        `SELECT status, is_default_branch AS d, policy_status AS ps, policy_matched_pattern AS pat,
+                commit_sha AS sha, scanned_commit_date AS scd FROM run_unit_head WHERE branch = ?`,
+      )
+      .get(branch) as Record<string, unknown>;
+  const fresh = (): AuditDb => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    return db;
+  };
+
+  // ---- write-boundary guards (§3 mapping enforced at the single chokepoint) ----
+  test("G1: excluded-by-deny with an empty or null pattern is rejected (the deny CHECK admits '')", () => {
+    const db = fresh();
+    expect(() => seed(db, { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: "" })).toThrow(/non-empty policy_matched_pattern/);
+    expect(() => seed(db, { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: null })).toThrow(/non-empty policy_matched_pattern/);
+    db.close();
+  });
+
+  test("G2: a pattern without excluded-by-deny is rejected (allow-miss and no-exclusion carry none)", () => {
+    const db = fresh();
+    expect(() => seed(db, { isDefaultBranch: true, policyStatus: "excluded-by-allow", policyMatchedPattern: "feat/*" })).toThrow(/must be null unless excluded-by-deny/);
+    expect(() => seed(db, { policyStatus: null, policyMatchedPattern: "feat/*" })).toThrow(/must be null unless excluded-by-deny/);
+    db.close();
+  });
+
+  test("G3: a past-cap row carrying a policy_status is rejected (policy precedes the cap)", () => {
+    const db = fresh();
+    expect(() => seed(db, { status: "past-cap", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "x" })).toThrow(/past-cap rows must have policy_status null/);
+    db.close();
+  });
+
+  test("G4: a scanned policy row that is not the KNOWN default is rejected", () => {
+    const db = fresh();
+    expect(() => seed(db, { policyStatus: "excluded-by-deny", policyMatchedPattern: "b", isDefaultBranch: false })).toThrow(/must be the default branch/);
+    expect(() => seed(db, { policyStatus: "excluded-by-allow", isDefaultBranch: null })).toThrow(/must be the default branch/);
+    db.close();
+  });
+
+  test("G5: a scanned row with an empty commit_sha is rejected", () => {
+    const db = fresh();
+    expect(() => seed(db, { commitSha: "" })).toThrow(/scanned row requires a non-empty commit_sha/);
+    db.close();
+  });
+
+  test("G6: a non-scanned row with a non-empty commit_sha is rejected", () => {
+    const db = fresh();
+    expect(() => seed(db, { status: "skipped-cutoff", commitSha: "sha1" })).toThrow(/must have commit_sha=''/);
+    expect(() => seed(db, { status: "past-cap", commitSha: "sha1" })).toThrow(/must have commit_sha=''/);
+    db.close();
+  });
+
+  test("G7: a KNOWN default branch may not be non-scanned (Premise 6: the default is always scanned)", () => {
+    const db = fresh();
+    expect(() => seed(db, { status: "skipped-cutoff", commitSha: "", isDefaultBranch: true })).toThrow(/default branch is always scanned/);
+    expect(() => seed(db, { status: "past-cap", commitSha: "", isDefaultBranch: true })).toThrow(/default branch is always scanned/);
+    db.close();
+  });
+
+  test("G8: past-cap and policy-excluded rows must be a definite non-default (never null)", () => {
+    const db = fresh();
+    expect(() => seed(db, { status: "past-cap", commitSha: "", isDefaultBranch: null })).toThrow(/must have is_default_branch=false/);
+    expect(() => seed(db, { status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-allow", isDefaultBranch: null })).toThrow(/must have is_default_branch=false/);
+    // a PLAIN cutoff-skip (no policy) may still be null — the pre-v3/unknown case — and is accepted.
+    seed(db, { status: "skipped-cutoff", commitSha: "", isDefaultBranch: null });
+    expect(rowOf(db).d).toBeNull();
+    db.close();
+  });
+
+  test("a REJECTED upsert leaves a prior valid row for the same key unchanged (guard precedes the SQL)", () => {
+    const db = fresh();
+    seed(db, { commitSha: "good", scannedCommitDate: "2025-03-03T03:03:03Z" });
+    expect(() => seed(db, { commitSha: "" })).toThrow(DbError);
+    const row = rowOf(db);
+    expect(row.sha).toBe("good");
+    expect(row.scd).toBe("2025-03-03T03:03:03Z");
+    db.close();
+  });
+
+  // ---- §3 disposition → persisted-row mapping (all eight rows) ----
+  test("§3 mapping: every disposition persists the exact status/policy/pattern columns", () => {
+    const db = fresh();
+    seed(db, { branch: "d1", isDefaultBranch: true, commitSha: "s" }); //                                    default scanned, no-exclusion
+    seed(db, { branch: "d2", isDefaultBranch: true, commitSha: "s", policyStatus: "excluded-by-deny", policyMatchedPattern: "d2" }); // default scanned, WOULD deny
+    seed(db, { branch: "d3", isDefaultBranch: true, commitSha: "s", policyStatus: "excluded-by-allow" }); //   default scanned, WOULD allow-miss
+    seed(db, { branch: "n1", isDefaultBranch: false, commitSha: "s" }); //                                     non-default scanned, no-exclusion
+    seed(db, { branch: "n2", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "" }); //            non-default cutoff-skipped
+    seed(db, { branch: "n3", isDefaultBranch: false, status: "past-cap", commitSha: "" }); //                  non-default past-cap
+    seed(db, { branch: "n4", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "feat/*" }); // excluded by deny
+    seed(db, { branch: "n5", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-allow" }); //                               excluded by allow
+    const all = raw(db)
+      .query(`SELECT branch, status, policy_status AS ps, policy_matched_pattern AS pat FROM run_unit_head ORDER BY branch`)
+      .all();
+    expect(all).toEqual([
+      { branch: "d1", status: "scanned", ps: null, pat: null },
+      { branch: "d2", status: "scanned", ps: "excluded-by-deny", pat: "d2" },
+      { branch: "d3", status: "scanned", ps: "excluded-by-allow", pat: null },
+      { branch: "n1", status: "scanned", ps: null, pat: null },
+      { branch: "n2", status: "skipped-cutoff", ps: null, pat: null },
+      { branch: "n3", status: "past-cap", ps: null, pat: null },
+      { branch: "n4", status: "skipped-cutoff", ps: "excluded-by-deny", pat: "feat/*" },
+      { branch: "n5", status: "skipped-cutoff", ps: "excluded-by-allow", pat: null },
+    ]);
+    db.close();
+  });
+
+  // ---- always-overwrite transition matrix (§6): excluded.* clears stale values in every direction ----
+  test("re-upsert ALWAYS overwrites policy fields — synthetic deny → no-exclusion clears them (never COALESCE)", () => {
+    const db = fresh();
+    seed(db, { isDefaultBranch: true, commitSha: "s", policyStatus: "excluded-by-deny", policyMatchedPattern: "b" });
+    expect(rowOf(db).ps).toBe("excluded-by-deny");
+    seed(db, { isDefaultBranch: true, commitSha: "s", policyStatus: null, policyMatchedPattern: null });
+    expect(rowOf(db).ps).toBeNull();
+    expect(rowOf(db).pat).toBeNull();
+    db.close();
+  });
+
+  test("transition: scanned → past-cap clears the sha (a higher-ranked branch appeared, cap-order shift)", () => {
+    const db = fresh();
+    seed(db, { status: "scanned", commitSha: "sha-new", scannedCommitDate: "2025-06-06T00:00:00Z" });
+    seed(db, { status: "past-cap", commitSha: "", scannedCommitDate: "2025-06-06T00:00:00Z" });
+    const row = rowOf(db);
+    expect(row.status).toBe("past-cap");
+    expect(row.sha).toBe("");
+    db.close();
+  });
+
+  test("transition: past-cap → scanned fills the sha (a higher-ranked branch vanished)", () => {
+    const db = fresh();
+    seed(db, { status: "past-cap", commitSha: "", scannedCommitDate: "2025-06-06T00:00:00Z" });
+    seed(db, { status: "scanned", commitSha: "sha-promoted", scannedCommitDate: "2025-06-06T00:00:00Z" });
+    const row = rowOf(db);
+    expect(row.status).toBe("scanned");
+    expect(row.sha).toBe("sha-promoted");
+    db.close();
+  });
+
+  test("transition: the default flag flips (remote default changed) without disturbing the policy columns", () => {
+    const db = fresh();
+    seed(db, { isDefaultBranch: false, status: "scanned", commitSha: "s" });
+    expect(rowOf(db).d).toBe(0);
+    seed(db, { isDefaultBranch: true, status: "scanned", commitSha: "s" });
+    expect(rowOf(db)).toMatchObject({ d: 1, ps: null });
+    db.close();
+  });
+
+  test("transition: the branch's own head moved — both sha and scanned_commit_date refresh", () => {
+    const db = fresh();
+    seed(db, { commitSha: "sha-A", scannedCommitDate: "2025-01-01T00:00:00Z" });
+    seed(db, { commitSha: "sha-B", scannedCommitDate: "2025-02-02T00:00:00Z" });
+    expect(rowOf(db)).toMatchObject({ sha: "sha-B", scd: "2025-02-02T00:00:00Z" });
+    db.close();
+  });
+
+  test("transition: a non-default DENIED branch that BECOMES default is scanned but RETAINS the deny counterfactual", () => {
+    const db = fresh();
+    seed(db, { isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "b" });
+    // remote default moved onto this branch: now scanned (Premise 6), policy counterfactual retained.
+    seed(db, { isDefaultBranch: true, status: "scanned", commitSha: "sha-now", policyStatus: "excluded-by-deny", policyMatchedPattern: "b", scannedCommitDate: "2025-07-07T00:00:00Z" });
+    expect(rowOf(db)).toMatchObject({ status: "scanned", d: 1, ps: "excluded-by-deny", pat: "b", sha: "sha-now" });
+    db.close();
+  });
+
+  test("same-status re-upserts refresh the date/pattern (cutoff→cutoff, excluded→excluded)", () => {
+    const db = fresh();
+    seed(db, { branch: "c", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", scannedCommitDate: "2020-01-01T00:00:00Z" });
+    seed(db, { branch: "c", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", scannedCommitDate: "2020-02-02T00:00:00Z" });
+    expect(rowOf(db, "c").scd).toBe("2020-02-02T00:00:00Z");
+    seed(db, { branch: "e", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "old*" });
+    seed(db, { branch: "e", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "new*" });
+    expect(rowOf(db, "e").pat).toBe("new*");
+    db.close();
+  });
+
+  test("a migration-like all-null row is fully populated by a subsequent upsert", () => {
+    const db = fresh();
+    seed(db, { isDefaultBranch: null, status: "scanned", commitSha: "s0", scannedCommitDate: null });
+    seed(db, { isDefaultBranch: true, status: "scanned", commitSha: "s1", policyStatus: "excluded-by-deny", policyMatchedPattern: "b", scannedCommitDate: "2025-09-09T00:00:00Z" });
+    expect(rowOf(db)).toMatchObject({ d: 1, sha: "s1", ps: "excluded-by-deny", pat: "b", scd: "2025-09-09T00:00:00Z" });
+    db.close();
+  });
+
+  test("scanned_commit_date non-null → null IS cleared on re-upsert (proves excluded.*, not COALESCE, for the date column)", () => {
+    const db = fresh();
+    seed(db, { commitSha: "s", scannedCommitDate: "2025-05-05T00:00:00Z" });
+    expect(rowOf(db).scd).toBe("2025-05-05T00:00:00Z");
+    seed(db, { commitSha: "s", scannedCommitDate: null });
+    expect(rowOf(db).scd).toBeNull(); // a COALESCE on this column would keep the stale date and fail here
+    db.close();
+  });
+
+  test("is_default_branch non-null → null is cleared on re-upsert (completes the excluded.* null-clearing proof for every mutable column)", () => {
+    // A write-path overwrite (unreachable in a real run, where discovery always yields a definite
+    // boolean) — but it proves the sixth mutable column also uses excluded.*, not COALESCE. The 9×9
+    // matrix cannot cover this direction: a null-default row is invalid under G4/G8 in most cells.
+    const db = fresh();
+    seed(db, { commitSha: "s", isDefaultBranch: false });
+    expect(rowOf(db).d).toBe(0);
+    seed(db, { commitSha: "s", isDefaultBranch: null });
+    expect(rowOf(db).d).toBeNull(); // a COALESCE on is_default_branch would keep the stale 0 and fail here
+    db.close();
+  });
+
+  // Exhaustive proof of the §6 always-overwrite contract: from EVERY valid §3 state, re-upserting
+  // any other valid §3 state makes the persisted row EXACTLY equal the new state — so no mutable
+  // column can be COALESCE'd (a COALESCE would retain the old value whenever the new one is null:
+  // policy_status, policy_matched_pattern, scanned_commit_date). This is a WRITE-PATH superset of
+  // the reachable same-run transitions (a real run's config+name fix a branch's policy, but the
+  // write path must clear stale values in every direction regardless).
+  test("write-path overwrite matrix: any valid §3 state → any valid §3 state overwrites every mutable column (all 9×9 directions)", () => {
+    const db = fresh();
+    type State = Omit<RunUnitHeadInput, "runId" | "organization" | "repository" | "branch">;
+    const states: ReadonlyArray<readonly [string, State]> = [
+      ["scan-plain",    { status: "scanned",        commitSha: "sha-A", isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2025-01-01T00:00:00Z" }],
+      ["scan-default",  { status: "scanned",        commitSha: "sha-B", isDefaultBranch: true,  policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2025-02-02T00:00:00Z" }],
+      ["scan-deny",     { status: "scanned",        commitSha: "sha-C", isDefaultBranch: true,  policyStatus: "excluded-by-deny",  policyMatchedPattern: "d*", scannedCommitDate: "2025-03-03T00:00:00Z" }],
+      ["scan-allow",    { status: "scanned",        commitSha: "sha-D", isDefaultBranch: true,  policyStatus: "excluded-by-allow", policyMatchedPattern: null, scannedCommitDate: "2025-04-04T00:00:00Z" }],
+      ["scan-nulldate", { status: "scanned",        commitSha: "sha-E", isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: null }],
+      ["cutoff",        { status: "skipped-cutoff", commitSha: "",      isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2019-01-01T00:00:00Z" }],
+      ["past-cap",      { status: "past-cap",       commitSha: "",      isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2018-01-01T00:00:00Z" }],
+      ["excl-deny",     { status: "skipped-cutoff", commitSha: "",      isDefaultBranch: false, policyStatus: "excluded-by-deny",  policyMatchedPattern: "x*", scannedCommitDate: "2017-01-01T00:00:00Z" }],
+      ["excl-allow",    { status: "skipped-cutoff", commitSha: "",      isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null, scannedCommitDate: "2016-01-01T00:00:00Z" }],
+    ];
+    const proj = (s: State) => ({
+      status: s.status,
+      d: s.isDefaultBranch === null ? null : s.isDefaultBranch ? 1 : 0,
+      ps: s.policyStatus,
+      pat: s.policyMatchedPattern,
+      sha: s.commitSha,
+      scd: s.scannedCommitDate,
+    });
+    for (let i = 0; i < states.length; i++) {
+      for (let j = 0; j < states.length; j++) {
+        const branch = `m_${i}_${j}`;
+        seed(db, { branch, ...states[i]![1] });
+        seed(db, { branch, ...states[j]![1] });
+        expect(rowOf(db, branch)).toEqual(proj(states[j]![1]));
+      }
+    }
+    db.close();
+  });
+
+  // ---- scanned_commit_date is the GitHub commit-date family, stored RAW ----
+  test("scanned_commit_date null (clone-fallback boundary) is overwritten by a real date on re-upsert", () => {
+    const db = fresh();
+    seed(db, { commitSha: "s", scannedCommitDate: null });
+    expect(rowOf(db).scd).toBeNull();
+    seed(db, { commitSha: "s", scannedCommitDate: "2025-08-08T00:00:00Z" });
+    expect(rowOf(db).scd).toBe("2025-08-08T00:00:00Z");
+    db.close();
+  });
+
+  test("scanned_commit_date is stored RAW — second-precision and offset-bearing commit forms round-trip verbatim", () => {
+    const db = fresh();
+    const zForm = "2025-06-01T12:34:56Z"; // GitHub committedDate form — NOT the nowIso millisecond form
+    seed(db, { branch: "z", commitSha: "s", scannedCommitDate: zForm });
+    expect(rowOf(db, "z").scd).toBe(zForm);
+    const offsetForm = "2025-06-01T05:34:56-07:00"; // Git %cI form
+    seed(db, { branch: "o", commitSha: "s", scannedCommitDate: offsetForm });
+    expect(rowOf(db, "o").scd).toBe(offsetForm);
     db.close();
   });
 });
@@ -2455,7 +2730,7 @@ describe("openReadOnly (CV5 read seam)", () => {
   function buildCurrentV4Db(path: string): string {
     const db = AuditDb.open({ sqlitePath: path });
     const { runId } = db.startRun(runInput());
-    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     db.completeRun(runId);
     db.close();
     return runId;
@@ -2677,8 +2952,8 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
   function buildNativeV4(path: string): string {
     const db = AuditDb.open({ sqlitePath: path });
     const { runId } = db.startRun(runInput());
-    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
-    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: null });
     db.completeRun(runId);
     db.close();
     return runId;
