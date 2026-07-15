@@ -54,6 +54,16 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap (§1/§12)", 
     expect(names(p.cutoffSkipped)).toEqual([]);
   });
 
+  test("an EMPTY allowlist (branches:[]) eliminates every non-default but KEEPS the default (Premise 6)", () => {
+    const policy = compileBranchPolicy([], []); // allow NOTHING
+    const p = planRepoBranches(HEADS, policy, "2024-01-01", 25, "main");
+    expect(names(p.toScan)).toEqual(["main"]); // ONLY the default survives
+    expect(names(p.policyExcluded)).toEqual(["feat-a", "feat-b", "stale"]); // all non-defaults excluded-by-allow
+    expect(p.policyExcluded.every((d) => d.rawPolicyResult.kind === "excluded-by-allow")).toBe(true);
+    // the default carries the counterfactual (it too matched no allow entry)
+    expect(p.toScan[0]!.rawPolicyResult.kind).toBe("excluded-by-allow");
+  });
+
   test("the DEFAULT branch denied by policy STAYS eligible but records the counterfactual", () => {
     const policy = compileBranchPolicy(null, ["main", "feat-a"]); // deny includes the default
     const p = planRepoBranches(HEADS, policy, "2024-01-01", 25, "main");

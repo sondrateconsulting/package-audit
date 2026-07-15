@@ -106,6 +106,11 @@ describe("evaluateBranchPolicy — winner precedence + deny-before-allow", () =>
     expect(evaluateBranchPolicy(p, "release/1")).toEqual({ kind: "no-exclusion" });
     expect(evaluateBranchPolicy(p, "feature")).toEqual({ kind: "excluded-by-allow" });
   });
+  test("matching is case-SENSITIVE: 'dependabot/*' denies 'dependabot/x' but NOT 'Dependabot/x'", () => {
+    const p = compileBranchPolicy(null, ["dependabot/*"]);
+    expect(evaluateBranchPolicy(p, "dependabot/x")).toEqual({ kind: "excluded-by-deny", matchedPattern: "dependabot/*" });
+    expect(evaluateBranchPolicy(p, "Dependabot/x")).toEqual({ kind: "no-exclusion" }); // capital D → no match
+  });
 });
 
 describe("classifyBranch — default override preserves the counterfactual", () => {
