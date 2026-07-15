@@ -1,8 +1,22 @@
 import { expect, test, describe } from "bun:test";
-import { compileBranchPolicy, BranchPolicyError, type CompiledPattern } from "./branchPolicy.ts";
+import {
+  compileBranchPolicy, BranchPolicyError, PolicyMatchError, evaluateBranchPolicy, classifyBranch,
+  coverageForName, type CompiledPattern, type CompiledBranchPolicy,
+} from "./branchPolicy.ts";
 
 const names = (list: readonly CompiledPattern[] | null): string[] | null =>
   list === null ? null : list.map((c) => c.pattern);
+
+// A CompiledPattern whose glob THROWS at match time. compileBranchPolicy never produces one (no
+// real pattern throws at Bun.Glob construction), so fail-closed tests build these by hand.
+const throwingGlob = (thrown: unknown): Bun.Glob =>
+  ({ match() { throw thrown; } }) as unknown as Bun.Glob;
+const cp = (pattern: string, glob: Bun.Glob): CompiledPattern => ({ pattern, glob });
+// Hand-build a policy so tests can inject throwing globs and control canonical order directly.
+const policy = (
+  include: readonly CompiledPattern[] | null,
+  exclude: readonly CompiledPattern[],
+): CompiledBranchPolicy => ({ include, exclude });
 
 describe("compileBranchPolicy — structure + null/[] distinction", () => {
   test("include null stays null (unrestricted); exclude is always a list", () => {
@@ -62,5 +76,136 @@ describe("BranchPolicyError", () => {
     expect(e).toBeInstanceOf(Error);
     expect(e.name).toBe("BranchPolicyError");
     expect(e.message).toBe("boom");
+  });
+});
+
+describe("evaluateBranchPolicy — winner precedence + deny-before-allow", () => {
+  test("exact match beats an earlier-sorting glob (canonical exclude: '*' before 'main')", () => {
+    const p = compileBranchPolicy(null, ["*", "main"]);
+    expect(evaluateBranchPolicy(p, "main")).toEqual({ kind: "excluded-by-deny", matchedPattern: "main" });
+  });
+  test("no exact; the FIRST canonical-order glob wins", () => {
+    const p = compileBranchPolicy(null, ["feat*", "*-x"]); // canonical: ["*-x", "feat*"]
+    expect(evaluateBranchPolicy(p, "feat-x")).toEqual({ kind: "excluded-by-deny", matchedPattern: "*-x" });
+  });
+  test("deny wins over allow when both match", () => {
+    const p = compileBranchPolicy(["main"], ["main"]);
+    expect(evaluateBranchPolicy(p, "main")).toEqual({ kind: "excluded-by-deny", matchedPattern: "main" });
+  });
+  test("include=null is unrestricted, but deny is still evaluated", () => {
+    const p = compileBranchPolicy(null, ["dep*"]);
+    expect(evaluateBranchPolicy(p, "dependabot").kind).toBe("excluded-by-deny");
+    expect(evaluateBranchPolicy(p, "main")).toEqual({ kind: "no-exclusion" });
+  });
+  test("include=[] excludes every branch (excluded-by-allow, no matched pattern)", () => {
+    const p = compileBranchPolicy([], []);
+    expect(evaluateBranchPolicy(p, "feature")).toEqual({ kind: "excluded-by-allow" });
+  });
+  test("an allowlist match yields no-exclusion; a miss yields excluded-by-allow", () => {
+    const p = compileBranchPolicy(["release/*"], []);
+    expect(evaluateBranchPolicy(p, "release/1")).toEqual({ kind: "no-exclusion" });
+    expect(evaluateBranchPolicy(p, "feature")).toEqual({ kind: "excluded-by-allow" });
+  });
+});
+
+describe("classifyBranch — default override preserves the counterfactual", () => {
+  test("a non-default denied branch is ineligible", () => {
+    // "dep*" matches "dependabot" ('*' does not cross '/', so no slash in the name)
+    const p = compileBranchPolicy(null, ["dep*"]);
+    expect(classifyBranch(p, "dependabot", "main")).toEqual({
+      isDefaultBranch: false, eligible: false,
+      rawPolicyResult: { kind: "excluded-by-deny", matchedPattern: "dep*" },
+    });
+  });
+  test("a non-default denied branch using '**' matches across '/'", () => {
+    // to deny slash-containing bot branches, the operator uses '**' (crosses '/')
+    const p = compileBranchPolicy(null, ["dependabot/**"]);
+    expect(classifyBranch(p, "dependabot/npm/x", "main").eligible).toBe(false);
+    expect(classifyBranch(p, "dependabot/npm/x", "main").rawPolicyResult).toEqual({
+      kind: "excluded-by-deny", matchedPattern: "dependabot/**",
+    });
+  });
+  test("the default branch stays eligible even when policy WOULD deny it (raw result kept)", () => {
+    const c = classifyBranch(compileBranchPolicy(null, ["main"]), "main", "main");
+    expect(c.isDefaultBranch).toBe(true);
+    expect(c.eligible).toBe(true);
+    expect(c.rawPolicyResult).toEqual({ kind: "excluded-by-deny", matchedPattern: "main" });
+  });
+  test("the default branch stays eligible under an allowlist it does not match", () => {
+    const c = classifyBranch(compileBranchPolicy(["release/*"], []), "main", "main");
+    expect(c.eligible).toBe(true);
+    expect(c.rawPolicyResult).toEqual({ kind: "excluded-by-allow" });
+  });
+  test("a non-default allowlisted branch is eligible", () => {
+    expect(classifyBranch(compileBranchPolicy(["release/*"], []), "release/2", "main").eligible).toBe(true);
+  });
+});
+
+describe("fail-closed matching — a match-time throw is FATAL, never false", () => {
+  test("a glob match throw becomes PolicyMatchError (a denied branch is never let through)", () => {
+    const p = policy(null, [cp("aaa", throwingGlob(new Error("boom"))), cp("zzz", new Bun.Glob("zzz"))]);
+    expect(() => evaluateBranchPolicy(p, "something")).toThrow(PolicyMatchError);
+  });
+  test("the ALLOW-list (include) path also fails closed on a match throw (listKind='branches')", () => {
+    // empty exclude -> deny finds nothing -> evaluate falls through to the include matchWinner
+    const p = policy([cp("dep*", throwingGlob(new Error("boom")))], []);
+    let caught: unknown;
+    try {
+      evaluateBranchPolicy(p, "x");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(PolicyMatchError);
+    expect((caught as PolicyMatchError).listKind).toBe("branches");
+  });
+  test("an exact match short-circuits WITHOUT invoking that pattern's (throwing) glob", () => {
+    const p = policy(null, [cp("main", throwingGlob(new Error("should not run")))]);
+    expect(evaluateBranchPolicy(p, "main")).toEqual({ kind: "excluded-by-deny", matchedPattern: "main" });
+  });
+  test("an earlier throwing glob is fatal even though a later glob would have matched", () => {
+    const p = policy(null, [cp("aaa", throwingGlob(new Error("boom"))), cp("zzz", new Bun.Glob("*"))]);
+    expect(() => evaluateBranchPolicy(p, "zeta")).toThrow(PolicyMatchError);
+  });
+  test("classifying the DEFAULT branch still throws on a match failure (counterfactual eval runs)", () => {
+    const p = policy(null, [cp("aaa", throwingGlob(new Error("boom")))]);
+    expect(() => classifyBranch(p, "main", "main")).toThrow(PolicyMatchError);
+  });
+  test("PolicyMatchError carries list/pattern/branch; a non-Error cause is stringified", () => {
+    const p = policy(null, [cp("dep*", throwingGlob("weird"))]);
+    let caught: unknown;
+    try {
+      evaluateBranchPolicy(p, "x");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(PolicyMatchError);
+    const pe = caught as PolicyMatchError;
+    expect(pe.listKind).toBe("excludeBranches");
+    expect(pe.pattern).toBe("dep*");
+    expect(pe.branchName).toBe("x");
+    expect(pe.message).toContain('"dep*"');
+    expect(pe.message).toContain("excludeBranches");
+    expect(pe.message).toContain("weird");
+  });
+});
+
+describe("coverageForName — every matching pattern per list, kept separate", () => {
+  test("returns exact plus every glob match in canonical order", () => {
+    const p = compileBranchPolicy(["main", "*", "m*"], []); // canonical: ["*", "m*", "main"]
+    expect(coverageForName(p, "main").branches).toEqual(["*", "m*", "main"]);
+  });
+  test("include and exclude coverage are independent (the same string may be in both)", () => {
+    const p = compileBranchPolicy(["main"], ["main"]);
+    expect(coverageForName(p, "main")).toEqual({ branches: ["main"], excludeBranches: ["main"] });
+  });
+  test("unrestricted (include=null) has empty branches coverage", () => {
+    const p = compileBranchPolicy(null, ["dep*"]);
+    const cov = coverageForName(p, "dependabot");
+    expect(cov.branches).toEqual([]);
+    expect(cov.excludeBranches).toEqual(["dep*"]);
+  });
+  test("a throwing glob during coverage is fatal (no partial result)", () => {
+    const p = policy([cp("*", new Bun.Glob("*")), cp("zzz", throwingGlob(new Error("boom")))], []);
+    expect(() => coverageForName(p, "abc")).toThrow(PolicyMatchError);
   });
 });

@@ -78,3 +78,132 @@ export function compileBranchPolicy(
     exclude: compileList(exclude, "excludeBranches"),
   };
 }
+
+// ---- T3: matching ---------------------------------------------------------------------------
+// The winner/coverage APIs the classifier (T3) and pattern sweep (T7) consume. They take a NAME
+// (not a BranchHead) so this module stays a leaf; the run driver (T6) attaches the head.
+
+// Which configured list a pattern came from — threaded through matching so a fatal match-time
+// error names the operator-relevant list.
+type PolicyListKind = "branches" | "excludeBranches";
+
+// A fatal, operator-facing policy-evaluation failure: a compiled glob threw at .match() time.
+// Bun.Glob accepts malformed patterns at construction (e.g. "[" does not throw) and can fail only
+// here, data-dependently. We FAIL CLOSED — a throw becomes this error, NEVER a `false` result
+// (false for an exclude would be fail-OPEN: a denied branch silently scanned). Unlike
+// BranchPolicyError (always converted to ConfigError at load), this surfaces DIRECTLY: the run
+// driver (T6) calls db.failRun() and rethrows it unchanged, so it is registered in
+// KNOWN_OPERATOR_ERRORS and rendered message-only.
+export class PolicyMatchError extends Error {
+  readonly listKind: PolicyListKind;
+  readonly pattern: string;
+  readonly branchName: string;
+  constructor(listKind: PolicyListKind, pattern: string, branchName: string, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(
+      `branch policy pattern ${JSON.stringify(pattern)} (in ${listKind}) failed to match branch ${JSON.stringify(branchName)}: ${detail}`,
+    );
+    this.name = "PolicyMatchError";
+    this.listKind = listKind;
+    this.pattern = pattern;
+    this.branchName = branchName;
+    if (cause !== undefined) (this as { cause?: unknown }).cause = cause;
+  }
+}
+
+// The COUNTERFACTUAL policy decision for a branch (three outcomes that must never collapse):
+export type PolicyResult =
+  | { readonly kind: "excluded-by-deny"; readonly matchedPattern: string }
+  | { readonly kind: "excluded-by-allow" } // include non-null and matched NOTHING
+  | { readonly kind: "no-exclusion" }; //     unrestricted, or matched the allowlist
+
+// The ONLY place .glob.match() is invoked. Wrapped so a match-time throw becomes a fatal
+// PolicyMatchError — never `false`. The catch is scoped to the single .match() call so unrelated
+// programming errors keep their stacks.
+function safeMatch(p: CompiledPattern, listKind: PolicyListKind, name: string): boolean {
+  try {
+    return p.glob.match(name);
+  } catch (cause) {
+    throw new PolicyMatchError(listKind, p.pattern, name, cause);
+  }
+}
+
+// Highest-precedence match in a canonical list: exact string equality across the WHOLE list first
+// (no glob invoked — so an exact literal beats a glob that sorts earlier, e.g. "main" beats "*"),
+// then the FIRST canonical-order glob that matches. null if none.
+function matchWinner(
+  list: readonly CompiledPattern[],
+  listKind: PolicyListKind,
+  name: string,
+): CompiledPattern | null {
+  for (const p of list) if (p.pattern === name) return p; // pass 1: exact, no glob call
+  for (const p of list) if (safeMatch(p, listKind, name)) return p; // pass 2: first glob match
+  return null;
+}
+
+// The counterfactual policy decision for a branch NAME, deny-before-allow. Computed for EVERY
+// branch, INCLUDING the default (whose eligibility is overridden in classifyBranch) — so the
+// "would have been denied by X" fact is preserved. May throw PolicyMatchError (fail-closed).
+export function evaluateBranchPolicy(policy: CompiledBranchPolicy, name: string): PolicyResult {
+  const deny = matchWinner(policy.exclude, "excludeBranches", name);
+  if (deny !== null) return { kind: "excluded-by-deny", matchedPattern: deny.pattern };
+  if (policy.include === null) return { kind: "no-exclusion" }; // unrestricted
+  return matchWinner(policy.include, "branches", name) !== null
+    ? { kind: "no-exclusion" }
+    : { kind: "excluded-by-allow" };
+}
+
+// A branch's full classification. `eligible` is the AUTHORITATIVE scan-eligibility: the default
+// branch is ALWAYS eligible; a non-default branch is eligible iff policy did not exclude it.
+// `rawPolicyResult` is the RAW/counterfactual policy decision — for the default branch it may be
+// `excluded-by-*` while `eligible` stays true. Anything deciding whether to SCAN must read
+// `eligible`, never `rawPolicyResult` alone.
+export interface BranchClassification {
+  readonly isDefaultBranch: boolean;
+  readonly eligible: boolean;
+  readonly rawPolicyResult: PolicyResult;
+}
+
+// Classify a branch by name. `defaultBranch` is the repo's default branch NAME (not a boolean) so
+// the classifier — not the caller — decides default-ness. May throw PolicyMatchError (fail-closed).
+export function classifyBranch(
+  policy: CompiledBranchPolicy,
+  name: string,
+  defaultBranch: string,
+): BranchClassification {
+  const isDefaultBranch = name === defaultBranch;
+  const rawPolicyResult = evaluateBranchPolicy(policy, name);
+  return {
+    isDefaultBranch,
+    eligible: isDefaultBranch || rawPolicyResult.kind === "no-exclusion",
+    rawPolicyResult,
+  };
+}
+
+// Every pattern in `list` that matches `name` (exact OR glob), in canonical order. May throw
+// PolicyMatchError (fail-closed). NOTE: an exact match short-circuits WITHOUT invoking that
+// pattern's glob, so this is NOT comprehensive glob validation (a malformed pattern exactly equal
+// to a discovered name never throws here).
+function coverageList(
+  list: readonly CompiledPattern[],
+  listKind: PolicyListKind,
+  name: string,
+): string[] {
+  const out: string[] = [];
+  for (const p of list) if (p.pattern === name || safeMatch(p, listKind, name)) out.push(p.pattern);
+  return out;
+}
+
+// Coverage for BOTH lists, kept SEPARATE (the same string may legally appear in both). T7 unions
+// each list's matches across all discovered names to find configured patterns that matched
+// nothing. An unrestricted (`include === null`) or empty include has no patterns to cover.
+export interface PolicyCoverage {
+  readonly branches: readonly string[];
+  readonly excludeBranches: readonly string[];
+}
+export function coverageForName(policy: CompiledBranchPolicy, name: string): PolicyCoverage {
+  return {
+    branches: policy.include === null ? [] : coverageList(policy.include, "branches", name),
+    excludeBranches: coverageList(policy.exclude, "excludeBranches", name),
+  };
+}
