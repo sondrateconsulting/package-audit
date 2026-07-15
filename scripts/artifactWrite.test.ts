@@ -565,7 +565,10 @@ describe("ArtifactBundle — cross-kind manifest adoption (export + dossier shar
     // would reserialize as bytes:null); evil2 has a non-hex sha256.
     writeFileSync(
       join(out, XRAY_DIR_NAME, "manifest.json"),
-      `{"formatVersion":1,"runId":"run-1","artifacts":[` +
+      // formatVersion MUST match the current version — otherwise adoption bails on the
+      // version gate (line ~256) and the poison entries are never even evaluated, making
+      // this test pass for the wrong reason.
+      `{"formatVersion":${XRAY_FORMAT_VERSION},"runId":"run-1","artifacts":[` +
         `{"path":"evil1.csv","kind":"export","sha256":"${"0".repeat(64)}","bytes":1e400},` +
         `{"path":"evil2.csv","kind":"export","sha256":"nothex","bytes":5}]}`,
     );

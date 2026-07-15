@@ -37,7 +37,7 @@ The finished run writes `output/run-<run_id>.json` and `output/latest.json`. A l
 
 ### Data exports (`export`)
 
-`bun run export` writes run-scoped CSV + JSONL snapshots of the four audit tables (plus a `manifest.json`) into `output/xray/` — the same run-selection and snapshot semantics as the report, portable into Sheets, Excel, DuckDB, and jq. `--run-id <id>` exports a historical run; `--raw` is a loudly-labeled full-table forensic dump. The column-by-column contract is [EXPORTS.md](EXPORTS.md) (sync-tested against the writers). See [Analyze the exports](#analyze-the-exports) below.
+`bun run export` writes run-scoped CSV + JSONL snapshots of the five audit tables (plus a `manifest.json`) into `output/xray/` — the same run-selection and snapshot semantics as the report, portable into Sheets, Excel, DuckDB, and jq. `--run-id <id>` exports a historical run; `--raw` is a loudly-labeled full-table forensic dump. The column-by-column contract is [EXPORTS.md](EXPORTS.md) (sync-tested against the writers). See [Analyze the exports](#analyze-the-exports) below.
 
 ### Run comparison (`compare`)
 
@@ -101,6 +101,16 @@ FROM 'output/xray/dependency_findings.csv'
 WHERE resolved_version IS NOT NULL AND resolved_version_source IS NOT NULL
 GROUP BY resolved_version
 ORDER BY declarations DESC, resolved_version;
+```
+
+Branches excluded by branch policy, by disposition and causing pattern (a scanned default-branch override carries a `policy_status` too, so filter to the cutoff-skipped rows for genuine exclusions):
+
+```sql
+SELECT policy_status, policy_matched_pattern, COUNT(*) AS branches
+FROM 'output/xray/run_unit_head.csv'
+WHERE status = 'skipped-cutoff' AND policy_status IS NOT NULL
+GROUP BY policy_status, policy_matched_pattern
+ORDER BY policy_status, policy_matched_pattern;
 ```
 
 Published exports nobody imports (per the scanned slice):

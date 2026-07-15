@@ -1,6 +1,6 @@
 # EXPORTS.md — the data contract for `bun run export`
 
-`export` writes run-scoped snapshots of the four audit tables as CSV **and** JSONL under
+`export` writes run-scoped snapshots of the five audit tables as CSV **and** JSONL under
 `<outputDir>/xray/`, plus a `manifest.json` written last. This document is the contract for
 those files. It is **sync-tested against the code**: the column tables and row-order lines
 below are parsed by `scripts/exportsDoc.test.ts` and compared to the column registry in
@@ -26,7 +26,7 @@ Run selection: `--run-id <id>`, or the latest completed reportable run by defaul
 
 ## `--raw`: the forensic escape hatch
 
-`--raw` dumps **every row of the four tables** — including introspection marker rows, rows from
+`--raw` dumps **every row of the five tables** — including introspection marker rows, rows from
 other runs and other configs, and rows superseded by later scans. Filenames gain a `raw-`
 prefix and the export emits a loud `warning` JSONL event. Raw dumps are for forensics; the
 run-scoped default is the supported contract. **Stale data warning:** raw rows may span
@@ -39,6 +39,7 @@ multiple runs and configurations — never treat a raw dump as any single run's 
 | `dependency_findings.csv` / `.jsonl` | manifest/lockfile declarations of tracked packages |
 | `usage_findings.csv` / `.jsonl` | usage sites (imports/requires/re-exports/CLI invocations) |
 | `package_api_surface.csv` / `.jsonl` | introspected exports/bins per (package, version) |
+| `run_unit_head.csv` / `.jsonl` | the run's per-branch disposition snapshot — every branch (scanned / cutoff-skipped / past-cap / policy-excluded) with its branch-policy attribution |
 | `runs.csv` / `.jsonl` | the selected run's metadata row |
 | `manifest.json` | `{formatVersion, runId, artifacts:[{path, kind, sha256, bytes}]}` — written **last**; artifacts in `xray/` not listed in a coherent manifest are swept by the next generation |
 
@@ -72,9 +73,9 @@ Row order is total (each table's full unique key) and documented per table below
 
 ## Versioning
 
-The manifest's `formatVersion` (currently 1) covers the artifact set, the manifest shape,
+The manifest's `formatVersion` (currently 2) covers the artifact set, the manifest shape,
 and the column contract below. Any breaking change to this contract bumps it; bumping it is
-the one sanctioned way the golden fixtures change.
+the one sanctioned way the golden fixtures change. (v2 added the `run_unit_head` table.)
 
 ## dependency_findings
 
@@ -152,6 +153,33 @@ shared across runs.
 | introspected_at | string |
 
 Row order: `package_name, version, export_kind, export_name`
+
+## run_unit_head
+
+One row per branch the run discovered — the immutable per-run disposition snapshot. Unlike the
+findings tables, this exports EVERY disposition (the branch-policy columns live largely on the
+non-scanned rows). Scoped to the selected run only (`--raw` dumps all runs).
+
+| column | type |
+|---|---|
+| run_id | string |
+| organization | string |
+| repository | string |
+| branch | string |
+| commit_sha | string |
+| status | string |
+| is_default_branch | nullable-number |
+| policy_status | nullable-string |
+| policy_matched_pattern | nullable-string |
+| scanned_commit_date | nullable-string |
+
+Row order: `run_id, organization, repository, branch`
+
+Notes: `status` is `scanned` / `skipped-cutoff` / `past-cap`. `policy_status` (`excluded-by-deny` /
+`excluded-by-allow` / null) is the branch allow/deny decision; on a `skipped-cutoff` row it marks a
+policy exclusion, on a `scanned` row it marks a default-branch override. `policy_matched_pattern` is
+the causing deny pattern (null otherwise). `scanned_commit_date` is the scanned commit's date on a
+scanned row, the discovered-head date otherwise (null only for pre-v4 migrated rows).
 
 ## runs
 

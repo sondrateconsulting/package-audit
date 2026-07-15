@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb } from "./db.ts";
+import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import { buildReport } from "./report.ts";
 import { ArtifactBundle, ArtifactWriteError } from "./artifactWrite.ts";
 import {
@@ -46,8 +47,8 @@ const FIXED_CTX: DossierContext = {
   runId: "run-fixture",
   generatedAt: T0,
   config: { cutoffDate: "2024-01-01", githubHost: "github.com", organizations: ["org-a"] },
-  summary: { repositoriesScanned: 2, branchesScanned: 3, branchesSkippedByCutoff: 1 },
-  formatVersion: 1,
+  summary: { repositoriesScanned: 2, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+  formatVersion: XRAY_FORMAT_VERSION,
 };
 
 // Seed idiom from report.test.ts, with deterministic timestamps and a DEFAULT-BRANCH unit plus a
@@ -138,8 +139,8 @@ const syntheticPkg = (units: DossierUnit[], over: Partial<DossierPackage> = {}):
 // now emitted as a `<https://…>` angle-bracket autolink (was a bare URL through mdCell) so a path
 // with `(`/`)` keeps a correct link destination. Copy-markdown `<template>` bytes only (dossier
 // golden); the visible dossier HTML permalink (permalinkAnchor) is byte-unchanged.
-const GOLDEN_DOSSIER_SHA256 = "ef784e8cca60ddf3c16e2b069959485846cd7a44fedbe09ddf9f53940f4d502c";
-const GOLDEN_EMPTY_SHA256 = "dbf98a9aa63bc94212e930355cc8fcc87e28804080caa55ead1299fc6eda9a34";
+const GOLDEN_DOSSIER_SHA256 = "1b82113ec0f20fdfb49475f0457dd2c294a5d211bdb4da874ec019b123fac93a";
+const GOLDEN_EMPTY_SHA256 = "36ccb2eccf26d98e30bf1c10a0337c6b78cd9a8f1ea6466a5c880c2e9010e97c";
 
 describe("renderDossier — determinism and golden bytes", () => {
   test("double-render byte equality (same DB, two builds, two renders)", () => {
@@ -158,6 +159,23 @@ describe("renderDossier — determinism and golden bytes", () => {
     const pkgs = fixturePackages();
     const html = renderDossier(pkgs[1]!, FIXED_CTX); // left-pad: tracked, zero findings
     expect(createHash("sha256").update(html, "utf8").digest("hex")).toBe(GOLDEN_EMPTY_SHA256);
+  });
+});
+
+describe("renderDossier — footer scan-scope receipt (§5)", () => {
+  test("policy counts drive a compact receipt linking the run index; absent when nothing was dropped", () => {
+    const [pkg] = fixturePackages();
+    // default fixture: no policy exclusions, no cap deferrals → NO receipt clause
+    const plain = renderDossier(pkg!, FIXED_CTX);
+    expect(plain).not.toContain("excluded by policy");
+    expect(plain).not.toContain("index.html#scan-scope");
+    // once policy drops or the cap defers branches, the footer carries the receipt + the anchor link
+    const withPolicy = renderDossier(pkg!, {
+      ...FIXED_CTX,
+      summary: { ...FIXED_CTX.summary, branchesExcludedByPolicy: 4, branchesPastCap: 2 },
+    });
+    expect(withPolicy).toContain("4 excluded by policy, 2 past cap");
+    expect(withPolicy).toContain('<a href="index.html#scan-scope">scan scope</a>');
   });
 });
 
@@ -224,8 +242,8 @@ describe("renderDossier — content contract on the real report object", () => {
   });
 
   test("format version: meta tag + footer line", () => {
-    expect(html).toContain('<meta name="xray-format-version" content="1">');
-    expect(html).toContain("report-format version 1");
+    expect(html).toContain(`<meta name="xray-format-version" content="${XRAY_FORMAT_VERSION}">`);
+    expect(html).toContain(`report-format version ${XRAY_FORMAT_VERSION}`);
     expect(html).toContain("run run-fixture");
   });
 
@@ -471,7 +489,7 @@ describe("empty state (CEO addendum 12 + CT4)", () => {
 
   test("keeps the byte-identical static script and the format-version footer", () => {
     expect(html).toContain(`<script>${STATIC_SCRIPT}</script>`);
-    expect(html).toContain("report-format version 1");
+    expect(html).toContain(`report-format version ${XRAY_FORMAT_VERSION}`);
     const detailed = renderDossierDetailed(pkg, FIXED_CTX);
     expect(detailed.observationsStatus).toBe("emitted");
     expect(detailed.observationCount).toBe(0);

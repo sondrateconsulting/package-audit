@@ -15,6 +15,10 @@ import { z } from "zod";
 // module never touches the DB: the enum literals below are pinned to db.ts's unions at compile
 // time, so a new/renamed member on either side fails `bun run typecheck` instead of drifting.
 import type { ExportKind, UsageType } from "./db.ts";
+// Runtime value import — a plain numeric const, NO cycle (artifactWrite imports only node built-ins +
+// readOnlyGuard). Pins formatVersion below so the schema is a TRUE shape discriminator: a v2-shaped
+// report mislabeled formatVersion:1 must FAIL validation, and a version bump auto-updates the literal.
+import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 
 const semverish = z.string().min(1);
 // The nowIso canonical form (db.ts validates writes against the same shape) — every timestamp
@@ -161,15 +165,36 @@ export const summarySchema = z
   .strictObject({
     organizationsScanned: z.number().int().min(0).describe("DISTINCT orgs among the run's scanned branch snapshots"),
     repositoriesScanned: z.number().int().min(0).describe("DISTINCT org/repo among scanned snapshots"),
-    branchesScanned: z.number().int().min(0).describe("run_unit_head rows with status='scanned' (includes skipped-as-current units)"),
-    branchesSkippedByCutoff: z.number().int().min(0).describe("Still-live branches whose head predates cutoffDate this run"),
+    branchesScanned: z.number().int().min(0).describe("run_unit_head rows with status='scanned' (includes skipped-as-current + scanned default-override units)"),
+    branchesSkippedByCutoff: z.number().int().min(0).describe("GENUINE cutoff skips only: skipped-cutoff rows with policy_status NULL"),
+    branchesExcludedByPolicy: z.number().int().min(0).describe("Branch allow/deny exclusions: skipped-cutoff rows carrying a policy_status"),
+    branchesPastCap: z.number().int().min(0).describe("Eligible branches past the per-repo cap (not scanned this run)"),
     totalDependencyFindings: z.number().int().min(0),
     totalUsageFindings: z.number().int().min(0),
   })
-  .describe("Per-run totals derived from the immutable run_unit_head snapshot — never from the mutable work queue");
+  .describe("Per-run DISJOINT disposition partition + finding totals, from the immutable run_unit_head snapshot. totalHeads = scanned + skippedByCutoff + excludedByPolicy + pastCap");
+
+export const policyBranchSchema = z.strictObject({
+  organization: z.string(),
+  repository: z.string(),
+  branch: z.string(),
+  disposition: z.enum(["excluded", "scanned-default-override"]),
+  policyStatus: z.enum(["excluded-by-deny", "excluded-by-allow"]),
+  matchedPattern: z.string().nullable().describe("The causing deny pattern; null for an allow-miss / default-override-by-allow"),
+});
+export const scanScopeSchema = z
+  .strictObject({
+    excludedByDeny: z.number().int().min(0),
+    excludedByAllow: z.number().int().min(0),
+    defaultBranchPolicyOverrides: z.number().int().min(0).describe("OVERLAPPING diagnostic (within branchesScanned): scanned default branches policy would have excluded"),
+    policyBranches: z.array(policyBranchSchema).describe("Every head with a policy_status, sorted (organization, repository, branch)"),
+    provenance: z.enum(["complete", "pre-upgrade"]).describe("'pre-upgrade' when migrated from before v4 (a head has NULL scanned_commit_date): past-cap + policy counts UNDERSTATE what the run omitted"),
+  })
+  .describe("Branch allow/deny scan-scope diagnostics (§5) — SEPARATE from the disjoint summary counts (subcounts overlap)");
 
 export const reportSchema = z
   .strictObject({
+    formatVersion: z.literal(XRAY_FORMAT_VERSION).describe("XRAY_FORMAT_VERSION — the report/export/HTML artifact-set version (§10); PINNED so this schema is a true shape discriminator"),
     runId: z.string().describe("The reported run's identifier (report --run-id <id> re-emits it)"),
     generatedAt: isoUtc.describe("completed_at of the run (started_at fallback for a --run-id report of a non-completed run)"),
     config: z.strictObject({
@@ -182,6 +207,7 @@ export const reportSchema = z
     packages: z.array(packageReportSchema).describe("Sorted by name"),
     errors: z.array(reportErrorSchema).describe("Sorted (occurredAt, id)"),
     summary: summarySchema,
+    scanScope: scanScopeSchema,
   })
   .describe("The §7 consolidated report: deterministic, byte-reproducible, generated from SQLite alone");
 

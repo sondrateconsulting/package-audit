@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { AuditDb, nowIso } from "./db.ts";
 import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
+import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import type { Config } from "./config.ts";
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
@@ -78,7 +79,13 @@ describe("buildReport (§7)", () => {
 
     expect(report.summary).toEqual({
       organizationsScanned: 1, repositoriesScanned: 1, branchesScanned: 1,
-      branchesSkippedByCutoff: 1, totalDependencyFindings: 1, totalUsageFindings: 2,
+      branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0,
+      totalDependencyFindings: 1, totalUsageFindings: 2,
+    });
+    // T8: new top-level report fields
+    expect(report.formatVersion).toBe(XRAY_FORMAT_VERSION);
+    expect(report.scanScope).toEqual({
+      excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "complete",
     });
     db.close();
   });
@@ -112,6 +119,104 @@ describe("buildReport (§7)", () => {
     );
     expect(flags).toEqual({ svc: null, "r-default": true, "r-feature": false });
     db.close();
+  });
+
+  test("§5 disposition partition + scanScope across all four buckets (deny/allow/default-override/past-cap)", () => {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const head = (branch: string, status: "scanned" | "skipped-cutoff" | "past-cap", extra: {
+      isDefaultBranch?: boolean | null; policyStatus?: "excluded-by-deny" | "excluded-by-allow" | null; policyMatchedPattern?: string | null;
+    } = {}): void => {
+      db.upsertRunUnitHead({
+        runId, organization: "org-a", repository: "svc", branch,
+        commitSha: status === "scanned" ? `sha-${branch}` : "",
+        status, isDefaultBranch: extra.isDefaultBranch ?? null,
+        policyStatus: extra.policyStatus ?? null, policyMatchedPattern: extra.policyMatchedPattern ?? null,
+        // required non-null on every write: scanned commit's date on a scanned row, discovered-head date otherwise
+        scannedCommitDate: "2025-06-01T12:00:00Z",
+      });
+    };
+    // 3 scanned (one a default-branch override that a deny pattern would otherwise exclude),
+    // 1 genuine cutoff, 1 deny-excluded, 1 allow-miss-excluded, 1 past-cap → 7 heads total.
+    head("main", "scanned", { isDefaultBranch: true });
+    head("develop", "scanned", { isDefaultBranch: false });
+    const hostilePattern = "release/<img src=x onerror=alert(1)>*"; // carried verbatim in the JSON model
+    head("release/9.0", "scanned", { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: hostilePattern });
+    head("stale", "skipped-cutoff"); // genuine cutoff (no policy) — is_default_branch may stay null
+    // policy-excluded + past-cap rows are known non-defaults → is_default_branch MUST be false
+    head("feature/x", "skipped-cutoff", { isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*" });
+    head("wip/y", "skipped-cutoff", { isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null }); // allow-list miss
+    head("over-cap", "past-cap", { isDefaultBranch: false });
+    db.completeRun(runId);
+    const report = buildReport(db, db.getRun(runId)!) as any;
+
+    const s = report.summary;
+    expect(s).toMatchObject({
+      branchesScanned: 3, // includes the default-override row
+      branchesSkippedByCutoff: 1, // genuine cutoff ONLY (policy exclusions are their own bucket)
+      branchesExcludedByPolicy: 2,
+      branchesPastCap: 1,
+    });
+    // the four disposition buckets are a disjoint partition of every discovered head
+    const totalHeads = 7;
+    expect(s.branchesScanned + s.branchesSkippedByCutoff + s.branchesExcludedByPolicy + s.branchesPastCap).toBe(totalHeads);
+
+    expect(report.scanScope).toEqual({
+      excludedByDeny: 1, // feature/x — the default-override deny does NOT count as an exclusion
+      excludedByAllow: 1, // wip/y
+      defaultBranchPolicyOverrides: 1, // release/9.0
+      policyBranches: [
+        { organization: "org-a", repository: "svc", branch: "feature/x", disposition: "excluded", policyStatus: "excluded-by-deny", matchedPattern: "feature/*" },
+        { organization: "org-a", repository: "svc", branch: "release/9.0", disposition: "scanned-default-override", policyStatus: "excluded-by-deny", matchedPattern: hostilePattern },
+        { organization: "org-a", repository: "svc", branch: "wip/y", disposition: "excluded", policyStatus: "excluded-by-allow", matchedPattern: null },
+      ],
+      provenance: "complete", // every head carries a non-null scanned_commit_date
+    });
+    // hostile pattern is carried BYTE-VERBATIM in the data model — escaping is the HTML layer's job
+    expect(report.scanScope.policyBranches[1].matchedPattern).toBe(hostilePattern);
+    db.close();
+  });
+
+  test("a completed run with ZERO heads has unverifiable provenance → 'pre-upgrade', never a false 'complete'", () => {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    db.completeRun(runId); // reportable, but no run_unit_head rows were ever written (e.g. all discovery failed)
+    const report = buildReport(db, db.getRun(runId)!) as any;
+    // zero heads carry NO sentinel, so `.some()` is vacuously false — must NOT be reported as complete
+    expect(report.scanScope.provenance).toBe("pre-upgrade");
+    expect(report.summary.branchesScanned).toBe(0);
+    db.close();
+  });
+
+  test("a migrated pre-v4 run (NULL scanned_commit_date sentinel) marks scanScope provenance 'pre-upgrade'", () => {
+    // file-backed: the forge trick (a NULL scanned_commit_date the write path forbids) needs a real
+    // DB handle. Same ./data containment idiom as the runReport file tests below.
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-prov-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const run = seed(db); // heads carry non-null dates → a fresh run would be "complete"
+      db.close();
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.exec("UPDATE run_unit_head SET scanned_commit_date = NULL"); // the pre-v4 migration state
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      const report = buildReport(db2, db2.getRun(run.runId)!) as any;
+      expect(report.scanScope.provenance).toBe("pre-upgrade");
+      // the counts still render (best-available) — provenance is what tells the reader they understate
+      expect(report.summary.branchesScanned).toBe(1);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
   });
 
   test("a version whose introspection FAILED (no marker) is omitted from apiSurface but kept in versionsSeen", () => {
@@ -159,6 +264,18 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
     const run = seed(db);
     const drifted = { ...buildReport(db, run), extraField: 1 };
     expect(reportSchema.safeParse(drifted).success).toBe(false);
+    db.close();
+  });
+  test("formatVersion is PINNED to XRAY_FORMAT_VERSION — a mislabeled v-shape fails the discriminator", () => {
+    const db = mem();
+    const run = seed(db);
+    const report = buildReport(db, run);
+    expect(report.formatVersion).toBe(XRAY_FORMAT_VERSION);
+    expect(reportSchema.safeParse(report).success).toBe(true); // the real version validates
+    // a v2-shaped report mislabeled as another version must NOT pass the authoritative contract
+    for (const wrong of [1, -1, 999]) {
+      expect(reportSchema.safeParse({ ...report, formatVersion: wrong }).success).toBe(false);
+    }
     db.close();
   });
   test("the REAL not-reportable notice (all three branches) matches its schema", () => {

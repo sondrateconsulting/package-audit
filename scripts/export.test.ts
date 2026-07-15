@@ -178,7 +178,7 @@ describe("parseExportArgs", () => {
 });
 
 describe("EXPORT_REGISTRY ↔ live schema sync (the runtime half of the Equal<> type sync)", () => {
-  test("registry keys cover exactly the four export tables", () => {
+  test("registry keys cover exactly the five export tables", () => {
     expect([...EXPORT_TABLE_NAMES].map(String).sort()).toEqual(Object.keys(EXPORT_REGISTRY).sort());
   });
 
@@ -197,8 +197,10 @@ describe("EXPORT_REGISTRY ↔ live schema sync (the runtime half of the Equal<> 
           expect(`${table}.${n}@${idx}`).not.toBe(`${table}.${n}@-1`);
           from = idx + 1;
         }
-        // the ONLY declared columns not exported are the AUTOINCREMENT ids (storage detail)
-        expect(declared.filter((n) => !names.includes(n))).toEqual(table === "runs" ? [] : ["id"]);
+        // the ONLY declared columns not exported are the AUTOINCREMENT ids (storage detail). runs and
+        // run_unit_head have no surrogate id (composite PKs), so ALL their columns are exported.
+        const noId = table === "runs" || table === "run_unit_head";
+        expect(declared.filter((n) => !names.includes(n))).toEqual(noId ? [] : ["id"]);
         // ORDER BY keys are registry columns (the chain the contract documents)
         for (const k of orderBy) expect(names).toContain(k);
       }
@@ -228,7 +230,7 @@ describe("exportRun — run-scoped snapshot (default)", () => {
     expect(runs[0]!["tracked_packages"]).toBe('["expo"]'); // TEXT column exported verbatim
 
     const summary = JSON.parse(result.line) as Record<string, unknown>;
-    expect(summary).toEqual({ event: "export-summary", runId: newRun.runId, raw: false, artifacts: 8, swept: [] });
+    expect(summary).toEqual({ event: "export-summary", runId: newRun.runId, raw: false, artifacts: 10, swept: [] });
     db.close();
   });
 
@@ -253,11 +255,12 @@ describe("exportRun — run-scoped snapshot (default)", () => {
     const out = nextOutputDir();
     const { out: stdout, err } = await capture(() => exportRun(db, newRun, out, { raw: false }));
     const events = stdout.split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
-    expect(events).toHaveLength(8);
+    expect(events).toHaveLength(10);
     expect(events.every((e) => e["event"] === "export")).toBe(true);
     expect(events.map((e) => `${e["table"]}.${e["format"]}`)).toEqual([
       "dependency_findings.csv", "dependency_findings.jsonl",
       "package_api_surface.csv", "package_api_surface.jsonl",
+      "run_unit_head.csv", "run_unit_head.jsonl",
       "runs.csv", "runs.jsonl",
       "usage_findings.csv", "usage_findings.jsonl",
     ]);
@@ -315,6 +318,71 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     }
     db.close();
   });
+
+  // Seed ONE completed run whose run_unit_head carries all four dispositions + the nullable policy
+  // columns, one deny pattern shaped like a spreadsheet formula. Exercises the new export table's
+  // row output, ORDER BY, nullable→empty/JSON-null mapping, typed-number cells, and CSV formula defense.
+  function seedPolicyHeads(db: AuditDb): RunRecord {
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const D = "2025-06-01T12:00:00Z";
+    const base = { runId, organization: "org-a", repository: "svc", scannedCommitDate: D };
+    // deny-excluded with a formula-shaped pattern (branch sorts first)
+    db.upsertRunUnitHead({ ...base, branch: "feature-x", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "=cmd|calc" });
+    // scanned default (policy-clean)
+    db.upsertRunUnitHead({ ...base, branch: "main", commitSha: "aaa111", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null });
+    // allow-list miss (pattern is NULL → empty CSV / JSON null)
+    db.upsertRunUnitHead({ ...base, branch: "stale", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null });
+    // past the per-repo cap (never carries policy)
+    db.upsertRunUnitHead({ ...base, branch: "wip", commitSha: "", status: "past-cap", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null });
+    db.completeRun(runId);
+    return db.getRun(runId)!;
+  }
+
+  test("run_unit_head.csv: every disposition, nullable→empty, typed-number cells, formula defense on the deny pattern", async () => {
+    const db = mem();
+    const run = seedPolicyHeads(db);
+    const out = nextOutputDir();
+    await capture(() => exportRun(db, run, out, { raw: false }));
+    const id = run.runId;
+    const D = "2025-06-01T12:00:00Z";
+    const header = "run_id,organization,repository,branch,commit_sha,status,is_default_branch,policy_status,policy_matched_pattern,scanned_commit_date";
+    // rows in ORDER BY (run_id, organization, repository, branch); '=cmd|calc' → literal apostrophe
+    // prefix (formula defense); is_default_branch is a typed number (never prefixed); NULLs are empty.
+    const feature = `${id},org-a,svc,feature-x,,skipped-cutoff,0,excluded-by-deny,'=cmd|calc,${D}`;
+    const main = `${id},org-a,svc,main,aaa111,scanned,1,,,${D}`;
+    const stale = `${id},org-a,svc,stale,,skipped-cutoff,0,excluded-by-allow,,${D}`;
+    const wip = `${id},org-a,svc,wip,,past-cap,0,,,${D}`;
+    expect(readXray(out, "run_unit_head.csv")).toBe([header, feature, main, stale, wip].join("\r\n") + "\r\n");
+    db.close();
+  });
+
+  test("run_unit_head.jsonl: registry key order, byte-faithful pattern (no defense apostrophe), JSON null/number", async () => {
+    const db = mem();
+    const run = seedPolicyHeads(db);
+    const out = nextOutputDir();
+    await capture(() => exportRun(db, run, out, { raw: false }));
+    const content = readXray(out, "run_unit_head.jsonl");
+    const lines = content.split("\n").filter((l) => l.length > 0);
+    expect(lines).toHaveLength(4);
+    // exact first line (feature-x): keys in registry order, is_default_branch a JSON number, pattern byte-faithful
+    expect(lines[0]).toBe(
+      JSON.stringify({
+        run_id: run.runId, organization: "org-a", repository: "svc", branch: "feature-x",
+        commit_sha: "", status: "skipped-cutoff", is_default_branch: 0,
+        policy_status: "excluded-by-deny", policy_matched_pattern: "=cmd|calc", scanned_commit_date: "2025-06-01T12:00:00Z",
+      }),
+    );
+    // no formula-defense apostrophe in JSONL; the scanned default carries JSON null policy columns
+    expect(content).toContain('"policy_matched_pattern":"=cmd|calc"');
+    expect(content).toContain('"branch":"main","commit_sha":"aaa111","status":"scanned","is_default_branch":1,"policy_status":null,"policy_matched_pattern":null');
+    for (const line of lines) {
+      expect(Object.keys(JSON.parse(line) as object)).toEqual(EXPORT_REGISTRY.run_unit_head.columns.map((c) => c.name));
+    }
+    db.close();
+  });
 });
 
 describe("exportRun --raw (forensic full-table dump)", () => {
@@ -333,6 +401,7 @@ describe("exportRun --raw (forensic full-table dump)", () => {
       "manifest.json",
       "raw-dependency_findings.csv", "raw-dependency_findings.jsonl",
       "raw-package_api_surface.csv", "raw-package_api_surface.jsonl",
+      "raw-run_unit_head.csv", "raw-run_unit_head.jsonl",
       "raw-runs.csv", "raw-runs.jsonl",
       "raw-usage_findings.csv", "raw-usage_findings.jsonl",
     ]);
@@ -350,7 +419,7 @@ describe("exportRun --raw (forensic full-table dump)", () => {
     expect(manifest.runId).toBe(newRun.runId);
 
     expect(err).toContain("RAW EXPORT");
-    expect(JSON.parse(result.line)).toMatchObject({ event: "export-summary", raw: true, artifacts: 8 });
+    expect(JSON.parse(result.line)).toMatchObject({ event: "export-summary", raw: true, artifacts: 10 });
     db.close();
   });
 });
@@ -370,11 +439,12 @@ describe("bundle integration (xray/ containment, manifest, sweep)", () => {
       runId: string; artifacts: Array<{ path: string; kind: string }>;
     };
     expect(manifest.runId).toBe(newRun.runId);
-    expect(manifest.artifacts).toHaveLength(8);
+    expect(manifest.artifacts).toHaveLength(10);
     expect(manifest.artifacts.every((a) => a.kind === "export")).toBe(true);
     expect(manifest.artifacts.map((a) => a.path)).toEqual([
       "dependency_findings.csv", "dependency_findings.jsonl",
       "package_api_surface.csv", "package_api_surface.jsonl",
+      "run_unit_head.csv", "run_unit_head.jsonl",
       "runs.csv", "runs.jsonl",
       "usage_findings.csv", "usage_findings.jsonl",
     ]);

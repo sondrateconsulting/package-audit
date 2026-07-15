@@ -155,7 +155,7 @@ export function runSummaryText(
     `AUDIT COMPLETE — run ${runId}`,
     `  Organizations scanned:  ${s.organizationsScanned}`,
     `  Repositories scanned:   ${s.repositoriesScanned}`,
-    `  Branches scanned:       ${s.branchesScanned} (${s.branchesSkippedByCutoff} skipped by cutoff)`,
+    `  Branches scanned:       ${s.branchesScanned} (${s.branchesSkippedByCutoff} skipped by cutoff · ${s.branchesExcludedByPolicy} excluded by policy · ${s.branchesPastCap} past cap)`,
     `  Dependency findings:    ${s.totalDependencyFindings}`,
     `  Usage findings:         ${s.totalUsageFindings}`,
     `  Errors recorded:        ${errorCount} (fail-soft; details in the report's errors[])`,

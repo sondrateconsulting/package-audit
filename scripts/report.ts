@@ -12,9 +12,10 @@ import { assertContained } from "./readOnlyGuard.ts";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
 import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
-import { dossierFilename, renderDossierDetailed, type DossierContext } from "./reportHtml.ts";
+import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
 import { logLine } from "./log.ts";
+import { isPolicyExcluded, isDefaultOverride } from "./policyDisposition.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
 import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -37,6 +38,9 @@ interface UsageRowDb {
 interface HeadRow {
   organization: string; repository: string; branch: string; commit_sha: string; status: string;
   is_default_branch: number | null; // 1/0/NULL — NULL = unknown (pre-v3 run rows)
+  policy_status: string | null; // 'excluded-by-deny' | 'excluded-by-allow' | NULL (branch allow/deny §3)
+  policy_matched_pattern: string | null; // the causing deny pattern; NULL for allow-miss / no-policy
+  scanned_commit_date: string | null; // NULL only for pre-v4 migrated rows → scan-scope provenance sentinel
 }
 
 function unitKey(o: string, r: string, b: string, c: string): string {
@@ -51,9 +55,20 @@ export interface ReportSummary {
   repositoriesScanned: number;
   branchesScanned: number;
   branchesSkippedByCutoff: number;
+  // Branch allow/deny (§5): the disjoint disposition partition —
+  //   totalHeads = branchesScanned + branchesSkippedByCutoff + branchesExcludedByPolicy + branchesPastCap.
+  // branchesScanned INCLUDES scanned default-override rows (they WERE scanned). branchesSkippedByCutoff
+  // is now GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket.
+  branchesExcludedByPolicy: number;
+  branchesPastCap: number;
   totalDependencyFindings: number;
   totalUsageFindings: number;
 }
+
+// ScanScope + PolicyBranchRow are defined in reportHtml.ts (the render layer, to avoid an import
+// cycle) and imported above. Semantics (§5): excludedByDeny+excludedByAllow = branchesExcludedByPolicy;
+// defaultBranchPolicyOverrides OVERLAPS branchesScanned (scanned default branches policy would have
+// excluded). policyBranches lists every row carrying a policy_status, sorted (org, repo, branch).
 
 // Top-level envelope of the emitted report. `packages` is typed as the exact shape buildPackage
 // emits, which (by construction — see report.ts's apiSurface typing) stays assignable to the
@@ -63,12 +78,14 @@ export interface ReportSummary {
 // cli, dateFetched — a superset of the renderer's view) is preserved for run-<id>.json; its JSON
 // contract is separately enforced by reportSchema.ts in tests. errors[] stays untyped (leaf only).
 export interface EmittedReport {
+  formatVersion: number; // XRAY_FORMAT_VERSION — the report/export/HTML artifact-set version (§10)
   runId: string;
   generatedAt: string;
   config: { packages: string[]; cutoffDate: string; githubHost: string; organizations: string[]; organizationsSource: string };
   packages: ReadonlyArray<ReturnType<typeof buildPackage>>;
   errors: unknown[];
   summary: ReportSummary;
+  scanScope: ScanScope; // branch allow/deny diagnostics (§5) — separate from the disjoint summary counts
 }
 
 // Build the whole §7 report object for a run from SQLite alone. Works on the read-only handle;
@@ -83,7 +100,7 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   const tracked = JSON.stringify(run.trackedPackages);
 
   // scanned snapshot heads for this run (skipped-cutoff carry commit_sha='' and no findings).
-  const heads = db.read(`SELECT organization, repository, branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ?`).all(runId) as HeadRow[];
+  const heads = db.read(`SELECT organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date FROM run_unit_head WHERE run_id = ?`).all(runId) as HeadRow[];
   const scannedHeads = heads.filter((h) => h.status === "scanned");
   const scannedKeys = new Set(scannedHeads.map((h) => unitKey(h.organization, h.repository, h.branch, h.commit_sha)));
   // Tri-state default-branch flag per scanned unit (§5.B): true/false from v3 runs, null for
@@ -125,6 +142,7 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   }));
 
   return {
+    formatVersion: XRAY_FORMAT_VERSION,
     runId,
     generatedAt: run.completedAt ?? run.startedAt, // §7: COALESCE(completed_at, started_at)
     config: {
@@ -134,6 +152,7 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     packages,
     errors,
     summary: buildSummary(scannedHeads, heads, depRows, usageRows),
+    scanScope: buildScanScope(heads),
   };
 }
 
@@ -144,9 +163,42 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
     organizationsScanned: orgs.size,
     repositoriesScanned: repos.size,
     branchesScanned: scannedHeads.length,
-    branchesSkippedByCutoff: allHeads.filter((h) => h.status === "skipped-cutoff").length,
+    // GENUINE cutoff only (§5): a skipped-cutoff row with NO policy_status. Policy exclusions reuse the
+    // skipped-cutoff status but are their own disjoint bucket (isPolicyExcluded).
+    branchesSkippedByCutoff: allHeads.filter((h) => h.status === "skipped-cutoff" && h.policy_status === null).length,
+    branchesExcludedByPolicy: allHeads.filter(isPolicyExcluded).length,
+    branchesPastCap: allHeads.filter((h) => h.status === "past-cap").length,
     totalDependencyFindings: depRows.length,
     totalUsageFindings: usageRows.length,
+  };
+}
+
+// §5 scan-scope diagnostics. policyBranches lists every head with a policy_status (both the excluded
+// rows and the scanned default-overrides), deterministically sorted by (org, repo, branch).
+function buildScanScope(allHeads: HeadRow[]): ScanScope {
+  const policyRows = allHeads.filter((h) => h.policy_status !== null);
+  const policyBranches: PolicyBranchRow[] = policyRows
+    .map((h) => ({
+      organization: h.organization,
+      repository: h.repository,
+      branch: h.branch,
+      disposition: isDefaultOverride(h) ? ("scanned-default-override" as const) : ("excluded" as const),
+      policyStatus: h.policy_status as "excluded-by-deny" | "excluded-by-allow",
+      matchedPattern: h.policy_matched_pattern,
+    }))
+    .sort((a, b) => cmp(`${a.organization}\0${a.repository}\0${a.branch}`, `${b.organization}\0${b.repository}\0${b.branch}`));
+  return {
+    excludedByDeny: allHeads.filter((h) => isPolicyExcluded(h) && h.policy_status === "excluded-by-deny").length,
+    excludedByAllow: allHeads.filter((h) => isPolicyExcluded(h) && h.policy_status === "excluded-by-allow").length,
+    defaultBranchPolicyOverrides: allHeads.filter(isDefaultOverride).length,
+    policyBranches,
+    // Provenance is trustworthy ONLY for a v4-native run with at least one recorded head. A migrated
+    // pre-v4 run (the NULL scanned_commit_date backfilled by migrateV3toV4) never persisted past-cap
+    // branches and had no branch policy; a ZERO-head run carries no sentinel row at all, so its
+    // provenance is simply unverifiable (same treatment as compare.ts loadRunSlice). Either way the
+    // cap/policy counts may UNDERSTATE reality — flag it, don't present a false authoritative 0.
+    provenance:
+      allHeads.length === 0 || allHeads.some((h) => h.scanned_commit_date === null) ? "pre-upgrade" : "complete",
   };
 }
 
@@ -299,7 +351,7 @@ export function emitDossiers(report: EmittedReport, outputDir: string): { dossie
     generatedAt: report.generatedAt,
     config: report.config,
     summary: report.summary,
-    formatVersion: XRAY_FORMAT_VERSION,
+    formatVersion: report.formatVersion,
   };
   const bundle = new ArtifactBundle(outputDir, "dossier");
   let dossiers = 0;
@@ -315,7 +367,7 @@ export function emitDossiers(report: EmittedReport, outputDir: string): { dossie
       bytes: record.bytes, observations: observationsStatus, observationCount,
     });
   }
-  bundle.write(INDEX_FILENAME, renderIndex(report, { formatVersion: XRAY_FORMAT_VERSION }));
+  bundle.write(INDEX_FILENAME, renderIndex(report, { formatVersion: report.formatVersion }));
   const { swept } = bundle.finalize({ runId: report.runId });
   logLine({ event: "dossier-summary", runId: report.runId, dossiers, index: join(outputDir, XRAY_DIR_NAME, INDEX_FILENAME), swept });
   return { dossiers, swept };

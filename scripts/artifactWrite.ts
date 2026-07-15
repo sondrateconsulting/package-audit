@@ -44,7 +44,9 @@ export const XRAY_DIR_NAME = "xray";
 // Bumping this is the ONE sanctioned way golden files change. (The pre-launch addition of
 // per-entry `kind` tags was deliberately absorbed into v1 — no manifest had shipped yet;
 // after launch, any manifest-shape change bumps this.)
-export const XRAY_FORMAT_VERSION = 1;
+// v2 (branch allow/deny, T8): the report JSON gains formatVersion + scanScope + policy summary counts,
+// a new run_unit_head export table, and the HTML scan-scope panel — an artifact-set change.
+export const XRAY_FORMAT_VERSION = 2;
 
 // Injectable failure seam for the crash-behavior tests; production always uses node:fs.
 export interface AtomicWriteIo {

@@ -81,6 +81,30 @@ export interface DossierSummary {
   readonly repositoriesScanned: number;
   readonly branchesScanned: number;
   readonly branchesSkippedByCutoff: number;
+  readonly branchesExcludedByPolicy: number; // branch allow/deny (§5)
+  readonly branchesPastCap: number;
+}
+// Branch allow/deny scan-scope diagnostics (§5). Defined here (the render layer) so both the report
+// data layer (report.ts, structurally assignable) and the index renderer share ONE shape without a
+// report.ts ↔ reportHtml.ts import cycle. reportSchema.ts's scanScopeSchema is test-synced to it.
+export interface PolicyBranchRow {
+  readonly organization: string;
+  readonly repository: string;
+  readonly branch: string;
+  readonly disposition: "excluded" | "scanned-default-override";
+  readonly policyStatus: "excluded-by-deny" | "excluded-by-allow";
+  readonly matchedPattern: string | null;
+}
+export interface ScanScope {
+  readonly excludedByDeny: number;
+  readonly excludedByAllow: number;
+  readonly defaultBranchPolicyOverrides: number;
+  readonly policyBranches: readonly PolicyBranchRow[];
+  // "pre-upgrade" when any head carries a NULL scanned_commit_date — a run migrated from before v4,
+  // whose scanner never persisted past-cap branches and had no branch policy. Its "past the per-repo
+  // cap" and policy counts therefore UNDERSTATE what the run omitted; the panel says so rather than
+  // presenting a false authoritative zero. "complete" is the normal (v4-native) case.
+  readonly provenance: "complete" | "pre-upgrade";
 }
 export interface DossierContext {
   readonly runId: string;
@@ -96,6 +120,7 @@ export interface DossierReport {
   readonly config: DossierConfig;
   readonly packages: readonly DossierPackage[];
   readonly summary: DossierSummary;
+  readonly scanScope: ScanScope;
 }
 
 // ---- constants --------------------------------------------------------------------------------
@@ -866,7 +891,15 @@ function renderBands(m: DossierModel): string {
 }
 
 function renderFooter(ctx: DossierContext): string {
-  return `<footer>package usage x-ray · report-format version ${num(ctx.formatVersion)} · run ${esc(ctx.runId)} · generated ${esc(ctx.generatedAt)}</footer>`;
+  const s = ctx.summary;
+  // Compact global scan-scope receipt (branch allow/deny §5): shown only when policy actually dropped
+  // or deferred branches. The full per-branch ledger lives in the run index's #scan-scope panel — a
+  // package-centric dossier does not duplicate it N times (the href is a static literal, no injection).
+  const policyReceipt =
+    s.branchesExcludedByPolicy > 0 || s.branchesPastCap > 0
+      ? ` · ${num(s.branchesExcludedByPolicy)} excluded by policy, ${num(s.branchesPastCap)} past cap — <a href="index.html#scan-scope">scan scope</a>`
+      : "";
+  return `<footer>package usage x-ray · report-format version ${num(ctx.formatVersion)} · run ${esc(ctx.runId)} · generated ${esc(ctx.generatedAt)}${policyReceipt}</footer>`;
 }
 
 // The designed EMPTY state (CEO addendum 12 + CT4): coverage receipts, never "not coupled" —

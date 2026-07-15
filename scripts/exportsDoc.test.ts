@@ -65,7 +65,7 @@ const SQL_ALLOWLIST = new Set([
   "count", "distinct", "left", "join", "on", "is", "null", "desc", "asc",
   // recipe-local aliases (string literals and file paths are stripped before scanning, so
   // path/value words like output/xray/csv/cli never reach the check — keep this list tight):
-  "usage_sites", "repo", "distinct_exports", "declarations", "s", "u",
+  "usage_sites", "repo", "distinct_exports", "declarations", "s", "u", "branches",
 ]);
 
 describe("README recipes ↔ export registry sync", () => {

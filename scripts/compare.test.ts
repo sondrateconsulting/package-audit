@@ -1,10 +1,11 @@
 import { expect, test, describe, afterAll, spyOn } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso, type RunRecord, type UsageType } from "./db.ts";
 import {
-  COMPARE_DETAIL_CAP, COMPARE_HELP, buildCompare, buildNotComparableNotice, compareSummaryText,
+  COMPARE_DETAIL_CAP, COMPARE_FORMAT_VERSION, COMPARE_HELP, buildCompare, buildNotComparableNotice, compareSummaryText,
   main, parseCompareArgs, runCompare, type CompareEnvelope,
 } from "./compare.ts";
 import { ArgsError } from "./args.ts";
@@ -113,7 +114,7 @@ describe("buildCompare — added/removed sites", () => {
     site(db, runB.runId, uB, { filePath: "src/new.ts", lineNumber: 3 });
 
     const res = buildCompare(db, runA, runB);
-    expect(res.compare.formatVersion).toBe(1);
+    expect(res.compare.formatVersion).toBe(COMPARE_FORMAT_VERSION);
     expect(res.compare.runA).toEqual({ runId: runA.runId, startedAt: runA.startedAt, completedAt: runA.completedAt });
     expect(res.compare.runB).toEqual({ runId: runB.runId, startedAt: runB.startedAt, completedAt: runB.completedAt });
 
@@ -163,6 +164,106 @@ describe("buildCompare — added/removed sites", () => {
     // zeta is unchanged
     expect(zeta!.summary.usageSitesAdded).toBe(0);
     expect(zeta!.summary.usageSitesRemoved).toBe(0);
+    db.close();
+  });
+});
+
+// A policy-aware run_unit_head writer for §5 churn tests. Honors the write invariants:
+// scanned+policy → default; skipped/past-cap policy → non-default; deny → non-empty pattern.
+function phead(
+  db: AuditDb, runId: string, branch: string,
+  o: {
+    status?: "scanned" | "skipped-cutoff" | "past-cap";
+    isDefaultBranch?: boolean | null;
+    policyStatus?: "excluded-by-deny" | "excluded-by-allow" | null;
+    pattern?: string | null;
+    commitSha?: string;
+  } = {},
+): void {
+  const status = o.status ?? "scanned";
+  db.upsertRunUnitHead({
+    runId, organization: "org-a", repository: "svc", branch,
+    commitSha: status === "scanned" ? (o.commitSha ?? `sha-${branch}`) : "",
+    status, isDefaultBranch: o.isDefaultBranch ?? null,
+    policyStatus: o.policyStatus ?? null, policyMatchedPattern: o.pattern ?? null,
+    scannedCommitDate: "2025-06-01T12:00:00Z",
+  });
+}
+
+describe("buildCompare — §5 policy churn", () => {
+  test("classifies entered / left / reclassified / default-override-change; counts branches only in one run", () => {
+    const db = mem();
+    const runA = startCompleted(db, ["expo"]);
+    const runB = startCompleted(db, ["expo"]);
+    // main: policy-clean scanned default in both → compared, no category
+    phead(db, runA.runId, "main", { isDefaultBranch: true });
+    phead(db, runB.runId, "main", { isDefaultBranch: true });
+    // entering: clean-scanned in A → deny-excluded in B
+    phead(db, runA.runId, "entering", { isDefaultBranch: false });
+    phead(db, runB.runId, "entering", { status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
+    // leaving: deny-excluded in A → clean-scanned in B
+    phead(db, runA.runId, "leaving", { status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
+    phead(db, runB.runId, "leaving", { isDefaultBranch: false });
+    // reclass: excluded both sides but the causing pattern changed
+    phead(db, runA.runId, "reclass", { status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
+    phead(db, runB.runId, "reclass", { status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feat/*" });
+    // override-change: default-override carrying a counterfactual in A → plain clean default in B (neither APPLIED)
+    phead(db, runA.runId, "trunk", { isDefaultBranch: true, policyStatus: "excluded-by-deny", pattern: "release/*" });
+    phead(db, runB.runId, "trunk", { isDefaultBranch: true });
+    // only-in-A and only-in-B branches are NOT classified (absence has many causes)
+    phead(db, runA.runId, "gone", { isDefaultBranch: false });
+    phead(db, runB.runId, "fresh", { isDefaultBranch: false });
+
+    const churn = buildCompare(db, runA, runB).compare.policyChurn;
+    if (churn.available !== true) throw new Error("expected churn available");
+    expect(churn.summary).toEqual({
+      branchesCompared: 5, branchesOnlyInRunA: 1, branchesOnlyInRunB: 1,
+      enteredExclusion: 1, leftExclusion: 1, reclassifiedExclusion: 1, defaultOverrideChanges: 1,
+    });
+    expect(churn.enteredExclusion.map((e) => e.branch)).toEqual(["entering"]);
+    expect(churn.leftExclusion.map((e) => e.branch)).toEqual(["leaving"]);
+    expect(churn.reclassifiedExclusion.map((e) => e.branch)).toEqual(["reclass"]);
+    expect(churn.defaultOverrideChanges.map((e) => e.branch)).toEqual(["trunk"]);
+    // the entry carries both sides' full policy state
+    expect(churn.enteredExclusion[0]).toEqual({
+      organization: "org-a", repository: "svc", branch: "entering",
+      runA: { status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, policyApplied: false, defaultOverride: false },
+      runB: { status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*", policyApplied: true, defaultOverride: false },
+    });
+    // reclassified carries the pattern change explicitly
+    expect(churn.reclassifiedExclusion[0]!.runA.policyMatchedPattern).toBe("feature/*");
+    expect(churn.reclassifiedExclusion[0]!.runB.policyMatchedPattern).toBe("feat/*");
+    db.close();
+  });
+
+  test("churn is unavailable when EITHER run carries a pre-v4 NULL scanned_commit_date (unknown provenance)", () => {
+    const path = nextFile();
+    const db = AuditDb.open({ sqlitePath: path });
+    const runA = startCompleted(db, ["expo"]);
+    const runB = startCompleted(db, ["expo"]);
+    phead(db, runA.runId, "main", { isDefaultBranch: true });
+    phead(db, runB.runId, "main", { isDefaultBranch: true });
+    const runAId = runA.runId;
+    db.close();
+    // forge a legitimate pre-v4-migrated row: a NULL scanned_commit_date the write path forbids
+    const forge = new Database(path, { strict: true });
+    forge.exec(`UPDATE run_unit_head SET scanned_commit_date = NULL WHERE run_id = '${runAId}'`);
+    forge.close();
+
+    const db2 = AuditDb.open({ sqlitePath: path });
+    const churn = buildCompare(db2, db2.getRun(runA.runId)!, db2.getRun(runB.runId)!).compare.policyChurn;
+    expect(churn).toEqual({ available: false, reason: "pre-v4-policy-data" });
+    db2.close();
+  });
+
+  test("churn is unavailable when EITHER run has ZERO heads — an empty run carries no v4 provenance sentinel", () => {
+    const db = mem();
+    const runA = startCompleted(db, ["expo"]); // discovery produced heads
+    const runB = startCompleted(db, ["expo"]); // e.g. every repo's branch discovery failed → no heads at all
+    phead(db, runA.runId, "main", { isDefaultBranch: true });
+    // runB deliberately gets NO run_unit_head rows
+    const churn = buildCompare(db, runA, runB).compare.policyChurn;
+    expect(churn).toEqual({ available: false, reason: "pre-v4-policy-data" });
     db.close();
   });
 });

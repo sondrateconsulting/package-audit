@@ -1,4 +1,4 @@
-// export.ts — deterministic, run-scoped snapshot exports of the four audit tables as CSV +
+// export.ts — deterministic, run-scoped snapshot exports of the five audit tables as CSV +
 // JSONL under <outputDir>/xray/, written through the manifest-managed ArtifactBundle. Entry:
 //   bun run scripts/export.ts [--config <path>] [--run-id <id>] [--raw] [--help]
 // The DEFAULT export is a RUN-SCOPED SNAPSHOT: findings join through the per-run
@@ -23,7 +23,7 @@ import { renderFatal } from "./cliErrors.ts";
 export const EXPORT_USAGE =
   "Usage: bun run scripts/export.ts [--config <path>] [--run-id <id>] [--raw] [--help]";
 
-export const EXPORT_HELP = `package-audit export — run-scoped CSV/JSONL snapshots of the four audit tables
+export const EXPORT_HELP = `package-audit export — run-scoped CSV/JSONL snapshots of the five audit tables
 
 ${EXPORT_USAGE}
 
@@ -36,9 +36,9 @@ Flags:
                       raw-. The default run-scoped export is the supported contract.
   --help, -h          Show this help and exit.
 
-Writes <table>.csv + <table>.jsonl for dependency_findings, package_api_surface, runs and
-usage_findings into <outputDir>/xray/ through the manifest-managed artifact bundle; column
-order and row order per table are pinned by the export column registry (EXPORTS.md).`;
+Writes <table>.csv + <table>.jsonl for dependency_findings, package_api_surface, run_unit_head,
+runs and usage_findings into <outputDir>/xray/ through the manifest-managed artifact bundle;
+column order and row order per table are pinned by the export column registry (EXPORTS.md).`;
 
 // ---- argument parsing (local by design: the parser stays local, reusing args.ts run-id validation; same strict grammar) ----------
 export interface ExportArgs {
@@ -160,6 +160,23 @@ const USAGE_FINDINGS_COLUMNS = [
   { name: "found_at", type: "string" },
 ] as const satisfies readonly ExportColumn[];
 
+// The per-run branch disposition snapshot (branch allow/deny §5). Unlike the findings tables, this
+// exports EVERY disposition — scanned, genuine cutoff-skip, past-cap, and policy-excluded — because
+// the whole point of the policy columns is the NON-scanned rows. Columns are in RUN_UNIT_HEAD_BODY
+// (SCHEMA_SQL) order; is_default_branch and the three v4 policy/date columns are nullable.
+const RUN_UNIT_HEAD_COLUMNS = [
+  { name: "run_id", type: "string" },
+  { name: "organization", type: "string" },
+  { name: "repository", type: "string" },
+  { name: "branch", type: "string" },
+  { name: "commit_sha", type: "string" },
+  { name: "status", type: "string" },
+  { name: "is_default_branch", type: "nullable-number" },
+  { name: "policy_status", type: "nullable-string" },
+  { name: "policy_matched_pattern", type: "nullable-string" },
+  { name: "scanned_commit_date", type: "nullable-string" },
+] as const satisfies readonly ExportColumn[];
+
 // ORDER BY key chains — typed against each table's own column-name union so a typo'd or
 // non-exported key is a compile error, not a runtime SQL surprise.
 const DEPENDENCY_FINDINGS_ORDER_BY: ReadonlyArray<(typeof DEPENDENCY_FINDINGS_COLUMNS)[number]["name"]> = [
@@ -169,11 +186,14 @@ const PACKAGE_API_SURFACE_ORDER_BY: ReadonlyArray<(typeof PACKAGE_API_SURFACE_CO
   "package_name", "version", "export_kind", "export_name",
 ];
 const RUNS_ORDER_BY: ReadonlyArray<(typeof RUNS_COLUMNS)[number]["name"]> = ["run_id"];
+const RUN_UNIT_HEAD_ORDER_BY: ReadonlyArray<(typeof RUN_UNIT_HEAD_COLUMNS)[number]["name"]> = [
+  "run_id", "organization", "repository", "branch",
+];
 const USAGE_FINDINGS_ORDER_BY: ReadonlyArray<(typeof USAGE_FINDINGS_COLUMNS)[number]["name"]> = [
   "organization", "repository", "branch", "commit_sha", "package_name", "dependency_key", "usage_type", "file_path", "line_number", "export_name", "context",
 ];
 
-export const EXPORT_TABLE_NAMES = ["dependency_findings", "package_api_surface", "runs", "usage_findings"] as const;
+export const EXPORT_TABLE_NAMES = ["dependency_findings", "package_api_surface", "run_unit_head", "runs", "usage_findings"] as const;
 export type ExportTableName = (typeof EXPORT_TABLE_NAMES)[number];
 
 export interface ExportTableSpec {
@@ -184,6 +204,7 @@ export interface ExportTableSpec {
 export const EXPORT_REGISTRY: Readonly<Record<ExportTableName, ExportTableSpec>> = {
   dependency_findings: { columns: DEPENDENCY_FINDINGS_COLUMNS, orderBy: DEPENDENCY_FINDINGS_ORDER_BY },
   package_api_surface: { columns: PACKAGE_API_SURFACE_COLUMNS, orderBy: PACKAGE_API_SURFACE_ORDER_BY },
+  run_unit_head: { columns: RUN_UNIT_HEAD_COLUMNS, orderBy: RUN_UNIT_HEAD_ORDER_BY },
   runs: { columns: RUNS_COLUMNS, orderBy: RUNS_ORDER_BY },
   usage_findings: { columns: USAGE_FINDINGS_COLUMNS, orderBy: USAGE_FINDINGS_ORDER_BY },
 };
@@ -226,11 +247,17 @@ export type UsageFindingsExportRow = {
   context: string; file_path: string; line_number: number; permalink: string; snippet: string;
   found_at: string;
 };
+export type RunUnitHeadExportRow = {
+  run_id: string; organization: string; repository: string; branch: string; commit_sha: string;
+  status: string; is_default_branch: number | null; policy_status: string | null;
+  policy_matched_pattern: string | null; scanned_commit_date: string | null;
+};
 
 export type DependencyFindingsRegistrySynced = Expect<Equal<RegistryShape<typeof DEPENDENCY_FINDINGS_COLUMNS>, DependencyFindingsExportRow>>;
 export type PackageApiSurfaceRegistrySynced = Expect<Equal<RegistryShape<typeof PACKAGE_API_SURFACE_COLUMNS>, PackageApiSurfaceExportRow>>;
 export type RunsRegistrySynced = Expect<Equal<RegistryShape<typeof RUNS_COLUMNS>, RunsExportRow>>;
 export type UsageFindingsRegistrySynced = Expect<Equal<RegistryShape<typeof USAGE_FINDINGS_COLUMNS>, UsageFindingsExportRow>>;
+export type RunUnitHeadRegistrySynced = Expect<Equal<RegistryShape<typeof RUN_UNIT_HEAD_COLUMNS>, RunUnitHeadExportRow>>;
 // The spec-level guarantee stated separately: each registry's column-NAME union equals the
 // row alias's keyof (the shape checks above subsume this, but the name-union contract is the
 // one EXPORTS.md documents, so it gets its own assertion).
@@ -238,6 +265,7 @@ export type DependencyFindingsColumnNamesSynced = Expect<Equal<(typeof DEPENDENC
 export type PackageApiSurfaceColumnNamesSynced = Expect<Equal<(typeof PACKAGE_API_SURFACE_COLUMNS)[number]["name"], keyof PackageApiSurfaceExportRow>>;
 export type RunsColumnNamesSynced = Expect<Equal<(typeof RUNS_COLUMNS)[number]["name"], keyof RunsExportRow>>;
 export type UsageFindingsColumnNamesSynced = Expect<Equal<(typeof USAGE_FINDINGS_COLUMNS)[number]["name"], keyof UsageFindingsExportRow>>;
+export type RunUnitHeadColumnNamesSynced = Expect<Equal<(typeof RUN_UNIT_HEAD_COLUMNS)[number]["name"], keyof RunUnitHeadExportRow>>;
 
 // ---- snapshot collection ------------------------------------------------------------------------
 // A collected table: the registry-ordered rows, already in ORDER BY order (explicit in SQL).
@@ -252,7 +280,7 @@ const selectList = (columns: readonly ExportColumn[], alias = ""): string =>
 const orderByClause = (orderBy: readonly string[], alias = ""): string =>
   orderBy.map((k) => `${alias}${k}`).join(", ");
 
-// ALL reads run inside ONE deferred read transaction so the four tables come from a single
+// ALL reads run inside ONE deferred read transaction so the five tables come from a single
 // coherent snapshot even while a live audit commits concurrently (the report.ts precedent).
 function collectSnapshots(db: AuditDbReader, run: RunRecord, raw: boolean): readonly ExportSnapshot[] {
   return db.readTransaction(() => (raw ? collectRaw(db) : collectRunScoped(db, run)));
@@ -314,12 +342,25 @@ function collectRunScoped(db: AuditDbReader, run: RunRecord): ExportSnapshot[] {
   // runs export = exactly the selected run's row.
   const runs = db.read(`SELECT ${selectList(RUNS_COLUMNS)} FROM runs WHERE run_id = ?`).all(run.runId) as RunsExportRow[];
 
-  return [
-    { table: "dependency_findings", rows: dep },
-    { table: "package_api_surface", rows: surface },
-    { table: "runs", rows: runs },
-    { table: "usage_findings", rows: usage },
-  ];
+  // run_unit_head export = EVERY disposition of the selected run (scanned / genuine cutoff / past-cap /
+  // policy-excluded / scanned default-override). Scoped by run_id ONLY — no status or package filter
+  // (the policy columns are the point, and they live largely on the NON-scanned rows).
+  const runUnitHead = db.read(
+    `SELECT ${selectList(RUN_UNIT_HEAD_COLUMNS)} FROM run_unit_head WHERE run_id = ?
+     ORDER BY ${orderByClause(RUN_UNIT_HEAD_ORDER_BY)}`,
+  ).all(run.runId) as RunUnitHeadExportRow[];
+
+  // Registry-EXHAUSTIVE assembly (map EXPORT_TABLE_NAMES): the Record type forces a row source for
+  // every registry table, so a future table can never appear in --raw/EXPORTS.md yet silently vanish
+  // from the default export. Order follows EXPORT_TABLE_NAMES (matches --raw).
+  const byTable: Record<ExportTableName, readonly ExportRowWire[]> = {
+    dependency_findings: dep,
+    package_api_surface: surface,
+    run_unit_head: runUnitHead,
+    runs,
+    usage_findings: usage,
+  };
+  return EXPORT_TABLE_NAMES.map((table) => ({ table, rows: byTable[table] }));
 }
 
 // --raw: full-table forensic dump — every row, including '__complete__' markers and
