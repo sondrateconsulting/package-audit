@@ -2,7 +2,7 @@ import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime } from "./orchestrate.ts";
+import { discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type RepoInfo, type SpawnFn } from "./github.ts";
@@ -155,7 +155,8 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     expect(totals).toEqual({
       owners: ["org-a"], ownersSource: "configured",
       reposDiscovered: 1, reposKept: 1,
-      branchesEligible: 1, branchesSkippedByCutoff: 1, branchesPastCap: 0, branchesExcludedByPolicy: 0, discoveryErrors: 0,
+      branchesEligible: 1, branchesSkippedByCutoff: 1, branchesPastCap: 0, branchesExcludedByPolicy: 0,
+      excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, discoveryErrors: 0,
     });
     // the zero-write contract: no db file, no gitconfig, no pkg-audit-* dir — nothing at all
     expect(readdirSync(root)).toEqual([]);
@@ -748,6 +749,48 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("§5 plan diagnostics: deny/allow sub-counts + default override, over all four dispositions", async () => {
+    const root = mkdtempSync(join(tmpdir(), "plan-diag-"));
+    // allowlist keep/* + deny deny-me, cap=1. main (default) is NOT in the allowlist → a scanned
+    // default-branch OVERRIDE. deny-me → excluded-by-deny; other → excluded-by-allow. keep/a wins the
+    // single cap slot; keep/b past-cap; keep/old (< cutoff) cutoff-skipped. Six heads, all four buckets.
+    const config = { ...testConfig(root, 1), organizations: ["org-a"], branches: ["keep/*"], excludeBranches: ["deny-me"], packages: [] };
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([
+        { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },      // default → override (not allow-listed)
+        { name: "deny-me", oid: "o-deny", date: "2025-06-01T00:00:00Z" },   // excluded-by-deny
+        { name: "other", oid: "o-other", date: "2025-06-01T00:00:00Z" },    // excluded-by-allow (allow-list miss)
+        { name: "keep/a", oid: "o-ka", date: "2025-05-01T00:00:00Z" },      // eligible (wins cap=1)
+        { name: "keep/b", oid: "o-kb", date: "2025-04-01T00:00:00Z" },      // past-cap
+        { name: "keep/old", oid: "o-kold", date: "2023-01-01T00:00:00Z" },  // cutoff-skipped (< 2024-01-01)
+      ]) };
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    let totals: PlanTotals | undefined;
+    const events = await captureJsonl(async () => { totals = await runPlan(client, rt(config, "h"), "rvo"); });
+    const t = totals!;
+    // the four-way disjoint partition covers every discovered head
+    expect(t.branchesEligible).toBe(2);        // main (override) + keep/a
+    expect(t.branchesSkippedByCutoff).toBe(1); // keep/old
+    expect(t.branchesPastCap).toBe(1);         // keep/b
+    expect(t.branchesExcludedByPolicy).toBe(2); // deny-me + other
+    expect(t.branchesEligible + t.branchesSkippedByCutoff + t.branchesPastCap + t.branchesExcludedByPolicy).toBe(6);
+    // the §5 diagnostic overlays
+    expect(t.excludedByDeny).toBe(1);
+    expect(t.excludedByAllow).toBe(1);
+    expect(t.defaultBranchPolicyOverrides).toBe(1); // main
+    // overlay invariants: sub-counts sum to the excluded bucket; overrides live INSIDE eligible
+    expect(t.excludedByDeny + t.excludedByAllow).toBe(t.branchesExcludedByPolicy);
+    expect(t.defaultBranchPolicyOverrides).toBeLessThanOrEqual(t.branchesEligible);
+    // the per-repo plan event carries the same sub-counts (repo-level reconciliation)
+    const repoEvent = events.find((e) => e["event"] === "plan" && e["repo"] === "svc")!;
+    expect(repoEvent).toMatchObject({ branchesExcludedByPolicy: 2, excludedByDeny: 1, excludedByAllow: 1, defaultBranchPolicyOverrides: 1 });
+    // and so does the plan-summary event
+    const summary = events.find((e) => e["event"] === "plan-summary")!;
+    expect(summary).toMatchObject({ excludedByDeny: 1, excludedByAllow: 1, defaultBranchPolicyOverrides: 1 });
+    rmSync(root, { recursive: true, force: true });
+  });
+
   // ---- §8 policy warnings (T7) ----
   // A client serving one org repo (svc) + the given branch heads + an empty tree (so a scanned unit
   // runs to zero findings). Distinguishes the GraphQL head query, the git-trees fetch, and the repo list.
@@ -909,12 +952,16 @@ describe("planSummaryText", () => {
     packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
   };
 
+  // a full PlanTotals with all-zero §5 diagnostics; spread + override per test
+  const totals: PlanTotals = {
+    owners: ["org-a", "org-b"], ownersSource: "discovered",
+    reposDiscovered: 42, reposKept: 37,
+    branchesEligible: 210, branchesSkippedByCutoff: 58, branchesPastCap: 12, branchesExcludedByPolicy: 0,
+    excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, discoveryErrors: 0,
+  };
+
   test("names the counts, the cutoff, the packages, and the no-writes guarantee", () => {
-    const text = planSummaryText(config, {
-      owners: ["org-a", "org-b"], ownersSource: "discovered",
-      reposDiscovered: 42, reposKept: 37,
-      branchesEligible: 210, branchesSkippedByCutoff: 58, branchesPastCap: 12, branchesExcludedByPolicy: 3, discoveryErrors: 0,
-    });
+    const text = planSummaryText(config, { ...totals, branchesExcludedByPolicy: 3, excludedByDeny: 2, excludedByAllow: 1, defaultBranchPolicyOverrides: 1 });
     expect(text).toContain("PLAN — preview only");
     expect(text).toContain("no database opened");
     expect(text).toContain("org-a, org-b");
@@ -922,8 +969,24 @@ describe("planSummaryText", () => {
     expect(text).toContain("210 eligible");
     expect(text).toContain("58 skipped by cutoff (< 2024-01-01)");
     expect(text).toContain("12 past the per-repo cap (25)");
+    expect(text).toContain("3 excluded by branch policy");
     expect(text).toContain("expo");
     expect(text).toMatch(/Discovery errors:\s+0\b/);
+  });
+
+  test("§5 policy detail line: shown with the deny/allow split + override count when policy removed branches", () => {
+    const text = planSummaryText(config, { ...totals, branchesExcludedByPolicy: 3, excludedByDeny: 2, excludedByAllow: 1, defaultBranchPolicyOverrides: 1 });
+    expect(text).toContain("Policy detail:        2 excluded by deny · 1 excluded as not allow-listed · 1 default-branch policy override(s) (already counted as eligible)");
+  });
+
+  test("§5 policy detail line: shown for an override-only plan (no exclusions, but a policy would have excluded the default)", () => {
+    const text = planSummaryText(config, { ...totals, defaultBranchPolicyOverrides: 2 });
+    expect(text).toContain("0 excluded by deny · 0 excluded as not allow-listed · 2 default-branch policy override(s)");
+  });
+
+  test("§5 policy detail line: SUPPRESSED when no policy activity (no exclusions, no overrides)", () => {
+    const text = planSummaryText(config, totals); // all §5 diagnostics zero
+    expect(text).not.toContain("Policy detail:");
   });
 });
 

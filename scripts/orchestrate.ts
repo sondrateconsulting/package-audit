@@ -12,7 +12,7 @@ import { join, dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchHead } from "./github.ts";
-import { planRepoBranches, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
+import { planRepoBranches, planPolicyDiagnostics, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
 import { PolicyMatchError, type CompiledBranchPolicy, type PolicyCoverage } from "./branchPolicy.ts";
 import { discovered, discoveryFailed, type DiscoveryOutcome } from "./discovery.ts";
 import { computeUnmatchedWarnings, isEmptyAllowlist, policyWarningLines, type PolicyWarning } from "./policyWarnings.ts";
@@ -714,6 +714,12 @@ export interface PlanTotals {
   readonly branchesSkippedByCutoff: number;
   readonly branchesPastCap: number;
   readonly branchesExcludedByPolicy: number;
+  // §5 branch-policy diagnostics (the plan-mode analog of the report's scanScope sub-counts).
+  // OVERLAYS, not partition buckets: excludedByDeny + excludedByAllow === branchesExcludedByPolicy;
+  // defaultBranchPolicyOverrides <= branchesEligible (default branches a policy would have excluded).
+  readonly excludedByDeny: number;
+  readonly excludedByAllow: number;
+  readonly defaultBranchPolicyOverrides: number;
   readonly discoveryErrors: number;
 }
 export async function runPlan(client: GithubClient, runtime: AuditRuntime, personalLogin: string): Promise<PlanTotals> {
@@ -728,6 +734,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 
   let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, branchesExcludedByPolicy = 0, discoveryErrors = 0;
+  let excludedByDeny = 0, excludedByAllow = 0, defaultBranchPolicyOverrides = 0; // §5 policy diagnostics (overlays)
   const coverages: PolicyCoverage[] = []; // per successfully-discovered repo, for the §8 warning finalizer
   for (const owner of owners) {
     const isPersonal = config.includePersonalNamespace && owner === personalLogin;
@@ -757,15 +764,21 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
       // branchesEligible counts toScan (default + within-cap after-cutoff); policy-excluded is its own
       // disjoint bucket. A malformed-glob PolicyMatchError propagates FATAL (no DB to mark; main exits 1).
       const p = planRepoBranches(heads, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
+      const diag = planPolicyDiagnostics(p); // fail-closed deny/allow split + default-override count
       coverages.push(p.coverage); // this repo was discovered successfully (even if empty) — §8 coverage
       branchesEligible += p.toScan.length;
       branchesSkippedByCutoff += p.cutoffSkipped.length;
       branchesPastCap += p.pastCap.length;
       branchesExcludedByPolicy += p.policyExcluded.length;
+      excludedByDeny += diag.excludedByDeny;
+      excludedByAllow += diag.excludedByAllow;
+      defaultBranchPolicyOverrides += diag.defaultBranchPolicyOverrides;
       logLine({
         event: "plan", org: repo.organization, repo: repo.name,
         branchesEligible: p.toScan.length, branchesSkippedByCutoff: p.cutoffSkipped.length,
         branchesPastCap: p.pastCap.length, branchesExcludedByPolicy: p.policyExcluded.length,
+        excludedByDeny: diag.excludedByDeny, excludedByAllow: diag.excludedByAllow,
+        defaultBranchPolicyOverrides: diag.defaultBranchPolicyOverrides,
       });
     }
   }
@@ -773,7 +786,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   // §8: emit the unmatched-pattern warnings (before plan-summary) — identical to runScan's set.
   const warnings = emitPolicyWarnings(branchPolicy, coverages);
 
-  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, discoveryErrors };
+  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, excludedByDeny, excludedByAllow, defaultBranchPolicyOverrides, discoveryErrors };
   logLine({ event: "plan-summary", ...totals });
   process.stderr.write(planSummaryText(config, totals, warnings));
   return totals;
@@ -792,6 +805,11 @@ export function planSummaryText(
     `  Repos:                ${t.reposDiscovered} discovered, ${t.reposKept} kept after archive/fork filters and caps`,
     `  Branches:             ${t.branchesEligible} eligible to scan (a real run may skip already-current ones)`,
     `                        ${t.branchesSkippedByCutoff} skipped by cutoff (< ${config.cutoffDate}) · ${t.branchesPastCap} past the per-repo cap (${config.maxBranchesPerRepo}) · ${t.branchesExcludedByPolicy} excluded by branch policy`,
+    // §5 policy breakdown, shown only when policy actually removed or overrode branches. Wording avoids
+    // "scanned" (the plan header promises nothing is scanned); overrides are flagged as already-eligible.
+    ...(t.branchesExcludedByPolicy > 0 || t.defaultBranchPolicyOverrides > 0
+      ? [`  Policy detail:        ${t.excludedByDeny} excluded by deny · ${t.excludedByAllow} excluded as not allow-listed · ${t.defaultBranchPolicyOverrides} default-branch policy override(s) (already counted as eligible)`]
+      : []),
     `  Packages tracked:     ${config.packages.map((p) => p.name).join(", ")}`,
     `  Discovery errors:     ${t.discoveryErrors}`,
     ...policyWarningLines(warnings),

@@ -124,3 +124,39 @@ export function policyAttribution(r: PolicyResult): {
       return { policyStatus: null, policyMatchedPattern: null };
   }
 }
+
+// §5 branch-policy diagnostics for the --plan surface — the plan-mode analog of the report's
+// scanScope sub-counts (report.ts buildScanScope). `excludedByDeny`/`excludedByAllow` split the
+// disjoint `policyExcluded` bucket; `defaultBranchPolicyOverrides` counts default branches a policy
+// WOULD have excluded but that stay eligible (the override — an OVERLAPPING diagnostic within
+// branchesEligible, never its own partition bucket). FAIL-CLOSED: a no-exclusion/default row inside
+// `policyExcluded`, or a non-default excluded row inside `toScan`, is an impossible planner state
+// (a bucket-wiring bug, not operator error) and throws — mirroring the run path's guard at
+// orchestrate.ts's to-scan loop.
+export interface PlanPolicyDiagnostics {
+  readonly excludedByDeny: number;
+  readonly excludedByAllow: number;
+  readonly defaultBranchPolicyOverrides: number;
+}
+export function planPolicyDiagnostics(plan: RepoBranchPlan): PlanPolicyDiagnostics {
+  let excludedByDeny = 0;
+  let excludedByAllow = 0;
+  for (const d of plan.policyExcluded) {
+    if (d.isDefaultBranch || d.rawPolicyResult.kind === "no-exclusion")
+      throw new Error(`internal: policyExcluded carries a default/no-exclusion branch ${d.head.name} (planner bucket-wiring bug)`);
+    if (d.rawPolicyResult.kind === "excluded-by-deny") excludedByDeny++;
+    else excludedByAllow++;
+  }
+  // redundant given the loop's fail-closed guard, but pins the deny+allow = excluded invariant
+  // against a future refactor of the counting logic.
+  if (excludedByDeny + excludedByAllow !== plan.policyExcluded.length)
+    throw new Error(`internal: policy sub-counts (${excludedByDeny}+${excludedByAllow}) != policyExcluded (${plan.policyExcluded.length})`);
+  let defaultBranchPolicyOverrides = 0;
+  for (const d of plan.toScan) {
+    if (d.rawPolicyResult.kind === "no-exclusion") continue; // the common eligible case
+    if (!d.isDefaultBranch)
+      throw new Error(`internal: non-default toScan branch ${d.head.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
+    defaultBranchPolicyOverrides++;
+  }
+  return { excludedByDeny, excludedByAllow, defaultBranchPolicyOverrides };
+}

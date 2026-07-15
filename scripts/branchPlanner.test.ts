@@ -1,5 +1,5 @@
 import { expect, test, describe } from "bun:test";
-import { planRepoBranches, policyAttribution, classifyBranchPlan } from "./branchPlanner.ts";
+import { planRepoBranches, planPolicyDiagnostics, policyAttribution, classifyBranchPlan, type RepoBranchPlan, type BranchDecision } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError, type PolicyResult, type CompiledPattern, type CompiledBranchPolicy } from "./branchPolicy.ts";
 import type { BranchHead } from "./github.ts";
 
@@ -119,6 +119,47 @@ describe("planRepoBranches — coverage sweep (§8/§12)", () => {
     // invoked for classification — but the coverage sweep DOES call z*.match('main') and it throws.
     const policy = rawPolicy(null, [cp("main", new Bun.Glob("main")), cp("z*", throwingGlob(new Error("shadowed")))]);
     expect(() => planRepoBranches([head("main", "2025-01-01T00:00:00Z")], policy, "2024-01-01", 25, "main")).toThrow(PolicyMatchError);
+  });
+});
+
+describe("planPolicyDiagnostics — §5 plan sub-counts (deny/allow split + default override)", () => {
+  test("derives the deny/allow split and default-branch override from a real plan", () => {
+    // allowlist keep/* + deny deny-me. main (default) is not allow-listed → override; deny-me → deny;
+    // other → allow-miss; keep/a → eligible.
+    const policy = compileBranchPolicy(["keep/*"], ["deny-me"]);
+    const heads = [
+      head("main", "2025-06-01T00:00:00Z"),
+      head("deny-me", "2025-06-01T00:00:00Z"),
+      head("other", "2025-06-01T00:00:00Z"),
+      head("keep/a", "2025-05-01T00:00:00Z"),
+    ];
+    const p = planRepoBranches(heads, policy, "2024-01-01", 25, "main");
+    expect(planPolicyDiagnostics(p)).toEqual({ excludedByDeny: 1, excludedByAllow: 1, defaultBranchPolicyOverrides: 1 });
+  });
+
+  test("an unrestricted policy yields all-zero diagnostics", () => {
+    const p = planRepoBranches(HEADS, unrestricted, "2024-01-01", 25, "main");
+    expect(planPolicyDiagnostics(p)).toEqual({ excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0 });
+  });
+
+  // fail-closed: the planner can never produce these, so hand-build the impossible plans directly.
+  const emptyPlan: RepoBranchPlan = { toScan: [], cutoffSkipped: [], pastCap: [], policyExcluded: [], coverage: { branches: [], excludeBranches: [] } };
+  const decision = (name: string, isDefaultBranch: boolean, rawPolicyResult: BranchDecision["rawPolicyResult"]): BranchDecision =>
+    ({ head: head(name, "2025-06-01T00:00:00Z"), isDefaultBranch, rawPolicyResult });
+
+  test("throws when policyExcluded carries a no-exclusion decision (bucket-wiring bug)", () => {
+    const bad: RepoBranchPlan = { ...emptyPlan, policyExcluded: [decision("x", false, { kind: "no-exclusion" })] };
+    expect(() => planPolicyDiagnostics(bad)).toThrow(/policyExcluded carries a default\/no-exclusion/);
+  });
+
+  test("throws when policyExcluded carries a default branch (a default is never excluded)", () => {
+    const bad: RepoBranchPlan = { ...emptyPlan, policyExcluded: [decision("main", true, { kind: "excluded-by-deny", matchedPattern: "main" })] };
+    expect(() => planPolicyDiagnostics(bad)).toThrow(/policyExcluded carries a default\/no-exclusion/);
+  });
+
+  test("throws when a NON-default scanned (toScan) branch carries a policy exclusion (only the default may override)", () => {
+    const bad: RepoBranchPlan = { ...emptyPlan, toScan: [decision("feat", false, { kind: "excluded-by-deny", matchedPattern: "feat" })] };
+    expect(() => planPolicyDiagnostics(bad)).toThrow(/non-default toScan branch/);
   });
 });
 
