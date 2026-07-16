@@ -6,6 +6,7 @@
 
 import type { GithubClient } from "./github.ts";
 import type { Config } from "./config.ts";
+import { FETCH_TIMEOUT_MS } from "./apiSurface.ts";
 
 export class PreflightError extends Error {
   constructor(message: string) {
@@ -28,7 +29,8 @@ export interface PreflightReport {
 export type Version = [number, number, number];
 
 // Extract the FIRST dotted numeric tuple from a version string (`git version 2.45.1` →
-// [2,45,1]; `1.3.14` → [1,3,14]). Missing minor/patch default to 0. null when none present.
+// [2,45,1]; `1.3.14` → [1,3,14]). Missing patch defaults to 0; major and minor are REQUIRED —
+// a string without at least `X.Y` (even one carrying a bare number) returns null.
 export function parseVersion(text: string): Version | null {
   const m = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(text);
   if (m === null) return null;
@@ -69,6 +71,7 @@ const MIN_BUN: Version = [1, 1, 0]; // bun:sqlite + shell/glob features required
 export interface PreflightDeps {
   bunVersion?: string; // defaults to Bun.version
   fetchImpl?: (url: string) => Promise<{ ok: boolean; status: number }>;
+  registryFetchTimeoutMs?: number; // registry-probe deadline (default FETCH_TIMEOUT_MS)
   env?: Record<string, string | undefined>;
 }
 
@@ -88,17 +91,26 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
   const auth = await client.gh(["auth", "status", "--hostname", config.githubHost]);
   if (auth.exitCode !== 0)
     throw new PreflightError(
-      `not authenticated to ${config.githubHost}. Remediate: gh auth login -h ${config.githubHost}\n${auth.stderr.trim().slice(0, 300)}`,
+      `not authenticated to ${config.githubHost}. Remediate: gh auth login -h ${config.githubHost} (see README § What the gh token needs)\n${auth.stderr.trim().slice(0, 300)}`,
     );
 
   // 4. git >= 2.45.1 and tar present (+ flavor)
   const gitVer = await client.git(["--version"]);
   const gv = parseVersion(gitVer.stdout);
   if (gitVer.exitCode !== 0 || gv === null || !meetsMinimum(gv, MIN_GIT))
-    throw new PreflightError(`git >= 2.45.1 required (found '${gitVer.stdout.trim()}') — older releases carry the May-2024 clone CVEs`);
+    throw new PreflightError(
+      `git >= 2.45.1 required (found '${gitVer.stdout.trim()}') — older releases carry the May-2024 clone CVEs. Remediate: brew upgrade git (macOS) / apt-get install --only-upgrade git (Debian/Ubuntu)`,
+    );
   const tarVer = await client.tar(["--version"]);
   if (tarVer.exitCode !== 0) throw new PreflightError(`tar --version failed: ${tarVer.stderr.trim().slice(0, 200)}`);
   const tarFlavor = detectTarFlavor(tarVer.stdout);
+  // §5.E: the pre-extraction scan's resync/secure-symlink reasoning only holds for GNU tar and
+  // bsdtar/libarchive. A tar that is neither (e.g. busybox/toybox) could materialize a member the
+  // scan believed it rejected, so fail closed rather than extract with an unvetted implementation.
+  if (tarFlavor === "unknown")
+    throw new PreflightError(
+      `unsupported tar implementation (found '${tarVer.stdout.trim().slice(0, 80)}') — the §5.E pre-extraction scan requires GNU tar or bsdtar/libarchive. Remediate: install GNU tar or bsdtar (libarchive) and ensure it is first on PATH`,
+    );
 
   // 5. discovery scope evidence (only in discovery mode) + capture login
   const userRes = await client.restGet("user");
@@ -137,10 +149,11 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
     throw new PreflightError(`gh api rate_limit failed (network to ${config.githubHost}?): ${(e as Error).message}`);
   }
 
-  // 5b. registry reachability — ANY HTTP response counts (private registries may 401 a probe);
-  // only DNS/TLS/connect failures are fatal.
+  // 8. registry reachability (runs LAST, after the gh checks) — ANY HTTP response counts
+  // (private registries may 401 a probe); only DNS/TLS/connect failures are fatal.
   const fetchImpl = deps.fetchImpl ?? (async (url: string) => {
-    const res = await fetch(url, { method: "GET", redirect: "manual" });
+    // deadline: a wedged registry must fail the probe, not hang preflight (§5.E hardening)
+    const res = await fetch(url, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(deps.registryFetchTimeoutMs ?? FETCH_TIMEOUT_MS) });
     return { ok: res.ok, status: res.status };
   });
   for (const registryUrl of new Set(config.packages.map((p) => p.registryUrl))) {

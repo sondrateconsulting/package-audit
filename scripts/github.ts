@@ -15,7 +15,8 @@ import type { AuditDb } from "./db.ts";
 
 // ---- errors -----------------------------------------------------------------------------
 // Non-retryable API failure (404, permission, SSO enforcement, poisoned redirect, …) — the
-// orchestrator records an errors row for it.
+// orchestrator records an errors row for it, with ONE exception: a status-404 on a per-file
+// CONTENT read degrades to "file absent" (see orchestrate.ts apiReader), never a row.
 export class GithubApiError extends Error {
   readonly status: number;
   readonly endpoint: string;
@@ -28,12 +29,25 @@ export class GithubApiError extends Error {
     this.ssoRequired = opts.ssoRequired ?? false;
   }
 }
-// Retryable throttle that outlived the wrapper's internal retries — the orchestrator
-// RE-QUEUES the unit (work_queue back to pending, §4), never marks it a permanent error.
+// Retryable throttle that outlived the wrapper's internal wait+retry budget (§4). The wrapper
+// either slept through every window it was told about (attempt budget exhausted) or refused
+// to start a sleep that would blow the client-lifetime cumulative pause budget (early escape
+// from waitBucket). Either way the orchestrator treats it as TRANSIENT and defers to the
+// NEXT invocation instead of recording a permanent failure:
+// a mid-scan exhaustion resets that unit to `pending` with NO errors row (the §3 skip
+// predicate only skips `done` units, so a later run retries it); a repo/branch discovery
+// exhaustion logs a JSONL requeue event only (discovery re-runs every invocation anyway);
+// and an owner-resolution exhaustion ends the run cleanly WITHOUT starting one (no phantom
+// run row). --plan, which has no DB, instead counts a repo/branch discovery escape into its
+// failure totals (a plan-mode OWNER-discovery escape stays fatal — plan mode has nothing to
+// requeue into). Only NON-throttle errors at those sites are recorded or fatal — the
+// remediation here is time, then re-run.
 export class ThrottleExhausted extends Error {
   readonly endpoint: string;
   constructor(endpoint: string) {
-    super(`rate-limit throttling persisted beyond retries for ${endpoint}`);
+    super(
+      `rate-limit throttling persisted beyond the retry/pause budget for ${endpoint} — wait for the rate-limit window to reset, then re-run; a resumed run skips already-completed units`,
+    );
     this.name = "ThrottleExhausted";
     this.endpoint = endpoint;
   }
@@ -45,56 +59,145 @@ export interface SpawnResult {
   stdout: string;
   stderr: string;
 }
+// Minimal lib.dom-free abort plumbing (the tsconfig lib is ESNext-only, so the platform
+// AbortSignal instance type is memberless here): the client flips it on deadline expiry and
+// the spawn impl registers the child-kill. onAbort fires immediately if already aborted.
+export interface SpawnAbortSignal {
+  readonly aborted: boolean;
+  onAbort(cb: () => void): void;
+}
 export type SpawnFn = (
   bin: string,
   args: string[],
-  opts: { env: Record<string, string>; cwd?: string },
+  // `signal` aborts when the caller's wall-clock deadline expires — the impl must kill the child.
+  opts: { env: Record<string, string>; cwd?: string; signal?: SpawnAbortSignal },
 ) => Promise<SpawnResult>;
 
 const MAX_SPAWN_OUTPUT_BYTES = 110 * 1024 * 1024; // raw contents cap is 100 MB (§5.C) + slack
+// §4 hardening: SIGTERM is refusable — a signal-trapping/wedged child, or a descendant that
+// inherited the pipes, must not orphan the read loop or pin the event loop. This grace period
+// after the deadline's SIGTERM ends in SIGKILL, a best-effort process-group kill (the spawn
+// primitive cannot create a new group, so -pid only lands when the child leads one), reader
+// cancellation, and an unref of the handle so an abandoned loser can never hold the loop.
+export const SPAWN_KILL_GRACE_MS = 2_000;
+
+// structural (not the DOM/Bun-specific reader): the Bun subprocess reader is a superset, so a
+// minimal read/cancel shape accepts it without dragging in lib.dom's incompatible declaration.
+// EXPORTED (with readCapped) for the byte-cap unit tests; realSpawn is the only runtime caller.
+export interface StreamReader {
+  read(): Promise<{ done?: boolean; value?: Uint8Array }>;
+  cancel(reason?: unknown): Promise<void>;
+}
 
 // Stream-read with a BYTE cap enforced per chunk — the process is killed the moment the cap
-// is crossed, so an oversized response can never be fully buffered first.
-async function readCapped(stream: ReadableStream<Uint8Array>, cap: number, onExceed: () => void): Promise<string> {
+// is crossed, so an oversized response can never be fully buffered first. Takes the READER
+// (not the stream) so the kill-escalation path can cancel it from outside.
+export async function readCapped(reader: StreamReader, cap: number, onExceed: () => void): Promise<string> {
   const chunks: Uint8Array[] = [];
   let total = 0;
-  const reader = stream.getReader();
   for (;;) {
     const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > cap) {
-      onExceed();
-      throw new GithubApiError(`spawn output exceeds ${cap} bytes`, {});
+    if (value !== undefined) {
+      total += value.byteLength;
+      if (total > cap) {
+        onExceed();
+        throw new GithubApiError(`spawn output exceeds ${cap} bytes`, {});
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+    if (done) break;
   }
   return Buffer.concat(chunks).toString("utf8");
 }
 
-const realSpawn: SpawnFn = async (bin, args, opts) => {
-  const proc = Bun.spawn({
-    cmd: [bin, ...args],
-    env: opts.env,
-    cwd: opts.cwd,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const kill = (): void => {
-    try {
-      proc.kill();
-    } catch {
-      // already exited
-    }
+// Factory so the byte cap is injectable for tests (shipping 110MB through a real child to
+// exercise the cap would be pure test tax); realSpawn — the production SpawnFn — is
+// makeRealSpawn(MAX_SPAWN_OUTPUT_BYTES).
+export function makeRealSpawn(cap: number): SpawnFn {
+  return async (bin, args, opts) => {
+    const proc = Bun.spawn({
+      cmd: [bin, ...args],
+      env: opts.env,
+      cwd: opts.cwd,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const outReader = proc.stdout.getReader();
+    const errReader = proc.stderr.getReader();
+    const kill = (): void => {
+      try {
+        proc.kill();
+      } catch {
+        // already exited
+      }
+      // Escalation fires UNCONDITIONALLY after the grace (all steps are no-ops on a clean
+      // exit): SIGKILL cannot be trapped, and cancelling the readers unblocks readCapped even
+      // when a surviving grandchild still holds the inherited pipes open.
+      const escalate = setTimeout(() => {
+        try {
+          proc.kill(9); // SIGKILL
+        } catch {
+          // already exited
+        }
+        try {
+          process.kill(-proc.pid, 9); // group kill, when the child leads a group
+        } catch {
+          // not a group leader / already gone
+        }
+        outReader.cancel().catch(() => {});
+        errReader.cancel().catch(() => {});
+        proc.unref();
+      }, SPAWN_KILL_GRACE_MS);
+      escalate.unref?.();
+    };
+    opts.signal?.onAbort(kill);
+    // ANY reader failure — not only the byte cap's own onExceed — must start the kill
+    // escalation: a raw stream error otherwise leaves the child running and pins the
+    // hold-until-exit wait until the caller's wall-clock deadline. kill() is re-entrant
+    // (every step is a no-op on an already-dead child).
+    const killOnFailure = (p: Promise<string>): Promise<string> => {
+      p.catch(() => kill());
+      return p;
+    };
+    return joinSpawnOutcome(
+      killOnFailure(readCapped(outReader, cap, kill)),
+      killOnFailure(readCapped(errReader, cap, kill)),
+      proc.exited,
+    );
   };
-  const [stdout, stderr, exitCode] = await Promise.all([
-    readCapped(proc.stdout, MAX_SPAWN_OUTPUT_BYTES, kill),
-    readCapped(proc.stderr, MAX_SPAWN_OUTPUT_BYTES, kill),
-    proc.exited,
-  ]);
+}
+
+// Merge the two reader outcomes with the child's exit — NOT fail-fast: a byte-cap rejection
+// fires kill() while the child is still dying, and callers treat the spawn promise's
+// settlement as "the child is gone" (they may delete its working directory immediately).
+// Capture the TEMPORALLY FIRST reader error as it lands (a later, secondary failure must not
+// replace the original diagnostic), hold every outcome until the exit promise has resolved,
+// THEN rethrow it. NOTE the direct child's exit is the strongest guarantee available: a
+// descendant that survives the best-effort group kill could in principle still write
+// afterwards — that residue is the startup sweep's job. EXPORTED for tests: deterministic
+// two-failure ordering needs injected promises (a real child cannot produce two
+// distinguishable reader errors on demand).
+export async function joinSpawnOutcome(
+  stdoutP: Promise<string>,
+  stderrP: Promise<string>,
+  exited: Promise<number>,
+): Promise<SpawnResult> {
+  let firstErr: unknown;
+  let failed = false;
+  const capture = (p: Promise<string>): Promise<string> =>
+    p.catch((e: unknown) => {
+      if (!failed) {
+        failed = true;
+        firstErr = e;
+      }
+      return "";
+    });
+  const [stdout, stderr, exitCode] = await Promise.all([capture(stdoutP), capture(stderrP), exited]);
+  if (failed) throw firstErr;
   return { exitCode, stdout, stderr };
-};
+}
+const realSpawn: SpawnFn = makeRealSpawn(MAX_SPAWN_OUTPUT_BYTES);
 
 // ---- sanitized env (allowlist construction — dropped vars are simply never copied) --------
 type Env = Record<string, string | undefined>;
@@ -321,6 +424,10 @@ export function nextEndpointFromLink(linkUrl: string, githubHost: string): strin
   return `${path}${url.search}`;
 }
 
+// Hard ceiling on a Link rel="next" chain (§5.A): 1000 pages × per_page=100 = 100k rows,
+// far beyond any real listing. Bounds the requests/memory a poisoned Link chain can drive.
+export const MAX_PAGES = 1000;
+
 // ---- §4 throttle classification (pure) -----------------------------------------------------
 export type Classification =
   | { kind: "ok" }
@@ -330,10 +437,24 @@ export type Classification =
   | { kind: "fatal"; status: number; ssoRequired: boolean; message: string };
 
 const CLOCK_SKEW_MS = 5_000;
+// §4 hardening: reset/Retry-After are RESPONSE-controlled, so a poisoned header must not
+// command an unbounded pause (real GitHub resets are <= 1h). Every throttle wait is clamped
+// here at classification; the attempt loops stay bounded by MAX_ATTEMPTS, so the worst case
+// per call is MAX_ATTEMPTS clamped pauses.
+export const MAX_PAUSE_MS = 2 * 60 * 60 * 1000;
+const clampPauseMs = (ms: number | null): number | null =>
+  ms === null ? null : Math.min(ms, MAX_PAUSE_MS);
+// MAX_PAUSE_MS bounds ONE sleep; this bounds the TOTAL a bucket may sleep per client
+// lifetime — otherwise poison-then-succeed responses keep every call "succeeding" at
+// 5 clamped naps per page, ~417 days across one MAX_PAGES listing. Once spent, further
+// pending pauses fail as ThrottleExhausted instead of sleeping.
+export const MAX_TOTAL_PAUSE_MS = 8 * 60 * 60 * 1000;
 
 export function parseRetryAfterMs(value: string | undefined, nowMs: number): number | null {
   if (value === undefined || value === "") return null;
-  if (/^\d+$/.test(value.trim())) return Number(value.trim()) * 1000;
+  // the numeric form gets the same 1s floor as the HTTP-date form: Retry-After: 0 must
+  // not turn into a zero-length sleep + immediate retry.
+  if (/^\d+$/.test(value.trim())) return Math.max(1000, Number(value.trim()) * 1000);
   const asDate = Date.parse(value);
   if (!Number.isNaN(asDate)) return Math.max(1000, asDate - nowMs);
   return null;
@@ -343,6 +464,19 @@ export function parseRetryAfterMs(value: string | undefined, nowMs: number): num
 // permission/SSO/404 NON-retryable. So a 403 with nonzero remaining is secondary ONLY on
 // positive evidence (Retry-After header or the documented abuse wording); otherwise fatal.
 const SECONDARY_BODY_RE = /secondary rate limit|abuse detection|abuse rate limit/i;
+
+// Shared §4 PRIMARY-window computation (REST + GraphQL): reset epoch + skew, floored at
+// nowMs+1s, clamped at nowMs+MAX_PAUSE_MS. ONE site, so the four embedded constants
+// (CLOCK_SKEW_MS, the 60s no-header fallback, the 1s floor, MAX_PAUSE_MS) can never
+// silently desync between the two classifiers.
+function primaryUntilMs(headers: Record<string, string>, nowMs: number): number {
+  const resetSec = Number(headers["x-ratelimit-reset"] ?? "0");
+  const untilMs = Number.isFinite(resetSec) && resetSec > 0 ? resetSec * 1000 + CLOCK_SKEW_MS : nowMs + 60_000;
+  return Math.min(Math.max(untilMs, nowMs + 1000), nowMs + MAX_PAUSE_MS);
+}
+// Retry-After, parsed then clamped — the §4 secondary-throttle wait wherever it appears.
+const retryAfterClampedMs = (headers: Record<string, string>, nowMs: number): number | null =>
+  clampPauseMs(parseRetryAfterMs(headers["retry-after"], nowMs));
 
 export function classifyRest(
   status: number,
@@ -355,14 +489,11 @@ export function classifyRest(
     // PRIMARY is keyed on remaining==0, NOT the status code (§4). Checking it BEFORE the SSO
     // header is safe: a genuine SSO/permission 403 is not consuming the last request of the
     // window, so it arrives with nonzero remaining and falls through to the fatal branches.
-    if (headers["x-ratelimit-remaining"] === "0") {
-      const resetSec = Number(headers["x-ratelimit-reset"] ?? "0");
-      const untilMs = Number.isFinite(resetSec) && resetSec > 0 ? resetSec * 1000 + CLOCK_SKEW_MS : nowMs + 60_000;
-      return { kind: "primary", untilMs: Math.max(untilMs, nowMs + 1000) };
-    }
+    if (headers["x-ratelimit-remaining"] === "0")
+      return { kind: "primary", untilMs: primaryUntilMs(headers, nowMs) };
     if (headers["x-github-sso"] !== undefined)
-      return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso)" };
-    const retryAfter = parseRetryAfterMs(headers["retry-after"], nowMs);
+      return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso). Remediate: gh auth refresh (see README § What the gh token needs)" };
+    const retryAfter = retryAfterClampedMs(headers, nowMs);
     if (retryAfter !== null) return { kind: "secondary", waitMs: retryAfter };
     if (status === 429 || SECONDARY_BODY_RE.test(body)) return { kind: "secondary", waitMs: null };
     return { kind: "fatal", status, ssoRequired: false, message: `HTTP ${status} (permission/forbidden)` };
@@ -381,22 +512,18 @@ export function classifyGraphql(
   bodyErrors: GraphqlErrorEntry[],
   nowMs: number,
 ): Classification {
-  const primaryFromHeaders = (): Classification => {
-    const resetSec = Number(headers["x-ratelimit-reset"] ?? "0");
-    const untilMs = Number.isFinite(resetSec) && resetSec > 0 ? resetSec * 1000 + CLOCK_SKEW_MS : nowMs + 60_000;
-    return { kind: "primary", untilMs: Math.max(untilMs, nowMs + 1000) };
-  };
+  const primaryFromHeaders = (): Classification => ({ kind: "primary", untilMs: primaryUntilMs(headers, nowMs) });
   // SSO enforcement is ALWAYS fatal, never a retryable throttle — short-circuit on an error
   // status BEFORE the RATE_LIMITED body branch, so even a (hypothetical) 403 carrying both an
   // x-github-sso header and a RATE_LIMITED body stays fatal.
   if ((status === 403 || status === 429) && headers["x-github-sso"] !== undefined)
-    return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso)" };
+    return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso). Remediate: gh auth refresh (see README § What the gh token needs)" };
   // §4: GraphQL PRIMARY exhaustion is keyed on the BODY error (arrives as HTTP 200 with
   // errors[].type == 'RATE_LIMITED' and remaining 0) — never on the status code alone.
   const rateLimited = bodyErrors.some((e) => e.type === "RATE_LIMITED");
   if (rateLimited) {
     if (headers["x-ratelimit-remaining"] === "0") return primaryFromHeaders();
-    return { kind: "secondary", waitMs: parseRetryAfterMs(headers["retry-after"], nowMs) };
+    return { kind: "secondary", waitMs: retryAfterClampedMs(headers, nowMs) };
   }
   if (status === 403 || status === 429) {
     // §4's GraphQL 403 disambiguation (SSO already handled above): a documented permission
@@ -407,7 +534,7 @@ export function classifyGraphql(
       return { kind: "fatal", status, ssoRequired: false, message: text };
     if (headers["x-ratelimit-remaining"] === "0") return primaryFromHeaders();
     if (headers["retry-after"] !== undefined || SECONDARY_BODY_RE.test(text) || status === 429)
-      return { kind: "secondary", waitMs: parseRetryAfterMs(headers["retry-after"], nowMs) };
+      return { kind: "secondary", waitMs: retryAfterClampedMs(headers, nowMs) };
     return { kind: "fatal", status, ssoRequired: false, message: text || `HTTP ${status}` };
   }
   if (status >= 500) return { kind: "transient" };
@@ -500,10 +627,24 @@ class Semaphore {
 }
 
 // ---- client ---------------------------------------------------------------------------------
+// Resolve a binary against the SAME env the children are spawned with, so an injected PATH
+// (e.g. the entrypoint tests' offline shim dir) governs resolution too. Bare Bun.which reads
+// the process's INITIAL environ and ignores runtime PATH changes, which would silently reach
+// past an injected env to the machine's real binaries.
+function whichIn(env: Env, bin: string): string {
+  const path = env["PATH"];
+  return (path !== undefined ? Bun.which(bin, { PATH: path }) : Bun.which(bin)) ?? bin;
+}
+
 const RAW_ACCEPT = "application/vnd.github.raw+json";
 const MAX_ATTEMPTS = 6;
 const SECONDARY_BASE_WAIT_MS = 60_000; // §4: no Retry-After → wait at LEAST 60s, then backoff
 const TRANSIENT_BASE_WAIT_MS = 2_000;
+// §4 hardening: a poisoned endpoint can hang by PACING the response (trickling bytes) instead
+// of via headers — no byte cap or pause clamp fires when nothing arrives. Every spawn gets a
+// wall-clock kill deadline, generous enough for a large shallow clone or tarball extract. On
+// expiry the child is killed and the empty result flows into the transient retry path.
+export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
 
 export interface GithubClientOptions {
   githubHost: string;
@@ -512,13 +653,16 @@ export interface GithubClientOptions {
   spawnImpl?: SpawnFn;
   sleepImpl?: (ms: number) => Promise<void>;
   nowImpl?: () => number;
+  spawnTimeoutMs?: number; // wall-clock kill deadline per spawn (default SPAWN_TIMEOUT_MS)
   env?: Env;
   binPaths?: { gh: string; git: string; tar: string };
   tempRoot?: string; // default realpath(os.tmpdir()); pkg-audit-* dirs live directly under it
 }
 
 interface Bucket {
+  label: string;
   pausedUntilMs: number;
+  totalPausedMs: number; // cumulative slept-for-throttle ms, capped by MAX_TOTAL_PAUSE_MS
 }
 
 export class GithubClient {
@@ -528,13 +672,20 @@ export class GithubClient {
   private readonly spawn: SpawnFn;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
+  private readonly spawnTimeoutMs: number;
   private readonly bins: { gh: string; git: string; tar: string };
   private readonly ghEnv: Record<string, string>;
   private readonly baseEnv: Env;
   private readonly sem: Semaphore;
-  private readonly core: Bucket = { pausedUntilMs: 0 };
-  private readonly graphqlBucket: Bucket = { pausedUntilMs: 0 };
+  private readonly core: Bucket = { label: "core", pausedUntilMs: 0, totalPausedMs: 0 };
+  private readonly graphqlBucket: Bucket = { label: "graphql", pausedUntilMs: 0, totalPausedMs: 0 };
   private gitConfigPath: string | null = null;
+
+  // Observable cache-role: --plan's zero-write contract requires a cache-less client (db: null),
+  // and runPlan guards on this rather than trusting its caller's construction.
+  get cachesToDb(): boolean {
+    return this.db !== null;
+  }
 
   constructor(opts: GithubClientOptions) {
     this.githubHost = opts.githubHost;
@@ -542,15 +693,96 @@ export class GithubClient {
     this.spawn = opts.spawnImpl ?? realSpawn;
     this.sleep = opts.sleepImpl ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.now = opts.nowImpl ?? Date.now;
+    this.spawnTimeoutMs = opts.spawnTimeoutMs ?? SPAWN_TIMEOUT_MS;
+    // fail-fast knob validation: 0/negative here does NOT mean "unlimited" — a zero-slot
+    // semaphore hangs the first acquire forever (no exception, and the spawn deadline never
+    // covers semaphore queueing), and a nonpositive deadline instantly expires every spawn.
+    if (!Number.isFinite(this.spawnTimeoutMs) || this.spawnTimeoutMs < 1)
+      throw new Error(`spawnTimeoutMs must be >= 1 (got ${this.spawnTimeoutMs}) — a nonpositive deadline instantly times out every spawn`);
+    const concurrency = opts.concurrency ?? 8;
+    if (!Number.isFinite(concurrency) || concurrency < 1)
+      throw new Error(`concurrency must be >= 1 (got ${concurrency}) — a zero-slot semaphore hangs the first acquire forever`);
     this.baseEnv = opts.env ?? process.env;
     this.bins = opts.binPaths ?? {
-      gh: Bun.which("gh") ?? "gh",
-      git: Bun.which("git") ?? "git",
-      tar: Bun.which("tar") ?? "tar",
+      gh: whichIn(this.baseEnv, "gh"),
+      git: whichIn(this.baseEnv, "git"),
+      tar: whichIn(this.baseEnv, "tar"),
     };
     this.ghEnv = buildGhEnv(this.baseEnv, this.githubHost);
-    this.sem = new Semaphore(opts.concurrency ?? 8);
+    this.sem = new Semaphore(concurrency);
     this.tempRoot = opts.tempRoot ?? realpathSync(tmpdir());
+  }
+
+  // Race a spawn against the wall-clock deadline. A REAL timer (never the injectable fake
+  // clock — sleepImpl would resolve instantly under tests and expire every spawn) aborts the
+  // signal, so the impl kills the child, and yields an EMPTY-stdout nonzero result that the
+  // callers' existing no-HTTP-response transient path retries under MAX_ATTEMPTS. After the
+  // deadline fires, the return additionally WAITS for the spawned promise to settle — callers
+  // (cloneShallow, introspectVersion) delete the child's working directory the moment this
+  // returns, and a SIGTERMed-but-not-yet-dead child could still be writing into that tree.
+  // The wait is BOUNDED by the kill-escalation grace + margin so an impl that never settles
+  // (or a wedged kill) cannot convert the deadline into a hang — on a timeout the caller's
+  // semaphore slot is held up to that long extra, the deliberate price of race-free cleanup.
+  // The loser promise gets a no-op catch so a late rejection (e.g. the byte cap) is never
+  // unhandled.
+  private async spawnBounded(
+    bin: string,
+    args: string[],
+    opts: { env: Record<string, string>; cwd?: string },
+  ): Promise<SpawnResult> {
+    let aborted = false;
+    const killers: Array<() => void> = [];
+    const signal: SpawnAbortSignal = {
+      get aborted() { return aborted; },
+      onAbort(cb) { if (aborted) cb(); else killers.push(cb); },
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    // Both the deadline and the settle-fallback timers stay REF'D: they are actively
+    // awaited, and by the settle-wait the escalation may have unref'd every other handle —
+    // an unref'd awaited timer would let a standalone CLI process drain its event loop and
+    // exit MID-AWAIT, skipping the caller's cleanup and the run's report finalization.
+    // Neither can leak: both are cleared in the finally below.
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        aborted = true;
+        for (const kill of killers) kill();
+        resolve();
+      }, this.spawnTimeoutMs);
+    });
+    try {
+      const spawned = this.spawn(bin, args, { ...opts, signal });
+      // the settle observer doubles as the no-op catch (a late rejection is never unhandled)
+      // AND records any rejection so the timeout branch can prefer the real diagnostic.
+      let spawnRejected = false;
+      let spawnRejection: unknown;
+      const settled = spawned.then(
+        () => undefined,
+        (e: unknown) => {
+          spawnRejected = true;
+          spawnRejection = e;
+        },
+      );
+      await Promise.race([settled, deadline]);
+      // the flag (not race order) decides: a kill that settles the spawn in the same tick as
+      // the deadline must still be reported as a timeout, not as the child's own exit.
+      if (!timedOut) return spawned;
+      const gaveUp = new Promise<void>((resolve) => {
+        settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
+      });
+      await Promise.race([settled, gaveUp]);
+      // A rejection that settled the spawn is a REAL diagnostic (byte cap, stream failure) —
+      // it must win over the synthetic timeout even when the deadline fired during the
+      // hold-until-exit window: a synthetic 124 would misclassify it as a transient
+      // no-response and re-drive the oversized request through every retry.
+      if (spawnRejected) throw spawnRejection;
+      return { exitCode: 124, stdout: "", stderr: `spawn timed out after ${this.spawnTimeoutMs}ms: ${bin}` };
+    } finally {
+      clearTimeout(timer);
+      clearTimeout(settleTimer);
+    }
   }
 
   // ---- guarded low-level spawns (the §6 chokepoint) ----
@@ -563,7 +795,7 @@ export class GithubClient {
     assertReadOnlyGh(args);
     const release = bucket !== undefined ? await this.acquireRespectingPause(bucket) : await this.sem.acquire();
     try {
-      return await this.spawn(this.bins.gh, args, { env: this.ghEnv });
+      return await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
     } finally {
       release();
     }
@@ -590,8 +822,12 @@ export class GithubClient {
       const dest = positionals[1] ?? "";
       assertContained(dest, [this.tempRoot]);
     }
-    const env = buildGitEnv(this.baseEnv, this.ensureGitConfig());
-    return this.spawn(this.bins.git, args, { env, cwd });
+    // The `--version` probe (§2 preflight — also --plan's ONLY git invocation) needs no
+    // credential helper: point its global config at devNull instead of materializing the temp
+    // gitconfig, so plan mode truly writes nothing and leaks no pkg-audit-gitcfg-* dir.
+    const isVersionProbe = args.length === 1 && args[0] === "--version";
+    const env = buildGitEnv(this.baseEnv, isVersionProbe ? devNull : this.ensureGitConfig());
+    return this.spawnBounded(this.bins.git, args, { env, cwd });
   }
 
   async tar(args: string[]): Promise<SpawnResult> {
@@ -648,7 +884,7 @@ export class GithubClient {
       if (!args.includes("--no-same-owner") || !args.includes("--no-same-permissions"))
         throw new GithubApiError("tar extract requires --no-same-owner and --no-same-permissions", {});
     }
-    return this.spawn(this.bins.tar, args, { env: buildTarEnv(this.baseEnv) });
+    return this.spawnBounded(this.bins.tar, args, { env: buildTarEnv(this.baseEnv) });
   }
 
   // ---- REST GET with cache + throttle handling ----
@@ -658,7 +894,15 @@ export class GithubClient {
 
   private async waitBucket(bucket: Bucket): Promise<void> {
     const wait = bucket.pausedUntilMs - this.now();
-    if (wait > 0) await this.sleep(wait); // semaphore NOT held while sleeping
+    if (wait <= 0) return;
+    // the single chokepoint every throttle pause sleeps through — enforce the budget here.
+    // totalPausedMs is PER-CALLER-slept ms, not wall-clock: N concurrent callers sleeping one
+    // window ledger N×W. That over-count is deliberate (fails EARLY, never late), as is the
+    // accrue-BEFORE-sleep ordering — a concurrent caller must see the budget already committed.
+    if (bucket.totalPausedMs + wait > MAX_TOTAL_PAUSE_MS)
+      throw new ThrottleExhausted(`${bucket.label} bucket (cumulative pause budget ${MAX_TOTAL_PAUSE_MS}ms exceeded)`);
+    bucket.totalPausedMs += wait;
+    await this.sleep(wait); // semaphore NOT held while sleeping
   }
 
   // Acquire a slot with the pause re-checked AFTER acquisition: a caller queued on the
@@ -672,6 +916,18 @@ export class GithubClient {
     }
   }
 
+  // §4: the FINAL attempt's classification must not arm the bucket — the call is about to
+  // throw, and a residual pause would tax the next (possibly honest) call for free. ONE site
+  // for the guard so restGet and graphql can never drift apart. Callers compute untilMs
+  // eagerly; on the final attempt that spends one extra this.now() read and one discarded
+  // backoffWait computation (both pure — the injected test clocks only advance on sleep).
+  private armBucketPause(bucket: Bucket, attempt: number, untilMs: number): void {
+    if (attempt < MAX_ATTEMPTS - 1) bucket.pausedUntilMs = Math.max(bucket.pausedUntilMs, untilMs);
+  }
+
+  // MUST stay PURE (no state, no jitter, no counters): armBucketPause callers evaluate it
+  // even on the final attempt and discard the result — a side effect here would silently
+  // start taxing that discarded call.
   private backoffWait(kind: "secondary" | "transient", attempt: number, waitMs: number | null): number {
     if (waitMs !== null) return waitMs;
     const base = kind === "secondary" ? SECONDARY_BASE_WAIT_MS : TRANSIENT_BASE_WAIT_MS;
@@ -730,11 +986,11 @@ export class GithubClient {
       if (cls.kind === "fatal")
         throw new GithubApiError(`${cls.message} (${endpoint})`, { status: cls.status, endpoint, ssoRequired: cls.ssoRequired });
       if (cls.kind === "primary") {
-        this.core.pausedUntilMs = Math.max(this.core.pausedUntilMs, cls.untilMs);
+        this.armBucketPause(this.core, attempt, cls.untilMs);
         continue;
       }
       const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-      this.core.pausedUntilMs = Math.max(this.core.pausedUntilMs, this.now() + waitMs);
+      this.armBucketPause(this.core, attempt, this.now() + waitMs);
     }
     throw new ThrottleExhausted(endpoint);
   }
@@ -752,8 +1008,16 @@ export class GithubClient {
   // recomposed relative) until absent, accumulating array pages.
   async restGetPagedArray(endpoint: string): Promise<unknown[]> {
     const acc: unknown[] = [];
+    // A compromised/misbehaving API controls the Link chain: a repeated endpoint (cycle) or
+    // an endless unique chain must fail closed, not loop unbounded (rate-limit/memory/hang).
+    const seen = new Set<string>();
     let ep: string | null = endpoint;
     while (ep !== null) {
+      if (seen.has(ep))
+        throw new GithubApiError(`pagination Link cycle: ${ep} already fetched`, { endpoint: ep });
+      if (seen.size >= MAX_PAGES)
+        throw new GithubApiError(`pagination exceeded ${MAX_PAGES} pages following Link next`, { endpoint: ep });
+      seen.add(ep);
       const res = await this.restGet(ep);
       let page: unknown;
       try {
@@ -799,11 +1063,11 @@ export class GithubClient {
       if (cls.kind === "fatal")
         throw new GithubApiError(`graphql: ${cls.message}`, { status: cls.status, endpoint: "graphql", ssoRequired: cls.ssoRequired });
       if (cls.kind === "primary") {
-        this.graphqlBucket.pausedUntilMs = Math.max(this.graphqlBucket.pausedUntilMs, cls.untilMs);
+        this.armBucketPause(this.graphqlBucket, attempt, cls.untilMs);
         continue;
       }
       const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-      this.graphqlBucket.pausedUntilMs = Math.max(this.graphqlBucket.pausedUntilMs, this.now() + waitMs);
+      this.armBucketPause(this.graphqlBucket, attempt, this.now() + waitMs);
     }
     throw new ThrottleExhausted("graphql");
   }
@@ -830,8 +1094,15 @@ export class GithubClient {
     const query =
       "query($owner:String!,$name:String!,$endCursor:String){repository(owner:$owner,name:$name){refs(refPrefix:\"refs/heads/\",first:100,after:$endCursor){pageInfo{hasNextPage endCursor}nodes{name target{...on Commit{oid committedDate tree{oid}}}}}}}";
     const heads: BranchHead[] = [];
+    // same poisoned-pagination bound as restGetPagedArray: a response controls the next
+    // cursor, so a repeated or endless cursor chain must fail closed, not loop unbounded.
+    const seenCursors = new Set<string>();
     let cursor: string | null = null;
     for (;;) {
+      // loop-top cap = at most MAX_PAGES fetches, the same semantics as restGetPagedArray
+      // (seenCursors holds one cursor per follow-up, so size = pages already fetched - 1).
+      if (seenCursors.size >= MAX_PAGES)
+        throw new GithubApiError(`refs pagination exceeded ${MAX_PAGES} pages for ${org}/${repo}`, { endpoint: "graphql" });
       const fields: Record<string, string> = { owner: org, name: repo };
       if (cursor !== null) fields["endCursor"] = cursor; // omit entirely on the first page (§5.B)
       const data = (await this.graphql(query, fields)) as {
@@ -846,7 +1117,11 @@ export class GithubClient {
           heads.push({ name: n.name, oid: n.target.oid, committedDate: n.target.committedDate, treeOid: n.target.tree.oid });
       }
       if (refs.pageInfo?.hasNextPage === true && typeof refs.pageInfo.endCursor === "string") {
-        cursor = refs.pageInfo.endCursor;
+        const next = refs.pageInfo.endCursor;
+        if (seenCursors.has(next))
+          throw new GithubApiError(`refs pagination cursor cycle for ${org}/${repo}`, { endpoint: "graphql" });
+        seenCursors.add(next);
+        cursor = next;
       } else {
         break;
       }
@@ -928,21 +1203,35 @@ export class GithubClient {
   }
 
   async cloneShallow(org: string, repo: string, branch: string): Promise<{ dir: string; headSha: string }> {
-    const dest = join(this.makeRunTempDir(), "clone");
+    const runDir = this.makeRunTempDir();
+    const dest = join(runDir, "clone");
     assertContained(dest, [this.tempRoot]); // §0: clone dest containment BEFORE spawning
     const url = `https://${this.githubHost}/${encodeURIComponent(org)}/${encodeURIComponent(repo)}.git`;
     const args = [
       "clone", "--depth", "1", "--single-branch", "--branch", branch,
       "--no-tags", "--no-recurse-submodules", "--template=", url, dest,
     ];
-    const res = await this.git(args);
-    if (res.exitCode !== 0)
-      throw new GithubApiError(`git clone failed for ${org}/${repo}@${branch}: ${res.stderr.trim().slice(0, 300)}`, { endpoint: url });
-    // §0: record the fetched SHA. cwd inside the clone is permitted for git itself only.
-    const rev = await this.git(["rev-parse", "HEAD"], dest);
-    if (rev.exitCode !== 0)
-      throw new GithubApiError(`git rev-parse HEAD failed in ${dest}: ${rev.stderr.trim().slice(0, 300)}`, { endpoint: url });
-    return { dir: dest, headSha: rev.stdout.trim() };
+    try {
+      const res = await this.git(args);
+      if (res.exitCode !== 0)
+        throw new GithubApiError(`git clone failed for ${org}/${repo}@${branch}: ${res.stderr.trim().slice(0, 300)}`, { endpoint: url });
+      // §0: record the fetched SHA. cwd inside the clone is permitted for git itself only.
+      const rev = await this.git(["rev-parse", "HEAD"], dest);
+      if (rev.exitCode !== 0)
+        throw new GithubApiError(`git rev-parse HEAD failed in ${dest}: ${rev.stderr.trim().slice(0, 300)}`, { endpoint: url });
+      return { dir: dest, headSha: rev.stdout.trim() };
+    } catch (e) {
+      // a failed/timed-out clone can leave a multi-GB partial tree — reclaim it NOW rather
+      // than at the next run's startup sweep (the caller only cleans up on success). The
+      // cleanup is BEST-EFFORT: force only suppresses ENOENT, and an EACCES/EBUSY here must
+      // not replace the actionable git error (a stuck tree is the next sweep's problem).
+      try {
+        rmSync(runDir, { recursive: true, force: true });
+      } catch {
+        // the original error propagates below
+      }
+      throw e;
+    }
   }
 
   // ---- startup sweep (§0): stale pkg-audit-* DIRECT children of the temp root only ----

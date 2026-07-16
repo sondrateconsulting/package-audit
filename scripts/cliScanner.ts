@@ -40,6 +40,7 @@ interface DerivedTerms {
   scoped: boolean;
   runnerTerms: Set<string>; // dlx-family (npx/bunx/pnpm dlx/yarn dlx/bun x): {name} + bins
   execAndBareTerms: Set<string>; // pnpm/yarn exec + bare: unscoped {name} + bins
+  bareMatchers: RegExp[]; // §5.G/§7: bareTokenRegex compiled ONCE per exec/bare term (see below)
 }
 
 export function deriveTerms(t: CliTermSet): DerivedTerms {
@@ -47,7 +48,26 @@ export function deriveTerms(t: CliTermSet): DerivedTerms {
   const bins = t.binNames.filter((b) => b !== ""); // an empty bin name would make bareTokenRegex match everywhere
   const runnerTerms = new Set<string>([t.name, ...bins]);
   const execAndBareTerms = new Set<string>([...(scoped ? [] : [t.name]), ...bins]);
-  return { packageName: t.packageName, scoped, runnerTerms, execAndBareTerms };
+  // §7: PRECOMPILE the bare-token matchers once here instead of constructing a fresh RegExp per
+  // bin per command-unit inside commandInvokes. Behaviour-identical — bareTokenRegex has no `/g`,
+  // so `.test` is stateless and reusing the compiled RegExp cannot leak lastIndex across commands.
+  // The hostile bin COUNT is bounded upstream by MAX_BIN_NAMES (apiSurface §7).
+  const bareMatchers = [...execAndBareTerms].map(bareTokenRegex);
+  return { packageName: t.packageName, scoped, runnerTerms, execAndBareTerms, bareMatchers };
+}
+
+// §7: derive each unit's term sets ONCE, not per scanned file. scanCli is called per FILE with the
+// SAME termSets array reference for every file in a unit (unitPipeline.scanUnit), so caching on that
+// reference hoists derivation to once-per-unit without changing the caller. A WeakMap keeps it
+// GC-safe (no retained references once the unit's array is dropped).
+const derivedCache = new WeakMap<CliTermSet[], DerivedTerms[]>();
+function deriveAll(termSets: CliTermSet[]): DerivedTerms[] {
+  let derived = derivedCache.get(termSets);
+  if (derived === undefined) {
+    derived = termSets.map(deriveTerms);
+    derivedCache.set(termSets, derived);
+  }
+  return derived;
 }
 
 // A punctuation-aware BARE-token boundary (consult §5.G): a bare term must not substring-match
@@ -94,7 +114,7 @@ function commandInvokes(cmd: string, terms: DerivedTerms): boolean {
   for (const runner of EXEC_RUNNERS) {
     if (runnerTargets(cmd, runner).some((t) => terms.execAndBareTerms.has(t))) return true;
   }
-  for (const bare of terms.execAndBareTerms) if (bareTokenRegex(bare).test(cmd)) return true;
+  for (const re of terms.bareMatchers) if (re.test(cmd)) return true; // precompiled (§7)
   return false;
 }
 
@@ -124,7 +144,7 @@ export function scanCli(content: string, ctx: CliScanContext, termSets: CliTermS
   if (termSets.length === 0) return [];
   const kind = classifyFile(ctx.filePath);
   if (kind === "other") return [];
-  const derived = termSets.map(deriveTerms);
+  const derived = deriveAll(termSets); // §7: once per unit (cached on the termSets reference)
   const lines = content.split("\n");
 
   let units: Unit[];
@@ -190,6 +210,47 @@ function lineUnits(lines: string[], contextKind: "shell" | "makefile" | "workflo
   return units;
 }
 
+// A stage name is a leading run of these chars WITHIN a single token — one char class, no
+// overlapping quantifiers, so it stays linear even on a hostile token.
+const STAGE_NAME_PREFIX = /^[A-Za-z0-9_.-]+/;
+// ASCII-case-insensitive keyword tests. Deliberately regex (not `.toUpperCase() === "AS"`): JS's
+// non-Unicode `/i` folds only ASCII, so `/^as$/i` rejects e.g. `aſ` (U+017F, whose toUpperCase is
+// "S") — matching exactly what the old `…\s+AS\s+…/i` regex did.
+const FROM_KEYWORD = /^from$/i;
+const AS_KEYWORD = /^as$/i;
+
+// The stage name of a `FROM <image> AS <name>` line, or null when the line is not a FROM…AS.
+//
+// Linear replacement for the old `/^\s*FROM\s+.*?\s+AS\s+([A-Za-z0-9_.-]+)/i`, whose overlapping
+// `\s+ .*? \s+` quantifiers explored O(N³) partitions of a space run before failing (CWE-1333
+// ReDoS — a single space-padded line hung the whole audit). Splitting on whitespace bounds the work
+// to O(line length) and reproduces the old regex term for term:
+//   • Search AS from index 2 — the old `\s+.*?\s+` forces ≥1 token between FROM and AS, so AS is
+//     never token 0 (FROM) or token 1 (the image, or a leading flag like `--platform=…`). We do NOT
+//     parse out flags; like the old regex we just take the first standalone case-insensitive
+//     `as`/`AS` token from index 2 on. If the image is literally named `as`, BOTH old and new treat
+//     it as the keyword (e.g. `FROM --platform=x as AS build` → `stage:AS`) — this is equivalence
+//     with the old parser, not Docker-correctness.
+//   • `/^as$/i` mirrors the old literal `AS` under `/i` (ASCII-only case folding, so e.g. `aſ` is
+//     not `AS` — matching the old regex, unlike `.toUpperCase() === "AS"`).
+//   • First AS with a valid following name wins → the old lazy `.*?`; an AS whose next token starts
+//     with an invalid char is skipped → the old capture backtracking to a later AS.
+//   • STAGE_NAME_PREFIX = the leading valid-char run of the next token → the old capture group.
+// Differential-tested over 40k random inputs: the ONLY divergence is a malformed FROM with no image
+// (the token right after FROM is itself `AS`), which never appears in a real Dockerfile.
+function dockerfileStageName(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const toks = trimmed.split(/\s+/);
+  if (!FROM_KEYWORD.test(toks[0]!)) return null;
+  for (let i = 2; i < toks.length - 1; i++) {
+    if (!AS_KEYWORD.test(toks[i]!)) continue;
+    const name = STAGE_NAME_PREFIX.exec(toks[i + 1]!);
+    if (name) return name[0];
+  }
+  return null;
+}
+
 // Dockerfile: track `FROM … AS <stage>`; RUN/other lines carry `stage:<name>` (or stage:<index>).
 function dockerfileUnits(lines: string[]): Unit[] {
   const units: Unit[] = [];
@@ -197,12 +258,13 @@ function dockerfileUnits(lines: string[]): Unit[] {
   let stageIndex = 0;
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i]!;
-    const fromMatch = /^\s*FROM\s+.*?\s+AS\s+([A-Za-z0-9_.-]+)/i.exec(raw);
-    const bareFrom = /^\s*FROM\s+/i.test(raw);
-    if (fromMatch) {
-      stage = `stage:${fromMatch[1]}`;
+    const stageName = dockerfileStageName(raw);
+    if (stageName !== null) {
+      stage = `stage:${stageName}`;
       stageIndex++;
-    } else if (bareFrom) {
+    } else if (/^\s*FROM\s+/i.test(raw)) {
+      // a bare `FROM <image>` (no `AS <name>`) — carry an index-based stage. This test is linear:
+      // one `\s*` and one `\s+` with nothing overlapping after them.
       stage = `stage:${stageIndex}`;
       stageIndex++;
     }

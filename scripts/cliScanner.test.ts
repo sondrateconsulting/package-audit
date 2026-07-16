@@ -1,5 +1,6 @@
 import { expect, test, describe } from "bun:test";
 import { scanCli, deriveTerms, classifyFile, type CliTermSet, type CliScanContext } from "./cliScanner.ts";
+import type { WorkerReply } from "./cliScannerRedosWorker.ts";
 
 const ctx = (filePath: string): CliScanContext => ({
   githubHost: "github.com",
@@ -122,6 +123,174 @@ describe("scanCli — shell / Dockerfile / workflow / Makefile", () => {
   test("Makefile recipe line matches", () => {
     const mk = `build:\n\texpo export\n`;
     expect(scan(mk, "Makefile")).toEqual([{ context: "makefile", line: 2 }]);
+  });
+});
+
+describe("scanCli — Dockerfile FROM…AS stage parsing (linear, ReDoS-safe)", () => {
+  // Regression guard for CWE-1333. The previous parser used
+  //   /^\s*FROM\s+.*?\s+AS\s+([A-Za-z0-9_.-]+)/i
+  // whose `\s+ .*? \s+` places three space-matching quantifiers back-to-back before a literal `AS`
+  // that can fail; on a `FROM` line followed by a long run of spaces the engine explores O(N³)
+  // partitions of that run before declaring failure. `.exec` is synchronous, so one such line —
+  // landable by any contributor in a scanned Dockerfile — blocks the single JS thread and hangs the
+  // whole audit run. Timings for the old regex: 1k spaces ≈ 0.2s, 2k ≈ 1.6s, 4k ≈ 14s (×8 per
+  // doubling → 100k spaces ≈ hours). The linear tokenizer resolves 100k spaces in single-digit ms.
+  //
+  // We run scanCli in a Worker so a re-introduced backtracking regex hangs the WORKER, not the test
+  // runner: the parent races a 5s deadline and terminate()s a hung worker, turning a would-be
+  // unbounded hang into a bounded, deterministic failure. A synchronous regex cannot be interrupted
+  // by Bun's per-test timeout, and the repo-wide single-chokepoint guard (github.test.ts) forbids
+  // process-spawning APIs, so a Worker (a thread the parent can terminate) is the fit.
+  //
+  // Three outcomes, all bounded: the worker posts a tagged reply on success/scanCli-throw (surfaced
+  // immediately with its real cause), `onerror` catches a worker that fails to load/run, and the 5s
+  // deadline catches an actual ReDoS hang — so a NON-ReDoS failure never masquerades as a timeout.
+  test("a space-padded FROM line cannot hang the scanner (ReDoS regression guard)", async () => {
+    const worker = new Worker(new URL("./cliScannerRedosWorker.ts", import.meta.url).href);
+    try {
+      const reply = await new Promise<WorkerReply>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("scanCli did not finish in 5s — a cubic-time FROM…AS regression is hanging")),
+          5000,
+        );
+        const settle = (action: () => void) => {
+          clearTimeout(timer);
+          action();
+        };
+        worker.onmessage = (event) => settle(() => resolve(event.data as WorkerReply));
+        worker.onerror = (event) =>
+          settle(() => reject(new Error(`worker failed to run: ${(event as { message?: string }).message ?? String(event)}`)));
+        worker.postMessage(100_000); // 100k spaces
+      });
+      if (!reply.ok) throw new Error(`scanCli threw inside the worker: ${reply.error}`);
+      // the padded FROM has no `AS` token → it is a bare FROM (stage index 0); the expo line inherits it
+      expect(reply.rows).toEqual([{ context: "stage:0", line: 2 }]);
+    } finally {
+      worker.terminate();
+    }
+  }, 15_000);
+
+  test("named stages, a later stage, and a trailing bare FROM all track correctly", () => {
+    const df =
+      [
+        "FROM node:20 AS build", //         named → stage:build
+        "RUN expo a", //                    line 2 → stage:build
+        "COPY --from=build /a /b", //       non-FROM line does NOT transition the stage
+        "FROM nginx AS serve", //           named → stage:serve
+        "RUN expo b", //                    line 5 → stage:serve
+        "FROM alpine", //                   bare  → stage index 2 (two prior FROMs)
+        "RUN expo c", //                    line 7 → stage:2
+      ].join("\n") + "\n";
+    expect(scan(df, "Dockerfile")).toEqual([
+      { context: "stage:build", line: 2 },
+      { context: "stage:serve", line: 5 },
+      { context: "stage:2", line: 7 },
+    ]);
+  });
+
+  test("FROM/AS keywords are case-insensitive", () => {
+    expect(scan("from ubuntu as base\nRUN expo x\n", "Dockerfile")).toEqual([
+      { context: "stage:base", line: 2 },
+    ]);
+  });
+
+  test("flags before the image (--platform) do not confuse the AS parser", () => {
+    expect(scan("FROM --platform=linux/amd64 node:20 AS builder\nRUN expo x\n", "Dockerfile")).toEqual([
+      { context: "stage:builder", line: 2 },
+    ]);
+  });
+
+  test("irregular inner whitespace (extra spaces + tabs) still parses the stage name", () => {
+    expect(scan("FROM   node:20 \t AS   \t build\nRUN expo x\n", "Dockerfile")).toEqual([
+      { context: "stage:build", line: 2 },
+    ]);
+  });
+
+  test("a leading bare FROM yields stage index 0", () => {
+    expect(scan("FROM alpine\nRUN expo x\n", "Dockerfile")).toEqual([{ context: "stage:0", line: 2 }]);
+  });
+
+  test("an image literally named `as` is not mistaken for the AS keyword", () => {
+    // the AS keyword can only appear AFTER a real image token; the image `as` must be skipped
+    expect(scan("FROM as AS build\nRUN expo x\n", "Dockerfile")).toEqual([
+      { context: "stage:build", line: 2 },
+    ]);
+  });
+
+  test("a FROM…AS with no trailing stage name falls back to a bare (indexed) stage", () => {
+    // line 1 → stage:named (index→1); line 2 `FROM x AS` has no name → bare FROM → stage:1
+    const df = "FROM base AS named\nFROM x AS\nRUN expo z\n";
+    expect(scan(df, "Dockerfile")).toEqual([{ context: "stage:1", line: 3 }]);
+  });
+
+  test("an AS whose next token is not a valid stage name is skipped for the next AS", () => {
+    expect(scan("FROM x AS @bad AS good\nRUN expo z\n", "Dockerfile")).toEqual([
+      { context: "stage:good", line: 2 },
+    ]);
+  });
+
+  test("the first valid AS wins", () => {
+    expect(scan("FROM x AS first AS second\nRUN expo z\n", "Dockerfile")).toEqual([
+      { context: "stage:first", line: 2 },
+    ]);
+  });
+
+  test("a stage name keeps only its leading valid chars (drops a trailing `:tag`)", () => {
+    expect(scan("FROM x AS build:latest\nRUN expo z\n", "Dockerfile")).toEqual([
+      { context: "stage:build", line: 2 },
+    ]);
+  });
+
+  test("a comment line does not transition the stage", () => {
+    const df = "FROM base AS keep\n# FROM foo AS changed\nRUN expo z\n";
+    expect(scan(df, "Dockerfile")).toEqual([{ context: "stage:keep", line: 3 }]);
+  });
+
+  test("a trailing-space bare FROM still advances the stage index", () => {
+    // line 1 `FROM ` (trailing space, no image) is a bare FROM → stage:0, index→1;
+    // line 2 `FROM scratch` is a bare FROM → stage:1
+    const df = "FROM \nFROM scratch\nRUN expo z\n";
+    expect(scan(df, "Dockerfile")).toEqual([{ context: "stage:1", line: 3 }]);
+  });
+
+  test("an image literally named `as` under a flag matches the old regex (stage:AS, not Docker semantics)", () => {
+    // Both the OLD case-insensitive regex and the tokenizer treat the lowercase image `as` as the AS
+    // keyword, so the stage becomes `AS`. This asserts behavior-EQUIVALENCE with the old parser, not
+    // Docker-correctness (Docker would read the stage as `build`). Confirmed by differential testing:
+    // old and new both yield stage:AS here.
+    expect(scan("FROM --platform=linux/amd64 as AS build\nRUN expo x\n", "Dockerfile")).toEqual([
+      { context: "stage:AS", line: 2 },
+    ]);
+  });
+
+  test("a malformed no-image `FROM  AS x` is the sole documented divergence (bare stage, not stage:x)", () => {
+    // The old two-`\s+` regex read this malformed line (no image between FROM and AS) as `stage:x`;
+    // tokenizing normalizes whitespace and treats it as a bare FROM → `stage:0`. A real Dockerfile
+    // always has an image, so this input never occurs in practice. This is the ONLY input where the
+    // tokenizer intentionally differs from the old regex (verified over 40k differential inputs).
+    expect(scan("FROM  AS x\nRUN expo z\n", "Dockerfile")).toEqual([{ context: "stage:0", line: 2 }]);
+  });
+});
+
+describe("deriveTerms — precompiled bare matchers (§7)", () => {
+  test("bareMatchers is compiled once per exec/bare term and matches like bareTokenRegex", () => {
+    const d = deriveTerms({ packageName: "expo", name: "expo", binNames: ["expo-cli"] });
+    expect(d.bareMatchers.length).toBe(d.execAndBareTerms.size); // one per exec/bare term
+    expect(d.bareMatchers.some((re) => re.test("expo start"))).toBe(true);
+    expect(d.bareMatchers.some((re) => re.test("expo-cli run"))).toBe(true);
+    // boundary-aware: a longer word must NOT match (behaviour-identical to bareTokenRegex)
+    expect(d.bareMatchers.some((re) => re.test("run-export-thing"))).toBe(false);
+  });
+  test("a scoped name contributes only its bins as bare matchers (never the scoped specifier)", () => {
+    const d = deriveTerms({ packageName: "@scope/pkg", name: "@scope/pkg", binNames: ["mycli"] });
+    expect(d.bareMatchers.length).toBe(1); // just the bin
+    expect(d.bareMatchers[0]!.test("mycli run")).toBe(true);
+  });
+  test("a reused precompiled matcher is stateless across commands (no /g lastIndex leak)", () => {
+    const d = deriveTerms({ packageName: "expo", name: "expo", binNames: [] });
+    const re = d.bareMatchers[0]!;
+    expect(re.test("expo a")).toBe(true);
+    expect(re.test("expo a")).toBe(true); // second call: same result, no lastIndex advance
   });
 });
 

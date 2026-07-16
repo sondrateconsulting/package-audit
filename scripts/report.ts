@@ -1,17 +1,23 @@
 // report.ts — §7 consolidated report, generated DETERMINISTICALLY from SQLite ALONE. Entry point:
-//   bun run scripts/report.ts [--run-id <id>]
+//   bun run scripts/report.ts [--config <path>] [--run-id <id>] [--html]
 // Default (no --run-id): the latest COMPLETED run with non-empty tracked_packages; also overwrites
-// <outputDir>/latest.json. A --run-id writes ONLY <outputDir>/run-<id>.json (never latest.json).
-// Findings are joined through the IMMUTABLE run_unit_head snapshot (never findings.run_id) filtered
+// <outputDir>/latest.json. A --run-id writes its JSON report ONLY to <outputDir>/run-<id>.json (never latest.json).
+// Findings are joined through the per-run run_unit_head snapshot (never findings.run_id) filtered
 // to runs.tracked_packages, and EVERY emitted array has a total, stable sort key so the output is
 // byte-reproducible.
 
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { loadConfig } from "./config.ts";
-import { AuditDb, type RunRecord } from "./db.ts";
 import { assertContained } from "./readOnlyGuard.ts";
+import { loadConfig, type Config } from "./config.ts";
+import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
+import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
+import { dossierFilename, renderDossierDetailed, type DossierContext } from "./reportHtml.ts";
+import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
+import { logLine } from "./log.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
+import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
+import { renderFatal } from "./cliErrors.ts";
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -28,21 +34,66 @@ interface UsageRowDb {
   package_name: string; dependency_key: string; usage_type: string; export_name: string;
   context: string; file_path: string; line_number: number; permalink: string; snippet: string; found_at: string;
 }
-interface HeadRow { organization: string; repository: string; branch: string; commit_sha: string; status: string }
+interface HeadRow {
+  organization: string; repository: string; branch: string; commit_sha: string; status: string;
+  is_default_branch: number | null; // 1/0/NULL — NULL = unknown (pre-v3 run rows)
+}
 
 function unitKey(o: string, r: string, b: string, c: string): string {
   return `${o}\0${r}\0${b}\0${c}`;
 }
 
-// Build the whole §7 report object for a run from SQLite alone.
-export function buildReport(db: AuditDb, run: RunRecord): unknown {
+// The report's §7 summary block — the ONE hand-written source for this shape. orchestrate.ts
+// imports it for the done event + stderr summary, and reportSchema's summarySchema is key-synced
+// to it by test, so the three can never silently disagree.
+export interface ReportSummary {
+  organizationsScanned: number;
+  repositoriesScanned: number;
+  branchesScanned: number;
+  branchesSkippedByCutoff: number;
+  totalDependencyFindings: number;
+  totalUsageFindings: number;
+}
+
+// Top-level envelope of the emitted report. `packages` is typed as the exact shape buildPackage
+// emits, which (by construction — see report.ts's apiSurface typing) stays assignable to the
+// dossier renderer's DossierPackage contract. This is the compile-time link (review M5): if
+// buildPackage/buildUnit rename or drop a field the renderer reads, emitDossiers' renderDossierDetailed
+// call stops compiling here instead of throwing at render time. The full report shape (declarations,
+// cli, dateFetched — a superset of the renderer's view) is preserved for run-<id>.json; its JSON
+// contract is separately enforced by reportSchema.ts in tests. errors[] stays untyped (leaf only).
+export interface EmittedReport {
+  runId: string;
+  generatedAt: string;
+  config: { packages: string[]; cutoffDate: string; githubHost: string; organizations: string[]; organizationsSource: string };
+  packages: ReadonlyArray<ReturnType<typeof buildPackage>>;
+  errors: unknown[];
+  summary: ReportSummary;
+}
+
+// Build the whole §7 report object for a run from SQLite alone. Works on the read-only handle;
+// the whole build runs inside ONE deferred read transaction so its multiple statements see a
+// single coherent snapshot even while a live audit commits concurrently.
+export function buildReport(db: AuditDbReader, run: RunRecord): EmittedReport {
+  return db.readTransaction(() => buildReportInner(db, run));
+}
+
+function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   const runId = run.runId;
   const tracked = JSON.stringify(run.trackedPackages);
 
   // scanned snapshot heads for this run (skipped-cutoff carry commit_sha='' and no findings).
-  const heads = db.read(`SELECT organization, repository, branch, commit_sha, status FROM run_unit_head WHERE run_id = ?`).all(runId) as HeadRow[];
+  const heads = db.read(`SELECT organization, repository, branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ?`).all(runId) as HeadRow[];
   const scannedHeads = heads.filter((h) => h.status === "scanned");
   const scannedKeys = new Set(scannedHeads.map((h) => unitKey(h.organization, h.repository, h.branch, h.commit_sha)));
+  // Tri-state default-branch flag per scanned unit (§5.B): true/false from v3 runs, null for
+  // pre-v3 rows — the renderer shows null as its own "(default branch unknown)" state.
+  const defaultFlags = new Map<string, boolean | null>(
+    scannedHeads.map((h) => [
+      unitKey(h.organization, h.repository, h.branch, h.commit_sha),
+      h.is_default_branch === null ? null : h.is_default_branch === 1,
+    ]),
+  );
 
   // findings joined through the immutable snapshot, filtered to tracked_packages.
   const depRows = (db.read(
@@ -63,7 +114,7 @@ export function buildReport(db: AuditDb, run: RunRecord): unknown {
   const packages = run.trackedPackages
     .slice()
     .sort(cmp)
-    .map((name) => buildPackage(db, name, depRows, usageRows, scannedKeys));
+    .map((name) => buildPackage(db, name, depRows, usageRows, scannedKeys, defaultFlags));
 
   const errors = (db.read(
     `SELECT scope, organization, repository, branch, package_name, version, message, occurred_at, id
@@ -86,7 +137,7 @@ export function buildReport(db: AuditDb, run: RunRecord): unknown {
   };
 }
 
-function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[]) {
+function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[]): ReportSummary {
   const orgs = new Set(scannedHeads.map((h) => h.organization));
   const repos = new Set(scannedHeads.map((h) => `${h.organization}/${h.repository}`));
   return {
@@ -99,7 +150,10 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
   };
 }
 
-function buildPackage(db: AuditDb, name: string, depRows: DepRow[], usageRows: UsageRowDb[], scannedKeys: Set<string>) {
+function buildPackage(
+  db: AuditDbReader, name: string, depRows: DepRow[], usageRows: UsageRowDb[],
+  scannedKeys: Set<string>, defaultFlags: Map<string, boolean | null>,
+) {
   const deps = depRows.filter((d) => d.package_name === name);
   const usage = usageRows.filter((u) => u.package_name === name);
 
@@ -107,8 +161,10 @@ function buildPackage(db: AuditDb, name: string, depRows: DepRow[], usageRows: U
   const versionsSeen = [...new Set(deps.map((d) => d.resolved_version).filter((v): v is string => v !== null && parseSemver(v) !== null))]
     .sort(compareForReport);
 
-  // apiSurface: only versions carrying a completion marker; keys in versionsSeen order.
-  const apiSurface: Record<string, unknown> = {};
+  // apiSurface: only versions carrying a completion marker; keys in versionsSeen order. Typed
+  // concretely (not Record<string, unknown>) so the emitted package stays statically assignable to
+  // the dossier renderer's DossierApiSurfaceEntry — see the compile-time link on EmittedReport.packages.
+  const apiSurface: Record<string, { exports: { name: string; kind: string }[]; cli: { hasCli: boolean; binNames: string[] } }> = {};
   for (const version of versionsSeen) {
     if (!db.hasCompletionMarker(name, version)) continue;
     const rows = db.read(`SELECT export_name, export_kind FROM package_api_surface WHERE package_name = ? AND version = ?`).all(name, version) as Array<{ export_name: string; export_kind: string }>;
@@ -129,14 +185,31 @@ function buildPackage(db: AuditDb, name: string, depRows: DepRow[], usageRows: U
 
   const usageByRepo = [...unitMap.values()]
     .sort((a, b) => cmp(a.organization, b.organization) || cmp(a.repository, b.repository) || cmp(a.branch, b.branch) || cmp(a.commitSha, b.commitSha))
-    .map((unit) => buildUnit(unit, deps, usage));
+    .map((unit) => buildUnit(unit, deps, usage, defaultFlags.get(unitKey(unit.organization, unit.repository, unit.branch, unit.commitSha)) ?? null));
 
   return { name, versionsSeen, apiSurface, usageByRepo };
 }
 
+// lockfile_lines is self-produced (written via JSON.stringify at ingest), so this parse is not
+// attacker-facing — but guard it anyway, matching artifactWrite.ts's guarded manifest parse: a
+// corrupted DB cell degrades that one declaration's line refs to null instead of throwing and
+// failing the ENTIRE report build (report/report --html/orchestrate's final step).
+export function parseLockfileLines(json: string | null): number[] | null {
+  if (json === null) return null;
+  try {
+    const v: unknown = JSON.parse(json);
+    // Line refs are 1-based POSITIVE SAFE integers (the report schema's contract); reject a corrupted
+    // cell holding NaN/Infinity/floats/0/negatives/unsafe integers (all still `typeof "number"`) so
+    // the report never carries a malformed line number.
+    return Array.isArray(v) && v.every((n) => Number.isSafeInteger(n) && (n as number) > 0) ? (v as number[]) : null;
+  } catch {
+    return null;
+  }
+}
+
 function buildUnit(
   unit: { organization: string; repository: string; branch: string; commitSha: string },
-  deps: DepRow[], usage: UsageRowDb[],
+  deps: DepRow[], usage: UsageRowDb[], isDefaultBranch: boolean | null,
 ) {
   const inUnit = <T extends { organization: string; repository: string; branch: string; commit_sha: string }>(r: T): boolean =>
     r.organization === unit.organization && r.repository === unit.repository && r.branch === unit.branch && r.commit_sha === unit.commitSha;
@@ -155,7 +228,7 @@ function buildUnit(
       permalink: d.manifest_permalink, declaredVersion: d.declared_version,
       resolvedVersion: d.resolved_version, resolvedVersionSource: d.resolved_version_source,
       lockfile: d.lockfile_path === null ? null : {
-        path: d.lockfile_path, lines: d.lockfile_lines === null ? null : (JSON.parse(d.lockfile_lines) as number[]), permalink: d.lockfile_permalink,
+        path: d.lockfile_path, lines: parseLockfileLines(d.lockfile_lines), permalink: d.lockfile_permalink,
       },
     }))
     .sort((a, b) => cmp(a.dependencyType, b.dependencyType) || cmp(a.dependencyKey, b.dependencyKey) || cmp(a.path, b.path) || a.line - b.line);
@@ -170,64 +243,154 @@ function buildUnit(
     .map((u) => ({ file: u.file_path, line: u.line_number, context: u.context, permalink: u.permalink, snippet: u.snippet }))
     .sort((a, b) => cmp(a.file, b.file) || a.line - b.line || cmp(a.context, b.context));
 
-  return { organization: unit.organization, repository: unit.repository, branch: unit.branch, commitSha: unit.commitSha, dateFetched, declarations, apiUsage, cliUsage };
+  return { organization: unit.organization, repository: unit.repository, branch: unit.branch, isDefaultBranch, commitSha: unit.commitSha, dateFetched, declarations, apiUsage, cliUsage };
 }
 
 // Emit a run's report files into outputDir (§7). Writes run-<id>.json always; the DEFAULT
 // report also overwrites latest.json with a byte copy. Reused by orchestrate.ts (§8 step 6-7) so
-// a full run ends with a report without a second command. Returns the primary file path.
-export function emitReport(db: AuditDb, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean }): string {
-  mkdirSync(outputDir, { recursive: true });
+// a full run ends with a report without a second command. Returns the path AND the report
+// object, so the caller's done-event counters and human summary derive from the EXACT emitted
+// report (never a separate re-query that could disagree with run-<id>.json).
+export function emitReportDetailed(
+  db: AuditDbReader, run: RunRecord, outputDir: string, opts: { alsoLatest: boolean },
+): { path: string; report: EmittedReport } {
+  mkdirCanonical(outputDir);
   const report = buildReport(db, run);
   const runPath = join(outputDir, `run-${run.runId}.json`);
   writeJson(runPath, outputDir, report);
   if (opts.alsoLatest) writeJson(join(outputDir, "latest.json"), outputDir, report);
-  return runPath;
+  return { path: runPath, report };
+}
+// The "nothing to report" notice (no completed reportable run, or an unknown/pre-migration
+// --run-id). Exported so tests validate the REAL emitted object against notReportableSchema,
+// not a hand-written lookalike.
+export function buildNotReportableNotice(runIdArg: string | null, missingDbPath?: string): { notReportable: true; reason: string } {
+  // A missing database is the most fundamental "nothing to report" cause and gets an actionable
+  // reason (run the audit first); it takes precedence over the run-id/empty cases, which only
+  // make sense once a database exists.
+  return {
+    notReportable: true,
+    reason:
+      missingDbPath !== undefined
+        ? `no database at ${missingDbPath} — run \`bun run audit\` first`
+        : runIdArg !== null
+          ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)`
+          : "no completed reportable run yet",
+  };
 }
 
-// ---- entry point ----------------------------------------------------------------------------
-async function main(): Promise<void> {
-  const argv = Bun.argv.slice(2);
-  const runIdArg = getRunIdArg(argv);
-  const { config } = await loadConfig(argv);
-  const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath });
+// The report flow minus argv/config parsing (main() below wires those in). Exported as a
+// testable seam — like orchestrate.ts's runPlan — so the "no database yet" invariant is proven
+// against a real temp dir, not just asserted. Returns the exact line main() writes to stdout.
+//
+// Invariant (the reason this seam exists): running `report` before any `audit` is a pure no-op.
+// AuditDb.open would create data/audit.db (create:true) and the emit path would mkdir outputDir;
+// a first report must touch NOTHING and just say so. So we exist-check before opening: a missing
+// database short-circuits with the notReportable notice and zero filesystem effect.
+// `report --html` (T3-T6): render one self-contained dossier per tracked package plus the
+// index, through the ArtifactBundle (kind "dossier" — export artifacts of the SAME run are
+// adopted, never swept). One JSONL event per dossier (T7), with the observations fallback
+// VISIBLE (observations: "emitted"|"omitted"), then a dossier-summary event. The rendered
+// dossier/index bytes are a pure function of the report object; the caller already holds it, so
+// no re-query can disagree with run-<id>.json.
+export function emitDossiers(report: EmittedReport, outputDir: string): { dossiers: number; swept: string[] } {
+  const ctx: DossierContext = {
+    runId: report.runId,
+    generatedAt: report.generatedAt,
+    config: report.config,
+    summary: report.summary,
+    formatVersion: XRAY_FORMAT_VERSION,
+  };
+  const bundle = new ArtifactBundle(outputDir, "dossier");
+  let dossiers = 0;
+  for (const pkg of report.packages) {
+    // No cast: report.packages is typed as buildPackage's output, statically assignable to the
+    // renderer's DossierPackage — a drift in the build shape fails to compile right here.
+    const { html, observationsStatus, observationCount } = renderDossierDetailed(pkg, ctx);
+    const name = dossierFilename(pkg.name);
+    const record = bundle.write(name, html);
+    dossiers++;
+    logLine({
+      event: "dossier", package: pkg.name, path: join(outputDir, XRAY_DIR_NAME, record.path),
+      bytes: record.bytes, observations: observationsStatus, observationCount,
+    });
+  }
+  bundle.write(INDEX_FILENAME, renderIndex(report, { formatVersion: XRAY_FORMAT_VERSION }));
+  const { swept } = bundle.finalize({ runId: report.runId });
+  logLine({ event: "dossier-summary", runId: report.runId, dossiers, index: join(outputDir, XRAY_DIR_NAME, INDEX_FILENAME), swept });
+  return { dossiers, swept };
+}
+
+export function runReport(config: Config, runIdArg: string | null, opts: { html?: boolean } = {}): { line: string } {
+  const sqlitePath = config.paths.sqlitePath;
+  // :memory: folds into the missing-db notice: a fresh in-memory database can never hold a
+  // completed run, and openReadOnly (below) rightly refuses to open one.
+  if (sqlitePath === ":memory:" || !existsSync(sqlitePath)) {
+    // Exit 0 (main() returns normally): notReportable is a well-formed, successful answer on the
+    // stdout JSONL contract — consumers branch on the parsed `notReportable` field, not the exit
+    // code — and this matches the exit-0 behavior of the DB-present notReportable cases below.
+    return { line: `${JSON.stringify(buildNotReportableNotice(runIdArg, sqlitePath))}\n` };
+  }
+  // CV5: report is a pure READ — it must never create, migrate, or write the database. A
+  // too-old schema renders the actionable "run `bun run audit` once to migrate" DbError.
+  const db = AuditDb.openReadOnly({ sqlitePath });
   try {
     const run = runIdArg !== null ? db.getRun(runIdArg) : db.latestReportableRun();
     const outputDir = config.paths.outputDir;
-    mkdirSync(outputDir, { recursive: true });
+    mkdirCanonical(outputDir);
 
     if (run === null || run.trackedPackages.length === 0) {
-      const notice = { notReportable: true, reason: runIdArg !== null ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)` : "no completed reportable run yet" };
+      const notice = buildNotReportableNotice(runIdArg);
       const path = join(outputDir, runIdArg !== null ? `run-${runIdArg}.json` : "latest.json");
       writeJson(path, outputDir, notice);
-      process.stdout.write(`${JSON.stringify(notice)}\n`);
-      return;
+      return { line: `${JSON.stringify(notice)}\n` };
     }
 
-    const runPath = emitReport(db, run, outputDir, { alsoLatest: runIdArg === null });
-    process.stdout.write(`report written: ${runPath}${runIdArg === null ? " (+ latest.json)" : ""}\n`);
+    const emitted = emitReportDetailed(db, run, outputDir, { alsoLatest: runIdArg === null });
+    if (opts.html === true) {
+      const { dossiers } = emitDossiers(emitted.report, outputDir);
+      return {
+        line: `report written: ${emitted.path}${runIdArg === null ? " (+ latest.json)" : ""} — ${dossiers} dossier(s) + index in ${join(outputDir, XRAY_DIR_NAME)}\n`,
+      };
+    }
+    return { line: `report written: ${emitted.path}${runIdArg === null ? " (+ latest.json)" : ""}\n` };
   } finally {
     db.close();
   }
 }
 
-function getRunIdArg(argv: string[]): string | null {
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!;
-    if (a === "--run-id") return argv[i + 1] ?? null;
-    if (a.startsWith("--run-id=")) return a.slice("--run-id=".length);
+// ---- entry point ----------------------------------------------------------------------------
+// argv is injectable (defaulting to the process argv) so the entrypoint tests can drive the
+// REAL dispatch — help short-circuit before config/DB, runReport wiring — in-process.
+export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
+  const rargs = parseReportArgs(argv); // strict: unknown flags / valueless --run-id are rejected
+  if (rargs.help) {
+    process.stdout.write(REPORT_HELP + "\n");
+    return;
   }
-  return null;
+  const { config } = await loadConfig(argv);
+  process.stdout.write(runReport(config, rargs.runId, { html: rargs.html }).line);
 }
 
+// Atomic (temp+rename) and SYNC — the old Bun.write here discarded its Promise, a latent
+// fire-and-forget that could lose the report on a fast exit. §0 containment lives inside
+// writeFileAtomic (roots = [outputDir], the same contract as before).
 function writeJson(path: string, outputDir: string, value: unknown): void {
-  assertContained(path, [outputDir]); // §0 write containment
-  Bun.write(path, JSON.stringify(value, null, 2) + "\n");
+  writeFileAtomic(path, JSON.stringify(value, null, 2) + "\n", [outputDir]);
+}
+
+// mkdir the CANONICAL outputDir, never the raw configured string: recursive mkdirSync creates
+// every path component physically, so a config-accepted `..` chain (canonical resolution lands
+// inside the roots) would otherwise create its intermediate directories OUTSIDE them —
+// `out/../evil/../out` must never create `evil/`. assertContained(dir, [dir]) is the resolving
+// identity: it returns the symlink-aware canonical path (the writeFileAtomic precedent).
+function mkdirCanonical(outputDir: string): void {
+  mkdirSync(assertContained(outputDir, [outputDir]), { recursive: true });
 }
 
 if (import.meta.main) {
   main().catch((e) => {
-    process.stderr.write(`report failed: ${(e as Error).stack ?? (e as Error).message}\n`);
+    process.stderr.write(renderFatal(e, { command: "report", usage: REPORT_USAGE }));
     process.exit(1);
   });
 }

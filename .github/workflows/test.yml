@@ -1,0 +1,90 @@
+# Run the test suite and typecheck on every PR and every push to main.
+#
+# Before this workflow existed the only CI gate was the zizmor workflow audit (sca.yml),
+# so a code regression in any scripts/*.ts module would merge green. This closes that gap.
+#
+# Bun is pinned to the version the repo is developed and live-tested against (README
+# documents ≥ 1.1; bump deliberately, not via "latest"). `--frozen-lockfile` makes the
+# install fail loudly on bun.lock drift instead of silently resolving new versions.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # Same pattern as sca.yml: PRs coalesce by ref (a newer push cancels the superseded
+  # run, since only the latest commit gates the merge); main and workflow_dispatch get
+  # a per-commit group (the github.sha suffix) so every commit is tested to completion.
+  # ('pr' is a truthy constant, avoiding the empty-string falsy pitfall in GitHub's
+  # `a && b || c` ternary.)
+  group: tests-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: bun test + typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run typecheck
+
+  # CT8: every DuckDB/jq recipe in the README's "Analyze the exports" section is executed
+  # VERBATIM against a synthetic fixture export. Execution lives HERE (not in bun test):
+  # spawning external binaries from the codebase is confined to the audited gh/git/tar
+  # chokepoint by a repo-wide scan, so the CLI runs are workflow steps. Identifier drift
+  # between recipes and the export column registry is caught by scripts/exportsDoc.test.ts.
+  # DuckDB is SHA-pinned like every other action; the CLI version is pinned explicitly.
+  recipes:
+    name: README export recipes (DuckDB + jq)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+      - uses: opt-nc/setup-duckdb-action@69cdd8ddbc31d02a76e4b733fdfad3b19123a3e7 # v1.2.10
+        with:
+          version: v1.5.4
+      - run: bun install --frozen-lockfile
+      - name: Generate the synthetic fixture exports
+        run: bun run scripts/ciExportFixture.ts
+      - name: Extract and run every README recipe verbatim
+        run: |
+          set -euo pipefail
+          shopt -s nullglob  # an empty recipe glob reaches the count guards' clear diagnostic
+          # Slice the "Analyze the exports" section, split out each fenced block by language.
+          awk '/^## Analyze the exports$/{flag=1;next}/^## /{flag=0}flag' README.md > /tmp/recipes-section.md
+          awk '/^```sql$/{i++;flag=1;next}/^```$/{flag=0}flag{print > ("/tmp/recipe-" i ".sql")}' /tmp/recipes-section.md
+          awk '/^```sh$/{j++;flag=1;next}/^```$/{flag=0}flag{print > ("/tmp/recipe-sh-" j ".sh")}' /tmp/recipes-section.md
+          sql_count=0
+          for f in /tmp/recipe-*.sql; do
+            sql_count=$((sql_count + 1))
+            echo "=== $f ==="
+            cat "$f"
+            duckdb -init /dev/null -batch < "$f"
+          done
+          sh_count=0
+          for f in /tmp/recipe-sh-*.sh; do
+            sh_count=$((sh_count + 1))
+            echo "=== $f ==="
+            cat "$f"
+            bash "$f"
+          done
+          # The extraction itself must never silently go stale: fail if counts drop.
+          test "$sql_count" -ge 4
+          test "$sh_count" -ge 1

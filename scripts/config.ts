@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
+import { isValidPackageName } from "./packageName.ts";
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -88,6 +89,43 @@ function optStringArray(o: Record<string, unknown>, key: string, dflt: string[])
   return v as string[];
 }
 
+// ---- unknown-key rejection (strict at every object level) ---------------------------------
+// A typo'd key must fail LOUDLY: `"organization"` (missing s) would otherwise be silently
+// ignored, leaving organizations=null — DISCOVERY MODE — and widening the scan to every org the
+// token can see. Key sets are exported so the config.schema.json sync tests can assert the
+// schema and the runtime agree. `$schema` is a root-only editor hint: allowed, type-checked,
+// and excluded from config_hash (it never enters the hash projection).
+export const CONFIG_ROOT_KEYS = [
+  "$schema", "githubHost", "organizations", "excludeOrganizations", "includePersonalNamespace",
+  "includeForks", "includeArchived", "maxReposPerOrg", "maxBranchesPerRepo", "cutoffDate",
+  "concurrency", "packages", "excludeDirGlobs", "paths",
+] as const;
+export const CONFIG_CONCURRENCY_KEYS = ["organizations", "repositories", "branches"] as const;
+export const CONFIG_PATHS_KEYS = ["sqlitePath", "outputDir"] as const;
+export const CONFIG_PACKAGE_KEYS = ["name", "registryUrl", "registryAuthEnvVar"] as const;
+
+// Classic two-row Levenshtein — inputs are short config keys, so this stays trivial.
+function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur: number[] = [i];
+    for (let j = 1; j <= b.length; j++)
+      cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length]!;
+}
+
+function rejectUnknownKeys(o: Record<string, unknown>, known: readonly string[], path: string): void {
+  const knownSet = new Set<string>(known);
+  for (const key of Object.keys(o)) {
+    if (knownSet.has(key)) continue;
+    const best = known.map((k) => ({ k, d: editDistance(key, k) })).sort((x, y) => x.d - y.d)[0];
+    const hint = best !== undefined && best.d <= 2 ? ` — did you mean "${best.k}"?` : "";
+    fail(`unknown config key ${path}.${key}${hint} (valid keys: ${[...known].sort().join(", ")})`);
+  }
+}
+
 // ---- validation + normalization ----------------------------------------------------------
 function normalizeGithubHost(o: Record<string, unknown>): string {
   const host = optString(o, "githubHost", DEFAULT_GITHUB_HOST);
@@ -129,9 +167,14 @@ function normalizePackages(o: Record<string, unknown>, env: Record<string, strin
   if (!Array.isArray(raw) || raw.length === 0) fail(`packages is required and must be a non-empty array (minItems: 1)`);
   const seen = new Set<string>();
   const packages: PackageConfig[] = [];
-  for (const entry of raw as unknown[]) {
+  for (const [i, entry] of (raw as unknown[]).entries()) {
     if (!isObject(entry)) fail(`each packages[] entry must be an object`);
+    rejectUnknownKeys(entry, CONFIG_PACKAGE_KEYS, `$.packages[${i}]`);
     const name = reqString(entry, "name", "packages[]");
+    // Fail-closed at the boundary: a name that isn't a strictly valid npm package name could,
+    // once embedded in a registry URL, normalize to an off-target same-origin path/query and
+    // leak the registry bearer token (§5.E). Reject it before it ever reaches the fetch layer.
+    if (!isValidPackageName(name)) fail(`packages["${name}"].name is not a valid npm package name`);
     if (seen.has(name)) fail(`packages[].name must be UNIQUE across the array — duplicate: ${name}`);
     seen.add(name);
     const registryUrl = validateRegistryUrl(optString(entry, "registryUrl", DEFAULT_REGISTRY_URL), name);
@@ -152,6 +195,7 @@ function normalizePackages(o: Record<string, unknown>, env: Record<string, strin
 function normalizeConcurrency(o: Record<string, unknown>): Concurrency {
   const c = o["concurrency"];
   if (!isObject(c)) fail(`concurrency must be an object`);
+  rejectUnknownKeys(c, CONFIG_CONCURRENCY_KEYS, "$.concurrency");
   const read = (k: keyof Concurrency): number => {
     const v = (c as Record<string, unknown>)[k];
     if (!isPosInt(v)) fail(`concurrency.${k} must be a positive integer`);
@@ -163,6 +207,7 @@ function normalizeConcurrency(o: Record<string, unknown>): Concurrency {
 function normalizePaths(o: Record<string, unknown>): { sqlitePath: string; outputDir: string } {
   const p = o["paths"];
   if (!isObject(p)) fail(`paths must be an object`);
+  rejectUnknownKeys(p, CONFIG_PATHS_KEYS, "$.paths");
   const sqlitePath = reqString(p, "sqlitePath", "paths");
   const outputDir = reqString(p, "outputDir", "paths");
   // §0 WRITE CONTAINMENT: the configured storage locations must resolve under an allowed root
@@ -181,6 +226,9 @@ function normalizePaths(o: Record<string, unknown>): { sqlitePath: string; outpu
 export function validateAndNormalize(raw: unknown, env: Record<string, string | undefined>): Config {
   if (!isObject(raw)) throw new ConfigError(`config root must be a JSON object`);
   const o: Record<string, unknown> = raw;
+  rejectUnknownKeys(o, CONFIG_ROOT_KEYS, "$");
+  const schemaHint = o["$schema"];
+  if (schemaHint !== undefined && !isString(schemaHint)) fail(`$schema must be a string (editor hint)`);
 
   const cutoffDate = reqString(o, "cutoffDate", "config");
   if (!DATE_RE.test(cutoffDate)) fail(`cutoffDate must be YYYY-MM-DD: ${cutoffDate}`);

@@ -1,4 +1,5 @@
 {
+    "$schema": "./config.schema.json",
     "concurrency": {
         "branches": 4,
         "organizations": 3,

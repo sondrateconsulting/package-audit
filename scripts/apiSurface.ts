@@ -9,15 +9,25 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { mkdirSync, rmSync, existsSync, readFileSync, readdirSync, lstatSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
+import { logLine } from "./log.ts";
 import type { GithubClient } from "./github.ts";
 import type { AuditDb, ApiSurfaceRow, ResolvedVersionSource } from "./db.ts";
 import { parseJsoncObject } from "./jsonc.ts";
-import { resolveTypeTargets, typeTargetToDts, binNames, exportsSubpathKeys, resolveSubpath, type PkgJson } from "./exportsResolve.ts";
-import { enumerateDtsExports, joinRelative, type DtsResolver } from "./dtsExports.ts";
+import {
+  resolveTypeTargets, typeTargetToDts, binNames, exportsSubpathKeys, resolveSubpath,
+  resolvePatternTargetTemplates, hasVersionedExportCondition, declarationCandidates, type PkgJson,
+} from "./exportsResolve.ts";
+import {
+  enumerateDtsExports, joinRelative, createParseBudget,
+  type DtsResolver, type DtsResolved, type ParseBudget, type ParseBudgetOptions,
+} from "./dtsExports.ts";
 import { maxSatisfying } from "./semver.ts";
 import { scanTarball } from "./tarScan.ts";
+// Re-exported so callers (and tests) get the same fail-closed name validator the fetch layer uses.
+export { isValidPackageName, MAX_PACKAGE_NAME_LEN } from "./packageName.ts";
+import { isValidPackageName } from "./packageName.ts";
 
 export class IntrospectionError extends Error {
   constructor(message: string) {
@@ -28,6 +38,12 @@ export class IntrospectionError extends Error {
 
 const MAX_TARBALL_BYTES = 100 * 1024 * 1024; // registry tarball hard cap, COMPRESSED (§5.C/§5.E)
 const MAX_REDIRECTS = 5;
+// §5.E hardening: the registry is untrusted — a trickling or never-ending response must not
+// hang the serial introspection stage, and a chunked (no Content-Length) body must not be
+// buffered past its cap. Every fetch carries this wall-clock deadline (connect through body),
+// and bodies are stream-read with the cap enforced per chunk (mirrors github.ts readCapped).
+export const FETCH_TIMEOUT_MS = 60_000;
+export const MAX_PACKUMENT_BYTES = 50 * 1024 * 1024; // large packages ship multi-MB packuments
 // UNCOMPRESSED cap: a registry .tgz is untrusted, and a decompression bomb (a tiny .tgz that
 // inflates to gigabytes) must not exhaust memory. node:zlib enforces maxOutputLength INCREMENTALLY
 // and throws before the cap is exceeded (Bun.gunzipSync has no such cap). Set above tarScan's
@@ -122,19 +138,119 @@ export function resolveRangeToVersion(packument: Packument, range: string): stri
 }
 
 // SLASH-only encoding of a scoped package name for the packument URL: `@scope/name` →
-// `@scope%2Fname` (NOT full encodeURIComponent, which would also encode the `@`).
+// `@scope%2Fname` (NOT full encodeURIComponent, which would also encode the `@`). Encode
+// EVERY slash (global): a valid scoped name has exactly one, but a malformed name must not
+// leave later slashes as literal URL path separators.
 export function encodePackageNameForUrl(name: string): string {
-  return name.startsWith("@") ? name.replace("/", "%2F") : name;
+  return name.startsWith("@") ? name.replace(/\//g, "%2F") : name;
+}
+
+// ---- artifact-path policy (§5.E finding #8, pure) -------------------------------------------
+// The registry BASE PATH, derived ONLY from operator config (never packument data): the registry
+// URL's pathname with trailing slashes collapsed to a single trailing '/'. Yields '/' for a root
+// registry (npmjs) and '/api/npm/team/' for a based one. The trailing slash is a free segment
+// boundary — '/api/npm/team-evil/...' does NOT startsWith '/api/npm/team/'.
+export function registryBasePrefix(registryUrl: string): string {
+  return new URL(registryUrl).pathname.replace(/\/+$/, "") + "/";
+}
+
+// HARDENED artifact-path predicate (§5.E finding #8). A bare startsWith gate is NOT fail-closed:
+// downstream servers apply their OWN path normalization AFTER this check, so a same-origin path
+// that startsWith the base can still resolve above/outside it via a normalization differential.
+// Returns true ONLY when ALL hold:
+//   1. pathname startsWith basePrefix (the segment-bounded base check), AND
+//   2. the RAW pathname carries no encoded path separator — %2f/%2F (some servers decode to '/')
+//      or %5c/%5C (to '\') — which WHATWG `new URL` preserves un-decoded here, AND
+//   3. the pathname carries no ';' matrix parameter (Java/Tomcat/Jetty strip '..;/' → '../'), AND
+//   4. every segment AFTER basePrefix, once decodeURIComponent-ed, is neither '.' nor '..' and
+//      contains no '/' or '\' (defense against any residual normalization differential).
+// Legit npm tarball paths ('/<pkg>/-/...', scoped '/@scope/pkg/-/...') never contain %2f or ';',
+// so false-positive risk is minimal; failing closed on a rare percent-encoded-slash path is the
+// governing decision.
+export function isSafeArtifactPath(u: URL, basePrefix: string): boolean {
+  const path = u.pathname;
+  if (!path.startsWith(basePrefix)) return false;
+  if (/%2f|%5c/i.test(path)) return false; // encoded path separators a downstream server may decode
+  if (path.includes(";")) return false; // matrix parameters (…;/ folds to ../ on some stacks)
+  const rest = path.slice(basePrefix.length);
+  if (rest === "") return false; // must name an artifact UNDER the base, not the base itself
+  for (const seg of rest.split("/")) {
+    if (seg === "") continue; // incidental empty segment (e.g. a doubled slash) is not a traversal
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(seg);
+    } catch {
+      return false; // malformed percent-encoding fails closed
+    }
+    if (decoded === "." || decoded === "..") return false;
+    if (decoded.includes("/") || decoded.includes("\\")) return false;
+  }
+  return true;
 }
 
 // ---- fetch layer (injectable) ---------------------------------------------------------------
-export type FetchFn = (url: string, init: { headers: Record<string, string>; redirect: "manual" }) => Promise<{
+export type FetchFn = (url: string, init: { headers: Record<string, string>; redirect: "manual"; signal?: AbortSignal }) => Promise<{
   status: number;
   ok: boolean;
   headers: { get(name: string): string | null };
+  // present on the real fetch (and stream-aware mocks): read via readBodyCapped so the byte
+  // cap trips incrementally; the buffer methods below are the legacy-mock fallback.
+  body?: ReadableStream<Uint8Array> | null;
   arrayBuffer(): Promise<ArrayBuffer>;
   text(): Promise<string>;
 }>;
+
+// unknown-safe rendering for diagnostic labels: streams and fetch impls may reject with
+// non-Error values, and a bare `(e as Error).message` would render "undefined" (or throw
+// on null) inside the very label meant to explain the failure.
+const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+// Stream-read a response body with the cap enforced PER CHUNK and a single wall-clock deadline
+// for the whole read — a trickling registry can neither out-buffer the cap nor stall forever.
+export async function readBodyCapped(
+  body: ReadableStream<Uint8Array>,
+  cap: number,
+  timeoutMs: number,
+  what: string,
+): Promise<Uint8Array> {
+  // fail-fast at the boundary: 0/negative does NOT mean "no limit" — a nonpositive cap would
+  // reject every body, and a nonpositive deadline fires ~immediately.
+  if (!Number.isFinite(cap) || cap < 1) throw new IntrospectionError(`${what} cap must be >= 1 (got ${cap})`);
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new IntrospectionError(`${what} timeoutMs must be >= 1 (got ${timeoutMs})`);
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new IntrospectionError(`${what} body read timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer.unref?.(); // a pending deadline must never pin the event loop by itself
+  });
+  try {
+    for (;;) {
+      const readP = reader.read();
+      readP.catch(() => {}); // a post-deadline rejection must not become unhandled
+      let done: boolean | undefined;
+      let value: Uint8Array | undefined;
+      try {
+        ({ done, value } = await Promise.race([readP, deadline]));
+      } catch (e) {
+        // the deadline's own labeled timeout passes through; a RAW mid-stream failure
+        // (connection reset, TLS error) gets the same what+progress labeling the sibling
+        // timeout/cap diagnostics carry — operators triage these from the errors table.
+        if (e instanceof IntrospectionError) throw e;
+        throw new IntrospectionError(`${what} body read failed after ${total} bytes: ${errText(e)}`);
+      }
+      if (done || value === undefined) break;
+      total += value.byteLength;
+      if (total > cap) throw new IntrospectionError(`${what} exceeds ${cap} bytes`);
+      chunks.push(value);
+    }
+    return new Uint8Array(Buffer.concat(chunks));
+  } finally {
+    clearTimeout(timer);
+    reader.cancel().catch(() => {}); // release the stream on every exit (no-op when done)
+  }
+}
 
 export interface IntrospectOptions {
   client: GithubClient;
@@ -147,28 +263,56 @@ export interface IntrospectOptions {
   versionSource: ResolvedVersionSource;
   env?: Record<string, string | undefined>;
   fetchImpl?: FetchFn;
+  fetchTimeoutMs?: number; // wall-clock deadline per hop/body read (default FETCH_TIMEOUT_MS)
   packument?: Packument; // optional pre-fetched packument (the orchestrator caches per package)
+  maxPatternMatches?: number; // §5.E #6a cap on distinct wildcard-export matches (default MAX_PATTERN_MATCHES)
+  inspectCaps?: InspectCaps; // §7 parse-budget / cardinality overrides (tests inject tiny caps)
 }
 
-const realFetch: FetchFn = (url, init) => fetch(url, { headers: init.headers, redirect: init.redirect }) as unknown as ReturnType<FetchFn>;
+const realFetch: FetchFn = (url, init) =>
+  fetch(url, { headers: init.headers, redirect: init.redirect, signal: init.signal }) as unknown as ReturnType<FetchFn>;
 
-// Fetch a URL following redirects MANUALLY, re-verifying the per-hop origin and attaching the
-// bearer token ONLY on hops whose origin equals the registry origin (never carrying it across a
-// redirect to a different origin). Accept-Encoding: identity so the .tgz gzip bytes are not
-// transparently decoded (SRI is over those exact bytes, and system tar needs them).
+// Fetch a URL following redirects MANUALLY, re-verifying the per-hop origin AND base path and
+// attaching the bearer token ONLY on hops whose origin equals the registry origin AND whose path
+// is a safe under-base artifact path (never carrying it across a redirect to a different origin,
+// nor to a same-origin off-base/traversal path — §5.E finding #8). Accept-Encoding: identity so
+// the .tgz gzip bytes are not transparently decoded (SRI is over those exact bytes, and system
+// tar needs them).
 async function fetchFollowing(
   startUrl: string,
   registryOrigin: string,
+  // The token attaches only to a same-origin URL this predicate AUTHORIZES; the tarball passes a
+  // safe-artifact-path check, the packument passes its exact pinned path (which may carry the one
+  // legitimate scope-slash %2F). rejectOffPolicyRedirect hard-rejects a same-origin off-policy 302
+  // (tarball) vs following it token-less (packument) — both fail-closed for the bearer token.
+  isAuthorizedPath: (u: URL) => boolean,
+  rejectOffPolicyRedirect: boolean,
   authToken: string | null,
   fetchImpl: FetchFn,
   wantBytes: boolean,
+  timeoutMs: number,
 ): Promise<{ bytes: Uint8Array; text: string }> {
+  // fail-fast at the chokepoint both callers route through: a nonpositive deadline fires
+  // ~immediately (instant abort on every hop), it does NOT mean "no deadline".
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new IntrospectionError(`fetchTimeoutMs must be >= 1 (got ${timeoutMs})`);
   let current = startUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const sameOrigin = new URL(current).origin === registryOrigin;
+    const target = new URL(current);
+    // §5.E finding #8: origin-only is a confused-deputy hole — the token attaches ONLY to a
+    // same-origin path the caller's policy AUTHORIZES (tarball: a safe under-base artifact path;
+    // packument: exactly its pinned path, which legitimately carries the scope-slash %2F).
+    const authorized = target.origin === registryOrigin && isAuthorizedPath(target);
     const headers: Record<string, string> = { "Accept-Encoding": "identity" };
-    if (authToken !== null && sameOrigin) headers["Authorization"] = `Bearer ${authToken}`;
-    const res = await fetchImpl(current, { headers, redirect: "manual" });
+    if (authToken !== null && authorized) headers["Authorization"] = `Bearer ${authToken}`;
+    // per-hop deadline: covers connect/headers on the real fetch; body reads carry their own.
+    let res: Awaited<ReturnType<FetchFn>>;
+    try {
+      res = await fetchImpl(current, { headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+    } catch (e) {
+      // a platform-fetch rejection (abort/network) carries no URL — label the hop, redacted
+      // (origin+path only; never query/token), like every sibling diagnostic in this loop.
+      throw new IntrospectionError(`fetch failed at hop ${hop} (${redactUrl(current)}): ${errText(e)}`);
+    }
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
       if (loc === null) throw new IntrospectionError(`redirect ${res.status} without Location`);
@@ -177,6 +321,13 @@ async function fetchFollowing(
       // ever fetches registry-origin resources, and this closes an off-origin exfiltration path.
       if (next.origin !== registryOrigin)
         throw new IntrospectionError(`off-origin redirect to ${next.origin} (registry is ${registryOrigin})`);
+      // §5.E finding #8: for the tarball (rejectOffPolicyRedirect=true) a SAME-origin redirect to
+      // an off-base / traversal-bypass path is REJECTED before the hop — a hostile 302 must not
+      // steer the token to an authenticated non-artifact path (blind confused-deputy GET). The
+      // packument (rejectOffPolicyRedirect=false) still follows a same-origin redirect but WITHOUT
+      // the token, since isAuthorizedPath only matches its exact pinned path — also fail-closed.
+      if (rejectOffPolicyRedirect && !isAuthorizedPath(next))
+        throw new IntrospectionError(`non-artifact redirect to ${next.pathname} (outside registry artifact policy)`);
       current = next.href;
       continue;
     }
@@ -192,11 +343,20 @@ async function fetchFollowing(
         if (Number.isNaN(len) || len > MAX_TARBALL_BYTES)
           throw new IntrospectionError(`invalid/oversized tarball content-length: ${lenHeader}`);
       }
-      const bytes = new Uint8Array(await res.arrayBuffer());
+      const bytes = res.body != null
+        ? await readBodyCapped(res.body, MAX_TARBALL_BYTES, timeoutMs, "tarball")
+        : new Uint8Array(await res.arrayBuffer()); // legacy-mock fallback (no stream)
       if (bytes.length > MAX_TARBALL_BYTES) throw new IntrospectionError(`tarball exceeds ${MAX_TARBALL_BYTES} bytes`);
       return { bytes, text: "" };
     }
-    return { bytes: new Uint8Array(), text: await res.text() };
+    if (res.body != null) {
+      const raw = await readBodyCapped(res.body, MAX_PACKUMENT_BYTES, timeoutMs, "packument");
+      return { bytes: new Uint8Array(), text: new TextDecoder().decode(raw) };
+    }
+    const text = await res.text(); // legacy-mock fallback (post-hoc cap; the real path streams)
+    if (Buffer.byteLength(text, "utf8") > MAX_PACKUMENT_BYTES)
+      throw new IntrospectionError(`packument exceeds ${MAX_PACKUMENT_BYTES} bytes`);
+    return { bytes: new Uint8Array(), text };
   }
   throw new IntrospectionError(`too many redirects fetching ${redactUrl(startUrl)}`);
 }
@@ -215,9 +375,138 @@ interface ExtractedSurface {
   rows: ApiSurfaceRow[];
 }
 
-function inspectExtracted(packageRoot: string): ExtractedSurface {
+// §5.E #6a pattern-export enumeration bounds (coordinate with §7 resource caps). MAX_PATTERN_MATCHES
+// is DELIBERATELY high (not 256): a legit wildcard package (`"./*": "./dist/*.d.ts"`) can ship
+// hundreds/thousands of declaration files, and rejecting those would leave real surface unaudited.
+// Overflow of any bound is fail-closed (IntrospectionError → no marker), never a silent truncation.
+const MAX_PATTERN_KEYS = 512;
+const MAX_PATTERN_FILES = 20_000; // aligns with tarScan MAX_ENTRIES
+export const MAX_PATTERN_MATCHES = 4096;
+const DECL_OR_SOURCE_FILE_RE = /\.(d\.[cm]?ts|tsx?|mts|cts)$/;
+
+// §7 cardinality / size caps for attacker-controlled package.json metadata. `inspectExtracted`
+// enumerates exports/bins/subpaths with no bound beyond the 100MB archive cap, so a hostile
+// manifest could amplify into millions of rows / names. These caps are GENEROUS vs real packages;
+// every breach is fail-closed (IntrospectionError → no marker), never a silent truncation.
+export const MAX_PKG_JSON_BYTES = 4 * 1024 * 1024;
+export const MAX_EXACT_EXPORTS = 16_384;
+export const MAX_BIN_NAMES = 4096;
+export const MAX_SURFACE_ROWS = 65_536;
+export const MAX_NAME_BYTES = 1024;
+// Per-specifier declaration probes for a followed re-export (§D3 extension substitution + legacy).
+const MAX_REEXPORT_CANDIDATES = 16;
+
+// Turn a raw target TEMPLATE (containing '*') into an ANCHORED RegExp: literal parts are regex-
+// escaped, the FIRST '*' becomes a NAMED capture `(?<cap>[\s\S]+?)`, and every LATER '*' becomes a
+// named backref `\k<cap>`. Named (not numbered) backrefs avoid the `\1`+digit ambiguity; `[\s\S]`
+// (not `.`) matches path separators and line terminators. A no-'*' template anchors to one file.
+function patternTemplateToRegExp(template: string): RegExp {
+  const norm = template.startsWith("./") ? template : "./" + template.replace(/^\.?\/+/, "");
+  const parts = norm.split("*");
+  const escaped = parts.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  let body = escaped[0]!;
+  for (let i = 1; i < escaped.length; i++) {
+    body += (i === 1 ? "(?<cap>[\\s\\S]+?)" : "\\k<cap>") + escaped[i];
+  }
+  return new RegExp("^" + body + "$");
+}
+
+// Match the un-substituted pattern TEMPLATES against a files-only listing, returning the DISTINCT
+// matched files (`./`-relative). Globally capped: distinct matches over `maxMatches` fail closed
+// (IntrospectionError). EXPORTED for direct unit coverage of the regex/backref/escape/cap logic.
+export function matchPatternTemplates(templates: string[], files: string[], maxMatches: number): string[] {
+  const matched: string[] = [];
+  const seen = new Set<string>();
+  for (const template of templates) {
+    const re = patternTemplateToRegExp(template);
+    for (const f of files) {
+      if (!re.test(f) || seen.has(f)) continue;
+      seen.add(f);
+      matched.push(f);
+      if (matched.length > maxMatches) throw new IntrospectionError(`pattern export matches exceed ${maxMatches}`);
+    }
+  }
+  return matched;
+}
+
+// Bounded, files-only recursive listing of declaration/source files under the package root,
+// returned `./`-relative with '/' separators. The tree was already proven symlink-free by
+// assertExtractedTreeSafe, so a plain recursive readdir is safe. Overflow fails closed.
+function listDeclarationFiles(packageRoot: string, cap: number): string[] {
+  const out: string[] = [];
+  const stack: string[] = [packageRoot];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue; // an unreadable subdir yields no candidates (the safety sweep already ran)
+    }
+    for (const ent of entries) {
+      const full = join(dir, ent.name);
+      if (ent.isDirectory()) stack.push(full);
+      else if (ent.isFile() && DECL_OR_SOURCE_FILE_RE.test(ent.name)) {
+        out.push("./" + relative(packageRoot, full).split(sep).join("/"));
+        if (out.length > cap) throw new IntrospectionError(`pattern file-listing exceeds ${cap} files`);
+      }
+    }
+  }
+  return out;
+}
+
+// §7: canonical (segment-collapsed) package-relative path — the memo key that dedupes a file
+// reached via any subpath alias (`.//x`, `./d/../x`) OR any re-export barrel so it is parsed at
+// most once. The extracted tree is proven symlink-free (assertExtractedTreeSafe), so a plain
+// join-collapse equals the realpath here; '/' separators are normalized for a stable key.
+function canonicalRel(packageRoot: string, rel: string): string {
+  const abs = join(packageRoot, rel.replace(/^\.\//, ""));
+  return relative(packageRoot, abs).split(sep).join("/");
+}
+
+// §D3: bounded declaration candidates for a followed runtime re-export specifier. Reuses the SAME
+// extension-substitution logic exportsResolve.declarationCandidates uses (`./m.js`→`m.d.ts`,
+// `.mjs`→`.d.mts`, `.cjs`→`.d.cts`, `.ts/.tsx` source, extensionless→`.d.ts`/`/index.d.ts`),
+// unioned with the legacy `.d.mts/.d.cts/base` probes, deduped and capped per specifier.
+function reexportCandidates(base: string): string[] {
+  const out: string[] = [];
+  const push = (c: string): void => {
+    if (c !== "" && !out.includes(c) && out.length < MAX_REEXPORT_CANDIDATES) out.push(c);
+  };
+  for (const c of declarationCandidates(base)) push(c);
+  for (const c of [`${base}.d.ts`, `${base}.d.mts`, `${base}.d.cts`, `${base}/index.d.ts`, base]) push(c);
+  return out;
+}
+
+// Injectable caps for direct testing: the wildcard-match cap, the cardinality/size caps, AND the
+// shared parse-budget overrides. Small values let tests exercise every boundary (alias-memoization,
+// barrel exhaustion, cardinality overflow) deterministically without building multi-MB inputs; each
+// defaults to its exported constant so production behaviour is unchanged.
+export interface InspectCaps extends ParseBudgetOptions {
+  maxPatternMatches?: number;
+  maxPkgJsonBytes?: number;
+  maxExactExports?: number;
+  maxBinNames?: number;
+  maxSurfaceRows?: number;
+  maxNameBytes?: number;
+}
+
+// EXPORTED for §7 direct testing. Enumerates the .d.ts export surface + bin names from an extracted
+// package, fail-closed on any cardinality/parse-budget breach (throws → no marker written).
+export function inspectExtracted(packageRoot: string, caps: InspectCaps = {}): ExtractedSurface {
+  // Effective §7 caps (each defaults to its exported constant; overridable for deterministic tests).
+  const maxPkgJsonBytes = caps.maxPkgJsonBytes ?? MAX_PKG_JSON_BYTES;
+  const maxExactExports = caps.maxExactExports ?? MAX_EXACT_EXPORTS;
+  const maxBinNames = caps.maxBinNames ?? MAX_BIN_NAMES;
+  const maxSurfaceRows = caps.maxSurfaceRows ?? MAX_SURFACE_ROWS;
+  const maxNameBytes = caps.maxNameBytes ?? MAX_NAME_BYTES;
+
   const pkgText = readContained(packageRoot, "package.json");
   if (pkgText === null) throw new IntrospectionError("package/package.json not found in tarball");
+  // §7 size cap: a multi-MB manifest is rejected BEFORE parse/enumeration (bounds JSON + downstream
+  // regex/DB work on attacker-controlled metadata).
+  if (Buffer.byteLength(pkgText, "utf8") > maxPkgJsonBytes)
+    throw new IntrospectionError(`package.json exceeds ${maxPkgJsonBytes} bytes`);
   let pkg: PkgJson;
   try {
     pkg = parseJsoncObject(pkgText).value as PkgJson;
@@ -225,16 +514,38 @@ function inspectExtracted(packageRoot: string): ExtractedSurface {
     throw new IntrospectionError(`invalid package.json: ${(e as Error).message}`);
   }
 
+  // §5.E #5b FAIL-CLOSED: a VERSIONED export condition (`types@>=5.0`, `types@<4.5`) selects a
+  // different type surface per tsc version — unmodelable from the manifest alone. Refuse the
+  // version (no marker) rather than risk auditing a decoy branch while the real surface hides
+  // behind a version-gated key. (exportsResolve stays never-throwing; the throw is raised here.)
+  if (hasVersionedExportCondition(pkg["exports"])) {
+    throw new IntrospectionError("versioned export condition (types@<range>) is not statically modelable — fail closed");
+  }
+
   const rows: ApiSurfaceRow[] = [];
   const seen = new Set<string>(); // dedup export rows across import+require targets
+  // §7 shared parse budget (per-file byte cap, global parse-count + parsed-bytes budgets, canonical
+  // memo, follow/per-file caps) threaded through EVERY collectFromDts AND the re-export follower.
+  const budget: ParseBudget = createParseBudget(caps);
 
-  // dtsExports resolver: map a relative `export * from './x'` to its declaration text, trying the
-  // usual .d.ts resolution candidates. Paths are package-relative (dtsExports uses joinRelative).
-  const resolver: DtsResolver = (spec, fromFile): string | null => {
+  // §7 EVERY row creation routes through pushRow → fail-closed on an over-long name or a row-count
+  // breach (a hostile manifest cannot amplify into an unbounded surface before the DB write).
+  const pushRow = (row: ApiSurfaceRow): void => {
+    if (Buffer.byteLength(row.exportName, "utf8") > maxNameBytes)
+      throw new IntrospectionError(`export name exceeds ${maxNameBytes} bytes`);
+    if (rows.length + 1 > maxSurfaceRows)
+      throw new IntrospectionError(`surface rows exceed ${maxSurfaceRows}`);
+    rows.push(row);
+  };
+
+  // dtsExports resolver: map a relative `export * from './x'` to its declaration text AND the
+  // CANONICAL path of the file OPENED (§D2 — subsequent nested relatives resolve against THAT path,
+  // not the requested specifier). Paths are package-relative (dtsExports uses joinRelative).
+  const resolver: DtsResolver = (spec, fromFile): DtsResolved | null => {
     const base = joinRelative(fromFile, spec);
-    for (const cand of [`${base}.d.ts`, `${base}.d.mts`, `${base}.d.cts`, `${base}/index.d.ts`, base]) {
+    for (const cand of reexportCandidates(base)) {
       const text = readContained(packageRoot, cand);
-      if (text !== null) return text;
+      if (text !== null) return { text, canonicalPath: canonicalRel(packageRoot, cand) };
     }
     return null;
   };
@@ -242,30 +553,66 @@ function inspectExtracted(packageRoot: string): ExtractedSurface {
   const collectFromDts = (dtsRel: string): void => {
     const dts = readContained(packageRoot, dtsRel);
     if (dts === null) return;
-    for (const exp of enumerateDtsExports(dts, dtsRel.replace(/^\.\//, ""), resolver)) {
+    // canonical rootPath = the shared memo key (dedupes aliases + barrels against one parse).
+    const canonical = canonicalRel(packageRoot, dtsRel);
+    for (const exp of enumerateDtsExports(dts, canonical, resolver, budget)) {
       const key = `${exp.kind}\0${exp.name}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      rows.push({ exportName: exp.name, exportKind: exp.kind, source: dtsRel });
+      pushRow({ exportName: exp.name, exportKind: exp.kind, source: dtsRel });
     }
   };
 
-  // root surface (union of import+require targets)
-  for (const target of resolveTypeTargets(pkg)) collectFromDts(typeTargetToDts(target));
+  // root surface (union of import+require targets). With `exports` present, resolveTypeTargets
+  // returns RAW targets → map each to its adjacent .d.ts. The no-exports LEGACY branch already
+  // returns final declaration CANDIDATES (incl. .ts sources that must not be re-mapped), so those
+  // are read directly (§5.E #3/#4).
+  const hasExports = pkg["exports"] !== undefined;
+  for (const target of resolveTypeTargets(pkg)) {
+    collectFromDts(hasExports ? typeTargetToDts(target) : target);
+  }
 
   // exact `exports` subpaths ('./config' …) are part of the FULL public surface (§5.E), each
-  // resolved under both modes and unioned. '*'-pattern keys are skipped: their concrete
-  // expansions are not statically enumerable from the map alone.
-  for (const subpath of exportsSubpathKeys(pkg).exact) {
+  // resolved under both modes and unioned. §7: the KEY count is capped (a hostile manifest with
+  // millions of exact subpaths would otherwise drive unbounded resolution/parse work).
+  const subpathKeys = exportsSubpathKeys(pkg);
+  if (subpathKeys.exact.length > maxExactExports)
+    throw new IntrospectionError(`too many exact export subpaths (> ${maxExactExports}) — fail closed`);
+  for (const subpath of subpathKeys.exact) {
     for (const target of resolveSubpath(pkg, subpath).targets) collectFromDts(typeTargetToDts(target));
   }
 
-  // bin names (§5.G) — the cli-bin surface, deduped
-  for (const bin of binNames(pkg)) {
+  // '*'-pattern `exports` subpaths (§5.E #6a): resolve each pattern's raw target TEMPLATE under
+  // both modes, map to its .d.ts form, and match against a bounded declaration-file listing of the
+  // extracted tree — so a decoy that hides real surface behind a wildcard export is still audited.
+  const patternKeys = subpathKeys.patterns;
+  if (patternKeys.length > 0) {
+    if (patternKeys.length > MAX_PATTERN_KEYS)
+      throw new IntrospectionError(`too many pattern export keys (> ${MAX_PATTERN_KEYS}) — fail closed`);
+    const templates: string[] = [];
+    for (const key of patternKeys) {
+      for (const tmpl of resolvePatternTargetTemplates(pkg, key)) {
+        const dts = typeTargetToDts(tmpl); // '*' preserved; runtime→declaration form
+        if (!templates.includes(dts)) templates.push(dts);
+      }
+    }
+    if (templates.length > 0) {
+      const files = listDeclarationFiles(packageRoot, MAX_PATTERN_FILES);
+      const maxMatches = caps.maxPatternMatches ?? MAX_PATTERN_MATCHES;
+      for (const matchedRel of matchPatternTemplates(templates, files, maxMatches)) collectFromDts(matchedRel);
+    }
+  }
+
+  // bin names (§5.G) — the cli-bin surface, deduped. §7: the bin COUNT is capped (also bounds the
+  // downstream CLI matcher work, whose hostile-bin count is bounded HERE).
+  const bins = binNames(pkg);
+  if (bins.length > maxBinNames)
+    throw new IntrospectionError(`too many bin names (> ${maxBinNames}) — fail closed`);
+  for (const bin of bins) {
     const key = `cli-bin\0${bin}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    rows.push({ exportName: bin, exportKind: "cli-bin", source: "package.json#bin" });
+    pushRow({ exportName: bin, exportKind: "cli-bin", source: "package.json#bin" });
   }
   return { rows };
 }
@@ -340,10 +687,17 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
     const dist = selectVersionDist(packument, version);
     if (dist === null) throw new IntrospectionError(`version ${version} not present in packument`);
     // §5.E: the tarball origin MUST equal the registry origin (prevents off-origin token leaks).
+    // KEEP this origin check FIRST — a test asserts the 'origin' message on an off-origin tarball.
     if (new URL(dist.tarball).origin !== registryOrigin)
       throw new IntrospectionError(`tarball origin ${new URL(dist.tarball).origin} != registry ${registryOrigin}`);
+    // §5.E finding #8: origin alone is a confused-deputy hole — the tarball must ALSO be a safe
+    // under-base artifact path. A hostile packument setting dist.tarball to a same-origin
+    // authenticated non-artifact path (or a traversal-bypass of the base) is rejected fail-closed.
+    const basePrefix = registryBasePrefix(registryUrl);
+    if (!isSafeArtifactPath(new URL(dist.tarball), basePrefix))
+      throw new IntrospectionError(`tarball path ${new URL(dist.tarball).pathname} is outside the registry base ${basePrefix} or is not an artifact path`);
 
-    const { bytes } = await fetchFollowing(dist.tarball, registryOrigin, authToken, fetchImpl, true);
+    const { bytes } = await fetchFollowing(dist.tarball, registryOrigin, (u) => isSafeArtifactPath(u, basePrefix), true, authToken, fetchImpl, true, opts.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
     verifyIntegrity(bytes, dist.integrity, dist.shasum); // BEFORE extraction
 
     const scan = scanTarball(bytes, (b) => inflateBounded(b));
@@ -366,15 +720,25 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
       // reject the version if the extracted tree contains any symlink or non-regular member.
       assertExtractedTreeSafe(extractRoot);
       // npm tarballs root everything under `package/`.
-      const surface = inspectExtracted(join(extractRoot, "package"));
+      const surface = inspectExtracted(join(extractRoot, "package"), { maxPatternMatches: opts.maxPatternMatches, ...opts.inspectCaps });
       // atomic surface + '__complete__' marker (durable success record, even for zero rows)
       db.writeApiSurface({ packageName, version, versionSource, rows: surface.rows });
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      // BEST-EFFORT: a throw here would REPLACE the primary error (finally-throw semantics),
+      // recording a useless fs error instead of the extraction/inspection failure. A stuck
+      // tree is reclaimed by the next run's startup sweep.
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // the primary outcome (success or the original error) wins
+      }
     }
   } catch (e) {
-    // per-version REGISTRY failure → version-keyed errors row (§5.E/§8), no marker written.
-    db.insertError({ runId, scope: "introspection", packageName, version, message: (e as Error).message });
+    // per-version REGISTRY failure → version-keyed errors row (§5.E/§8) + the live JSONL event
+    // (fail-soft: an operator tailing stdout sees it now, not only in the report), no marker.
+    const message = (e as Error).message;
+    db.insertError({ runId, scope: "introspection", packageName, version, message });
+    logLine({ event: "introspection", packageName, version, error: message });
   }
 }
 
@@ -384,6 +748,7 @@ export interface PackumentRequest {
   registryAuthEnvVar: string | null;
   env?: Record<string, string | undefined>;
   fetchImpl?: FetchFn;
+  fetchTimeoutMs?: number; // wall-clock deadline per hop/body read (default FETCH_TIMEOUT_MS)
 }
 
 // Fetch + parse a package's packument. EXPORTED for the orchestrator: the §5.E range-resolution
@@ -395,9 +760,33 @@ export async function fetchPackument(req: PackumentRequest): Promise<Packument> 
   const fetchImpl = req.fetchImpl ?? realFetch;
   const authToken = req.registryAuthEnvVar !== null ? (env[req.registryAuthEnvVar] ?? null) : null;
   const registryOrigin = new URL(req.registryUrl).origin;
+  // FAIL-CLOSED (§5.E): reject a hostile package name BEFORE it can shape the URL. A name like
+  // `@x\..\..\admin?x=1` (real backslashes) or `%2e%2e/%2e%2e/admin?x=1` would otherwise normalize
+  // (via `new URL`) to a DIFFERENT same-origin path/query, and fetchFollowing attaches the bearer
+  // token to any same-origin URL — leaking it off-target.
+  if (!isValidPackageName(req.packageName))
+    throw new IntrospectionError(`invalid package name: ${JSON.stringify(req.packageName)}`);
   const base = req.registryUrl.replace(/\/+$/, "");
   const url = `${base}/${encodePackageNameForUrl(req.packageName)}`;
-  const { text } = await fetchFollowing(url, registryOrigin, authToken, fetchImpl, false);
+  // Defense-in-depth: even a validated name must resolve to EXACTLY the intended packument path
+  // on the registry origin — no query, fragment, or path drift. EXACT pathname equality (not
+  // startsWith, which would admit `.../expo/../secret`) closes any residual normalization gap.
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    throw new IntrospectionError(`unparseable packument URL for ${req.packageName}`);
+  }
+  const baseUrl = new URL(base);
+  const expectedPath = baseUrl.pathname.replace(/\/+$/, "") + "/" + encodePackageNameForUrl(req.packageName);
+  if (target.origin !== baseUrl.origin || target.search !== "" || target.hash !== "" || target.pathname !== expectedPath)
+    throw new IntrospectionError(`refusing off-target packument URL for ${req.packageName}`);
+  // §5.E finding #8: the packument token attaches ONLY to this exact pinned path (which for a
+  // scoped name legitimately carries the single scope-slash %2F — the artifact-path policy would
+  // wrongly reject that). A same-origin redirect is followed WITHOUT the token (path no longer
+  // matches), closing the confused-deputy without breaking scoped fetches on private registries.
+  const isPackumentPath = (u: URL): boolean => u.origin === baseUrl.origin && u.pathname === expectedPath;
+  const { text } = await fetchFollowing(url, registryOrigin, isPackumentPath, false, authToken, fetchImpl, false, req.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
