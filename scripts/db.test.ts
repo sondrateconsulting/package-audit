@@ -148,12 +148,24 @@ describe("open — fresh create", () => {
     expect(() => AuditDb.open({ sqlitePath: "./escape.db" })).toThrow(ReadOnlyViolation);
   });
 
-  test("refuses to adopt a non-audit SQLite database", () => {
+  test("refuses to adopt a non-audit SQLite database WITHOUT mutating it (rejected on the read-only preflight)", () => {
     const path = nextFile();
     const raw = new Database(path, { create: true });
     raw.exec("CREATE TABLE not_audit (x TEXT)");
+    const before = (raw.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
     raw.close();
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+    // Rejecting is only half the contract. The rejection must happen on the READ-ONLY preflight,
+    // because a writable open runs `PRAGMA journal_mode = WAL`, which PERSISTS in the header and
+    // creates -wal/-shm sidecars — mutating a file this tool just decided it does not own. Reaching
+    // here needs no tampering, only a sqlitePath aimed at some other app's database. Asserting the
+    // throw alone let that through; these assertions are what pin the zero-mutation guarantee.
+    const ro = new Database(path, { readonly: true, strict: true });
+    const after = (ro.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
+    ro.close();
+    expect(after).toBe(before); // 'delete', not 'wal'
+    expect(existsSync(`${path}-wal`)).toBe(false);
+    expect(existsSync(`${path}-shm`)).toBe(false);
   });
 
   test("refuses a database stamped with a NEWER schema version", () => {

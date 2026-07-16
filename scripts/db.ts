@@ -1243,6 +1243,17 @@ function assertOpenCompatible(db: Database, userVersion: number): void {
   const reject = (why: string): never => fail(`refusing to open an incompatible database (stamped v${userVersion}): ${why}`);
   // These cross-table invariants hold at EVERY stamp (including pre-v2), and must run BEFORE the
   // legacy short-circuit AND before any --fresh drop, since --fresh runs before the migration:
+  // (a0) ZERO audit tables + foreign tables present = someone else's database; never adopt it.
+  //      This check lives HERE, in the READ-ONLY preflight, rather than at the adoption site after
+  //      the writable open, because the writable open runs `PRAGMA journal_mode = WAL` — which
+  //      PERSISTS in the file header and spawns -wal/-shm sidecars. Rejecting after that has already
+  //      mutated a file we just decided we do not own, breaking the zero-mutation guarantee
+  //      AuditDb.open's preflight note makes. It is reachable by ordinary operator error (a
+  //      `sqlitePath` aimed at some other app's .db), not only by tampering.
+  //      A genuinely fresh/empty path has no tables at all, so hasForeignTables is false and it
+  //      still falls through to normal creation.
+  if (AUDIT_TABLES.every((t) => !tableExists(db, t)) && hasForeignTables(db))
+    reject("foreign tables present, no audit tables — refusing to adopt a non-audit SQLite database");
   // (a) a runs.outcome column is a foreign v4 (table_xinfo, so a GENERATED outcome is caught);
   if (tableExists(db, "runs") && tableXinfo(db, "runs").some((c) => c.name === "outcome"))
     reject("the runs table has an 'outcome' column — a different v4 schema; use the matching tool build or a new database path");
@@ -1536,9 +1547,10 @@ export class AuditDb {
     const db = new Database(path, { create: true, strict: true });
     // PRAGMAs, version ceiling and the ownership BACKSTOP under one fail-closed discipline —
     // see initWritableConnection (extracted so its failure contract is directly unit-testable).
-    // The compatibility gate already ran on the READ-ONLY preflight above, so an incompatible
-    // EXISTING database never reaches this writable open (and thus is never WAL-mutated or
-    // --fresh-dropped).
+    // The compatibility gate already ran on the READ-ONLY preflight above — INCLUDING the
+    // foreign-database adoption check — so an incompatible EXISTING file never reaches this
+    // writable open, and thus is never WAL-mutated (journal_mode=WAL persists in the header +
+    // creates sidecars) or --fresh-dropped.
     const userVersion = initWritableConnection(db, path);
 
     if (opts.fresh === true) {
