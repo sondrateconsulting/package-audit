@@ -469,9 +469,15 @@ export async function processRepo(
   // the exact live branch set for THIS discovery snapshot). Prune this run's stale run_unit_head rows —
   // phantom branches a prior resume-invocation recorded that no longer exist. Scoped to this
   // (run_id, org, repo); a failed/throttled repo never reaches here and is retained. Reconciliation
-  // reflects the discovery-time snapshot: a branch deleted-then-recreated between discovery and here has
-  // its prior row pruned and is re-recorded on the next run — an accepted TOCTOU for this single-user
-  // tool (no permanent data loss; global findings persist, only the disposition row briefly lapses).
+  // reflects the DISCOVERY-TIME snapshot, not the state at this instant, so the keep-set can be stale in
+  // both directions — an accepted TOCTOU for this single-user tool (no permanent data loss; the next run
+  // re-discovers and re-reconciles):
+  //   - a branch DELETED after discovery is still in the keep-set, so its row is RETAINED this run (a
+  //     phantom that survives until the next run prunes it);
+  //   - a branch CREATED after discovery is absent from the keep-set, but it has no row to prune either,
+  //     so nothing is lost — it is simply recorded next run.
+  // Note the prune direction: being in `heads` PROTECTS a row. Reconciliation can only ever delete rows
+  // for names discovery did NOT return, which is why a stale keep-set errs toward retaining, not deleting.
   //
   // SIBLING ACCEPTED-STALENESS (same-name stale head). On a RESUME: a branch whose head ADVANCED since a
   // prior invocation, whose re-scan then errors (the insertError arm above) or throttles (the requeue

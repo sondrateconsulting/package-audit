@@ -200,6 +200,60 @@ describe("buildReport (§7)", () => {
     db.close();
   });
 
+  test("§5 the scan-scope ledger FAILS CLOSED on a policy-bearing row that is neither excluded nor an override", () => {
+    // The ledger must decide via BOTH shared predicates, never `isDefaultOverride(h) ? … : "excluded"` —
+    // that binary form would re-define "excluded" as "policy-bearing but not an override", a second
+    // definition competing with policyDisposition.ts. assertRunUnitHeadInvariants makes this shape
+    // unreachable through the write path (a past-cap row must carry policy_status null), so it is forged
+    // with a raw handle to prove the READ surface fails closed on its own rather than mislabelling.
+    // Same ./data containment idiom as the provenance test below (§0 forbids writes outside ./data).
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-ledger-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      // forge past-cap + policy_status: the write path forbids it, the CHECK constraints permit it
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'past-cap', 0, 'excluded-by-deny', 'weird', '2025-06-01T00:00:00Z')`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/neither a policy exclusion nor a default-branch override/);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test("§5 RESUME: a branch holding a RETAINED row that errors later is NOT in branchesErrored (no double-count)", () => {
+    // The resumed-run shape the single-invocation test above cannot reach. A resumed run reuses the
+    // run_id, so errors[] and run_unit_head both span invocations:
+    //   invocation 1 — main scanned@A, writing a row.
+    //   invocation 2 — main advanced to B; the re-scan errors. No new row, and §11's name-keyed prune
+    //                  RETAINS invocation 1's row (main is still a live branch).
+    // main therefore holds BOTH a row and a scan error. It is counted ONCE — in branchesScanned, via the
+    // retained row — and NOT in branchesErrored. Deliberate: counting it in both would count one
+    // discovered branch twice and break the partition. This is exactly why branchesErrored must be read
+    // as "errored branches holding no row" and NOT as "every branch whose scan errored" (see report.ts).
+    const db = mem();
+    const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "main", commitSha: "sha-A", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-05-01T00:00:00Z" });
+    db.insertError({ runId, scope: "scan", organization: "org-a", repository: "svc", branch: "main", message: "tree boom at sha-B" });
+    db.completeRun(runId);
+    const report = buildReport(db, db.getRun(runId)!) as any;
+    expect(report.summary.branchesErrored).toBe(0); // suppressed by the row-key exclusion — NOT a bug
+    expect(report.summary.branchesScanned).toBe(1); // counted here instead, at the OLDER head
+    // the error stays visible to a reader, so the tension is not hidden — only the COUNT omits it
+    expect(report.errors.some((e: any) => e.branch === "main" && e.scope === "scan")).toBe(true);
+    // and the branch is counted exactly ONCE across the buckets + errored (the partition holds)
+    const s = report.summary;
+    expect(s.branchesScanned + s.branchesSkippedByCutoff + s.branchesExcludedByPolicy + s.branchesPastCap + s.branchesErrored).toBe(1);
+    db.close();
+  });
+
   test("a completed run with ZERO heads has unverifiable provenance → 'pre-upgrade', never a false 'complete'", () => {
     const db = mem();
     const { runId } = db.startRun({

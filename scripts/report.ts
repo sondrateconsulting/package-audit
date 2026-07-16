@@ -66,25 +66,32 @@ export interface ReportSummary {
   // GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket.
   branchesExcludedByPolicy: number;
   branchesPastCap: number;
-  // DISTINCT (org, repo, branch) with a scope='scan' errors[] entry for this run and NO run_unit_head
-  // disposition row. EXACT on a single-invocation run; an UPPER BOUND on a RESUMED one.
+  // Counts EXACTLY this: distinct (org, repo, branch) with a scope='scan' errors[] entry for this run
+  // that hold NO run_unit_head disposition row. Read it as that, and not as "every branch whose scan
+  // errored" — on a SINGLE-INVOCATION run the two coincide (a to-scan branch either gets a row or
+  // errors, never both), but on a RESUMED run they diverge in BOTH directions.
   //
-  // Why it can only inflate: a resumed run REUSES the run_id (db.startRun), errors[] is append-only and is
-  // NEVER reconciled, while run_unit_head rows ARE pruned for branches gone since a prior invocation
-  // (reconcileRunUnitHead). An errored branch holds no row, so the "has a row" exclusion below can never
-  // suppress it. Any branch that errored in an EARLIER invocation and did not reach a ROW-BEARING
-  // disposition in the final one is therefore still counted. That is MORE than just deletion — it also
-  // covers a branch throttle-requeued on retry, and one whose repo's discovery failed that invocation.
-  // Deliberately not stated as an exact arithmetic characterisation: the membership rule above is the
-  // claim, and enumerating "overcounts by exactly N deleted branches" would be false.
+  // A resumed run REUSES the run_id (db.startRun), so errors[] and run_unit_head both span invocations.
+  // errors[] is append-only and is NEVER reconciled; run_unit_head rows ARE pruned (reconcileRunUnitHead).
   //
-  // It NEVER undercounts the branches that errored this run: every other later outcome writes a row
-  // (scanned / past-cap / skipped-cutoff), which moves the branch into its own terminal bucket.
+  //   MORE than the errored set: a branch that errored in an EARLIER invocation and reached no
+  //   row-bearing disposition in the final one is still counted — whether it is now gone (deleted),
+  //   deferred (throttle-requeued on retry), or unvisited (its repo's discovery failed). Stated as this
+  //   membership rule on purpose: "overcounts by exactly the deleted branches" would be false.
   //
-  // Throttle carve-out, precisely: a branch throttle-requeued with NO prior error has neither a row nor an
-  // error — deferred, not terminal, finished next run — so it is in no count. That holds absolutely only
-  // within a single invocation; after an earlier-invocation error the branch DOES carry an error and so IS
-  // counted here, despite being deferred rather than terminal.
+  //   LESS than the errored set: a branch holding a row from an EARLIER invocation that errors in a
+  //   LATER one is NOT counted here — the row-key exclusion below drops it. That is deliberate and
+  //   correct: its retained row already places it in that row's disposition bucket, and counting it here
+  //   too would count one discovered branch TWICE and break the partition. This is the same-name
+  //   stale-head case; see the §11 note in orchestrate.ts::processRepo.
+  //
+  // So the exclusion is what keeps every discovered branch counted at most once, which is why the
+  // identity above stays an UPPER BOUND (never a double-count) rather than an equality on a resume.
+  //
+  // Throttle carve-out, precisely: a branch throttle-requeued with NO prior error has neither a row nor
+  // an error — deferred, not terminal, finished next run — so it is in no count. That holds absolutely
+  // only WITHIN a single invocation; after an earlier-invocation error the branch DOES carry an error
+  // and so IS counted here, despite being deferred rather than terminal.
   branchesErrored: number;
   totalDependencyFindings: number;
   totalUsageFindings: number;
@@ -211,6 +218,18 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
   };
 }
 
+// The ledger's disposition for ONE policy-bearing row, decided by the shared predicates only. Every
+// caller reaching here has already established policy_status !== null, so the two predicates are
+// exhaustive over every shape the write path permits; anything else is a write-path invariant
+// violation (or a disposition added without updating this surface) and must not be guessed at.
+function dispositionOf(h: HeadRow): "scanned-default-override" | "excluded" {
+  if (isDefaultOverride(h)) return "scanned-default-override";
+  if (isPolicyExcluded(h)) return "excluded";
+  throw new Error(
+    `internal: run_unit_head ${h.organization}/${h.repository}@${h.branch} carries policy_status=${JSON.stringify(h.policy_status)} on status=${JSON.stringify(h.status)} — neither a policy exclusion nor a default-branch override`,
+  );
+}
+
 // §5 scan-scope diagnostics. policyBranches lists every head with a policy_status (both the excluded
 // rows and the scanned default-overrides), deterministically sorted by (org, repo, branch).
 function buildScanScope(allHeads: HeadRow[]): ScanScope {
@@ -220,7 +239,16 @@ function buildScanScope(allHeads: HeadRow[]): ScanScope {
       organization: h.organization,
       repository: h.repository,
       branch: h.branch,
-      disposition: isDefaultOverride(h) ? ("scanned-default-override" as const) : ("excluded" as const),
+      // BOTH shared predicates, never a `policy_status !== null` ternary. A binary
+      // `isDefaultOverride(h) ? override : excluded` would silently re-define "excluded" HERE as
+      // "policy-bearing but not an override" — a second definition competing with
+      // policyDisposition.ts, which exists precisely because that conflation is load-bearing
+      // (invariant: a non-null policy_status does NOT mean excluded). The write-path invariants
+      // (assertRunUnitHeadInvariants) make a third shape unreachable today — a past-cap row must carry
+      // policy_status null, and a scanned policy-bearing row must be the default — but those run at the
+      // WRITE chokepoint, not here, and a future disposition (e.g. an 'error' status) would land in the
+      // ternary's else-branch and be mislabelled EXCLUDED. Fail closed instead of guessing.
+      disposition: dispositionOf(h),
       policyStatus: h.policy_status as "excluded-by-deny" | "excluded-by-allow",
       matchedPattern: h.policy_matched_pattern,
     }))

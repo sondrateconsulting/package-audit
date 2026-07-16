@@ -15,8 +15,11 @@ import type { PolicyStatus } from "./db.ts";
 // cap, must still be scanned). Every OTHER still-live branch before cutoffDate is
 // `cutoffSkipped` (regardless of the cap); the after-cutoff survivors are `eligible` up to
 // maxBranchesPerRepo (the cap counts NON-default branches only, so a repo can yield cap+1
-// eligible units); older survivors past the cap are `pastCap` (they retain prior state and are
-// not surfaced this run). Order within each group preserves the input order. A defaultBranch
+// eligible units); older survivors past the cap are `pastCap` — NOT scanned this run, but still
+// SURFACED: processRepo records a `past-cap` run_unit_head row for report visibility while leaving
+// the WORK QUEUE untouched, so a prior 'done' scan survives and a later cap-order shift can promote
+// the branch without a re-scan. ("Retains prior state" is about the work queue, never the report.)
+// Order within each group preserves the input order. A defaultBranch
 // not among the live heads admits nothing — heads are never synthesized. This runs over an
 // ALREADY-policy-filtered head list (see planRepoBranches), so the cap counts only ELIGIBLE branches.
 export interface BranchPlan {

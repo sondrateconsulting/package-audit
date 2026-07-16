@@ -861,7 +861,7 @@ function migrateV2toV3(db: Database): void {
 }
 
 // ---- v3→v4: on-disk run_unit_head shape classification + migration (§3.1 branch allow/deny) ---
-// The shape fingerprint is STRUCTURAL, not a string match: PRAGMA table_info (columns + NOT NULL +
+// The shape fingerprint is STRUCTURAL, not a string match: PRAGMA table_xinfo (columns + NOT NULL +
 // composite PK), PRAGMA foreign_key_list (the run_id→runs FK), the ix_ruh_loc index, and the FULL
 // set of CHECK constraints (paren-balanced, comment/quote-aware extraction — never a naive
 // first-fragment substring match, which a crafted foreign CHECK could satisfy). This is the v4

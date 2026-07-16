@@ -165,12 +165,18 @@ was **throttle-requeued** is deferred with neither a row nor an error — it is 
 Scoped to the selected run only (`--raw` dumps all runs).
 
 On a **resumed** run (one interrupted and re-invoked, which reuses the same `run_id`), the report's
-`branchesErrored` is an upper bound rather than an equality: `errors[]` is append-only and is never
+`branchesErrored` counts precisely "errored branches holding no row here" — which is looser than
+"every branch whose scan errored", in **both** directions. `errors[]` is append-only and is never
 reconciled, while the rows in *this* table **are** pruned for branches gone since an earlier invocation.
 So a branch that errored in an earlier invocation and reached no row-bearing disposition in the final one
 — deleted, throttle-requeued on retry, or its repo's discovery failed — is still counted there while
-correctly holding no row here. This table itself stays exact either way: every row is a disposition the
-run genuinely recorded.
+correctly holding no row here. Conversely, a branch that kept a row from an earlier invocation and then
+errored in a later one is **not** counted there: the row you see here already places it in that
+disposition, and counting it twice would double-count one discovered branch.
+
+This table itself stays exact either way: every row is a disposition the run genuinely recorded. Note the
+row may be pinned to an older head than the branch's current one (same-name stale head) — `commit_sha`
+and `scanned_commit_date` always name the commit that was actually scanned.
 
 | column | type |
 |---|---|

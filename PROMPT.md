@@ -374,15 +374,38 @@ CREATE TABLE IF NOT EXISTS usage_findings (
 CREATE TABLE IF NOT EXISTS run_unit_head (
   run_id TEXT NOT NULL REFERENCES runs(run_id),
   organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
-  commit_sha TEXT NOT NULL DEFAULT '',  -- '' for skipped-cutoff branches (never scanned)
+  commit_sha TEXT NOT NULL DEFAULT '',  -- '' for every NON-scanned disposition (never scanned)
   status TEXT NOT NULL DEFAULT 'scanned'
-    CHECK (status IN ('scanned','skipped-cutoff')),  -- per-run, immutable: lets the report
-                                       -- count scanned vs cutoff-skipped branches for THIS run
-                                       -- alone (work_queue is mutable and cross-run)
+    CHECK (status IN ('scanned','skipped-cutoff','past-cap')),  -- per-run, immutable: lets the
+                                       -- report count each disposition for THIS run alone
+                                       -- (work_queue is mutable and cross-run). 'past-cap' (v4):
+                                       -- eligible but past maxBranchesPerRepo — recorded for
+                                       -- report VISIBILITY only; its work_queue row is untouched,
+                                       -- so a later cap-order shift promotes it without a rescan.
+                                       -- NOTE 'skipped-cutoff' covers TWO dispositions,
+                                       -- disambiguated by policy_status (below) — never count the
+                                       -- whole status as cutoff skips.
   is_default_branch INTEGER,           -- tri-state 1/0/NULL (v3): whether this branch was the
                                        -- repo's default branch at discovery time (§5.B).
                                        -- NULL = unknown (pre-v3 rows); the report renders NULL
                                        -- as its own state — never coerce it to 0
+  policy_status TEXT                   -- v4, branch allow/deny: NULL = policy said nothing.
+    CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+                                       -- LOAD-BEARING: NOT NULL does NOT mean "excluded". On a
+                                       -- 'skipped-cutoff' row it means policy DROPPED the branch;
+                                       -- on a 'scanned' row it is the COUNTERFACTUAL carried by a
+                                       -- default branch policy would have dropped but which is
+                                       -- scanned anyway (Premise 6). Read surfaces MUST decide via
+                                       -- BOTH status and policy_status (scripts/policyDisposition.ts
+                                       -- is the one definition), never policy_status alone.
+  policy_matched_pattern TEXT,         -- v4: the exact configured pattern that caused an
+                                       -- 'excluded-by-deny'; NULL for every other disposition
+                                       -- (an allow-list MISS names no single pattern)
+  scanned_commit_date TEXT,            -- v4: the committed date of the commit ACTUALLY scanned
+                                       -- (the clone's real HEAD on the clone fallback, §5.C) —
+                                       -- NULL only on rows backfilled by the v3→v4 migration,
+                                       -- which is what makes a run's scan-scope provenance
+                                       -- unverifiable (§7 `provenance`)
   PRIMARY KEY (run_id, organization, repository, branch)
 );
 CREATE TABLE IF NOT EXISTS api_cache (
@@ -975,7 +998,10 @@ Entrypoints:
     #   unknown/valueless arguments are rejected, never silently defaulted
     # --html: ALSO render one HTML dossier per tracked package + index into <outputDir>/xray/
   bun run scripts/export.ts [--config <path>] [--run-id <id>] [--raw] [--help]
-    # run-scoped CSV/JSONL snapshots of the four audit tables into <outputDir>/xray/;
+    # run-scoped CSV/JSONL snapshots of the FIVE audit tables into <outputDir>/xray/
+    #   (dependency_findings, package_api_surface, run_unit_head, runs, usage_findings —
+    #    run_unit_head is exported so the per-run branch dispositions, incl. the branch
+    #    allow/deny columns, are inspectable outside the report; see EXPORTS.md);
     #   --raw: forensic full-table dump (every row, raw- prefixed)
   bun run scripts/compare.ts <runIdA> <runIdB> [--config <path>] [--help]
     # deterministic run-to-run usage diff (two COMPLETED run ids) — one JSON line on stdout
@@ -1219,13 +1245,29 @@ summary.
                                                  //   organization/repository/branch (repo/branch-scoped) or
                                                  //   packageName/version (§5.E per-version introspection)
   "summary": { "organizationsScanned":0,"repositoriesScanned":0,"branchesScanned":0,
-               "branchesSkippedByCutoff":0,"totalDependencyFindings":0,"totalUsageFindings":0 }
+               "branchesSkippedByCutoff":0,"branchesExcludedByPolicy":0,"branchesPastCap":0,
+               "branchesErrored":0,"totalDependencyFindings":0,"totalUsageFindings":0 },
+  "scanScope": { "excludedByDeny":0,"excludedByAllow":0,"defaultBranchPolicyOverrides":0,
+                 "policyBranches":[ ... ],"provenance":"complete" }  // branch allow/deny diagnostics
 }
 ```
 Summary derivation — ALL per-run from the IMMUTABLE `run_unit_head` slice for the reported
 run (NEVER from the mutable work_queue, which is cross-run): `branchesScanned` =
 COUNT(*) WHERE run_id=R AND status='scanned'; `branchesSkippedByCutoff` = COUNT WHERE
-run_id=R AND status='skipped-cutoff'; `repositoriesScanned` =
+run_id=R AND status='skipped-cutoff' **AND policy_status IS NULL** — GENUINE cutoff only:
+the policy-excluded disposition REUSES the 'skipped-cutoff' status, so counting the whole
+status would silently fold policy exclusions into cutoff skips; `branchesExcludedByPolicy`
+= COUNT WHERE status='skipped-cutoff' AND policy_status IS NOT NULL; `branchesPastCap` =
+COUNT WHERE status='past-cap'. Those four counts partition the RECORDED rows exactly once
+each. `branchesErrored` counts DISTINCT branches carrying a scope='scan' errors[] entry that
+hold NO row (a scan that errors writes no disposition row) — read it as exactly that, since
+on a RESUMED run it diverges from "every branch whose scan errored" in both directions
+(see scripts/report.ts). Together the five account for every branch that reached a TERMINAL
+outcome — an equality on a single-invocation run, an upper bound on a resumed one. A
+THROTTLE-REQUEUED branch is deferred, not terminal: it writes neither a row nor an error and
+is in no count. Decide policy dispositions ONLY via both status and policy_status
+(scripts/policyDisposition.ts); `policy_status IS NOT NULL` alone is never a proxy for
+"excluded" (a scanned default branch carries the counterfactual). `repositoriesScanned` =
 COUNT(DISTINCT organization||'/'||repository) and `organizationsScanned` =
 COUNT(DISTINCT organization) — both over run_id=R AND status='scanned' rows (matching
 branchesScanned semantics; a repo/org whose every branch was cutoff-skipped is NOT

@@ -100,10 +100,14 @@ export interface ScanScope {
   readonly excludedByAllow: number;
   readonly defaultBranchPolicyOverrides: number;
   readonly policyBranches: readonly PolicyBranchRow[];
-  // "pre-upgrade" when any head carries a NULL scanned_commit_date — a run migrated from before v4,
-  // whose scanner never persisted past-cap branches and had no branch policy. Its "past the per-repo
-  // cap" and policy counts therefore UNDERSTATE what the run omitted; the panel says so rather than
-  // presenting a false authoritative zero. "complete" is the normal (v4-native) case.
+  // "pre-upgrade" = the scan scope is UNVERIFIABLE, from EITHER of two causes (report.ts::buildScanScope
+  // maps both to this one value, and the label is deliberately not a claim about which):
+  //   - a head carries a NULL scanned_commit_date — a run migrated from before v4, whose scanner never
+  //     persisted past-cap branches and had no branch policy; or
+  //   - the run recorded ZERO heads, so there is no sentinel row to judge provenance by at all.
+  // Either way the "past the per-repo cap" and policy counts may UNDERSTATE what the run omitted; the
+  // panel says so rather than presenting a false authoritative zero. "complete" is the normal case, and
+  // requires a v4-native run with at least one recorded head.
   readonly provenance: "complete" | "pre-upgrade";
 }
 export interface DossierContext {
