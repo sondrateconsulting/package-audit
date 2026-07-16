@@ -2,9 +2,12 @@
 // work-queue state, and prepared-statement upserts for every finding/cache/surface table.
 // SQLite is the source of truth. Tool-generated timestamps (found_at/date_fetched/occurred_at) are
 // persisted in ONE canonical fixed-width ISO-8601 UTC form (nowIso), so lexicographic ordering equals
-// chronological ordering (§3/§7). Commit-date columns (cutoff_date, scanned_commit_date) instead hold
-// GitHub's committedDate form (second-precision, offset-bearing) verbatim — NOT the nowIso form — and
-// do NOT participate in the nowIso MAX/ordering invariant (see assertCanonicalTimestamp).
+// chronological ordering (§3/§7). Commit-INSTANT columns (work_queue.last_commit_date,
+// run_unit_head.scanned_commit_date) instead hold what their producers supply — in production, GitHub
+// committedDate / git-%cI instants (second-precision, offset preserved) verbatim, NOT the nowIso
+// form — and runs.cutoff_date holds the operator-CONFIGURED bare YYYY-MM-DD cutoff (validated at
+// config load; legacy-migrated rows carry ''). None of these participate in the nowIso MAX/ordering
+// invariant (see assertCanonicalTimestamp).
 // Single-writer: orchestrate.ts owns all writes; report.ts reads via the exposed handle.
 
 import { Database, type Statement } from "bun:sqlite";
@@ -68,8 +71,9 @@ export const nowIso = (): string => new Date().toISOString();
 // §3: tool-GENERATED timestamps (found_at/date_fetched/occurred_at) use ONE canonical fixed-width
 // ISO-8601 UTC form so that lexicographic ordering equals chronological ordering (§7 relies on MAX
 // over these). db.ts is the write boundary, so caller-supplied tool timestamps are validated here.
-// (Commit-date columns cutoff_date/scanned_commit_date are the GitHub committedDate family — stored
-// raw, NOT validated here, and NOT part of this ordering invariant.)
+// (Commit-instant columns last_commit_date/scanned_commit_date are the GitHub committedDate /
+// git-%cI family, and runs.cutoff_date is the configured bare YYYY-MM-DD — all stored raw, NOT
+// validated here, and NOT part of this ordering invariant.)
 const CANONICAL_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 function assertCanonicalTimestamp(value: string, ctx: string): string {
   // Shape check first (fast reject), then a Date round-trip so a fixed-width-but-impossible
@@ -231,8 +235,8 @@ export interface RunUnitHeadInput {
   // stale values in every direction. Invariants enforced by assertRunUnitHeadInvariants.
   policyStatus: PolicyStatus | null; // null = no exclusion (the branch is policy-eligible)
   policyMatchedPattern: string | null; // non-empty ONLY when policyStatus === 'excluded-by-deny'
-  // The commit date (GitHub committedDate / cutoff_date family — ISO with a UTC offset, stored RAW,
-  // NOT the nowIso millisecond form). scanned → the ACTUALLY-scanned commit's date (the clone HEAD's
+  // The commit date (GitHub committedDate / git-%cI family — an ISO instant, offset preserved,
+  // stored RAW, NOT the nowIso millisecond form). scanned → the ACTUALLY-scanned commit's date (the clone HEAD's
   // own date under the clone fallback); non-scanned → the discovered head date. REQUIRED non-null:
   // every fresh upsert has a real date (the DB column stays nullable only for pre-v4 migrated rows,
   // which the migration writes directly, never through this input). A runtime guard rejects ''/null.
@@ -1234,11 +1238,17 @@ function migrateV3toV4(db: Database): void {
 // Throw (fail) if the on-disk shape is INCOMPATIBLE with its stamp — a foreign/sibling database that
 // must be neither adopted NOR destroyed. Runs on a READ-ONLY preflight handle (so a rejection cannot
 // checkpoint/mutate a WAL file); the caller owns the handle. Recognizes legitimate predecessors, so a
-// real v2/v3 database is NOT rejected: for stamp >= v4 only ours-v4 is allowed; for v2..v3 an
-// exact-v2/exact-v3 OR a physically-upgraded ours-v4 is allowed; below v2 the legacy step rebuilds
-// run_unit_head EMPTY, so its shape is not validated here (a runs.outcome sibling still is, via the
-// classifier's first check). This runs BEFORE --fresh precisely so a --fresh cannot destroy a foreign
-// database at any stamp.
+// real v2/v3 database is NOT rejected — per-stamp allowed shapes: stamp 2 accepts exact-v2/exact-v3/
+// ours-v4 (each v4 form ± the repairable missing ix_ruh_loc); stamp 3 drops exact-v2; stamp >= 4
+// accepts only the ours-v4 forms. Below v2, run_unit_head's shape is not validated here AT ALL: a
+// pre-v2 table legitimately has the OLD shape (no status column — the legacy step ADDs it via an
+// additive ALTER, PRESERVING the rows; see the in-function note), so fingerprinting it against the
+// classifier's supported v2–v4 shapes would reject a perfectly good old database. A runs.outcome
+// sibling is still rejected below v2 — by the stamp-independent gate (a), which mirrors the
+// classifier's first check. This runs BEFORE --fresh, so an incompatibility DETECTED by these gates
+// is rejected before --fresh can drop anything; what they cannot detect (the pre-v2 "Accepted
+// residual" class below, and the adoption KNOWN HOLE documented at the writable open) can still
+// reach it.
 function assertOpenCompatible(db: Database, userVersion: number): void {
   const reject = (why: string): never => fail(`refusing to open an incompatible database (stamped v${userVersion}): ${why}`);
   // These cross-table invariants hold at EVERY stamp (including pre-v2), and must run BEFORE the
@@ -1272,9 +1282,10 @@ function assertOpenCompatible(db: Database, userVersion: number): void {
   // It is NOT skipped because the table gets rebuilt: the legacy step PRESERVES run_unit_head via an
   // additive ALTER and deliberately excludes it from the rebuild list (see migrateLegacy — "Do NOT
   // 'fix' this into a rebuild"). This comment used to claim the rebuild, which was both false and the
-  // stated reason for the skip; the real reason is the one above. What still backstops the skip is the
-  // chain itself: each step re-fingerprints its own result before stamping, so a shape that survives
-  // the ALTER is validated at v3→v4 rather than here.
+  // stated reason for the skip; the real reason is the one above. What still backstops the skip is
+  // the v3→v4 step — the ONE step that classifies the on-disk shape before touching it and
+  // re-fingerprints its result before stamping (legacy and v2→v3 stamp without fingerprinting) — so
+  // a shape that survives the additive ALTERs is validated there rather than here.
   //
   // Accepted residual: a pre-v2 file whose run_unit_head was hand-modified into a foreign shape can be
   // ALTERed (and other tables reset+committed) before a later step rejects it. That is the same
@@ -1397,9 +1408,11 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   //
   // Non-empty is not the contract, though: the field is specified as an ISO instant, and NULL carries a
   // load-bearing meaning of its own (a v3→v4-migrated row, the sentinel that makes a run's scan-scope
-  // provenance unverifiable). A non-empty GARBAGE date would be accepted as authoritative, counted as
-  // 'complete' provenance, and — because the cutoff compares slice(0, 10) lexically — could steer a
-  // later run's selection. The producers (github.ts discovery + the clone-date read) already validate
+  // provenance unverifiable). A non-empty GARBAGE date would be accepted as authoritative and counted
+  // as 'complete' provenance by the read surfaces (report scanScope, compare policyChurn availability).
+  // The STORED value is never re-read for cutoff or selection decisions — later runs judge freshly
+  // DISCOVERED head dates, where the same shared validator is what protects the live slice(0, 10)
+  // cutoff comparison. The producers (github.ts discovery + the clone-date read) already validate
   // with the same isIsoInstant, so this enforces the documented semantic at the chokepoint rather than
   // trusting every caller to have done it, exactly as the presence checks above do.
   if (!h.scannedCommitDate) fail(`run_unit_head ${where}: a non-empty scanned_commit_date is required`);

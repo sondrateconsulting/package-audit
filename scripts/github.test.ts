@@ -516,6 +516,41 @@ describe("throttle wait clamping (§4 hardening)", () => {
     expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
   });
 
+  test("graphql 200 with a PRESENT-but-non-array errors field fails closed — never coerced to 'no errors'", async () => {
+    // GraphQL spec: a present `errors` member is an array. A response carrying coherent data plus
+    // errors:"garbage" must NOT classify ok: the error signal we were meant to see is unreadable,
+    // and post-§11 an ok:true branch discovery feeds the reconcile PRUNE — a coerced-away failure
+    // could turn a partial result into row deletion. Fail closed instead.
+    const { client } = makeClient([ok(http(200, {}, `{"data":{"x":1},"errors":"garbage"}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(GithubApiError);
+  });
+
+  test("a malformed errors field does NOT preempt status evidence: 503+garbage stays transient (retries to success)", async () => {
+    // The malformed-envelope check must run AFTER classifyGraphql: a 5xx's retry semantics come from
+    // the STATUS, and hardening the ok path must not convert a transient outage into a fatal error.
+    const { client, sleeps } = makeClient([
+      ok(http(503, {}, `{"errors":"boom"}`)),
+      ok(http(200, {}, `{"data":{"x":1}}`)),
+    ]);
+    const data = await client.graphql("query{x}", {});
+    expect(data).toEqual({ x: 1 });
+    expect(sleeps.length).toBeGreaterThanOrEqual(1); // it actually took the transient retry path
+  });
+
+  test("a malformed errors field does NOT preempt SSO evidence: 403+x-github-sso stays fatal WITH ssoRequired", async () => {
+    const { client } = makeClient([
+      ok(http(403, { "x-ratelimit-remaining": "5", "x-github-sso": "required" }, `{"errors":"garbage"}`)),
+    ]);
+    let caught: unknown;
+    try {
+      await client.graphql("query{x}", {});
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).ssoRequired).toBe(true); // the SSO remediation signal survives
+  });
+
   test("MAX_TOTAL_PAUSE_MS is 8 hours (independent literal pins the magnitude)", () => {
     expect(MAX_TOTAL_PAUSE_MS).toBe(28_800_000);
   });

@@ -1081,14 +1081,33 @@ export class GithubClient {
       }
       let body: { data?: unknown; errors?: GraphqlErrorEntry[] } = {};
       try {
-        body = JSON.parse(parsed.body) as typeof body;
+        // A non-object root (null / array / primitive — JSON.parse("null") SUCCEEDS) carries neither
+        // data nor a readable errors member; normalize it to {} exactly like unparseable JSON, so the
+        // property reads below cannot TypeError and a missing `data` is rejected structurally
+        // downstream.
+        const parsedBody: unknown = JSON.parse(parsed.body);
+        body = parsedBody !== null && typeof parsedBody === "object" && !Array.isArray(parsedBody) ? (parsedBody as typeof body) : {};
       } catch {
         body = {};
       }
+      // GraphQL spec: a PRESENT `errors` member is an ARRAY. A present-but-non-array errors field
+      // means the failure signal we were meant to read is unreadable — coercing it to "no errors"
+      // would be fail-OPEN: an ok:true branch discovery feeds the reconcile PRUNE (§11), so a
+      // swallowed error signal could turn a partial result into row deletion. classifyGraphql still
+      // runs FIRST with errors=[]: status/header evidence (5xx retry, throttle, SSO-fatal) keeps its
+      // semantics, and the malformed envelope only preempts the OK path below.
+      const errorsMalformed = body.errors !== undefined && !Array.isArray(body.errors);
       const errors = Array.isArray(body.errors) ? body.errors : [];
       // §4: GraphQL throttles can arrive as HTTP 200 with body errors — check BOTH.
       const cls = classifyGraphql(parsed.status, parsed.headers, errors, this.now());
-      if (cls.kind === "ok") return body.data;
+      if (cls.kind === "ok") {
+        if (errorsMalformed)
+          throw new GithubApiError(
+            "graphql: response carries a malformed (non-array) errors field — refusing to treat it as success",
+            { status: parsed.status, endpoint: "graphql" },
+          );
+        return body.data;
+      }
       if (cls.kind === "fatal")
         throw new GithubApiError(`graphql: ${cls.message}`, { status: cls.status, endpoint: "graphql", ssoRequired: cls.ssoRequired });
       if (cls.kind === "primary") {
@@ -1372,10 +1391,11 @@ export class GithubClient {
         throw new GithubApiError(`git show HEAD committer date failed in ${dest}: ${dateRes.stderr.trim().slice(0, 300)}`, { endpoint: url });
       const headCommittedDate = dateRes.stdout.trim();
       // Exactly one strict-ISO line, offset preserved verbatim (NOT normalized to Z/ms — this joins
-      // the committedDate/cutoff_date family). A garbled read would poison the durable scanned_commit_date.
-      // isIsoInstant, not a bare shape regex: the shape alone admits impossible CALENDAR values
-      // (2025-02-30, which Date.parse silently rolls over rather than rejecting), and this value is
-      // recorded as the scanned commit's date and compared lexically against the cutoff.
+      // the committedDate family feeding scanned_commit_date). A garbled read would poison that
+      // durable provenance. isIsoInstant, not a bare shape regex: the shape alone admits impossible
+      // CALENDAR values (2025-02-30, which Date.parse silently rolls over rather than rejecting).
+      // Planning already happened — the cutoff was judged on the DISCOVERED head date, never on this
+      // value — so the poison risk here is the run's durable scan-scope ledger, not selection.
       if (!isIsoInstant(headCommittedDate))
         throw new GithubApiError(`git show HEAD returned a non-ISO committer date in ${dest}: ${JSON.stringify(headCommittedDate.slice(0, 80))}`, { endpoint: url });
       return { dir: dest, headSha: rev.stdout.trim(), headCommittedDate };
