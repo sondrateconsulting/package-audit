@@ -1090,8 +1090,12 @@ export class AuditDb {
   // §5.E range-resolution write-back: for a repo that committed NO lockfile, the orchestrator
   // resolves the declared range against the packument (max-satisfying) and records that concrete
   // version on the dependency finding so the report can attribute a per-repo version. GUARDED by
-  // `resolved_version IS NULL` so it NEVER clobbers a lockfile-resolved row (whose resolution is
-  // authoritative). Returns true when a row was updated.
+  // `resolved_version IS NULL AND resolved_version_source IS NULL AND lockfile_path IS NULL`: the
+  // first two ensure it NEVER clobbers a lockfile-resolved row (whose resolution is authoritative);
+  // `lockfile_path IS NULL` is independently load-bearing — a dependency with a GOVERNING lockfile
+  // that left it unresolved (e.g. an uninstalled peer) has resolved_version NULL, but its absence
+  // from that lockfile is the finding, so it must NOT be guessed from the range. Returns true when
+  // a row was updated.
   setRangeResolvedVersion(key: RangeResolveKey, version: string): boolean {
     const res = this.db
       .query(
