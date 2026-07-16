@@ -1270,7 +1270,11 @@ describe("listBranchHeads (§5.B)", () => {
     // is never caught downstream: "2025-99-99…" simply sorts as far-future and the branch is silently
     // classified ELIGIBLE. 2025-02-30 is the case a bare Date.parse would MISS — it rolls over to
     // March 2 rather than failing, so an impossible calendar date would be recorded as real.
-    for (const bad of ["2025-99-99T99:99:99Z", "2025-02-30T00:00:00Z", "2025-13-01T00:00:00Z", "2025-06-01T25:00:00Z", "2025-06-01T00:00:00+99:00", "2025-06-01", "yesterday"]) {
+    // T24:00:00Z is the one a Date.parse-based check MISSES for the opposite reason: hour 24 is a legal
+    // ISO end-of-day spelling that Date.parse NORMALIZES to 00:00 the next day — so the value would be
+    // accepted while its slice(0,10) names a different day than the instant it denotes. Explicit
+    // component bounds, not Date.parse, are what reject it. 2025-02-30 covers the rollover direction.
+    for (const bad of ["2025-99-99T99:99:99Z", "2025-02-30T00:00:00Z", "2025-13-01T00:00:00Z", "2025-06-01T25:00:00Z", "2025-06-01T24:00:00Z", "2025-06-01T24:00:00+00:00", "2025-06-01T00:60:00Z", "2025-06-01T00:00:60Z", "2025-06-00T00:00:00Z", "2025-06-32T00:00:00Z", "2025-00-01T00:00:00Z", "2025-06-01T00:00:00+99:00", "2025-06-01T00:00:00+00:99", "2025-06-01", "yesterday"]) {
       const { client } = makeClient([
         refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: bad, tree: { oid: "t" } } }] }, { defaultBranchRef: { name: "dev" } }),
       ]);

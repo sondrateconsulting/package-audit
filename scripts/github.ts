@@ -612,21 +612,29 @@ export function filterSortCapRepos(
 // is silently classified ELIGIBLE (or, symmetrically, silently cutoff-skipped), and that same string
 // then lands in the durable scanned_commit_date. Every date this module emits passes here first.
 //
-// Date.parse alone is NOT sufficient — that is the entire reason for the component round-trip. It does
-// reject "2025-13-01" / "T25:00" / "+99:00", but "2025-02-30T00:00:00Z" ROLLS OVER to March 2 rather
-// than failing, so an impossible calendar date would otherwise be accepted and recorded as real.
-// The round-trip checks the components AS WRITTEN, never the UTC projection: a legitimate offset date
-// ("2025-06-01T02:00:00+05:00") lands on a different UTC day, so comparing toISOString() would reject
-// genuine dates. Offset-bearing forms are accepted because `git show --format=%cI` emits them.
-const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/;
+// Validation is by EXPLICIT component ranges plus a day-of-month probe. `Date.parse` is deliberately
+// NOT used as the range check, because it is not one — it silently NORMALIZES two forms this must
+// reject, and normalization is exactly the laundering we are guarding against:
+//   - "2025-06-01T24:00:00Z" — hour 24 is a legal ISO end-of-day spelling and Date.parse maps it to
+//     00:00 on June 2, yet the stored string still slices to "2025-06-01", so the cutoff would compare
+//     a DIFFERENT DAY than the instant denotes. Rejected: GitHub and `git show --format=%cI` emit 00-23.
+//   - "2025-02-30T00:00:00Z" — an impossible calendar date, rolled over to March 2 rather than failing.
+// So the explicit bounds catch what normalization would launder, and the day probe catches rollover
+// (Feb 30, day 00, day 32). Both judge the components AS WRITTEN, never the UTC projection: a
+// legitimate offset date ("2025-06-01T02:00:00+05:00") lands on a different UTC day, so comparing
+// toISOString() would reject genuine git output. Offset forms are accepted because %cI emits them; a
+// leap second (:60) is rejected, as no producer feeding this emits one.
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:Z|[+-](\d{2}):(\d{2}))$/;
 export function isIsoInstant(s: string): boolean {
   const m = ISO_INSTANT.exec(s);
-  if (m === null) return false; // shape — this is also what makes the cutoff's slice(0,10) meaningful
-  if (Number.isNaN(Date.parse(s))) return false; // month / hour / minute / second / offset ranges
-  const [, y, mo, d] = m;
+  if (m === null) return false; // shape — also what makes the cutoff's slice(0, 10) meaningful
+  const [, y, mo, d, h, mi, sec, oh, om] = m;
   const [Y, MO, D] = [Number(y), Number(mo), Number(d)];
+  if (MO < 1 || MO > 12 || D < 1) return false;
+  if (Number(h) > 23 || Number(mi) > 59 || Number(sec) > 59) return false;
+  if (oh !== undefined && (Number(oh) > 23 || Number(om) > 59)) return false; // undefined for the Z form
   const probe = new Date(Date.UTC(Y, MO - 1, D));
-  // a rolled-over date (Feb 30 → Mar 2) comes back with different components than it went in
+  // a rolled-over day (Feb 30 → Mar 2, day 32 → next month) returns different components than it got
   return probe.getUTCFullYear() === Y && probe.getUTCMonth() === MO - 1 && probe.getUTCDate() === D;
 }
 
