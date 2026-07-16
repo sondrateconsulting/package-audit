@@ -488,9 +488,11 @@ export function classifyRest(
 ): Classification {
   if (status === 200) return { kind: "ok" };
   // §5.C: only EXACTLY 200 is success. A non-200 2xx (206 Partial Content from a middlebox,
-  // 203 proxy-transformed content, …) carries a body that cannot be trusted as complete, and
-  // restGet's consumers scan those bodies as raw file content with no structural validation of
-  // their own — so ONE fatal here covers every consumer, current and future. Non-retryable on
+  // 203 proxy-transformed content, …) carries a body that cannot be trusted as complete. The
+  // raw consumers (fetchFileRaw/fetchBlobRaw) scan those bodies as file content with no
+  // structural validation at all, and the structured consumers' validation cannot establish
+  // transport completeness anyway — so ONE fatal here covers every consumer, current and
+  // future. Non-retryable on
   // purpose: a transforming middlebox would re-transform on retry, and the transient path would
   // end in a misleading ThrottleExhausted that loses the status. Every REST endpoint this tool
   // calls returns exactly 200 on success; an endpoint with genuine 202/204 semantics would need

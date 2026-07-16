@@ -192,7 +192,7 @@ describe("classifyRest / classifyGraphql / parseRetryAfterMs", () => {
     // scan it as file content. Fail closed at the classifier so EVERY restGet consumer —
     // current and future — inherits the gate from one site.
     expect(classifyRest(200, {}, "", NOW)).toEqual({ kind: "ok" });
-    for (const status of [201, 202, 203, 204, 206, 226, 299]) {
+    for (let status = 201; status <= 299; status++) {
       const cls = classifyRest(status, {}, "", NOW);
       expect(cls.kind).toBe("fatal");
       if (cls.kind === "fatal") {
@@ -203,13 +203,18 @@ describe("classifyRest / classifyGraphql / parseRetryAfterMs", () => {
     }
     // range boundaries: the statuses BRACKETING the 2xx range keep their existing paths — a
     // terminal 1xx (parseGhApiOutput can surface one when no final block follows) and a bare
-    // 3xx are fatal via the catch-all, never swallowed by the new branch.
-    expect(classifyRest(199, {}, "", NOW).kind).toBe("fatal");
-    expect(classifyRest(300, {}, "", NOW).kind).toBe("fatal");
+    // 3xx are fatal via the CATCH-ALL. Asserting kind alone would still pass if the new branch
+    // accidentally widened to swallow them (both branches return fatal), so pin the message.
+    for (const status of [199, 300]) {
+      const cls = classifyRest(status, {}, "", NOW);
+      expect(cls.kind).toBe("fatal");
+      if (cls.kind === "fatal") expect(cls.message).not.toMatch(/only exactly 200/);
+    }
   });
-  test("a 2xx-non-200 is fatal even when throttle-looking headers ride along — 2xx is never a 403/429", () => {
-    // ordering guard: the narrowing sits BEFORE the 403/429 branch; a poisoned 206 carrying
-    // exhausted-window headers or Retry-After must not be reclassified as a retryable throttle.
+  test("a 2xx-non-200 is fatal even when throttle-looking headers ride along — never a retryable throttle", () => {
+    // outcome pin, not a source-ordering proof (the 2xx and 403/429 predicates are disjoint, so
+    // ordering is unobservable here): a poisoned 206 carrying exhausted-window headers or
+    // Retry-After must classify fatal, never primary/secondary.
     const cls = classifyRest(206, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1000000100", "retry-after": "30" }, "", NOW);
     expect(cls.kind).toBe("fatal");
   });
