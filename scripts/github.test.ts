@@ -521,6 +521,63 @@ describe("restGet caching + conditional requests", () => {
     db.close();
   });
 
+  test("a parsed 200 from a FAILED gh process is a TRUNCATED transfer — transient retry, never consumed or persisted", async () => {
+    // gh api -i streams the body AFTER printing the header block, so a mid-body transport
+    // failure leaves a well-formed 200 head + partial body on stdout and a NONZERO exit —
+    // invisible to every status gate. Persistent failure must exhaust the transient retries
+    // and surface the stderr diagnostic, leaving nothing in the cache.
+    const truncated = err(http(200, { etag: 'W/"t"' }, `{"half":`), "read: connection reset by peer");
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client, sleeps } = makeClient([truncated, truncated, truncated, truncated, truncated, truncated], { db });
+    await expect(client.restGet("user/orgs?per_page=100&page=1")).rejects.toThrow(/truncated|connection reset/);
+    expect(sleeps.length).toBeGreaterThanOrEqual(5);
+    const rows = db.read("SELECT COUNT(*) AS n FROM api_cache").get() as { n: number };
+    expect(rows.n).toBe(0);
+    db.close();
+  });
+
+  test("a truncated 200 recovers on retry — only the COMPLETE body is returned and persisted", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client, calls } = makeClient(
+      [err(http(200, {}, "partial"), "read: connection reset"), ok(http(200, { etag: 'W/"f"' }, "full-body"))],
+      { db },
+    );
+    const res = await client.restGet("user/orgs?per_page=100&page=1");
+    expect(res.body).toBe("full-body");
+    expect(calls.length).toBe(2);
+    const row = db.read("SELECT response_body AS body FROM api_cache").get() as { body: string };
+    expect(row.body).toBe("full-body"); // the truncated attempt never touched the cache
+    db.close();
+  });
+
+  test("fetchFileRaw: a truncated 200 can never poison the immutable cache (the reviewer-reproduced hole)", async () => {
+    // Pre-gate, this exact sequence returned "partial" AND froze it into the SHA-pinned
+    // immutable path — served forever with zero network. Now the failed transfer retries.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client, calls } = makeClient(
+      [err(http(200, {}, "partial"), "read: connection reset"), ok(http(200, {}, "full"))],
+      { db },
+    );
+    const body = await client.fetchFileRaw("o", "r", "package.json", SHA);
+    expect(body).toBe("full");
+    expect(calls.length).toBe(2);
+    const again = await client.fetchFileRaw("o", "r", "package.json", SHA);
+    expect(again).toBe("full");
+    expect(calls.length).toBe(2); // immutable hit serves the COMPLETE body, zero new spawns
+    db.close();
+  });
+
+  test("gh2-era cache rows are quarantined by the gh3 epoch — a pre-exit-gate row may be a truncated 200", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const legacyEndpoint = `repos/o/r/contents/package.json?ref=${SHA}`;
+    db.putApiCache({ method: "GET", url: `gh2:github.com:${legacyEndpoint}`, variantHash: "application/vnd.github.raw+json", etag: null, responseBody: "gh2-era-possibly-truncated" });
+    const { client, calls } = makeClient([ok(http(200, {}, "fresh-full-body"))], { db });
+    const body = await client.fetchFileRaw("o", "r", "package.json", SHA);
+    expect(body).toBe("fresh-full-body"); // the network answered — never the gh2 row
+    expect(calls.length).toBe(1);
+    db.close();
+  });
+
   test("legacy pre-epoch cache rows are quarantined — never served to ANY consumer", async () => {
     // Rows are statusless, survive --fresh, and pre-gate code cached any ok-classified 2xx. The
     // raw contents/blob consumers have no structural validation, so a legacy 206 body would ride
@@ -541,7 +598,8 @@ describe("restGet caching + conditional requests", () => {
     // githubHost accepts host:port and numeric hosts, so an epoch spelled INSIDE the old `gh:`
     // namespace (e.g. `gh:200.1:`) would collide: legacy host "200.1:443" and current host "443"
     // spell the same key. The prefix itself must be impossible under the old grammar — every
-    // legacy key starts with the literal `gh:`, so `gh2:` can never match one.
+    // first-epoch key starts with the literal `gh:`, so a later epoch prefix (`gh2:`, `gh3:`, …)
+    // can never match one.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const SHA2 = "0123456789abcdef0123456789abcdef01234567";
     const legacyEndpoint = `repos/o/r/contents/package.json?ref=${SHA2}`;
@@ -1561,6 +1619,17 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
   test("HTTP 2xx-but-not-200 with a pristine envelope is NOT graphql success", async () => {
     const { client } = makeClient([ok(http(206, {}, `{"data":{"x":1}}`))]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/200/);
+  });
+  test("a parsed 200 from a FAILED gh process is a truncated transfer for graphql too — retried, not consumed", async () => {
+    // a truncated graphql body USUALLY fails JSON.parse, but truncation can land on a valid
+    // JSON boundary — the exit code is the only reliable completeness signal.
+    const { client, calls } = makeClient([
+      err(http(200, {}, `{"data":{"x":1}}`), "read: connection reset"),
+      ok(http(200, {}, `{"data":{"x":2}}`)),
+    ]);
+    const data = await client.graphql("query{x}", {});
+    expect(data).toEqual({ x: 2 }); // attempt 1's possibly-truncated envelope was never trusted
+    expect(calls.length).toBe(2);
   });
   test("junk errors entries do NOT preempt SSO evidence: 403+x-github-sso stays fatal WITH ssoRequired", async () => {
     const { client } = makeClient([

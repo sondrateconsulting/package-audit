@@ -1068,17 +1068,20 @@ export class GithubClient {
 
   // ---- REST GET with cache + throttle handling ----
   private cacheKey(endpoint: string): string {
-    // KEY EPOCH `gh2`: quarantines every row written BEFORE the exact-200 persist gate. Rows
-    // are statusless and survive --fresh, and pre-gate code cached any ok-classified 2xx — a
-    // legacy 206 body would otherwise ride the immutable/304 hits' synthesized 200 into the
-    // UNVALIDATED raw contents/blob consumers with zero network calls. Pre-epoch rows simply
-    // never match again (--purge-cache reclaims the dead rows). The epoch lives in the PREFIX
-    // itself (gh2:, next bump gh3:) because githubHost accepts host:port and numeric hosts —
-    // an epoch spelled INSIDE the old `gh:` namespace could collide with a legacy key across a
-    // host transition (`gh:200.1:443:` = legacy host "200.1:443" = current host "443"); every
-    // legacy key starts with the literal `gh:`, so no string can inhabit both grammars. Bump
-    // whenever cache WRITE-provenance guarantees change in a way reads rely on.
-    return `gh2:${this.githubHost}:${endpoint}`; // host-scoped; never a hand-built API hostname
+    // KEY EPOCH `gh3`: rows are statusless and survive --fresh, so every strengthening of cache
+    // WRITE provenance quarantines all older rows by making their keys unreachable (--purge-cache
+    // reclaims the dead rows; the cost is a one-time refetch). gh:→gh2: closed rows written
+    // before the exact-200 persist gate (any ok-classified 2xx body, e.g. a 206, could ride the
+    // immutable/304 hits' synthesized 200 into the unvalidated raw consumers). gh2:→gh3: closed
+    // rows written before the truncated-transfer exit gate (a parsed 200 from a FAILED gh
+    // process could persist a mid-stream-cut body — same laundering, worse provenance). The
+    // epoch lives in the PREFIX itself (next bump gh4:) because githubHost accepts host:port
+    // and numeric hosts — an epoch spelled INSIDE the old `gh:` namespace could collide with a
+    // legacy key across a host transition (`gh:200.1:443:` = legacy host "200.1:443" = current
+    // host "443"). Every legacy key starts with the literal `gh:` or `gh2:`, and no string can
+    // inhabit two of these grammars (they disagree at index 2: ':', '2', '3'). Bump whenever
+    // cache WRITE-provenance guarantees change in a way reads rely on.
+    return `gh3:${this.githubHost}:${endpoint}`; // host-scoped; never a hand-built API hostname
   }
 
   private async waitBucket(bucket: Bucket): Promise<void> {
@@ -1167,6 +1170,23 @@ export class GithubClient {
       if (parsed.status === 304 && cached !== null && cached.responseBody !== null) {
         this.db?.putApiCache({ method: "GET", url: key, variantHash: accept, etag: cached.etag, responseBody: cached.responseBody });
         return { status: 200, headers: parsed.headers, body: cached.responseBody };
+      }
+      // A parsed SUCCESS from a FAILED gh process is untrustworthy: gh api -i streams the body
+      // AFTER printing the header block, so a mid-body transport failure leaves a well-formed
+      // 200 head with a TRUNCATED body on stdout and a nonzero exit — invisible to every status
+      // gate, and the exact-200 persist gate would freeze it into the cache. Only the exact-200
+      // path consumes/persists bodies; HTTP-error statuses arrive with a nonzero exit BY DESIGN
+      // (gh exits 1 on 4xx/5xx and on the 304 the cache hit above depends on) and classify
+      // normally below. Same transient class as no-response: retry, then surface stderr.
+      if (parsed.status === 200 && res.exitCode !== 0) {
+        if (attempt < MAX_ATTEMPTS - 1) {
+          await this.sleep(this.backoffWait("transient", attempt, null));
+          continue;
+        }
+        throw new GithubApiError(
+          `gh exited ${res.exitCode} with an HTTP 200 response — the body may be truncated: ${res.stderr.trim().slice(0, 300)}`,
+          { endpoint },
+        );
       }
       const cls = classifyRest(parsed.status, parsed.headers, parsed.body, this.now());
       if (cls.kind === "ok") {
@@ -1261,6 +1281,20 @@ export class GithubClient {
           continue;
         }
         throw new GithubApiError(`gh api graphql produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`, { endpoint: "graphql" });
+      }
+      // Same truncated-transfer guard as restGet: a nonzero gh exit under a parsed 200 means
+      // the body may be cut mid-stream. GraphQL truncation USUALLY fails JSON.parse, but a cut
+      // can land on a valid JSON boundary — the exit code is the only reliable completeness
+      // signal. (No cache here; the risk is consuming a partial envelope as truth.)
+      if (parsed.status === 200 && res.exitCode !== 0) {
+        if (attempt < MAX_ATTEMPTS - 1) {
+          await this.sleep(this.backoffWait("transient", attempt, null));
+          continue;
+        }
+        throw new GithubApiError(
+          `gh exited ${res.exitCode} with an HTTP 200 graphql response — the body may be truncated: ${res.stderr.trim().slice(0, 300)}`,
+          { endpoint: "graphql" },
+        );
       }
       // Spec-shape validation lives in parseGraphqlEnvelope (pure). A malformed envelope means the
       // failure signal we were meant to read is unreadable — coercing it to "no errors" would be
