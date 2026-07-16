@@ -605,6 +605,31 @@ export function filterSortCapRepos(
   return opts.maxReposPerOrg === null ? sorted : sorted.slice(0, opts.maxReposPerOrg);
 }
 
+// A commit date is UNTRUSTED INPUT that silently steers scan SELECTION, so it is validated for real
+// calendar validity — not merely for being a non-empty string. classifyBranchPlan compares
+// `committedDate.slice(0, 10)` LEXICALLY against cutoffDate, so nothing downstream can catch a
+// malformed value: "2025-99-99T99:99:99Z" simply sorts as if it were far in the future and the branch
+// is silently classified ELIGIBLE (or, symmetrically, silently cutoff-skipped), and that same string
+// then lands in the durable scanned_commit_date. Every date this module emits passes here first.
+//
+// Date.parse alone is NOT sufficient — that is the entire reason for the component round-trip. It does
+// reject "2025-13-01" / "T25:00" / "+99:00", but "2025-02-30T00:00:00Z" ROLLS OVER to March 2 rather
+// than failing, so an impossible calendar date would otherwise be accepted and recorded as real.
+// The round-trip checks the components AS WRITTEN, never the UTC projection: a legitimate offset date
+// ("2025-06-01T02:00:00+05:00") lands on a different UTC day, so comparing toISOString() would reject
+// genuine dates. Offset-bearing forms are accepted because `git show --format=%cI` emits them.
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/;
+export function isIsoInstant(s: string): boolean {
+  const m = ISO_INSTANT.exec(s);
+  if (m === null) return false; // shape — this is also what makes the cutoff's slice(0,10) meaningful
+  if (Number.isNaN(Date.parse(s))) return false; // month / hour / minute / second / offset ranges
+  const [, y, mo, d] = m;
+  const [Y, MO, D] = [Number(y), Number(mo), Number(d)];
+  const probe = new Date(Date.UTC(Y, MO - 1, D));
+  // a rolled-over date (Feb 30 → Mar 2) comes back with different components than it went in
+  return probe.getUTCFullYear() === Y && probe.getUTCMonth() === MO - 1 && probe.getUTCDate() === D;
+}
+
 export interface BranchHead {
   name: string;
   oid: string;
@@ -1204,6 +1229,14 @@ export class GithubClient {
             typeof n.target.committedDate !== "string" || n.target.committedDate.length === 0 ||
             typeof n.target.tree?.oid !== "string" || n.target.tree.oid.length === 0)
           throw new GithubApiError(`malformed branch-head node for ${org}/${repo}`, { endpoint: "graphql" });
+        // Non-empty is NOT enough for the DATE: it steers cutoff/cap selection lexically and is then
+        // persisted, so an impossible value would silently change WHAT GETS SCANNED rather than fail
+        // (see isIsoInstant). Same fail-closed posture as every other guard in this loop.
+        if (!isIsoInstant(n.target.committedDate))
+          throw new GithubApiError(
+            `branch ${JSON.stringify(n.name)} of ${org}/${repo} has a non-ISO committedDate: ${JSON.stringify(n.target.committedDate.slice(0, 40))}`,
+            { endpoint: "graphql" },
+          );
         if (seenNames.has(n.name))
           throw new GithubApiError(`duplicate branch ${JSON.stringify(n.name)} across pages for ${org}/${repo}`, { endpoint: "graphql" });
         seenNames.add(n.name);
@@ -1364,7 +1397,10 @@ export class GithubClient {
       const headCommittedDate = dateRes.stdout.trim();
       // Exactly one strict-ISO line, offset preserved verbatim (NOT normalized to Z/ms — this joins
       // the committedDate/cutoff_date family). A garbled read would poison the durable scanned_commit_date.
-      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/.test(headCommittedDate))
+      // isIsoInstant, not a bare shape regex: the shape alone admits impossible CALENDAR values
+      // (2025-02-30, which Date.parse silently rolls over rather than rejecting), and this value is
+      // recorded as the scanned commit's date and compared lexically against the cutoff.
+      if (!isIsoInstant(headCommittedDate))
         throw new GithubApiError(`git show HEAD returned a non-ISO committer date in ${dest}: ${JSON.stringify(headCommittedDate.slice(0, 80))}`, { endpoint: url });
       return { dir: dest, headSha: rev.stdout.trim(), headCommittedDate };
     } catch (e) {

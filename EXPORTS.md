@@ -167,7 +167,10 @@ Scoped to the selected run only (`--raw` dumps all runs).
 On a **resumed** run (one interrupted and re-invoked, which reuses the same `run_id`), the report's
 `branchesErrored` counts precisely "errored branches holding no row here" — which is looser than
 "every branch whose scan errored", in **both** directions. `errors[]` is append-only and is never
-reconciled, while the rows in *this* table **are** pruned for branches gone since an earlier invocation.
+reconciled, while the rows in *this* table **are** pruned for branches gone since an earlier invocation —
+though only within a repo this run re-discovered and kept: the prune runs per repo, so a repo that dropped
+out of the kept set entirely (deleted, renamed, newly archived/fork-filtered, or displaced past
+`maxReposPerOrg`) is never revisited and keeps its prior rows.
 So a branch that errored in an earlier invocation and reached no row-bearing disposition in the final one
 — deleted, throttle-requeued on retry, or its repo's discovery failed — is still counted there while
 correctly holding no row here. Conversely, a branch that kept a row from an earlier invocation and then

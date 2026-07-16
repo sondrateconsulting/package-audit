@@ -469,15 +469,21 @@ export async function processRepo(
   // the exact live branch set for THIS discovery snapshot). Prune this run's stale run_unit_head rows —
   // phantom branches a prior resume-invocation recorded that no longer exist. Scoped to this
   // (run_id, org, repo); a failed/throttled repo never reaches here and is retained. Reconciliation
-  // reflects the DISCOVERY-TIME snapshot, not the state at this instant, so the keep-set can be stale in
-  // both directions — an accepted TOCTOU for this single-user tool (no permanent data loss; the next run
-  // re-discovers and re-reconciles):
-  //   - a branch DELETED after discovery is still in the keep-set, so its row is RETAINED this run (a
-  //     phantom that survives until the next run prunes it);
-  //   - a branch CREATED after discovery is absent from the keep-set, but it has no row to prune either,
-  //     so nothing is lost — it is simply recorded next run.
-  // Note the prune direction: being in `heads` PROTECTS a row. Reconciliation can only ever delete rows
-  // for names discovery did NOT return, which is why a stale keep-set errs toward retaining, not deleting.
+  // reflects the DISCOVERY-TIME snapshot, not the state at this instant, so the keep-set can be stale
+  // in both directions — an accepted TOCTOU for this single-user tool (no permanent data loss; the next
+  // run re-discovers and re-reconciles). Membership in `heads` is what decides, so there are exactly
+  // three cases:
+  //   - PRESENT in the keep-set → the row is RETAINED, whatever happened after discovery. A branch
+  //     deleted in that window keeps its row this run (a phantom the next run prunes).
+  //   - ABSENT and it never had a row (created after discovery) → nothing to prune, nothing lost; it is
+  //     simply recorded next run.
+  //   - ABSENT but it DOES hold a row from an earlier invocation of this run → the row is PRUNED. This
+  //     is the sharp edge, and it does not require the branch to still be gone: one deleted BEFORE this
+  //     discovery and RECREATED before the DELETE below is live again by the time we prune, yet its
+  //     prior row goes anyway (the keep-set no longer names it). Accepted: the row is re-recorded on the
+  //     next run, and global findings persist — only the per-run disposition row lapses.
+  // Note the direction: presence PROTECTS. Reconciliation can only delete rows for names discovery did
+  // not return — so a stale keep-set errs toward retaining, except in that third case.
   //
   // SIBLING ACCEPTED-STALENESS (same-name stale head). On a RESUME: a branch whose head ADVANCED since a
   // prior invocation, whose re-scan then errors (the insertError arm above) or throttles (the requeue

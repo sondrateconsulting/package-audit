@@ -1265,6 +1265,28 @@ describe("listBranchHeads (§5.B)", () => {
     ]);
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/omits defaultBranchRef/);
   });
+  test("a non-ISO / impossible committedDate throws — it steers cutoff selection, so non-empty is not enough", async () => {
+    // The date is compared LEXICALLY (`committedDate.slice(0,10) < cutoffDate`), so a malformed value
+    // is never caught downstream: "2025-99-99…" simply sorts as far-future and the branch is silently
+    // classified ELIGIBLE. 2025-02-30 is the case a bare Date.parse would MISS — it rolls over to
+    // March 2 rather than failing, so an impossible calendar date would be recorded as real.
+    for (const bad of ["2025-99-99T99:99:99Z", "2025-02-30T00:00:00Z", "2025-13-01T00:00:00Z", "2025-06-01T25:00:00Z", "2025-06-01T00:00:00+99:00", "2025-06-01", "yesterday"]) {
+      const { client } = makeClient([
+        refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: bad, tree: { oid: "t" } } }] }, { defaultBranchRef: { name: "dev" } }),
+      ]);
+      await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/non-ISO committedDate/);
+    }
+  });
+  test("a legitimate OFFSET-bearing date is accepted (git emits them; the UTC day may differ)", async () => {
+    // Guards against over-validating: comparing toISOString() would reject this, because 02:00+05:00
+    // is the PREVIOUS day in UTC. Validity is judged on the components as written.
+    const { client } = makeClient([
+      refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: "2025-06-01T02:00:00+05:00", tree: { oid: "t" } } }] }, { defaultBranchRef: { name: "dev" } }),
+    ]);
+    const snap = await client.listBranchHeads("o", "r");
+    expect(snap.heads[0]!.committedDate).toBe("2025-06-01T02:00:00+05:00"); // preserved verbatim, never normalized
+  });
+
   test("a default branch that CHANGES mid-pagination throws (the classification authority moved)", async () => {
     // Membership alone cannot catch this when both names stay live: page 1 says main is default, page 2
     // says trunk, and both are in the head set. Unlike the rejected totalCount cross-check (which trips

@@ -1969,6 +1969,12 @@ export class AuditDb {
   // from that real scan), and the work_queue unit is left error/pending so the next run re-scans and
   // refreshes it. Accepted, not overlooked — see processRepo's §11 note for the rejected alternative.
   //
+  // SCOPE, stated precisely because the surrounding docs used to over-claim it: the caller invokes this
+  // ONCE PER RE-DISCOVERED REPO, so what it guarantees is "a re-discovered repo's rows match its live
+  // branches" — never "the run's rows match the live estate". A repo that dropped out of this run's kept
+  // set entirely (deleted, renamed, newly archived/fork-filtered, or displaced past maxReposPerOrg) never
+  // reaches this call at all, so ALL of its prior rows survive untouched.
+  //
   // Returns the number of rows pruned.
   reconcileRunUnitHead(runId: string, organization: string, repository: string, discoveredBranches: readonly string[]): number {
     const res = this.db
