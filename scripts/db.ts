@@ -1547,10 +1547,10 @@ export class AuditDb {
     const db = new Database(path, { create: true, strict: true });
     // PRAGMAs, version ceiling and the ownership BACKSTOP under one fail-closed discipline —
     // see initWritableConnection (extracted so its failure contract is directly unit-testable).
-    // The compatibility gate already ran on the READ-ONLY preflight above — INCLUDING the
-    // foreign-database adoption check — so an incompatible EXISTING file never reaches this
-    // writable open, and thus is never WAL-mutated (journal_mode=WAL persists in the header +
-    // creates sidecars) or --fresh-dropped.
+    // What the READ-ONLY preflight above guarantees before this writable open is stated NARROWLY
+    // at the preflight itself: it covers only a file that EXISTED at that moment, subject to the
+    // accepted TOCTOU window documented there, and later migration-internal failures fire AFTER
+    // this point, each rolling back its OWN transaction only.
     const userVersion = initWritableConnection(db, path);
 
     if (opts.fresh === true) {
