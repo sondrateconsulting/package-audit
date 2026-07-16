@@ -168,6 +168,49 @@ describe("open — fresh create", () => {
     expect(existsSync(`${path}-shm`)).toBe(false);
   });
 
+  test("refuses a foreign database whose only objects are NON-TABLES (a view) — and does not mutate it", () => {
+    // The `type='table'` blind spot, which was not theoretical: a view-only file read as non-foreign,
+    // so the writable open WAL-converted it AND the adoption path CREATED the whole audit schema
+    // inside someone else's database. Zero audit tables means the file is ours only if it is EMPTY.
+    const path = nextFile();
+    const raw = new Database(path, { create: true });
+    raw.exec("CREATE TABLE t (x TEXT)");
+    raw.exec("CREATE VIEW someones_view AS SELECT x FROM t");
+    raw.exec("DROP TABLE t"); // leaves a file whose ONLY object is a view
+    const before = (raw.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
+    raw.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+    const ro = new Database(path, { readonly: true, strict: true });
+    const after = (ro.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
+    const objects = ro.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
+    ro.close();
+    expect(after).toBe(before); // not WAL-converted
+    expect(existsSync(`${path}-wal`)).toBe(false);
+    expect(objects.map((o) => o.name)).toEqual(["someones_view"]); // no audit schema written into it
+  });
+
+  test("refuses a foreign database whose ONLY object COLLIDES with an audit table name (a view called 'runs')", () => {
+    // The second half of the hole: name-matching against the audit set meant a foreign object NAMED
+    // like one of ours counted as ours. Deliberately a backing-table-free view, so `runs` is the file's
+    // ONLY object — otherwise a stray foreign table would make it foreign for the wrong reason and the
+    // test would not discriminate. Under the old predicate this file looked adoptable, so it was
+    // WAL-mutated and `CREATE TABLE runs` then failed against the existing view — a raw SQLiteError
+    // AFTER the damage, not a clean DbError before it.
+    const path = nextFile();
+    const raw = new Database(path, { create: true });
+    raw.exec("CREATE VIEW runs AS SELECT 1 AS x");
+    const before = (raw.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
+    raw.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError); // rejected cleanly, on the preflight
+    const ro = new Database(path, { readonly: true, strict: true });
+    const after = (ro.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
+    const objects = ro.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
+    ro.close();
+    expect(after).toBe(before);
+    expect(existsSync(`${path}-wal`)).toBe(false);
+    expect(objects.map((o) => o.name)).toEqual(["runs"]); // their view, untouched
+  });
+
   test("refuses a database stamped with a NEWER schema version", () => {
     const path = nextFile();
     const raw = new Database(path, { create: true });

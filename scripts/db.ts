@@ -1250,10 +1250,10 @@ function assertOpenCompatible(db: Database, userVersion: number): void {
   //      mutated a file we just decided we do not own, breaking the zero-mutation guarantee
   //      AuditDb.open's preflight note makes. It is reachable by ordinary operator error (a
   //      `sqlitePath` aimed at some other app's .db), not only by tampering.
-  //      A genuinely fresh/empty path has no tables at all, so hasForeignTables is false and it
+  //      A genuinely fresh/empty path has no objects at all, so hasForeignObjects is false and it
   //      still falls through to normal creation.
-  if (AUDIT_TABLES.every((t) => !tableExists(db, t)) && hasForeignTables(db))
-    reject("foreign tables present, no audit tables — refusing to adopt a non-audit SQLite database");
+  if (AUDIT_TABLES.every((t) => !tableExists(db, t)) && hasForeignObjects(db))
+    reject("foreign objects present, no audit tables — refusing to adopt a non-audit SQLite database");
   // (a) a runs.outcome column is a foreign v4 (table_xinfo, so a GENERATED outcome is caught);
   if (tableExists(db, "runs") && tableXinfo(db, "runs").some((c) => c.name === "outcome"))
     reject("the runs table has an 'outcome' column — a different v4 schema; use the matching tool build or a new database path");
