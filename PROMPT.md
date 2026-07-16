@@ -212,9 +212,12 @@ NEVER write to a SQLite file it does not own: a misdirected `sqlitePath` (an ord
 typo onto another application's `.db`) must cost nothing. The writable open's very first pragma,
 `PRAGMA journal_mode = WAL`, rewrites the file header and spawns `-wal`/`-shm` siblings — itself
 an unacceptable mutation of a stranger's file — so ownership MUST be proven on a READ-ONLY handle
-BEFORE the writable open, on a connection opened with SQLite's `immutable=1` — the ONLY genuinely
-filesystem-read-only mode (a plain readonly open of a WAL database rewrites the `-shm` wal-index
-and fails outright on an own WAL file copied without its sidecars). The predicate, first match
+BEFORE the writable open, by reading the file's BYTES and inspecting the base image in memory
+(`Database.deserialize`; the journal-mode header bytes are patched 2→1 on the private copy because
+an in-memory database cannot run WAL) — no SQLite file handle ever touches the target, so the
+check is filesystem-read-only by construction. (A plain readonly open of a WAL database rewrites
+the `-shm` wal-index and fails outright on an own WAL file copied without its sidecars; SQLite's
+`immutable=1` URI would also work but `file:` URI support is missing from some bun releases.) The predicate, first match
 wins: (1) no file, or a file with NO objects at all → ours to create (an empty database belongs to
 no one, and is also what our own interrupted create leaves behind) — but ONLY when no journal
 could be hiding a schema: `immutable` reads the base file alone, and a WAL database whose writer

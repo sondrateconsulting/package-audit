@@ -6,7 +6,7 @@
 
 import { Database, type Statement } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { logLine } from "./log.ts";
@@ -429,11 +429,14 @@ function tableShape(db: Database, table: string): string {
   const meta = db
     .query("SELECT wr, strict FROM pragma_table_list WHERE schema = 'main' AND name = ?")
     .get(table) as { wr: number; strict: number } | null;
+  // Each column tuple is JSON-encoded BEFORE joining: JSON strings are self-delimiting, so no
+  // legally-quoted identifier or DEFAULT literal containing the join characters can make two
+  // different shapes serialize identically (a plain `:`/`|` join is not injective — one column
+  // named `a:TEXT:1::0:0|b` would read as two). JSON also keeps NULL default distinct from ''.
   const colSig = cols
-    .map((c) => `${c.name}:${(c.type ?? "").toUpperCase()}:${c.notnull}:${c.dflt_value ?? ""}:${c.pk}:${c.hidden}`)
-    .sort()
-    .join("|");
-  return `wr=${meta?.wr ?? 0},strict=${meta?.strict ?? 0};${colSig}`;
+    .map((c) => JSON.stringify([c.name, (c.type ?? "").toUpperCase(), c.notnull, c.dflt_value, c.pk, c.hidden]))
+    .sort();
+  return JSON.stringify({ wr: meta?.wr ?? 0, strict: meta?.strict ?? 0, cols: colSig });
 }
 
 function hasOwnedTableSet(db: Database): boolean {
@@ -515,50 +518,78 @@ export function mapReadOnlyOpenError(e: unknown, path: string): unknown {
 // `sqlitePath` at a new file and loses nothing, whereas a wrong adoption destroys a stranger's
 // data. That asymmetry decides every ambiguous case here.
 //
-// The preflight connection opens with SQLite's `immutable=1`, which is the ONLY genuinely
-// filesystem-read-only mode: a plain `readonly:true` open of a WAL-mode database is NOT — SQLite
-// creates a missing `-shm` wal-index and mutates an existing one to read it, so a plain readonly
-// probe would leave a stranger's sidecar changed while we refuse (and would fail outright with
-// SQLITE_CANTOPEN on an OWN WAL database whose sidecars were dropped, e.g. a bare-`.db` copy —
-// blocking the writable open that would have recreated them). immutable reads the base file as a
-// static image: it never touches `-wal`/`-shm`. Its only cost is staleness — it ignores any live
-// `-wal` frames — which is HARMLESS here: our own database is never foreign and was stamped
-// >= MIN_OWNED_VERSION at creation, so a stale read can only ever UNDER-report (fewer objects, an
-// older version), never invent a foreign object or a sub-2 stamp that would wrongly refuse it; the
-// subsequent writable open re-reads the true state through the WAL and self-heals.
-function toImmutableUri(path: string): string {
-  // file: URI filename encoding — percent-encode the delimiters SQLite's URI parser reserves.
-  // `%` MUST go first (it introduces every other escape). `path` is absolute (assertContained).
-  const enc = path.replace(/%/g, "%25").replace(/\?/g, "%3f").replace(/#/g, "%23").replace(/ /g, "%20");
-  return `file:${enc}?immutable=1`;
+// The preflight never opens a SQLite file handle on the target at all: it reads the file's bytes
+// (readFileSync) and inspects the BASE IMAGE in memory via Database.deserialize — zero filesystem
+// mutation by construction. The obvious alternatives both fail: a plain `readonly:true` open of a
+// WAL-mode database is NOT filesystem-read-only (SQLite creates a missing `-shm` wal-index and
+// mutates an existing one to read, and fails with SQLITE_CANTOPEN on an OWN WAL database whose
+// sidecars were dropped — a bare-`.db` backup); and SQLite's `immutable=1` URI needs `file:` URI
+// support, which bun 1.3.x does NOT parse (it treats the URI as a literal filename, refusing every
+// existing database — observed on CI). Base-image semantics means live `-wal` frames are invisible;
+// that staleness is HARMLESS for our own database (never foreign, never stamped below
+// MIN_OWNED_VERSION, so under-reporting cannot flip it to refused; the writable open re-reads the
+// true state through the WAL and self-heals) and the zero-objects wal-guard below covers the
+// foreign wal-resident case.
+//
+// An in-memory database cannot run WAL (no shared memory), and SQLite refuses to deserialize a
+// WAL-header image outright — so the journal-mode header bytes (offsets 18/19: 2 = WAL,
+// 1 = rollback) are patched on OUR PRIVATE COPY of the bytes. Pages are mode-independent; the
+// patch changes no content, and the on-disk file is never touched.
+function readBaseImage(path: string): Buffer {
+  const bytes = readFileSync(path);
+  if (bytes.length >= 20) {
+    if (bytes[18] === 2) bytes[18] = 1;
+    if (bytes[19] === 2) bytes[19] = 1;
+  }
+  return bytes;
+}
+// The zero-objects escape hatch is provable only when no journal could be hiding a schema: the
+// base image alone is inspected, and a WAL database whose writer crashed (or is still running)
+// can hold its entire committed schema in -wal frames — a foreign file in exactly that state
+// would otherwise read as "empty, ours to create", and the writable open would then graft the
+// audit schema into it THROUGH the recovered WAL. A non-empty rollback -journal is the same
+// story for a non-WAL crashed writer.
+function assertNoPendingJournal(path: string): void {
+  for (const sidecar of [`${path}-wal`, `${path}-journal`] as const) {
+    if (existsSync(sidecar) && statSync(sidecar).size > 0)
+      fail(
+        `refusing to write to ${path}: it has no committed schema but ${sidecar} holds ` +
+          "frames the read-only ownership check cannot inspect — if it is another " +
+          "application's database, point `sqlitePath` elsewhere; if it is a crashed fresh " +
+          "audit database, delete it and its sidecars and retry (nothing was modified)",
+      );
+  }
 }
 function assertOwnedDatabase(path: string): void {
   if (!existsSync(path)) return; // nothing on disk — the writable open creates it
+  let bytes: Buffer;
+  try {
+    bytes = readBaseImage(path);
+  } catch (e) {
+    fail(`cannot read ${path} for the ownership check (${(e as Error).message}) — refusing to open it writable unverified`);
+  }
+  // A 0-byte file is an empty database (SQLite treats it as one; deserialize refuses an empty
+  // buffer, so it is decided here) — ours to create, unless a journal says otherwise.
+  if (bytes.length === 0) {
+    assertNoPendingJournal(path);
+    return;
+  }
   let db: Database;
   try {
-    db = new Database(toImmutableUri(path), { readonly: true, strict: true });
+    db = Database.deserialize(bytes, true);
   } catch (e) {
-    throw mapReadOnlyOpenError(e, path);
+    // Not a readable SQLite image (junk bytes, torn mid-write copy, corruption): fail CLOSED —
+    // what cannot be inspected cannot be proven ours.
+    fail(
+      `refusing to write to ${path}: it is not a readable SQLite database (${(e as Error).message}) — ` +
+        "point `sqlitePath` at a new or existing audit database instead (nothing was modified)",
+    );
   }
   try {
     // Every object type, so an interrupted create (0 objects) is told apart from a live database.
-    const objects = db.query(`SELECT 1 AS x FROM sqlite_master WHERE ${NOT_SQLITE_INTERNAL}`).all();
-    if (objects.length === 0) {
-      // A zero-object BASE file is provably unowned only when no journal could be hiding a
-      // schema: immutable reads the base file alone, and a WAL database whose writer crashed
-      // (or is still running) can hold its entire committed schema in -wal frames — a foreign
-      // file in exactly that state would otherwise read as "empty, ours to create", and the
-      // writable open would then graft the audit schema into it THROUGH the recovered WAL.
-      // A non-empty rollback -journal is the same story for a non-WAL crashed writer.
-      for (const sidecar of [`${path}-wal`, `${path}-journal`] as const) {
-        if (existsSync(sidecar) && statSync(sidecar).size > 0)
-          fail(
-            `refusing to write to ${path}: it has no committed schema but ${sidecar} holds ` +
-              "frames the read-only ownership check cannot inspect — if it is another " +
-              "application's database, point `sqlitePath` elsewhere; if it is a crashed fresh " +
-              "audit database, delete it and its sidecars and retry (nothing was modified)",
-          );
-      }
+    const isEmpty = db.query(`SELECT 1 AS x FROM sqlite_master WHERE ${NOT_SQLITE_INTERNAL} LIMIT 1`).get() === null;
+    if (isEmpty) {
+      assertNoPendingJournal(path);
       return;
     }
     if (readUserVersion(db) >= MIN_OWNED_VERSION && !hasForeignObjects(db) && hasOwnedTableSet(db)) return;
@@ -567,7 +598,12 @@ function assertOwnedDatabase(path: string): void {
         "point `sqlitePath` at a new or existing audit database instead (nothing was modified)",
     );
   } catch (e) {
-    throw e instanceof DbError ? e : mapReadOnlyOpenError(e, path);
+    // Anything the image inspection throws that is not already our refusal (a corrupt page
+    // surfacing mid-query, an unexpected pragma failure) is fail-CLOSED with context, never a
+    // raw SQLiteError and never a misleading "run bun run audit" remediation.
+    throw e instanceof DbError
+      ? e
+      : new DbError(`refusing to write to ${path}: the ownership check could not inspect it (${(e as Error).message})`);
   } finally {
     db.close();
   }

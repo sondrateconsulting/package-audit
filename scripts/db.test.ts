@@ -279,33 +279,47 @@ describe("ownership — a foreign database is refused BEFORE any writable open",
     expect(rowCount(path, "errors")).toBe(3);
   });
 
-  test("a foreign WAL database is refused WITHOUT mutating its -shm sidecar", () => {
+  test("a foreign WAL database is refused WITHOUT mutating its -wal/-shm sidecars", () => {
     // A plain readonly open of a WAL database is NOT filesystem-read-only: SQLite rewrites the
     // `-shm` wal-index to read it, so a plain-readonly probe would leave a stranger's sidecar
-    // changed while claiming "nothing was modified". The preflight opens `immutable=1` instead,
-    // which reads the base file as a static image — the on-disk `-shm` must survive byte-for-byte.
+    // changed while claiming "nothing was modified". The preflight reads the file's BYTES instead
+    // (no SQLite handle on the target at all) — every sidecar must survive byte-for-byte.
+    // Sidecars are copied while the writer is still open: whether a clean CLOSE leaves them on
+    // disk is platform-dependent (Linux bun removes them; macOS keeps them), but a LIVE WAL
+    // connection always has both, so this construction is deterministic everywhere.
+    const src = nextFile();
+    const w = new Database(src, { create: true, strict: true });
+    w.exec("PRAGMA journal_mode = wal;");
+    w.exec("CREATE TABLE errors (id INTEGER PRIMARY KEY, note TEXT NOT NULL)");
+    w.exec("INSERT INTO errors (note) VALUES ('a'), ('b'), ('c')");
+    w.exec("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    w.exec("INSERT INTO customers (name) VALUES ('acme'), ('globex')");
+    w.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    w.exec("PRAGMA wal_checkpoint(FULL);"); // base file now carries the schema and rows
     const path = nextFile();
-    const d = new Database(path, { create: true, strict: true });
-    d.exec("PRAGMA journal_mode = wal;"); // header now says WAL; a clean close leaves -wal/-shm
-    d.exec("CREATE TABLE errors (id INTEGER PRIMARY KEY, note TEXT NOT NULL)");
-    d.exec("INSERT INTO errors (note) VALUES ('a'), ('b'), ('c')");
-    d.exec("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
-    d.exec("INSERT INTO customers (name) VALUES ('acme'), ('globex')");
-    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-    d.close();
-
-    const shmPath = join(TEST_ROOT, `${basename(path)}-shm`);
-    // The fixture only earns its keep if the -shm is actually present to be mutated (bun leaves it
-    // after a WAL close); if a future runtime stops doing so, fail loudly rather than pass vacuously.
-    expect(existsSync(shmPath)).toBe(true);
-    const shmBefore = readFileSync(shmPath);
+    copyFileSync(src, path);
+    copyFileSync(`${src}-wal`, `${path}-wal`);
+    copyFileSync(`${src}-shm`, `${path}-shm`);
+    w.close();
+    const walBefore = readFileSync(`${path}-wal`);
+    const shmBefore = readFileSync(`${path}-shm`);
+    const baseBefore = readFileSync(path);
 
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
 
-    expect(existsSync(shmPath)).toBe(true);
-    expect(Buffer.compare(readFileSync(shmPath), shmBefore)).toBe(0); // -shm byte-for-byte intact
-    expect(rowCount(path, "errors")).toBe(3); // base file theirs, unconverted, rows intact
-    expect(rowCount(path, "customers")).toBe(2);
+    expect(Buffer.compare(readFileSync(path), baseBefore)).toBe(0); // base byte-for-byte intact
+    expect(Buffer.compare(readFileSync(`${path}-wal`), walBefore)).toBe(0);
+    expect(Buffer.compare(readFileSync(`${path}-shm`), shmBefore)).toBe(0);
+    // Their rows are intact in the base (checkpointed above) — read them through an in-memory
+    // image: a plain readonly open of a WAL-header file with copied-mid-connection sidecars is
+    // not guaranteed to work, and byte-equality above was the real assertion.
+    const rows = Buffer.from(baseBefore);
+    if (rows[18] === 2) rows[18] = 1;
+    if (rows[19] === 2) rows[19] = 1;
+    const img = Database.deserialize(rows, true);
+    expect((img.query("SELECT count(*) AS n FROM errors").get() as { n: number }).n).toBe(3);
+    expect((img.query("SELECT count(*) AS n FROM customers").get() as { n: number }).n).toBe(2);
+    img.close();
   });
 
   test("a foreign database whose ONLY table is one generic audit name (no other objects) is refused", () => {
@@ -376,7 +390,7 @@ describe("ownership — a foreign database is refused BEFORE any writable open",
   });
 
   test("a foreign database whose schema lives ONLY in its uncheckpointed WAL is refused, untouched", () => {
-    // The preflight's immutable read sees the BASE file alone — and a WAL database whose writer
+    // The preflight's base-image read sees the BASE file alone — and a WAL database whose writer
     // crashed (or is still running) holds its entire committed schema in -wal frames over a
     // ZERO-object base. That must NOT read as "empty, ours to create": the writable open would
     // recover the WAL and graft the audit schema into a stranger's live file. Constructed by
@@ -392,8 +406,13 @@ describe("ownership — a foreign database is refused BEFORE any writable open",
     copyFileSync(`${src}-wal`, `${path}-wal`);
     writer.close();
 
-    // Prove the fixture is the hazardous state: zero objects in the base, schema wal-resident.
-    const im = new Database(`file:${path}?immutable=1`, { readonly: true, strict: true });
+    // Prove the fixture is the hazardous state: zero objects in the base, schema wal-resident —
+    // read the way the preflight reads (a deserialize of the bytes, journal-mode header bytes
+    // patched on the copy because an in-memory database cannot run WAL).
+    const imageBytes = readFileSync(path);
+    if (imageBytes[18] === 2) imageBytes[18] = 1;
+    if (imageBytes[19] === 2) imageBytes[19] = 1;
+    const im = Database.deserialize(imageBytes, true);
     expect(im.query("SELECT count(*) AS c FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").get()).toEqual({ c: 0 });
     im.close();
     const baseBefore = readFileSync(path);
@@ -685,6 +704,43 @@ describe("ownership — every database this tool legitimately produces still ope
     expect(after.sidecars).toEqual([]);
     expect(after.objects).toEqual(before.objects);
     expect(rowCount(path, "api_cache")).toBe(1);
+  });
+
+  test("a delimiter-collision column name cannot forge an audit table's shape signature", () => {
+    // Shape signatures must be INJECTIVE. A naive `name:type:...` join with `|` between columns
+    // is not: one column legally named `<sig1>|<sig2-minus-its-tail>` serializes exactly like two
+    // real columns. Craft that collision live against the REAL errors shape (derived from a fresh
+    // database, so this cannot drift from the schema) and prove it no longer matches.
+    const ref = nextFile();
+    AuditDb.open({ sqlitePath: ref }).close();
+    const r = new Database(ref, { readonly: true, strict: true });
+    const cols = r.query("PRAGMA table_xinfo(errors)").all() as Array<{
+      name: string; type: string | null; notnull: number; dflt_value: string | null; pk: number; hidden: number;
+    }>;
+    r.close();
+    // The legacy (non-injective) encoding this collision defeats: per-column `:` join, `|` between.
+    const legacyParts = cols
+      .map((c) => `${c.name}:${(c.type ?? "").toUpperCase()}:${c.notnull}:${c.dflt_value ?? ""}:${c.pk}:${c.hidden}`)
+      .sort();
+    const joined = legacyParts.join("|");
+    const tail = ":TEXT:0::0:0"; // the signature a plain nullable TEXT column contributes
+    expect(joined.endsWith(tail)).toBe(true); // sorted-last errors column is nullable TEXT — precondition
+    const craftedName = joined.slice(0, -tail.length);
+
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec(`CREATE TABLE errors ("${craftedName}" TEXT)`);
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
   });
 
   test("a foreign partial set with audit NAMES but wrong column shapes is still refused", () => {
@@ -1442,7 +1498,8 @@ CREATE INDEX IF NOT EXISTS ix_ruh_loc    ON run_unit_head(organization, reposito
 `;
 
 // Seed a REAL v2 database: a sentinel row in every owned table (the migration must preserve
-// every one of them — most importantly the four tables migrateLegacy would have destroyed).
+// every one of them — most importantly the four run-scoped tables the since-removed legacy
+// migration's reset would have destroyed).
 function buildV2Db(path: string): void {
   const raw = new Database(path, { create: true, strict: true });
   raw.exec(V2_SCHEMA_SQL);
