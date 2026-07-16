@@ -276,6 +276,12 @@ Then the v3→v4 step, a crash-atomic REBUILD rather than an ALTER (SQLite canno
 v4 widens the status CHECK to admit 'past-cap'): in ONE transaction it creates a scratch table
 carrying the v4 body, copies the v3 columns explicitly BY NAME, drops the old table, renames the
 scratch into place, re-fingerprints the result and re-checks FK integrity, and only then stamps 4.
+The step also FAILS every pre-existing RUNNING run — a migration-boundary rule — because a pre-v4
+run's scope may have left NO `run_unit_head` rows at all (pre-v4 never recorded past-cap rows, and
+a repo whose scans all errored wrote nothing): such a repo carries no NULL sentinel, so RESUMING
+that run under v4 could report authoritative provenance over an unknowable pre-v4 scope. The next
+invocation starts a fresh all-v4 run; the unchanged config_hash lets its completed work-queue
+units skip-as-current.
 Its three new columns (`policy_status`, `policy_matched_pattern`, `scanned_commit_date`) are NULL on
 backfilled rows BY CONSTRUCTION — a pre-v4 run recorded no branch policy and never persisted
 past-cap branches — so a NULL `scanned_commit_date` is the sentinel marking that run's scan

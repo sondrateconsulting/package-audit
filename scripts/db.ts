@@ -1220,6 +1220,17 @@ function migrateV3toV4(db: Database): void {
       case "incompatible":
         fail(`cannot migrate database to schema v4: ${cls.reason}`);
     }
+    // Migration-boundary rule (mirrors migrateLegacy step 4): every pre-v4 RUNNING run is failed —
+    // inside this same transaction — so it can never be resumed under v4 semantics. A pre-v4 run's
+    // scope may have left NO run_unit_head rows at all (v3 never recorded past-cap rows, and a repo
+    // whose scans all errored/throttled wrote nothing): such a repo carries no NULL
+    // scanned_commit_date sentinel, and if it drops from the kept estate the repo-scoped
+    // reconciliation never revisits it — a RESUMED run could then report scanScope.provenance
+    // 'complete' (and compare policyChurn available) while its pre-v4 scope is unknowable. Failing
+    // the run makes the next invocation start a NEW all-v4 run whose provenance is genuinely
+    // authoritative; the config_hash is unchanged by design, so completed work_queue units still
+    // skip-as-current (estate/branch discovery reruns; content rescans do not).
+    if (tableExists(db, "runs")) db.exec(`UPDATE runs SET status='failed' WHERE status='running'`);
     // Recreate ix_ruh_loc + any other missing object (idempotent) — AFTER the table-specific step so
     // a rebuild's fresh table gets its index here.
     db.exec(SCHEMA_SQL);

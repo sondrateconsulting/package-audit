@@ -2454,9 +2454,14 @@ describe("migration — v2 → v3 (version-stepped, CRITICAL round-trip)", () =>
     try {
       const r = raw(db);
       expect((r.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
-      // Every v2 row survives, byte-for-byte on the v2 columns.
+      // Every v2 row survives, byte-for-byte on the v2 columns — with EXACTLY ONE intended field
+      // change: the v3→v4 migration-boundary rule fails the pre-v4 running run (see migrateV3toV4).
+      // status stays IN the projection so any other flip would still be caught.
+      const expectedRuns = (beforeProjections.get("runs")! as Array<Record<string, unknown>>).map((row) =>
+        row.run_id === "v2-running" ? { ...row, status: "failed" } : row,
+      );
       for (const [table, sql] of Object.entries(V2_PROJECTIONS)) {
-        expect(r.query(sql).all()).toEqual(beforeProjections.get(table)!);
+        expect(r.query(sql).all()).toEqual(table === "runs" ? expectedRuns : beforeProjections.get(table)!);
       }
       // The new column exists and is NULL (= unknown) on every migrated row — never 0.
       const flags = r.query("SELECT is_default_branch FROM run_unit_head").all() as Array<{ is_default_branch: unknown }>;
@@ -2464,8 +2469,10 @@ describe("migration — v2 → v3 (version-stepped, CRITICAL round-trip)", () =>
       for (const f of flags) expect(f.is_default_branch).toBeNull();
       // Referential integrity intact.
       expect(r.query("PRAGMA foreign_key_check").all()).toEqual([]);
-      // v2 running runs are NOT failed by the additive step (that is the LEGACY boundary rule).
-      expect(db.getRun("v2-running")?.status).toBe("running");
+      // The pre-v4 running run IS failed — by the v3→v4 migration-boundary rule, NOT by the
+      // additive v2→v3 step: a run spanning pre-v4 and v4 semantics could report unverifiable
+      // 'complete' provenance (see migrateV3toV4's boundary-rule note and the dedicated test below).
+      expect(db.getRun("v2-running")?.status).toBe("failed");
       // The old run's report is byte-identical to the natively-stored twin's.
       const migratedReport = buildReport(db, db.getRun("v2-run")!);
       const afterReport = JSON.stringify(migratedReport, null, 2);
@@ -3205,6 +3212,24 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     db.close();
   });
 
+  test("migration-boundary rule: a pre-v4 RUNNING run is FAILED by the v3→v4 step, never resumed under v4 semantics", () => {
+    // Reviewer-C counterexample (verified by probe): a v3 repo whose scans all errored left ZERO
+    // run_unit_head rows — nothing carries the NULL provenance sentinel — and a repo can drop from
+    // the kept estate before any resume revisits it. A pre-v4 running run resumed under v4 could
+    // then report scanScope.provenance='complete' (and compare policyChurn available) while its
+    // pre-v4 scope is unknowable. So migrateV3toV4 mirrors migrateLegacy's boundary rule: fail it;
+    // the next invocation starts a NEW all-v4 run whose provenance is genuinely authoritative
+    // (work_queue skip-as-current keeps that cheap — the config_hash is unchanged by design).
+    const path = nextFile();
+    buildV3TwinDb(path); // carries 'v2-running' (status running, config_hash h-v2) at stamp 3
+    const db = AuditDb.open({ sqlitePath: path });
+    expect(db.getRun("v2-running")?.status).toBe("failed"); // the boundary rule
+    const res = db.startRun(runInput({ configHash: "h-v2" }));
+    expect(res.resumed).toBe(false); // a NEW v4 run — the pre-v4 run is quarantined, not resumed
+    expect(res.runId).not.toBe("v2-running");
+    db.close();
+  });
+
   test("a migration that aborts at the pre-swap guard leaves the v3 table + stamp untouched", () => {
     const path = nextFile();
     buildV3TwinDb(path); // v3, stamp 3
@@ -3236,6 +3261,10 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     expect(uv(check)).toBe(3); // stamp rolled back
     expect(cols(check, "run_unit_head")).not.toContain("policy_status"); // rename rolled back -> still v3
     expect((check.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n).toBe(beforeRows); // rows intact
+    // The boundary rule's running→failed flip runs BEFORE SCHEMA_SQL in the same transaction, so
+    // this induced post-swap failure proves it rolls back with the schema — no failed-run
+    // quarantine ever escapes an aborted migration.
+    expect((check.query("SELECT status FROM runs WHERE run_id='v2-running'").get() as { status: string }).status).toBe("running");
     check.close();
   });
 
