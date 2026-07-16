@@ -398,19 +398,24 @@ function hasForeignObjects(db: Database): boolean {
 // existing constants so a future schema change cannot silently diverge from this check.
 const FRESH_PRESERVED_SET = new Set<string>([...AUDIT_TABLES].filter((t) => !(FRESH_DROP_ORDER as readonly string[]).includes(t)));
 
-// Reference column shapes for the REPAIR path below: what each audit table looks like under the
-// CURRENT schema, read from a throwaway :memory: build of SCHEMA_SQL (never hardcoded — a future
-// migration changes this automatically). table_xinfo, not table_info: it also lists hidden and
-// generated columns, so a foreign table cannot alias an audit shape through columns table_info
-// omits. Built once, lazily — the preflight only needs it for damaged-database opens.
-let referenceShapes: Map<string, string> | null = null;
-function currentTableShapes(): Map<string, string> {
-  if (referenceShapes !== null) return referenceShapes;
+// Reference column shapes for the REPAIR path below: what each audit table looks like under a
+// given stamped schema version, read from a throwaway :memory: build of SCHEMA_SQL (never
+// hardcoded — a future migration changes this automatically; the v2 shape is the current one
+// minus the columns the later steps added). table_xinfo, not table_info: it also lists hidden
+// and generated columns, so a foreign table cannot alias an audit shape through columns
+// table_info omits. Built once per version, lazily — the preflight only needs this for
+// damaged-database opens.
+const referenceShapesByVersion = new Map<number, Map<string, string>>();
+function tableShapesAt(version: number): Map<string, string> {
+  const cached = referenceShapesByVersion.get(version);
+  if (cached !== undefined) return cached;
   const ref = new Database(":memory:", { strict: true });
   try {
     ref.exec(SCHEMA_SQL); // the CURRENT schema — includes the v3 is_default_branch column
-    referenceShapes = new Map(AUDIT_TABLES.map((t) => [t, tableShape(ref, t)]));
-    return referenceShapes;
+    if (version < V3_TARGET_VERSION) ref.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch");
+    const shapes = new Map(AUDIT_TABLES.map((t) => [t, tableShape(ref, t)]));
+    referenceShapesByVersion.set(version, shapes);
+    return shapes;
   } finally {
     ref.close();
   }
@@ -446,17 +451,28 @@ function hasOwnedTableSet(db: Database): boolean {
   const matches = (want: ReadonlySet<string>): boolean =>
     present.length === want.size && present.every((n) => want.has(n));
   if (matches(AUDIT_TABLE_SET) || matches(FRESH_PRESERVED_SET)) return true;
-  // REPAIR path: a current-version database missing tables (an externally damaged file — e.g. a
-  // partial restore) must stay openable, because openReadOnly's documented remediation for it is
-  // "run `bun run audit` once to repair it" and the self-heal branch re-creates what is missing.
-  // A partial set is provably ours only when every table that IS present carries the CURRENT
-  // schema's exact column shape — a foreign `errors(id, note)` under a plausible migration
-  // counter matches no audit shape and stays refused. Quarantined to uv === SCHEMA_VERSION: for
-  // older stamps the shape reference would be a moving target, and a damaged old-version file is
-  // refused fail-closed like every other unprovable state.
-  if (readUserVersion(db) !== SCHEMA_VERSION || present.length === 0) return false;
-  const shapes = currentTableShapes();
+  // REPAIR path: a stamped database missing tables (an externally damaged file — e.g. a partial
+  // restore) must stay openable, because openReadOnly's documented remediation for it is "run
+  // `bun run audit` once to repair it" and the self-heal/migration branches re-create what is
+  // missing. A partial set is provably ours only when every table that IS present carries the
+  // exact column shape of the schema its STAMP names — a foreign `errors(id, note)` under a
+  // plausible migration counter matches no audit shape and stays refused. Covers every version
+  // this tool ever stamped (2..current): refusing a damaged v2 file would make openReadOnly's
+  // "migrate it" advice a dead end that then claims the file is not ours.
+  const uv = readUserVersion(db);
+  if (uv < MIN_OWNED_VERSION || uv > SCHEMA_VERSION || present.length === 0) return false;
+  const shapes = tableShapesAt(uv);
   return present.every((t) => AUDIT_TABLE_SET.has(t) && tableShape(db, t) === shapes.get(t));
+}
+
+// The ownedness test the writable open re-runs as its BACKSTOP: empty (a just-created file has
+// no owner to protect — this arm keeps fresh creation alive), or foreign-free with a producible
+// table set. Exported for direct unit tests — the backstop's live trigger is a checkpoint RACE
+// between the preflight and the writable open, impractical to fabricate deterministically in a
+// test fixture (the same rationale as mapReadOnlyOpenError's export).
+export function isOwnedOrEmpty(db: Database): boolean {
+  const isEmpty = db.query(`SELECT 1 AS x FROM sqlite_master WHERE ${NOT_SQLITE_INTERNAL} LIMIT 1`).get() === null;
+  return isEmpty || (!hasForeignObjects(db) && hasOwnedTableSet(db));
 }
 
 // PRAGMA table_info cannot bind either; `table` is always one of AUDIT_TABLES (enforced).
@@ -549,14 +565,34 @@ function readBaseImage(path: string): Buffer {
 // would otherwise read as "empty, ours to create", and the writable open would then graft the
 // audit schema into it THROUGH the recovered WAL. A non-empty rollback -journal is the same
 // story for a non-WAL crashed writer.
+//
+// This state is also what OUR OWN live audit looks like to a SECOND invocation before the first
+// auto-checkpoint (the writer holds one connection for the whole run, so early on the schema sits
+// only in -wal over a zero-object base) — and a lock-free byte read cannot tell that apart from a
+// crashed foreign writer. The refusal is still correct (fail-closed), but its FIRST remediation
+// must be "wait and retry"; deletion comes LAST, explicitly conditioned on no audit process being
+// alive — an operator who deletes a live run's database destroys that run, which is the exact
+// loss this preflight exists to prevent.
 function assertNoPendingJournal(path: string): void {
   for (const sidecar of [`${path}-wal`, `${path}-journal`] as const) {
-    if (existsSync(sidecar) && statSync(sidecar).size > 0)
+    // One stat, ENOENT-tolerant — an existsSync-then-statSync pair races a concurrent process
+    // removing the sidecar (e.g. another invocation finishing its checkpoint), and a vanished
+    // sidecar means exactly "no frames to hide", not an error.
+    let size = 0;
+    try {
+      size = statSync(sidecar).size;
+    } catch (e) {
+      if ((e as { code?: unknown }).code === "ENOENT") continue;
+      throw e;
+    }
+    if (size > 0)
       fail(
         `refusing to write to ${path}: it has no committed schema but ${sidecar} holds ` +
-          "frames the read-only ownership check cannot inspect — if it is another " +
-          "application's database, point `sqlitePath` elsewhere; if it is a crashed fresh " +
-          "audit database, delete it and its sidecars and retry (nothing was modified)",
+          "frames the read-only ownership check cannot inspect. If another `bun run audit` may " +
+          "still be running against this path, wait for it to finish and retry; if this is " +
+          "another application's database, point `sqlitePath` elsewhere; only if it is a " +
+          "crashed fresh audit database (no audit process alive) delete the file and its " +
+          "sidecars and retry (nothing was modified)",
       );
   }
 }
@@ -729,15 +765,12 @@ export class AuditDb {
     // BACKSTOP only — assertOwnedDatabase already refused every foreign file it could prove, so
     // this is normally unreachable. It re-runs the SAME ownedness test (empty, or foreign-free
     // with a producible table set) on the WRITABLE connection, which reads THROUGH any recovered
-    // WAL — closing what the immutable preflight cannot see: a foreign checkpoint landing between
+    // WAL — closing what the base-image preflight cannot see: a foreign checkpoint landing between
     // the preflight and this open (the preflight's own wal-guard covers the on-disk case, but not
     // that race). Reaching it costs sidecar recovery on their file and a checkpoint on close —
     // data-preserving, and strictly better than the alternative of writing our schema into it.
-    // Fires BEFORE --fresh can drop anything. The empty arm keeps fresh creation alive: a
-    // just-created file has zero objects and, by definition, no owner to protect.
-    const backstopEmpty =
-      db.query(`SELECT 1 AS x FROM sqlite_master WHERE ${NOT_SQLITE_INTERNAL} LIMIT 1`).get() === null;
-    if (!backstopEmpty && (hasForeignObjects(db) || !hasOwnedTableSet(db))) {
+    // Fires BEFORE --fresh can drop anything.
+    if (!isOwnedOrEmpty(db)) {
       db.close();
       fail(
         `refusing to write to ${path}: it is a SQLite database this tool did not create — ` +

@@ -228,12 +228,12 @@ audit-named, and there are NO views or triggers — this tool creates neither, a
 execute a stranger's writes inside our migration) AND the present tables form a set this tool can
 actually leave on disk (every DDL batch is one transaction, so only the FULL audit set or the
 `--fresh`-preserved caches are reachable — a lone generic `errors` table with a plausible
-migration counter is neither; EXCEPTION: a current-version file with a PARTIAL set stays on the
-self-heal repair path — openReadOnly's documented remediation — when every present table carries
-the current schema's exact shape: full table_xinfo rows (names, types, NOT NULL, defaults, PK
-positions, hidden/generated kinds) plus rowid-ness and STRICT-ness, compared order-independently
-against a `:memory:` build of the schema so the reference cannot drift; matching NAMES alone would
-admit a foreign table wearing our labels) → ours; (3) anything else → REFUSE, untouched, with an actionable
+migration counter is neither; EXCEPTION: a stamped (v2..current) file with a PARTIAL set stays on the
+migrate-and-repair path — openReadOnly's documented remediation — when every present table carries
+the exact shape of the schema its STAMP names: full table_xinfo rows (names, types, NOT NULL,
+defaults, PK positions, hidden/generated kinds) plus rowid-ness and STRICT-ness, compared
+order-independently against a `:memory:` build of the schema so the reference cannot drift;
+matching NAMES alone would admit a foreign table wearing our labels) → ours; (3) anything else → REFUSE, untouched, with an actionable
 error naming the file. The internal-object exemption matches the literal `sqlite_` prefix
 (LIKE's `_` is a wildcard — unescaped, it would hide legal names like `sqliteevil` from the
 checks). The writable open then re-runs the foreign-object check

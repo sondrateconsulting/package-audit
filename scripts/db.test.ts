@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { copyFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, mapReadOnlyOpenError, nowIso, type RunInput } from "./db.ts";
+import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, isOwnedOrEmpty, mapReadOnlyOpenError, nowIso, type RunInput } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 
@@ -320,6 +320,62 @@ describe("ownership — a foreign database is refused BEFORE any writable open",
     expect((img.query("SELECT count(*) AS n FROM errors").get() as { n: number }).n).toBe(3);
     expect((img.query("SELECT count(*) AS n FROM customers").get() as { n: number }).n).toBe(2);
     img.close();
+  });
+
+  test("a SECOND invocation while a live audit still holds the database is refused with wait-first guidance", () => {
+    // Early in a run — before the first auto-checkpoint — our OWN database looks exactly like a
+    // crashed foreign WAL writer: zero-object base, schema wal-resident. A lock-free byte read
+    // cannot tell those apart, so the refusal is correct — but its guidance must lead with
+    // "wait and retry", never with deletion: an operator who deletes a live run's file destroys
+    // that run. (Pre-fix, the concurrent second open simply raced the writer instead.)
+    const path = nextFile();
+    const live = AuditDb.open({ sqlitePath: path }); // connection held: schema sits in -wal
+    try {
+      const img = readFileSync(path);
+      if (img[18] === 2) img[18] = 1;
+      if (img[19] === 2) img[19] = 1;
+      const base = Database.deserialize(img, true);
+      expect(base.query("SELECT count(*) AS c FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").get()).toEqual({ c: 0 });
+      base.close();
+
+      expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/still be running.*wait for it/s);
+
+      live.startRun(runInput()); // the live writer is unharmed by the refused second open
+    } finally {
+      live.close();
+    }
+    // Once the writer closes (checkpointing its WAL), a normal reopen succeeds.
+    const reopened = AuditDb.open({ sqlitePath: path });
+    try {
+      expect(rowCount(path, "runs")).toBe(1);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  test("a non-SQLite junk file is refused fail-closed with an ownership-check message, untouched", () => {
+    const path = nextFile();
+    writeFileSync(path, "definitely not a database\n");
+    const before = readFileSync(path);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+    // Whether SQLite rejects the bytes at deserialize time or at the first query is a runtime
+    // detail — either way the refusal must carry ownership-check context, not a raw SQLiteError.
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/not a readable SQLite database|could not inspect it/);
+    expect(Buffer.compare(readFileSync(path), before)).toBe(0); // bytes untouched
+    expect(readdirSync(TEST_ROOT).filter((f) => f.startsWith(`${basename(path)}-`))).toEqual([]);
+  });
+
+  test("a zero-object base beside a non-empty rollback -journal is refused (crashed non-WAL writer)", () => {
+    // The -journal arm of the pending-journal guard: same reasoning as -wal, for a rollback-mode
+    // crashed writer. A 0-byte base file IS an empty database — only the hot journal blocks it.
+    const path = nextFile();
+    writeFileSync(path, "");
+    writeFileSync(`${path}-journal`, "pretend-hot-journal");
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/-journal holds/);
+    expect(statSync(path).size).toBe(0); // still empty — nothing created or recovered
+    expect(readFileSync(`${path}-journal`, "utf8")).toBe("pretend-hot-journal");
+    rmSync(`${path}-journal`); // and with the journal gone, the same path opens fresh
+    AuditDb.open({ sqlitePath: path }).close();
   });
 
   test("a foreign database whose ONLY table is one generic audit name (no other objects) is refused", () => {
@@ -653,11 +709,37 @@ describe("ownership — every database this tool legitimately produces still ope
     const repaired = AuditDb.open({ sqlitePath: path });
     try {
       expect(rowCount(path, "runs")).toBe(1); // existing data intact
-      raw(repaired).query("SELECT run_id FROM errors").all(); // errors re-created in current shape
+      // errors re-created EMPTY in the current shape (an asserted equality, not a bare call —
+      // a query that merely doesn't throw proves nothing about the rebuilt table's content)
+      expect(raw(repaired).query("SELECT run_id FROM errors").all()).toEqual([]);
     } finally {
       repaired.close();
     }
     AuditDb.openReadOnly({ sqlitePath: path }).close(); // read side is whole again
+  });
+
+  test("a damaged v2 database (one table dropped externally) stays on the migrate-and-repair path", () => {
+    // openReadOnly tells a v2 file's operator to "run `bun run audit` once to migrate it" — that
+    // remediation must work even when the v2 file is ALSO missing a table, so the repair path
+    // compares partial sets against the shape of the schema the STAMP names, not only the
+    // current one. (A quarantine to uv === SCHEMA_VERSION made the advice a dead end that then
+    // claimed the file was not ours.)
+    const path = nextFile();
+    buildV2Db(path);
+    const w = new Database(path, { strict: true });
+    w.exec("DROP TABLE errors");
+    w.close();
+
+    const db = AuditDb.open({ sqlitePath: path }); // migrates v2→v3 AND re-creates the dropped table
+    try {
+      expect((raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+      expect(rowCount(path, "runs")).toBe(2); // preserved v2 rows intact
+      expect(raw(db).query("SELECT run_id FROM errors").all()).toEqual([]); // re-created, current shape
+      expect(raw(db).query("SELECT is_default_branch FROM run_unit_head LIMIT 1").all().length).toBeGreaterThan(0); // v3 column arrived
+    } finally {
+      db.close();
+    }
+    AuditDb.openReadOnly({ sqlitePath: path }).close(); // the documented remediation now completes
   });
 
   test("a foreign table matching an audit table's column NAMES but not its types is refused", () => {
@@ -788,6 +870,38 @@ describe("ownership — every database this tool legitimately produces still ope
     } finally {
       db.close();
     }
+  });
+});
+
+// The writable-open backstop's guard, tested directly: its live trigger is a checkpoint RACE
+// between the preflight and the writable open, impractical to fabricate deterministically —
+// the same reason mapReadOnlyOpenError is unit-tested as a pure function.
+describe("isOwnedOrEmpty — the writable-open backstop's guard", () => {
+  test("an empty database is adoptable (fresh creation must survive the backstop)", () => {
+    const d = new Database(":memory:", { strict: true });
+    expect(isOwnedOrEmpty(d)).toBe(true);
+    d.close();
+  });
+
+  test("a full audit database passes", () => {
+    const db = mem();
+    expect(isOwnedOrEmpty(raw(db))).toBe(true);
+    db.close();
+  });
+
+  test("a foreign table alongside the audit set fails", () => {
+    const db = mem();
+    raw(db).exec("CREATE TABLE customers (id INTEGER PRIMARY KEY)");
+    expect(isOwnedOrEmpty(raw(db))).toBe(false);
+    db.close();
+  });
+
+  test("a lone audit-named table with a plausible stamp fails (set + shape check applies)", () => {
+    const d = new Database(":memory:", { strict: true });
+    d.exec("CREATE TABLE errors (id INTEGER PRIMARY KEY, note TEXT NOT NULL)");
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    expect(isOwnedOrEmpty(d)).toBe(false);
+    d.close();
   });
 });
 
