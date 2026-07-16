@@ -486,7 +486,19 @@ export function classifyRest(
   body: string,
   nowMs: number,
 ): Classification {
-  if (status >= 200 && status < 300) return { kind: "ok" };
+  if (status === 200) return { kind: "ok" };
+  // §5.C: only EXACTLY 200 is success. A non-200 2xx (206 Partial Content from a middlebox,
+  // 203 proxy-transformed content, …) carries a body that cannot be trusted as complete, and
+  // restGet's consumers scan those bodies as raw file content with no structural validation of
+  // their own — so ONE fatal here covers every consumer, current and future. Non-retryable on
+  // purpose: a transforming middlebox would re-transform on retry, and the transient path would
+  // end in a misleading ThrottleExhausted that loses the status. Every REST endpoint this tool
+  // calls returns exactly 200 on success; an endpoint with genuine 202/204 semantics would need
+  // its own explicit handler, never a re-widening of this range. Bounds are exact (201-299) so
+  // status 0 (no HTTP response — handled before classification) and a terminal 1xx (the -i
+  // parser can surface one when no final block follows) keep their existing paths.
+  if (status >= 201 && status < 300)
+    return { kind: "fatal", status, ssoRequired: false, message: `HTTP ${status} — only exactly 200 is success (a non-200 2xx body cannot be trusted as complete)` };
   if (status === 403 || status === 429) {
     // PRIMARY is keyed on remaining==0, NOT the status code (§4). Checking it BEFORE the SSO
     // header is safe: a genuine SSO/permission 403 is not consuming the last request of the
@@ -1112,6 +1124,10 @@ export class GithubClient {
   // One REST GET. `immutable: true` (commit/tree/blob-SHA-pinned URLs) serves a cached body
   // with ZERO network request (§3); otherwise a cached ETag rides as If-None-Match and gh's
   // non-zero-exit 304 is a cache HIT.
+  // CONTRACT: a resolved response always has status EXACTLY 200 — direct (classifyRest fails
+  // every non-200 2xx closed) or cache-synthesized (both cache-serving paths fabricate 200).
+  // Consumers (fetchFileRaw/fetchBlobRaw/restGetJson/restGetPagedArray) rely on this and do
+  // not re-check status; an endpoint with genuine 202/204 semantics must get its own handler.
   // An endpoint is only genuinely IMMUTABLE if it pins a git object id — a blob/tree SHA in
   // the path or a sha-shaped `?ref=`. This is defense-in-depth over the callers' own isSha
   // gate: a caller can never zero-network-freeze a mutable branch/tag URL by passing immutable.
@@ -1154,8 +1170,11 @@ export class GithubClient {
       if (cls.kind === "ok") {
         // Persist ONLY an exact-200 body. Both cache-serving paths above synthesize status 200,
         // so caching any other 2xx (e.g. a 206 Partial Content) would launder it into a
-        // 'complete' 200 on every later call — permanently, for SHA-pinned endpoints. The
-        // response is still RETURNED (classification is unchanged); it just never persists.
+        // 'complete' 200 on every later call — permanently, for SHA-pinned endpoints.
+        // classifyRest now makes ok imply exactly 200, so this check looks redundant — it is
+        // DELIBERATE defense-in-depth: cache write provenance is a durable invariant (rows are
+        // statusless and outlive --fresh) and must hold locally, never by depending on a distant
+        // classifier's range staying narrow. Expected to survive mutation testing.
         if (parsed.status === 200)
           this.db?.putApiCache({
             method: "GET", url: key, variantHash: accept,
@@ -1466,8 +1485,10 @@ export class GithubClient {
     const immutable = GithubClient.isSha(treeOid);
     const res = await this.restGet(endpoint, { immutable });
     try {
-      // classifyRest calls every 2xx ok (and a CACHE HIT synthesizes status 200), but a 206
-      // Partial Content body parsed here would read as a complete tree — exactness required.
+      // Unreachable through restGet (its contract is exact-200), so this is DELIBERATE
+      // defense-in-depth: a partial 206 body parsed here would read as a complete tree, and
+      // tree completeness must not silently depend on a distant classifier's range staying
+      // narrow. Exercised by a stubbed-restGet test; expected to survive mutation testing.
       if (res.status !== 200)
         throw new GithubApiError(`malformed git-tree response from ${endpoint}: HTTP ${res.status} — only exactly 200 is success`, { status: res.status, endpoint });
       let json: unknown;

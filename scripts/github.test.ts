@@ -186,6 +186,33 @@ describe("classifyRest / classifyGraphql / parseRetryAfterMs", () => {
     expect(classifyRest(503, {}, "", NOW).kind).toBe("transient");
     expect(classifyRest(200, {}, "", NOW).kind).toBe("ok");
   });
+  test("only exactly 200 is ok — every other 2xx is FATAL, never consumable success", () => {
+    // A non-200 2xx (206 Partial Content from a middlebox, 203 proxy-transformed content, …)
+    // carries a body that cannot be trusted as complete; raw-content consumers would silently
+    // scan it as file content. Fail closed at the classifier so EVERY restGet consumer —
+    // current and future — inherits the gate from one site.
+    expect(classifyRest(200, {}, "", NOW)).toEqual({ kind: "ok" });
+    for (const status of [201, 202, 203, 204, 206, 226, 299]) {
+      const cls = classifyRest(status, {}, "", NOW);
+      expect(cls.kind).toBe("fatal");
+      if (cls.kind === "fatal") {
+        expect(cls.status).toBe(status);
+        expect(cls.ssoRequired).toBe(false);
+        expect(cls.message).toMatch(/only exactly 200/);
+      }
+    }
+    // range boundaries: the statuses BRACKETING the 2xx range keep their existing paths — a
+    // terminal 1xx (parseGhApiOutput can surface one when no final block follows) and a bare
+    // 3xx are fatal via the catch-all, never swallowed by the new branch.
+    expect(classifyRest(199, {}, "", NOW).kind).toBe("fatal");
+    expect(classifyRest(300, {}, "", NOW).kind).toBe("fatal");
+  });
+  test("a 2xx-non-200 is fatal even when throttle-looking headers ride along — 2xx is never a 403/429", () => {
+    // ordering guard: the narrowing sits BEFORE the 403/429 branch; a poisoned 206 carrying
+    // exhausted-window headers or Retry-After must not be reclassified as a retryable throttle.
+    const cls = classifyRest(206, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1000000100", "retry-after": "30" }, "", NOW);
+    expect(cls.kind).toBe("fatal");
+  });
   test("parseRetryAfterMs: seconds, HTTP-date, garbage", () => {
     expect(parseRetryAfterMs("120", NOW)).toBe(120_000);
     const date = new Date(NOW + 30_000).toUTCString();
@@ -411,16 +438,81 @@ describe("restGet caching + conditional requests", () => {
     db.close();
   });
 
-  test("a 2xx-non-200 response is NEVER persisted to api_cache — a cache hit synthesizes status 200", async () => {
-    // Both cache-serving paths fabricate status 200, so a cached 206 Partial Content body would
-    // be laundered into an exact-200 'complete' response on every later call — permanently, for
-    // SHA-pinned endpoints. The only safe rows are ones created from a genuine exact-200.
+  test("a DIRECT 2xx-non-200 response is IMMEDIATELY fatal — never returned, never retried, never persisted", async () => {
+    // Closes the last 2xx hole: the persist gate + key epoch already stopped cache laundering,
+    // but a direct 206 body was still RETURNED once to consumers with no status check of their
+    // own (fetchFileRaw/fetchBlobRaw/fetchFileMeta) — partial file content silently scanned.
+    // The classifier now fails it closed for every consumer at one site: no retry (a
+    // transforming middlebox would just re-transform), no bucket pause, no cache row.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
-    const { client } = makeClient([ok(http(206, { etag: 'W/"p"' }, "partial-body"))], { db });
-    const res = await client.restGet("user/orgs?per_page=100&page=1");
-    expect(res.status).toBe(206); // still returned to the caller (classification unchanged)…
+    const { client, calls, sleeps } = makeClient([ok(http(206, { etag: 'W/"p"' }, "partial-body"))], { db });
+    let caught: unknown;
+    try {
+      await client.restGet("user/orgs?per_page=100&page=1");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    const apiErr = caught as GithubApiError;
+    expect(apiErr.status).toBe(206);
+    expect(apiErr.endpoint).toBe("user/orgs?per_page=100&page=1");
+    expect(apiErr.ssoRequired).toBe(false);
+    expect(apiErr.message).toMatch(/only exactly 200/);
+    expect(calls.length).toBe(1); // fatal on the spot — not the transient/throttle retry path
+    expect(sleeps).toEqual([]);
     const rows = db.read("SELECT COUNT(*) AS n FROM api_cache").get() as { n: number };
-    expect(rows.n).toBe(0); // …but never persisted
+    expect(rows.n).toBe(0); // and never persisted
+    db.close();
+  });
+
+  test("fetchFileRaw: a direct 206 partial body is NEVER returned as file content, and nothing is cached", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client, calls } = makeClient([ok(http(206, {}, "const partial = "))], { db });
+    await expect(client.fetchFileRaw("o", "r", "index.ts", SHA)).rejects.toThrow(/only exactly 200/);
+    expect(calls.length).toBe(1);
+    const rows = db.read("SELECT COUNT(*) AS n FROM api_cache").get() as { n: number };
+    expect(rows.n).toBe(0); // the SHA-pinned endpoint holds no row — the next call refetches
+    db.close();
+  });
+
+  test("fetchBlobRaw: a direct 206 partial blob is NEVER returned", async () => {
+    const { client } = makeClient([ok(http(206, {}, "partial blob bytes"))]);
+    await expect(client.fetchBlobRaw("o", "r", SHA)).rejects.toThrow(/only exactly 200/);
+  });
+
+  test("fetchFileMeta: a 206 carrying VALID success-shaped JSON is still fatal — the gate is the status, not the parse", async () => {
+    const { client } = makeClient([ok(http(206, {}, `{"type":"file","sha":"${SHA}","size":12}`))]);
+    await expect(client.fetchFileMeta("o", "r", "package.json", SHA)).rejects.toThrow(/only exactly 200/);
+  });
+
+  test("rateLimit: a 206 carrying valid JSON is fatal, not consumed", async () => {
+    const { client } = makeClient([ok(http(206, {}, `{"resources":{"core":{"remaining":100}}}`))]);
+    await expect(client.rateLimit()).rejects.toThrow(/only exactly 200/);
+  });
+
+  test("a 304 with NO cached body stays fatal — the narrowing does not touch the revalidation flow", async () => {
+    // If-None-Match is only ever sent when a cached etag+body exist, so a 304 arriving with no
+    // usable cache row is anomalous and was already fatal; pin that the 2xx narrowing (which
+    // sits just above it in the classifier) leaves this path exactly as it was.
+    const { client } = makeClient([err(`HTTP/2.0 304 Not Modified\r\nEtag: W/"x"`, "gh: HTTP 304")]);
+    await expect(client.restGet("user/orgs?per_page=100&page=1")).rejects.toThrow(/304/);
+  });
+
+  test("a 206 on revalidation leaves the previously-trusted exact-200 cache row UNTOUCHED", async () => {
+    // The poisoned response must fail the call without destroying good state: the existing row
+    // was written from a genuine exact-200 and stays serveable once the middlebox stops lying.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client, calls } = makeClient(
+      [ok(http(200, { etag: 'W/"good"' }, `{"a":1}`)), ok(http(206, {}, "partial"))],
+      { db },
+    );
+    const first = await client.restGet("user/orgs?per_page=100&page=1");
+    expect(first.body).toBe(`{"a":1}`);
+    await expect(client.restGet("user/orgs?per_page=100&page=1")).rejects.toThrow(/only exactly 200/);
+    expect(calls.length).toBe(2);
+    const row = db.read("SELECT response_body AS body, etag FROM api_cache").get() as { body: string; etag: string };
+    expect(row.body).toBe(`{"a":1}`); // not overwritten, not tombstoned
+    expect(row.etag).toBe('W/"good"');
     db.close();
   });
 
@@ -637,8 +729,18 @@ describe("fetchTreeRecursive envelope validation (§5.C fail-closed)", () => {
     await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/does not match/);
   });
   test("HTTP 2xx-but-not-200 (e.g. 206 Partial Content) is NOT success — a partial tree must not read as complete", async () => {
+    // now trips at classifyRest (restGet fails every non-200 2xx closed); the tree fetcher's own
+    // inner gate is exercised independently by the stubbed-restGet test below.
     const { client } = makeClient([ok(http(206, {}, body()))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/200/);
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/only exactly 200/);
+  });
+  test("the tree fetcher's OWN exact-200 gate holds even if restGet were to leak a non-200 2xx (defense in depth)", async () => {
+    // classifyRest already fails non-200 2xx closed, so this state is unreachable through the
+    // spawn seam — stub restGet to prove tree completeness never silently depends on a distant
+    // classifier's range staying narrow.
+    const { client } = makeClient([]);
+    client.restGet = async () => ({ status: 206, headers: {}, body: body() });
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/only exactly 200/);
   });
   test("a valid response maps entries verbatim; absent size maps to null", async () => {
     const b = JSON.stringify({ sha: TREE_SHA, truncated: false, tree: [blob(), { path: "src", type: "tree", sha: "b".repeat(40) }] });
@@ -676,12 +778,15 @@ describe("fetchTreeRecursive envelope validation (§5.C fail-closed)", () => {
     expect(calls.length).toBe(2); // …and the VALID body still earns the immutable zero-network hit
     db.close();
   });
-  test("a cached 2xx-non-200 body cannot launder into success via the synthesized-200 cache hit", async () => {
-    // restGet classifies any 2xx ok and caches it; a cache hit then fabricates status 200. Without
-    // the tombstone a 206 partial body would be re-served as a 'complete' 200 tree next call.
+  test("a direct 2xx-non-200 tree response is fatal, leaves NO cache row, and the next call refetches cleanly", async () => {
+    // Laundering is doubly closed: restGet persists only exact-200 bodies AND classifyRest now
+    // fails a direct non-200 2xx before any consumer sees it. Pin the recovery shape: the failed
+    // call leaves no poisoned row behind, so the retry serves fresh valid bytes from the network.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const { client, calls } = makeClient([ok(http(206, {}, body())), tree(body())], { db });
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/200/);
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/only exactly 200/);
+    const afterFailure = db.read("SELECT COUNT(*) AS n FROM api_cache").get() as { n: number };
+    expect(afterFailure.n).toBe(0); // restGet threw before the fetcher ran — not even a tombstone
     const second = await client.fetchTreeRecursive("o", "r", TREE_SHA);
     expect(second.truncated).toBe(false);
     expect(calls.length).toBe(2);
@@ -1318,6 +1423,16 @@ describe("pagination", () => {
   test("a non-array page is an error", async () => {
     const { client } = makeClient([ok(http(200, {}, `{"not":"array"}`))]);
     await expect(client.restGetPagedArray("orgs/x/repos?page=1")).rejects.toThrow(/array/);
+  });
+  test("a 2xx-non-200 mid-chain page fails the WHOLE listing — no partial page is accumulated, no next page fetched", async () => {
+    // page 2 is a valid-looking array WITH a rel="next" — the status alone must kill it: a 206
+    // page silently accepted would understate the listing (repos silently out of scope).
+    const { client, calls } = makeClient([
+      ok(http(200, { link: `<https://api.github.com/orgs/x/repos?per_page=100&page=2&type=all>; rel="next"` }, `[{"name":"a"}]`)),
+      ok(http(206, { link: `<https://api.github.com/orgs/x/repos?per_page=100&page=3&type=all>; rel="next"` }, `[{"name":"only-half-of-page-2"}]`)),
+    ]);
+    await expect(client.restGetPagedArray("orgs/x/repos?per_page=100&page=1&type=all")).rejects.toThrow(GithubApiError);
+    expect(calls.length).toBe(2); // page 3 was never requested
   });
   test("a self-referential Link cycle throws instead of looping", async () => {
     // every page points rel="next" at the SAME URL — the second visit to an already-seen
