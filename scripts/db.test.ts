@@ -1,8 +1,8 @@
 import { expect, test, describe, afterAll, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { rmSync, mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, mapReadOnlyOpenError, nowIso, type RunInput } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
@@ -165,131 +165,573 @@ describe("open — fresh create", () => {
   });
 });
 
-// ---- migration (§3 run-scoped-reset) --------------------------------------------------------
-const LEGACY_DDL = `
-CREATE TABLE runs (run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT,
-  config_hash TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('running','completed','failed')));
-CREATE TABLE work_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL,
-  organization TEXT NOT NULL, repository TEXT, branch TEXT, last_commit_sha TEXT,
-  last_commit_date TEXT, status TEXT NOT NULL, error_message TEXT, updated_at TEXT NOT NULL);
-CREATE TABLE dependency_findings (id INTEGER PRIMARY KEY AUTOINCREMENT, organization TEXT NOT NULL,
-  repository TEXT NOT NULL, branch TEXT NOT NULL, commit_sha TEXT NOT NULL, date_fetched TEXT NOT NULL,
-  package_name TEXT NOT NULL, dependency_key TEXT NOT NULL, dependency_type TEXT NOT NULL,
-  manifest_path TEXT NOT NULL, manifest_line INTEGER NOT NULL, manifest_permalink TEXT NOT NULL,
-  declared_version TEXT NOT NULL, lockfile_path TEXT, lockfile_kind TEXT, lockfile_lines TEXT,
-  lockfile_permalink TEXT, resolved_version TEXT);
-CREATE TABLE usage_findings (id INTEGER PRIMARY KEY AUTOINCREMENT, organization TEXT NOT NULL,
-  repository TEXT NOT NULL, branch TEXT NOT NULL, commit_sha TEXT NOT NULL, package_name TEXT NOT NULL,
-  dependency_key TEXT NOT NULL DEFAULT '', usage_type TEXT NOT NULL, export_name TEXT NOT NULL DEFAULT '',
-  file_path TEXT NOT NULL, line_number INTEGER NOT NULL, permalink TEXT NOT NULL, snippet TEXT NOT NULL,
-  found_at TEXT NOT NULL);
-CREATE TABLE package_api_surface (id INTEGER PRIMARY KEY AUTOINCREMENT, package_name TEXT NOT NULL,
-  version TEXT NOT NULL, export_name TEXT NOT NULL, export_kind TEXT NOT NULL, source TEXT NOT NULL,
-  introspected_at TEXT NOT NULL, UNIQUE(package_name, version, export_name, export_kind));
-CREATE TABLE run_unit_head (run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL,
-  repository TEXT NOT NULL, branch TEXT NOT NULL, commit_sha TEXT NOT NULL,
-  PRIMARY KEY (run_id, organization, repository, branch));
-CREATE TABLE api_cache (url TEXT PRIMARY KEY, etag TEXT, response_body TEXT, cached_at TEXT NOT NULL);
-CREATE TABLE errors (id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, organization TEXT,
-  repository TEXT, branch TEXT, message TEXT NOT NULL, occurred_at TEXT NOT NULL);
+// ---- ownership predicate (§0: never write to a database this tool does not own) -------------
+// The gate this suite defends used to fire ONLY when ZERO audit-named tables existed, so ONE
+// generic audit-named table (`errors`, `work_queue`, …) read as proof of ownership and the
+// migration's run-scoped reset then DESTROYED that table's rows. `toThrow()` alone is what let
+// that ship — a raw SQLiteError thrown AFTER the writable open passes `toThrow(DbError)` never,
+// but passes a bare `toThrow()` happily, and by then the file is already WAL-converted. So every
+// case here asserts what must NOT have happened to the file: journal_mode unconverted, no
+// -wal/-shm sidecars, user_version unstamped, objects and rows exactly as the other app left them.
+
+// Restated here deliberately rather than imported from db.ts: a test that inherits the
+// production list cannot notice the production list going wrong.
+const AUDIT_TABLE_NAMES = [
+  "runs", "work_queue", "dependency_findings", "package_api_surface",
+  "usage_findings", "run_unit_head", "api_cache", "errors",
+] as const;
+
+// A second application's tables/index/view, and rows we must never touch.
+const FOREIGN_SQL = `
+CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+INSERT INTO customers (name) VALUES ('acme'), ('globex');
+CREATE INDEX ix_customers_name ON customers(name);
+CREATE VIEW v_customers AS SELECT name FROM customers;
 `;
 
-function buildLegacyDb(path: string): void {
-  const raw = new Database(path, { create: true });
-  raw.exec(LEGACY_DDL);
-  raw.exec(`INSERT INTO runs VALUES ('old-running', '2024-01-01T00:00:00.000Z', NULL, 'h-old', 'running')`);
-  raw.exec(`INSERT INTO runs VALUES ('old-done', '2024-01-02T00:00:00.000Z', '2024-01-02T01:00:00.000Z', 'h-old', 'completed')`);
-  raw.exec(`INSERT INTO work_queue (scope, organization, status, updated_at) VALUES ('org', 'org-a', 'done', '2024-01-02T00:00:00.000Z')`);
-  raw.exec(`INSERT INTO dependency_findings (organization, repository, branch, commit_sha, date_fetched,
-    package_name, dependency_key, dependency_type, manifest_path, manifest_line, manifest_permalink, declared_version)
-    VALUES ('org-a', 'r', 'main', 'sha1', '2024-01-02T00:00:00.000Z', 'expo', 'expo', 'dependencies', 'package.json', 1, 'x', '^1')`);
-  raw.exec(`INSERT INTO usage_findings (organization, repository, branch, commit_sha, package_name,
-    usage_type, file_path, line_number, permalink, snippet, found_at)
-    VALUES ('org-a', 'r', 'main', 'sha1', 'expo', 'named-import', 'src/a.ts', 3, 'x', 's', '2024-01-02T00:00:00.000Z')`);
-  raw.exec(`INSERT INTO package_api_surface (package_name, version, export_name, export_kind, source, introspected_at)
-    VALUES ('expo', '50.0.0', 'registerRootComponent', 'named', 'build/Expo.d.ts', '2024-01-02T00:00:00.000Z')`);
-  raw.exec(`INSERT INTO run_unit_head VALUES ('old-done', 'org-a', 'r', 'main', 'sha1')`);
-  raw.exec(`INSERT INTO api_cache VALUES ('https://api.github.com/x', 'W/"etag1"', '{"a":1}', '2024-01-02T00:00:00.000Z')`);
-  raw.exec(`INSERT INTO errors (scope, message, occurred_at) VALUES ('repo', 'boom', '2024-01-02T00:00:00.000Z')`);
-  raw.exec("PRAGMA user_version = 1");
-  raw.close();
+interface FileState {
+  journalMode: string;
+  userVersion: number;
+  objects: string[];
+  sidecars: string[];
 }
 
-describe("migration — legacy v1 → current", () => {
-  const path = nextFile();
-  buildLegacyDb(path);
-  const db = AuditDb.open({ sqlitePath: path });
-  afterAll(() => db.close());
+function fileState(path: string): FileState {
+  // Sidecars off the filesystem FIRST: a readonly open of a WAL database can itself create them.
+  const sidecars = readdirSync(TEST_ROOT).filter((f) => f.startsWith(`${basename(path)}-`)).sort();
+  const d = new Database(path, { readonly: true, strict: true });
+  try {
+    return {
+      journalMode: (d.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode,
+      userVersion: (d.query("PRAGMA user_version").get() as { user_version: number }).user_version,
+      objects: (
+        d.query("SELECT type || ':' || name AS o FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY o").all() as Array<{ o: string }>
+      ).map((r) => r.o),
+      sidecars,
+    };
+  } finally {
+    d.close();
+  }
+}
 
-  test("bumps user_version", () => {
-    const v = (raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version;
-    expect(v).toBe(SCHEMA_VERSION);
+function rowCount(path: string, table: string): number {
+  const d = new Database(path, { readonly: true, strict: true });
+  try {
+    return (d.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+  } finally {
+    d.close();
+  }
+}
+
+// A database another application owns. `journal_mode=delete` is the non-WAL mode such a file
+// realistically carries — and the mode our writable open would silently convert to WAL.
+function buildForeignDb(path: string, opts: { auditName?: string; userVersion?: number } = {}): void {
+  const d = new Database(path, { create: true, strict: true });
+  d.exec("PRAGMA journal_mode = delete;");
+  if (opts.auditName !== undefined) {
+    d.exec(`CREATE TABLE ${opts.auditName} (id INTEGER PRIMARY KEY, note TEXT NOT NULL)`);
+    d.exec(`INSERT INTO ${opts.auditName} (note) VALUES ('a'), ('b'), ('c')`);
+  }
+  d.exec(FOREIGN_SQL);
+  d.exec(`PRAGMA user_version = ${opts.userVersion ?? 0}`);
+  d.close();
+}
+
+// The whole-file assertion: refused cleanly, and the file is byte-for-byte as they left it.
+function expectRefusedUnmutated(path: string, before: FileState): void {
+  expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+  const after = fileState(path);
+  expect(after.journalMode).toBe("delete"); // WAL conversion persists in the file header
+  expect(after.sidecars).toEqual([]); // no -wal/-shm spawned beside a stranger's file
+  expect(after.userVersion).toBe(before.userVersion);
+  expect(after.objects).toEqual(before.objects); // no audit tables/indexes grafted on
+  expect(rowCount(path, "customers")).toBe(2);
+}
+
+describe("ownership — a foreign database is refused BEFORE any writable open", () => {
+  for (const name of AUDIT_TABLE_NAMES) {
+    test(`one audit-named table (${name}) is NOT proof of ownership: refused, file unmutated`, () => {
+      const path = nextFile();
+      buildForeignDb(path, { auditName: name });
+      const before = fileState(path);
+      expectRefusedUnmutated(path, before);
+      // The rows the run-scoped reset destroyed: dependency_findings/usage_findings/errors/
+      // work_queue all read 0 under the old gate. This is the data-loss assertion proper.
+      expect(rowCount(path, name)).toBe(3);
+    });
+  }
+
+  test("a foreign database with no audit-named table at all is refused, file unmutated", () => {
+    const path = nextFile();
+    buildForeignDb(path);
+    const before = fileState(path);
+    expectRefusedUnmutated(path, before);
   });
 
-  test("api_cache rows are PRESERVED and backfilled (method='GET', variant_hash='')", () => {
-    const entry = db.getApiCache("GET", "https://api.github.com/x", "");
-    expect(entry).not.toBeNull();
-    expect(entry!.etag).toBe('W/"etag1"');
-    expect(entry!.responseBody).toBe('{"a":1}');
-    expect(entry!.cachedAt).toBe("2024-01-02T00:00:00.000Z");
+  test("a foreign database that stamps user_version as a migration counter (Room/GRDB) is refused", () => {
+    // user_version is not ours alone — Room and GRDB use it as a migration counter. A stamp in
+    // our range must not by itself buy adoption; the absence of foreign objects is the conjunct.
+    const path = nextFile();
+    buildForeignDb(path, { auditName: "errors", userVersion: SCHEMA_VERSION });
+    const before = fileState(path);
+    expect(before.userVersion).toBe(SCHEMA_VERSION);
+    expectRefusedUnmutated(path, before);
+    expect(rowCount(path, "errors")).toBe(3);
   });
 
-  test("run-scoped tables are rebuilt EMPTY in the new shape", () => {
-    for (const t of ["dependency_findings", "usage_findings", "errors", "work_queue"]) {
-      const n = (raw(db).query(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n;
-      expect(n).toBe(0);
+  test("a foreign WAL database is refused WITHOUT mutating its -shm sidecar", () => {
+    // A plain readonly open of a WAL database is NOT filesystem-read-only: SQLite rewrites the
+    // `-shm` wal-index to read it, so a plain-readonly probe would leave a stranger's sidecar
+    // changed while claiming "nothing was modified". The preflight opens `immutable=1` instead,
+    // which reads the base file as a static image — the on-disk `-shm` must survive byte-for-byte.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = wal;"); // header now says WAL; a clean close leaves -wal/-shm
+    d.exec("CREATE TABLE errors (id INTEGER PRIMARY KEY, note TEXT NOT NULL)");
+    d.exec("INSERT INTO errors (note) VALUES ('a'), ('b'), ('c')");
+    d.exec("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    d.exec("INSERT INTO customers (name) VALUES ('acme'), ('globex')");
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+
+    const shmPath = join(TEST_ROOT, `${basename(path)}-shm`);
+    // The fixture only earns its keep if the -shm is actually present to be mutated (bun leaves it
+    // after a WAL close); if a future runtime stops doing so, fail loudly rather than pass vacuously.
+    expect(existsSync(shmPath)).toBe(true);
+    const shmBefore = readFileSync(shmPath);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    expect(existsSync(shmPath)).toBe(true);
+    expect(Buffer.compare(readFileSync(shmPath), shmBefore)).toBe(0); // -shm byte-for-byte intact
+    expect(rowCount(path, "errors")).toBe(3); // base file theirs, unconverted, rows intact
+    expect(rowCount(path, "customers")).toBe(2);
+  });
+
+  test("a foreign database whose ONLY table is one generic audit name (no other objects) is refused", () => {
+    // The narrowest disguise: a single table named `errors` and a migration counter in our range —
+    // no customers table, no view, nothing else for the foreign-object check to catch. What
+    // refuses it is the table-SET requirement: this tool's transactions only ever leave the FULL
+    // audit set, the --fresh-preserved caches, or nothing, and a lone `errors` is none of those.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec("CREATE TABLE errors (id INTEGER PRIMARY KEY, note TEXT NOT NULL)");
+    d.exec("INSERT INTO errors (note) VALUES ('a'), ('b'), ('c')");
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+    expect(before.objects).toEqual(["table:errors"]);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.userVersion).toBe(SCHEMA_VERSION);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "errors")).toBe(3);
+  });
+
+  test("a table named with a LIKE-wildcard near-miss of the internal prefix (sqliteevil) is not invisible", () => {
+    // SQLite reserves the LITERAL `sqlite_` prefix; `sqliteevil` is a legal user name. But in
+    // LIKE, `_` matches ANY character, so an unescaped `NOT LIKE 'sqlite_%'` filter swallows it —
+    // making a foreign database look EMPTY (zero objects → "ours to create"). The checks must
+    // escape the underscore so only genuinely internal objects are exempt.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec("CREATE TABLE sqliteevil (id INTEGER PRIMARY KEY, note TEXT NOT NULL)");
+    d.exec("INSERT INTO sqliteevil (note) VALUES ('a'), ('b'), ('c')");
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.userVersion).toBe(0);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "sqliteevil")).toBe(3);
+  });
+
+  test("a sqliteevil table hiding among a full audit set is still a foreign object", () => {
+    // Same wildcard trap from the other side: on an otherwise-ours database the foreign-object
+    // check must SEE `sqliteevil` (it is not internal), not silently exempt it.
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close();
+    const w = new Database(path, { strict: true });
+    w.exec("PRAGMA journal_mode = delete;");
+    w.exec("CREATE TABLE sqliteevil (id INTEGER PRIMARY KEY)");
+    w.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual(before.sidecars);
+    expect(after.objects).toEqual(before.objects);
+  });
+
+  test("a foreign database whose schema lives ONLY in its uncheckpointed WAL is refused, untouched", () => {
+    // The preflight's immutable read sees the BASE file alone — and a WAL database whose writer
+    // crashed (or is still running) holds its entire committed schema in -wal frames over a
+    // ZERO-object base. That must NOT read as "empty, ours to create": the writable open would
+    // recover the WAL and graft the audit schema into a stranger's live file. Constructed by
+    // copying base+wal while the writer is still open — a clean close would checkpoint the
+    // frames into the base and hide exactly the state under test.
+    const src = nextFile();
+    const writer = new Database(src, { create: true, strict: true });
+    writer.exec("PRAGMA journal_mode = wal;");
+    writer.exec("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    writer.exec("INSERT INTO customers (name) VALUES ('acme'), ('globex')");
+    const path = nextFile();
+    copyFileSync(src, path);
+    copyFileSync(`${src}-wal`, `${path}-wal`);
+    writer.close();
+
+    // Prove the fixture is the hazardous state: zero objects in the base, schema wal-resident.
+    const im = new Database(`file:${path}?immutable=1`, { readonly: true, strict: true });
+    expect(im.query("SELECT count(*) AS c FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").get()).toEqual({ c: 0 });
+    im.close();
+    const baseBefore = readFileSync(path);
+    const walBefore = readFileSync(`${path}-wal`);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    // Byte-for-byte: refused WITHOUT recovering the WAL, checkpointing, or building a wal-index.
+    expect(Buffer.compare(readFileSync(path), baseBefore)).toBe(0);
+    expect(Buffer.compare(readFileSync(`${path}-wal`), walBefore)).toBe(0);
+    expect(existsSync(`${path}-shm`)).toBe(false);
+  });
+
+  test("a VIEW named like an audit table does not read as ownership", () => {
+    // ISOLATED deliberately: the view is the ONLY object, and the stamp is in our range, so the
+    // single thing standing between this file and adoption is that an audit NAME must be an audit
+    // TABLE. Add any other foreign object and this passes for the wrong reason — a name-only check
+    // would read `runs` as familiar, and `CREATE TABLE runs` would then collide with the view.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec("CREATE VIEW runs AS SELECT 1 AS run_id, 'completed' AS status");
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+    expect(before.objects).toEqual(["view:runs"]);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
+  });
+
+  test("a TRIGGER is foreign even on an otherwise-ours database", () => {
+    // This tool creates no triggers, so any trigger belongs to someone else — and a trigger fires
+    // writes of their choosing inside the migration/self-heal transactions we are about to run.
+    // Refusing our own file over one is the fail-closed side of the trade, and is intended.
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close();
+    const w = new Database(path, { strict: true });
+    w.exec("PRAGMA journal_mode = delete;");
+    w.exec("CREATE TRIGGER t_runs AFTER INSERT ON runs BEGIN UPDATE runs SET status='failed'; END");
+    w.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual(before.sidecars);
+    expect(after.userVersion).toBe(before.userVersion);
+    expect(after.objects).toEqual(before.objects);
+  });
+
+  test("a dump/restore that lost its header pragmas (v3 tables, user_version 0) is refused, not reset", () => {
+    // `.dump`/restore replays the DDL but not the header, so a genuine v3 database comes back
+    // stamped 0. It must REFUSE — silently treating it as pre-v2 would rebuild the run-scoped
+    // tables empty and destroy reportable rows. Rejection is recoverable; that erasure is not.
+    const path = nextFile();
+    const db = AuditDb.open({ sqlitePath: path });
+    db.startRun(runInput());
+    db.close();
+    const before = (() => {
+      const w = new Database(path, { strict: true });
+      w.exec("PRAGMA journal_mode = delete;"); // as a restored (non-WAL) file would arrive
+      w.exec("PRAGMA user_version = 0");
+      w.close();
+      // Normalize the fixture to what a real .dump/restore produces: no sidecars. Building it
+      // through AuditDb.open above necessarily passed through WAL, and that residue is the
+      // test's own, not the product's — leaving it would blunt the assertion that matters.
+      for (const s of readdirSync(TEST_ROOT).filter((f) => f.startsWith(`${basename(path)}-`)))
+        rmSync(join(TEST_ROOT, s));
+      return fileState(path);
+    })();
+    expect(before.userVersion).toBe(0);
+    expect(before.sidecars).toEqual([]);
+    expect(rowCount(path, "runs")).toBe(1);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.userVersion).toBe(0);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "runs")).toBe(1); // the reportable row the old path would have kept…
+    expect(rowCount(path, "work_queue")).toBe(0);
+  });
+
+  test("the refusal names the file and tells the operator what to do", () => {
+    const path = nextFile();
+    buildForeignDb(path, { auditName: "errors" });
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/refusing to write to .*sqlitePath/s);
+  });
+});
+
+describe("ownership — every database this tool legitimately produces still opens", () => {
+  test("a path that does not exist yet is created fresh at the current version", () => {
+    const path = nextFile();
+    expect(existsSync(path)).toBe(false);
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      expect((raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+      expect(db.latestReportableRun()).toBeNull();
+    } finally {
+      db.close();
     }
-    // new-shape columns exist (would throw if missing)
-    raw(db).query("SELECT run_id, resolved_version_source FROM dependency_findings").all();
-    raw(db).query("SELECT run_id, context FROM usage_findings").all();
-    raw(db).query("SELECT run_id, package_name, version FROM errors").all();
-    raw(db).query("SELECT config_hash, created_run_id, last_run_id FROM work_queue").all();
   });
 
-  test("runs are preserved; every pre-migration running run is failed; defaults applied", () => {
-    const oldRunning = db.getRun("old-running");
-    expect(oldRunning?.status).toBe("failed");
-    const oldDone = db.getRun("old-done");
-    expect(oldDone?.status).toBe("completed");
-    expect(oldDone?.trackedPackages).toEqual([]); // '[]' — pre-migration runs are non-reportable
-    expect(oldDone?.effectiveOwners).toEqual([]);
-    expect(oldDone?.ownersSource).toBe("discovered");
-    expect(oldDone?.githubHost).toBe("github.com");
+  test("an existing 0-byte file is an empty database, not a foreign one", () => {
+    // The writable open's own create path can leave this behind: the file is created before the
+    // schema transaction commits. It has no objects, so it cannot belong to anyone.
+    const path = nextFile();
+    writeFileSync(path, "");
+    expect(statSync(path).size).toBe(0);
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      expect((raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+    } finally {
+      db.close();
+    }
   });
 
-  test("package_api_surface preserved with version_source default 'lockfile'", () => {
-    const row = raw(db)
-      .query("SELECT version_source, export_name FROM package_api_surface WHERE package_name='expo'")
-      .get() as { version_source: string; export_name: string };
-    expect(row.version_source).toBe("lockfile");
-    expect(row.export_name).toBe("registerRootComponent");
+  // --fresh's drop is its own committed transaction, and SCHEMA_SQL re-creates the tables in a
+  // LATER one — so "only the caches remain" is not an end state of a successful open, it is what
+  // a crash BETWEEN those two transactions leaves on disk. Both fixtures below reproduce that
+  // interrupted state directly (a completed --fresh would hide it behind the re-create).
+  const dropTables = (path: string, tables: readonly string[]): void => {
+    const w = new Database(path, { strict: true });
+    w.exec("PRAGMA journal_mode = delete;"); // model a plain (non-WAL) file, as a restore leaves
+    for (const t of tables) w.exec(`DROP TABLE IF EXISTS ${t}`);
+    w.close();
+  };
+
+  test("a --fresh interrupted after the drop (only the preserved caches remain) reopens", () => {
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close();
+    // Exactly FRESH_DROP_ORDER, child-before-parent — the state where "require ALL audit tables"
+    // and "require the distinctive `runs` table" would each wrongly reject our OWN file.
+    dropTables(path, ["run_unit_head", "dependency_findings", "usage_findings", "errors", "work_queue", "runs"]);
+    const d = new Database(path, { readonly: true, strict: true });
+    const names = (d.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>).map((r) => r.name);
+    const uv = (d.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+    d.close();
+    expect(names).toEqual(["api_cache", "package_api_surface"]);
+    expect(uv).toBe(SCHEMA_VERSION); // still stamped: only the tables went
+
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      expect((raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+      db.startRun(runInput()); // the self-heal re-created the dropped tables
+    } finally {
+      db.close();
+    }
   });
 
-  test("run_unit_head preserved with status default 'scanned'", () => {
-    const row = raw(db)
-      .query("SELECT status, commit_sha FROM run_unit_head WHERE run_id='old-done'")
-      .get() as { status: string; commit_sha: string };
-    expect(row.status).toBe("scanned");
-    expect(row.commit_sha).toBe("sha1");
+  test("a --fresh --purge-cache interrupted after the drop (zero objects, still stamped) reopens", () => {
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close();
+    dropTables(path, [
+      "run_unit_head", "dependency_findings", "usage_findings", "errors", "work_queue", "runs",
+      "api_cache", "package_api_surface",
+    ]);
+    const d = new Database(path, { readonly: true, strict: true });
+    expect(d.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").all()).toEqual([]);
+    d.close();
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      expect((raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+    } finally {
+      db.close();
+    }
   });
 
-  test("run_unit_head keeps its run_id FK to runs through the additive ALTER", () => {
-    const fks = raw(db).query("PRAGMA foreign_key_list(run_unit_head)").all() as Array<{
-      table: string;
-      from: string;
-    }>;
-    expect(fks.some((fk) => fk.table === "runs" && fk.from === "run_id")).toBe(true);
+  test("a completed --fresh leaves a fully re-created database that reopens", () => {
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close();
+    captureStdout(() => AuditDb.open({ sqlitePath: path, fresh: true }).close());
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      expect((raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+      db.startRun(runInput());
+    } finally {
+      db.close();
+    }
   });
 
-  test("pre-migration runs are NOT reportable (empty tracked_packages)", () => {
-    expect(db.latestReportableRun()).toBeNull();
+  test("a current-version database reopens and keeps its rows", () => {
+    const path = nextFile();
+    const first = AuditDb.open({ sqlitePath: path });
+    first.startRun(runInput());
+    first.close();
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      expect(rowCount(path, "runs")).toBe(1);
+    } finally {
+      db.close();
+    }
   });
 
-  test("the chain continues past v2: preserved heads gain is_default_branch = NULL (unknown)", () => {
-    const row = raw(db)
-      .query("SELECT is_default_branch FROM run_unit_head WHERE run_id='old-done'")
-      .get() as { is_default_branch: unknown };
-    expect(row.is_default_branch).toBeNull();
+  test("a non-empty database stamped BELOW the oldest version we ever wrote is refused", () => {
+    // db.ts has stamped >= 2 since its first commit, and `PRAGMA user_version` is transactional
+    // (a crashed create rolls back the DDL and the stamp together, leaving zero objects). So a
+    // non-empty database reading back < 2 was never produced by this tool — it is someone else's.
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close();
+    const w = new Database(path, { strict: true });
+    w.exec("PRAGMA journal_mode = delete;");
+    w.exec("PRAGMA user_version = 1");
+    w.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual(before.sidecars);
+    expect(after.userVersion).toBe(1);
+    expect(after.objects).toEqual(before.objects);
+  });
+
+  test("a damaged OWN database (one audit table dropped externally) stays on the repair path", () => {
+    // openReadOnly's documented remediation for a missing table is "run `bun run audit` once to
+    // repair it" — so the ownership gate must recognize a PARTIAL current-version set as ours
+    // when every present table carries the current schema's exact column shape, and the
+    // self-heal branch must then actually re-create what is missing.
+    const path = nextFile();
+    const first = AuditDb.open({ sqlitePath: path });
+    first.startRun(runInput());
+    first.close();
+    const w = new Database(path, { strict: true });
+    w.exec("DROP TABLE errors");
+    w.close();
+
+    // The documented contract, end-to-end: read side names the table and the remediation…
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/missing the errors table.*bun run audit/s);
+    // …and the remediation works: the writable open repairs instead of refusing.
+    const repaired = AuditDb.open({ sqlitePath: path });
+    try {
+      expect(rowCount(path, "runs")).toBe(1); // existing data intact
+      raw(repaired).query("SELECT run_id FROM errors").all(); // errors re-created in current shape
+    } finally {
+      repaired.close();
+    }
+    AuditDb.openReadOnly({ sqlitePath: path }).close(); // read side is whole again
+  });
+
+  test("a foreign table matching an audit table's column NAMES but not its types is refused", () => {
+    // The repair path must prove same-TABLE, not same-names: identical column names with
+    // all-INTEGER types, no NOT NULLs and no PK is someone else's table wearing our labels.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec(`CREATE TABLE errors (id INTEGER, run_id INTEGER, scope INTEGER, organization INTEGER,
+      repository INTEGER, branch INTEGER, package_name INTEGER, version INTEGER, message INTEGER, occurred_at INTEGER)`);
+    d.exec("INSERT INTO errors (id) VALUES (1), (2), (3)");
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "errors")).toBe(3);
+  });
+
+  test("a WITHOUT ROWID clone of an audit table is refused despite identical columns", () => {
+    // Same columns, types, constraints and PK as our api_cache — only the rowid-ness differs.
+    // table_xinfo alone cannot see that; the shape check must include it.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec(`CREATE TABLE api_cache (
+      method TEXT NOT NULL, url TEXT NOT NULL, variant_hash TEXT NOT NULL,
+      etag TEXT, response_body TEXT, cached_at TEXT NOT NULL,
+      PRIMARY KEY (method, url, variant_hash)) WITHOUT ROWID`);
+    d.exec(`INSERT INTO api_cache VALUES ('GET', 'https://x', '', NULL, '{}', '2026-01-01T00:00:00.000Z')`);
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "api_cache")).toBe(1);
+  });
+
+  test("a foreign partial set with audit NAMES but wrong column shapes is still refused", () => {
+    // The repair path must not readmit the lone-generic-table disguise: audit names carrying
+    // someone else's column shapes match no state this tool can produce.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec("CREATE TABLE runs (id INTEGER PRIMARY KEY)"); // audit NAME, foreign shape
+    d.exec("CREATE TABLE errors (id INTEGER PRIMARY KEY, note TEXT NOT NULL)");
+    d.exec("INSERT INTO errors (note) VALUES ('a'), ('b'), ('c')");
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "errors")).toBe(3);
+  });
+
+  test("an OWN WAL database copied without its -wal/-shm sidecars still reopens", () => {
+    // A WAL database that is cleanly closed / checkpointed and then copied as the bare `.db`
+    // (a common backup) arrives with NO sidecars. The ownership preflight must read it as OURS
+    // and let the writable open recreate the sidecars — a plain readonly probe would instead hit
+    // SQLITE_CANTOPEN and refuse a perfectly good database with the circular "run audit" error.
+    const path = nextFile();
+    const first = AuditDb.open({ sqlitePath: path }); // opens in WAL (open's journal_mode pragma)
+    first.startRun(runInput());
+    first.close();
+    // Checkpoint into the base file, then strip the sidecars — the "copied only the .db" state.
+    const w = new Database(path, { strict: true });
+    w.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    w.close();
+    for (const s of readdirSync(TEST_ROOT).filter((f) => f.startsWith(`${basename(path)}-`)))
+      rmSync(join(TEST_ROOT, s));
+    expect(readdirSync(TEST_ROOT).filter((f) => f.startsWith(`${basename(path)}-`))).toEqual([]);
+
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      expect(rowCount(path, "runs")).toBe(1); // the row survived; the db was not refused or reset
+    } finally {
+      db.close();
+    }
   });
 });
 

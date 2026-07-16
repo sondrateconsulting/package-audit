@@ -6,7 +6,7 @@
 
 import { Database, type Statement } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { logLine } from "./log.ts";
@@ -29,12 +29,18 @@ export const SCHEMA_VERSION = 3;
 // SCHEMA_VERSION. (If a step stamped SCHEMA_VERSION, bumping the constant for v4 would make a
 // crash between the v2→v3 step and the future v3→v4 step leave a v3-SHAPED database stamped 4,
 // and every later open would skip the missing migration.)
-// migrateLegacy's target. The legacy migration is QUARANTINED to user_version < 2: it rebuilds
-// the run-scoped tables EMPTY (sound only for pre-v2 databases, whose findings are
-// non-reportable) — routing a v2+ database through it would DESTROY reportable data.
-const LEGACY_TARGET_VERSION = 2;
 // migrateV2toV3's target.
 const V3_TARGET_VERSION = 3;
+
+// §0 OWNERSHIP PROOF. The OLDEST version this tool has ever stamped: db.ts shipped at
+// SCHEMA_VERSION = 2 in its first commit and has stamped >= 2 ever since. `PRAGMA user_version`
+// is TRANSACTIONAL, so a crash during the create/migrate transaction rolls the stamp back
+// together with the DDL — there is no torn "audit tables present, user_version 0" state of ours.
+// Therefore a NON-EMPTY database reading back < 2 was never produced by this tool, while a
+// foreign SQLite file defaults to exactly 0. That asymmetry is what assertOwnedDatabase rests on.
+// (Consequence: there is no pre-v2 migration. A database stamped below this is REFUSED, not
+// adopted and rebuilt — see assertOwnedDatabase.)
+const MIN_OWNED_VERSION = 2;
 
 // §7 SURFACE-CACHE EPOCH. Bumped when the introspection LOGIC changes (resolver correctness, parse
 // bounds) so a package audited by an OLDER, buggier resolver does NOT keep its stale '__complete__'
@@ -346,10 +352,6 @@ const FRESH_DROP_ORDER = [
   "run_unit_head", "dependency_findings", "usage_findings", "errors", "work_queue", "runs",
 ] as const;
 
-// The migration's run-scoped-reset tables: rebuilt EMPTY in their new shape (§3) — their
-// legacy rows belong only to pre-migration (non-reportable) runs and are never copied.
-const RUN_SCOPED_RESET = ["dependency_findings", "usage_findings", "errors", "work_queue"] as const;
-
 // ---- low-level helpers ----------------------------------------------------------------------
 function readUserVersion(db: Database): number {
   const row = db.query("PRAGMA user_version").get() as { user_version: number };
@@ -366,11 +368,92 @@ function tableExists(db: Database, name: string): boolean {
   return db.query("SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name = ?").get(name) !== null;
 }
 
-function hasForeignTables(db: Database): boolean {
+// SQLite reserves the LITERAL prefix `sqlite_` for its internal objects (sqlite_sequence,
+// sqlite_autoindex_*). In LIKE, `_` is a single-character WILDCARD — an unescaped
+// `NOT LIKE 'sqlite_%'` also swallows legal user names like `sqliteXevil`, hiding a foreign
+// object from the ownership checks. ESCAPE makes the underscore literal.
+const NOT_SQLITE_INTERNAL = `name NOT LIKE 'sqlite\\_%' ESCAPE '\\'`;
+
+// Any object proving another application owns this file. Tables, views and triggers only:
+// an INDEX cannot exist without its table (and SQLite makes its own sqlite_autoindex_* for every
+// PK/UNIQUE), so the tables already answer the question — counting indexes would only reject our
+// own file over a stray operator index. Views and triggers are ALWAYS foreign: this tool creates
+// neither, and a trigger would execute writes of someone else's choosing during a migration.
+// An audit NAME only counts as ours when it is genuinely a TABLE — a view named `runs` looks
+// familiar to a name-only check while `CREATE TABLE runs` would then fail against it.
+function hasForeignObjects(db: Database): boolean {
   const rows = db
-    .query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-    .all() as Array<{ name: string }>;
-  return rows.some((r) => !AUDIT_TABLE_SET.has(r.name));
+    .query(`SELECT type, name FROM sqlite_master WHERE type IN ('table','view','trigger') AND ${NOT_SQLITE_INTERNAL}`)
+    .all() as Array<{ type: string; name: string }>;
+  return rows.some((r) => r.type !== "table" || !AUDIT_TABLE_SET.has(r.name));
+}
+
+// The table SETS this tool can actually leave on disk. Every DDL batch here runs in ONE
+// transaction (create, --fresh drop incl. --purge-cache, each migration step, self-heal), so a
+// crash never leaves a partial set — the only reachable states are the FULL set, the
+// --fresh-preserved caches (a crash between --fresh's drop transaction and the re-create), and
+// zero tables (handled by the empty branch). A foreign database whose ONLY table happens to carry
+// one generic audit name (`errors`, `work_queue`) plus a plausible migration counter presents a
+// set this tool cannot produce — requiring set membership is what refuses it. Derived from the
+// existing constants so a future schema change cannot silently diverge from this check.
+const FRESH_PRESERVED_SET = new Set<string>([...AUDIT_TABLES].filter((t) => !(FRESH_DROP_ORDER as readonly string[]).includes(t)));
+
+// Reference column shapes for the REPAIR path below: what each audit table looks like under the
+// CURRENT schema, read from a throwaway :memory: build of SCHEMA_SQL (never hardcoded — a future
+// migration changes this automatically). table_xinfo, not table_info: it also lists hidden and
+// generated columns, so a foreign table cannot alias an audit shape through columns table_info
+// omits. Built once, lazily — the preflight only needs it for damaged-database opens.
+let referenceShapes: Map<string, string> | null = null;
+function currentTableShapes(): Map<string, string> {
+  if (referenceShapes !== null) return referenceShapes;
+  const ref = new Database(":memory:", { strict: true });
+  try {
+    ref.exec(SCHEMA_SQL); // the CURRENT schema — includes the v3 is_default_branch column
+    referenceShapes = new Map(AUDIT_TABLES.map((t) => [t, tableShape(ref, t)]));
+    return referenceShapes;
+  } finally {
+    ref.close();
+  }
+}
+// Canonical shape string: the FULL table_xinfo row per column (name, type, NOT NULL, default,
+// PK position, hidden/generated kind), sorted by name so ALTER-appended columns compare equal to
+// inline-created ones, plus rowid-ness and STRICT-ness from table_list — matching NAMES alone
+// would admit a foreign table whose columns merely share ours' names (all-INTEGER types, no
+// constraints, or a WITHOUT ROWID clone). (PRAGMA cannot bind — `table` is validated against
+// AUDIT_TABLE_SET, same contract as columnExists.)
+function tableShape(db: Database, table: string): string {
+  if (!AUDIT_TABLE_SET.has(table)) fail(`tableShape called for unknown table ${table}`);
+  const cols = db.query(`PRAGMA table_xinfo(${table})`).all() as Array<{
+    name: string; type: string | null; notnull: number; dflt_value: string | null; pk: number; hidden: number;
+  }>;
+  const meta = db
+    .query("SELECT wr, strict FROM pragma_table_list WHERE schema = 'main' AND name = ?")
+    .get(table) as { wr: number; strict: number } | null;
+  const colSig = cols
+    .map((c) => `${c.name}:${(c.type ?? "").toUpperCase()}:${c.notnull}:${c.dflt_value ?? ""}:${c.pk}:${c.hidden}`)
+    .sort()
+    .join("|");
+  return `wr=${meta?.wr ?? 0},strict=${meta?.strict ?? 0};${colSig}`;
+}
+
+function hasOwnedTableSet(db: Database): boolean {
+  const present = (
+    db.query(`SELECT name FROM sqlite_master WHERE type='table' AND ${NOT_SQLITE_INTERNAL}`).all() as Array<{ name: string }>
+  ).map((r) => r.name);
+  const matches = (want: ReadonlySet<string>): boolean =>
+    present.length === want.size && present.every((n) => want.has(n));
+  if (matches(AUDIT_TABLE_SET) || matches(FRESH_PRESERVED_SET)) return true;
+  // REPAIR path: a current-version database missing tables (an externally damaged file — e.g. a
+  // partial restore) must stay openable, because openReadOnly's documented remediation for it is
+  // "run `bun run audit` once to repair it" and the self-heal branch re-creates what is missing.
+  // A partial set is provably ours only when every table that IS present carries the CURRENT
+  // schema's exact column shape — a foreign `errors(id, note)` under a plausible migration
+  // counter matches no audit shape and stays refused. Quarantined to uv === SCHEMA_VERSION: for
+  // older stamps the shape reference would be a moving target, and a damaged old-version file is
+  // refused fail-closed like every other unprovable state.
+  if (readUserVersion(db) !== SCHEMA_VERSION || present.length === 0) return false;
+  const shapes = currentTableShapes();
+  return present.every((t) => AUDIT_TABLE_SET.has(t) && tableShape(db, t) === shapes.get(t));
 }
 
 // PRAGMA table_info cannot bind either; `table` is always one of AUDIT_TABLES (enforced).
@@ -406,78 +489,91 @@ export function mapReadOnlyOpenError(e: unknown, path: string): unknown {
   return e;
 }
 
-// ---- migrations (§3: version-stepped; each step ONE transaction stamping its target) --------
-// migrateLegacy — the pre-v2 (legacy) step, QUARANTINED to user_version < LEGACY_TARGET_VERSION.
-// Preserves the provenance tables (runs, run_unit_head) via additive ALTERs, preserves the
-// caches (api_cache rebuilt WITH row copy; package_api_surface via ALTER), rebuilds the
-// run-scoped tables EMPTY in their new shape, and marks every pre-existing 'running' run
-// failed so the startup resume rule can never select a pre-migration run as the live run.
-// ⚠️ NEVER route a v2+ database through this step: the run-scoped reset is sound ONLY for
-// legacy databases (whose findings are non-reportable) — on a v2 database it destroys
-// reportable data. It stamps exactly LEGACY_TARGET_VERSION; later steps take it from there.
-function migrateLegacy(db: Database): void {
-  db.transaction(() => {
-    // 1. Additive ALTERs on the PRESERVED tables first (§3 ordering). Every added NOT NULL
-    //    column carries a DEFAULT that satisfies its CHECK (SQLite rejects it otherwise).
-    if (tableExists(db, "runs")) {
-      addColumnIfMissing(db, "runs", "effective_owners", `TEXT NOT NULL DEFAULT '[]'`);
-      addColumnIfMissing(
-        db, "runs", "owners_source",
-        `TEXT NOT NULL DEFAULT 'discovered' CHECK (owners_source IN ('configured','discovered'))`,
-      );
-      addColumnIfMissing(db, "runs", "tracked_packages", `TEXT NOT NULL DEFAULT '[]'`);
-      addColumnIfMissing(db, "runs", "cutoff_date", `TEXT NOT NULL DEFAULT ''`);
-      addColumnIfMissing(db, "runs", "github_host", `TEXT NOT NULL DEFAULT 'github.com'`);
+// ---- ownership (§0: never write to a database this tool does not own) -----------------------
+// Proves the file at `path` is OURS, on a READ-ONLY handle, BEFORE any writable open. The order
+// matters: `PRAGMA journal_mode = WAL` rewrites the file header and spawns -wal/-shm siblings, so
+// by the time a writable connection exists we have already mutated a database we may not own. A
+// misdirected `sqlitePath` — an ordinary operator typo onto another app's .db — must cost nothing.
+//
+// The predicate, first match wins:
+//   1. No file, or a file with NO objects at all -> ours to create. An empty database cannot
+//      belong to anyone; it is also what our own interrupted create leaves behind.
+//   2. user_version >= MIN_OWNED_VERSION AND no foreign objects -> ours. NEITHER conjunct is
+//      sufficient alone: user_version is not ours exclusively (Room and GRDB use it as a
+//      migration counter), and "an audit-named table exists" is precisely the check this replaces.
+//   3. Anything else -> REFUSE, untouched.
+//
+// Rejected alternatives, each disproved against a database this tool legitimately produces:
+//   • "an audit-named table exists" — ONE generic table (`errors`, `work_queue`) is not proof;
+//     that was the bug, and the migration's run-scoped reset then destroyed that table's rows.
+//   • "a DISTINCTIVE table (`runs`) exists" / "ALL audit tables exist" — a --fresh interrupted
+//     after its drop transaction legitimately leaves ONLY api_cache + package_api_surface.
+//   • "every audit-named table matches a known column spec" — unsound both ways: extra columns on
+//     a foreign table would be silently dropped by a rebuild, and no pre-v2 schema ever shipped,
+//     so there is no archived spec to match a legacy file against.
+// A legitimate database we cannot PROVE is ours is refused too: the operator repoints
+// `sqlitePath` at a new file and loses nothing, whereas a wrong adoption destroys a stranger's
+// data. That asymmetry decides every ambiguous case here.
+//
+// The preflight connection opens with SQLite's `immutable=1`, which is the ONLY genuinely
+// filesystem-read-only mode: a plain `readonly:true` open of a WAL-mode database is NOT — SQLite
+// creates a missing `-shm` wal-index and mutates an existing one to read it, so a plain readonly
+// probe would leave a stranger's sidecar changed while we refuse (and would fail outright with
+// SQLITE_CANTOPEN on an OWN WAL database whose sidecars were dropped, e.g. a bare-`.db` copy —
+// blocking the writable open that would have recreated them). immutable reads the base file as a
+// static image: it never touches `-wal`/`-shm`. Its only cost is staleness — it ignores any live
+// `-wal` frames — which is HARMLESS here: our own database is never foreign and was stamped
+// >= MIN_OWNED_VERSION at creation, so a stale read can only ever UNDER-report (fewer objects, an
+// older version), never invent a foreign object or a sub-2 stamp that would wrongly refuse it; the
+// subsequent writable open re-reads the true state through the WAL and self-heals.
+function toImmutableUri(path: string): string {
+  // file: URI filename encoding — percent-encode the delimiters SQLite's URI parser reserves.
+  // `%` MUST go first (it introduces every other escape). `path` is absolute (assertContained).
+  const enc = path.replace(/%/g, "%25").replace(/\?/g, "%3f").replace(/#/g, "%23").replace(/ /g, "%20");
+  return `file:${enc}?immutable=1`;
+}
+function assertOwnedDatabase(path: string): void {
+  if (!existsSync(path)) return; // nothing on disk — the writable open creates it
+  let db: Database;
+  try {
+    db = new Database(toImmutableUri(path), { readonly: true, strict: true });
+  } catch (e) {
+    throw mapReadOnlyOpenError(e, path);
+  }
+  try {
+    // Every object type, so an interrupted create (0 objects) is told apart from a live database.
+    const objects = db.query(`SELECT 1 AS x FROM sqlite_master WHERE ${NOT_SQLITE_INTERNAL}`).all();
+    if (objects.length === 0) {
+      // A zero-object BASE file is provably unowned only when no journal could be hiding a
+      // schema: immutable reads the base file alone, and a WAL database whose writer crashed
+      // (or is still running) can hold its entire committed schema in -wal frames — a foreign
+      // file in exactly that state would otherwise read as "empty, ours to create", and the
+      // writable open would then graft the audit schema into it THROUGH the recovered WAL.
+      // A non-empty rollback -journal is the same story for a non-WAL crashed writer.
+      for (const sidecar of [`${path}-wal`, `${path}-journal`] as const) {
+        if (existsSync(sidecar) && statSync(sidecar).size > 0)
+          fail(
+            `refusing to write to ${path}: it has no committed schema but ${sidecar} holds ` +
+              "frames the read-only ownership check cannot inspect — if it is another " +
+              "application's database, point `sqlitePath` elsewhere; if it is a crashed fresh " +
+              "audit database, delete it and its sidecars and retry (nothing was modified)",
+          );
+      }
+      return;
     }
-    if (tableExists(db, "package_api_surface")) {
-      addColumnIfMissing(
-        db, "package_api_surface", "version_source",
-        `TEXT NOT NULL DEFAULT 'lockfile' CHECK (version_source IN ('lockfile','range-resolved'))`,
-      );
-    }
-    // run_unit_head is PRESERVED via this additive ALTER alone (§3 lists exactly this, and
-    // deliberately excludes run_unit_head from the FK-gaining rebuild list — the legacy shape
-    // already carried run_id REFERENCES runs(run_id)). Do NOT "fix" this into a rebuild: a
-    // rebuild of the provenance snapshot risks the data §3 orders preserved.
-    if (tableExists(db, "run_unit_head")) {
-      addColumnIfMissing(
-        db, "run_unit_head", "status",
-        `TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff'))`,
-      );
-    }
-
-    // 2. api_cache rebuild WITH row copy: legacy rows (PK url) predate GraphQL/variant
-    //    support — backfill method='GET', variant_hash='' (§3 keeps --fresh-preserves-api_cache).
-    if (tableExists(db, "api_cache") && !columnExists(db, "api_cache", "variant_hash")) {
-      db.exec(`CREATE TABLE api_cache_migrated (
-        method TEXT NOT NULL, url TEXT NOT NULL, variant_hash TEXT NOT NULL,
-        etag TEXT, response_body TEXT, cached_at TEXT NOT NULL,
-        PRIMARY KEY (method, url, variant_hash))`);
-      db.exec(`INSERT INTO api_cache_migrated (method, url, variant_hash, etag, response_body, cached_at)
-               SELECT 'GET', url, '', etag, response_body, cached_at FROM api_cache`);
-      db.exec("DROP TABLE api_cache");
-      db.exec("ALTER TABLE api_cache_migrated RENAME TO api_cache");
-    }
-
-    // 3. Run-scoped reset: rebuilt EMPTY — no legacy-row copy, no backfill, no orphan-run
-    //    quarantine (§3). Dropping a child table is FK-safe even while parent rows exist.
-    for (const t of RUN_SCOPED_RESET) db.exec(`DROP TABLE IF EXISTS ${t}`);
-
-    // 4. Migration-boundary rule: every pre-existing running run is failed (any config_hash)
-    //    so it can never be resumed as the live run with tracked_packages='[]'.
-    if (tableExists(db, "runs")) db.exec(`UPDATE runs SET status='failed' WHERE status='running'`);
-
-    // 5. New-shape CREATEs fill the emptied/missing tables + indexes, then stamp THIS step's
-    //    target version (never SCHEMA_VERSION — the v2→v3 step still has to run; a crash
-    //    between the steps leaves a valid v2-stamped database the next open resumes from).
-    //    SCHEMA_SQL is the CURRENT schema, so freshly-created tables may already carry later
-    //    columns — harmless: later steps use addColumnIfMissing, and preserved tables (the ones
-    //    with data) get their new columns only from their own step's ALTER.
-    db.exec(SCHEMA_SQL);
-    setUserVersion(db, LEGACY_TARGET_VERSION);
-  })();
+    if (readUserVersion(db) >= MIN_OWNED_VERSION && !hasForeignObjects(db) && hasOwnedTableSet(db)) return;
+    fail(
+      `refusing to write to ${path}: it is a SQLite database this tool did not create — ` +
+        "point `sqlitePath` at a new or existing audit database instead (nothing was modified)",
+    );
+  } catch (e) {
+    throw e instanceof DbError ? e : mapReadOnlyOpenError(e, path);
+  } finally {
+    db.close();
+  }
 }
 
+// ---- migrations (§3: version-stepped; each step ONE transaction stamping its target) --------
 // migrateV2toV3 — additive: run_unit_head gains nullable is_default_branch (INTEGER 1/0/NULL;
 // NULL = unknown). Existing v2 rows are backfilled NULL by construction (ALTER ADD COLUMN),
 // NEVER 0 — "unknown" and "not the default branch" are different report states. SCHEMA_SQL runs
@@ -567,6 +663,10 @@ export class AuditDb {
       // Re-assert now that the parent exists: a symlink swapped in between the first check
       // and the mkdir would be followed by this second resolution and rejected.
       path = assertContained(resolved, roots);
+      // §0 ownership: prove the file is ours BEFORE the writable open below, whose WAL pragma
+      // would already have rewritten a stranger's header. (:memory: needs no proof — a fresh
+      // in-memory database is empty by construction and shares nothing with the filesystem.)
+      assertOwnedDatabase(path);
     }
     // strict: throws on binding-count mismatches instead of silently binding NULLs.
     // NOTE: `safeIntegers` is intentionally left OFF (the default). With it off, bun:sqlite returns
@@ -588,6 +688,25 @@ export class AuditDb {
     if (userVersion > SCHEMA_VERSION) {
       db.close();
       fail(`database schema version ${userVersion} is newer than this tool's ${SCHEMA_VERSION} — upgrade the tool`);
+    }
+
+    // BACKSTOP only — assertOwnedDatabase already refused every foreign file it could prove, so
+    // this is normally unreachable. It re-runs the SAME ownedness test (empty, or foreign-free
+    // with a producible table set) on the WRITABLE connection, which reads THROUGH any recovered
+    // WAL — closing what the immutable preflight cannot see: a foreign checkpoint landing between
+    // the preflight and this open (the preflight's own wal-guard covers the on-disk case, but not
+    // that race). Reaching it costs sidecar recovery on their file and a checkpoint on close —
+    // data-preserving, and strictly better than the alternative of writing our schema into it.
+    // Fires BEFORE --fresh can drop anything. The empty arm keeps fresh creation alive: a
+    // just-created file has zero objects and, by definition, no owner to protect.
+    const backstopEmpty =
+      db.query(`SELECT 1 AS x FROM sqlite_master WHERE ${NOT_SQLITE_INTERNAL} LIMIT 1`).get() === null;
+    if (!backstopEmpty && (hasForeignObjects(db) || !hasOwnedTableSet(db))) {
+      db.close();
+      fail(
+        `refusing to write to ${path}: it is a SQLite database this tool did not create — ` +
+          "point `sqlitePath` at a new or existing audit database instead",
+      );
     }
 
     if (opts.fresh === true) {
@@ -620,20 +739,17 @@ export class AuditDb {
 
     const existing = AUDIT_TABLES.filter((t) => tableExists(db, t));
     if (existing.length === 0) {
-      if (hasForeignTables(db)) {
-        db.close();
-        fail(`refusing to adopt a non-audit SQLite database (foreign tables present, no audit tables)`);
-      }
-      // Fresh (or fully fresh-dropped) database: create at the current version.
+      // Fresh (or fully fresh-dropped) database: create at the current version. assertOwnedDatabase
+      // already established this file is ours to write — a foreign database never reaches here.
       db.transaction(() => {
         db.exec(SCHEMA_SQL);
         setUserVersion(db, SCHEMA_VERSION);
       })();
     } else if (userVersion < SCHEMA_VERSION) {
-      // Version-stepped chain: the quarantined legacy step first (pre-v2 only), then each
-      // additive step gated on its own PINNED target. Every step stamps that target in its
-      // own transaction, so a crash mid-chain resumes cleanly on the next open.
-      if (userVersion < LEGACY_TARGET_VERSION) migrateLegacy(db);
+      // Version-stepped chain: each additive step gated on its own PINNED target, stamping that
+      // target in its own transaction, so a crash mid-chain resumes cleanly on the next open.
+      // There is no pre-v2 step: assertOwnedDatabase refuses a non-empty database stamped below
+      // MIN_OWNED_VERSION rather than adopting and rebuilding it, so userVersion is >= 2 here.
       if (readUserVersion(db) < V3_TARGET_VERSION) migrateV2toV3(db);
     } else {
       // Idempotent self-heal for a current-version database: recreate any missing
