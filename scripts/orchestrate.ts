@@ -11,7 +11,7 @@ import { readdirSync, lstatSync, readFileSync, existsSync, rmSync } from "node:f
 import { join, dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
-import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchHead } from "./github.ts";
+import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchSnapshot, type BranchDiscoveryOutcome } from "./github.ts";
 import { planRepoBranches, planPolicyDiagnostics, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
 import { PolicyMatchError, type CompiledBranchPolicy, type PolicyCoverage } from "./branchPolicy.ts";
 import { discovered, discoveryFailed, type DiscoveryOutcome } from "./discovery.ts";
@@ -354,9 +354,13 @@ export async function discoverOwnerRepos(
 // requeues with no errors row (transient); any other error records a permanent discovery-failure row.
 export async function discoverBranchHeads(
   db: AuditDb, client: GithubClient, runId: string, repo: RepoInfo,
-): Promise<DiscoveryOutcome<BranchHead>> {
+): Promise<BranchDiscoveryOutcome> {
   try {
-    return discovered(await client.listBranchHeads(repo.organization, repo.name));
+    // listBranchHeads validates the snapshot's coherence INSIDE this try on purpose: an incoherent
+    // snapshot must become a discovery FAILURE (errors row + retained rows + no reconcile), not an
+    // exception escaping past the outcome boundary where no error is recorded and the run can be left
+    // resumable-but-wrong.
+    return { ok: true, snapshot: await client.listBranchHeads(repo.organization, repo.name) };
   } catch (e) {
     if (e instanceof ThrottleExhausted) {
       logLine({ event: "discovery", org: repo.organization, repo: repo.name, action: "requeue-throttle", message: (e as Error).message });
@@ -380,13 +384,14 @@ export async function processRepo(
   const { config, configHash, branchPolicy } = runtime;
   const outcome = await discoverBranchHeads(db, client, runId, repo);
   if (!outcome.ok) return null; // failed/throttled — this repo isn't "discovered"; contributes no coverage
-  const heads = outcome.items;
+  const heads = outcome.snapshot.heads;
   // Classify the WHOLE repo up-front (policy → cutoff/cap) via the ONE shared planner. This runs
   // OUTSIDE the discovery catch and BEFORE any per-branch write, so a malformed-glob PolicyMatchError
   // aborts before this repo is half-classified (runScan then fails the run and rethrows).
-  const plan = planRepoBranches(heads, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
-  // Discovery KNOWS the default branch (§5.A), so every head row this run writes carries a definite
-  // true/false — NULL is reserved for pre-v3 rows where nothing ever recorded it.
+  const plan = planRepoBranches(outcome.snapshot, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo);
+  // Discovery KNOWS the default branch (§5.B — resolved from the same snapshot as these heads), so
+  // every head row this run writes carries a definite true/false — NULL is reserved for pre-v3 rows
+  // where nothing ever recorded it.
   const keyFor = (branch: string): WorkUnitKey => ({ configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch });
 
   // Policy-excluded (non-default, denied/allow-missed): a NEW skipped-cutoff row carrying the policy
@@ -764,9 +769,12 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
     });
     reposKept += kept.length;
     for (const repo of kept) {
-      let heads: BranchHead[];
+      // --plan has no DB, so it consumes the client directly rather than via discoverBranchHeads. It
+      // must still take the default branch from the SAME snapshot as the heads (§5.B) — a --plan that
+      // sourced it differently from the run would report a scan scope the run would not produce.
+      let snapshot: BranchSnapshot;
       try {
-        heads = await client.listBranchHeads(repo.organization, repo.name);
+        snapshot = await client.listBranchHeads(repo.organization, repo.name);
       } catch (e) {
         discoveryErrors++;
         logLine({ event: "plan", org: repo.organization, repo: repo.name, error: `branch discovery failed: ${(e as Error).message}` });
@@ -775,7 +783,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
       // The SAME shared planner the real run uses, so --plan and the run can never disagree (§5).
       // branchesEligible counts toScan (default + within-cap after-cutoff); policy-excluded is its own
       // disjoint bucket. A malformed-glob PolicyMatchError propagates FATAL (no DB to mark; main exits 1).
-      const p = planRepoBranches(heads, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
+      const p = planRepoBranches(snapshot, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo);
       const diag = planPolicyDiagnostics(p); // fail-closed deny/allow split + default-override count
       coverages.push(p.coverage); // this repo was discovered successfully (even if empty) — §8 coverage
       branchesEligible += p.toScan.length;

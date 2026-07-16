@@ -165,11 +165,30 @@ export interface BranchClassification {
 }
 
 // Classify a branch by name. `defaultBranch` is the repo's default branch NAME (not a boolean) so
-// the classifier — not the caller — decides default-ness. May throw PolicyMatchError (fail-closed).
+// the classifier — not the caller — decides default-ness. It comes from the SAME GraphQL snapshot as
+// the head being classified (github.ts::BranchSnapshot), never from the older REST listing. `null`
+// means the repo has no default branch, which a validated snapshot only permits when it has no heads
+// at all — so in practice this function is never called with null.
+//
+// The comparison is the bare `name === defaultBranch` simply because a `defaultBranch !== null &&`
+// guard would be REDUNDANT: no head can be named null (listBranchHeads also rejects an empty name), so
+// the equality is already false for a null default. The two forms are exactly equivalent — `null` and
+// `undefined` both yield false either way — so the guard would add a condition that never changes an
+// outcome.
+//
+// Note what that equivalence means, because it is easy to misread as a safety property: it is NOT one.
+// With no default, `isDefaultBranch` is false for EVERY head, which is precisely the Premise-6
+// violation (nothing wins the always-eligible exemption, so a restrictive policy excludes the whole
+// repo). This function CANNOT fail closed on that — from here "no default" and "not the default" are
+// indistinguishable. Two callers upstream are what actually prevent it: listBranchHeads rejects an
+// incoherent snapshot on the wire, and planRepoBranches refuses (`defaultBranch == null`, loose, so
+// `undefined` is caught too) to plan heads with no default. Do not weaken either on the assumption
+// that this comparison is defensive.
+// May throw PolicyMatchError (fail-closed).
 export function classifyBranch(
   policy: CompiledBranchPolicy,
   name: string,
-  defaultBranch: string,
+  defaultBranch: string | null,
 ): BranchClassification {
   const isDefaultBranch = name === defaultBranch;
   const rawPolicyResult = evaluateBranchPolicy(policy, name);

@@ -3,12 +3,13 @@
 // counts can never diverge. Policy is applied BEFORE cutoff/cap: a denied recent branch must never
 // consume a cap slot that an allowed older branch could have used (§12). Pure — no I/O, no DB.
 
-import type { BranchHead } from "./github.ts";
+import type { BranchHead, BranchSnapshot } from "./github.ts";
 import { classifyBranch, coverageForName, type CompiledBranchPolicy, type PolicyResult, type PolicyCoverage } from "./branchPolicy.ts";
 import type { PolicyStatus } from "./db.ts";
 
 // §5.B classification, pure: heads arrive sorted committedDate DESC. The repo's DEFAULT branch
-// (matched by name; known from §5.A discovery) is ALWAYS eligible — exempt from BOTH the cutoff
+// (matched by name; resolved by §5.B discovery from the SAME snapshot as these heads — never from the
+// older §5.A REST listing, see github.ts::BranchSnapshot) is ALWAYS eligible — exempt from BOTH the cutoff
 // filter and the cap — so the default-branch view the report's headline metrics depend on is
 // never silently absent (CV2: a dormant default behind active feature branches, or one past the
 // cap, must still be scanned). Every OTHER still-live branch before cutoffDate is
@@ -24,7 +25,7 @@ export interface BranchPlan {
   readonly pastCap: readonly BranchHead[];
 }
 export function classifyBranchPlan(
-  heads: readonly BranchHead[], cutoffDate: string, maxBranchesPerRepo: number, defaultBranch: string,
+  heads: readonly BranchHead[], cutoffDate: string, maxBranchesPerRepo: number, defaultBranch: string | null,
 ): BranchPlan {
   const cutoffSkipped: BranchHead[] = [];
   const eligible: BranchHead[] = [];
@@ -72,12 +73,31 @@ export interface RepoBranchPlan {
 // so such a throw aborts before this repo is half-classified; callers must let it propagate FATAL
 // (never a per-repo/per-unit soft error — a denied branch must never be silently scanned).
 export function planRepoBranches(
-  heads: readonly BranchHead[],
+  snapshot: BranchSnapshot,
   policy: CompiledBranchPolicy,
   cutoffDate: string,
   maxBranchesPerRepo: number,
-  defaultBranch: string,
 ): RepoBranchPlan {
+  const { heads, defaultBranch } = snapshot;
+  // FAIL-CLOSED snapshot invariant (§12). listBranchHeads already rejects this pairing, so reaching it
+  // means the snapshot did not come from a validated discovery — a hand-built test double, or a future
+  // caller that reassembled `heads` and `defaultBranch` from different sources (exactly the stale-epoch
+  // mistake BranchSnapshot exists to make unrepresentable). Planning it would be actively dangerous:
+  // with no default, NO head can win the always-eligible exemption, so a restrictive policy would
+  // exclude every branch and the repo would silently yield zero scanned units. Throw instead — the
+  // whole-repo classification runs before any per-branch write, and processRepo lets this propagate
+  // FATAL rather than degrade into a silent under-report.
+  // `== null` (LOOSE) is deliberate and load-bearing: it catches `undefined` as well as `null`. The
+  // shape this guard exists to catch is a hand-built double, and the commonest such shape is an
+  // OMITTED key — which yields `undefined`, and `undefined === null` is false. A strict check would
+  // therefore miss the exact case it was written for and let the snapshot through to be planned with
+  // nothing default. This is the ONLY thing standing between that mistake and a silent zero-unit repo:
+  // `name === defaultBranch` yields false for null AND undefined alike, so the classifier cannot
+  // distinguish "no default" from "not the default" — it does not, and cannot, fail closed on its own.
+  if (defaultBranch == null && heads.length > 0)
+    throw new Error(
+      `internal: branch snapshot has ${heads.length} head(s) but no default branch — refusing to plan (an unvalidated snapshot; policy would exclude every head)`,
+    );
   const decisions = new Map<BranchHead, BranchDecision>();
   const matchedInclude = new Set<string>();
   const matchedExclude = new Set<string>();

@@ -252,19 +252,24 @@ describe("path encoding + repo shaping", () => {
   test("encodeContentsPath encodes per segment, preserving '/'", () => {
     expect(encodeContentsPath("src dir/ü#?.ts")).toBe("src%20dir/%C3%BC%23%3F.ts");
   });
-  test("mapRestRepo maps the snake_case REST shape", () => {
+  test("mapRestRepo maps the snake_case REST shape and IGNORES default_branch (a stale epoch)", () => {
     const repo = mapRestRepo({
       name: "r", owner: { login: "o" }, default_branch: "main",
       pushed_at: "2024-06-01T00:00:00Z", archived: false, fork: true, private: true,
     });
+    // toEqual is exact, so this pins the ABSENCE of any default-branch field: the REST listing is a
+    // different (older) epoch than §5.B branch discovery, and letting its default_branch reach the
+    // planner is what allowed a renamed default to be policy-excluded. The default comes from
+    // listBranchHeads' snapshot instead — there is deliberately no REST fallback.
     expect(repo).toEqual({
-      name: "r", organization: "o", defaultBranch: "main",
+      name: "r", organization: "o",
       pushedAt: "2024-06-01T00:00:00Z", archived: false, fork: true, isPrivate: true,
     });
+    expect(Object.hasOwn(repo, "defaultBranch")).toBe(false);
   });
   test("filterSortCapRepos: client-side fork/archived policy, pushed_at DESC nulls last, cap", () => {
     const mk = (name: string, pushedAt: string | null, extra: Partial<RepoInfo> = {}): RepoInfo => ({
-      name, organization: "o", defaultBranch: "main", pushedAt, archived: false, fork: false, isPrivate: false, ...extra,
+      name, organization: "o", pushedAt, archived: false, fork: false, isPrivate: false, ...extra,
     });
     const repos = [
       mk("old", "2023-01-01T00:00:00Z"),
@@ -1116,10 +1121,11 @@ describe("graphql", () => {
 });
 
 describe("listBranchHeads (§5.B)", () => {
-  test("paginates with endCursor (omitted on first page), sorts committedDate DESC", async () => {
+  test("paginates with endCursor (omitted on first page), sorts committedDate DESC, resolves the default", async () => {
     const page1 = {
       data: {
         repository: {
+          defaultBranchRef: { name: "main" },
           refs: {
             pageInfo: { hasNextPage: true, endCursor: "CUR1" },
             nodes: [{ name: "old", target: { oid: "o1", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t1" } } }],
@@ -1130,6 +1136,7 @@ describe("listBranchHeads (§5.B)", () => {
     const page2 = {
       data: {
         repository: {
+          defaultBranchRef: { name: "main" },
           refs: {
             pageInfo: { hasNextPage: false, endCursor: null },
             nodes: [{ name: "main", target: { oid: "o2", committedDate: "2024-06-01T00:00:00Z", tree: { oid: "t2" } } }],
@@ -1138,18 +1145,33 @@ describe("listBranchHeads (§5.B)", () => {
       },
     };
     const { client, calls } = makeClient([ok(http(200, {}, JSON.stringify(page1))), ok(http(200, {}, JSON.stringify(page2)))]);
-    const heads = await client.listBranchHeads("o", "r");
-    expect(heads.map((h) => h.name)).toEqual(["main", "old"]);
-    expect(heads[0]!.treeOid).toBe("t2");
+    const snapshot = await client.listBranchHeads("o", "r");
+    expect(snapshot.heads.map((h) => h.name)).toEqual(["main", "old"]);
+    expect(snapshot.heads[0]!.treeOid).toBe("t2");
+    expect(snapshot.defaultBranch).toBe("main"); // from the SAME snapshot as the heads, not the REST listing
     expect(calls[0]!.args.some((a) => a.startsWith("endCursor="))).toBe(false); // first page omits it
     expect(calls[1]!.args).toContain("endCursor=CUR1");
+  });
+
+  // Pins the QUERY, not just the response handling. A scripted fixture answers whatever it is asked, so
+  // every assertion above would still pass if the query silently stopped requesting defaultBranchRef and
+  // the field were served from a stale fixture — this is the only check that the wire request is right.
+  test("the GraphQL query actually requests defaultBranchRef on the repository node", async () => {
+    const { client, calls } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: null, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } }))),
+    ]);
+    await client.listBranchHeads("o", "r");
+    const queryArg = calls[0]!.args.find((a) => a.startsWith("query="))!;
+    expect(queryArg).toContain("defaultBranchRef{name}");
   });
 
   // FAIL-CLOSED completeness (load-bearing for T11 reconciliation): an understated branch set would
   // make the prune delete live branches, so a malformed node or a silently-truncated page must THROW
   // (→ discovery 'failed' → the repo is retained, never reconciled) rather than return a partial list.
-  const refsPage = (over: Record<string, unknown>) =>
-    ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [], ...over } } } })));
+  // `defaultBranchRef: null` (a repo with no commits) is the neutral default here so these fixtures
+  // exercise the node/pagination guards rather than tripping the default-branch guards first.
+  const refsPage = (over: Record<string, unknown>, repoOver: Record<string, unknown> = {}) =>
+    ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: null, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [], ...over }, ...repoOver } } })));
   test("a non-Commit / malformed node throws instead of being silently dropped", async () => {
     const { client } = makeClient([refsPage({ nodes: [{ name: "weird", target: {} }] })]);
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed branch-head node/);
@@ -1181,15 +1203,83 @@ describe("listBranchHeads (§5.B)", () => {
   test("a duplicate branch name across pages throws (unstable pagination)", async () => {
     const dup = { name: "main", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } };
     const { client } = makeClient([
-      ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [dup] } } } }))),
-      ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [dup] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [dup] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [dup] } } } }))),
     ]);
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/duplicate branch/);
   });
+
+  // ---- default-branch resolution (§5.B): the snapshot's two halves must be coherent -------------
+  // The default's ALWAYS-eligible exemption is decided by `headName === defaultBranch`, so a default
+  // that is wrong, unresolved, or paired with the wrong head set would let a restrictive policy drop a
+  // repo's real default SILENTLY. Every incoherence therefore fails closed (→ discovery 'failed' → an
+  // errors row → the repo is retained and never reconciled) rather than degrading.
+  test("a page that OMITS defaultBranchRef throws — absent is not the same as null", async () => {
+    // We asked for the field; a clean 200 without it is structurally malformed (a real schema or
+    // permission failure would have surfaced in GraphQL `errors` and been rejected upstream). Explicit
+    // null is a legal answer ("this repo has no default"); silence is not.
+    const { client } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } }))),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/omits defaultBranchRef/);
+  });
+  test("defaultBranchRef null + ZERO heads is the legal empty repo (not an error)", async () => {
+    const { client } = makeClient([refsPage({})]);
+    await expect(client.listBranchHeads("o", "r")).resolves.toEqual({ heads: [], defaultBranch: null });
+  });
+  test("defaultBranchRef null + a live head throws (cannot plan a repo with no default)", async () => {
+    // With no default, NO head can win the always-eligible exemption, so `branches: []` would exclude
+    // every branch and the repo would silently yield zero units. A loud error beats that.
+    const { client } = makeClient([
+      refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] }),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/null but 1 head\(s\) were discovered/);
+  });
+  test("a malformed defaultBranchRef (missing/empty name) throws", async () => {
+    for (const ref of [{}, { name: "" }, { name: 42 }]) {
+      const { client } = makeClient([refsPage({}, { defaultBranchRef: ref })]);
+      await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed defaultBranchRef/);
+    }
+  });
+  test("a default branch ABSENT from the discovered heads throws (incoherent snapshot)", async () => {
+    // e.g. the default is 'trunk' but no 'trunk' head came back — the two halves describe different
+    // repo states, so no head could be classified default and policy would exclude the real one.
+    const { client } = makeClient([
+      refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] }, { defaultBranchRef: { name: "trunk" } }),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/is absent from the discovered heads/);
+  });
+  test("a null→named defaultBranchRef transition mid-pagination throws (the null is not 'unset')", async () => {
+    // The re-assertion compares against the FIRST page's value including an explicit null, so a repo
+    // that gains a default mid-walk is caught too — null is a read answer, not "not yet known".
+    const { client } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: null, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ name: "main", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] } } } }))),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/changed mid-pagination/);
+  });
+  test("defaultBranchRef ABSENT on a LATER page throws (every page is validated, not just page 1)", async () => {
+    const { client } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [{ name: "main", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } }))),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/omits defaultBranchRef/);
+  });
+  test("a default branch that CHANGES mid-pagination throws (the classification authority moved)", async () => {
+    // Membership alone cannot catch this when both names stay live: page 1 says main is default, page 2
+    // says trunk, and both are in the head set. Unlike the rejected totalCount cross-check (which trips
+    // on unrelated branch churn), a default disagreement means the authority itself changed mid-walk.
+    const { client } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [{ name: "main", target: { oid: "o1", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t1" } } }] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "trunk" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ name: "trunk", target: { oid: "o2", committedDate: "2024-02-01T00:00:00Z", tree: { oid: "t2" } } }] } } } }))),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/changed mid-pagination/);
+  });
+
   // same poisoned-pagination class as restGetPagedArray: the cursor chain must be bounded.
   const cursorPage = (cursor: string) =>
     ok(http(200, {}, JSON.stringify({
-      data: { repository: { refs: { pageInfo: { hasNextPage: true, endCursor: cursor }, nodes: [] } } },
+      data: { repository: { defaultBranchRef: null, refs: { pageInfo: { hasNextPage: true, endCursor: cursor }, nodes: [] } } },
     })));
   test("a repeated endCursor throws instead of looping", async () => {
     const { client, calls } = makeClient([cursorPage("CUR1"), cursorPage("CUR1")]);

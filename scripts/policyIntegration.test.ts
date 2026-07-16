@@ -44,17 +44,24 @@ const rt = (config: Config, configHash: string): AuditRuntime =>
 // One org repo `svc` (default main) + GraphQL heads + EMPTY trees; any git spawn is a failure (pins the
 // no-clone assumption — a non-truncated tree never triggers cloneShallow).
 interface Head { name: string; oid: string; date: string }
-const graphqlHeads = (nodes: Head[]): string =>
-  `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: { refs: {
-    pageInfo: { hasNextPage: false, endCursor: null },
-    nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: `tree-${n.oid}` } } })),
-  } } } })}`;
+// The default branch is stated EXPLICITLY (never inferred from the head list): §5.B discovery resolves
+// it from THIS response, so a fixture that derived it from its own heads could never disagree with the
+// code and would hide a default-resolution defect.
+const graphqlHeads = (nodes: Head[], defaultBranch: string | null): string =>
+  `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: {
+    defaultBranchRef: defaultBranch === null ? null : { name: defaultBranch },
+    refs: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: `tree-${n.oid}` } } })),
+    },
+  } } })}`;
+// NOTE the REST listing still carries default_branch — the shape is real, the auditor just ignores it.
 const repoList = `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}`;
 
-function scanClient(root: string, heads: Head[]): GithubClient {
+function scanClient(root: string, heads: Head[], defaultBranch: string | null): GithubClient {
   const spawn: SpawnFn = async (bin, args) => {
     if (bin.endsWith("/git")) throw new Error(`unexpected git spawn (${args.join(" ")}) — non-truncated trees must never clone`);
-    if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads(heads) };
+    if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads(heads, defaultBranch) };
     if (args.some((a) => a.includes("git/trees"))) return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: false, tree: [] })}` };
     return { exitCode: 0, stderr: "", stdout: repoList };
   };
@@ -99,7 +106,7 @@ describe("branch allow/deny — end-to-end policy classification seam (T10)", ()
     try {
       // ---- Run A: deny [deny-me] ----
       const cfgA = mkConfig(root, { branches: ALLOW, excludeBranches: ["deny-me"], maxBranchesPerRepo: 1 });
-      const evA = await captureJsonl(() => runScan(db, scanClient(root, HEADS), rt(cfgA, "hashA"), NO_ARGS, null));
+      const evA = await captureJsonl(() => runScan(db, scanClient(root, HEADS, "main"), rt(cfgA, "hashA"), NO_ARGS, null));
       const runIdA = runIdOf(evA);
 
       // the persisted disposition snapshot — the single source both report and export read
@@ -134,7 +141,7 @@ describe("branch allow/deny — end-to-end policy classification seam (T10)", ()
 
       // ---- Run B: additionally deny [feature/x] — overflow is PROMOTED into the freed cap slot ----
       const cfgB = mkConfig(root, { branches: ALLOW, excludeBranches: ["deny-me", "feature/x"], maxBranchesPerRepo: 1 });
-      const evB = await captureJsonl(() => runScan(db, scanClient(root, HEADS), rt(cfgB, "hashB"), NO_ARGS, null));
+      const evB = await captureJsonl(() => runScan(db, scanClient(root, HEADS, "main"), rt(cfgB, "hashB"), NO_ARGS, null));
       const runIdB = runIdOf(evB);
       const rowsB = Object.fromEntries(headRows(db, runIdB).map((r) => [r["branch"], r]));
       expect(rowsB["feature/x"]).toMatchObject({ status: "skipped-cutoff", sha: "", ps: "excluded-by-deny", pat: "feature/x" });

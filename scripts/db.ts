@@ -1938,7 +1938,7 @@ export class AuditDb {
   }
 
   // §11 reconciliation (schema-neutral): after a repo's branches are COMPLETELY re-discovered
-  // (DiscoveryOutcome ok:true, which listBranchHeads guarantees is the exact live set), prune this
+  // (BranchDiscoveryOutcome ok:true, whose snapshot listBranchHeads guarantees is the exact live set), prune this
   // run's run_unit_head rows for branches no longer present — the phantom rows a resume leaves when a
   // branch is deleted between invocations. Scoped to (run_id, org, repo): it can NEVER touch another
   // run or another repo, and the sole caller (processRepo) reaches it only on successful discovery, so

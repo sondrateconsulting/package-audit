@@ -611,11 +611,27 @@ A. Resolve the effective owner list per the NORMATIVE algorithm in §1 (base set
    `pushed_at` DESC (nulls last), and TAKE the first N when maxReposPerOrg is finite (all
    when null). The REST shape is snake_case (`pushed_at`, `archived`, `fork`,
    `default_branch` as a flat STRING) — map it into the one internal shape the rest of the
-   workflow uses. maxReposPerOrg applies per OWNER (incl. the personal namespace).
+   workflow uses, but DELIBERATELY DROP `default_branch`: this listing is a DIFFERENT (older)
+   EPOCH than §5.B branch discovery — the whole owner is listed up front, then each repo's
+   heads are discovered one at a time — so carrying its default-branch name forward would let
+   a default renamed in that window be treated as non-default, and under branch policy the
+   always-eligible exemption would then miss the repo's REAL default and silently exclude it.
+   §5.B resolves the default instead. There is NO REST fallback: a fallback would reintroduce
+   the stale epoch at exactly the moment the authoritative source is unavailable.
+   maxReposPerOrg applies per OWNER (incl. the personal namespace).
 B. Discover & prioritize branches: via `gh api graphql` querying
    refs(refPrefix:"refs/heads/", first:100, after:$endCursor) with
    target{...on Commit{committedDate,oid,tree{oid}}} and `pageInfo{hasNextPage endCursor}`
-   (the `tree.oid` is the commit's ROOT TREE SHA, needed by §5.C's git/trees call).
+   (the `tree.oid` is the commit's ROOT TREE SHA, needed by §5.C's git/trees call), PLUS
+   `defaultBranchRef{name}` on the SAME `repository` node — so the default branch is resolved
+   from the same snapshot as the heads, at no extra request. The two halves are validated
+   TOGETHER and fail closed: `defaultBranchRef` ABSENT from a page is malformed (we asked for
+   it) and is NOT the same as an explicit `null`, which legitimately means "this repo has no
+   commits"; the name is re-asserted on EVERY page (a mid-pagination change means the
+   classification authority itself moved); a non-null default MUST name one of the discovered
+   heads; and a null default paired with any head is rejected. An incoherent snapshot becomes
+   a discovery FAILURE (an errors row — loud, and the repo is retained, never reconciled)
+   rather than a silently mis-planned repo.
    GitHub's `RefOrderField` cannot order heads by commit date server-side (only
    ALPHABETICAL, or TAG_COMMIT_DATE for tags), so ENUMERATE ALL PAGES — a repo with >100
    branches would otherwise silently lose branches. As in §5.A, PAGINATE IN TYPESCRIPT
@@ -632,11 +648,13 @@ B. Discover & prioritize branches: via `gh api graphql` querying
    status `skipped` AND upsert a `run_unit_head` row for THIS run with
    `status='skipped-cutoff'`, commit_sha='', so §7's branchesSkippedByCutoff is per-run
    reproducible), and cap at maxBranchesPerRepo. EXCEPTION: the repo's DEFAULT branch
-   (known from §5.A discovery) is ALWAYS eligible — exempt from both the cutoff filter
+   (resolved by §5.B from the SAME snapshot as these heads — never from §5.A's older REST
+   listing) is ALWAYS eligible — exempt from both the cutoff filter
    and the cap (the cap counts the remaining branches, so a repo can yield cap+1
    eligible units) — the default-branch view the report's headline metrics depend on
    must never be silently absent; a default branch not among the live heads admits
-   nothing. Record `is_default_branch` (1/0, §3) on every `run_unit_head` upsert —
+   nothing (and §5.B rejects that snapshot outright, so a live run never plans one).
+   Record `is_default_branch` (1/0, §3) on every `run_unit_head` upsert —
    discovery always knows it, so live runs never write NULL. The `oid` is the live head the §3 skip predicate compares against —
    obtaining it here costs zero extra requests.
 C. Locate manifests read-only. Build the API path in TypeScript (github.ts) —
