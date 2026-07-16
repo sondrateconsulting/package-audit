@@ -1062,7 +1062,7 @@ describe("introspectVersion — integration (real system tar)", () => {
     db.close();
   });
 
-  test("§7 surface epoch: a STALE-epoch marker is re-inspected; the fresh current-epoch marker then short-circuits", async () => {
+  test("§5.E surface epoch: a STALE-epoch marker is re-inspected; the fresh current-epoch marker then short-circuits", async () => {
     // A package audited by the OLD, buggy resolver left a bare '__complete__' marker (no epoch).
     // hasCompletionMarker must treat it as ABSENT so the fixed resolver re-audits the version.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
@@ -1098,7 +1098,7 @@ describe("introspectVersion — integration (real system tar)", () => {
     db.close();
   });
 
-  test("a thin-barrel chain over the parse-file budget is fail-closed: NO marker + errors row (§7)", async () => {
+  test("a thin-barrel chain over the parse-file budget is fail-closed: NO marker + errors row (§5.E)", async () => {
     // 4 barrels + a shared child = 5 parses; inject maxParseFiles=3 → DtsLimitError → errors row.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     await run(
