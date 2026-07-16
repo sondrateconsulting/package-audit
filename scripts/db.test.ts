@@ -2549,6 +2549,33 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     db.close();
   });
 
+  test("G2b: an OMITTED or undefined required field is rejected — undefined must never default silently", () => {
+    // The field docs promise `undefined` can never silently become "not the default" / "no policy",
+    // but the type is erased at runtime and the upsert's own binding would launder it:
+    // `isDefaultBranch === null ? null : isDefaultBranch ? 1 : 0` maps undefined to 0 — `undefined
+    // === null` is FALSE, and undefined is then falsy — durably recording "not the default branch"
+    // for a branch whose default-ness was never established. A JS caller or a test double bypassing
+    // the type is exactly how that arrives, so the chokepoint enforces the presence the docs claim
+    // rather than trusting the compiler.
+    const db = fresh();
+    const base = (): Record<string, unknown> => ({
+      runId: "r1", organization: "o", repository: "r", branch: "b", commitSha: "sha1",
+      status: "scanned", isDefaultBranch: false,
+      policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-01-01T00:00:00Z",
+    });
+    for (const k of ["isDefaultBranch", "policyStatus", "policyMatchedPattern", "scannedCommitDate"] as const) {
+      const omitted = base();
+      delete omitted[k];
+      expect(() => db.upsertRunUnitHead(omitted as unknown as RunUnitHeadInput)).toThrow(new RegExp(`${k} is required \\(key omitted\\)`));
+      const undef = { ...base(), [k]: undefined };
+      expect(() => db.upsertRunUnitHead(undef as unknown as RunUnitHeadInput)).toThrow(new RegExp(`${k} is required, got undefined`));
+    }
+    // the tri-state is checked BY VALUE too, so a stray truthy/JSON-ish value cannot slip through to 1/0
+    expect(() => seed(db, { isDefaultBranch: "true" as unknown as boolean })).toThrow(/is_default_branch must be true, false, or null/);
+    expect(() => seed(db, { isDefaultBranch: 1 as unknown as boolean })).toThrow(/is_default_branch must be true, false, or null/);
+    db.close();
+  });
+
   test("G3: a past-cap row carrying a policy_status is rejected (policy precedes the cap)", () => {
     const db = fresh();
     expect(() => seed(db, { status: "past-cap", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "x" })).toThrow(/past-cap rows must have policy_status null/);

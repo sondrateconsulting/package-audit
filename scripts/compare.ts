@@ -24,7 +24,7 @@
 import { existsSync } from "node:fs";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
-import { isPolicyExcluded, isDefaultOverride } from "./policyDisposition.ts";
+import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
@@ -309,17 +309,26 @@ function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
       .map((h) => [unitKey(h.organization, h.repository, h.branch, h.commit_sha), h.is_default_branch === null ? null : h.is_default_branch === 1]),
   );
   const policyByBranch = new Map<string, PolicyBranchState>(
-    heads.map((h) => [
-      `${h.organization}\0${h.repository}\0${h.branch}`,
-      {
-        status: h.status,
-        isDefaultBranch: h.is_default_branch === null ? null : h.is_default_branch === 1,
-        policyStatus: h.policy_status,
-        policyMatchedPattern: h.policy_matched_pattern,
-        policyApplied: isPolicyExcluded(h),
-        defaultOverride: isDefaultOverride(h),
-      },
-    ]),
+    heads.map((h) => {
+      // Fail closed on a policy-bearing row that is neither an exclusion nor a default override — the
+      // same guard the report's scan-scope ledger applies, from the same shared definition. Without it
+      // such a row gets policyApplied=false + defaultOverride=false, i.e. exactly the shape of an
+      // ordinary unrestricted branch, and buildPolicyChurn's final else-branch would file it under
+      // defaultOverrideChanges ("neither applied, but the counterfactual changed") — laundering a
+      // malformed disposition into a plausible-looking churn entry.
+      assertKnownPolicyDisposition(h, `${h.organization}/${h.repository}@${h.branch}`);
+      return [
+        `${h.organization}\0${h.repository}\0${h.branch}`,
+        {
+          status: h.status,
+          isDefaultBranch: h.is_default_branch === null ? null : h.is_default_branch === 1,
+          policyStatus: h.policy_status,
+          policyMatchedPattern: h.policy_matched_pattern,
+          policyApplied: isPolicyExcluded(h),
+          defaultOverride: isDefaultOverride(h),
+        },
+      ];
+    }),
   );
 
   // The run-scoped slice: findings joined through the immutable snapshot (report.ts's join),

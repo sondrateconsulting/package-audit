@@ -93,6 +93,19 @@ below).
                                        //   scanned repo's .npmrc
     }
   ],
+  "branches": null,                    // branch allow/deny (§5.B): allowlist of exact names or Bun
+                                       //   globs. null/omitted = UNRESTRICTED (every branch eligible,
+                                       //   subject to cutoff/cap); [] = ONLY the default branch is
+                                       //   eligible; a leading '!' is rejected (no glob negation).
+                                       //   null and [] are DIFFERENT and both meaningful: [] makes the
+                                       //   policy CONFIGURED, which config_hash keys on — a POLICY-FREE
+                                       //   config must keep its PRE-FEATURE hash, so the hashed
+                                       //   projection omits both keys when neither is configured.
+  "excludeBranches": [],               // denylist, same syntax. DENY WINS over `branches`. The DEFAULT
+                                       //   branch is ALWAYS eligible regardless of either list
+                                       //   (Premise 6); it records the counterfactual instead — a
+                                       //   policy_status on a SCANNED row is the default-branch
+                                       //   override, NOT an exclusion (§3).
   "cutoffDate": "2024-01-01",          // ISO date; ignore non-default branches with no commits since this
   "maxBranchesPerRepo": 25,
   "maxReposPerOrg": null,              // null = unlimited
@@ -259,9 +272,21 @@ database the next open resumes from. Current chain: the additive v2→v3 step �
 and "not the default branch" are distinct report states); the step runs the idempotent new-shape
 CREATEs FIRST (a `--fresh` drop on a v2 database removes `run_unit_head` while the preserved caches
 keep the file non-empty, so the step must recreate missing tables before its ALTER), then stamps 3.
-A current-version (v3) database self-heals idempotently on open: re-run the new-shape CREATEs and
-re-apply the additive column set, so a file missing a table or the `is_default_branch` column is
-repaired rather than left a dead end.
+Then the v3→v4 step, a crash-atomic REBUILD rather than an ALTER (SQLite cannot ALTER a CHECK, and
+v4 widens the status CHECK to admit 'past-cap'): in ONE transaction it creates a scratch table
+carrying the v4 body, copies the v3 columns explicitly BY NAME, drops the old table, renames the
+scratch into place, re-fingerprints the result and re-checks FK integrity, and only then stamps 4.
+Its three new columns (`policy_status`, `policy_matched_pattern`, `scanned_commit_date`) are NULL on
+backfilled rows BY CONSTRUCTION — a pre-v4 run recorded no branch policy and never persisted
+past-cap branches — so a NULL `scanned_commit_date` is the sentinel marking that run's scan
+scope UNVERIFIABLE (§7 `provenance`), never a claim that it excluded nothing. A STRUCTURAL
+shape classifier inspects an existing `run_unit_head` (columns via `table_xinfo`, CHECKs, FKs,
+indexes) on a READ-ONLY preflight BEFORE any writable open, so an incompatible or foreign-shaped
+table is refused without ever WAL-mutating the file.
+A current-version (v4) database self-heals idempotently on open: re-run the new-shape CREATEs, so a
+file missing a table or the `ix_ruh_loc` index is repaired rather than left a dead end (the v4
+policy columns carry CHECKs and cannot be column-repaired — a v4 `run_unit_head` missing one is
+REJECTED by the shape classifier, not silently repaired).
 `runs.tracked_packages` is persisted EXACTLY from config at run creation, so every run carries the
 correct, exact package set and the report invariant (`package_name IN json_each(tracked_packages)`)
 stays unqualified and sound. A run row carrying `tracked_packages='[]'` is explicitly NOT reportable
@@ -401,11 +426,20 @@ CREATE TABLE IF NOT EXISTS run_unit_head (
   policy_matched_pattern TEXT,         -- v4: the exact configured pattern that caused an
                                        -- 'excluded-by-deny'; NULL for every other disposition
                                        -- (an allow-list MISS names no single pattern)
-  scanned_commit_date TEXT,            -- v4: the committed date of the commit ACTUALLY scanned
-                                       -- (the clone's real HEAD on the clone fallback, §5.C) —
-                                       -- NULL only on rows backfilled by the v3→v4 migration,
-                                       -- which is what makes a run's scan-scope provenance
-                                       -- unverifiable (§7 `provenance`)
+  scanned_commit_date TEXT,            -- v4. On a SCANNED row: the committed date of the commit
+                                       -- ACTUALLY scanned (the clone's real HEAD on the clone
+                                       -- fallback, §5.C — which may differ from the discovered
+                                       -- head). On every NON-scanned row (commit_sha=''): the
+                                       -- DISCOVERED head's date, so a skipped/excluded/past-cap
+                                       -- branch still records how recent it was. NULL only on rows
+                                       -- backfilled by the v3→v4 migration — which is what makes a
+                                       -- run's scan-scope provenance unverifiable (§7 `provenance`)
+  CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+                                       -- v4, TABLE-level: a deny MUST name its causing pattern.
+                                       -- Only IS NOT NULL is expressible here, so '' still passes;
+                                       -- the write chokepoint (assertRunUnitHeadInvariants) rejects
+                                       -- the empty pattern, and also enforces the converse — every
+                                       -- NON-deny disposition carries policy_matched_pattern NULL
   PRIMARY KEY (run_id, organization, repository, branch)
 );
 CREATE TABLE IF NOT EXISTS api_cache (
@@ -463,8 +497,19 @@ Resumability rules:
   remote (no longer a live ref) or fell past `maxBranchesPerRepo` (only the most-recent N
   non-default heads are kept; the repo's DEFAULT branch is always processed, §5.B) — is
   neither re-evaluated nor re-scanned this run; it simply retains its
-  prior `done` state and historical findings/snapshot — this is intended, not an error (its
-  usage is genuinely stale), and it just isn't refreshed into new runs. A still-live non-default branch
+  prior `done` WORK-QUEUE state and its historical findings — this is intended, not an error
+  (its usage is genuinely stale), and it just isn't refreshed into new runs. What "retains" does
+  NOT mean is "this run says nothing about it", and the two cases differ: a PAST-CAP branch DOES
+  get a FRESH `run_unit_head` row this run (`status='past-cap'`, commit_sha='') recorded purely
+  for report VISIBILITY — the work queue is left untouched, so a later cap-order shift promotes it
+  without a re-scan; a DELETED branch is not surfaced at all, and §11 reconciliation prunes any row
+  a prior resume-invocation of THIS run left for it (earlier runs' rows are immutable and stay). That
+  prune is REPO-SCOPED, and deliberately so: it runs inside the per-repo path, so it can only speak for
+  repos this run re-discovered AND kept. A repo that dropped out of the kept set between invocations —
+  deleted, renamed, newly archived/fork-filtered, or displaced past `maxReposPerOrg` — is never
+  revisited, so ALL its prior rows survive. The reconciliation guarantee is therefore "a re-discovered
+  repo's rows match its live branches", never "the run's rows match the live estate".
+  A still-live non-default branch
   whose head fell BEFORE `cutoffDate` is DIFFERENT: §5.B DOES surface it and records it THIS
   run as `skipped-cutoff` in `run_unit_head` (commit_sha=''), so it stays per-run
   reproducible (§7's `branchesSkippedByCutoff`) — it is NOT left in this retain-prior-state
@@ -674,11 +719,30 @@ B. Discover & prioritize branches: via `gh api graphql` querying
    entirely so the variable defaults to null (GraphQL `after: null` = first page; do NOT
    pass an empty string); on later calls pass the returned non-null cursor. Read each page's rate-limit headers (§4), concatenate
    `data.repository.refs.nodes`, and continue while `pageInfo.hasNextPage`. ALSO check each page BODY for
-   `errors[].type == 'RATE_LIMITED'` (§4 — GraphQL throttles arrive as HTTP 200). THEN
-   sort client-side by committedDate DESC (most-recent FIRST), filter out branches whose
+   `errors[].type == 'RATE_LIMITED'` (§4 — GraphQL throttles arrive as HTTP 200). Validate
+   each head's `committedDate` as a real ISO instant, not merely a non-empty string: it is
+   UNTRUSTED input that steers selection (the cutoff compares its first ten characters
+   LEXICALLY), so a malformed value would silently misclassify rather than fail — and note
+   `Date.parse` is NOT that check, since it NORMALIZES hour 24 to the next day and rolls
+   Feb 30 over to March 2 instead of rejecting either.
+   THEN sort client-side by committedDate DESC (most-recent FIRST).
+   APPLY BRANCH POLICY FIRST — BEFORE the cutoff filter and BEFORE the cap. This ordering is
+   load-bearing, not incidental: policy runs over the raw head set, and only the surviving
+   (policy-eligible) heads are then cutoff-filtered and capped. Were the cap applied first, a
+   DENIED recent branch would consume a cap slot an ALLOWED older branch could have used, so a
+   branch the operator explicitly asked for could be silently dropped by a branch they
+   explicitly excluded. `excludeBranches` (deny) is evaluated before `branches` (allow) — deny
+   wins — and a policy-dropped NON-default head is recorded for THIS run as a
+   `status='skipped-cutoff'` row carrying a non-null `policy_status` (its own disposition,
+   disambiguated from a genuine cutoff skip by that column; commit_sha=''), and enqueued
+   `skipped` like a cutoff skip. Policy exclusion NEVER applies to the default branch (below).
+   A malformed glob that throws at match time is FATAL, never "no match" — a denied branch must
+   never be silently scanned.
+   THEN, over the policy-eligible set only: filter out branches whose
    last commit is BEFORE cutoffDate (do not inspect at all — record them as `work_queue`
    status `skipped` AND upsert a `run_unit_head` row for THIS run with
-   `status='skipped-cutoff'`, commit_sha='', so §7's branchesSkippedByCutoff is per-run
+   `status='skipped-cutoff'` and `policy_status` NULL, commit_sha='', so §7's
+   branchesSkippedByCutoff — which counts GENUINE cutoff only — is per-run
    reproducible), and cap at maxBranchesPerRepo. EXCEPTION: the repo's DEFAULT branch
    (resolved by §5.B from the SAME snapshot as these heads — never from §5.A's older REST
    listing) is ALWAYS eligible — exempt from both the cutoff filter
@@ -1204,6 +1268,9 @@ it, §5.E.) A run with no findings still emits the full shape with empty arrays 
 summary.
 ```jsonc
 {
+  "formatVersion": 2,                            // XRAY_FORMAT_VERSION — the report/export/HTML
+                                                 //   artifact-set version (§10). REQUIRED, and
+                                                 //   INDEPENDENT of the compare format version
   "runId": "...",
   "generatedAt": "...",                          // COALESCE(runs.completed_at, runs.started_at) of
                                                  //   the reported run — a persisted SQLite value,

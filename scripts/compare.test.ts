@@ -236,6 +236,31 @@ describe("buildCompare — §5 policy churn", () => {
     db.close();
   });
 
+  test("policy churn FAILS CLOSED on a policy-bearing row that is neither excluded nor a default override", () => {
+    // The same shared guard the report's scan-scope ledger uses (policyDisposition.ts). Without it such
+    // a row gets policyApplied=false + defaultOverride=false — indistinguishable from an ordinary
+    // unrestricted branch — and buildPolicyChurn's final else-branch would file it under
+    // defaultOverrideChanges, laundering a malformed disposition into a plausible churn entry.
+    // assertRunUnitHeadInvariants forbids this shape at the WRITE chokepoint (a past-cap row must carry
+    // policy_status null), so it is forged with a raw handle to prove the READ surface fails closed.
+    const path = nextFile();
+    const db = AuditDb.open({ sqlitePath: path });
+    const runA = startCompleted(db, ["expo"]);
+    const runB = startCompleted(db, ["expo"]);
+    phead(db, runA.runId, "main", { isDefaultBranch: true });
+    phead(db, runB.runId, "main", { isDefaultBranch: true });
+    const runBId = runB.runId;
+    db.close();
+    const forge = new Database(path, { strict: true });
+    forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'past-cap', 0, 'excluded-by-deny', 'weird', '2025-06-01T00:00:00Z')`).run(runBId);
+    forge.close();
+    const db2 = AuditDb.open({ sqlitePath: path });
+    expect(() => buildCompare(db2, db2.getRun(runA.runId)!, db2.getRun(runB.runId)!)).toThrow(
+      /neither a policy exclusion nor a default-branch override/,
+    );
+    db2.close();
+  });
+
   test("churn is unavailable when EITHER run carries a pre-v4 NULL scanned_commit_date (unknown provenance)", () => {
     const path = nextFile();
     const db = AuditDb.open({ sqlitePath: path });

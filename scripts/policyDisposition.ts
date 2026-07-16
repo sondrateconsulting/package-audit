@@ -18,3 +18,21 @@ export const isPolicyExcluded = (r: PolicyDispositionRow): boolean =>
 // is a DIAGNOSTIC, never part of the disjoint disposition partition.
 export const isDefaultOverride = (r: PolicyDispositionRow): boolean =>
   r.status === "scanned" && r.policy_status !== null;
+
+// FAIL-CLOSED guard for any read surface that LABELS a policy-bearing row (report's scan-scope ledger,
+// compare's policy churn). Over rows carrying a policy_status the two predicates above are exhaustive
+// for every shape the write path permits: assertRunUnitHeadInvariants forbids a past-cap row from
+// carrying a policy_status, and forces a scanned policy-bearing row to be the default. But those run at
+// the WRITE chokepoint, not here — so a read surface must never INFER "excluded" from "policy-bearing
+// and not an override". That inference is the second definition this module exists to prevent, and a
+// disposition added later (e.g. an 'error' status) would silently inherit the wrong label. A
+// policy-bearing row satisfying neither predicate is a write-path violation or an unmigrated read
+// surface: fail, never guess.
+// A row with NO policy_status returns immediately — that is the common, unlabelled case.
+export function assertKnownPolicyDisposition(r: PolicyDispositionRow, where: string): void {
+  if (r.policy_status === null) return;
+  if (isPolicyExcluded(r) || isDefaultOverride(r)) return;
+  throw new Error(
+    `internal: run_unit_head ${where} carries policy_status=${JSON.stringify(r.policy_status)} on status=${JSON.stringify(r.status)} — neither a policy exclusion nor a default-branch override`,
+  );
+}

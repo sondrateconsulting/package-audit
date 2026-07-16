@@ -1351,6 +1351,20 @@ export interface AuditDbReader {
 // rows carry NULL, and those are written directly by the migration, never through this input.
 function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   const where = `${h.organization}/${h.repository}@${h.branch}`;
+  // PRESENCE first, before any semantic rule. The input type declares these REQUIRED precisely so
+  // `undefined` can never silently mean "not the default" / "no policy" — but the type is erased at
+  // runtime, and the upsert's own binding would quietly launder it: `isDefaultBranch === null ? null
+  // : isDefaultBranch ? 1 : 0` maps undefined to 0 (`undefined === null` is FALSE, and undefined is
+  // then falsy), and an undefined policy column binds as NULL. Both are exactly the durable
+  // mis-attribution the field docs promise cannot happen, so enforce it at this one chokepoint
+  // instead of documenting a guarantee nothing checks. (`in` separates an omitted key from an
+  // explicit undefined — both rejected, but the message says which.)
+  for (const k of ["isDefaultBranch", "policyStatus", "policyMatchedPattern", "scannedCommitDate"] as const) {
+    if (!(k in h)) fail(`run_unit_head ${where}: ${k} is required (key omitted) — it must never default silently`);
+    if (h[k] === undefined) fail(`run_unit_head ${where}: ${k} is required, got undefined — it must never default silently`);
+  }
+  if (h.isDefaultBranch !== true && h.isDefaultBranch !== false && h.isDefaultBranch !== null)
+    fail(`run_unit_head ${where}: is_default_branch must be true, false, or null (got ${JSON.stringify(h.isDefaultBranch)})`);
   // scanned_commit_date is REQUIRED on every fresh upsert (§4): the type enforces non-null, and this
   // also rejects '' / a JS caller that bypassed the type — an empty date would poison the durable
   // provenance and is indistinguishable from "unknown".

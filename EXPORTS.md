@@ -174,9 +174,11 @@ correctly holding no row here. Conversely, a branch that kept a row from an earl
 errored in a later one is **not** counted there: the row you see here already places it in that
 disposition, and counting it twice would double-count one discovered branch.
 
-This table itself stays exact either way: every row is a disposition the run genuinely recorded. Note the
-row may be pinned to an older head than the branch's current one (same-name stale head) — `commit_sha`
-and `scanned_commit_date` always name the commit that was actually scanned.
+This table itself stays exact either way: every row is a disposition the run genuinely recorded. Note a
+**scanned** row may be pinned to an older head than the branch's current one (same-name stale head): its
+`commit_sha` and `scanned_commit_date` name the commit that was actually scanned, which on a resumed run
+may predate the live head. (On a NON-scanned row `commit_sha` is `''` and `scanned_commit_date` is the
+discovered-head date — see the column notes below.)
 
 | column | type |
 |---|---|

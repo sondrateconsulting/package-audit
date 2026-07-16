@@ -15,7 +15,7 @@ import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } f
 import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
 import { logLine } from "./log.ts";
-import { isPolicyExcluded, isDefaultOverride } from "./policyDisposition.ts";
+import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition } from "./policyDisposition.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
 import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -218,16 +218,12 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
   };
 }
 
-// The ledger's disposition for ONE policy-bearing row, decided by the shared predicates only. Every
-// caller reaching here has already established policy_status !== null, so the two predicates are
-// exhaustive over every shape the write path permits; anything else is a write-path invariant
-// violation (or a disposition added without updating this surface) and must not be guessed at.
+// The ledger's disposition for ONE policy-bearing row, via the shared predicates only. The fail-closed
+// case lives in policyDisposition.ts (the ONE definition) so this surface and compare's policy churn
+// cannot drift apart on what an unrecognised policy-bearing row means.
 function dispositionOf(h: HeadRow): "scanned-default-override" | "excluded" {
-  if (isDefaultOverride(h)) return "scanned-default-override";
-  if (isPolicyExcluded(h)) return "excluded";
-  throw new Error(
-    `internal: run_unit_head ${h.organization}/${h.repository}@${h.branch} carries policy_status=${JSON.stringify(h.policy_status)} on status=${JSON.stringify(h.status)} — neither a policy exclusion nor a default-branch override`,
-  );
+  assertKnownPolicyDisposition(h, `${h.organization}/${h.repository}@${h.branch}`);
+  return isDefaultOverride(h) ? "scanned-default-override" : "excluded";
 }
 
 // §5 scan-scope diagnostics. policyBranches lists every head with a policy_status (both the excluded
