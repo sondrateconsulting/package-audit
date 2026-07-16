@@ -71,10 +71,14 @@ export interface RepoBranchPlan {
 
 // Classify every head — policy FIRST, then cutoff/cap over ONLY the policy-eligible set. Also sweeps
 // coverage over EVERY raw head (§8/§12). classifyBranch and coverageForName may throw PolicyMatchError
-// (a malformed glob, fail-closed) — and coverage invokes patterns the WINNER matcher shadows, so a
-// shadowed malformed glob fails HERE. This runs the WHOLE repo up-front, before any per-branch write,
-// so such a throw aborts before this repo is half-classified; callers must let it propagate FATAL
-// (never a per-repo/per-unit soft error — a denied branch must never be silently scanned).
+// (a glob that THROWS at .match() time, fail-closed) — and coverage invokes patterns the WINNER
+// matcher shadows, so a shadowed throwing glob fails HERE. This runs the WHOLE repo up-front, before
+// any per-branch write, so such a throw aborts before this repo is half-classified; callers must let
+// it propagate FATAL (never a per-repo/per-unit soft error — a denied branch must never be silently
+// scanned). The fail-closed promise is scoped to the THROW class only: a malformed pattern Bun.Glob
+// ACCEPTS and that never throws (e.g. "[") is not an error anywhere — it matches nothing, so it
+// excludes nothing and surfaces as a §8 unmatched-pattern warning (branchPolicy.ts's fail-closed
+// contract states this scope; the "[" pin test in branchPlanner.test.ts executes it).
 export function planRepoBranches(
   snapshot: BranchSnapshot,
   policy: CompiledBranchPolicy,

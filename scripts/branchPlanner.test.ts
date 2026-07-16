@@ -98,6 +98,19 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap (§1/§12)", 
     expect(() => planRepoBranches(snap([head("x", "2025-01-01T00:00:00Z")], "main"), policy, "2024-01-01", 25)).toThrow(PolicyMatchError);
   });
 
+  test('a malformed pattern Bun ACCEPTS (deny "[") is NOT fatal: it matches nothing, denies nothing, and coverage reports it dead', () => {
+    // Pins the OTHER half of the fail-closed contract's scope (branchPolicy.ts): the promise covers
+    // globs that THROW at .match() time; "[" compiles and returns false for every name, so it must
+    // exclude nothing and land in NO coverage set — the §8 unmatched-pattern warning is its surface.
+    // Bun.Glob-VERSION-SENSITIVE (CI pins 1.3.14): if a Bun upgrade starts rejecting "[" at
+    // construction, this test goes red so the load/validation story is re-decided consciously.
+    const policy = compileBranchPolicy(null, ["["]);
+    const p = planRepoBranches(snap([head("feature-x", "2025-01-01T00:00:00Z")], "main"), policy, "2024-01-01", 25);
+    expect(names(p.toScan)).toEqual(["feature-x"]); // NOT denied — "[" matched nothing
+    expect(p.policyExcluded).toEqual([]);
+    expect(p.coverage.excludeBranches).toEqual([]); // "[" matched NO head → unmatched-pattern warning upstream
+  });
+
   test("classifyBranchPlan still exported for the §5.B cutoff/cap unit tests", () => {
     const p = classifyBranchPlan(HEADS, "2024-01-01", 25, "main");
     expect(p.eligible.map((h) => h.name)).toEqual(["main", "feat-a", "feat-b"]);
