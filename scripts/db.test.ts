@@ -3493,3 +3493,44 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/incompatible|foreign key into run_unit_head/);
   });
 });
+
+describe("LIKE-wildcard table names vs the foreign-object/inbound-FK guards (santa round 5)", () => {
+  test("a CASCADE child named sqliteevil blocks the v3→v4 rebuild — rejected on the read-only preflight, nothing mutated", () => {
+    const path = nextFile();
+    buildV3TwinDb(path); // v3, stamp 3, journal delete
+    const forge = new Database(path, { strict: true });
+    forge.exec(`CREATE TABLE sqliteevil (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL, organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+      FOREIGN KEY (run_id, organization, repository, branch)
+        REFERENCES run_unit_head(run_id, organization, repository, branch) ON DELETE CASCADE)`);
+    forge.exec(`INSERT INTO sqliteevil (run_id, organization, repository, branch)
+                SELECT run_id, organization, repository, branch FROM run_unit_head LIMIT 1`);
+    forge.close();
+    // 'sqliteevil' is a LEGAL name (no literal 'sqlite_' prefix) that an UNescaped LIKE 'sqlite_%'
+    // wildcard-matches ('_' matches 'e') — the guard must still see its inbound FK: the rebuild's
+    // DROP TABLE run_unit_head would otherwise silently CASCADE its rows away (observed 2→0 before
+    // the ESCAPE fix).
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/foreign key into run_unit_head/);
+    const check = new Database(path, { readonly: true });
+    expect((check.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3); // unstamped
+    expect((check.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("delete"); // preflight reject: no WAL flip
+    expect((check.query("SELECT COUNT(*) AS n FROM sqliteevil").get() as { n: number }).n).toBe(1); // rows intact
+    check.close();
+  });
+
+  test("a foreign file whose ONLY table is sqliteevil is REJECTED, not silently adopted", () => {
+    const path = nextFile();
+    const raw = new Database(path, { create: true, strict: true });
+    raw.exec("CREATE TABLE sqliteevil (id INTEGER PRIMARY KEY, secret TEXT)");
+    raw.exec("INSERT INTO sqliteevil VALUES (1,'s1')");
+    raw.close();
+    // hasForeignObjects must count this LEGAL name as FOREIGN (zero audit tables + a foreign object
+    // = someone else's database); the unescaped LIKE used to read it as internal and adopt the file.
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/refusing to (open an incompatible|adopt)/);
+    const check = new Database(path, { readonly: true });
+    expect((check.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("delete"); // never WAL-mutated
+    expect((check.query("SELECT COUNT(*) AS n FROM sqliteevil").get() as { n: number }).n).toBe(1);
+    check.close();
+  });
+});
