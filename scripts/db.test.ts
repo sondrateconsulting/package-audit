@@ -2576,6 +2576,20 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     db.close();
   });
 
+  test("G2c: a non-empty but NON-ISO scanned_commit_date is rejected — the field's contract is ISO, not truthy", () => {
+    // A garbage date is worse than an empty one: it is accepted as authoritative, counts the run as
+    // 'complete' provenance, and (because the cutoff compares slice(0,10) lexically) can steer a later
+    // run's selection. T24:00:00Z is the sharp case — a legal ISO end-of-day spelling that Date.parse
+    // NORMALIZES to the next day, so a Date.parse-based guard would accept a value whose slice(0,10)
+    // names a different day than the instant it denotes.
+    const db = fresh();
+    for (const bad of ["not-a-date", "2025-06-01", "2025-02-30T00:00:00Z", "2025-06-01T24:00:00Z", "2025-99-99T99:99:99Z"])
+      expect(() => seed(db, { scannedCommitDate: bad })).toThrow(/scanned_commit_date must be an ISO instant/);
+    // the legitimate offset form still passes (git emits it; its UTC day may differ from the written one)
+    expect(() => seed(db, { branch: "ok", scannedCommitDate: "2025-06-01T02:00:00+05:00" })).not.toThrow();
+    db.close();
+  });
+
   test("G3: a past-cap row carrying a policy_status is rejected (policy precedes the cap)", () => {
     const db = fresh();
     expect(() => seed(db, { status: "past-cap", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "x" })).toThrow(/past-cap rows must have policy_status null/);

@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { logLine } from "./log.ts";
+import { isIsoInstant } from "./isoDate.ts";
 
 export class DbError extends Error {
   constructor(message: string) {
@@ -1253,8 +1254,22 @@ function assertOpenCompatible(db: Database, userVersion: number): void {
   //     external rows — reject before either can run.
   if (ruhPresent && hasInboundForeignKey(db, "run_unit_head"))
     reject("an external table has a foreign key into run_unit_head — a DROP would cascade to its rows");
-  // Below v2 the legacy step REBUILDS run_unit_head EMPTY, so its on-disk SHAPE is irrelevant and
-  // must NOT be validated (a pre-v2 head legitimately has an old shape); the invariants above ran.
+  // Below v2 the shape check is SKIPPED because a pre-v2 run_unit_head legitimately has the OLD shape
+  // (no status column — the legacy step ADDs it), and fingerprinting that against the v4 expectation
+  // would reject a perfectly good old database.
+  //
+  // It is NOT skipped because the table gets rebuilt: the legacy step PRESERVES run_unit_head via an
+  // additive ALTER and deliberately excludes it from the rebuild list (see migrateLegacy — "Do NOT
+  // 'fix' this into a rebuild"). This comment used to claim the rebuild, which was both false and the
+  // stated reason for the skip; the real reason is the one above. What still backstops the skip is the
+  // chain itself: each step re-fingerprints its own result before stamping, so a shape that survives
+  // the ALTER is validated at v3→v4 rather than here.
+  //
+  // Accepted residual: a pre-v2 file whose run_unit_head was hand-modified into a foreign shape can be
+  // ALTERed (and other tables reset+committed) before a later step rejects it. That is the same
+  // hand-crafted-DB class this classifier's scope explicitly excludes — it defends the MIGRATION's
+  // compatibility, not a tampered file's integrity — and reaching it requires out-of-band edits to the
+  // tool's own local database.
   if (userVersion < LEGACY_TARGET_VERSION) return;
   if (!ruhPresent) return; // absent + runs also absent -> genuine fresh / post-fresh cache-only state
   const cls = classifyRunUnitHead(db);
@@ -1368,7 +1383,17 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   // scanned_commit_date is REQUIRED on every fresh upsert (§4): the type enforces non-null, and this
   // also rejects '' / a JS caller that bypassed the type — an empty date would poison the durable
   // provenance and is indistinguishable from "unknown".
+  //
+  // Non-empty is not the contract, though: the field is specified as an ISO instant, and NULL carries a
+  // load-bearing meaning of its own (a v3→v4-migrated row, the sentinel that makes a run's scan-scope
+  // provenance unverifiable). A non-empty GARBAGE date would be accepted as authoritative, counted as
+  // 'complete' provenance, and — because the cutoff compares slice(0, 10) lexically — could steer a
+  // later run's selection. The producers (github.ts discovery + the clone-date read) already validate
+  // with the same isIsoInstant, so this enforces the documented semantic at the chokepoint rather than
+  // trusting every caller to have done it, exactly as the presence checks above do.
   if (!h.scannedCommitDate) fail(`run_unit_head ${where}: a non-empty scanned_commit_date is required`);
+  if (!isIsoInstant(h.scannedCommitDate))
+    fail(`run_unit_head ${where}: scanned_commit_date must be an ISO instant (got ${JSON.stringify(h.scannedCommitDate.slice(0, 40))})`);
   // Policy pattern (§2a / §3): a deny row MUST name a real, NON-EMPTY causing pattern (the deny CHECK
   // only enforces IS NOT NULL, and '' passes it). Every non-deny disposition carries NO pattern.
   if (h.policyStatus === "excluded-by-deny") {
