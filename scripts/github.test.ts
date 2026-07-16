@@ -6,7 +6,7 @@ import { join, dirname } from "node:path";
 import {
   GithubClient, GithubApiError, ThrottleExhausted, MAX_PAGES, MAX_PAUSE_MS, SPAWN_TIMEOUT_MS, MAX_TOTAL_PAUSE_MS, SPAWN_KILL_GRACE_MS,
   parseGhApiOutput, parseLinkNext, nextEndpointFromLink, parseRetryAfterMs,
-  classifyRest, classifyGraphql, encodeContentsPath, mapRestRepo, filterSortCapRepos,
+  classifyRest, classifyGraphql, parseGraphqlEnvelope, parseTreeResponse, encodeContentsPath, mapRestRepo, filterSortCapRepos,
   buildGhEnv, buildGitEnv, buildTarEnv, readCapped, makeRealSpawn, joinSpawnOutcome,
   type SpawnFn, type SpawnResult, type RepoInfo, type SpawnAbortSignal, type StreamReader,
 } from "./github.ts";
@@ -411,6 +411,52 @@ describe("restGet caching + conditional requests", () => {
     db.close();
   });
 
+  test("a 2xx-non-200 response is NEVER persisted to api_cache — a cache hit synthesizes status 200", async () => {
+    // Both cache-serving paths fabricate status 200, so a cached 206 Partial Content body would
+    // be laundered into an exact-200 'complete' response on every later call — permanently, for
+    // SHA-pinned endpoints. The only safe rows are ones created from a genuine exact-200.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client } = makeClient([ok(http(206, { etag: 'W/"p"' }, "partial-body"))], { db });
+    const res = await client.restGet("user/orgs?per_page=100&page=1");
+    expect(res.status).toBe(206); // still returned to the caller (classification unchanged)…
+    const rows = db.read("SELECT COUNT(*) AS n FROM api_cache").get() as { n: number };
+    expect(rows.n).toBe(0); // …but never persisted
+    db.close();
+  });
+
+  test("legacy pre-epoch cache rows are quarantined — never served to ANY consumer", async () => {
+    // Rows are statusless, survive --fresh, and pre-gate code cached any ok-classified 2xx. The
+    // raw contents/blob consumers have no structural validation, so a legacy 206 body would ride
+    // the immutable hit's synthesized 200 straight into the scan pipeline with ZERO network
+    // calls. The key epoch makes every pre-gate row unreachable; --purge-cache reclaims them.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const SHA2 = "0123456789abcdef0123456789abcdef01234567";
+    const legacyEndpoint = `repos/o/r/contents/package.json?ref=${SHA2}`;
+    db.putApiCache({ method: "GET", url: `gh:github.com:${legacyEndpoint}`, variantHash: "application/vnd.github.raw+json", etag: null, responseBody: "partial-206-body" });
+    const { client, calls } = makeClient([ok(http(200, {}, "full-body"))], { db });
+    const body = await client.fetchFileRaw("o", "r", "package.json", SHA2);
+    expect(body).toBe("full-body"); // the network answered — never the legacy row
+    expect(calls.length).toBe(1);
+    db.close();
+  });
+
+  test("the epoch namespace is DISJOINT from the legacy grammar even under host:port collisions", async () => {
+    // githubHost accepts host:port and numeric hosts, so an epoch spelled INSIDE the old `gh:`
+    // namespace (e.g. `gh:200.1:`) would collide: legacy host "200.1:443" and current host "443"
+    // spell the same key. The prefix itself must be impossible under the old grammar — every
+    // legacy key starts with the literal `gh:`, so `gh2:` can never match one.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const SHA2 = "0123456789abcdef0123456789abcdef01234567";
+    const legacyEndpoint = `repos/o/r/contents/package.json?ref=${SHA2}`;
+    // a legacy row written by PRE-gate code configured with githubHost "200.1:443"
+    db.putApiCache({ method: "GET", url: `gh:200.1:443:${legacyEndpoint}`, variantHash: "application/vnd.github.raw+json", etag: null, responseBody: "poisoned-legacy-body" });
+    const { client, calls } = makeClient([ok(http(200, {}, "full-body"))], { db, githubHost: "443" });
+    const body = await client.fetchFileRaw("o", "r", "package.json", SHA2);
+    expect(body).toBe("full-body");
+    expect(calls.length).toBe(1);
+    db.close();
+  });
+
   test("restGet immutable:true is IGNORED for a non-sha-pinned endpoint (defense in depth)", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const { client, calls } = makeClient(
@@ -468,6 +514,178 @@ describe("restGet caching + conditional requests", () => {
     const { client, sleeps } = makeClient([netfail, netfail, netfail, netfail, netfail, netfail]);
     await expect(client.restGet("rate_limit")).rejects.toThrow(/could not connect/);
     expect(sleeps.length).toBeGreaterThanOrEqual(5);
+  });
+});
+
+// ---- pure envelope validators ------------------------------------------------------------------
+describe("parseGraphqlEnvelope / parseTreeResponse (pure)", () => {
+  test("a well-formed data envelope: malformed null, data verbatim, no errors", () => {
+    expect(parseGraphqlEnvelope(`{"data":{"x":1}}`)).toEqual({ data: { x: 1 }, errors: [], malformed: null });
+  });
+  test("junk beside a readable entry: the readable projection survives AND the violation is flagged", () => {
+    const env = parseGraphqlEnvelope(`{"errors":[null,{"type":"RATE_LIMITED","message":"slow"},{"message":{"x":1}}]}`);
+    expect(env.errors).toEqual([{ type: "RATE_LIMITED", message: "slow" }]);
+    expect(env.malformed).not.toBeNull();
+  });
+  test("a non-string type is dropped from the projection but a string message on the SAME entry is kept", () => {
+    const env = parseGraphqlEnvelope(`{"errors":[{"type":42,"message":"still readable"}]}`);
+    expect(env.errors).toEqual([{ message: "still readable" }]);
+    expect(env.malformed).toContain("type is not a string");
+  });
+  test("data:null beside valid errors is the legal total-failure shape — not malformed", () => {
+    const env = parseGraphqlEnvelope(`{"data":null,"errors":[{"message":"boom"}]}`);
+    expect(env.malformed).toBeNull();
+    expect(env.data).toBeNull();
+  });
+  test("extra unknown envelope/entry keys are tolerated (strict on what we consume only)", () => {
+    const env = parseGraphqlEnvelope(`{"data":{"x":1},"extensions":{"cost":1}}`);
+    expect(env.malformed).toBeNull();
+  });
+  const SHA = "a".repeat(40);
+  test("expectedSha null skips the root-sha check (non-SHA-pinned request)", () => {
+    const res = parseTreeResponse({ truncated: false, tree: [] }, "ep", null);
+    expect(res).toEqual({ truncated: false, paths: [] });
+  });
+  test("the root-sha comparison is case-insensitive (gh may echo either case)", () => {
+    const res = parseTreeResponse({ sha: SHA.toUpperCase(), truncated: false, tree: [] }, "ep", SHA);
+    expect(res.truncated).toBe(false);
+  });
+  test("size zero is legal; absent size maps to null", () => {
+    const res = parseTreeResponse(
+      { sha: SHA, truncated: false, tree: [{ path: "a", type: "blob", sha: "b".repeat(40), size: 0 }, { path: "b", type: "commit", sha: "c".repeat(40) }] },
+      "ep", SHA,
+    );
+    expect(res.paths.map((p) => p.size)).toEqual([0, null]);
+  });
+});
+
+// ---- fetchTreeRecursive envelope validation (§5.C fail-closed) --------------------------------
+// A malformed 200 git/trees response must FAIL LOUD (→ a scan-scope errors row via processUnit's
+// catch), never read as "no files in this branch": `json.tree ?? []` silently produced an empty
+// tree, and a missing/malformed `truncated` flag silently suppressed the clone fallback that is
+// the caller's ONLY complete-tree escape hatch (orchestrate §5.C).
+describe("fetchTreeRecursive envelope validation (§5.C fail-closed)", () => {
+  const TREE_SHA = "f".repeat(40);
+  const tree = (body: string) => ok(http(200, {}, body));
+  const blob = (over: Record<string, unknown> = {}): Record<string, unknown> =>
+    ({ path: "package.json", type: "blob", sha: "a".repeat(40), size: 12, ...over });
+  const body = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({ sha: TREE_SHA, truncated: false, tree: [blob()], ...over });
+
+  test("a 200 response MISSING the tree member fails closed — never an empty tree", async () => {
+    const { client } = makeClient([tree(JSON.stringify({ sha: TREE_SHA, truncated: false }))]);
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/tree member/);
+  });
+  test("a non-array tree member is a clean GithubApiError, not a raw TypeError", async () => {
+    const { client } = makeClient([tree(body({ tree: "nope" }))]);
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
+  });
+  test("a MISSING or non-boolean truncated flag fails closed — false would silently disable the clone fallback", async () => {
+    for (const b of [JSON.stringify({ sha: TREE_SHA, tree: [blob()] }), body({ truncated: "yes" })]) {
+      const { client } = makeClient([tree(b)]);
+      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/truncated/);
+    }
+  });
+  test("a non-object JSON root (null/array/primitive) is a clean GithubApiError", async () => {
+    for (const b of ["null", "[]", "42", `"tree"`]) {
+      const { client } = makeClient([tree(b)]);
+      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
+    }
+  });
+  test("a non-object tree entry fails closed", async () => {
+    for (const entry of [null, "x", 7, [1]]) {
+      const { client } = makeClient([tree(body({ tree: [entry] }))]);
+      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
+    }
+  });
+  test("an entry with a missing/empty/non-canonical path fails closed — it would misaddress every downstream read", async () => {
+    // leading/trailing/double slash and dot segments would silently become the swallowed contents
+    // 404 (orchestrate apiReader); a NUL would corrupt the permalink and the contents URL.
+    const bads: Array<Record<string, unknown>> = [
+      { path: undefined }, { path: "" }, { path: 5 },
+      { path: "/lead" }, { path: "trail/" }, { path: "a//b" }, { path: "a/./b" }, { path: "a/../b" }, { path: "a\u0000b" },
+    ];
+    for (const over of bads) {
+      const { client } = makeClient([tree(body({ tree: [blob(over)] }))]);
+      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
+    }
+  });
+  test("a DUPLICATE path fails closed — last-wins mapping downstream would let a later entry mask a manifest", async () => {
+    const { client } = makeClient([tree(body({ tree: [blob(), blob({ type: "tree", size: undefined })] }))]);
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/duplicate/);
+  });
+  test("an unknown entry type fails closed — the blob filter downstream would silently discard it", async () => {
+    const { client } = makeClient([tree(body({ tree: [blob({ type: "symlink" })] }))]);
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/type/);
+  });
+  test("a non-hex entry sha fails closed — it addresses the blob fetch", async () => {
+    for (const sha of [undefined, "", "main", "zz".repeat(20)]) {
+      const { client } = makeClient([tree(body({ tree: [blob({ sha })] }))]);
+      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
+    }
+  });
+  test("a PRESENT size must be a non-negative safe integer — Infinity (1e400), negatives and fractions fail closed", async () => {
+    // typeof-number alone admits JSON.parse("1e400") === Infinity, which would trip the silent
+    // large-file skip downstream instead of failing loud.
+    for (const raw of [`1e400`, `-1`, `1.5`, `"5"`, `null`]) {
+      const { client } = makeClient([tree(`{"sha":"${TREE_SHA}","truncated":false,"tree":[{"path":"p","type":"blob","sha":"${"a".repeat(40)}","size":${raw}}]}`)]);
+      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
+    }
+  });
+  test("a response whose root sha does not match the requested tree oid fails closed", async () => {
+    const { client } = makeClient([tree(body({ sha: "e".repeat(40) }))]);
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/does not match/);
+  });
+  test("HTTP 2xx-but-not-200 (e.g. 206 Partial Content) is NOT success — a partial tree must not read as complete", async () => {
+    const { client } = makeClient([ok(http(206, {}, body()))]);
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/200/);
+  });
+  test("a valid response maps entries verbatim; absent size maps to null", async () => {
+    const b = JSON.stringify({ sha: TREE_SHA, truncated: false, tree: [blob(), { path: "src", type: "tree", sha: "b".repeat(40) }] });
+    const { client } = makeClient([tree(b)]);
+    const res = await client.fetchTreeRecursive("o", "r", TREE_SHA);
+    expect(res).toEqual({
+      truncated: false,
+      paths: [
+        { path: "package.json", type: "blob", sha: "a".repeat(40), size: 12 },
+        { path: "src", type: "tree", sha: "b".repeat(40), size: null },
+      ],
+    });
+  });
+  test("truncated:true returns NO paths — the partial entry list is unusable and the caller must clone", async () => {
+    // per-entry validation is deliberately skipped here: junk inside a partial list must not block
+    // the clone fallback, and nothing downstream may read these entries anyway.
+    const b = JSON.stringify({ sha: TREE_SHA, truncated: true, tree: [{ path: 42 }] });
+    const { client } = makeClient([tree(b)]);
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).resolves.toEqual({ truncated: true, paths: [] });
+  });
+  test("a malformed 200 body does NOT permanently poison the immutable cache — the next call refetches", async () => {
+    // restGet caches the 200 body BEFORE validation sees it; without the tombstone the SHA-pinned
+    // immutable path would serve the malformed body forever (until --purge-cache).
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client, calls } = makeClient(
+      [tree(JSON.stringify({ sha: TREE_SHA, truncated: false })), tree(body())],
+      { db },
+    );
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/tree member/);
+    const second = await client.fetchTreeRecursive("o", "r", TREE_SHA);
+    expect(second.paths.map((p) => p.path)).toEqual(["package.json"]);
+    expect(calls.length).toBe(2); // call 2 went back to the network, not the poisoned cache row
+    const third = await client.fetchTreeRecursive("o", "r", TREE_SHA);
+    expect(third).toEqual(second);
+    expect(calls.length).toBe(2); // …and the VALID body still earns the immutable zero-network hit
+    db.close();
+  });
+  test("a cached 2xx-non-200 body cannot launder into success via the synthesized-200 cache hit", async () => {
+    // restGet classifies any 2xx ok and caches it; a cache hit then fabricates status 200. Without
+    // the tombstone a 206 partial body would be re-served as a 'complete' 200 tree next call.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client, calls } = makeClient([ok(http(206, {}, body())), tree(body())], { db });
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/200/);
+    const second = await client.fetchTreeRecursive("o", "r", TREE_SHA);
+    expect(second.truncated).toBe(false);
+    expect(calls.length).toBe(2);
+    db.close();
   });
 });
 
@@ -1155,6 +1373,90 @@ describe("graphql", () => {
   });
 });
 
+// ---- graphql envelope validation (§4 spec hardening) ------------------------------------------
+// The GraphQL spec pins the envelope shape: an object root; `data` and/or a NON-EMPTY `errors`
+// array of maps. Anything else means the failure signal we were meant to read is unreadable —
+// accepting it as success is fail-OPEN (an ok:true discovery feeds the §11 reconcile PRUNE).
+// Classification still runs FIRST on whatever error evidence IS readable, so status/header
+// semantics (5xx transient, SSO fatal, throttle retry) are never downgraded by a malformed body;
+// malformation only preempts the SUCCESS path.
+describe("graphql envelope validation (§4 spec hardening)", () => {
+  test("errors:[] on 200 fails closed — the spec requires a present errors member be NON-EMPTY", async () => {
+    const { client } = makeClient([ok(http(200, {}, `{"data":{"x":1},"errors":[]}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
+  });
+  test("errors:[null] on 200 is a clean GithubApiError, not a raw TypeError from classifyGraphql", async () => {
+    const { client } = makeClient([ok(http(200, {}, `{"errors":[null]}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(GithubApiError);
+  });
+  test("a junk errors entry does NOT erase readable throttle evidence — RATE_LIMITED beside it still retries", async () => {
+    const { client, calls } = makeClient([
+      ok(http(200, { "x-ratelimit-remaining": "10" }, `{"errors":[null,{"type":"RATE_LIMITED","message":"slow down"}]}`)),
+      ok(http(200, {}, `{"data":{"x":1}}`)),
+    ]);
+    const data = await client.graphql("query{x}", {});
+    expect(data).toEqual({ x: 1 });
+    expect(calls.length).toBe(2); // classified secondary from the readable entry, retried, succeeded
+  });
+  test("an envelope with NEITHER data nor errors on 200 fails closed instead of returning undefined", async () => {
+    const { client } = makeClient([ok(http(200, {}, `{}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
+  });
+  test("a non-object JSON root on 200 fails closed instead of returning undefined", async () => {
+    for (const b of ["null", "[]", `"x"`, "42"]) {
+      const { client } = makeClient([ok(http(200, {}, b))]);
+      await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
+    }
+  });
+  test("an UNPARSEABLE 200 body fails closed instead of returning undefined", async () => {
+    const { client } = makeClient([ok(http(200, {}, "<html>bad gateway</html>"))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
+  });
+  test("data:null WITHOUT errors is malformed — the spec requires errors when data is null", async () => {
+    const { client } = makeClient([ok(http(200, {}, `{"data":null}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
+  });
+  test("data:null WITH valid errors is the LEGAL total-failure shape — classified fatal on the error text", async () => {
+    const { client } = makeClient([ok(http(200, {}, `{"data":null,"errors":[{"type":"NOT_FOUND","message":"gone"}]}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/NOT_FOUND/);
+  });
+  test("a non-object data member (string/array) is malformed", async () => {
+    for (const b of [`{"data":"nope"}`, `{"data":[1]}`]) {
+      const { client } = makeClient([ok(http(200, {}, b))]);
+      await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
+    }
+  });
+  test("an errors entry with NOTHING readable must not sanitize into no-errors success", async () => {
+    // {"errors":[{locations:[]}]} — object entry, but no type/message. Silent dropping would leave
+    // errors=[] and the 200 would classify ok; the flag-and-drop rule is what fails it closed.
+    const { client } = makeClient([ok(http(200, {}, `{"data":{"x":1},"errors":[{"locations":[]}]}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/no readable/);
+  });
+  test("a non-string nested error field cannot TypeError during message coercion — clean GithubApiError", async () => {
+    // {"message":{"toString":null}} would throw inside classifyGraphql's template-literal join;
+    // sanitized projections keep only string-valued fields, so coercion is total.
+    const { client } = makeClient([ok(http(200, {}, `{"data":{"x":1},"errors":[{"message":{"toString":null}}]}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(GithubApiError);
+  });
+  test("HTTP 2xx-but-not-200 with a pristine envelope is NOT graphql success", async () => {
+    const { client } = makeClient([ok(http(206, {}, `{"data":{"x":1}}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/200/);
+  });
+  test("junk errors entries do NOT preempt SSO evidence: 403+x-github-sso stays fatal WITH ssoRequired", async () => {
+    const { client } = makeClient([
+      ok(http(403, { "x-ratelimit-remaining": "5", "x-github-sso": "required" }, `{"errors":[null]}`)),
+    ]);
+    let caught: unknown;
+    try {
+      await client.graphql("query{x}", {});
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).ssoRequired).toBe(true);
+  });
+});
+
 describe("listBranchHeads (§5.B)", () => {
   test("paginates with endCursor (omitted on first page), sorts committedDate DESC, resolves the default", async () => {
     const page1 = {
@@ -1163,7 +1465,7 @@ describe("listBranchHeads (§5.B)", () => {
           defaultBranchRef: { name: "main" },
           refs: {
             pageInfo: { hasNextPage: true, endCursor: "CUR1" },
-            nodes: [{ name: "old", target: { oid: "o1", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t1" } } }],
+            nodes: [{ name: "old", target: { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } } }],
           },
         },
       },
@@ -1174,7 +1476,7 @@ describe("listBranchHeads (§5.B)", () => {
           defaultBranchRef: { name: "main" },
           refs: {
             pageInfo: { hasNextPage: false, endCursor: null },
-            nodes: [{ name: "main", target: { oid: "o2", committedDate: "2024-06-01T00:00:00Z", tree: { oid: "t2" } } }],
+            nodes: [{ name: "main", target: { oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", committedDate: "2024-06-01T00:00:00Z", tree: { oid: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" } } }],
           },
         },
       },
@@ -1182,7 +1484,7 @@ describe("listBranchHeads (§5.B)", () => {
     const { client, calls } = makeClient([ok(http(200, {}, JSON.stringify(page1))), ok(http(200, {}, JSON.stringify(page2)))]);
     const snapshot = await client.listBranchHeads("o", "r");
     expect(snapshot.heads.map((h) => h.name)).toEqual(["main", "old"]);
-    expect(snapshot.heads[0]!.treeOid).toBe("t2");
+    expect(snapshot.heads[0]!.treeOid).toBe("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
     expect(snapshot.defaultBranch).toBe("main"); // from the SAME snapshot as the heads, not the REST listing
     expect(calls[0]!.args.some((a) => a.startsWith("endCursor="))).toBe(false); // first page omits it
     expect(calls[1]!.args).toContain("endCursor=CUR1");
@@ -1215,11 +1517,27 @@ describe("listBranchHeads (§5.B)", () => {
     // an empty committedDate would classify as cutoff-skipped then trip the non-empty-date write
     // invariant OUTSIDE the fail-soft path; an empty oid drives an invalid scan. Both must fail here.
     for (const target of [
-      { oid: "", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } },
-      { oid: "o", committedDate: "", tree: { oid: "t" } },
-      { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "" } },
+      { oid: "", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } },
+      { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: "", tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } },
+      { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "" } },
     ]) {
       const { client } = makeClient([refsPage({ nodes: [{ name: "x", target }] })]);
+      await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed branch-head node/);
+    }
+  });
+  test("a NULL node is a clean GithubApiError, not a raw TypeError", async () => {
+    const { client } = makeClient([refsPage({ nodes: [null] })]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed branch-head node/);
+  });
+  test("a non-hex oid / tree.oid is malformed — a ref-looking value would freeze MUTABLE reads into the immutable cache", async () => {
+    // h.oid / h.treeOid flow into SHA-pinned fetches where isSha() earns the zero-network cache
+    // path, and into skip-current persistence; "main" in an oid field must fail loud here.
+    for (const target of [
+      { oid: "main", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "d".repeat(40) } },
+      { oid: "a".repeat(40), committedDate: "2024-01-01T00:00:00Z", tree: { oid: "refs/heads/x" } },
+      { oid: "a".repeat(39), committedDate: "2024-01-01T00:00:00Z", tree: { oid: "d".repeat(40) } },
+    ]) {
+      const { client } = makeClient([refsPage({ nodes: [{ name: "x", target }] }, { defaultBranchRef: { name: "x" } })]);
       await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed branch-head node/);
     }
   });
@@ -1236,7 +1554,7 @@ describe("listBranchHeads (§5.B)", () => {
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/missing a nodes array/);
   });
   test("a duplicate branch name across pages throws (unstable pagination)", async () => {
-    const dup = { name: "main", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } };
+    const dup = { name: "main", target: { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } } };
     const { client } = makeClient([
       ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [dup] } } } }))),
       ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [dup] } } } }))),
@@ -1266,7 +1584,7 @@ describe("listBranchHeads (§5.B)", () => {
     // With no default, NO head can win the always-eligible exemption, so `branches: []` would exclude
     // every branch and the repo would silently yield zero units. A loud error beats that.
     const { client } = makeClient([
-      refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] }),
+      refsPage({ nodes: [{ name: "dev", target: { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } } }] }),
     ]);
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/null but 1 head\(s\) were discovered/);
   });
@@ -1280,7 +1598,7 @@ describe("listBranchHeads (§5.B)", () => {
     // e.g. the default is 'trunk' but no 'trunk' head came back — the two halves describe different
     // repo states, so no head could be classified default and policy would exclude the real one.
     const { client } = makeClient([
-      refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] }, { defaultBranchRef: { name: "trunk" } }),
+      refsPage({ nodes: [{ name: "dev", target: { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } } }] }, { defaultBranchRef: { name: "trunk" } }),
     ]);
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/is absent from the discovered heads/);
   });
@@ -1289,13 +1607,13 @@ describe("listBranchHeads (§5.B)", () => {
     // that gains a default mid-walk is caught too — null is a read answer, not "not yet known".
     const { client } = makeClient([
       ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: null, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [] } } } }))),
-      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ name: "main", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ name: "main", target: { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } } }] } } } }))),
     ]);
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/changed mid-pagination/);
   });
   test("defaultBranchRef ABSENT on a LATER page throws (every page is validated, not just page 1)", async () => {
     const { client } = makeClient([
-      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [{ name: "main", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [{ name: "main", target: { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } } }] } } } }))),
       ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } }))),
     ]);
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/omits defaultBranchRef/);
@@ -1311,7 +1629,7 @@ describe("listBranchHeads (§5.B)", () => {
     // component bounds, not Date.parse, are what reject it. 2025-02-30 covers the rollover direction.
     for (const bad of ["2025-99-99T99:99:99Z", "2025-02-30T00:00:00Z", "2025-13-01T00:00:00Z", "2025-06-01T25:00:00Z", "2025-06-01T24:00:00Z", "2025-06-01T24:00:00+00:00", "2025-06-01T00:60:00Z", "2025-06-01T00:00:60Z", "2025-06-00T00:00:00Z", "2025-06-32T00:00:00Z", "2025-00-01T00:00:00Z", "2025-06-01T00:00:00+99:00", "2025-06-01T00:00:00+00:99", "2025-06-01", "yesterday"]) {
       const { client } = makeClient([
-        refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: bad, tree: { oid: "t" } } }] }, { defaultBranchRef: { name: "dev" } }),
+        refsPage({ nodes: [{ name: "dev", target: { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: bad, tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } } }] }, { defaultBranchRef: { name: "dev" } }),
       ]);
       await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/non-ISO committedDate/);
     }
@@ -1320,7 +1638,7 @@ describe("listBranchHeads (§5.B)", () => {
     // Guards against over-validating: comparing toISOString() would reject this, because 02:00+05:00
     // is the PREVIOUS day in UTC. Validity is judged on the components as written.
     const { client } = makeClient([
-      refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: "2025-06-01T02:00:00+05:00", tree: { oid: "t" } } }] }, { defaultBranchRef: { name: "dev" } }),
+      refsPage({ nodes: [{ name: "dev", target: { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: "2025-06-01T02:00:00+05:00", tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } } }] }, { defaultBranchRef: { name: "dev" } }),
     ]);
     const snap = await client.listBranchHeads("o", "r");
     expect(snap.heads[0]!.committedDate).toBe("2025-06-01T02:00:00+05:00"); // preserved verbatim, never normalized
@@ -1331,8 +1649,8 @@ describe("listBranchHeads (§5.B)", () => {
     // says trunk, and both are in the head set. Unlike the rejected totalCount cross-check (which trips
     // on unrelated branch churn), a default disagreement means the authority itself changed mid-walk.
     const { client } = makeClient([
-      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [{ name: "main", target: { oid: "o1", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t1" } } }] } } } }))),
-      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "trunk" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ name: "trunk", target: { oid: "o2", committedDate: "2024-02-01T00:00:00Z", tree: { oid: "t2" } } }] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [{ name: "main", target: { oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "dddddddddddddddddddddddddddddddddddddddd" } } }] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "trunk" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ name: "trunk", target: { oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", committedDate: "2024-02-01T00:00:00Z", tree: { oid: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" } } }] } } } }))),
     ]);
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/changed mid-pagination/);
   });

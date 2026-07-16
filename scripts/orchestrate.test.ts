@@ -12,6 +12,16 @@ import type { OrchestrateArgs } from "./args.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
 
+// listBranchHeads requires HEX object ids and fetchTreeRecursive requires a sha-echoing tree
+// envelope (§5.B/§5.C fail-closed): derive a stable 40-hex oid from a readable seed, and answer
+// a git-trees request with the oid it actually asked for.
+const hexOid = (seed: string): string => Buffer.from(seed).toString("hex").padEnd(40, "0").slice(0, 40);
+const treeBody = (args: string[], truncated = false): string => {
+  const ep = args.find((a) => a.includes("/git/trees/")) ?? "";
+  const sha = decodeURIComponent(ep.split("/git/trees/")[1]?.split("?")[0] ?? "");
+  return `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ sha, truncated, tree: [] })}`;
+};
+
 // Build the AuditRuntime bundle from a Config — the branch policy is compiled from the config's own
 // branch lists, so the default (`branches: null, excludeBranches: []`) is unrestricted and behaves
 // exactly as before this feature. Tests exercising policy pass a config with populated lists.
@@ -120,8 +130,8 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       { exitCode: 0, stderr: "", stdout: http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: {
         pageInfo: { hasNextPage: false, endCursor: null },
         nodes: [
-          { name: "main", target: { oid: "o-main", committedDate: "2025-06-01T00:00:00Z", tree: { oid: "t1" } } },
-          { name: "stale", target: { oid: "o-stale", committedDate: "2023-06-01T00:00:00Z", tree: { oid: "t2" } } },
+          { name: "main", target: { oid: hexOid("o-main"), committedDate: "2025-06-01T00:00:00Z", tree: { oid: hexOid("t1") } } },
+          { name: "stale", target: { oid: hexOid("o-stale"), committedDate: "2023-06-01T00:00:00Z", tree: { oid: hexOid("t2") } } },
         ],
       } } } })) },
     ];
@@ -456,7 +466,7 @@ describe("runPlan org-level discovery failure (fail-soft continue)", () => {
         if (joined.includes("graphql")) {
           return { exitCode: 0, stderr: "", stdout: http(200, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: {
             pageInfo: { hasNextPage: false, endCursor: null },
-            nodes: [{ name: "main", target: { oid: "o1", committedDate: "2025-06-01T00:00:00Z", tree: { oid: "t1" } } }],
+            nodes: [{ name: "main", target: { oid: hexOid("o1"), committedDate: "2025-06-01T00:00:00Z", tree: { oid: hexOid("t1") } } }],
           } } } })) };
         }
         if (joined.includes("org-a")) return { exitCode: 1, stderr: "gh: boom", stdout: "" };
@@ -490,7 +500,7 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
       defaultBranchRef: defaultBranch === null ? null : { name: defaultBranch },
       refs: {
         pageInfo: { hasNextPage: false, endCursor: null },
-        nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: `t-${n.name}` } } })),
+        nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: hexOid(`t-${n.name}`) } } })),
       },
     } } })}`;
 
@@ -505,17 +515,17 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     // pre-seed "main" AND "dev" as done AT their live heads so the §3 skip-current path is
     // taken for both (no scanUnit; the scripted client only answers branch discovery)
     db.enqueueUnit(key("main"), runId);
-    db.setUnitStatus(key("main"), { status: "done", runId, lastCommitSha: "o-main", lastCommitDate: "2025-06-01T00:00:00Z" });
+    db.setUnitStatus(key("main"), { status: "done", runId, lastCommitSha: hexOid("o-main"), lastCommitDate: "2025-06-01T00:00:00Z" });
     db.enqueueUnit(key("dev"), runId);
-    db.setUnitStatus(key("dev"), { status: "done", runId, lastCommitSha: "o-dev", lastCommitDate: "2025-05-01T00:00:00Z" });
+    db.setUnitStatus(key("dev"), { status: "done", runId, lastCommitSha: hexOid("o-dev"), lastCommitDate: "2025-05-01T00:00:00Z" });
 
     const client = // heads newest-first; cap=1 counts NON-default branches: main default-exempt
     // (current), dev fills the cap (current), feat past-cap, stale pre-cutoff
     makeClient(root, async () => ({ exitCode: 0, stderr: "", stdout: graphqlHeads([
-        { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
-        { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
-        { name: "feat", oid: "o-feat", date: "2025-04-01T00:00:00Z" },
-        { name: "stale", oid: "o-stale", date: "2023-06-01T00:00:00Z" },
+        { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+        { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
+        { name: "feat", oid: hexOid("o-feat"), date: "2025-04-01T00:00:00Z" },
+        { name: "stale", oid: hexOid("o-stale"), date: "2023-06-01T00:00:00Z" },
       ], "main") }));
     const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
 
@@ -528,9 +538,9 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     // past-cap branch is now recorded for report visibility, though its work queue stays untouched).
     const headRows = db.read(`SELECT branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
     expect(headRows).toEqual([
-      { branch: "dev", commit_sha: "o-dev", status: "scanned", is_default_branch: 0 },
+      { branch: "dev", commit_sha: hexOid("o-dev"), status: "scanned", is_default_branch: 0 },
       { branch: "feat", commit_sha: "", status: "past-cap", is_default_branch: 0 },
-      { branch: "main", commit_sha: "o-main", status: "scanned", is_default_branch: 1 },
+      { branch: "main", commit_sha: hexOid("o-main"), status: "scanned", is_default_branch: 1 },
       { branch: "stale", commit_sha: "", status: "skipped-cutoff", is_default_branch: 0 },
     ]);
     // work-queue state: stale skipped, main+dev still done (reused), feat never enqueued (past-cap
@@ -560,10 +570,10 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
       const isGraphql = args.some((a) => a === "graphql");
       if (isGraphql)
         return { exitCode: 0, stderr: "", stdout: graphqlHeads([
-          { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
-          { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+          { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+          { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
         ], "main") };
-      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: false, tree: [] })}` };
+      return { exitCode: 0, stderr: "", stdout: treeBody(args) };
     });
     const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
 
@@ -573,8 +583,8 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
 
     const headRows = db.read(`SELECT branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
     expect(headRows).toEqual([
-      { branch: "dev", commit_sha: "o-dev", status: "scanned", is_default_branch: 0 },
-      { branch: "main", commit_sha: "o-main", status: "scanned", is_default_branch: 1 },
+      { branch: "dev", commit_sha: hexOid("o-dev"), status: "scanned", is_default_branch: 0 },
+      { branch: "main", commit_sha: hexOid("o-main"), status: "scanned", is_default_branch: 1 },
     ]);
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -589,14 +599,14 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       defaultBranchRef: defaultBranch === null ? null : { name: defaultBranch },
       refs: {
         pageInfo: { hasNextPage: false, endCursor: null },
-        nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: `t-${n.name}` } } })),
+        nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: hexOid(`t-${n.name}`) } } })),
       },
     } } })}`;
   // heads via GraphQL, an EMPTY tree via REST so a scanned unit runs the pipeline to zero findings.
   const scanClient = (root: string, nodes: Array<{ name: string; oid: string; date: string }>, defaultBranch: string | null): GithubClient =>
     makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads(nodes, defaultBranch) };
-      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: false, tree: [] })}` };
+      return { exitCode: 0, stderr: "", stdout: treeBody(args) };
     });
   const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
   const startScanRun = (db: AuditDb): string =>
@@ -614,13 +624,13 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const runId = startScanRun(db);
     const config = { ...testConfig(root, 25), excludeBranches: ["dev"] };
     const client = scanClient(root, [
-      { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
-      { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+      { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+      { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
     ], "main");
     await captureJsonl(() => processRepo(db, client, rt(config, "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId)).toEqual([
       { branch: "dev", status: "policy-excluded", sha: "", d: 0, ps: "excluded-by-deny", pat: "dev", scd: "2025-05-01T00:00:00Z" },
-      { branch: "main", status: "scanned", sha: "o-main", d: 1, ps: null, pat: null, scd: "2025-06-01T00:00:00Z" },
+      { branch: "main", status: "scanned", sha: hexOid("o-main"), d: 1, ps: null, pat: null, scd: "2025-06-01T00:00:00Z" },
     ]);
     expect(db.getUnit(key("dev"))?.status).toBe("skipped"); // enqueued but never scanned
     db.close();
@@ -632,10 +642,10 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
     const config = { ...testConfig(root, 25), excludeBranches: ["main"] }; // deny the DEFAULT branch
-    const client = scanClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }], "main");
+    const client = scanClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main");
     await captureJsonl(() => processRepo(db, client, rt(config, "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId)).toEqual([
-      { branch: "main", status: "scanned", sha: "o-main", d: 1, ps: "excluded-by-deny", pat: "main", scd: "2025-06-01T00:00:00Z" },
+      { branch: "main", status: "scanned", sha: hexOid("o-main"), d: 1, ps: "excluded-by-deny", pat: "main", scd: "2025-06-01T00:00:00Z" },
     ]);
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -645,7 +655,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const root = mkdtempSync(join(tmpdir(), "policy-throw-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
-    const client = scanClient(root, [{ name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" }], "dev");
+    const client = scanClient(root, [{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], "dev");
     const runtime: AuditRuntime = { config: testConfig(root, 25), configHash: "h", branchPolicy: throwingPolicy };
     await expect(processRepo(db, client, runtime, runId, "org-a", repo, [], new Set())).rejects.toThrow(PolicyMatchError);
     db.close();
@@ -658,7 +668,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     // packages:[] so discoverCliTerms is a no-op (no registry fetch); the planner throws mid-run.
     const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
     const client = makeClient(root, async (_bin, args) => {
-      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" }], "dev") };
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], "dev") };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
     const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
@@ -711,13 +721,13 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const runId = startScanRun(db);
     const config = { ...testConfig(root, 25), branches: ["main"] }; // allowlist: only main (+ the default)
     const client = scanClient(root, [
-      { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
-      { name: "feat", oid: "o-feat", date: "2025-05-01T00:00:00Z" }, // not allowlisted → excluded-by-allow
+      { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+      { name: "feat", oid: hexOid("o-feat"), date: "2025-05-01T00:00:00Z" }, // not allowlisted → excluded-by-allow
     ], "main");
     await captureJsonl(() => processRepo(db, client, rt(config, "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId)).toEqual([
       { branch: "feat", status: "policy-excluded", sha: "", d: 0, ps: "excluded-by-allow", pat: null, scd: "2025-05-01T00:00:00Z" },
-      { branch: "main", status: "scanned", sha: "o-main", d: 1, ps: null, pat: null, scd: "2025-06-01T00:00:00Z" },
+      { branch: "main", status: "scanned", sha: hexOid("o-main"), d: 1, ps: null, pat: null, scd: "2025-06-01T00:00:00Z" },
     ]);
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -728,17 +738,17 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
     db.enqueueUnit(key("feat"), runId); // a prior run scanned feat to done@o-feat
-    db.setUnitStatus(key("feat"), { status: "done", runId, lastCommitSha: "o-feat", lastCommitDate: "2025-04-01T00:00:00Z" });
+    db.setUnitStatus(key("feat"), { status: "done", runId, lastCommitSha: hexOid("o-feat"), lastCommitDate: "2025-04-01T00:00:00Z" });
     const client = scanClient(root, [ // cap=1: main default-exempt, dev fills the slot, feat past-cap
-      { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
-      { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
-      { name: "feat", oid: "o-feat", date: "2025-04-01T00:00:00Z" },
+      { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+      { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
+      { name: "feat", oid: hexOid("o-feat"), date: "2025-04-01T00:00:00Z" },
     ], "main");
     await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 1), "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId).find((r) => (r as { branch: string }).branch === "feat")).toMatchObject({ status: "past-cap", sha: "", ps: null });
     const featUnit = db.getUnit(key("feat")); // work queue UNTOUCHED — the prior done scan survives
     expect(featUnit?.status).toBe("done");
-    expect(featUnit?.lastCommitSha).toBe("o-feat");
+    expect(featUnit?.lastCommitSha).toBe(hexOid("o-feat"));
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -750,11 +760,11 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     // discovery: main@o-main dated 2025-06-01. The tree is TRUNCATED → clone fallback, and the clone
     // HEAD has MOVED to o-moved dated 2025-06-15 (branch advanced between discovery and the clone).
     const client = makeClient(root, async (_bin, args) => {
-      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }], "main") };
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
       if (args[0] === "clone") { const dest = args[args.length - 1]!; mkdirSync(dest, { recursive: true }); writeFileSync(join(dest, "package.json"), "{}"); return { exitCode: 0, stderr: "", stdout: "" }; }
       if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: "o-moved\n" };
       if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
-      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: true, tree: [] })}` }; // REST tree → truncated
+      return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // REST tree → truncated
     });
     await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
     // the durable row pins the SCANNED (clone) commit + its OWN date — never the stale discovered date
@@ -773,8 +783,8 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["dev"], packages: [] };
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([
-        { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },
-        { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+        { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+        { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
       ], "main") };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
@@ -795,12 +805,12 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const config = { ...testConfig(root, 1), organizations: ["org-a"], branches: ["keep/*"], excludeBranches: ["deny-me"], packages: [] };
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([
-        { name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" },      // default → override (not allow-listed)
-        { name: "deny-me", oid: "o-deny", date: "2025-06-01T00:00:00Z" },   // excluded-by-deny
-        { name: "other", oid: "o-other", date: "2025-06-01T00:00:00Z" },    // excluded-by-allow (allow-list miss)
-        { name: "keep/a", oid: "o-ka", date: "2025-05-01T00:00:00Z" },      // eligible (wins cap=1)
-        { name: "keep/b", oid: "o-kb", date: "2025-04-01T00:00:00Z" },      // past-cap
-        { name: "keep/old", oid: "o-kold", date: "2023-01-01T00:00:00Z" },  // cutoff-skipped (< 2024-01-01)
+        { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },      // default → override (not allow-listed)
+        { name: "deny-me", oid: hexOid("o-deny"), date: "2025-06-01T00:00:00Z" },   // excluded-by-deny
+        { name: "other", oid: hexOid("o-other"), date: "2025-06-01T00:00:00Z" },    // excluded-by-allow (allow-list miss)
+        { name: "keep/a", oid: hexOid("o-ka"), date: "2025-05-01T00:00:00Z" },      // eligible (wins cap=1)
+        { name: "keep/b", oid: hexOid("o-kb"), date: "2025-04-01T00:00:00Z" },      // past-cap
+        { name: "keep/old", oid: hexOid("o-kold"), date: "2023-01-01T00:00:00Z" },  // cutoff-skipped (< 2024-01-01)
       ], "main") };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
@@ -836,7 +846,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     makeClient(root, async (_bin, args) => {
       const j = args.join(" ");
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads(heads, defaultBranch) };
-      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: false, tree: [] })}` };
+      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
   const noArgsT7: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
@@ -845,7 +855,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
   test("runPlan emits an unmatched-pattern warning (before plan-summary) for a deny pattern that matched no branch", async () => {
     const root = mkdtempSync(join(tmpdir(), "warn-plan-"));
     const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["release/*"], packages: [] };
-    const events = await captureJsonl(async () => { await runPlan(fullClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }], "main"), rt(config, "h"), "rvo"); });
+    const events = await captureJsonl(async () => { await runPlan(fullClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main"), rt(config, "h"), "rvo"); });
     expect(policyWarnEvents(events)).toEqual([{ event: "policy-warning", kind: "unmatched-pattern", direction: "deny", pattern: "release/*" }]);
     expect(events.findIndex((e) => e["event"] === "policy-warning")).toBeLessThan(events.findIndex((e) => e["event"] === "plan-summary"));
     rmSync(root, { recursive: true, force: true });
@@ -884,7 +894,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
   test("branches:[] emits empty-allowlist EXACTLY ONCE on a normally-completing run (not double-counted)", async () => {
     const root = mkdtempSync(join(tmpdir(), "warn-empty-once-"));
     const config = { ...testConfig(root, 25), organizations: ["org-a"], branches: [], packages: [] };
-    const events = await captureJsonl(async () => { await runPlan(fullClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }], "main"), rt(config, "h"), "rvo"); });
+    const events = await captureJsonl(async () => { await runPlan(fullClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main"), rt(config, "h"), "rvo"); });
     const emptyAllow = events.filter((e) => e["event"] === "policy-warning" && e["kind"] === "empty-allowlist");
     expect(emptyAllow).toEqual([{ event: "policy-warning", kind: "empty-allowlist" }]); // once (at entry), never re-emitted at finalize
     rmSync(root, { recursive: true, force: true });
@@ -894,7 +904,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const root = mkdtempSync(join(tmpdir(), "warn-both-"));
     const config = { ...testConfig(root, 25), organizations: ["org-a"], branches: ["shared"], excludeBranches: ["shared"], packages: [] };
     // only 'main' (default) is discovered — 'shared' matches nothing in either list
-    const events = await captureJsonl(async () => { await runPlan(fullClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }], "main"), rt(config, "h"), "rvo"); });
+    const events = await captureJsonl(async () => { await runPlan(fullClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main"), rt(config, "h"), "rvo"); });
     expect(policyWarnEvents(events)).toEqual([
       { event: "policy-warning", kind: "unmatched-pattern", direction: "deny", pattern: "shared" },
       { event: "policy-warning", kind: "unmatched-pattern", direction: "allow", pattern: "shared" },
@@ -911,7 +921,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     // coverage sweep invokes z*.match('main') and throws — the run must fail with no branch rows.
     const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [{ pattern: "main", glob: new Bun.Glob("main") }, { pattern: "z*", glob: throwingGlob(badError) }] } };
     let thrown: unknown = null;
-    await captureJsonl(async () => { thrown = await runScan(db, fullClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }], "main"), runtime, noArgsT7, null).then(() => null, (e: unknown) => e); });
+    await captureJsonl(async () => { thrown = await runScan(db, fullClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main"), runtime, noArgsT7, null).then(() => null, (e: unknown) => e); });
     expect(thrown).toBeInstanceOf(PolicyMatchError);
     expect((thrown as { cause?: unknown }).cause).toBe(badError); // the ORIGINAL error, unchanged
     expect(db.read("SELECT COUNT(*) AS n FROM run_unit_head").get()).toEqual({ n: 0 });
@@ -924,7 +934,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
   test("--plan and the real run emit IDENTICAL ordered policy-warning arrays for the same discovered heads", async () => {
     const root = mkdtempSync(join(tmpdir(), "warn-parity-"));
     const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["release/*", "wip"], packages: [] };
-    const heads = [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }];
+    const heads = [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }];
     const planEvents = await captureJsonl(async () => { await runPlan(fullClient(root, heads, "main"), rt(config, "h"), "rvo"); });
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runEvents = await captureJsonl(async () => { await runScan(db, fullClient(root, heads, "main"), rt(config, "h"), noArgsT7, null); });
@@ -972,7 +982,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
     staleHead(db, runId, "deleted"); // a prior invocation recorded it; this discovery no longer sees it
-    const client = scanClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }], "main");
+    const client = scanClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main");
     const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId).map((r) => (r as { branch: string }).branch)).toEqual(["main"]); // 'deleted' pruned
     expect(events.filter((e) => e["event"] === "reconciliation")).toEqual([
@@ -988,7 +998,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const runId = startScanRun(db);
     staleHead(db, runId, "ghost");
     const failClient = makeClient(root, async (_bin, args) =>
-      args.some((a) => a === "graphql") ? { exitCode: 1, stderr: "gh: boom", stdout: "" } : { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: false, tree: [] })}` });
+      args.some((a) => a === "graphql") ? { exitCode: 1, stderr: "gh: boom", stdout: "" } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
     const events = await captureJsonl(() => processRepo(db, failClient, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId).map((r) => (r as { branch: string }).branch)).toEqual(["ghost"]); // retained, NOT pruned
     expect(events.some((e) => e["event"] === "reconciliation")).toBe(false); // no prune ran
@@ -1003,7 +1013,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     staleHead(db, runId, "main", { commitSha: "old-sha", status: "scanned", isDefaultBranch: true, scannedCommitDate: "2025-05-01T00:00:00Z" });
     // re-discovers main at a NEW commit, but the tree fetch (scan) FAILS → no new row written this attempt
     const scanFailClient = makeClient(root, async (_bin, args) => {
-      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: "new-sha", date: "2025-06-01T00:00:00Z" }], "main") };
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("new-sha"), date: "2025-06-01T00:00:00Z" }], "main") };
       if (args.some((a) => a.includes("git/trees"))) return { exitCode: 1, stderr: "gh: tree boom", stdout: "" };
       return { exitCode: 0, stderr: "", stdout: "HTTP/2.0 200 X\r\n\r\n[]" };
     });
@@ -1028,8 +1038,8 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     // reports 'trunk' as the default. branches:[] allow-lists NOTHING, so only the default survives.
     const config = { ...testConfig(root, 25), branches: [], packages: [] };
     const client = fullClient(root, [
-      { name: "trunk", oid: "o-trunk", date: "2025-06-01T00:00:00Z" }, // the REAL (renamed) default
-      { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+      { name: "trunk", oid: hexOid("o-trunk"), date: "2025-06-01T00:00:00Z" }, // the REAL (renamed) default
+      { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
     ], "trunk");
     await captureJsonl(() => processRepo(db, client, rt(config, "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId)).toEqual([
@@ -1038,7 +1048,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       // trunk: SCANNED and flagged default. Before the fix this row read
       // {status:"policy-excluded", d:0, ps:"excluded-by-allow"} — the repo's real default, dropped.
       // ps records the COUNTERFACTUAL (policy would have excluded it); the override keeps it eligible.
-      { branch: "trunk", status: "scanned", sha: "o-trunk", d: 1, ps: "excluded-by-allow", pat: null, scd: "2025-06-01T00:00:00Z" },
+      { branch: "trunk", status: "scanned", sha: hexOid("o-trunk"), d: 1, ps: "excluded-by-allow", pat: null, scd: "2025-06-01T00:00:00Z" },
     ]);
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -1048,8 +1058,8 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const root = mkdtempSync(join(tmpdir(), "stale-default-plan-"));
     const config = { ...testConfig(root, 25), organizations: ["org-a"], branches: [], packages: [] };
     const client = fullClient(root, [
-      { name: "trunk", oid: "o-trunk", date: "2025-06-01T00:00:00Z" },
-      { name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" },
+      { name: "trunk", oid: hexOid("o-trunk"), date: "2025-06-01T00:00:00Z" },
+      { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
     ], "trunk");
     let totals: PlanTotals | undefined;
     await captureJsonl(async () => { totals = await runPlan(client, rt(config, "h"), "rvo"); });
@@ -1067,7 +1077,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     // repo it never actually resolved — the same silent under-report in preview form.
     const root = mkdtempSync(join(tmpdir(), "plan-incoherent-"));
     const config = { ...testConfig(root, 25), organizations: ["org-a"], branches: [], packages: [] };
-    const client = fullClient(root, [{ name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" }], null); // heads, no default
+    const client = fullClient(root, [{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], null); // heads, no default
     let totals: PlanTotals | undefined;
     const events = await captureJsonl(async () => { totals = await runPlan(client, rt(config, "h"), "rvo"); });
     expect(totals?.discoveryErrors).toBe(1);
@@ -1084,7 +1094,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
     staleHead(db, runId, "ghost"); // a prior invocation's row for a branch this discovery won't return
-    const client = scanClient(root, [{ name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" }], null);
+    const client = scanClient(root, [{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], null);
     const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId).map((r) => (r as { branch: string }).branch)).toEqual(["ghost"]); // retained
     expect(events.some((e) => e["event"] === "reconciliation")).toBe(false); // no prune ran
