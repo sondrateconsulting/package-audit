@@ -1316,7 +1316,7 @@ describe("package_api_surface (§5.E durable introspection)", () => {
     expect(rows.length).toBe(3); // 2 rows + marker
     const marker = rows.find((r) => r["export_kind"] === "__complete__")!;
     expect(marker["export_name"]).toBe("");
-    // §7 epoch: the marker's `source` carries the current surface schema version.
+    // §5.E epoch: the marker's `source` carries the current surface schema version.
     expect(marker["source"]).toBe(`__complete__@${SURFACE_SCHEMA_VERSION}`);
 
     db.writeApiSurface({ packageName: "empty-pkg", version: "1.0.0", versionSource: "range-resolved", rows: [] });
@@ -1385,7 +1385,7 @@ describe("package_api_surface (§5.E durable introspection)", () => {
   });
 });
 
-describe("package_api_surface — §7 surface-cache epoch", () => {
+describe("package_api_surface — §5.E surface-cache epoch", () => {
   test("SURFACE_SCHEMA_VERSION starts at 2 so every pre-epoch marker misses", () => {
     expect(SURFACE_SCHEMA_VERSION).toBe(2);
   });
@@ -1635,7 +1635,7 @@ function buildV2Db(path: string): void {
     VALUES (21, 'v2-run', 'org-a', 'repo', 'main', 'sha1', 'expo', 'expo', 'named-import', 'registerRootComponent', '',
     'index.js', 1, 'https://github.com/org-a/repo/blob/sha1/index.js#L1',
     'import { registerRootComponent } from "expo"', '2026-01-01T00:20:00.000Z')`);
-  // The marker carries the CURRENT surface epoch (§7): this fixture models a v2 database
+  // The marker carries the CURRENT surface epoch (§5.E): this fixture models a v2 database
   // written by the current pre-v3 code, whose markers are epoch-stamped. (A PRE-epoch bare
   // '__complete__' marker deliberately reads as ABSENT — that shape has its own tests — and
   // using it here would silently drain the round-trip twin's apiSurface coverage.)
@@ -1742,7 +1742,7 @@ describe("migration — v2 → v3 (version-stepped, CRITICAL round-trip)", () =>
       expect(afterReport).toBe(expectedReport);
       expect(afterReport).toContain('"isDefaultBranch": null'); // pre-v3 rows render as unknown
       // apiSurface must be POPULATED, not silently drained: the fixture's epoch-stamped completion
-      // marker is load-bearing. A bare/stale marker reads as ABSENT (§7 epoch), so the surface would
+      // marker is load-bearing. A bare/stale marker reads as ABSENT (§5.E epoch), so the surface would
       // empty out and the byte-identity above would still pass empty-vs-empty (both build from the
       // same fixture) — asserting NOTHING. This positive check makes that regression fail (see 4d0b42d).
       const migratedExpo = migratedReport.packages.find((p) => p.name === "expo");

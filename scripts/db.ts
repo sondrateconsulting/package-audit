@@ -42,7 +42,7 @@ const V3_TARGET_VERSION = 3;
 // adopted and rebuilt — see assertOwnedDatabase.)
 const MIN_OWNED_VERSION = 2;
 
-// §7 SURFACE-CACHE EPOCH. Bumped when the introspection LOGIC changes (resolver correctness, parse
+// §5.E SURFACE-CACHE EPOCH. Bumped when the introspection LOGIC changes (resolver correctness, parse
 // bounds) so a package audited by an OLDER, buggier resolver does NOT keep its stale '__complete__'
 // marker forever (hasCompletionMarker short-circuits BEFORE inspection, and even --fresh preserves
 // package_api_surface). The epoch is stamped into the marker row's `source` column (no DDL change,
@@ -1199,7 +1199,7 @@ export class AuditDb {
   // so a partial/crashed introspection leaves NO marker and is re-attempted. The write REPLACES
   // the version's whole row set: a marker-less partial introspection may have left rows that
   // are no longer in the new surface, and upserting over them would orphan stale exports.
-  // §7 EPOCH: a marker counts ONLY when its stored surface epoch (in `source`) equals the current
+  // §5.E EPOCH: a marker counts ONLY when its stored surface epoch (in `source`) equals the current
   // SURFACE_SCHEMA_VERSION — a stale-epoch marker (an OLD resolver's, or a pre-epoch bare
   // '__complete__') is treated as ABSENT, so this version is re-inspected under the current logic.
   hasCompletionMarker(packageName: string, version: string): boolean {
@@ -1234,7 +1234,7 @@ export class AuditDb {
         .run(input.packageName, input.version);
       for (const r of input.rows)
         insert.run(input.packageName, input.version, input.versionSource, r.exportName, r.exportKind, r.source, now);
-      // … then stamp the marker LAST with the CURRENT surface epoch in `source` (§7).
+      // … then stamp the marker LAST with the CURRENT surface epoch in `source` (§5.E).
       insert.run(input.packageName, input.version, input.versionSource, "", COMPLETION_KIND, markerSource(SURFACE_SCHEMA_VERSION), now);
     })();
   }

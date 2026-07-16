@@ -345,6 +345,8 @@ CREATE TABLE IF NOT EXISTS package_api_surface (
                                        -- presence is the durable SUCCESS record (§5.E) — true
                                        -- even for a zero-export/zero-bin surface, absent after a
                                        -- partial/crashed introspection. The report EXCLUDES it.
+                                       -- Marker `source` = '__complete__@<epoch>' (§5.E
+                                       -- SURFACE-CACHE EPOCH); a stale epoch reads as ABSENT.
   source TEXT NOT NULL, introspected_at TEXT NOT NULL,
   UNIQUE(package_name, version, export_name, export_kind)
 );
@@ -756,7 +758,17 @@ E. Introspect API surface, deduplicated GLOBALLY by (package_name, resolved_vers
    `export_kind='__complete__'`) written in the SAME transaction as that version's export/
    bin rows, so a partial or crashed introspection leaves NO marker and is re-attempted, and
    a version with ZERO exports/bins still earns a marker (distinguishing "introspected,
-   empty surface" from "never introspected"). Introspection is RECONCILED PER RUN and
+   empty surface" from "never introspected"). SURFACE-CACHE EPOCH: the marker row's
+   `source` column is stamped `__complete__@<epoch>`, where <epoch> is the current
+   surface-cache epoch (the `SURFACE_SCHEMA_VERSION` constant in db.ts). A marker counts
+   as the SUCCESS record ONLY when its stored epoch equals the current constant; a marker
+   whose epoch DIFFERS (including a pre-epoch bare `source='__complete__'`) is treated as
+   ABSENT, so the version is RE-introspected under the CURRENT resolver (that re-write
+   REPLACES the version's whole row set, dropping the stale marker and rows). BUMP the
+   epoch whenever introspection LOGIC changes (resolver correctness, parse bounds): the
+   marker is durable by design (even `--fresh` preserves `package_api_surface`), so
+   without the epoch a version audited by an older, buggier resolver would keep its stale
+   marker — and its wrong surface — forever. Introspection is RECONCILED PER RUN and
    DECOUPLED from unit skip: every distinct (package_name, resolved_version) in THIS run's
    reportable slice (the versionsSeen the report will show, §7 — INCLUDING versions carried
    by units SKIPPED-as-current, §3, whose `dependency_findings` are reused) that LACKS a
@@ -830,8 +842,9 @@ E. Introspect API surface, deduplicated GLOBALLY by (package_name, resolved_vers
    `typesVersions` remap → `types`/`typings` → `index.d.ts`. Enumerate named exports from
    the resolved .d.ts (preferred; else statically parse top-level export/module.exports —
    never execute). Record bin names. Upsert the export/bin rows into package_api_surface,
-   THEN the completion marker (`export_name=''`, `export_kind='__complete__'`, sentinel
-   `source='__complete__'`) LAST in the same transaction. On introspection FAILURE of a
+   THEN the completion marker (`export_name=''`, `export_kind='__complete__'`, the
+   epoch-stamped sentinel `source='__complete__@<epoch>'` — SURFACE-CACHE EPOCH, above)
+   LAST in the same transaction. On introspection FAILURE of a
    REGISTRY version (network/parse/integrity/off-origin), write NO marker and instead log an
    `errors` row with `package_name` AND the concrete semver `version` set — so §7/§8's
    per-version guarantee (scoped to versionsSeen, which is semver-only) is derivable by
