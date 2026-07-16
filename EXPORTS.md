@@ -164,6 +164,14 @@ entry in the report's `errors[]` (and is counted by the report's `branchesErrore
 was **throttle-requeued** is deferred with neither a row nor an error — it is finished on the next run.
 Scoped to the selected run only (`--raw` dumps all runs).
 
+On a **resumed** run (one interrupted and re-invoked, which reuses the same `run_id`), the report's
+`branchesErrored` is an upper bound rather than an equality: `errors[]` is append-only and is never
+reconciled, while the rows in *this* table **are** pruned for branches gone since an earlier invocation.
+So a branch that errored in an earlier invocation and reached no row-bearing disposition in the final one
+— deleted, throttle-requeued on retry, or its repo's discovery failed — is still counted there while
+correctly holding no row here. This table itself stays exact either way: every row is a disposition the
+run genuinely recorded.
+
 | column | type |
 |---|---|
 | run_id | string |

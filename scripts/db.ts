@@ -1945,7 +1945,17 @@ export class AuditDb {
   // a failed/throttled repo is retained, never pruned (a transient failure must not delete a live
   // branch). `discoveredBranches` is the COMPLETE live-name keep-set (all discovered heads, every
   // disposition) — NOT merely rows rewritten this invocation, so a live branch whose scan failed this
-  // attempt keeps its prior row. Returns the number of rows pruned.
+  // attempt keeps its prior row.
+  //
+  // The prune is NAME-keyed BY DESIGN, so a same-name STALE HEAD is retained, not pruned: if a branch's
+  // head advanced since a prior invocation and this attempt's re-scan errored or throttled, no
+  // replacement row is written and the prior row — pinned to the OLDER commit — survives. The report
+  // then counts that branch as scanned AT THE OLD HEAD. This is STALE, not WRONG: the row self-describes
+  // what it is (commit_sha + scanned_commit_date name the commit actually scanned, and its findings came
+  // from that real scan), and the work_queue unit is left error/pending so the next run re-scans and
+  // refreshes it. Accepted, not overlooked — see processRepo's §11 note for the rejected alternative.
+  //
+  // Returns the number of rows pruned.
   reconcileRunUnitHead(runId: string, organization: string, repository: string, discoveredBranches: readonly string[]): number {
     const res = this.db
       .query(

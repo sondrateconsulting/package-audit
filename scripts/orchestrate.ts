@@ -472,6 +472,28 @@ export async function processRepo(
   // reflects the discovery-time snapshot: a branch deleted-then-recreated between discovery and here has
   // its prior row pruned and is re-recorded on the next run — an accepted TOCTOU for this single-user
   // tool (no permanent data loss; global findings persist, only the disposition row briefly lapses).
+  //
+  // SIBLING ACCEPTED-STALENESS (same-name stale head). On a RESUME: a branch whose head ADVANCED since a
+  // prior invocation, whose re-scan then errors (the insertError arm above) or throttles (the requeue
+  // arm), writes no row this attempt — and the name-keyed prune RETAINS the prior row, pinned to the
+  // OLDER head. The report counts it scanned at that old head. Accepted, because:
+  //   - it is stale, not wrong: the row and its findings describe a real scan of a real commit, and
+  //     commit_sha + scanned_commit_date say WHICH. PROMPT.md's report-head invariant defines commit_sha
+  //     as "the head it reported", never "the live head".
+  //   - it is NOT a regression: before §11 existed there was no prune at all, so the row was retained
+  //     identically. The prune is a mitigation this feature ADDED (it removes deleted-branch phantoms
+  //     that used to persist forever); it is not the cause.
+  //   - it self-heals: the unit is left error/pending, never done, so the next run re-scans and re-upserts
+  //     at the live head.
+  // A head-SHA-aware prune is REJECTED: it would delete the clone-fallback path's legitimate rows (whose
+  // commit_sha is the clone's real HEAD, deliberately != the discovered h.oid — see processUnit) and the
+  // commit_sha='' sentinels the non-scanned dispositions rely on, hiding a real branch's real findings
+  // entirely rather than reporting them one commit late.
+  // Sharp edge worth knowing: the ERROR variant is loud (an errors[] row + a JSONL `action:"error"`
+  // line, visible beside the stale row), but the THROTTLE variant writes neither — only a stdout
+  // requeue line — so a completed run can present the old head with no in-report signal. Related: the
+  // retained row also masks that branch from the report's branchesErrored, which counts only errored
+  // branches holding NO row (see report.ts).
   const pruned = db.reconcileRunUnitHead(runId, repo.organization, repo.name, heads.map((h) => h.name));
   if (pruned > 0)
     logLine({ event: "reconciliation", target: "run_unit_head", runId, org: repo.organization, repo: repo.name, action: "prune-stale", pruned });

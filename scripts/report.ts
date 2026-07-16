@@ -56,20 +56,35 @@ export interface ReportSummary {
   branchesScanned: number;
   branchesSkippedByCutoff: number;
   // Branch allow/deny (§5): the disjoint disposition partition. The four disposition counts partition the
-  // run_unit_head rows this run RECORDED, exactly once each. Together with branchesErrored they account
-  // for every branch that reached a TERMINAL outcome this run:
+  // run_unit_head rows this run RECORDED, exactly once each. (That clause is unconditional and exact.)
+  // Together with branchesErrored they account for the branches that reached a TERMINAL outcome:
   //   discovered (terminal) = branchesScanned + branchesSkippedByCutoff + branchesExcludedByPolicy
-  //                           + branchesPastCap + branchesErrored.
+  //                           + branchesPastCap + branchesErrored   — EXACT on a SINGLE-INVOCATION run.
+  //   discovered (terminal) <= that sum                             — on a RESUMED run; see branchesErrored
+  //                                                                   for exactly which branches inflate it.
   // branchesScanned INCLUDES scanned default-override rows (they WERE scanned). branchesSkippedByCutoff is
-  // GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket. (A branch whose
-  // scan was throttle-requeued is deferred, not terminal — it is finished on the next run, so it is in no
-  // count here.)
+  // GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket.
   branchesExcludedByPolicy: number;
   branchesPastCap: number;
-  // Discovered branches whose scan ERRORED this run (a scope='scan' errors[] entry) and therefore hold NO
-  // run_unit_head disposition row — surfaced so the disposition counts + this reconcile to discovered heads.
-  // (A throttle-requeued branch has NEITHER a row nor an error: it is deferred, not terminal, and is
-  // finished on the next run — so it is deliberately in no count.)
+  // DISTINCT (org, repo, branch) with a scope='scan' errors[] entry for this run and NO run_unit_head
+  // disposition row. EXACT on a single-invocation run; an UPPER BOUND on a RESUMED one.
+  //
+  // Why it can only inflate: a resumed run REUSES the run_id (db.startRun), errors[] is append-only and is
+  // NEVER reconciled, while run_unit_head rows ARE pruned for branches gone since a prior invocation
+  // (reconcileRunUnitHead). An errored branch holds no row, so the "has a row" exclusion below can never
+  // suppress it. Any branch that errored in an EARLIER invocation and did not reach a ROW-BEARING
+  // disposition in the final one is therefore still counted. That is MORE than just deletion — it also
+  // covers a branch throttle-requeued on retry, and one whose repo's discovery failed that invocation.
+  // Deliberately not stated as an exact arithmetic characterisation: the membership rule above is the
+  // claim, and enumerating "overcounts by exactly N deleted branches" would be false.
+  //
+  // It NEVER undercounts the branches that errored this run: every other later outcome writes a row
+  // (scanned / past-cap / skipped-cutoff), which moves the branch into its own terminal bucket.
+  //
+  // Throttle carve-out, precisely: a branch throttle-requeued with NO prior error has neither a row nor an
+  // error — deferred, not terminal, finished next run — so it is in no count. That holds absolutely only
+  // within a single invocation; after an earlier-invocation error the branch DOES carry an error and so IS
+  // counted here, despite being deferred rather than terminal.
   branchesErrored: number;
   totalDependencyFindings: number;
   totalUsageFindings: number;

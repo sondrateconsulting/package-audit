@@ -445,7 +445,16 @@ Resumability rules:
   whose head fell BEFORE `cutoffDate` is DIFFERENT: §5.B DOES surface it and records it THIS
   run as `skipped-cutoff` in `run_unit_head` (commit_sha=''), so it stays per-run
   reproducible (§7's `branchesSkippedByCutoff`) — it is NOT left in this retain-prior-state
-  path.
+  path. A THIRD retain-prior-state case exists on RESUME (same-name stale head): a still-live
+  branch whose head ADVANCED between invocations and whose re-scan then ERRORS or THROTTLES
+  writes no row this attempt, so §11's name-keyed prune retains the row from the earlier
+  invocation — pinned to the OLDER head — and the run reports that branch as scanned there.
+  Like the cases above this is intended, not an error: the row is per-run reproducible and
+  truthful about the commit it scanned (see the report-head invariant below — commit_sha is
+  "the head it reported", never "the live head"), and the unit is left `error`/`pending` so
+  the next run refreshes it. A head-SHA-aware prune is deliberately NOT used: it would delete
+  the clone-fallback path's legitimate rows (commit_sha = the clone's real HEAD, which may
+  differ from the discovered head by design, §5.C) and the commit_sha='' sentinels.
 - Report-head invariant (co-designed with the skip predicate): as each unit is
   processed (scanned OR skipped-as-current), the run upserts `run_unit_head(run_id, org,
   repo, branch, commit_sha=the head it reported)`. Findings accumulate across commits
