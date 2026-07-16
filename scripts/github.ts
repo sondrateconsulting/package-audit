@@ -492,8 +492,8 @@ export function classifyRest(
   // raw consumers (fetchFileRaw/fetchBlobRaw) scan those bodies as file content with no
   // structural validation at all, and the structured consumers' validation cannot establish
   // transport completeness anyway — so ONE fatal here covers every consumer, current and
-  // future. Non-retryable on
-  // purpose: a transforming middlebox would re-transform on retry, and the transient path would
+  // future. Non-retryable on purpose: a transforming middlebox would re-transform on retry,
+  // and the transient path would
   // end in a misleading ThrottleExhausted that loses the status. Every REST endpoint this tool
   // calls returns exactly 200 on success; an endpoint with genuine 202/204 semantics would need
   // its own explicit handler, never a re-widening of this range. Bounds are exact (201-299) so
@@ -1282,20 +1282,14 @@ export class GithubClient {
         }
         throw new GithubApiError(`gh api graphql produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`, { endpoint: "graphql" });
       }
-      // Same truncated-transfer guard as restGet: a nonzero gh exit under a parsed 200 means
-      // the body may be cut mid-stream. GraphQL truncation USUALLY fails JSON.parse, but a cut
-      // can land on a valid JSON boundary — the exit code is the only reliable completeness
-      // signal. (No cache here; the risk is consuming a partial envelope as truth.)
-      if (parsed.status === 200 && res.exitCode !== 0) {
-        if (attempt < MAX_ATTEMPTS - 1) {
-          await this.sleep(this.backoffWait("transient", attempt, null));
-          continue;
-        }
-        throw new GithubApiError(
-          `gh exited ${res.exitCode} with an HTTP 200 graphql response — the body may be truncated: ${res.stderr.trim().slice(0, 300)}`,
-          { endpoint: "graphql" },
-        );
-      }
+      // There is DELIBERATELY no restGet-style nonzero-exit truncation guard here: gh exits 1
+      // BY DESIGN after printing a complete HTTP-200 envelope whose body carries `errors` —
+      // including genuine RATE_LIMITED throttles — so a nonzero exit under a parsed 200 is the
+      // NORMAL semantic-error shape, not a truncation signal (such a guard would blind-retry
+      // real throttles past their reset window and misreport them as truncated). Truncation is
+      // still fail-closed without it: the envelope is object-rooted JSON, and no proper prefix
+      // of a valid top-level-object JSON text is itself valid JSON, so a mid-stream cut always
+      // fails JSON.parse → parseGraphqlEnvelope flags it malformed → rejected below.
       // Spec-shape validation lives in parseGraphqlEnvelope (pure). A malformed envelope means the
       // failure signal we were meant to read is unreadable — coercing it to "no errors" would be
       // fail-OPEN: an ok:true branch discovery feeds the reconcile PRUNE (reconcileRunUnitHead), so a

@@ -208,7 +208,9 @@ describe("classifyRest / classifyGraphql / parseRetryAfterMs", () => {
     for (const status of [199, 300]) {
       const cls = classifyRest(status, {}, "", NOW);
       expect(cls.kind).toBe("fatal");
-      if (cls.kind === "fatal") expect(cls.message).not.toMatch(/only exactly 200/);
+      // the exact catch-all message, not merely "some fatal" — an accidentally-widened 2xx
+      // branch (or any rerouting) would change this wording
+      if (cls.kind === "fatal") expect(cls.message).toBe(`HTTP ${status}`);
     }
   });
   test("a 2xx-non-200 is fatal even when throttle-looking headers ride along — never a retryable throttle", () => {
@@ -528,9 +530,12 @@ describe("restGet caching + conditional requests", () => {
     // and surface the stderr diagnostic, leaving nothing in the cache.
     const truncated = err(http(200, { etag: 'W/"t"' }, `{"half":`), "read: connection reset by peer");
     const db = AuditDb.open({ sqlitePath: ":memory:" });
-    const { client, sleeps } = makeClient([truncated, truncated, truncated, truncated, truncated, truncated], { db });
-    await expect(client.restGet("user/orgs?per_page=100&page=1")).rejects.toThrow(/truncated|connection reset/);
-    expect(sleeps.length).toBeGreaterThanOrEqual(5);
+    const { client, calls, sleeps } = makeClient([truncated, truncated, truncated, truncated, truncated, truncated], { db });
+    // the stderr diagnostic specifically — the wrapper's own "truncated" wording would match
+    // even if stderr propagation were dropped
+    await expect(client.restGet("user/orgs?per_page=100&page=1")).rejects.toThrow(/connection reset by peer/);
+    expect(calls.length).toBe(6); // exactly MAX_ATTEMPTS spawns…
+    expect(sleeps.length).toBe(5); // …with a backoff between each pair, none after the last
     const rows = db.read("SELECT COUNT(*) AS n FROM api_cache").get() as { n: number };
     expect(rows.n).toBe(0);
     db.close();
@@ -892,8 +897,9 @@ describe("throttle wait clamping (§4 hardening)", () => {
   });
 
   test("a graphql RATE_LIMITED with a far-future reset sleeps exactly MAX_PAUSE_MS, then retries", async () => {
+    // exit 1 on the throttle page: gh exits nonzero for a 200-with-errors envelope BY DESIGN
     const { client, sleeps } = makeClient([
-      ok(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`)),
+      err(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`), "gh: GraphQL error"),
       ok(http(200, {}, `{"data":{"x":1}}`)),
     ]);
     const data = await client.graphql("query{x}", {});
@@ -1525,9 +1531,10 @@ describe("pagination", () => {
 describe("graphql", () => {
   test("RATE_LIMITED 200 body is retried; success returns data; never cached", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // exit 1 on the throttle page: gh exits nonzero for a 200-with-errors envelope BY DESIGN
     const { client, calls } = makeClient(
       [
-        ok(http(200, { "x-ratelimit-remaining": "10" }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`)),
+        err(http(200, { "x-ratelimit-remaining": "10" }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`), "gh: GraphQL error"),
         ok(http(200, {}, `{"data":{"x":1}}`)),
       ],
       { db },
@@ -1620,16 +1627,32 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
     const { client } = makeClient([ok(http(206, {}, `{"data":{"x":1}}`))]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/200/);
   });
-  test("a parsed 200 from a FAILED gh process is a truncated transfer for graphql too — retried, not consumed", async () => {
-    // a truncated graphql body USUALLY fails JSON.parse, but truncation can land on a valid
-    // JSON boundary — the exit code is the only reliable completeness signal.
-    const { client, calls } = makeClient([
-      err(http(200, {}, `{"data":{"x":1}}`), "read: connection reset"),
-      ok(http(200, {}, `{"data":{"x":2}}`)),
+  test("a RATE_LIMITED 200 envelope with gh EXIT 1 is a THROTTLE, never mistaken for a truncated transfer", async () => {
+    // gh exits 1 BY DESIGN after printing a complete 200 envelope that carries `errors` — the
+    // realistic wire shape for every GraphQL throttle. A restGet-style nonzero-exit guard here
+    // would blind-retry this past its reset window and misreport it as truncation (reviewer-
+    // caught regression); the exit code must never preempt classifyGraphql.
+    const { client, calls, sleeps } = makeClient([
+      err(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1000000100" }, `{"errors":[{"type":"RATE_LIMITED","message":"wait"}]}`), "gh: GraphQL error"),
+      ok(http(200, {}, `{"data":{"x":1}}`)),
     ]);
     const data = await client.graphql("query{x}", {});
-    expect(data).toEqual({ x: 2 }); // attempt 1's possibly-truncated envelope was never trusted
+    expect(data).toEqual({ x: 1 });
     expect(calls.length).toBe(2);
+    expect(sleeps.some((ms) => ms >= 100_000)).toBe(true); // waited out the PRIMARY window (reset+skew), not blind backoff
+  });
+  test("a fatal-errors 200 envelope with gh EXIT 1 keeps its error text — no retries, no 'truncated' misreport", async () => {
+    const { client, calls } = makeClient([
+      err(http(200, {}, `{"data":null,"errors":[{"type":"NOT_FOUND","message":"gone"}]}`), "gh: GraphQL error"),
+    ]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/NOT_FOUND.*gone/);
+    expect(calls.length).toBe(1);
+  });
+  test("a TRUNCATED graphql body fails closed without any exit-code guard — a JSON-object prefix is never valid JSON", async () => {
+    const { client } = makeClient([
+      err(http(200, {}, `{"data":{"x":1}`), "read: connection reset"), // mid-stream cut: brace never closes
+    ]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/unparseable JSON/);
   });
   test("junk errors entries do NOT preempt SSO evidence: 403+x-github-sso stays fatal WITH ssoRequired", async () => {
     const { client } = makeClient([
