@@ -180,8 +180,11 @@ disposition, and counting it twice would double-count one discovered branch.
 This table itself stays exact either way: every row is a disposition the run genuinely recorded. Note a
 **scanned** row may be pinned to an older head than the branch's current one (same-name stale head): its
 `commit_sha` and `scanned_commit_date` name the commit that was actually scanned, which on a resumed run
-may predate the live head. (On a NON-scanned row `commit_sha` is `''` and `scanned_commit_date` is the
-discovered-head date — see the column notes below.)
+may predate the live head. The same retention is disposition-agnostic — a resumed run whose re-scan of an
+advanced head failed keeps the branch's prior row whatever its `status`, so e.g. a `skipped-cutoff` row can
+describe an older evaluation of a branch whose current head has since passed the cutoff. (On a NON-scanned
+row `commit_sha` is `''` and `scanned_commit_date` is the discovered-head date — see the column notes
+below.)
 
 | column | type |
 |---|---|

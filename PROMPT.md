@@ -522,11 +522,15 @@ Resumability rules:
   path. A THIRD retain-prior-state case exists on RESUME (same-name stale head): a still-live
   branch whose head ADVANCED between invocations and whose re-scan then ERRORS or THROTTLES
   writes no row this attempt, so §11's name-keyed prune retains the row from the earlier
-  invocation — pinned to the OLDER head — and the run reports that branch as scanned there.
-  Like the cases above this is intended, not an error: the row is per-run reproducible and
-  truthful about the commit it scanned (see the report-head invariant below — commit_sha is
-  "the head it reported", never "the live head"), and the unit is left `error`/`pending` so
-  the next run refreshes it. A head-SHA-aware prune is deliberately NOT used: it would delete
+  invocation — WHATEVER its disposition, pinned to the OLDER evaluation — and the run reports
+  the branch under that PRIOR disposition. A prior scanned row reads "scanned at the old head";
+  a prior NON-scanned row (e.g. `skipped-cutoff` recorded when the old head sat below the
+  cutoff) keeps the branch in its old bucket even though the advanced head became eligible.
+  Like the cases above this is intended, not an error: each retained row is per-run
+  reproducible and truthful about what its own invocation decided (a scanned row's commit_sha
+  is "the head it reported", never "the live head" — the report-head invariant below; a
+  non-scanned row's commit_sha='' and discovered-head date describe the older evaluation), and
+  the unit is left `error`/`pending` so the next run refreshes it. A head-SHA-aware prune is deliberately NOT used: it would delete
   the clone-fallback path's legitimate rows (commit_sha = the clone's real HEAD, which may
   differ from the discovered head by design, §5.C) and the commit_sha='' sentinels.
 - Report-head invariant (co-designed with the skip predicate): as each unit is

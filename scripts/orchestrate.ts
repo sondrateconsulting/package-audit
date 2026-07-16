@@ -487,11 +487,16 @@ export async function processRepo(
   //
   // SIBLING ACCEPTED-STALENESS (same-name stale head). On a RESUME: a branch whose head ADVANCED since a
   // prior invocation, whose re-scan then errors (the insertError arm above) or throttles (the requeue
-  // arm), writes no row this attempt — and the name-keyed prune RETAINS the prior row, pinned to the
-  // OLDER head. The report counts it scanned at that old head. Accepted, because:
-  //   - it is stale, not wrong: the row and its findings describe a real scan of a real commit, and
-  //     commit_sha + scanned_commit_date say WHICH. PROMPT.md's report-head invariant defines commit_sha
-  //     as "the head it reported", never "the live head".
+  // arm), writes no row this attempt — and the name-keyed prune RETAINS the prior row, WHATEVER its
+  // disposition, pinned to the OLDER evaluation. The report counts the branch under that PRIOR
+  // disposition: scanned at the old head — or still skipped-cutoff/past-cap/policy-excluded from the
+  // older evaluation, even though the head became eligible this attempt (cutoff-skip via an advanced
+  // head; past-cap via a cap-order shift; policy-excluded only when the branch also BECAME the
+  // default, the one override policy permits). Accepted, because:
+  //   - it is stale, not wrong: a scanned row and its findings describe a real scan of a real commit —
+  //     commit_sha + scanned_commit_date say WHICH (PROMPT.md's report-head invariant defines commit_sha
+  //     as "the head it reported", never "the live head") — and a non-scanned row's commit_sha='' +
+  //     discovered-head date describe the older evaluation it records.
   //   - it is NOT a regression: before §11 existed there was no prune at all, so the row was retained
   //     identically. The prune is a mitigation this feature ADDED (it removes deleted-branch phantoms
   //     that used to persist forever); it is not the cause.

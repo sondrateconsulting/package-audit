@@ -1307,9 +1307,16 @@ function assertOpenCompatible(db: Database, userVersion: number): void {
   if (!ruhPresent) return; // absent + runs also absent -> genuine fresh / post-fresh cache-only state
   const cls = classifyRunUnitHead(db);
   if (cls.kind === "incompatible") reject(cls.reason);
-  // Per-stamp allowed shapes, TIGHTENED: the transactional migration chain cannot produce a shape
-  // newer than its stamp, so e.g. a v3 stamp must not carry a v2 shape (that would skip migrateV2toV3
-  // and fail mid-migration — after --fresh already dropped the tables).
+  // Per-stamp allowed shapes, TIGHTENED in one direction: each step transforms the shape BEFORE
+  // stamping (one transaction each), so the chain can never leave a shape OLDER than its stamp — a
+  // v3 stamp carrying a v2 shape proves migrateV2toV3 was skipped; without --fresh, accepting it
+  // would only defer the failure to migrateV3toV4's exact-v2 rejection. Recognized NEWER shapes are
+  // also accepted at older stamps: a COMPLETE current-shape table under an older stamp is
+  // chain-producible — the legacy and v2→v3 steps execute SCHEMA_SQL (which creates any MISSING
+  // table in the CURRENT shape) before stamping their own target, so a crash before the NEXT step
+  // stamps leaves that physically-upgraded table behind — and stamp 2 likewise accepts exact-v3.
+  // The ours-v4-missing-index form is NOT chain-producible (SCHEMA_SQL creates ix_ruh_loc in the
+  // same transaction as the table); it is accepted separately as REPAIRABLE.
   const okV4 = cls.kind === "ours-v4" || cls.kind === "ours-v4-missing-index";
   const allowed =
     userVersion >= V4_TARGET_VERSION
@@ -2024,11 +2031,15 @@ export class AuditDb {
   //
   // The prune is NAME-keyed BY DESIGN, so a same-name STALE HEAD is retained, not pruned: if a branch's
   // head advanced since a prior invocation and this attempt's re-scan errored or throttled, no
-  // replacement row is written and the prior row — pinned to the OLDER commit — survives. The report
-  // then counts that branch as scanned AT THE OLD HEAD. This is STALE, not WRONG: the row self-describes
-  // what it is (commit_sha + scanned_commit_date name the commit actually scanned, and its findings came
-  // from that real scan), and the work_queue unit is left error/pending so the next run re-scans and
-  // refreshes it. Accepted, not overlooked — see processRepo's §11 note for the rejected alternative.
+  // replacement row is written and the prior row — WHATEVER its disposition, pinned to the OLDER
+  // evaluation — survives. The report counts the branch under that PRIOR disposition: a prior scanned
+  // row reads "scanned at the old head" (commit_sha + scanned_commit_date name the commit actually
+  // scanned, and its findings came from that real scan); a prior NON-scanned row (say skipped-cutoff,
+  // recorded when the old head sat below the cutoff) keeps the branch in its old bucket even though the
+  // advanced head became eligible — its commit_sha='' and discovered-head date describe that older
+  // evaluation. This is STALE, not WRONG: every retained row is truthful about what its own invocation
+  // decided, and the work_queue unit is left error/pending so the next run re-scans and refreshes it.
+  // Accepted, not overlooked — see processRepo's §11 note for the rejected alternative.
   //
   // SCOPE, stated precisely because the surrounding docs used to over-claim it: the caller invokes this
   // ONCE PER RE-DISCOVERED REPO, so what it guarantees is "a re-discovered repo's rows match its live

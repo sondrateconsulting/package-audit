@@ -1291,6 +1291,69 @@ describe("processRepo throttle requeue (§4)", () => {
   });
 });
 
+describe("same-name stale-head retention is DISPOSITION-AGNOSTIC (§11)", () => {
+  test("a prior skipped-cutoff row survives a failed re-scan of the now-eligible advanced head", async () => {
+    // Round-4 review finding: the retention docs used to describe the retained row as "scanned at
+    // the old head" — but retention is name-keyed and disposition-agnostic. Invocation 1: the
+    // non-default head sits BELOW the cutoff → a skipped-cutoff row (commit_sha='',
+    // scanned_commit_date = discovered-head date). Invocation 2: the head ADVANCED past the cutoff
+    // (now eligible, toScan) but its scan ERRORS → no replacement row is written, the name-keyed
+    // prune keeps the branch (it is in the live keep-set), and the OLD skipped-cutoff row survives —
+    // the report counts the branch in the cutoff bucket this run even though its live head is
+    // eligible. Stale-not-wrong; the next run re-scans (unit left error).
+    // branches/excludeBranches EXPLICIT: the shared frozen config omits them, and rt() would compile
+    // the missing allowlist into [] (= default-only policy), silently policy-excluding `feat` in both
+    // invocations — whose bucket rewrites its row every invocation, defeating the retention scenario.
+    const cutoffConfig = { ...(config as unknown as Record<string, unknown>), cutoffDate: "2025-06-01", branches: null, excludeBranches: [] } as unknown as Config;
+    // The persisted run cutoff matches the runtime's (startRun normally guarantees the pairing).
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "hash", effectiveOwners: ["o"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2025-06-01", githubHost: "github.com",
+    });
+    let snapshot: BranchSnapshot = {
+      heads: [
+        { name: "main", oid: "a".repeat(40), committedDate: "2026-01-01T00:00:00Z", treeOid: "b".repeat(40) },
+        { name: "feat", oid: "c".repeat(40), committedDate: "2025-01-01T00:00:00Z", treeOid: "d".repeat(40) }, // below cutoff
+      ],
+      defaultBranch: "main",
+    };
+    const treesRequested: string[] = [];
+    const client = {
+      listBranchHeads: async () => snapshot,
+      fetchTreeRecursive: async (_o: string, _r: string, treeOid: string) => {
+        treesRequested.push(treeOid);
+        throw new GithubApiError("scan boom", { endpoint: "x" });
+      },
+    } as unknown as GithubClient;
+    await processRepo(db, client, rt(cutoffConfig, "hash"), runId, "o", repo, [], new Set());
+    const row1 = db.read("SELECT status, commit_sha, scanned_commit_date FROM run_unit_head WHERE branch='feat'").get() as { status: string };
+    expect(row1.status).toBe("skipped-cutoff"); // invocation 1: recorded below the cutoff
+
+    // invocation 2 (same run, resumed): feat's head ADVANCED past the cutoff, its scan errors.
+    // Heads newest-first, as listBranchHeads supplies them.
+    snapshot = {
+      heads: [
+        { name: "feat", oid: "e".repeat(40), committedDate: "2026-01-02T00:00:00Z", treeOid: "f".repeat(40) }, // ADVANCED past cutoff
+        { name: "main", oid: "a".repeat(40), committedDate: "2026-01-01T00:00:00Z", treeOid: "b".repeat(40) },
+      ],
+      defaultBranch: "main",
+    };
+    await processRepo(db, client, rt(cutoffConfig, "hash"), runId, "o", repo, [], new Set());
+    expect(treesRequested).toContain("f".repeat(40)); // the ADVANCED head really was scan-attempted (toScan, not re-skipped)
+    const row2 = db.read("SELECT status, commit_sha, scanned_commit_date, policy_status, policy_matched_pattern FROM run_unit_head WHERE branch='feat'").get() as { status: string; commit_sha: string; scanned_commit_date: string; policy_status: string | null; policy_matched_pattern: string | null };
+    expect(row2.status).toBe("skipped-cutoff"); // the PRIOR disposition survives — neither scanned nor pruned
+    expect(row2.commit_sha).toBe(""); // still the non-scanned sentinel
+    expect(row2.scanned_commit_date).toBe("2025-01-01T00:00:00Z"); // pinned to the OLDER evaluation's discovered date
+    expect(row2.policy_status).toBeNull(); // a GENUINE cutoff row (the report's cutoff bucket), not a policy exclusion
+    expect(row2.policy_matched_pattern).toBeNull();
+    const featErrors = db.read("SELECT message FROM errors WHERE scope='scan' AND branch='feat'").all();
+    expect(featErrors.length).toBe(1); // the failed re-scan is loud — the retained row is stale, not silent
+    expect(db.getUnit({ configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "feat" })?.status).toBe("error"); // retryable: the next run re-scans
+    db.close();
+  });
+});
+
 describe("processRepo branch-discovery throttle (§4, site c)", () => {
   // client whose branch discovery (listBranchHeads) fails with the injected error.
   const branchDiscoveryFails = (failure: Error): GithubClient =>
