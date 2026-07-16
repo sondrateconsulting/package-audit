@@ -161,7 +161,10 @@ export interface PolicyChurnEntry {
 // scanned_commit_date = unknown policy provenance; a naive diff would fabricate churn). Only branch
 // keys present in BOTH runs are classified; one-sided keys are counted, never churned.
 export type PolicyChurn =
-  | { readonly available: false; readonly reason: "pre-v4-policy-data" }
+  // "pre-v4-policy-data": a run MIGRATED from before v4 (a NULL scanned_commit_date sentinel) — its policy
+  // provenance is unknowable. "no-recorded-heads": a run that recorded no heads at all; it may be perfectly
+  // native-v4, so it must NOT be labelled pre-v4 — there is simply nothing to compare.
+  | { readonly available: false; readonly reason: "pre-v4-policy-data" | "no-recorded-heads" }
   | {
       readonly available: true;
       readonly summary: {
@@ -198,7 +201,12 @@ function policyStateEq(a: PolicyBranchState, b: PolicyBranchState): boolean {
 // Classify per-branch policy churn between two run slices. Compares only branch keys present in BOTH
 // runs (a branch absent from one run cannot be "entering/leaving" exclusion — absence has many causes).
 function buildPolicyChurn(a: RunSlice, b: RunSlice): PolicyChurn {
-  if (a.policyProvenanceMissing || b.policyProvenanceMissing) return { available: false, reason: "pre-v4-policy-data" };
+  // A pre-v4 gap on EITHER side wins over a mere empty-run gap: it is the more specific (and more
+  // actionable) explanation for why policy churn cannot be computed.
+  const gap = a.policyProvenanceGap === "pre-v4-policy-data" || b.policyProvenanceGap === "pre-v4-policy-data"
+    ? "pre-v4-policy-data"
+    : (a.policyProvenanceGap ?? b.policyProvenanceGap);
+  if (gap !== null) return { available: false, reason: gap };
   const entered: PolicyChurnEntry[] = [], left: PolicyChurnEntry[] = [];
   const reclassified: PolicyChurnEntry[] = [], overrideChanges: PolicyChurnEntry[] = [];
   let onlyA = 0, onlyB = 0, compared = 0;
@@ -277,7 +285,7 @@ interface RunSlice {
   flags: Map<string, boolean | null>; // unitKey → tri-state default-branch flag (scanned heads)
   hasNullFlag: boolean; // ANY head row of the run with is_default_branch NULL (pre-v3)
   policyByBranch: Map<string, PolicyBranchState>; // (org\0repo\0branch) → policy disposition (§5 churn)
-  policyProvenanceMissing: boolean; // pre-v4 (a NULL scanned_commit_date) OR zero heads → no v4 policy provenance
+  policyProvenanceGap: "pre-v4-policy-data" | "no-recorded-heads" | null; // why churn is unavailable; null = provenance sound
 }
 
 function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
@@ -285,10 +293,16 @@ function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
     `SELECT organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date FROM run_unit_head WHERE run_id = ?`,
   ).all(run.runId) as HeadRow[];
   const hasNullFlag = heads.some((h) => h.is_default_branch === null);
-  // No positive v4 policy provenance: a migrated pre-v4 run (NULL scanned_commit_date sentinel) OR a
-  // run with ZERO heads (e.g. all branch discovery failed) — the empty case carries no sentinel row at
-  // all, so `.some()` alone would falsely report provenance as present. Both make churn unavailable.
-  const policyProvenanceMissing = heads.length === 0 || heads.some((h) => h.scanned_commit_date === null);
+  // No positive v4 policy provenance, and the two causes are DISTINCT: a migrated pre-v4 run (the NULL
+  // scanned_commit_date sentinel) vs a run with ZERO heads (e.g. all branch discovery failed) — the empty
+  // case carries no sentinel row at all, so `.some()` alone would falsely report provenance as present,
+  // and calling it "pre-v4" would misstate the schema of a perfectly native-v4 empty run.
+  const policyProvenanceGap: "pre-v4-policy-data" | "no-recorded-heads" | null =
+    heads.some((h) => h.scanned_commit_date === null)
+      ? "pre-v4-policy-data"
+      : heads.length === 0
+        ? "no-recorded-heads"
+        : null;
   const flags = new Map<string, boolean | null>(
     heads
       .filter((h) => h.status === "scanned")
@@ -341,7 +355,7 @@ function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
     const key = siteKey(row);
     if (!sites.has(key)) sites.set(key, row);
   }
-  return { byPackage, flags, hasNullFlag, policyByBranch, policyProvenanceMissing };
+  return { byPackage, flags, hasNullFlag, policyByBranch, policyProvenanceGap };
 }
 
 const EMPTY_SITES: ReadonlyMap<string, UsageRowDb> = new Map();

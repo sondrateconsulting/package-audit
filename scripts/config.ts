@@ -327,6 +327,14 @@ function canonicalize(value: unknown): unknown {
 // sorted/deduped so reordering the file does not churn the hash. `concurrency` and `paths` are
 // DELIBERATELY excluded (speed / storage location only), preserving resumability across tuning.
 export function computeConfigHash(config: Config): string {
+  // Branch policy is scan-defining, so a CONFIGURED policy must change the hash. But a policy-FREE config
+  // (branches omitted → null, excludeBranches omitted → []) scans exactly what it scanned before this
+  // feature existed, so it MUST keep its original hash: the work queue is keyed by config_hash, and
+  // churning the hash for every legacy config on upgrade would orphan its completed units and force a
+  // full rescan (and fail its running run). Hence the policy keys are present ONLY when a policy is
+  // actually configured — which also preserves null (unrestricted) hashing distinctly from [] (only the
+  // default branch), since [] itself makes the policy configured.
+  const hasBranchPolicy = config.branches !== null || config.excludeBranches.length > 0;
   const projection = {
     githubHost: config.githubHost,
     organizations: config.organizations === null ? null : sortedDedup(config.organizations),
@@ -336,10 +344,13 @@ export function computeConfigHash(config: Config): string {
     includeArchived: config.includeArchived,
     maxReposPerOrg: config.maxReposPerOrg,
     maxBranchesPerRepo: config.maxBranchesPerRepo,
-    // Branch policy is scan-defining. null (unrestricted) hashes distinctly from [] (only the
-    // default branch); reordering/duplicating patterns does not change the hash (shared canonicalizer).
-    branches: config.branches === null ? null : sortedDedup(config.branches),
-    excludeBranches: sortedDedup(config.excludeBranches),
+    // Reordering/duplicating patterns does not change the hash (shared canonicalizer).
+    ...(hasBranchPolicy
+      ? {
+          branches: config.branches === null ? null : sortedDedup(config.branches),
+          excludeBranches: sortedDedup(config.excludeBranches),
+        }
+      : {}),
     cutoffDate: config.cutoffDate,
     excludeDirGlobs: sortedDedup(config.excludeDirGlobs),
     // packages sorted by name (order does not change what is scanned; names are unique)

@@ -55,16 +55,22 @@ export interface ReportSummary {
   repositoriesScanned: number;
   branchesScanned: number;
   branchesSkippedByCutoff: number;
-  // Branch allow/deny (§5): the disjoint disposition partition. These four counts partition the
-  // run_unit_head rows this run RECORDED, exactly once each:
-  //   recordedRows = branchesScanned + branchesSkippedByCutoff + branchesExcludedByPolicy + branchesPastCap.
-  // They do NOT necessarily sum to every branch DISCOVERED: a discovered branch whose scan errored or was
-  // throttle-requeued this run writes no run_unit_head row (it is recorded in `errors[]` / re-attempted
-  // next run), so it belongs to no disposition bucket. branchesScanned INCLUDES scanned default-override
-  // rows (they WERE scanned). branchesSkippedByCutoff is GENUINE cutoff only (policy_status IS NULL) —
-  // policy exclusions are their own bucket.
+  // Branch allow/deny (§5): the disjoint disposition partition. The four disposition counts partition the
+  // run_unit_head rows this run RECORDED, exactly once each. Together with branchesErrored they account
+  // for every branch that reached a TERMINAL outcome this run:
+  //   discovered (terminal) = branchesScanned + branchesSkippedByCutoff + branchesExcludedByPolicy
+  //                           + branchesPastCap + branchesErrored.
+  // branchesScanned INCLUDES scanned default-override rows (they WERE scanned). branchesSkippedByCutoff is
+  // GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket. (A branch whose
+  // scan was throttle-requeued is deferred, not terminal — it is finished on the next run, so it is in no
+  // count here.)
   branchesExcludedByPolicy: number;
   branchesPastCap: number;
+  // Discovered branches whose scan ERRORED this run (a scope='scan' errors[] entry) and therefore hold NO
+  // run_unit_head disposition row — surfaced so the disposition counts + this reconcile to discovered heads.
+  // (A throttle-requeued branch has NEITHER a row nor an error: it is deferred, not terminal, and is
+  // finished on the next run — so it is deliberately in no count.)
+  branchesErrored: number;
   totalDependencyFindings: number;
   totalUsageFindings: number;
 }
@@ -145,6 +151,18 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     packageName: e["package_name"], version: e["version"], message: e["message"], occurredAt: e["occurred_at"],
   }));
 
+  // §5: branches DISCOVERED but holding no disposition row because their scan ERRORED this run — each has
+  // a scope='scan' errors[] entry. Counted so the disposition buckets + branchesErrored reconcile to the
+  // discovered heads. A branch with BOTH a scan error AND a row (e.g. scanned on an earlier resume attempt,
+  // errored on this one) is already a disposition and is excluded here — hence the row-key exclusion.
+  const headKeys = new Set(heads.map((h) => `${h.organization}\0${h.repository}\0${h.branch}`));
+  const branchesErrored = new Set(
+    errors
+      .filter((e) => e.scope === "scan" && typeof e.branch === "string" && e.branch !== "")
+      .map((e) => `${String(e.organization)}\0${String(e.repository)}\0${String(e.branch)}`)
+      .filter((k) => !headKeys.has(k)),
+  ).size;
+
   return {
     formatVersion: XRAY_FORMAT_VERSION,
     runId,
@@ -155,12 +173,12 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     },
     packages,
     errors,
-    summary: buildSummary(scannedHeads, heads, depRows, usageRows),
+    summary: buildSummary(scannedHeads, heads, depRows, usageRows, branchesErrored),
     scanScope: buildScanScope(heads),
   };
 }
 
-function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[]): ReportSummary {
+function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[], branchesErrored: number): ReportSummary {
   const orgs = new Set(scannedHeads.map((h) => h.organization));
   const repos = new Set(scannedHeads.map((h) => `${h.organization}/${h.repository}`));
   return {
@@ -172,6 +190,7 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
     branchesSkippedByCutoff: allHeads.filter((h) => h.status === "skipped-cutoff" && h.policy_status === null).length,
     branchesExcludedByPolicy: allHeads.filter(isPolicyExcluded).length,
     branchesPastCap: allHeads.filter((h) => h.status === "past-cap").length,
+    branchesErrored,
     totalDependencyFindings: depRows.length,
     totalUsageFindings: usageRows.length,
   };

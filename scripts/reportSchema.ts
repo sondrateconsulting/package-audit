@@ -169,10 +169,11 @@ export const summarySchema = z
     branchesSkippedByCutoff: z.number().int().min(0).describe("GENUINE cutoff skips only: skipped-cutoff rows with policy_status NULL"),
     branchesExcludedByPolicy: z.number().int().min(0).describe("Branch allow/deny exclusions: skipped-cutoff rows carrying a policy_status"),
     branchesPastCap: z.number().int().min(0).describe("Eligible branches past the per-repo cap (not scanned this run)"),
+    branchesErrored: z.number().int().min(0).describe("Discovered branches whose scan ERRORED this run: they hold no run_unit_head disposition row and carry a scope='scan' errors[] entry"),
     totalDependencyFindings: z.number().int().min(0),
     totalUsageFindings: z.number().int().min(0),
   })
-  .describe("Per-run DISJOINT disposition partition + finding totals, from the immutable run_unit_head snapshot. The four disposition counts partition the RECORDED run_unit_head rows exactly once each (recordedRows = scanned + skippedByCutoff + excludedByPolicy + pastCap); they do NOT necessarily sum to every discovered branch — a branch whose scan errored or was throttled this run has no row and is in errors[] instead");
+  .describe("Per-run disposition counts + finding totals, from the immutable run_unit_head snapshot. The four disposition counts partition the RECORDED run_unit_head rows exactly once each; together with branchesErrored they account for every branch that reached a TERMINAL outcome this run (scanned + skippedByCutoff + excludedByPolicy + pastCap + errored). A branch whose scan was THROTTLE-REQUEUED is deferred, not terminal — it holds no row and no error, and is finished on the next run, so it appears in no count here");
 
 export const policyBranchSchema = z.strictObject({
   organization: z.string(),

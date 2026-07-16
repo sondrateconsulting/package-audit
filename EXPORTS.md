@@ -158,9 +158,11 @@ Row order: `package_name, version, export_kind, export_name`
 
 One row per branch that reached a TERMINAL disposition this run — the immutable per-run disposition
 snapshot. Unlike the findings tables, this exports every disposition TYPE (scanned / skipped-cutoff /
-past-cap, plus the branch-policy columns that live largely on the non-scanned rows). A branch whose
-scan errored or was throttle-requeued this run has NO row here — it is recorded in the report's
-`errors[]` (and re-attempted on the next run). Scoped to the selected run only (`--raw` dumps all runs).
+past-cap, plus the branch-policy columns that live largely on the non-scanned rows). A discovered branch
+that reached no terminal disposition has NO row here: one whose scan **errored** carries a `scope='scan'`
+entry in the report's `errors[]` (and is counted by the report's `branchesErrored`), while one whose scan
+was **throttle-requeued** is deferred with neither a row nor an error — it is finished on the next run.
+Scoped to the selected run only (`--raw` dumps all runs).
 
 | column | type |
 |---|---|

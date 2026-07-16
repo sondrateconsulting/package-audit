@@ -89,6 +89,25 @@ describe("validateAndNormalize — validation failures", () => {
 
 describe("computeConfigHash — determinism + scope", () => {
   test("same config → same hash", () => expect(hashOf(baseRaw())).toBe(hashOf(baseRaw())));
+
+  // UPGRADE REGRESSION PIN: the work queue is keyed by config_hash. A config that configures NO branch
+  // policy scans exactly what it scanned before the policy feature existed, so its hash MUST NOT change —
+  // otherwise every existing user's completed units are orphaned on upgrade and a full rescan is forced
+  // (and their running run is failed). This literal was verified byte-equal against the pre-feature
+  // implementation at 81d79a1: the hashed projection omits branches/excludeBranches when neither is set.
+  test("a policy-FREE config keeps its PRE-FEATURE hash (legacy work_queue/resume survives the upgrade)", () => {
+    expect(hashOf(baseRaw())).toBe("86b8d1c1c68298fbe85dbe5012e9a7110ae3ed260ccf3c468ab920d62d8efe8b");
+    // explicitly writing the legacy defaults is still the same policy → still the same hash
+    expect(hashOf({ ...baseRaw(), branches: null, excludeBranches: [] })).toBe(hashOf(baseRaw()));
+  });
+
+  test("any CONFIGURED branch policy changes the hash, and null (unrestricted) stays distinct from [] (default-only)", () => {
+    const free = hashOf(baseRaw());
+    const emptyAllowlist = hashOf({ ...baseRaw(), branches: [] });
+    const denyOnly = hashOf({ ...baseRaw(), excludeBranches: ["dev"] });
+    const allowlist = hashOf({ ...baseRaw(), branches: ["main"] });
+    expect(new Set([free, emptyAllowlist, denyOnly, allowlist]).size).toBe(4); // all four are distinct scopes
+  });
   test("key insertion order does not change the hash", () => {
     const b = baseRaw();
     const reordered = Object.fromEntries(Object.entries(b).reverse());

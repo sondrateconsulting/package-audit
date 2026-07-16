@@ -981,14 +981,14 @@ describe("runSummaryText", () => {
   test("prints the §7 counters with report-matching labels and the fail-soft note", () => {
     const text = runSummaryText("run-abc", {
       organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
-      branchesSkippedByCutoff: 13, branchesExcludedByPolicy: 5, branchesPastCap: 2,
+      branchesSkippedByCutoff: 13, branchesExcludedByPolicy: 5, branchesPastCap: 2, branchesErrored: 4,
       totalDependencyFindings: 104, totalUsageFindings: 994,
     }, 3, "output/run-run-abc.json");
     // labels + values pinned; column padding is cosmetic and free to change
     expect(text).toContain("AUDIT COMPLETE — run run-abc");
     expect(text).toMatch(/Organizations scanned:\s+2\b/);
     expect(text).toMatch(/Repositories scanned:\s+7\b/);
-    expect(text).toMatch(/Branches scanned:\s+88 \(13 skipped by cutoff · 5 excluded by policy · 2 past cap\)/);
+    expect(text).toMatch(/Branches scanned:\s+88 \(13 skipped by cutoff · 5 excluded by policy · 2 past cap · 4 scan-errored\)/);
     expect(text).toMatch(/Dependency findings:\s+104\b/);
     expect(text).toMatch(/Usage findings:\s+994\b/);
     expect(text).toMatch(/Errors recorded:\s+3 \(fail-soft/);

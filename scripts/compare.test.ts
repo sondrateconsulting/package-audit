@@ -256,14 +256,15 @@ describe("buildCompare — §5 policy churn", () => {
     db2.close();
   });
 
-  test("churn is unavailable when EITHER run has ZERO heads — an empty run carries no v4 provenance sentinel", () => {
+  test("churn is unavailable when EITHER run has ZERO heads — reported as no-recorded-heads, NOT mislabelled pre-v4", () => {
     const db = mem();
     const runA = startCompleted(db, ["expo"]); // discovery produced heads
     const runB = startCompleted(db, ["expo"]); // e.g. every repo's branch discovery failed → no heads at all
     phead(db, runA.runId, "main", { isDefaultBranch: true });
-    // runB deliberately gets NO run_unit_head rows
+    // runB deliberately gets NO run_unit_head rows. It is a perfectly NATIVE-v4 run, so calling it
+    // "pre-v4-policy-data" would misstate its schema — it simply has nothing to compare.
     const churn = buildCompare(db, runA, runB).compare.policyChurn;
-    expect(churn).toEqual({ available: false, reason: "pre-v4-policy-data" });
+    expect(churn).toEqual({ available: false, reason: "no-recorded-heads" });
     db.close();
   });
 });

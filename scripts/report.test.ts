@@ -79,7 +79,7 @@ describe("buildReport (§7)", () => {
 
     expect(report.summary).toEqual({
       organizationsScanned: 1, repositoriesScanned: 1, branchesScanned: 1,
-      branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0,
+      branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
       totalDependencyFindings: 1, totalUsageFindings: 2,
     });
     // T8: new top-level report fields
@@ -189,10 +189,13 @@ describe("buildReport (§7)", () => {
     db.insertError({ runId, scope: "scan", organization: "org-a", repository: "svc", branch: "feature", message: "tree fetch failed" });
     db.completeRun(runId);
     const report = buildReport(db, db.getRun(runId)!) as any;
-    // the four-way partition sums to the RECORDED rows (1: main), NOT the 2 discovered branches
+    // the four disposition buckets sum to the RECORDED rows (1: main) — 'feature' is in none of them…
     expect(report.summary).toMatchObject({ branchesScanned: 1, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0 });
-    expect(report.summary.branchesScanned + report.summary.branchesSkippedByCutoff + report.summary.branchesExcludedByPolicy + report.summary.branchesPastCap).toBe(1);
-    // 'feature' IS accounted for — in errors[] — so the two discovered heads are both represented across the report
+    // …it is counted as ERRORED instead, so the summary reconciles to BOTH discovered heads
+    expect(report.summary.branchesErrored).toBe(1);
+    const s = report.summary;
+    expect(s.branchesScanned + s.branchesSkippedByCutoff + s.branchesExcludedByPolicy + s.branchesPastCap + s.branchesErrored).toBe(2);
+    // and 'feature' carries its scan failure in errors[]
     expect(report.errors.some((e: any) => e.branch === "feature" && e.scope === "scan")).toBe(true);
     db.close();
   });
