@@ -244,7 +244,8 @@ actually leave on disk (every DDL batch is one transaction, so only the FULL aud
 `--fresh`-preserved caches are reachable — a lone generic `errors` table with a plausible
 migration counter is neither; EXCEPTION: a stamped (v2..current) file with a PARTIAL set stays on the
 migrate-and-repair path — openReadOnly's documented remediation — when every present table carries
-the exact shape of the schema its STAMP names: full table_xinfo rows (names, types, NOT NULL,
+the exact shape of the schema its STAMP names (one partial set is nonetheless rejected downstream by
+the compatibility gate on both opens: `run_unit_head` missing while `runs` survives — see §3): full table_xinfo rows (names, types, NOT NULL,
 defaults, PK positions, hidden/generated kinds) plus rowid-ness and STRICT-ness, compared
 order-independently against a `:memory:` build of the schema so the reference cannot drift;
 matching NAMES alone would admit a foreign table wearing our labels) → ours; (3) anything else → REFUSE, untouched, with an actionable
@@ -288,16 +289,20 @@ backfilled rows BY CONSTRUCTION — a pre-v4 run recorded no branch policy and n
 past-cap branches — so a NULL `scanned_commit_date` is the sentinel marking that run's scan
 scope UNVERIFIABLE (§7 `provenance`), never a claim that it excluded nothing. A STRUCTURAL
 shape classifier inspects an existing `run_unit_head` (columns via `table_xinfo`, CHECKs, FKs,
-indexes) TWICE: on the ownership preflight's deserialized base image BEFORE any writable open
-(an incompatibility visible there is refused with no SQLite handle ever opened on the target),
+indexes) up to TWICE before any migration: on the ownership preflight's deserialized base image
+BEFORE any writable open (an incompatibility visible there is refused with no SQLite handle ever
+opened on the target; a preflight rejection stops after that one inspection),
 and again on the writable connection — through any recovered WAL — before the WAL journal-mode
 flip and before `--fresh`, so an incompatible state committed only into `-wal` frames (a sibling
 build's v4 over a common v3 base) is still refused before it can be adopted or dropped, at the
 documented cost of sidecar recovery on that file.
 A current-version (v4) database self-heals idempotently on open: re-run the new-shape CREATEs, so a
-file missing a table or the `ix_ruh_loc` index is repaired rather than left a dead end (the v4
-policy columns carry CHECKs and cannot be column-repaired — a v4 `run_unit_head` missing one is
-REJECTED by the shape classifier, not silently repaired).
+file missing a table or the `ix_ruh_loc` index is repaired rather than left a dead end — subject to
+the compatibility gates; in particular, `run_unit_head` missing while `runs` survives is rejected
+as INCOMPATIBLE (recreating an empty provenance table under surviving runs would silently un-scope
+their reports — the same gate the read path applies), and the v4 policy columns carry CHECKs and
+cannot be column-repaired — a v4 `run_unit_head` missing one is REJECTED before repair, not
+silently patched.
 `runs.tracked_packages` is persisted EXACTLY from config at run creation, so every run carries the
 correct, exact package set and the report invariant (`package_name IN json_each(tracked_packages)`)
 stays unqualified and sound. A run row carrying `tracked_packages='[]'` is explicitly NOT reportable

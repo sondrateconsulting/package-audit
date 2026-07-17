@@ -71,9 +71,12 @@ export const nowIso = (): string => new Date().toISOString();
 // §3: tool-GENERATED timestamps (found_at/date_fetched/occurred_at) use ONE canonical fixed-width
 // ISO-8601 UTC form so that lexicographic ordering equals chronological ordering (§7 relies on MAX
 // over these). db.ts is the write boundary, so caller-supplied tool timestamps are validated here.
-// (Commit-instant columns last_commit_date/scanned_commit_date are the GitHub committedDate /
-// git-%cI family, and runs.cutoff_date is the configured bare YYYY-MM-DD — all stored raw, NOT
-// validated here, and NOT part of this ordering invariant.)
+// (Commit-instant columns are the GitHub committedDate / git-%cI family and are stored AS
+// WRITTEN — never normalized to this canonical form, and NOT part of this ordering invariant.
+// scanned_commit_date is nonetheless VALIDATED at the upsert chokepoint (isIsoInstant: a real
+// ISO instant, judged on its components as written, offset preserved); work_queue.last_commit_date
+// and runs.cutoff_date (the configured bare YYYY-MM-DD) remain raw and unvalidated in this module
+// — their producers validate them upstream (github.ts discovery/clone capture; config.ts).)
 const CANONICAL_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 function assertCanonicalTimestamp(value: string, ctx: string): string {
   // Shape check first (fast reject), then a Date round-trip so a fixed-width-but-impossible
@@ -605,10 +608,13 @@ function tableShape(db: Database, table: string): string {
 //     while every accepted older shape has an idempotent repair on the writable open — the
 //     "historical schema shape self-heals" test executes that claim and trips on a
 //     SCHEMA_VERSION bump by design.
-// Any SUBSET of audit tables passes (a partial restore must stay repairable — openReadOnly
-// documents "run `bun run audit` once to repair it", and every DDL batch here re-creates what
-// is missing); what a subset can never do is carry a non-audit shape. A real database of ours
-// matches by construction: creates, migrations and self-heals all run the same SCHEMA_SQL the
+// Any SUBSET of audit tables passes this predicate (a partial restore must stay repairable —
+// openReadOnly documents "run `bun run audit` once to repair it", and every DDL batch here
+// re-creates what is missing), SUBJECT to the downstream compatibility gates: one deliberate
+// exception is run_unit_head missing while runs survives, which is OWNED by this predicate but
+// rejected by the compatibility gate on both opens (see assertOpenCompatible gate b). What a
+// subset can never do is carry a non-audit shape. A real database of ours matches by
+// construction: creates, migrations and self-heals all run the same SCHEMA_SQL the
 // references derive from. (Shape is still not FULL DDL equality — CHECK bodies, collations,
 // ON CONFLICT clauses and FK deferrability are invisible, though FKs, PK/UNIQUE structure and
 // AUTOINCREMENT do count — see tableShape. hasForeignObjects separately rejects every
@@ -1303,14 +1309,17 @@ export function migrateV3toV4(db: Database): void {
 }
 
 // Throw (fail) if the on-disk shape is INCOMPATIBLE with its stamp — a foreign/sibling database that
-// must be neither adopted NOR destroyed. Runs TWICE per open, on states the ownership predicate has
-// already accepted (so the database is empty, or foreign-object-free and stamped >=
+// must be neither adopted NOR destroyed. Runs up to TWICE per open, on states the ownership
+// predicate has already accepted (so the database is empty, or foreign-object-free and stamped >=
 // MIN_OWNED_VERSION — a pre-v2 non-empty file is refused as not-ours first; there is no pre-v2
 // migration):
-//   1. on the OWNERSHIP preflight's deserialized base image (see assertOwnedDatabase) — a rejection
-//      there happens with no SQLite handle ever opened on the target (only a byte read);
-//   2. on the WRITABLE connection, as the live backstop — through any recovered WAL, catching an
-//      incompatible state the base image could not see (see AuditDb.open).
+//   1. on the OWNERSHIP preflight's deserialized base image (see assertOwnedDatabase) — for a
+//      NON-EMPTY owned image only (an empty image has no shapes to check and skips this call;
+//      its too-new stamp is refused separately in that arm); a rejection here happens with no
+//      SQLite handle ever opened on the target (only a byte read);
+//   2. on the WRITABLE connection, as the live backstop, on every writable AuditDb.open that
+//      reaches it — through any recovered WAL, catching an incompatible state the base image
+//      could not see (see AuditDb.open); a no-op on an empty/new database (no tables yet).
 // Recognizes legitimate predecessors, so a real v2/v3 database is NOT rejected — per-stamp allowed
 // shapes: stamp 2 accepts exact-v2/exact-v3/ours-v4 (each v4 form ± the repairable missing
 // ix_ruh_loc); stamp 3 drops exact-v2; stamp >= 4 accepts only the ours-v4 forms. Both call sites
@@ -1372,8 +1381,10 @@ export interface OpenDbOptions {
 // The writable connection's INIT span — per-connection PRAGMAs, the version ceiling, then the
 // ownership and compatibility BACKSTOPS, under ONE failure discipline. The backstops are
 // normally unreachable: assertOwnedDatabase already refused every foreign or incompatible file
-// it could prove. They re-run the SAME ownedness + compatibility tests (isOwnedOrEmpty,
-// assertOpenCompatible) on the WRITABLE connection, which reads THROUGH any recovered WAL —
+// it could prove. They run the SAME ownedness + compatibility tests (isOwnedOrEmpty,
+// assertOpenCompatible) on the WRITABLE connection, which reads THROUGH any recovered WAL (for
+// a non-empty preflighted image this is a RE-run; empty/new/:memory: databases meet them here
+// first, where they are no-ops) —
 // closing what the base-image preflight cannot see: a foreign checkpoint landing between the
 // preflight and this open, and — the decisive case — an incompatible state committed ONLY into
 // -wal frames over a compatible base (e.g. a SIBLING build's v4 rebuild + stamp on a common v3
@@ -1569,9 +1580,10 @@ export class AuditDb {
       path = assertContained(resolved, roots);
       // §0 ownership + migration compatibility: prove the file is ours AND acceptable to the
       // migration BEFORE the writable open below, whose WAL pragma would already have rewritten a
-      // stranger's header. Both checks run on the same deserialized BASE IMAGE — no SQLite handle
-      // on the target (only a byte read), so a rejection cannot mutate the file, its sidecars, or
-      // its journal mode.
+      // stranger's header. Both checks run on the same deserialized BASE IMAGE (the shape check
+      // only for a non-empty image — an empty one has no shapes, and its too-new stamp is refused
+      // in the same preflight) — no SQLite handle on the target (only a byte read), so a
+      // rejection cannot mutate the file, its sidecars, or its journal mode.
       // (:memory: needs no proof — a fresh in-memory database is empty by construction and shares
       // nothing with the filesystem.)
       // ACCEPTED LIMITATION (documented, not fixed): a concurrent process could replace the file
