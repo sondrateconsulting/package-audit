@@ -426,17 +426,22 @@ describe("config.schema.json ↔ runtime sync", () => {
   test("packages.items requires exactly name", () => {
     expect(schema["properties"]["packages"]["items"]["required"]).toEqual(["name"]);
   });
-  test("every items.minLength constraint in the schema is runtime-enforced ([\"\"] throws)", () => {
+  test("every items.minLength constraint in the schema is runtime-enforced ([\"\"] and [42] throw)", () => {
     // Derived FROM the schema, then pinned: a new string-array key gaining items.minLength must be
-    // added to the expected list (loud), and every listed key must actually reject an empty item at
-    // runtime — so schema/code drift on array items fails here instead of shipping.
+    // added to the expected list (loud), and every listed key must actually reject an empty item
+    // AND a non-string item at runtime (the schema declares items.type "string" for all of them,
+    // and the keys route through THREE different validators — optStringArray,
+    // normalizeOrganizations, validateBranchPattern — so per-key coverage is what keeps them in
+    // lockstep). Schema/code drift on array items fails here instead of shipping.
     const constrained = Object.entries<Record<string, any>>(schema["properties"])
       .filter(([, prop]) => prop["items"]?.["type"] === "string" && prop["items"]?.["minLength"] >= 1)
       .map(([key]) => key)
       .sort();
     expect(constrained).toEqual(["branches", "excludeBranches", "excludeDirGlobs", "excludeOrganizations", "organizations"]);
-    for (const key of constrained)
+    for (const key of constrained) {
       expect(() => norm({ ...baseRaw(), [key]: [""] })).toThrow(ConfigError);
+      expect(() => norm({ ...baseRaw(), [key]: [42] })).toThrow(ConfigError);
+    }
   });
   test("every schema 'default' annotation equals the actual runtime default", () => {
     // required keys only, so every optional field falls back to its runtime default; a schema

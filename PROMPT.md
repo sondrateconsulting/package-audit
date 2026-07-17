@@ -623,7 +623,10 @@ Resumability rules:
   any lock-taking statement), NO journal_mode pragma, NO DDL, NO migration, no directory
   creation. A database whose `user_version` is older than the tool refuses with an
   actionable "run `bun run audit` once to migrate" error (reads never migrate); newer
-  refuses with "upgrade the tool"; missing tables and the v3 is_default_branch column are detected up front. Note a
+  refuses with "upgrade the tool"; ownership and the structural `run_unit_head` classifier
+  re-run up front (a sibling/foreign shape refuses as incompatible; a recognized
+  predecessor-era shape — e.g. missing the v4 policy columns — advises "run `bun run audit`
+  once to repair"; missing tables are named individually). Note a
   readonly WAL open may still create `-wal`/`-shm` sidecars beside the (path-contained)
   database file — the seam is no-DDL/no-write, not literally zero-filesystem-effect.
 

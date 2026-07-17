@@ -1,7 +1,7 @@
 import { expect, test, describe, afterAll, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { copyFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, assertOwnedDatabase, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, migrateV3toV4, nowIso, type RunInput, type RunUnitHeadInput } from "./db.ts";
 import { buildReport } from "./report.ts";
@@ -1004,6 +1004,13 @@ describe("ownership — every database this tool legitimately produces still ope
     w.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch"); // v3 era → v2 era
     w.close();
 
+    // The read path names the v2-era damage and its remediation BEFORE the writer heals it —
+    // openReadOnly cannot repair, so silently succeeding here would be the dead-end class this
+    // arbitration exists to prevent. The SPECIFIC policy-columns message is asserted (not the
+    // generic repair phrasing): this fixture is also missing `errors`, whose missing-TABLE advice
+    // matches the generic phrasing too, and would mask the exact-v2 disjunct being dropped.
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/missing the v4 policy columns/);
+
     const db = AuditDb.open({ sqlitePath: path });
     try {
       expect(rowCount(path, "runs")).toBe(1); // adopted and healed, not refused or reset
@@ -1575,9 +1582,11 @@ describe("corrupted database files fail closed with OUR context, never a raw SQL
     // documented checkpoint race the backstop exists for) — impractical to fabricate
     // deterministically end-to-end, the same rationale as isOwnedOrEmpty's own export. Called
     // directly on a corrupted file: EVERY raw throw inside the init span (here the corrupt
-    // schema btree, met by the first statement that needs it) must come out as a DbError with
-    // ownership-check context AND must close the handle — no leaked writable connection on a
-    // file whose ownership could not be re-verified.
+    // schema btree, met by the first statement that needs it) must come out as a DbError naming
+    // the init span AND must close the handle — no leaked writable connection on a file whose
+    // ownership could not be re-verified. (The message deliberately does NOT say "ownership
+    // check": with the WAL pragma LAST in the span, a raw throw can also be a filesystem
+    // problem met AFTER ownership was proven — see the finalize-failure test below.)
     const path = nextFile();
     AuditDb.open({ sqlitePath: path }).close();
     corruptSchemaPage(path);
@@ -1589,8 +1598,45 @@ describe("corrupted database files fail closed with OUR context, never a raw SQL
       caught = e;
     }
     expect(caught).toBeInstanceOf(DbError);
-    expect((caught as Error).message).toMatch(/could not inspect it on the writable connection/);
+    expect((caught as Error).message).toMatch(/writable connection could not be verified and initialized/);
     expect(() => db.query("SELECT 1 AS x").get()).toThrow(/closed database/);
+  });
+
+  test("a WAL-pragma failure AFTER the gates passed still fails closed — and is not blamed on the ownership check", () => {
+    // The rebase moved journal_mode=WAL to the END of the init span (a rejection must never
+    // persist a delete→wal flip), which created a new raw-throw class: an OWNED, compatible
+    // database in a directory that became unwritable — the gates all pass, then the WAL pragma
+    // (the first statement needing a write) throws. The wrap must close the handle and the
+    // message must not claim ownership could not be verified (it WAS).
+    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root ignores modes
+    const dir = join(TEST_ROOT, `ro-finalize-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "db.db");
+    const seed = new Database(path, { create: true, strict: true });
+    seed.exec("PRAGMA journal_mode = delete;"); // no sidecars, so the open below needs no recovery
+    seed.close();
+    chmodSync(dir, 0o500); // directory read-only: -wal/-shm creation (the WAL flip) must fail
+    try {
+      const db = new Database(path, { strict: true });
+      let caught: unknown;
+      try {
+        initWritableConnection(db, path);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(DbError);
+      expect((caught as Error).message).toMatch(/writable connection could not be verified and initialized/);
+      expect((caught as Error).message).not.toMatch(/ownership/);
+      expect(() => db.query("SELECT 1 AS x").get()).toThrow(/closed database/);
+    } finally {
+      chmodSync(dir, 0o700); // restore so afterAll's rmSync can clean up
+    }
+    // The rejection changed nothing: still a rollback-journal database, no sidecars spawned.
+    const check = new Database(path, { readonly: true, strict: true });
+    expect((check.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).not.toBe("wal");
+    check.close();
+    expect(existsSync(`${path}-wal`)).toBe(false);
+    expect(existsSync(`${path}-shm`)).toBe(false);
   });
 });
 
@@ -2971,7 +3017,10 @@ describe("openReadOnly (read seam)", () => {
     expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/upgrade the tool/);
   });
 
-  test("a v3-stamped file missing audit tables is refused up front, not mid-query", () => {
+  test("a current-stamped file missing audit tables is refused up front, not mid-query", () => {
+    // Stamped SCHEMA_VERSION deliberately (this is the CURRENT-stamp case; a genuinely
+    // OLDER-stamped empty shell keeps the migrate-first message and has its own test) — the old
+    // title said "v3-stamped", accurate only before the v4 bump.
     const path = nextFile();
     const forged = new Database(path, { create: true, strict: true });
     forged.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -3247,6 +3296,94 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     expect(uv(r)).toBe(SCHEMA_VERSION);
     expect((r.query("SELECT scanned_commit_date AS d FROM run_unit_head WHERE branch='main'").get() as { d: string }).d).toBe("2024-05-05");
     db.close();
+  });
+
+  test("a physically-v4 database stamped v2 fast-forwards through BOTH steps WITHOUT a rebuild — new-column values preserved", () => {
+    // The stamp-2 half of the above-stamp acceptance (the ownership span's [2..SCHEMA_VERSION]
+    // upper bound): the ownership preflight must admit v4 shapes under stamp 2, migrateV2toV3's
+    // ALTER must be an addColumnIfMissing no-op, and migrateV3toV4 must classify ours-v4 →
+    // preserve. Narrowing the span back toward the stamp would falsely refuse this file.
+    const path = nextFile();
+    buildNativeV4(path);
+    const forge = new Database(path, { strict: true });
+    forge.exec("UPDATE run_unit_head SET scanned_commit_date = '2024-05-05' WHERE branch='main'");
+    forge.exec("PRAGMA user_version = 2"); // the earlier-build / crash-remnant stamp
+    forge.close();
+    const db = AuditDb.open({ sqlitePath: path });
+    const r = raw(db);
+    expect(uv(r)).toBe(SCHEMA_VERSION);
+    expect((r.query("SELECT scanned_commit_date AS d FROM run_unit_head WHERE branch='main'").get() as { d: string }).d).toBe("2024-05-05");
+    db.close();
+  });
+
+  test("gate order pin: a live rejection leaves a rollback-journal database UNFLIPPED (the WAL pragma runs after the gates)", () => {
+    // Direct-drive pin for initWritableConnection's ordering (version ceiling → isOwnedOrEmpty →
+    // assertOpenCompatible → journal_mode=WAL): through AuditDb.open, any file the live gates
+    // would reject is caught by the read-only preflight first (same bytes), and the WAL-resident
+    // sibling fixture is ALREADY in WAL mode by construction — so neither can detect the WAL
+    // pragma migrating above the gates. Here the gates meet delete-mode files directly: if the
+    // pragma ran first, each rejection would leave journal_mode=wal (and sidecars) behind.
+    const journalMode = (p: string): string => {
+      const c = new Database(p, { readonly: true, strict: true });
+      const m = (c.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
+      c.close();
+      return m;
+    };
+    // (a) ownership rejector: a foreign delete-mode file.
+    const foreign = nextFile();
+    const f = new Database(foreign, { create: true, strict: true });
+    f.exec("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)");
+    f.exec("PRAGMA user_version = 2");
+    f.close();
+    const fh = new Database(foreign, { strict: true });
+    expect(() => initWritableConnection(fh, foreign)).toThrow(/did not create/);
+    expect(journalMode(foreign)).not.toBe("wal");
+    expect(existsSync(`${foreign}-wal`)).toBe(false);
+    // (b) compatibility rejector: OWNED shapes, but a CHECK-set variant only the classifier can
+    //     see (tableShape is CHECK-blind) — converted to a rollback journal first.
+    const sib = nextFile();
+    buildNativeV4(sib);
+    const conv = new Database(sib, { strict: true });
+    conv.exec("PRAGMA journal_mode = delete;");
+    conv.exec("PRAGMA foreign_keys = OFF;");
+    conv.exec("DROP TABLE run_unit_head");
+    conv.exec(`CREATE TABLE run_unit_head (
+      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap') OR status IN ('reused')),
+      is_default_branch INTEGER,
+      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+      policy_matched_pattern TEXT, scanned_commit_date TEXT,
+      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      PRIMARY KEY (run_id, organization, repository, branch))`);
+    conv.close();
+    rmSync(`${sib}-wal`, { force: true });
+    rmSync(`${sib}-shm`, { force: true });
+    expect(journalMode(sib)).not.toBe("wal"); // fixture sanity: the conversion took
+    const sh = new Database(sib, { strict: true });
+    expect(() => initWritableConnection(sh, sib)).toThrow(/incompatible/);
+    expect(journalMode(sib)).not.toBe("wal"); // the rejection did not flip it
+    expect(existsSync(`${sib}-wal`)).toBe(false);
+  });
+
+  test("current-stamp self-heal: an orphaned run_unit_head row (FK violation committed out-of-band) fails the open loudly, rolled back", () => {
+    // Reaches the self-heal arm's foreign_key_check teeth through the public API: shapes are
+    // pristine ours-v4 (every gate passes), only the DATA violates the run_id→runs FK. The open
+    // must fail rather than proceed on referentially-broken provenance — mirroring the v3→v4
+    // migration's own orphan check — and the transaction must roll back, leaving the orphan in
+    // place for the operator to inspect. (The shape half of the same teeth is a documented
+    // structurally-unreachable backstop: the gates reject every non-ours-v4 shape first.)
+    const path = nextFile();
+    buildNativeV4(path);
+    const f = new Database(path, { strict: true });
+    f.exec("PRAGMA foreign_keys = OFF;");
+    f.exec(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status)
+            VALUES ('ghost', 'o', 'r', 'b', '', 'skipped-cutoff')`);
+    f.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/self-heal left 1 orphaned/);
+    const check = new Database(path, { readonly: true });
+    expect((check.query("SELECT COUNT(*) AS n FROM run_unit_head WHERE run_id='ghost'").get() as { n: number }).n).toBe(1);
+    check.close();
   });
 
   test("--fresh on a native v3 db: run data dropped, result is a clean writable v4", () => {

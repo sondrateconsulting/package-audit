@@ -1421,11 +1421,14 @@ export interface OpenDbOptions {
 // states a lock-free byte read cannot judge).
 // The discipline exists because EVERY statement in this span can throw raw (SQLITE_CORRUPT and
 // friends) on a file that changed since the preflight. Same contract as assertOwnedDatabase's
-// catch: close the handle (no leaked half-initialized writer), fail CLOSED with
-// ownership-check context, never a raw SQLiteError; our own DbError refusals pass through
-// unwrapped. Returns the verified user_version so open() decides create-vs-migrate-vs-heal
-// without re-reading. Exported for direct unit tests — the live trigger is the same checkpoint
-// race that justifies isOwnedOrEmpty's export.
+// catch: close the handle (no leaked half-initialized writer), fail CLOSED, never a raw
+// SQLiteError; our own DbError refusals pass through unwrapped. The wrapped message names the
+// whole INIT span, not "the ownership check" — with the WAL pragma now LAST, a raw throw here
+// can also be a plain filesystem problem (read-only directory, disk full) hit AFTER ownership
+// was already proven, and an ownership-flavoured message would misdirect the operator. Returns
+// the verified user_version so open() decides create-vs-migrate-vs-heal without re-reading.
+// Exported for direct unit tests — the live trigger is the same checkpoint race that justifies
+// isOwnedOrEmpty's export.
 export function initWritableConnection(db: Database, path: string): number {
   try {
     // busy_timeout FIRST — it is per-connection and must protect every later lock-taking
@@ -1455,7 +1458,7 @@ export function initWritableConnection(db: Database, path: string): number {
     throw e instanceof DbError
       ? e
       : new DbError(
-          `refusing to write to ${path}: the ownership check could not inspect it on the writable connection (${(e as Error).message})`,
+          `refusing to write to ${path}: the writable connection could not be verified and initialized (${(e as Error).message})`,
         );
   }
 }
