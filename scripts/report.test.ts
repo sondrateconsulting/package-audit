@@ -424,15 +424,14 @@ describe("buildReport (§7)", () => {
   });
 
   test("the scan-scope ledger FAILS CLOSED on an OUT-OF-BAND policy_status literal (never stamped into the emitted JSON)", () => {
-    // The sibling test above forges an unrecognised SHAPE; this forges an unrecognised VALUE. Both
-    // shared predicates and assertKnownPolicyDisposition discriminate on (status, policy_status IS NOT
-    // NULL) alone — none of them reads the LITERAL — so 'excluded-by-sideways' on a skipped-cutoff row
-    // is shape-valid, satisfies isPolicyExcluded, and passes the ledger's disposition guard. What
-    // remains is the emitted claim: policyBranches[].policyStatus is typed as exactly two literals, so
-    // the value must be CHECKED, not asserted. Nothing produces this today (the v4 column CHECK
-    // constrains it and classifyRunUnitHead refuses a table whose CHECK set differs), hence the forge
-    // past the CHECK — this is the read-side backstop for a value that arrived out of band, and the
-    // reason the emitted type is a promise the code keeps rather than one a cast makes.
+    // The test.each above forges disagreeing SHAPES; this forges an unrecognised VALUE on a shape the
+    // gate otherwise accepts (policy-excluded, definite non-default, no pattern, native date). The
+    // whole-row gate validates the literal itself: a bogus token belongs to NO verdict and must never
+    // be counted or stamped into policyBranches[].policyStatus, which is typed as exactly two
+    // literals. Nothing produces this today (the v4 column CHECK constrains the value and
+    // classifyRunUnitHead refuses a table whose CHECK set differs), hence the forge past the CHECK —
+    // this is the read-side backstop for a value that arrived out of band; policyStatusOrThrow at the
+    // stamping site is the second layer that keeps the emitted type a promise the code checks.
     // Same ./data containment idiom as the sibling (§0 forbids writes outside ./data).
     const dataExistedBefore = existsSync("./data");
     const dbRoot = `./data/.reporttest-literal-${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -442,15 +441,15 @@ describe("buildReport (§7)", () => {
       const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
       db.completeRun(runId);
       db.close();
-      // ignore_check_constraints is what makes this forge possible at all: unlike the sibling's
-      // past-cap row, the column CHECK genuinely rejects this literal, so the write path AND SQLite
-      // both have to be stepped around to simulate external damage / a future status.
+      // ignore_check_constraints is what makes this forge possible at all: the column CHECK genuinely
+      // rejects this literal, so the write path AND SQLite both have to be stepped around to simulate
+      // external damage / a future status.
       const forge = new Database(sqlitePath, { strict: true });
       forge.exec("PRAGMA ignore_check_constraints = ON");
-      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'sideways', '', 'skipped-cutoff', 0, 'excluded-by-sideways', null, '2025-06-01T00:00:00Z')`).run(runId);
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'sideways', '', 'policy-excluded', 0, 'excluded-by-sideways', null, '2025-06-01T00:00:00Z')`).run(runId);
       forge.close();
       const db2 = AuditDb.open({ sqlitePath });
-      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/unrecognised policy_status="excluded-by-sideways"/);
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/outside the known domain/);
       db2.close();
     } finally {
       rmSync(dbRoot, { recursive: true, force: true });

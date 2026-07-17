@@ -3782,20 +3782,25 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
 
   // Round-4 identity gaps, each demonstrated by ADOPTION before the fix. Every fixture is a v4Ruh
   // single-property mutation, anchored by the control above.
+  // The four pragma-VISIBLE identity deviations below (DEFAULT, FK action, STRICT, PK order) are
+  // refused by shape-level ownership on the preflight ("did not create") before the classifier can
+  // name them; the classifier's own checks remain the layered in-gate backstop. The pragma-INVISIBLE
+  // deviations (ON CONFLICT / DEFERRABLE, further down) pass the shape signature and pin the
+  // classifier's sql-token scan directly.
   test("fingerprint: a foreign column DEFAULT is rejected — defaults change what future INSERTs mean", () => {
     const path = nextFile();
     forgeRuh(path, v4Ruh({ cols: V4_RUH_PARTS.cols.replace("commit_sha TEXT NOT NULL DEFAULT ''", "commit_sha TEXT NOT NULL DEFAULT 'foreign-default'") }));
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
   });
   test("fingerprint: a foreign FK action (ON DELETE CASCADE) is rejected — it changes write semantics", () => {
     const path = nextFile();
     forgeRuh(path, v4Ruh({ cols: V4_RUH_PARTS.cols.replace("REFERENCES runs(run_id)", "REFERENCES runs(run_id) ON DELETE CASCADE") }));
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/foreign key/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|foreign key/);
   });
   test("fingerprint: a STRICT table is rejected — STRICT changes type-affinity semantics", () => {
     const path = nextFile();
     forgeRuh(path, v4Ruh() + " STRICT");
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/STRICT/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|STRICT/);
   });
   test("index: a DESC column in ix_ruh_loc is rejected — same name, different scan semantics", () => {
     const path = nextFile();
@@ -3820,7 +3825,7 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
   test("fingerprint: a DESC member of the composite PRIMARY KEY is rejected", () => {
     const path = nextFile();
     forgeRuh(path, v4Ruh({ pk: "PRIMARY KEY (run_id, organization DESC, repository, branch)" }));
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/primary key|incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|primary key|incompatible/);
   });
 
   // Direct pins for extractChecks' trivia handling — the property the DEFAULT-string fixture above

@@ -51,7 +51,14 @@ const KNOWN_STATUS_MAP = {
 } as const satisfies Record<UnitHeadStatus, true>;
 const KNOWN_STATUSES = Object.keys(KNOWN_STATUS_MAP);
 const isKnownStatus = (v: string): v is UnitHeadStatus => KNOWN_STATUSES.includes(v);
-const isKnownPolicyStatus = (v: string | null): v is PolicyStatus => v === "excluded-by-deny" || v === "excluded-by-allow";
+// Same exhaustive link for the policy domain: a hand-written `=== "a" || === "b"` guard would
+// silently start REJECTING a valid verdict the day the union grows (the type predicate does not
+// police coverage) — the map makes that day a build error instead.
+const KNOWN_POLICY_STATUS_MAP = {
+  "excluded-by-deny": true, "excluded-by-allow": true,
+} as const satisfies Record<PolicyStatus, true>;
+const KNOWN_POLICY_STATUSES = Object.keys(KNOWN_POLICY_STATUS_MAP);
+const isKnownPolicyStatus = (v: string | null): v is PolicyStatus => v !== null && KNOWN_POLICY_STATUSES.includes(v);
 
 // A branch actually DROPPED by policy — its own disposition in the disjoint partition (PROMPT.md §3),
 // named identically to the live JSONL stream's `action:'skip-policy'` event. The status alone is
