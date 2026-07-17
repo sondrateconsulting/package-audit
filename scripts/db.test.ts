@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { copyFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, nowIso, type RunInput, type RunUnitHeadInput } from "./db.ts";
+import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, migrateV3toV4, nowIso, type RunInput, type RunUnitHeadInput } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 
@@ -3217,7 +3217,7 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     // run_unit_head rows — nothing carries the NULL provenance sentinel — and a repo can drop from
     // the kept estate before any resume revisits it. A pre-v4 running run resumed under v4 could
     // then report scanScope.provenance='complete' (and compare policyChurn available) while its
-    // pre-v4 scope is unknowable. So migrateV3toV4 mirrors migrateLegacy's boundary rule: fail it;
+    // pre-v4 scope is unknowable. So migrateV3toV4 enforces a migration-boundary rule: fail it;
     // the next invocation starts a NEW all-v4 run whose provenance is genuinely authoritative
     // (work_queue skip-as-current keeps that cheap — the config_hash is unchanged by design).
     const path = nextFile();
@@ -3230,13 +3230,16 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     db.close();
   });
 
-  test("a migration that aborts at the pre-swap guard leaves the v3 table + stamp untouched", () => {
+  test("a pre-existing migration scratch table aborts the open, leaving the v3 table + stamp untouched", () => {
     const path = nextFile();
     buildV3TwinDb(path); // v3, stamp 3
     const forge = new Database(path, { strict: true });
-    forge.exec("CREATE TABLE run_unit_head__v4_new (x INTEGER)"); // pre-existing scratch -> migration aborts
+    forge.exec("CREATE TABLE run_unit_head__v4_new (x INTEGER)"); // not chain-producible (the migration is one transaction)
     forge.close();
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/scratch table/);
+    // The scratch name is not an audit table, so the ownership preflight refuses the file outright;
+    // migrateV3toV4's own scratch-collision guard remains as the in-transaction backstop for a
+    // scratch appearing after the preflight.
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/this tool did not create/);
     const check = new Database(path, { readonly: true });
     expect(uv(check)).toBe(3);
     expect(cols(check, "run_unit_head")).not.toContain("policy_status");
@@ -3244,19 +3247,26 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
   });
 
   test("rollback AFTER the destructive swap: a post-rename failure restores the v3 rows, shape, and stamp", () => {
-    const path = nextFile();
-    buildV3TwinDb(path); // v3, stamp 3
-    const before = new Database(path, { readonly: true });
-    const beforeRows = (before.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n;
-    before.close();
-    const forge = new Database(path, { strict: true });
     // Drop the real ix_ruh_loc index and squat its name with a TABLE, so SCHEMA_SQL's
     // `CREATE INDEX ... ix_ruh_loc` fails AFTER the rebuild's DROP+RENAME already ran — proving the
-    // destructive swap is inside the rolled-back transaction.
-    forge.exec("DROP INDEX IF EXISTS ix_ruh_loc");
-    forge.exec("CREATE TABLE ix_ruh_loc (x INTEGER)");
-    forge.close();
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow();
+    // destructive swap (and the boundary rule's running→failed flip, which precedes SCHEMA_SQL) is
+    // inside the rolled-back transaction.
+    //
+    // Driven through migrateV3toV4 DIRECTLY (exported for tests — the isOwnedOrEmpty /
+    // mapReadOnlyOpenError precedent): through AuditDb.open, every state that could make SCHEMA_SQL
+    // fail post-swap is now intercepted before the migration runs (the ownership preflight refuses
+    // committed non-audit tables/views/triggers, the writable backstop re-checks through any
+    // recovered WAL, and classify-first rejects a wrong ix_ruh_loc index) — the interception is the
+    // desired hardening, but it makes this rollback property unreachable from the public seam.
+    const path = nextFile();
+    buildV3TwinDb(path); // v3, stamp 3
+    const dbx = new Database(path, { strict: true });
+    dbx.exec("PRAGMA foreign_keys = ON;");
+    const beforeRows = (dbx.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n;
+    dbx.exec("DROP INDEX IF EXISTS ix_ruh_loc"); // classify-first reads this as 'absent' (repairable) — the rebuild proceeds
+    dbx.exec("CREATE TABLE ix_ruh_loc (x INTEGER)"); // …until SCHEMA_SQL's CREATE INDEX collides post-RENAME
+    expect(() => migrateV3toV4(dbx)).toThrow();
+    dbx.close();
     const check = new Database(path, { readonly: true });
     expect(uv(check)).toBe(3); // stamp rolled back
     expect(cols(check, "run_unit_head")).not.toContain("policy_status"); // rename rolled back -> still v3
@@ -3318,18 +3328,42 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/incompatible/);
   });
 
-  test("inbound FK: rebuild is refused when an external table references run_unit_head (a DROP would cascade)", () => {
+  test("inbound FK from a NON-audit table: the ownership preflight refuses the file before --fresh/migration", () => {
     const path = nextFile();
     buildV3TwinDb(path); // v3, stamp 3 — would otherwise migrate
     const f = new Database(path, { strict: true });
     f.exec("PRAGMA foreign_keys = OFF;");
     f.exec("CREATE TABLE ext (id INTEGER PRIMARY KEY, ruh TEXT REFERENCES run_unit_head(run_id) ON DELETE CASCADE)");
     f.close();
-    // The read-only gate rejects this BEFORE --fresh/migration (so a --fresh cannot cascade-drop ext).
+    // `ext` is not an audit table name, so assertOwnedDatabase refuses the whole file (fail-closed)
+    // BEFORE the compat gate or --fresh can run — its CASCADE rows can never be reached by a DROP.
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/this tool did not create/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/this tool did not create/);
+    const check = new Database(path, { readonly: true });
+    expect(uv(check)).toBe(3); // untouched
+    check.close();
+  });
+
+  test("inbound FK from an AUDIT-NAMED table: the compat gate refuses it on the preflight, nothing mutated", () => {
+    // An audit-NAMED carrier passes ownership (the full-set match is name-level), so the inbound-FK
+    // gate (assertOpenCompatible gate c) is what must catch it: the v3→v4 rebuild's DROP of
+    // run_unit_head would otherwise cascade-delete the carrier's rows, and foreign_key_check on the
+    // rebuilt table cannot detect that loss. The journal-mode assertion discriminates THIS gate from
+    // the migration's own in-transaction inbound-FK guard, which only fires after the WAL flip.
+    const path = nextFile();
+    buildV3TwinDb(path); // v3, stamp 3 — would otherwise migrate
+    const f = new Database(path, { strict: true });
+    f.exec("PRAGMA foreign_keys = OFF;");
+    f.exec("DROP TABLE errors");
+    f.exec("CREATE TABLE errors (id INTEGER PRIMARY KEY, ruh TEXT REFERENCES run_unit_head(run_id) ON DELETE CASCADE)");
+    f.exec("INSERT INTO errors (id, ruh) VALUES (1, 'r1')");
+    f.close();
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/foreign key into run_unit_head/);
     expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/foreign key into run_unit_head/);
     const check = new Database(path, { readonly: true });
     expect(uv(check)).toBe(3); // untouched
+    expect((check.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).not.toBe("wal"); // never WAL-flipped
+    expect((check.query("SELECT COUNT(*) AS n FROM errors").get() as { n: number }).n).toBe(1); // carrier rows intact
     check.close();
   });
 
@@ -3403,7 +3437,10 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     const f = new Database(path, { strict: true });
     f.exec("CREATE TRIGGER trg AFTER INSERT ON run_unit_head BEGIN SELECT 1; END");
     f.close();
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible|unexpected trigger/);
+    // A trigger is an ALWAYS-foreign object (this tool creates none), so the ownership preflight
+    // refuses the whole file before the compat gate runs; the classifier's unexpected-dependents
+    // check remains the in-gate backstop for the same state.
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/this tool did not create/);
   });
 
   test("gate: a v2-shaped run_unit_head stamped v3 is rejected (the chain would skip migrateV2toV3)", () => {
@@ -3508,10 +3545,11 @@ describe("LIKE-wildcard table names vs the foreign-object/inbound-FK guards (san
                 SELECT run_id, organization, repository, branch FROM run_unit_head LIMIT 1`);
     forge.close();
     // 'sqliteevil' is a LEGAL name (no literal 'sqlite_' prefix) that an UNescaped LIKE 'sqlite_%'
-    // wildcard-matches ('_' matches 'e') — the guard must still see its inbound FK: the rebuild's
-    // DROP TABLE run_unit_head would otherwise silently CASCADE its rows away (observed 2→0 before
-    // the ESCAPE fix).
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/foreign key into run_unit_head/);
+    // wildcard-matches ('_' matches 'e') — the rebuild's DROP TABLE run_unit_head would silently
+    // CASCADE its rows away (observed 2→0 before the ESCAPE fix). The ownership preflight (whose
+    // NOT_SQLITE_INTERNAL predicate carries the same ESCAPE) refuses the file first; the escaped
+    // inbound-FK guard remains the layered backstop inside the compat gate and the migration.
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/this tool did not create/);
     const check = new Database(path, { readonly: true });
     expect((check.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3); // unstamped
     expect((check.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("delete"); // preflight reject: no WAL flip
@@ -3527,10 +3565,63 @@ describe("LIKE-wildcard table names vs the foreign-object/inbound-FK guards (san
     raw.close();
     // hasForeignObjects must count this LEGAL name as FOREIGN (zero audit tables + a foreign object
     // = someone else's database); the unescaped LIKE used to read it as internal and adopt the file.
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/refusing to (open an incompatible|adopt)/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/this tool did not create/);
     const check = new Database(path, { readonly: true });
     expect((check.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("delete"); // never WAL-mutated
     expect((check.query("SELECT COUNT(*) AS n FROM sqliteevil").get() as { n: number }).n).toBe(1);
     check.close();
+  });
+});
+
+describe("live compat backstop — states the base-image preflight cannot see", () => {
+  test("a sibling v4 committed ONLY into -wal frames over a common v3 base is rejected before adoption or --fresh", () => {
+    // The base-image counterexample: a sibling build (descended from the same v3) rebuilds
+    // run_unit_head incompatibly and stamps 4, but its commit sits entirely in -wal frames over a
+    // checkpointed common-v3 base. The deserialize preflight classifies the BASE (exact-v3, stamp
+    // 3) and passes; the LIVE stamp reads 4, so without a live compat re-check the migration would
+    // never reclassify — the sibling would be silently ADOPTED, and --fresh would DROP its
+    // reshaped tables. The live assertOpenCompatible backstop (before the WAL pragma and --fresh)
+    // must reject it.
+    const path = nextFile();
+    buildV3TwinDb(path); // checkpointed common v3 base, delete journal
+    const snap = `${path}.snap`;
+    const sib = new Database(path, { strict: true });
+    sib.exec("PRAGMA journal_mode = WAL;");
+    sib.exec("BEGIN");
+    sib.exec("DROP TABLE run_unit_head");
+    sib.exec("CREATE TABLE run_unit_head (run_id TEXT NOT NULL, outcome TEXT NOT NULL, PRIMARY KEY (run_id))"); // sibling shape
+    sib.exec("COMMIT");
+    sib.exec("PRAGMA user_version = 4");
+    // Snapshot base+wal while the writer is still open (nothing has checkpointed), then swap the
+    // snapshot back so the on-disk state is exactly "clean v3 base + sibling-v4 -wal".
+    copyFileSync(path, snap);
+    copyFileSync(`${path}-wal`, `${snap}-wal`);
+    sib.close();
+    copyFileSync(snap, path);
+    copyFileSync(`${snap}-wal`, `${path}-wal`);
+    rmSync(snap, { force: true });
+    rmSync(`${snap}-wal`, { force: true });
+    rmSync(`${path}-shm`, { force: true });
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/incompatible/); // --fresh cannot drop it
+    // The sibling's data survives (WAL recovery on their file is the documented residual cost —
+    // data-preserving; adoption/drop is what must never happen).
+    const check = new Database(path, { readonly: true });
+    expect((check.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(4);
+    expect((check.query("SELECT COUNT(*) AS n FROM pragma_table_xinfo('run_unit_head')").get() as { n: number }).n).toBe(2); // sibling shape intact
+    check.close();
+  });
+
+  test("isOwnedOrEmpty rejects a FULL-name-set database stamped below MIN_OWNED_VERSION", () => {
+    // hasOwnedTableSet's FULL/FRESH_PRESERVED shortcut is name-level and checks the stamp only on
+    // its PARTIAL-set repair path — the backstop must therefore carry the version conjunct itself,
+    // or a foreign full-name-set file stamped 0/1 (a state this tool never produced) would pass.
+    const db = new Database(":memory:", { strict: true });
+    db.exec(V2_SCHEMA_SQL); // all eight audit table names
+    db.exec("PRAGMA user_version = 1"); // below MIN_OWNED_VERSION
+    expect(isOwnedOrEmpty(db)).toBe(false);
+    db.exec("PRAGMA user_version = 2"); // at MIN_OWNED_VERSION the same set is owned
+    expect(isOwnedOrEmpty(db)).toBe(true);
+    db.close();
   });
 });

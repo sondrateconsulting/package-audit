@@ -449,18 +449,39 @@ function hasForeignObjects(db: Database): boolean {
 
 // Reference column shapes for the ownership check: what each audit table looks like under a
 // given stamped schema version, read from a throwaway :memory: build of SCHEMA_SQL (never
-// hardcoded — a future migration changes this automatically; the v2 shape is the current one
-// minus the columns the later steps added). table_xinfo, not table_info: it also lists hidden
-// and generated columns, so a foreign table cannot alias an audit shape through columns
-// table_info omits. Built once per version, lazily, and cached for the process.
+// hardcoded — a future migration changes this automatically). table_xinfo, not table_info: it
+// also lists hidden and generated columns, so a foreign table cannot alias an audit shape through
+// columns table_info omits. Built once per version, lazily, and cached for the process.
+//
+// run_unit_head is the exception to "derive by ALTERing the current build": its v4 body carries a
+// TABLE-LEVEL CHECK referencing policy_status/policy_matched_pattern, and SQLite refuses to DROP a
+// column a table-level CHECK mentions (verified by probe: DROP policy_status / DROP
+// policy_matched_pattern both fail on the v4 table) — nor could any ALTER un-widen the status
+// CHECK. So the v3 reference REBUILDS run_unit_head from a FROZEN literal of the historical v3
+// body. Freezing it is sound where hardcoding the CURRENT shape is not: a stamped-v3 file's shape
+// is history and can never change again (the v2 shape is then v3 minus is_default_branch, which IS
+// derivable — no CHECK references that column).
+const RUN_UNIT_HEAD_V3_BODY = `
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+  commit_sha TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'scanned'
+    CHECK (status IN ('scanned','skipped-cutoff')),
+  is_default_branch INTEGER,
+  PRIMARY KEY (run_id, organization, repository, branch)
+`;
 const referenceShapesByVersion = new Map<number, Map<string, string>>();
 function tableShapesAt(version: number): Map<string, string> {
   const cached = referenceShapesByVersion.get(version);
   if (cached !== undefined) return cached;
   const ref = new Database(":memory:", { strict: true });
   try {
-    ref.exec(SCHEMA_SQL); // the CURRENT schema — includes the v3 is_default_branch column
-    if (version < V3_TARGET_VERSION) ref.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch");
+    ref.exec(SCHEMA_SQL); // the CURRENT (v4) schema
+    if (version < V4_TARGET_VERSION) {
+      ref.exec("DROP TABLE run_unit_head");
+      ref.exec(`CREATE TABLE run_unit_head (${RUN_UNIT_HEAD_V3_BODY});`);
+      if (version < V3_TARGET_VERSION) ref.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch");
+    }
     const shapes = new Map(AUDIT_TABLES.map((t) => [t, tableShape(ref, t)]));
     referenceShapesByVersion.set(version, shapes);
     return shapes;
@@ -833,7 +854,19 @@ function assertOwnedDatabase(path: string): void {
       return;
     }
     // The version bounds live inside hasOwnedTableSet, shared with the writable backstop.
-    if (!hasForeignObjects(db) && hasOwnedTableSet(db)) return;
+    if (!hasForeignObjects(db) && hasOwnedTableSet(db)) {
+      // The file is provably OURS — now prove the MIGRATION can accept it, on the SAME base image
+      // (still no SQLite handle on the target): a run_unit_head whose classified shape is outside
+      // the stamp's allowed set (e.g. a SIBLING tool's v4 — same audit table names, so ownership
+      // alone cannot tell it apart) is refused here, before the writable open's WAL pragma can
+      // touch the file. (A too-new stamp was already refused before the empty arm above.)
+      // Base-image staleness is harmless for the same reason as above: any committed prior state
+      // of OUR OWN database classifies as compatible, and the writable open re-checks on its own
+      // connection (isOwnedOrEmpty + assertOpenCompatible inside initWritableConnection; the
+      // migration classifies again inside its transaction) through any recovered WAL.
+      assertOpenCompatible(db, readUserVersion(db));
+      return;
+    }
     fail(
       `refusing to write to ${path}: it is a SQLite database this tool did not create — ` +
         "point `sqlitePath` at a new or existing audit database instead (nothing was modified)",
@@ -1186,7 +1219,11 @@ function classifyRunUnitHead(db: Database): RuhClass {
 // shape). foreign_keys stays ON: run_unit_head is a leaf child, safe to DROP (implicit child-row
 // delete cannot violate the outgoing ref to runs); toggling the pragma inside a transaction is a
 // no-op anyway.
-function migrateV3toV4(db: Database): void {
+// Exported for direct unit tests (the isOwnedOrEmpty / mapReadOnlyOpenError precedent): through
+// AuditDb.open, every state that could make this transaction fail AFTER its destructive swap is
+// now intercepted earlier (ownership preflight, live backstops, classify-first), so the
+// rollback-after-swap property is only pinnable by driving the function on a raw connection.
+export function migrateV3toV4(db: Database): void {
   db.transaction(() => {
     const cls = classifyRunUnitHead(db);
     switch (cls.kind) {
@@ -1223,7 +1260,7 @@ function migrateV3toV4(db: Database): void {
       case "incompatible":
         fail(`cannot migrate database to schema v4: ${cls.reason}`);
     }
-    // Migration-boundary rule (mirrors migrateLegacy step 4): every pre-v4 RUNNING run is failed —
+    // Migration-boundary rule: every pre-v4 RUNNING run is failed —
     // inside this same transaction — so it can never be resumed under v4 semantics. A pre-v4 run's
     // scope may have left NO run_unit_head rows at all (v3 never recorded past-cap rows, and a repo
     // whose scans all errored/throttled wrote nothing): such a repo carries no NULL
@@ -1250,63 +1287,40 @@ function migrateV3toV4(db: Database): void {
 }
 
 // Throw (fail) if the on-disk shape is INCOMPATIBLE with its stamp — a foreign/sibling database that
-// must be neither adopted NOR destroyed. Runs on a READ-ONLY preflight handle (so a rejection cannot
-// checkpoint/mutate a WAL file); the caller owns the handle. Recognizes legitimate predecessors, so a
-// real v2/v3 database is NOT rejected — per-stamp allowed shapes: stamp 2 accepts exact-v2/exact-v3/
-// ours-v4 (each v4 form ± the repairable missing ix_ruh_loc); stamp 3 drops exact-v2; stamp >= 4
-// accepts only the ours-v4 forms. Below v2, run_unit_head's shape is not validated here AT ALL: a
-// pre-v2 table legitimately has the OLD shape (no status column — the legacy step ADDs it via an
-// additive ALTER, PRESERVING the rows; see the in-function note), so fingerprinting it against the
-// classifier's supported v2–v4 shapes would reject a perfectly good old database. A runs.outcome
-// sibling is still rejected below v2 — by the stamp-independent gate (a), which mirrors the
-// classifier's first check. This runs BEFORE --fresh, so an incompatibility DETECTED by these gates
-// is rejected before --fresh can drop anything; what they cannot detect (the pre-v2 "Accepted
-// residual" class below, and the adoption KNOWN HOLE documented at the writable open) can still
-// reach it.
+// must be neither adopted NOR destroyed. Runs TWICE per open, on states the ownership predicate has
+// already accepted (so the database is empty, or foreign-object-free and stamped >=
+// MIN_OWNED_VERSION — a pre-v2 non-empty file is refused as not-ours first; there is no pre-v2
+// migration):
+//   1. on the OWNERSHIP preflight's deserialized base image (see assertOwnedDatabase) — a rejection
+//      there happens with ZERO file handles ever opened on the target;
+//   2. on the WRITABLE connection, as the live backstop — through any recovered WAL, catching an
+//      incompatible state the base image could not see (see AuditDb.open).
+// Recognizes legitimate predecessors, so a real v2/v3 database is NOT rejected — per-stamp allowed
+// shapes: stamp 2 accepts exact-v2/exact-v3/ours-v4 (each v4 form ± the repairable missing
+// ix_ruh_loc); stamp 3 drops exact-v2; stamp >= 4 accepts only the ours-v4 forms. Both call sites
+// run BEFORE the WAL pragma and BEFORE --fresh, so a DETECTED incompatibility is rejected before
+// --fresh can drop anything.
 function assertOpenCompatible(db: Database, userVersion: number): void {
   const reject = (why: string): never => fail(`refusing to open an incompatible database (stamped v${userVersion}): ${why}`);
-  // These cross-table invariants hold at EVERY stamp (including pre-v2), and must run BEFORE the
-  // legacy short-circuit AND before any --fresh drop, since --fresh runs before the migration:
-  // (a0) ZERO audit tables + foreign tables present = someone else's database; never adopt it.
-  //      This check lives HERE, in the READ-ONLY preflight, rather than at the adoption site after
-  //      the writable open, because the writable open runs `PRAGMA journal_mode = WAL` — which
-  //      PERSISTS in the file header and spawns -wal/-shm sidecars. Rejecting after that has already
-  //      mutated a file we just decided we do not own, breaking the zero-mutation guarantee
-  //      AuditDb.open's preflight note makes. It is reachable by ordinary operator error (a
-  //      `sqlitePath` aimed at some other app's .db), not only by tampering.
-  //      A genuinely fresh/empty path has no objects at all, so hasForeignObjects is false and it
-  //      still falls through to normal creation.
-  if (AUDIT_TABLES.every((t) => !tableExists(db, t)) && hasForeignObjects(db))
-    reject("foreign objects present, no audit tables — refusing to adopt a non-audit SQLite database");
+  // Cross-table invariants first (they hold at every accepted stamp):
   // (a) a runs.outcome column is a foreign v4 (table_xinfo, so a GENERATED outcome is caught);
   if (tableExists(db, "runs") && tableXinfo(db, "runs").some((c) => c.name === "outcome"))
     reject("the runs table has an 'outcome' column — a different v4 schema; use the matching tool build or a new database path");
   const ruhPresent = tableExists(db, "run_unit_head");
-  // (b) run_unit_head absent while runs is present is never a legitimate (atomic) post-fresh state;
+  // (b) run_unit_head absent while runs is present is never a legitimate (atomic) post-fresh state.
+  //     Deliberately NOT left to the self-heal/repair path: recreating an EMPTY provenance table
+  //     under surviving runs would silently un-scope those runs' reports. openReadOnly rejects the
+  //     same state as incompatible BEFORE its missing-table repair advice, so "run `bun run audit`
+  //     once to repair it" is never suggested for a state the writer would refuse (no dead end).
   if (!ruhPresent && tableExists(db, "runs"))
     reject("run_unit_head is missing while the runs table is present");
   // (c) an inbound FK into run_unit_head would make a --fresh DROP (or the rebuild) cascade to
-  //     external rows — reject before either can run.
+  //     external rows — reject before either can run. With ownership already proven, the FK carrier
+  //     is necessarily an audit-NAMED table (any other table is a foreign object refused earlier) —
+  //     a state only out-of-band edits produce, but one whose rows a rebuild's DROP would silently
+  //     delete, so it is refused rather than risked.
   if (ruhPresent && hasInboundForeignKey(db, "run_unit_head"))
     reject("an external table has a foreign key into run_unit_head — a DROP would cascade to its rows");
-  // Below v2 the shape check is SKIPPED because a pre-v2 run_unit_head legitimately has the OLD shape
-  // (no status column — the legacy step ADDs it), and fingerprinting that against the v4 expectation
-  // would reject a perfectly good old database.
-  //
-  // It is NOT skipped because the table gets rebuilt: the legacy step PRESERVES run_unit_head via an
-  // additive ALTER and deliberately excludes it from the rebuild list (see migrateLegacy — "Do NOT
-  // 'fix' this into a rebuild"). This comment used to claim the rebuild, which was both false and the
-  // stated reason for the skip; the real reason is the one above. What still backstops the skip is
-  // the v3→v4 step — the ONE step that classifies the on-disk shape before touching it and
-  // re-fingerprints its result before stamping (legacy and v2→v3 stamp without fingerprinting) — so
-  // a shape that survives the additive ALTERs is validated there rather than here.
-  //
-  // Accepted residual: a pre-v2 file whose run_unit_head was hand-modified into a foreign shape can be
-  // ALTERed (and other tables reset+committed) before a later step rejects it. That is the same
-  // hand-crafted-DB class this classifier's scope explicitly excludes — it defends the MIGRATION's
-  // compatibility, not a tampered file's integrity — and reaching it requires out-of-band edits to the
-  // tool's own local database.
-  if (userVersion < LEGACY_TARGET_VERSION) return;
   if (!ruhPresent) return; // absent + runs also absent -> genuine fresh / post-fresh cache-only state
   const cls = classifyRunUnitHead(db);
   if (cls.kind === "incompatible") reject(cls.reason);
@@ -1314,10 +1328,12 @@ function assertOpenCompatible(db: Database, userVersion: number): void {
   // stamping (one transaction each), so the chain can never leave a shape OLDER than its stamp — a
   // v3 stamp carrying a v2 shape proves migrateV2toV3 was skipped; without --fresh, accepting it
   // would only defer the failure to migrateV3toV4's exact-v2 rejection. Recognized NEWER shapes are
-  // also accepted at older stamps: a COMPLETE current-shape table under an older stamp is
-  // chain-producible — the legacy and v2→v3 steps execute SCHEMA_SQL (which creates any MISSING
-  // table in the CURRENT shape) before stamping their own target, so a crash before the NEXT step
-  // stamps leaves that physically-upgraded table behind — and stamp 2 likewise accepts exact-v3.
+  // also accepted at older stamps: the CURRENT chain commits each reshape together with its stamp,
+  // but EARLIER tool builds ran a multi-step chain whose first (legacy) step committed current-shape
+  // CREATEs while stamping only 2 — a crash there left a physically newer table under the older
+  // stamp, and such files exist on disk. Accepting them is safe: the remaining steps' ALTERs are
+  // addColumnIfMissing no-ops, and the v3→v4 step classifies a physically-v4 table as ours-v4
+  // (preserved, no rebuild).
   // The ours-v4-missing-index form is NOT chain-producible (SCHEMA_SQL creates ix_ruh_loc in the
   // same transaction as the table); it is accepted separately as REPAIRABLE.
   const okV4 = cls.kind === "ours-v4" || cls.kind === "ours-v4-missing-index";
@@ -1338,32 +1354,35 @@ export interface OpenDbOptions {
 }
 
 // The writable connection's INIT span — per-connection PRAGMAs, the version ceiling, then the
-// ownership BACKSTOP, under ONE failure discipline. The backstop is normally unreachable:
-// assertOwnedDatabase already refused every foreign file it could prove. It re-runs the SAME
-// ownedness test (isOwnedOrEmpty) on the WRITABLE connection, which reads THROUGH any
-// recovered WAL — closing what the base-image preflight cannot see: a foreign checkpoint
-// landing between the preflight and this open (the preflight's own wal-guard covers the
-// on-disk case, but not that race). Reaching a refusal here costs sidecar recovery on their
-// file and a checkpoint on close — data-preserving, and strictly better than writing our
-// schema into it. Fires BEFORE --fresh can drop anything.
-// The discipline exists because EVERY statement in this span — the WAL pragma included, which
-// is the first thing to touch the file's pages — can throw raw (SQLITE_CORRUPT and friends)
-// on a file that changed since the preflight. Same contract as assertOwnedDatabase's catch:
-// close the handle (no leaked half-initialized writer), fail CLOSED with ownership-check
-// context, never a raw SQLiteError; our own DbError refusals pass through unwrapped. Returns
-// the verified user_version so open() decides create-vs-migrate-vs-heal without re-reading.
-// Exported for direct unit tests — the live trigger is the same checkpoint race that
-// justifies isOwnedOrEmpty's export.
+// ownership and compatibility BACKSTOPS, under ONE failure discipline. The backstops are
+// normally unreachable: assertOwnedDatabase already refused every foreign or incompatible file
+// it could prove. They re-run the SAME ownedness + compatibility tests (isOwnedOrEmpty,
+// assertOpenCompatible) on the WRITABLE connection, which reads THROUGH any recovered WAL —
+// closing what the base-image preflight cannot see: a foreign checkpoint landing between the
+// preflight and this open, and — the decisive case — an incompatible state committed ONLY into
+// -wal frames over a compatible base (e.g. a SIBLING build's v4 rebuild + stamp on a common v3
+// file: the base classifies exact-v3, the live stamp reads 4 so the migration would never
+// reclassify, and --fresh would DROP the sibling's reshaped tables). The version ceiling and
+// both backstops run BEFORE the journal_mode pragma persists a delete→wal flip in the file
+// header and BEFORE --fresh can drop anything — so a rejection here never converts the file;
+// reaching them still costs sidecar recovery on the file and normally a checkpoint on close —
+// data-preserving, and strictly better than adopting or dropping someone else's tables (the
+// residual mutation class is documented at assertOwnedDatabase; it exists for exactly the
+// states a lock-free byte read cannot judge).
+// The discipline exists because EVERY statement in this span can throw raw (SQLITE_CORRUPT and
+// friends) on a file that changed since the preflight. Same contract as assertOwnedDatabase's
+// catch: close the handle (no leaked half-initialized writer), fail CLOSED with
+// ownership-check context, never a raw SQLiteError; our own DbError refusals pass through
+// unwrapped. Returns the verified user_version so open() decides create-vs-migrate-vs-heal
+// without re-reading. Exported for direct unit tests — the live trigger is the same checkpoint
+// race that justifies isOwnedOrEmpty's export.
 export function initWritableConnection(db: Database, path: string): number {
   try {
-    // busy_timeout FIRST — it is per-connection and must protect the very next statement
-    // (the WAL pragma takes a lock and would otherwise fail immediately under contention).
-    // journal_mode is persistent (in the file header) but re-asserting is harmless;
-    // foreign_keys is per-connection too. All three run OUTSIDE any transaction
-    // (journal_mode cannot change inside one).
+    // busy_timeout FIRST — it is per-connection and must protect every later lock-taking
+    // statement in this span. journal_mode runs LAST, after the gates (it is what persists a
+    // delete→wal conversion in the file header); foreign_keys is per-connection. All pragmas
+    // run OUTSIDE any transaction (journal_mode cannot change inside one).
     db.exec("PRAGMA busy_timeout = 5000;");
-    db.exec("PRAGMA journal_mode = WAL;");
-    db.exec("PRAGMA foreign_keys = ON;");
     const userVersion = readUserVersion(db);
     if (userVersion > SCHEMA_VERSION)
       fail(`database schema version ${userVersion} is newer than this tool's ${SCHEMA_VERSION} — upgrade the tool`);
@@ -1372,6 +1391,9 @@ export function initWritableConnection(db: Database, path: string): number {
         `refusing to write to ${path}: it is a SQLite database this tool did not create — ` +
           "point `sqlitePath` at a new or existing audit database instead",
       );
+    assertOpenCompatible(db, userVersion); // no-op on an empty/new database (no tables yet)
+    db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA foreign_keys = ON;");
     return userVersion;
   } catch (e) {
     try {
@@ -1529,48 +1551,18 @@ export class AuditDb {
       // Re-assert now that the parent exists: a symlink swapped in between the first check
       // and the mkdir would be followed by this second resolution and rejected.
       path = assertContained(resolved, roots);
-      // §0 ownership: prove the file is ours BEFORE the writable open below, whose WAL pragma
-      // would already have rewritten a stranger's header. (:memory: needs no proof — a fresh
-      // in-memory database is empty by construction and shares nothing with the filesystem.)
-      assertOwnedDatabase(path);
-      // Read-only PREFLIGHT for an EXISTING file: classify + reject-if-incompatible through a
-      // READ-ONLY handle BEFORE opening read-write. A rejection therefore cannot mutate the file —
-      // opening a WAL database read-write and closing it can checkpoint (rewrite the main db,
-      // truncate -wal), which would break the zero-mutation guarantee. Fail CLOSED when read-only
-      // verification is impossible (a crashed writer's WAL can be unrecoverable read-only) rather
-      // than fall through to a writable open that could adopt or destroy an incompatible database.
+      // §0 ownership + migration compatibility: prove the file is ours AND acceptable to the
+      // migration BEFORE the writable open below, whose WAL pragma would already have rewritten a
+      // stranger's header. Both checks run on the same deserialized BASE IMAGE — zero file handles
+      // on the target, so a rejection cannot mutate the file, its sidecars, or its journal mode.
+      // (:memory: needs no proof — a fresh in-memory database is empty by construction and shares
+      // nothing with the filesystem.)
       // ACCEPTED LIMITATION (documented, not fixed): a concurrent process could replace the file
-      // between this read-only preflight and the writable open below (a TOCTOU window). This tool is
+      // between this preflight and the writable open below (a TOCTOU window). This tool is
       // single-user (one audit process per database), so concurrent modification of the same file
-      // mid-open is outside the threat model; closing it fully would require OS advisory file locking
-      // held across both opens, which is disproportionate here.
-      if (existsSync(path)) {
-        // One try covering BOTH the read-only open AND the reads: SQLite can defer WAL access and
-        // raise SQLITE_READONLY_RECOVERY at the first statement (readUserVersion), not just at open.
-        let ro: Database | null = null;
-        try {
-          ro = new Database(path, { readonly: true, strict: true });
-          ro.exec("PRAGMA busy_timeout = 5000;");
-          const uv = readUserVersion(ro);
-          if (uv > SCHEMA_VERSION)
-            fail(`database schema version ${uv} is newer than this tool's ${SCHEMA_VERSION} — upgrade the tool`);
-          assertOpenCompatible(ro, uv);
-        } catch (e) {
-          if (e instanceof DbError) throw e; // our own rejection (too-new / incompatible) — pass through
-          // A crashed-writer WAL needs WRITABLE recovery, which the read-only preflight cannot do, and
-          // mapReadOnlyOpenError's "run bun run audit" advice would LOOP here (this IS the audit
-          // writer). Give a non-looping remediation and stay fail-closed (we will NOT writable-recover
-          // a file we could not first verify as compatible).
-          if ((e as { code?: unknown }).code === "SQLITE_READONLY_RECOVERY")
-            fail(
-              `database at ${path} needs writable WAL recovery after a crashed writer, which cannot be verified read-only first — ` +
-                "recover it separately (e.g. `sqlite3 <path> \"PRAGMA wal_checkpoint(TRUNCATE)\"`) or use a fresh database path, then retry",
-            );
-          throw mapReadOnlyOpenError(e, path);
-        } finally {
-          if (ro !== null) ro.close();
-        }
-      }
+      // mid-open is outside the threat model; the isOwnedOrEmpty backstop below re-checks on the
+      // writable connection, which reads through any recovered WAL.
+      assertOwnedDatabase(path);
     }
     // strict: throws on binding-count mismatches instead of silently binding NULLs.
     // NOTE: `safeIntegers` is intentionally left OFF (the default). With it off, bun:sqlite returns
@@ -1579,12 +1571,26 @@ export class AuditDb {
     // JSON.stringify / numeric sort comparators / csvCell's number branch — revisit those cast sites
     // first before ever enabling it.
     const db = new Database(path, { create: true, strict: true });
-    // PRAGMAs, version ceiling and the ownership BACKSTOP under one fail-closed discipline —
-    // see initWritableConnection (extracted so its failure contract is directly unit-testable).
-    // What the READ-ONLY preflight above guarantees before this writable open is stated NARROWLY
-    // at the preflight itself: it covers only a file that EXISTED at that moment, subject to the
-    // accepted TOCTOU window documented there, and later migration-internal failures fire AFTER
-    // this point, each rolling back its OWN transaction only.
+    // Version ceiling, LIVE ownership + compatibility backstops, then the WAL/foreign_keys
+    // pragmas — one fail-closed discipline, in that ORDER (a rejection must fire before the
+    // journal_mode pragma persists a delete→wal flip): see initWritableConnection (extracted so
+    // its failure contract is directly unit-testable).
+    //
+    // What the preflight above guarantees before this writable open — stated NARROWLY: it runs only
+    // for a non-:memory: path (an absent file skips straight to creation), inspects the file's BASE
+    // IMAGE via deserialize (no SQLite handle on the target), and REFUSES — before this
+    // connection's `journal_mode = WAL` pragma and before the --fresh drop — every file it can
+    // prove is not ours to write. What it does NOT guarantee: the base image is a consistent but
+    // possibly STALE snapshot (live/crashed -wal frames are invisible; the zero-object+journal
+    // case is refused as unverifiable) — a state change landing between the preflight and this
+    // open, or visible only through a recovered WAL, is caught by the live backstops inside
+    // initWritableConnection and by the migration's own classify-first transaction. Later
+    // migration-internal failures (the v3→v4 scratch-table collision, the shape asserts, the
+    // post-migration shape/FK fingerprints, or any SQL error) fire AFTER this point, on databases
+    // the preflight accepted as compatible; WAL-converting such a database is normal operation —
+    // a SUCCESSFUL v3→v4 upgrade is preceded by the identical delete→wal flip — and each failing
+    // step rolls back its OWN transaction only: the WAL conversion and any EARLIER committed step
+    // (--fresh) are not undone.
     const userVersion = initWritableConnection(db, path);
 
     if (opts.fresh === true) {

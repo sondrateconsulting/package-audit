@@ -287,8 +287,12 @@ backfilled rows BY CONSTRUCTION — a pre-v4 run recorded no branch policy and n
 past-cap branches — so a NULL `scanned_commit_date` is the sentinel marking that run's scan
 scope UNVERIFIABLE (§7 `provenance`), never a claim that it excluded nothing. A STRUCTURAL
 shape classifier inspects an existing `run_unit_head` (columns via `table_xinfo`, CHECKs, FKs,
-indexes) on a READ-ONLY preflight BEFORE any writable open, so an incompatible or foreign-shaped
-table is refused without ever WAL-mutating the file.
+indexes) TWICE: on the ownership preflight's deserialized base image BEFORE any writable open
+(an incompatibility visible there is refused with zero file handles ever opened on the target),
+and again on the writable connection — through any recovered WAL — before the WAL journal-mode
+flip and before `--fresh`, so an incompatible state committed only into `-wal` frames (a sibling
+build's v4 over a common v3 base) is still refused before it can be adopted or dropped, at the
+documented cost of sidecar recovery on that file.
 A current-version (v4) database self-heals idempotently on open: re-run the new-shape CREATEs, so a
 file missing a table or the `ix_ruh_loc` index is repaired rather than left a dead end (the v4
 policy columns carry CHECKs and cannot be column-repaired — a v4 `run_unit_head` missing one is
