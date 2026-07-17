@@ -261,6 +261,39 @@ describe("buildCompare — policy churn", () => {
     db2.close();
   });
 
+  test("policy churn FAILS CLOSED on an OUT-OF-BAND policy_status literal (never stamped into the churn entry)", () => {
+    // The sibling above forges an unrecognised SHAPE; this forges an unrecognised VALUE. The shared
+    // guard reads (status, policy_status IS NOT NULL) and never the literal, so 'excluded-by-sideways'
+    // on a skipped-cutoff row satisfies isPolicyExcluded and clears it untouched. Verified before the
+    // fix: churn emitted runB.policyStatus:"excluded-by-sideways" and filed the branch under
+    // reclassifiedExclusion — a real deny on one side "reclassified" to garbage on the other, which is
+    // exactly the plausible-looking churn entry the sibling guard exists to prevent, reached by the one
+    // door it does not cover. Needs ignore_check_constraints because (unlike the sibling's past-cap row)
+    // the v4 column CHECK genuinely rejects this literal, so the write path AND SQLite must both be
+    // stepped around to simulate external damage or a status added to the schema but not to this surface.
+    const path = nextFile();
+    const db = AuditDb.open({ sqlitePath: path });
+    const runA = startCompleted(db, ["expo"]);
+    const runB = startCompleted(db, ["expo"]);
+    phead(db, runA.runId, "main", { isDefaultBranch: true });
+    phead(db, runB.runId, "main", { isDefaultBranch: true });
+    const [runAId, runBId] = [runA.runId, runB.runId];
+    db.close();
+    const forge = new Database(path, { strict: true });
+    forge.exec("PRAGMA ignore_check_constraints = ON");
+    const ins = (runId: string, ps: string, pat: string | null): void => {
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'sideways', '', 'skipped-cutoff', 0, ?, ?, '2025-06-01T00:00:00Z')`).run(runId, ps, pat);
+    };
+    ins(runAId, "excluded-by-deny", "p*"); // a REAL exclusion on the A side …
+    ins(runBId, "excluded-by-sideways", null); // … "reclassified" to an out-of-band literal on the B side
+    forge.close();
+    const db2 = AuditDb.open({ sqlitePath: path });
+    expect(() => buildCompare(db2, db2.getRun(runAId)!, db2.getRun(runBId)!)).toThrow(
+      /unrecognised policy_status="excluded-by-sideways"/,
+    );
+    db2.close();
+  });
+
   test("churn is unavailable when EITHER run carries a pre-v4 NULL scanned_commit_date (unknown provenance)", () => {
     const path = nextFile();
     const db = AuditDb.open({ sqlitePath: path });

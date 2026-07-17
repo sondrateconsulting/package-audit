@@ -229,6 +229,41 @@ describe("buildReport (§7)", () => {
     }
   });
 
+  test("the scan-scope ledger FAILS CLOSED on an OUT-OF-BAND policy_status literal (never stamped into the emitted JSON)", () => {
+    // The sibling test above forges an unrecognised SHAPE; this forges an unrecognised VALUE. Both
+    // shared predicates and assertKnownPolicyDisposition discriminate on (status, policy_status IS NOT
+    // NULL) alone — none of them reads the LITERAL — so 'excluded-by-sideways' on a skipped-cutoff row
+    // is shape-valid, satisfies isPolicyExcluded, and passes the ledger's disposition guard. What
+    // remains is the emitted claim: policyBranches[].policyStatus is typed as exactly two literals, so
+    // the value must be CHECKED, not asserted. Nothing produces this today (the v4 column CHECK
+    // constrains it and classifyRunUnitHead refuses a table whose CHECK set differs), hence the forge
+    // past the CHECK — this is the read-side backstop for a value that arrived out of band, and the
+    // reason the emitted type is a promise the code keeps rather than one a cast makes.
+    // Same ./data containment idiom as the sibling (§0 forbids writes outside ./data).
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-literal-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      // ignore_check_constraints is what makes this forge possible at all: unlike the sibling's
+      // past-cap row, the column CHECK genuinely rejects this literal, so the write path AND SQLite
+      // both have to be stepped around to simulate external damage / a future status.
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.exec("PRAGMA ignore_check_constraints = ON");
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'sideways', '', 'skipped-cutoff', 0, 'excluded-by-sideways', null, '2025-06-01T00:00:00Z')`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/unrecognised policy_status="excluded-by-sideways"/);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
   test("RESUME: a branch holding a RETAINED row that errors later is NOT in branchesErrored (no double-count)", () => {
     // The resumed-run shape the single-invocation test above cannot reach. A resumed run reuses the
     // run_id, so errors[] and run_unit_head both span invocations:

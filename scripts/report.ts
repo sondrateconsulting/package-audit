@@ -15,7 +15,7 @@ import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } f
 import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
 import { logLine } from "./log.ts";
-import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition } from "./policyDisposition.ts";
+import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition, checkedPolicyStatus } from "./policyDisposition.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
 import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -114,7 +114,10 @@ export interface ReportSummary {
 // cli, dateFetched — a superset of the renderer's view) is preserved for run-<id>.json; its JSON
 // contract is separately enforced by reportSchema.ts in tests. errors[] stays untyped (leaf only).
 export interface EmittedReport {
-  formatVersion: number; // XRAY_FORMAT_VERSION — the report/export/HTML artifact-set version
+  // PINNED to the constant, not a bare `number` (the COMPARE_FORMAT_VERSION precedent): this shape IS
+  // v2, so a build that emitted some other version here would be mislabelling itself, and reportSchema
+  // — the authoritative contract, but a TEST-ONLY one by design — would only catch it in the suite.
+  formatVersion: typeof XRAY_FORMAT_VERSION; // the report/export/HTML artifact-set version
   runId: string;
   generatedAt: string;
   config: { packages: string[]; cutoffDate: string; githubHost: string; organizations: string[]; organizationsSource: string };
@@ -249,7 +252,9 @@ function buildScanScope(allHeads: HeadRow[]): ScanScope {
       // WRITE chokepoint, not here, and a future disposition (e.g. an 'error' status) would land in the
       // ternary's else-branch and be mislabelled EXCLUDED. Fail closed instead of guessing.
       disposition: dispositionOf(h),
-      policyStatus: h.policy_status as "excluded-by-deny" | "excluded-by-allow",
+      // CHECKED, never `as`-cast: dispositionOf's guard above validates this row's SHAPE and stops
+      // there, so the literal itself is only a promise until something reads it. See checkedPolicyStatus.
+      policyStatus: checkedPolicyStatus(h, `${h.organization}/${h.repository}@${h.branch}`),
       matchedPattern: h.policy_matched_pattern,
     }))
     .sort((a, b) => cmp(`${a.organization}\0${a.repository}\0${a.branch}`, `${b.organization}\0${b.repository}\0${b.branch}`));

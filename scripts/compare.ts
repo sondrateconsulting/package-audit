@@ -23,8 +23,8 @@
 
 import { existsSync } from "node:fs";
 import { loadConfig, type Config } from "./config.ts";
-import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
-import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition } from "./policyDisposition.ts";
+import { AuditDb, type AuditDbReader, type PolicyStatus, type RunRecord } from "./db.ts";
+import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition, checkedPolicyStatus } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
@@ -279,7 +279,9 @@ function siteKey(r: UsageRowDb): string {
 interface PolicyBranchState {
   readonly status: string;
   readonly isDefaultBranch: boolean | null;
-  readonly policyStatus: string | null;
+  // The CLOSED set, not a bare string: every value here is checked by checkedPolicyStatus at
+  // construction, so the churn entries this feeds cannot carry a literal outside db.ts's union.
+  readonly policyStatus: PolicyStatus | null;
   readonly policyMatchedPattern: string | null;
   readonly policyApplied: boolean; // isPolicyExcluded — actually dropped by policy
   readonly defaultOverride: boolean; // isDefaultOverride — scanned default carrying the counterfactual
@@ -321,13 +323,17 @@ function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
       // ordinary unrestricted branch, and buildPolicyChurn's final else-branch would file it under
       // defaultOverrideChanges ("neither applied, but the counterfactual changed") — laundering a
       // malformed disposition into a plausible-looking churn entry.
-      assertKnownPolicyDisposition(h, `${h.organization}/${h.repository}@${h.branch}`);
+      const where = `${h.organization}/${h.repository}@${h.branch}`;
+      assertKnownPolicyDisposition(h, where);
       return [
         `${h.organization}\0${h.repository}\0${h.branch}`,
         {
           status: h.status,
           isDefaultBranch: h.is_default_branch === null ? null : h.is_default_branch === 1,
-          policyStatus: h.policy_status,
+          // The guard above settles the row's SHAPE and stops there; this settles the LITERAL, which
+          // churn compares (policyStateEq) and emits. Null stays null and is checked no further — an
+          // unrestricted branch is the common case, and only a policy-BEARING row makes a claim.
+          policyStatus: h.policy_status === null ? null : checkedPolicyStatus(h, where),
           policyMatchedPattern: h.policy_matched_pattern,
           policyApplied: isPolicyExcluded(h),
           defaultOverride: isDefaultOverride(h),

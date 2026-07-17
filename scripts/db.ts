@@ -28,6 +28,16 @@ function fail(msg: string): never {
   throw new DbError(msg);
 }
 
+// Compile-time exhaustiveness backstop for a switch over a closed union. The `never` parameter IS the
+// mechanism: the call typechecks only while every member is handled upstream, so ADDING one turns this
+// call site into a build error instead of a silent no-op. The throw is only the runtime half —
+// structurally unreachable — and is a plain Error rather than fail()/DbError because reaching it is a
+// TOOL BUG with no operator remediation to offer (the artifactWrite.ts precedent: internal lifecycle
+// violations keep their stacks; operator conditions get the registered error classes).
+function assertNever(x: never, what: string): never {
+  throw new Error(`internal: unhandled ${what}: ${JSON.stringify(x)}`);
+}
+
 // Bump when the schema changes; older on-disk versions run the §3 VERSION-STEPPED migration
 // chain — each step is one transaction that stamps its own target version, so a crash between
 // steps leaves a valid intermediate database that the next open resumes from.
@@ -1298,6 +1308,14 @@ function healRunUnitHeadShape(db: Database): void {
       // Structurally unreachable through AuditDb.open (the preflight + live compat gates reject
       // an unrecognized shape first) — kept as the transaction-internal backstop.
       fail(`run_unit_head is incompatible with this tool build (${cls.reason})`);
+    default:
+      // The heal is void-returning, so TS2366 can never police this switch: a 7th RuhClass era would
+      // fall straight out of it, heal NOTHING, and let the caller's SCHEMA_SQL step see rows in a shape
+      // it never migrated — silently, since every arm above still "handled" its own case. `cls` narrows
+      // to never here ONLY while all six eras are handled, so adding one makes this the build error that
+      // forces the decision (heal it, or state why it needs no heal). NB the exact-v2 arm's fall-through
+      // into exact-v3 is deliberate and unaffected: this arm is reachable only past every named case.
+      assertNever(cls, "run_unit_head class");
   }
 }
 
