@@ -13,9 +13,9 @@ import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchSnapshot, type BranchDiscoveryOutcome } from "./github.ts";
 import { planRepoBranches, planPolicyDiagnostics, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
-import { PolicyMatchError, type CompiledBranchPolicy, type PolicyCoverage } from "./branchPolicy.ts";
+import { PolicyMatchError, type CompiledBranchPolicy, type RepoPolicyCoverage } from "./branchPolicy.ts";
 import { discovered, discoveryFailed, type DiscoveryOutcome } from "./discovery.ts";
-import { computeUnmatchedWarnings, isEmptyAllowlist, policyWarningLines, type PolicyWarning } from "./policyWarnings.ts";
+import { computePolicyWarnings, isEmptyAllowlist, policyWarningLines, type PolicyWarning } from "./policyWarnings.ts";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseArgs, ORCHESTRATE_HELP, ORCHESTRATE_USAGE, type OrchestrateArgs } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -165,15 +165,15 @@ export function runSummaryText(
   ].join("\n");
 }
 
-// Compute AND emit the advisory unmatched-pattern warnings, then return the FULL advisory array for the
+// Compute AND emit the advisory dead-rule warnings, then return the FULL advisory array for the
 // summary. Shared by runScan and runPlan so their warning sets can never drift (run/plan parity is a
-// load-bearing property). The unmatched events are logged here (pure set-difference over the coverage
-// collected during discovery — no glob runs); the empty-allowlist event is emitted separately at mode
+// load-bearing property). These events are logged here (pure set algebra over the coverage collected
+// during discovery — no glob runs); the empty-allowlist event is emitted separately at mode
 // entry, and re-listed first in the returned array for the human summary.
-function emitPolicyWarnings(branchPolicy: CompiledBranchPolicy, coverages: readonly PolicyCoverage[]): PolicyWarning[] {
-  const unmatched = computeUnmatchedWarnings(branchPolicy, coverages);
-  for (const w of unmatched) logLine({ event: "policy-warning", ...w });
-  return [...(isEmptyAllowlist(branchPolicy) ? [{ kind: "empty-allowlist" } as const] : []), ...unmatched];
+function emitPolicyWarnings(branchPolicy: CompiledBranchPolicy, coverages: readonly RepoPolicyCoverage[]): PolicyWarning[] {
+  const dead = computePolicyWarnings(branchPolicy, coverages);
+  for (const w of dead) logLine({ event: "policy-warning", ...w });
+  return [...(isEmptyAllowlist(branchPolicy) ? [{ kind: "empty-allowlist" } as const] : []), ...dead];
 }
 
 // The full scan lifecycle (§0/§1/§3/§5/§8), after preflight opened the db + caching client.
@@ -233,7 +233,7 @@ export async function runScan(
   // THREW at match time — fail-closed) is a GLOBAL config defect — never a per-repo soft error — so
   // it ABORTS the whole run: mark the run failed (excluded from latest selection) and rethrow the
   // ORIGINAL operator-facing error unchanged (it is registered in KNOWN_OPERATOR_ERRORS).
-  const coverages: PolicyCoverage[] = [];
+  const coverages: RepoPolicyCoverage[] = [];
   try {
     for (const owner of owners) {
       coverages.push(...(await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen)));
@@ -304,13 +304,13 @@ export async function resolveOwnersWithDiscovery(
 export async function processOwner(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, personalLogin: string | null, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-): Promise<PolicyCoverage[]> {
+): Promise<RepoPolicyCoverage[]> {
   const isPersonal = runtime.config.includePersonalNamespace && owner === personalLogin;
   const outcome = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
   if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
   // Collect each successfully-discovered repo's coverage (null = its branch discovery failed) so the
   // run-level warning finalizer sees exactly the patterns exercised against real branches.
-  const coverages: PolicyCoverage[] = [];
+  const coverages: RepoPolicyCoverage[] = [];
   for (const repo of outcome.items) {
     const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen);
     if (cov !== null) coverages.push(cov);
@@ -380,7 +380,7 @@ export async function discoverBranchHeads(
 export async function processRepo(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-): Promise<PolicyCoverage | null> {
+): Promise<RepoPolicyCoverage | null> {
   const { config, configHash, branchPolicy } = runtime;
   const outcome = await discoverBranchHeads(db, client, runId, repo);
   if (!outcome.ok) return null; // failed/throttled — this repo isn't "discovered"; contributes no coverage
@@ -792,7 +792,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
 
   let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, branchesExcludedByPolicy = 0, discoveryErrors = 0;
   let excludedByDeny = 0, excludedByAllow = 0, defaultBranchPolicyOverrides = 0; // policy diagnostics (overlays)
-  const coverages: PolicyCoverage[] = []; // per successfully-discovered repo, for the warning finalizer
+  const coverages: RepoPolicyCoverage[] = []; // per successfully-discovered repo, for the warning finalizer
   for (const owner of owners) {
     const isPersonal = config.includePersonalNamespace && owner === personalLogin;
     let repos: RepoInfo[];

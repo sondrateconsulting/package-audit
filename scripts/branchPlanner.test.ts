@@ -113,6 +113,32 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap", () => {
     expect(p.coverage.excludeBranches).toEqual([]); // "[" matched NO head → unmatched-pattern warning upstream
   });
 
+  // The planner is the ONLY place a head's name and its default-ness are both in hand, so it is the
+  // only place the non-default deny coverage can be collected (the default-only-deny warning's input).
+  test("coverage splits deny matches into all-matches vs NON-DEFAULT matches", () => {
+    const policy = compileBranchPolicy(null, ["main", "wip/*"]);
+    const p = planRepoBranches(
+      snap([head("main", "2025-01-01T00:00:00Z"), head("wip/x", "2025-01-02T00:00:00Z")], "main"),
+      policy, "2024-01-01", 25,
+    );
+    // 'main' denied the DEFAULT (always scanned → excluded nothing); 'wip/*' denied a real branch.
+    expect(names(p.toScan)).toEqual(["main"]);
+    expect(names(p.policyExcluded)).toEqual(["wip/x"]);
+    expect([...p.coverage.excludeBranches].sort()).toEqual(["main", "wip/*"]);
+    expect(p.coverage.excludeBranchesMatchedByNonDefault).toEqual(["wip/*"]); // 'main' hit only the default
+  });
+
+  test("a deny pattern matching a NON-default branch of the same name IS non-default coverage", () => {
+    // The predicate is about the branch's role, not its name: here 'main' is not the default.
+    const policy = compileBranchPolicy(null, ["main"]);
+    const p = planRepoBranches(
+      snap([head("master", "2025-01-01T00:00:00Z"), head("main", "2025-01-02T00:00:00Z")], "master"),
+      policy, "2024-01-01", 25,
+    );
+    expect(names(p.policyExcluded)).toEqual(["main"]);
+    expect(p.coverage.excludeBranchesMatchedByNonDefault).toEqual(["main"]);
+  });
+
   test("classifyBranchPlan still exported for the §5.B cutoff/cap unit tests", () => {
     const p = classifyBranchPlan(HEADS, "2024-01-01", 25, "main");
     expect(p.eligible.map((h) => h.name)).toEqual(["main", "feat-a", "feat-b"]);
@@ -205,7 +231,10 @@ describe("planPolicyDiagnostics — plan sub-counts (deny/allow split + default 
   });
 
   // fail-closed: the planner can never produce these, so hand-build the impossible plans directly.
-  const emptyPlan: RepoBranchPlan = { toScan: [], cutoffSkipped: [], pastCap: [], policyExcluded: [], coverage: { branches: [], excludeBranches: [] } };
+  const emptyPlan: RepoBranchPlan = {
+    toScan: [], cutoffSkipped: [], pastCap: [], policyExcluded: [],
+    coverage: { branches: [], excludeBranches: [], excludeBranchesMatchedByNonDefault: [] },
+  };
   const decision = (name: string, isDefaultBranch: boolean, rawPolicyResult: BranchDecision["rawPolicyResult"]): BranchDecision =>
     ({ head: head(name, "2025-06-01T00:00:00Z"), isDefaultBranch, rawPolicyResult });
 

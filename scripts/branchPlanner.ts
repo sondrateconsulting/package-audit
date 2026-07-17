@@ -4,7 +4,7 @@
 // consume a cap slot that an allowed older branch could have used (§5.B). Pure — no I/O, no DB.
 
 import type { BranchHead, BranchSnapshot } from "./github.ts";
-import { classifyBranch, coverageForName, type CompiledBranchPolicy, type PolicyResult, type PolicyCoverage } from "./branchPolicy.ts";
+import { classifyBranch, coverageForName, type CompiledBranchPolicy, type PolicyResult, type RepoPolicyCoverage } from "./branchPolicy.ts";
 import type { PolicyStatus } from "./db.ts";
 
 // §5.B classification, pure: heads arrive sorted committedDate DESC. The repo's DEFAULT branch
@@ -65,9 +65,11 @@ export interface RepoBranchPlan {
   readonly pastCap: readonly BranchDecision[];
   readonly policyExcluded: readonly BranchDecision[];
   // The UNION over this repo's raw heads of every configured pattern that matched ≥1 head (warning-sweep
-  // coverage, per list). Folded into the run-level warning finalizer: a configured pattern absent from EVERY
-  // discovered repo's coverage matched nothing and warrants an "unmatched-pattern" warning.
-  readonly coverage: PolicyCoverage;
+  // coverage, per list), plus the narrower deny set that matched a ≥1 NON-DEFAULT head. Folded into the
+  // run-level warning finalizer: a configured pattern absent from EVERY discovered repo's coverage matched
+  // nothing ("unmatched-pattern"); a deny pattern present in the wide set but in NO repo's non-default set
+  // matched only defaults and therefore excluded nothing ("default-only-deny").
+  readonly coverage: RepoPolicyCoverage;
 }
 
 // Classify every head — policy FIRST, then cutoff/cap over ONLY the policy-eligible set. Also sweeps
@@ -110,6 +112,7 @@ export function planRepoBranches(
   const decisions = new Map<BranchHead, BranchDecision>();
   const matchedInclude = new Set<string>();
   const matchedExclude = new Set<string>();
+  const matchedExcludeNonDefault = new Set<string>();
   for (const head of heads) {
     const c = classifyBranch(policy, head.name, defaultBranch);
     decisions.set(head, { head, isDefaultBranch: c.isDefaultBranch, rawPolicyResult: c.rawPolicyResult });
@@ -118,6 +121,11 @@ export function planRepoBranches(
     const cov = coverageForName(policy, head.name);
     for (const p of cov.branches) matchedInclude.add(p);
     for (const p of cov.excludeBranches) matchedExclude.add(p);
+    // ...and the narrower deny set that matched a NON-DEFAULT head — the only heads a deny can ever
+    // drop. This loop is the one place a head's name and its default-ness are both in hand, so the
+    // fact is captured here or nowhere. Shadowed patterns count here for the same reason as above:
+    // the question is "could this pattern have excluded anything", not "did it win the race".
+    if (!c.isDefaultBranch) for (const p of cov.excludeBranches) matchedExcludeNonDefault.add(p);
   }
   // Stable-filter to the policy-eligible heads (order preserved), then cutoff/cap ONLY those. A
   // non-default excluded head is dropped here — before nonDefaultEligible can increment for it — so
@@ -133,7 +141,12 @@ export function planRepoBranches(
   const decide = (hs: readonly BranchHead[]): BranchDecision[] => hs.map((h) => decisions.get(h)!);
   return {
     toScan: decide(plan.eligible), cutoffSkipped: decide(plan.cutoffSkipped), pastCap: decide(plan.pastCap),
-    policyExcluded, coverage: { branches: [...matchedInclude], excludeBranches: [...matchedExclude] },
+    policyExcluded,
+    coverage: {
+      branches: [...matchedInclude],
+      excludeBranches: [...matchedExclude],
+      excludeBranchesMatchedByNonDefault: [...matchedExcludeNonDefault],
+    },
   };
 }
 

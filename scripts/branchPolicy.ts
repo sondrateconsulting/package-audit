@@ -221,6 +221,9 @@ function coverageList(
 // Coverage for BOTH lists, kept SEPARATE (the same string may legally appear in both). The
 // unmatched-pattern warning sweep unions each list's matches across all discovered names to find
 // configured patterns that matched nothing. An unrestricted (`include === null`) or empty include has no patterns to cover.
+// This is the PER-NAME contract — "which patterns match this branch name", nothing more. It knows
+// nothing about defaults (a name alone cannot answer that), which is why the repo-level aggregate
+// below is its own type rather than another field here.
 export interface PolicyCoverage {
   readonly branches: readonly string[];
   readonly excludeBranches: readonly string[];
@@ -230,4 +233,14 @@ export function coverageForName(policy: CompiledBranchPolicy, name: string): Pol
     branches: policy.include === null ? [] : coverageList(policy.include, "branches", name),
     excludeBranches: coverageList(policy.exclude, "excludeBranches", name),
   };
+}
+
+// The REPO-level aggregate the warning sweep consumes: every pattern that matched ANY head in one
+// successfully-discovered repo, plus the narrower set that matched a NON-DEFAULT head. Only the
+// planner can build the second — it is the only place a head's name and its default-ness are known
+// together (§5.B). The distinction exists because a deny pattern matching ONLY default branches
+// excludes nothing (the default is always scanned), a dead rule that is otherwise indistinguishable,
+// from the operator's side, from a rule that worked.
+export interface RepoPolicyCoverage extends PolicyCoverage {
+  readonly excludeBranchesMatchedByNonDefault: readonly string[];
 }
