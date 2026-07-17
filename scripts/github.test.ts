@@ -913,7 +913,8 @@ describe("throttle wait clamping (§4 hardening)", () => {
     // errors:"garbage" must NOT classify ok: the error signal we were meant to see is unreadable,
     // and an ok:true branch discovery feeds the reconcile PRUNE — a coerced-away failure
     // could turn a partial result into row deletion. Fail closed instead.
-    const { client } = makeClient([ok(http(200, {}, `{"data":{"x":1},"errors":"garbage"}`))]);
+    // exit 1: gh reports a non-empty STRING errors value as a server error
+    const { client } = makeClient([err(http(200, {}, `{"data":{"x":1},"errors":"garbage"}`), "gh: garbage")]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(GithubApiError);
   });
 
@@ -931,7 +932,7 @@ describe("throttle wait clamping (§4 hardening)", () => {
 
   test("a malformed errors field does NOT preempt SSO evidence: 403+x-github-sso stays fatal WITH ssoRequired", async () => {
     const { client } = makeClient([
-      ok(http(403, { "x-ratelimit-remaining": "5", "x-github-sso": "required" }, `{"errors":"garbage"}`)),
+      err(http(403, { "x-ratelimit-remaining": "5", "x-github-sso": "required" }, `{"errors":"garbage"}`), "gh: HTTP 403"), // gh exits 1 on any HTTP error status
     ]);
     let caught: unknown;
     try {
@@ -1571,7 +1572,8 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
   });
   test("errors:[null] on 200 is a clean GithubApiError, not a raw TypeError from classifyGraphql", async () => {
-    const { client } = makeClient([err(http(200, {}, `{"errors":[null]}`), "gh: GraphQL error")]);
+    // exit 0: gh extracts no string message from a null entry, so it reports no error
+    const { client } = makeClient([ok(http(200, {}, `{"errors":[null]}`))]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(GithubApiError);
   });
   test("a junk errors entry does NOT erase readable throttle evidence — RATE_LIMITED beside it still retries", async () => {
@@ -1614,12 +1616,16 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
   test("an errors entry with NOTHING readable must not sanitize into no-errors success", async () => {
     // {"errors":[{locations:[]}]} — object entry, but no type/message. Silent dropping would leave
     // errors=[] and the 200 would classify ok; the flag-and-drop rule is what fails it closed.
-    const { client } = makeClient([err(http(200, {}, `{"data":{"x":1},"errors":[{"locations":[]}]}`), "gh: GraphQL error")]);
+    // exit 0: gh extracts no string message from a message-less entry, so it reports no error
+    const { client } = makeClient([ok(http(200, {}, `{"data":{"x":1},"errors":[{"locations":[]}]}`))]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/no readable/);
   });
   test("a non-string nested error field cannot TypeError during message coercion — clean GithubApiError", async () => {
     // {"message":{"toString":null}} would throw inside classifyGraphql's template-literal join;
     // sanitized projections keep only string-valued fields, so coercion is total.
+    // DELIBERATELY SYNTHETIC shape: gh's own parse fails on a non-string message and aborts
+    // before copying the body, so gh never emits this full-body-plus-nonzero-exit combination.
+    // The fixture pins OUR sanitizer's totality against a hostile/changed transport instead.
     const { client } = makeClient([err(http(200, {}, `{"data":{"x":1},"errors":[{"message":{"toString":null}}]}`), "gh: GraphQL error")]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(GithubApiError);
   });
@@ -1656,7 +1662,7 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
   });
   test("junk errors entries do NOT preempt SSO evidence: 403+x-github-sso stays fatal WITH ssoRequired", async () => {
     const { client } = makeClient([
-      ok(http(403, { "x-ratelimit-remaining": "5", "x-github-sso": "required" }, `{"errors":[null]}`)),
+      err(http(403, { "x-ratelimit-remaining": "5", "x-github-sso": "required" }, `{"errors":[null]}`), "gh: HTTP 403"), // gh exits 1 on any HTTP error status
     ]);
     let caught: unknown;
     try {
