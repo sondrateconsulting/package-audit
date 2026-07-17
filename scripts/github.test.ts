@@ -963,7 +963,7 @@ describe("throttle wait clamping (§4 hardening)", () => {
   });
 
   test("the graphql bucket has its own cumulative pause budget", async () => {
-    const poisoned = ok(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`));
+    const poisoned = err(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`), "gh: GraphQL error");
     const { client, sleeps } = makeClient(Array.from({ length: 12 }, () => poisoned));
     await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
     expect(sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(MAX_TOTAL_PAUSE_MS);
@@ -989,7 +989,7 @@ describe("throttle wait clamping (§4 hardening)", () => {
   });
 
   test("graphql: the final attempt's classification does not arm a residual pause either", async () => {
-    const throttle = ok(http(200, { "x-ratelimit-remaining": "50", "retry-after": "7" }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`));
+    const throttle = err(http(200, { "x-ratelimit-remaining": "50", "retry-after": "7" }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`), "gh: GraphQL error");
     const { client, sleeps } = makeClient([...Array.from({ length: 6 }, () => throttle), ok(http(200, {}, `{"data":{"x":1}}`))]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
     const sleepsBefore = sleeps.length;
@@ -1020,7 +1020,7 @@ describe("throttle wait clamping (§4 hardening)", () => {
     // the exact-equality assertion distinguishes a clamped Retry-After from the
     // exponential-backoff substitute that a nulled wait would produce (60s base).
     const { client, sleeps } = makeClient([
-      ok(http(200, { "x-ratelimit-remaining": "50", "retry-after": "315360000" }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`)),
+      err(http(200, { "x-ratelimit-remaining": "50", "retry-after": "315360000" }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`), "gh: GraphQL error"),
       ok(http(200, {}, `{"data":{"x":1}}`)),
     ]);
     const data = await client.graphql("query{x}", {});
@@ -1553,7 +1553,7 @@ describe("graphql", () => {
     expect(calls.length).toBe(0);
   });
   test("non-throttle graphql errors are fatal", async () => {
-    const { client } = makeClient([ok(http(200, {}, `{"errors":[{"type":"NOT_FOUND","message":"gone"}]}`))]);
+    const { client } = makeClient([err(http(200, {}, `{"errors":[{"type":"NOT_FOUND","message":"gone"}]}`), "gh: GraphQL error")]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/NOT_FOUND/);
   });
 });
@@ -1571,12 +1571,12 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
   });
   test("errors:[null] on 200 is a clean GithubApiError, not a raw TypeError from classifyGraphql", async () => {
-    const { client } = makeClient([ok(http(200, {}, `{"errors":[null]}`))]);
+    const { client } = makeClient([err(http(200, {}, `{"errors":[null]}`), "gh: GraphQL error")]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(GithubApiError);
   });
   test("a junk errors entry does NOT erase readable throttle evidence — RATE_LIMITED beside it still retries", async () => {
     const { client, calls } = makeClient([
-      ok(http(200, { "x-ratelimit-remaining": "10" }, `{"errors":[null,{"type":"RATE_LIMITED","message":"slow down"}]}`)),
+      err(http(200, { "x-ratelimit-remaining": "10" }, `{"errors":[null,{"type":"RATE_LIMITED","message":"slow down"}]}`), "gh: GraphQL error"),
       ok(http(200, {}, `{"data":{"x":1}}`)),
     ]);
     const data = await client.graphql("query{x}", {});
@@ -1602,7 +1602,7 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
   });
   test("data:null WITH valid errors is the LEGAL total-failure shape — classified fatal on the error text", async () => {
-    const { client } = makeClient([ok(http(200, {}, `{"data":null,"errors":[{"type":"NOT_FOUND","message":"gone"}]}`))]);
+    const { client } = makeClient([err(http(200, {}, `{"data":null,"errors":[{"type":"NOT_FOUND","message":"gone"}]}`), "gh: GraphQL error")]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/NOT_FOUND/);
   });
   test("a non-object data member (string/array) is malformed", async () => {
@@ -1614,13 +1614,13 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
   test("an errors entry with NOTHING readable must not sanitize into no-errors success", async () => {
     // {"errors":[{locations:[]}]} — object entry, but no type/message. Silent dropping would leave
     // errors=[] and the 200 would classify ok; the flag-and-drop rule is what fails it closed.
-    const { client } = makeClient([ok(http(200, {}, `{"data":{"x":1},"errors":[{"locations":[]}]}`))]);
+    const { client } = makeClient([err(http(200, {}, `{"data":{"x":1},"errors":[{"locations":[]}]}`), "gh: GraphQL error")]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/no readable/);
   });
   test("a non-string nested error field cannot TypeError during message coercion — clean GithubApiError", async () => {
     // {"message":{"toString":null}} would throw inside classifyGraphql's template-literal join;
     // sanitized projections keep only string-valued fields, so coercion is total.
-    const { client } = makeClient([ok(http(200, {}, `{"data":{"x":1},"errors":[{"message":{"toString":null}}]}`))]);
+    const { client } = makeClient([err(http(200, {}, `{"data":{"x":1},"errors":[{"message":{"toString":null}}]}`), "gh: GraphQL error")]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(GithubApiError);
   });
   test("HTTP 2xx-but-not-200 with a pristine envelope is NOT graphql success", async () => {

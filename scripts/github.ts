@@ -1288,8 +1288,9 @@ export class GithubClient {
       // NORMAL semantic-error shape, not a truncation signal (such a guard would blind-retry
       // real throttles past their reset window and misreport them as truncated). Truncation is
       // still fail-closed without it: the envelope is object-rooted JSON, and no proper prefix
-      // of a valid top-level-object JSON text is itself valid JSON, so a mid-stream cut always
-      // fails JSON.parse → parseGraphqlEnvelope flags it malformed → rejected below.
+      // of a valid top-level-object JSON text is itself valid JSON except one that only sheds
+      // trailing whitespace (which still carries the complete object) — so a mid-stream cut
+      // either loses nothing or fails JSON.parse → flagged malformed → rejected below.
       // Spec-shape validation lives in parseGraphqlEnvelope (pure). A malformed envelope means the
       // failure signal we were meant to read is unreadable — coercing it to "no errors" would be
       // fail-OPEN: an ok:true branch discovery feeds the reconcile PRUNE (reconcileRunUnitHead), so a
