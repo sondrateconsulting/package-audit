@@ -999,12 +999,13 @@ function ruhPkBinaryCollation(db: Database): boolean {
 // Does ANY other table declare a foreign key REFERENCING `target`? A rebuild that DROPs `target` with
 // foreign_keys=ON would implicitly cascade/mutate those external rows, and foreign_key_check on the
 // rebuilt table cannot detect that loss — so an inbound FK makes the rebuild unsafe (reject). The
-// underscore is ESCAPEd ('_' is a LIKE wildcard): an unescaped 'sqlite_%' skipped LEGAL names like
-// `sqliteevil`, whose CASCADE child rows the v3→v4 DROP then silently deleted (verified by probe,
-// 2→0, migration committed clean). Only literal 'sqlite_'-prefixed internals are skipped.
+// internal-name exemption reuses NOT_SQLITE_INTERNAL (escaped '_') rather than an inline copy: an
+// unescaped 'sqlite_%' once skipped LEGAL names like `sqliteevil`, whose CASCADE child rows the
+// v3→v4 DROP then silently deleted (verified by probe, 2→0, migration committed clean) — and a
+// duplicated literal is exactly what let that predicate drift.
 function hasInboundForeignKey(db: Database, target: string): boolean {
   const t = target.toLowerCase();
-  const tables = (db.query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'").all() as Array<{ name: string }>).map(
+  const tables = (db.query(`SELECT name FROM sqlite_schema WHERE type='table' AND ${NOT_SQLITE_INTERNAL}`).all() as Array<{ name: string }>).map(
     (r) => r.name,
   );
   return tables.some((tbl) => tbl.toLowerCase() !== t && foreignKeys(db, tbl).some((fk) => fk.table === t));

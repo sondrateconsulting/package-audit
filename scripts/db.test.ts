@@ -3278,6 +3278,38 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     check.close();
   });
 
+  test("scratch-collision guard: a pre-existing run_unit_head__v4_new aborts migrateV3toV4 before any mutation", () => {
+    // Direct-drive coverage for the in-transaction guard: through AuditDb.open the ownership
+    // preflight refuses the non-audit scratch table first (pinned separately), so this guard is
+    // reachable only for a scratch appearing AFTER the preflight — forge that by driving the
+    // exported migrateV3toV4 on a raw connection. The message pattern discriminates the guard from
+    // the bare CREATE TABLE collision that would fire without it.
+    const path = nextFile();
+    buildV3TwinDb(path); // v3, stamp 3
+    const dbx = new Database(path, { strict: true });
+    dbx.exec("PRAGMA foreign_keys = ON;");
+    dbx.exec("CREATE TABLE run_unit_head__v4_new (x INTEGER)");
+    expect(() => migrateV3toV4(dbx)).toThrow(/scratch table/);
+    expect(uv(dbx)).toBe(3); // unstamped
+    expect(cols(dbx, "run_unit_head")).not.toContain("policy_status"); // still v3 — nothing rebuilt
+    expect((dbx.query("SELECT status FROM runs WHERE run_id='v2-running'").get() as { status: string }).status).toBe("running"); // boundary flip rolled back with the abort
+    dbx.close();
+  });
+
+  test("unexpected-dependents guard: a trigger on run_unit_head makes migrateV3toV4 classify-and-refuse", () => {
+    // Same layering as above: ownership refuses a committed trigger first (triggers are
+    // always-foreign objects), so the classifier's dependents check is driven directly.
+    const path = nextFile();
+    buildV3TwinDb(path); // v3, stamp 3
+    const dbx = new Database(path, { strict: true });
+    dbx.exec("PRAGMA foreign_keys = ON;");
+    dbx.exec("CREATE TRIGGER trg AFTER INSERT ON run_unit_head BEGIN SELECT 1; END");
+    expect(() => migrateV3toV4(dbx)).toThrow(/unexpected trigger/);
+    expect(uv(dbx)).toBe(3);
+    expect(cols(dbx, "run_unit_head")).not.toContain("policy_status");
+    dbx.close();
+  });
+
   // Replace run_unit_head with a FOREIGN shape at stamp 4 (same audit tables otherwise) to probe the
   // fingerprint's fail-closed properties.
   function forgeRuh(path: string, ruhCreate: string): void {
