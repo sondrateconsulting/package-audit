@@ -358,6 +358,19 @@ function readUserVersion(db: Database): number {
   return row.user_version;
 }
 
+// application_id is SQLite's designated FILE-TYPE marker (the header field `file(1)` reads).
+// This tool NEVER writes it, and every database it ever produced therefore reads 0 — so a
+// NONZERO id is affirmative proof another application claimed the file, trumping every
+// structural signal (even a perfect schema clone) and even emptiness (an application can stamp
+// its header before running any DDL). The converse is deliberately NOT relied on: 0 proves
+// nothing, most applications never set it. (Stamping our own id on verified opens — which
+// would let a FUTURE version refuse a 0-id clone — is recorded as possible follow-up
+// hardening; requiring it today would refuse every existing legitimate database.)
+function readApplicationId(db: Database): number {
+  const row = db.query("PRAGMA application_id").get() as { application_id: number };
+  return row.application_id;
+}
+
 // PRAGMA statements cannot bind parameters — interpolate a validated non-negative integer.
 function setUserVersion(db: Database, v: number): void {
   if (!Number.isSafeInteger(v) || v < 0) fail(`invalid schema version ${v}`);
@@ -388,23 +401,12 @@ function hasForeignObjects(db: Database): boolean {
   return rows.some((r) => r.type !== "table" || !AUDIT_TABLE_SET.has(r.name));
 }
 
-// The table SETS this tool can actually leave on disk. Every DDL batch here runs in ONE
-// transaction (create, --fresh drop incl. --purge-cache, each migration step, self-heal), so a
-// crash never leaves a partial set — the only reachable states are the FULL set, the
-// --fresh-preserved caches (a crash between --fresh's drop transaction and the re-create), and
-// zero tables (handled by the empty branch). A foreign database whose ONLY table happens to carry
-// one generic audit name (`errors`, `work_queue`) plus a plausible migration counter presents a
-// set this tool cannot produce — requiring set membership is what refuses it. Derived from the
-// existing constants so a future schema change cannot silently diverge from this check.
-const FRESH_PRESERVED_SET = new Set<string>([...AUDIT_TABLES].filter((t) => !(FRESH_DROP_ORDER as readonly string[]).includes(t)));
-
-// Reference column shapes for the REPAIR path below: what each audit table looks like under a
+// Reference column shapes for the ownership check: what each audit table looks like under a
 // given stamped schema version, read from a throwaway :memory: build of SCHEMA_SQL (never
 // hardcoded — a future migration changes this automatically; the v2 shape is the current one
 // minus the columns the later steps added). table_xinfo, not table_info: it also lists hidden
 // and generated columns, so a foreign table cannot alias an audit shape through columns
-// table_info omits. Built once per version, lazily — the preflight only needs this for
-// damaged-database opens.
+// table_info omits. Built once per version, lazily, and cached for the process.
 const referenceShapesByVersion = new Map<number, Map<string, string>>();
 function tableShapesAt(version: number): Map<string, string> {
   const cached = referenceShapesByVersion.get(version);
@@ -424,8 +426,21 @@ function tableShapesAt(version: number): Map<string, string> {
 // PK position, hidden/generated kind), sorted by name so ALTER-appended columns compare equal to
 // inline-created ones, plus rowid-ness and STRICT-ness from table_list — matching NAMES alone
 // would admit a foreign table whose columns merely share ours' names (all-INTEGER types, no
-// constraints, or a WITHOUT ROWID clone). (PRAGMA cannot bind — `table` is validated against
-// AUDIT_TABLE_SET, same contract as columnExists.)
+// constraints, or a WITHOUT ROWID clone). Constraint semantics table_xinfo cannot see count
+// too, from STRUCTURED pragmas: FOREIGN KEY clauses (foreign_key_list), PK/UNIQUE index
+// structure (index_list origin 'pk'/'u' + index_info — origin 'c' is excluded, so a stray
+// operator CREATE INDEX stays tolerated), and AUTOINCREMENT (the one bit with no pragma,
+// probed as a token in the comment-stripped stored CREATE text) — without these, a foreign
+// table matching every column tuple but missing our FK/UNIQUE/AUTOINCREMENT semantics would
+// compare equal. Index/FK signatures deliberately drop declaration-order artifacts (autoindex
+// numbering, the fk id itself) while KEEPING per-constraint grouping and in-constraint column
+// order, sorted across constraints. Still not FULL DDL equality: CHECK constraint bodies,
+// collations, ON CONFLICT clauses and FK deferrability stay invisible (all live only in SQL
+// text, whose exact matching would be brittle against legitimate ALTER-rewritten histories) —
+// the residual false-positive is a table matching columns AND constraint structure exactly,
+// differing only in those. (PRAGMA cannot bind — `table` is validated against
+// AUDIT_TABLE_SET, same contract as columnExists; index names come from index_list's own
+// output and are double-quoted.)
 function tableShape(db: Database, table: string): string {
   if (!AUDIT_TABLE_SET.has(table)) fail(`tableShape called for unknown table ${table}`);
   const cols = db.query(`PRAGMA table_xinfo(${table})`).all() as Array<{
@@ -434,45 +449,136 @@ function tableShape(db: Database, table: string): string {
   const meta = db
     .query("SELECT wr, strict FROM pragma_table_list WHERE schema = 'main' AND name = ?")
     .get(table) as { wr: number; strict: number } | null;
-  // Each column tuple is JSON-encoded BEFORE joining: JSON strings are self-delimiting, so no
+  // Each tuple is JSON-encoded BEFORE joining: JSON strings are self-delimiting, so no
   // legally-quoted identifier or DEFAULT literal containing the join characters can make two
   // different shapes serialize identically (a plain `:`/`|` join is not injective — one column
   // named `a:TEXT:1::0:0|b` would read as two). JSON also keeps NULL default distinct from ''.
   const colSig = cols
     .map((c) => JSON.stringify([c.name, (c.type ?? "").toUpperCase(), c.notnull, c.dflt_value, c.pk, c.hidden]))
     .sort();
-  return JSON.stringify({ wr: meta?.wr ?? 0, strict: meta?.strict ?? 0, cols: colSig });
+  // Grouped PER CONSTRAINT (foreign_key_list's id), columns in seq order within each: two
+  // independent single-column FKs and one composite FK over the same columns flatten to the
+  // SAME (from, to) pairs — only the grouping tells them apart. The id itself is dropped after
+  // grouping (a declaration-order artifact), and the groups are sorted.
+  const fkRows = db.query(`PRAGMA foreign_key_list(${table})`).all() as Array<{
+    id: number; seq: number; table: string; from: string; to: string | null; on_update: string; on_delete: string; match: string;
+  }>;
+  const fkGroups = new Map<number, typeof fkRows>();
+  for (const r of fkRows) {
+    const group = fkGroups.get(r.id);
+    if (group === undefined) fkGroups.set(r.id, [r]);
+    else group.push(r);
+  }
+  const fkSig = [...fkGroups.values()]
+    .map((rows) => {
+      const ordered = rows.slice().sort((a, b) => a.seq - b.seq);
+      const head = ordered[0]!;
+      return JSON.stringify([head.table, head.on_update, head.on_delete, head.match, ordered.map((r) => [r.from, r.to])]);
+    })
+    .sort();
+  const idxSig = (
+    db.query(`PRAGMA index_list(${table})`).all() as Array<{ name: string; unique: number; origin: string; partial: number }>
+  )
+    .filter((i) => i.origin !== "c")
+    .map((i) => {
+      // index_xinfo, not index_info: it also reports each key column's SORT DIRECTION and
+      // COLLATION (a clone with `PRIMARY KEY(method DESC, …)` or a NOCASE key column is a
+      // different index). key=0 rows are the implementation's trailing rowid/payload columns
+      // — not part of the declared constraint — and are excluded.
+      const idxCols = (
+        db.query(`PRAGMA index_xinfo(${JSON.stringify(i.name)})`).all() as Array<{
+          seqno: number; name: string | null; desc: number; coll: string; key: number;
+        }>
+      )
+        .filter((c) => c.key === 1)
+        .sort((a, b) => a.seqno - b.seqno)
+        .map((c) => [c.name, c.desc, c.coll]);
+      return JSON.stringify([i.origin, i.unique, i.partial, idxCols]);
+    })
+    .sort();
+  const sqlRow = db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as
+    | { sql: string | null }
+    | null;
+  // Comments, string literals AND quoted identifiers are all stripped BEFORE the token test
+  // (the same stripping discipline as read()): `/* AUTOINCREMENT */`, a CHECK body's
+  // 'autoincrement' string, and a CONSTRAINT "AUTOINCREMENT" name are not the keyword — rowid
+  // reuse genuinely differs. SQLite's parser rejects the BARE word as an identifier in DDL, so
+  // a token that survives the stripping can only be the real AUTOINCREMENT clause. Our own DDL
+  // contains no comments and no such literals, so the stripping never misreads OURS.
+  const ddl = (sqlRow?.sql ?? "")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--[^\n]*/g, " ")
+    .replace(/'(?:[^']|'')*'/g, "''")
+    .replace(/"(?:[^"]|"")*"/g, '""')
+    .replace(/`[^`]*`/g, "``")
+    .replace(/\[[^\]]*\]/g, "[]");
+  const autoinc = /\bautoincrement\b/i.test(ddl) ? 1 : 0;
+  return JSON.stringify({ wr: meta?.wr ?? 0, strict: meta?.strict ?? 0, autoinc, cols: colSig, fks: fkSig, idx: idxSig });
 }
 
+// The ownership question for a NON-EMPTY database: is every table present one of OURS, in a
+// shape this tool actually leaves on disk? Set membership alone is NOT proof — the cache
+// tables' names (`api_cache`, `package_api_surface`, exactly what a --fresh crash legitimately
+// leaves behind) are generic enough for another application to have chosen, and a full
+// eight-name clone is only more of the same; matched by NAME alone such a file was ADOPTED,
+// and --fresh --purge-cache then DROPPED its tables. So every present table must carry the
+// EXACT column shape (tableShape: full table_xinfo tuples + rowid/STRICT-ness) of a schema
+// this tool has stamped, and the stamp itself must be one we ever wrote:
+//   • below MIN_OWNED_VERSION was never ours (the transactional-stamp argument above);
+//   • above SCHEMA_VERSION has no reference schema here to verify against — false, so the
+//     writable-open backstop fails closed too (assertOwnedDatabase refuses that file earlier,
+//     with the accurate "newer — upgrade the tool" message);
+//   • a table may match the shape of ANY stamped version <= the stamp, evaluated PER TABLE: an
+//     older shape under a newer stamp is the externally-damaged-but-HEALABLE state the
+//     migration/self-heal chain repairs (the pinned case: a v3-stamped run_unit_head missing
+//     is_default_branch — openReadOnly's remediation for it is "run `bun run audit`", which
+//     must keep working; a damaged file can even mix eras per table). The span is sound only
+//     while every accepted older shape has an idempotent repair on the writable open — the
+//     "historical schema shape self-heals" test executes that claim and trips on a
+//     SCHEMA_VERSION bump by design.
+// Any SUBSET of audit tables passes (a partial restore must stay repairable — openReadOnly
+// documents "run `bun run audit` once to repair it", and every DDL batch here re-creates what
+// is missing); what a subset can never do is carry a non-audit shape. A real database of ours
+// matches by construction: creates, migrations and self-heals all run the same SCHEMA_SQL the
+// references derive from. (Shape is still not FULL DDL equality — CHECK bodies, collations,
+// ON CONFLICT clauses and FK deferrability are invisible, though FKs, PK/UNIQUE structure and
+// AUTOINCREMENT do count — see tableShape. hasForeignObjects separately rejects every
+// non-table object kind and every non-audit table name, so what remains adoptable is exactly:
+// audit-named tables in owned shapes under an owned stamp.)
 function hasOwnedTableSet(db: Database): boolean {
   const present = (
     db.query(`SELECT name FROM sqlite_master WHERE type='table' AND ${NOT_SQLITE_INTERNAL}`).all() as Array<{ name: string }>
   ).map((r) => r.name);
-  const matches = (want: ReadonlySet<string>): boolean =>
-    present.length === want.size && present.every((n) => want.has(n));
-  if (matches(AUDIT_TABLE_SET) || matches(FRESH_PRESERVED_SET)) return true;
-  // REPAIR path: a stamped database missing tables (an externally damaged file — e.g. a partial
-  // restore) must stay openable, because openReadOnly's documented remediation for it is "run
-  // `bun run audit` once to repair it" and the self-heal/migration branches re-create what is
-  // missing. A partial set is provably ours only when every table that IS present carries the
-  // exact column shape of the schema its STAMP names — a foreign `errors(id, note)` under a
-  // plausible migration counter matches no audit shape and stays refused. Covers every version
-  // this tool ever stamped (2..current): refusing a damaged v2 file would make openReadOnly's
-  // "migrate it" advice a dead end that then claims the file is not ours.
+  if (present.length === 0) return false; // zero tables is the empty branch's case, never ours
   const uv = readUserVersion(db);
-  if (uv < MIN_OWNED_VERSION || uv > SCHEMA_VERSION || present.length === 0) return false;
-  const shapes = tableShapesAt(uv);
-  return present.every((t) => AUDIT_TABLE_SET.has(t) && tableShape(db, t) === shapes.get(t));
+  if (uv < MIN_OWNED_VERSION || uv > SCHEMA_VERSION) return false;
+  const eras: Array<Map<string, string>> = [];
+  for (let v = MIN_OWNED_VERSION; v <= uv; v++) eras.push(tableShapesAt(v));
+  return present.every((t) => {
+    if (!AUDIT_TABLE_SET.has(t)) return false;
+    const shape = tableShape(db, t);
+    return eras.some((era) => era.get(t) === shape);
+  });
 }
 
 // The ownedness test the writable open re-runs as its BACKSTOP: empty (a just-created file has
-// no owner to protect — this arm keeps fresh creation alive), or foreign-free with a producible
-// table set. Exported for direct unit tests — the backstop's live trigger is a checkpoint RACE
-// between the preflight and the writable open, impractical to fabricate deterministically in a
-// test fixture (the same rationale as mapReadOnlyOpenError's export).
+// no owner to protect — this arm keeps fresh creation alive), or foreign-free with an
+// owned-shaped table set. The version bounds and the shape proof live INSIDE hasOwnedTableSet,
+// so this stays in lockstep with assertOwnedDatabase by construction — the backstop must never
+// be the weaker gate (a full name-clone at user_version 0 once passed here while the preflight
+// refused it). Exported for direct unit tests — the backstop's live trigger is a checkpoint
+// RACE between the preflight and the writable open, impractical to fabricate deterministically
+// in a test fixture (the same rationale as mapReadOnlyOpenError's export).
 export function isOwnedOrEmpty(db: Database): boolean {
+  // Affirmative foreign provenance first — it trumps both arms (see readApplicationId).
+  if (readApplicationId(db) !== 0) return false;
   const isEmpty = db.query(`SELECT 1 AS x FROM sqlite_master WHERE ${NOT_SQLITE_INTERNAL} LIMIT 1`).get() === null;
-  return isEmpty || (!hasForeignObjects(db) && hasOwnedTableSet(db));
+  // The empty arm carries the same version ceiling as the preflight (which checks the stamp
+  // BEFORE its empty arm): an object-free shell stamped beyond SCHEMA_VERSION belongs to a
+  // future tool, not to "anyone may create here". Live, the writable open's own version gate
+  // fires before this backstop — the ceiling keeps the exported predicate itself honest.
+  if (isEmpty) return readUserVersion(db) <= SCHEMA_VERSION;
+  return !hasForeignObjects(db) && hasOwnedTableSet(db);
 }
 
 // PRAGMA table_info cannot bind either; `table` is always one of AUDIT_TABLES (enforced).
@@ -515,21 +621,38 @@ export function mapReadOnlyOpenError(e: unknown, path: string): unknown {
 // misdirected `sqlitePath` — an ordinary operator typo onto another app's .db — must cost nothing.
 //
 // The predicate, first match wins:
-//   1. No file, or a file with NO objects at all -> ours to create. An empty database cannot
-//      belong to anyone; it is also what our own interrupted create leaves behind.
-//   2. user_version >= MIN_OWNED_VERSION AND no foreign objects -> ours. NEITHER conjunct is
-//      sufficient alone: user_version is not ours exclusively (Room and GRDB use it as a
-//      migration counter), and "an audit-named table exists" is precisely the check this replaces.
-//   3. Anything else -> REFUSE, untouched.
+//   1. No file, or a zero-byte file -> ours to create; it is also what our own interrupted
+//      create leaves behind.
+//   2. application_id != 0 -> REFUSE: another application's file-type stamp is affirmative
+//      foreign provenance, trumping every structural signal and even emptiness (this tool
+//      never writes it; every database it produced reads 0 — see readApplicationId).
+//   3. user_version > SCHEMA_VERSION and nothing foreign-looking -> refuse as "newer than this
+//      tool — upgrade": a future schema's shapes are unverifiable here, and the legitimate case
+//      (a rolled-back tool meeting its own future database) deserves the accurate message.
+//      Checked BEFORE the empty arm — a zero-OBJECT image carrying only a future stamp must not
+//      be adopted-as-empty and header-converted before the writable open's version check fires.
+//   4. A file with NO objects at all -> ours to create. An empty database cannot belong to
+//      anyone (its journal sidecars permitting — see assertNoPendingJournal).
+//   5. No foreign objects AND an owned-shaped table set (hasOwnedTableSet: stamp within
+//      [MIN_OWNED_VERSION, SCHEMA_VERSION], every present table carrying a stamped schema's
+//      exact column shape) -> ours. NO single conjunct is sufficient: user_version is not ours
+//      exclusively (Room and GRDB use it as a migration counter), audit table NAMES are generic
+//      enough to collide, and shapes without the foreign-object check would overlook extra
+//      tables/views/triggers riding along.
+//   6. Anything else -> REFUSE, untouched.
 //
 // Rejected alternatives, each disproved against a database this tool legitimately produces:
 //   • "an audit-named table exists" — ONE generic table (`errors`, `work_queue`) is not proof;
-//     that was the bug, and the migration's run-scoped reset then destroyed that table's rows.
+//     that was the first bug, and the migration's run-scoped reset destroyed that table's rows.
 //   • "a DISTINCTIVE table (`runs`) exists" / "ALL audit tables exist" — a --fresh interrupted
 //     after its drop transaction legitimately leaves ONLY api_cache + package_api_surface.
-//   • "every audit-named table matches a known column spec" — unsound both ways: extra columns on
-//     a foreign table would be silently dropped by a rebuild, and no pre-v2 schema ever shipped,
-//     so there is no archived spec to match a legacy file against.
+//   • name-level SET membership (the full set, or the --fresh-preserved cache pair) — the
+//     second bug: a set match says nothing about WHOSE tables those are, so a foreign file
+//     wearing exactly those generic names was adopted and --fresh --purge-cache DROPPED its
+//     tables. Only the per-table shape proof answers the ownership question.
+//   • shape matching as the SOLE criterion — still rejected: extra objects must refuse the
+//     file outright, and matching shapes under a stamp we never wrote is not a state of ours.
+//     Shapes are one conjunct, not the predicate.
 // A legitimate database we cannot PROVE is ours is refused too: the operator repoints
 // `sqlitePath` at a new file and loses nothing, whereas a wrong adoption destroys a stranger's
 // data. That asymmetry decides every ambiguous case here.
@@ -622,13 +745,33 @@ function assertOwnedDatabase(path: string): void {
     );
   }
   try {
+    // Affirmative foreign provenance first (see readApplicationId): a NONZERO application_id
+    // is another application's file-type stamp — refused before the version and empty arms
+    // can say anything friendlier, and regardless of how perfect the schema looks.
+    if (readApplicationId(db) !== 0)
+      fail(
+        `refusing to write to ${path}: it is a SQLite database this tool did not create — ` +
+          "point `sqlitePath` at a new or existing audit database instead (nothing was modified)",
+      );
+    // Version next, even before the empty check — see predicate step 3. Only OUR OWN stamped
+    // provenance (not written today) could tell a future OURS from a high-stamped name-clone;
+    // both get this refusal, equally untouched, and the message keeps the legitimate case
+    // actionable. Known message asymmetry, deliberately accepted: a future schema that ADDS a
+    // table reads as foreign here ("did not create") while openReadOnly's unconditional
+    // newer-first gate says "upgrade" — any gate admitting unknown table names would equally
+    // mis-message foreign files that stamp high migration counters; both are refusals, and
+    // guidance for files we cannot verify is best-effort by construction.
+    const uv = readUserVersion(db);
+    if (uv > SCHEMA_VERSION && !hasForeignObjects(db))
+      fail(`database schema version ${uv} is newer than this tool's ${SCHEMA_VERSION} — upgrade the tool`);
     // Every object type, so an interrupted create (0 objects) is told apart from a live database.
     const isEmpty = db.query(`SELECT 1 AS x FROM sqlite_master WHERE ${NOT_SQLITE_INTERNAL} LIMIT 1`).get() === null;
     if (isEmpty) {
       assertNoPendingJournal(path);
       return;
     }
-    if (readUserVersion(db) >= MIN_OWNED_VERSION && !hasForeignObjects(db) && hasOwnedTableSet(db)) return;
+    // The version bounds live inside hasOwnedTableSet, shared with the writable backstop.
+    if (!hasForeignObjects(db) && hasOwnedTableSet(db)) return;
     fail(
       `refusing to write to ${path}: it is a SQLite database this tool did not create — ` +
         "point `sqlitePath` at a new or existing audit database instead (nothing was modified)",
@@ -764,7 +907,7 @@ export class AuditDb {
 
     // BACKSTOP only — assertOwnedDatabase already refused every foreign file it could prove, so
     // this is normally unreachable. It re-runs the SAME ownedness test (empty, or foreign-free
-    // with a producible table set) on the WRITABLE connection, which reads THROUGH any recovered
+    // with an owned-shaped table set) on the WRITABLE connection, which reads THROUGH any recovered
     // WAL — closing what the base-image preflight cannot see: a foreign checkpoint landing between
     // the preflight and this open (the preflight's own wal-guard covers the on-disk case, but not
     // that race). Reaching it costs sidecar recovery on their file and a checkpoint on close —
@@ -858,14 +1001,30 @@ export class AuditDb {
       const userVersion = readUserVersion(db);
       if (userVersion > SCHEMA_VERSION)
         fail(`database schema version ${userVersion} is newer than this tool's ${SCHEMA_VERSION} — upgrade the tool`);
+      // Ownership parity with the write path (the preflight/backstop predicate, shared via
+      // isOwnedOrEmpty): a file wearing audit table NAMES over foreign shapes must be refused
+      // as NOT OURS here too — otherwise the advice below would dead-end. It runs AFTER the
+      // newer gate (a future database is "upgrade the tool", never "not ours" — its shapes are
+      // unverifiable here) but BEFORE the older-migrate advice AND the missing-table messages:
+      // a v2-stamped foreign file told to "run `bun run audit` once to migrate it" — like a
+      // v3-stamped name-clone told to "repair" — meets the audit's own refusal, and a full
+      // name-clone would otherwise sail past every up-front check into the report queries and
+      // fail raw mid-render. The empty-but-stamped file keeps its targeted messages
+      // (isOwnedOrEmpty's empty arm), and every healable damage state still reaches its
+      // specific remediation below.
+      if (!isOwnedOrEmpty(db))
+        fail(
+          `database at ${path} is a SQLite database this tool did not create — ` +
+            "point `sqlitePath` at an existing audit database",
+        );
       if (userVersion < SCHEMA_VERSION)
         fail(
           `database schema version ${userVersion} is older than this tool's ${SCHEMA_VERSION} — ` +
             "run `bun run audit` once to migrate it, then retry",
         );
-      // Schema sanity up front: a foreign file, or one missing an audit table or the v3
-      // is_default_branch column, must fail HERE with an actionable message, not later with a
-      // raw "no such table" (or "no such column") mid-query.
+      // Schema sanity up front: a file missing an audit table or the v3 is_default_branch
+      // column must fail HERE with an actionable message, not later with a raw
+      // "no such table" (or "no such column") mid-query.
       for (const t of AUDIT_TABLES) {
         if (!tableExists(db, t))
           fail(`database is missing the ${t} table — run \`bun run audit\` once to repair it, then retry`);

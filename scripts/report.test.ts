@@ -303,11 +303,15 @@ describe("runReport zero-write on a missing database", () => {
     const dbRoot = `./data/.reporttest-v2-${process.pid}-${Math.random().toString(36).slice(2)}`;
     const root = mkdtempSync(join(tmpdir(), "report-v2db-"));
     try {
-      // Minimal v2-stamped file with audit tables: enough for openReadOnly's version gate,
-      // which fires BEFORE any table/column inspection needs to succeed.
+      // Faithful v2 file: a v3 create downgraded to the v2 SHAPE (drop the v3 column) before
+      // the v2 stamp. openReadOnly's ownership check precedes its version gate, so a fixture
+      // must actually BE a v2 database — a v3-shaped file merely wearing the stamp is a state
+      // the tool never produces (migration stamps atomically with the ALTER) and is refused
+      // as not-ours, which is a different test's contract.
       const sqlitePath = join(dbRoot, "audit.db");
       AuditDb.open({ sqlitePath }).close(); // create a real v3 db…
       const bump = new Database(sqlitePath, { strict: true });
+      bump.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch"); // …downgrade to the v2 shape
       bump.exec("PRAGMA user_version = 2"); // …then stamp it old
       bump.close();
       const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };

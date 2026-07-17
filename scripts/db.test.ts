@@ -381,8 +381,9 @@ describe("ownership — a foreign database is refused BEFORE any writable open",
   test("a foreign database whose ONLY table is one generic audit name (no other objects) is refused", () => {
     // The narrowest disguise: a single table named `errors` and a migration counter in our range —
     // no customers table, no view, nothing else for the foreign-object check to catch. What
-    // refuses it is the table-SET requirement: this tool's transactions only ever leave the FULL
-    // audit set, the --fresh-preserved caches, or nothing, and a lone `errors` is none of those.
+    // refuses it is the SHAPE requirement: any subset of audit-named tables can be ours (partial
+    // restores must stay repairable), but only when every present table carries a stamped
+    // schema's exact shape — and this `errors(id, note)` matches none.
     const path = nextFile();
     const d = new Database(path, { create: true, strict: true });
     d.exec("PRAGMA journal_mode = delete;");
@@ -443,6 +444,101 @@ describe("ownership — a foreign database is refused BEFORE any writable open",
     expect(after.journalMode).toBe("delete");
     expect(after.sidecars).toEqual(before.sidecars);
     expect(after.objects).toEqual(before.objects);
+  });
+
+  test("a foreign database wearing BOTH --fresh-preserved cache names over foreign shapes is refused", () => {
+    // The narrowest SET disguise: exactly {api_cache, package_api_surface} — the state a --fresh
+    // crash legitimately leaves behind — under a Room-style migration counter in our range. These
+    // are generic enough names for another application to have chosen. Matched by NAME alone this
+    // was ADOPTED, and --fresh --purge-cache then DROPPED both foreign tables; ownership must
+    // require the stamp's exact column shapes, which someone else's tables cannot carry.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec("CREATE TABLE api_cache (cache_key TEXT PRIMARY KEY, payload BLOB, hits INTEGER NOT NULL DEFAULT 0)");
+    d.exec("INSERT INTO api_cache (cache_key, payload) VALUES ('a', x'01'), ('b', x'02'), ('c', x'03')");
+    d.exec("CREATE TABLE package_api_surface (pkg TEXT NOT NULL, region TEXT)");
+    d.exec("INSERT INTO package_api_surface (pkg, region) VALUES ('x', 'eu'), ('y', 'us')");
+    d.exec("PRAGMA user_version = 2"); // the oldest stamp we ever wrote — maximally plausible
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+    // The destructive caller that made this a data-loss bug, refused identically:
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true, purgeCache: true })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete"); // never WAL-converted
+    expect(after.sidecars).toEqual([]);
+    expect(after.userVersion).toBe(2); // never restamped
+    expect(after.objects).toEqual(before.objects); // nothing grafted, nothing dropped
+    expect(rowCount(path, "api_cache")).toBe(3); // the rows --purge-cache destroyed pre-fix
+    expect(rowCount(path, "package_api_surface")).toBe(2);
+  });
+
+  test("a foreign database cloning ALL EIGHT audit table names over foreign shapes is refused", () => {
+    // The full-set twin of the cache disguise. Matched by NAME alone this was adopted and
+    // WAL-converted; --fresh then either dropped six tables wholesale or leaked a raw
+    // `no such column: status` SQLiteError from its completed-runs count against the foreign
+    // `runs` shape — AFTER the header conversion. Shapes refuse it before any of that.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    for (const t of AUDIT_TABLE_NAMES) {
+      d.exec(`CREATE TABLE ${t} (id INTEGER PRIMARY KEY, note TEXT NOT NULL)`);
+      d.exec(`INSERT INTO ${t} (note) VALUES ('keep-1'), ('keep-2')`);
+    }
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`); // stamped exactly current
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.userVersion).toBe(SCHEMA_VERSION);
+    expect(after.objects).toEqual(before.objects);
+    for (const t of AUDIT_TABLE_NAMES) expect(rowCount(path, t)).toBe(2);
+  });
+
+  test("a database stamped NEWER than this tool is refused by the PREFLIGHT, header untouched", () => {
+    // A rolled-back tool meeting its future database must say "upgrade the tool" — from the
+    // read-only preflight, BEFORE the writable open whose WAL pragma rewrites the header. (The
+    // writable open's own version check stands as the backstop for :memory: and races.) Shapes
+    // of a future schema are unverifiable here, so this arm rests on the absence of foreign
+    // objects alone — the legit case and a hypothetical high-stamped name-clone both get the
+    // version refusal, and neither is touched.
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close(); // a REAL current database…
+    const w = new Database(path, { strict: true });
+    w.exec("PRAGMA journal_mode = delete;"); // …as a plain rollback-mode file, to observe conversion
+    w.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`); // …stamped by a future tool
+    w.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/newer than this tool/);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete"); // the preflight refused; the WAL pragma never ran
+    expect(after.sidecars).toEqual(before.sidecars);
+    expect(after.userVersion).toBe(SCHEMA_VERSION + 1);
+    expect(after.objects).toEqual(before.objects);
+
+    // The zero-OBJECT flavor of the same file (a future tool's interrupted create, or a stamped
+    // shell): nonzero bytes carrying only the stamp. The version check must fire BEFORE the
+    // "no objects -> ours to create" arm, or the writable open converts the header first.
+    const shell = nextFile();
+    const s = new Database(shell, { create: true, strict: true });
+    s.exec("PRAGMA journal_mode = delete;");
+    s.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+    s.close();
+    expect(() => AuditDb.open({ sqlitePath: shell })).toThrow(/newer than this tool/);
+    const shellAfter = fileState(shell);
+    expect(shellAfter.journalMode).toBe("delete");
+    expect(shellAfter.sidecars).toEqual([]);
+    expect(shellAfter.userVersion).toBe(SCHEMA_VERSION + 1);
   });
 
   test("a foreign database whose schema lives ONLY in its uncheckpointed WAL is refused, untouched", () => {
@@ -643,6 +739,24 @@ describe("ownership — every database this tool legitimately produces still ope
     }
   });
 
+  test("a v2-era --fresh interrupted after the drop (caches only, v2 stamp) migrates and reopens", () => {
+    // The same crash window on a version-2 file: only the preserved caches remain, still stamped
+    // 2. The cache tables' shapes are identical in every schema we ever stamped, so the shape
+    // check must adopt this, and the open must then run the migration chain to current.
+    const path = nextFile();
+    buildV2Db(path);
+    dropTables(path, ["run_unit_head", "dependency_findings", "usage_findings", "errors", "work_queue", "runs"]);
+
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      expect((raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+      expect(rowCount(path, "api_cache")).toBe(1); // the preserved cache rows survived adoption
+      db.startRun(runInput()); // and the re-created run-scoped tables work
+    } finally {
+      db.close();
+    }
+  });
+
   test("a completed --fresh leaves a fully re-created database that reopens", () => {
     const path = nextFile();
     AuditDb.open({ sqlitePath: path }).close();
@@ -742,6 +856,103 @@ describe("ownership — every database this tool legitimately produces still ope
     AuditDb.openReadOnly({ sqlitePath: path }).close(); // the documented remediation now completes
   });
 
+  test("a v3-stamped database missing a table AND the v3 column heals on one open (mixed-era shapes)", () => {
+    // Externally damaged twice over: `errors` dropped AND run_unit_head stripped back to its v2
+    // shape, stamp still 3. Each present table matches SOME stamped schema's shape (v2 for
+    // run_unit_head, v3 for the rest) — that mixture is provably ours and fully healable, so the
+    // shape check accepts per-table matches across the stamped span rather than demanding one
+    // uniform era. (Exact-at-stamp matching would refuse this file while openReadOnly still
+    // advised "run `bun run audit`" for each half of the damage — a dead end.)
+    const path = nextFile();
+    const first = AuditDb.open({ sqlitePath: path });
+    const { runId } = first.startRun(runInput());
+    // A REAL head row must ride through the heal — an empty run_unit_head would let a faulty
+    // drop-and-recreate "repair" pass every structural assertion while deleting report data.
+    first.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
+    first.close();
+    const w = new Database(path, { strict: true });
+    w.exec("DROP TABLE errors");
+    w.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch");
+    w.close();
+
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      expect(rowCount(path, "runs")).toBe(1); // adopted and healed, not refused or reset
+      expect(raw(db).query("SELECT run_id FROM errors").all()).toEqual([]); // re-created
+      // The head row survived the heal; the restored column reads NULL (the external damage
+      // destroyed the stored value — "unknown" is the only honest backfill).
+      expect(raw(db).query("SELECT organization, repository, branch, commit_sha, status, is_default_branch FROM run_unit_head").all())
+        .toEqual([{ organization: "o", repository: "r", branch: "main", commit_sha: "s", status: "scanned", is_default_branch: null }]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("every historical schema shape under the CURRENT stamp self-heals to the current shape", () => {
+    // The ownership check accepts a table carrying ANY stamped-era shape <= the stamp (the
+    // externally-damaged-but-healable states). That span is sound ONLY while every accepted
+    // older shape has an explicit, idempotent repair on the writable open — this test EXECUTES
+    // that claim for each pre-current version. Bumping SCHEMA_VERSION without extending
+    // DOWN_TRANSFORMS (and the self-heal that makes the new span entry true) fails here loudly,
+    // by design.
+    const DOWN_TRANSFORMS: Record<number, readonly string[]> = {
+      2: ["ALTER TABLE run_unit_head DROP COLUMN is_default_branch"],
+    };
+    for (let v = 2; v < SCHEMA_VERSION; v++) expect(DOWN_TRANSFORMS[v]?.length ?? 0).toBeGreaterThan(0);
+
+    // Reference: the shapes a fresh current-version database carries. Restated with the FULL
+    // production fingerprint surface (columns + rowid/STRICT + FKs + PK/UNIQUE indexes +
+    // AUTOINCREMENT) — a heal that restored columns but lost a constraint would otherwise
+    // pass here and strand the database as matching no era on its NEXT open.
+    const shapeOf = (d: Database, t: string): string =>
+      JSON.stringify({
+        cols: d.query(`PRAGMA table_xinfo(${t})`).all(),
+        meta: d.query("SELECT wr, strict FROM pragma_table_list WHERE schema='main' AND name = ?").get(t),
+        fks: d.query(`PRAGMA foreign_key_list(${t})`).all(),
+        idx: (d.query(`PRAGMA index_list(${t})`).all() as Array<{ name: string; origin: string }>)
+          .filter((i) => i.origin !== "c")
+          .map((i) => ({ i, cols: d.query(`PRAGMA index_xinfo(${JSON.stringify(i.name)})`).all() })),
+        autoinc: /\bautoincrement\b/i.test(
+          ((d.query("SELECT sql FROM sqlite_master WHERE type='table' AND name = ?").get(t) as { sql: string | null } | null)?.sql ?? "")
+            .replace(/\/\*[\s\S]*?\*\//g, " ")
+            .replace(/'(?:[^']|'')*'/g, "''")
+            .replace(/"(?:[^"]|"")*"/g, '""'),
+        ),
+      });
+    const refPath = nextFile();
+    AuditDb.open({ sqlitePath: refPath }).close();
+    const refDb = new Database(refPath, { readonly: true, strict: true });
+    const refShapes = new Map(AUDIT_TABLE_NAMES.map((t) => [t, shapeOf(refDb, t)]));
+    refDb.close();
+
+    for (let v = 2; v < SCHEMA_VERSION; v++) {
+      const path = nextFile();
+      const seed = AuditDb.open({ sqlitePath: path }); // current schema…
+      const { runId } = seed.startRun(runInput()); // …carrying REAL rows the heal must not lose
+      seed.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
+      seed.close();
+      const w = new Database(path, { strict: true });
+      for (const sql of DOWN_TRANSFORMS[v]!) w.exec(sql); // …downgraded to era-v shapes…
+      w.close(); // …still under the CURRENT stamp
+      // Teeth against a vacuous entry: the transform must actually produce a NON-current shape,
+      // or this loop would assert nothing about healing that era.
+      const downgraded = new Database(path, { readonly: true, strict: true });
+      const changed = AUDIT_TABLE_NAMES.filter((t) => shapeOf(downgraded, t) !== refShapes.get(t));
+      downgraded.close();
+      expect(changed.length).toBeGreaterThan(0);
+
+      AuditDb.open({ sqlitePath: path }).close(); // must adopt AND heal
+      const healed = new Database(path, { readonly: true, strict: true });
+      for (const t of AUDIT_TABLE_NAMES) expect(shapeOf(healed, t)).toBe(refShapes.get(t)!);
+      // Rows rode through: the run survived, the head row kept its fields, and the column the
+      // era-v transform destroyed reads NULL (a drop-and-recreate "heal" would fail here).
+      expect((healed.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n).toBe(1);
+      expect(healed.query("SELECT branch, commit_sha, is_default_branch FROM run_unit_head").all())
+        .toEqual([{ branch: "main", commit_sha: "s", is_default_branch: null }]);
+      healed.close();
+    }
+  });
+
   test("a foreign table matching an audit table's column NAMES but not its types is refused", () => {
     // The repair path must prove same-TABLE, not same-names: identical column names with
     // all-INTEGER types, no NOT NULLs and no PK is someone else's table wearing our labels.
@@ -786,6 +997,255 @@ describe("ownership — every database this tool legitimately produces still ope
     expect(after.sidecars).toEqual([]);
     expect(after.objects).toEqual(before.objects);
     expect(rowCount(path, "api_cache")).toBe(1);
+  });
+
+  // Constraint semantics count toward the shape: table_xinfo alone cannot see FOREIGN KEY
+  // clauses, PK/UNIQUE index structure, or AUTOINCREMENT — a foreign table can match every
+  // column tuple while missing all three. Each fixture below diverges in exactly ONE of them,
+  // so each kills its own fingerprint component.
+  test("an errors clone with exact columns but NO foreign key is refused", () => {
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec(`CREATE TABLE errors (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      organization TEXT, repository TEXT, branch TEXT,
+      package_name TEXT, version TEXT,
+      message TEXT NOT NULL,
+      occurred_at TEXT NOT NULL
+    )`);
+    d.exec(`INSERT INTO errors (run_id, scope, message, occurred_at) VALUES ('r','s','m','t'), ('r2','s','m','t')`);
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "errors")).toBe(2);
+  });
+
+  test("an errors clone with exact columns but NO AUTOINCREMENT is refused", () => {
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    // REFERENCES to a table absent from this file is legal SQLite (resolved lazily at DML
+    // under PRAGMA foreign_keys, which is OFF here) — foreign_key_list still reports it.
+    d.exec(`CREATE TABLE errors (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      scope TEXT NOT NULL,
+      organization TEXT, repository TEXT, branch TEXT,
+      package_name TEXT, version TEXT,
+      message TEXT NOT NULL,
+      occurred_at TEXT NOT NULL
+    )`);
+    d.exec(`INSERT INTO errors (run_id, scope, message, occurred_at) VALUES ('r','s','m','t'), ('r2','s','m','t')`);
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "errors")).toBe(2);
+  });
+
+  test("a work_queue clone with exact columns but NO UNIQUE constraint is refused", () => {
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec(`CREATE TABLE work_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      config_hash TEXT NOT NULL,
+      created_run_id TEXT NOT NULL REFERENCES runs(run_id),
+      last_run_id TEXT NOT NULL REFERENCES runs(run_id),
+      scope TEXT NOT NULL CHECK (scope IN ('org','repo','branch')),
+      organization TEXT NOT NULL,
+      repository TEXT NOT NULL DEFAULT '',
+      branch TEXT NOT NULL DEFAULT '',
+      last_commit_sha TEXT NOT NULL DEFAULT '',
+      last_commit_date TEXT,
+      status TEXT NOT NULL CHECK (status IN ('pending','in_progress','done','skipped','error')),
+      error_message TEXT, updated_at TEXT NOT NULL
+    )`);
+    d.exec(`INSERT INTO work_queue (config_hash, created_run_id, last_run_id, scope, organization, status, updated_at)
+      VALUES ('h','r','r','org','o','pending','t'), ('h2','r','r','org','o','pending','t')`);
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "work_queue")).toBe(2);
+  });
+
+  test("a work_queue clone whose two FKs are fused into one COMPOSITE foreign key is refused", () => {
+    // Constraint GROUPING counts, not just the flattened column pairs: our work_queue declares
+    // two independent single-column FKs to runs(run_id); a composite
+    // FOREIGN KEY(created_run_id, last_run_id) REFERENCES runs(run_id, run_id) yields the same
+    // (from, to) pairs — only the grouping (foreign_key_list's id/seq) tells them apart, so the
+    // signature must keep per-constraint structure while staying declaration-order-insensitive.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec(`CREATE TABLE work_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      config_hash TEXT NOT NULL,
+      created_run_id TEXT NOT NULL,
+      last_run_id TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      organization TEXT NOT NULL,
+      repository TEXT NOT NULL DEFAULT '',
+      branch TEXT NOT NULL DEFAULT '',
+      last_commit_sha TEXT NOT NULL DEFAULT '',
+      last_commit_date TEXT,
+      status TEXT NOT NULL,
+      error_message TEXT, updated_at TEXT NOT NULL,
+      UNIQUE(config_hash, scope, organization, repository, branch),
+      FOREIGN KEY(created_run_id, last_run_id) REFERENCES runs(run_id, run_id)
+    )`);
+    d.exec(`INSERT INTO work_queue (config_hash, created_run_id, last_run_id, scope, organization, status, updated_at)
+      VALUES ('h','r','r','org','o','pending','t'), ('h2','r','r','org','o','pending','t')`);
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "work_queue")).toBe(2);
+  });
+
+  test("an AUTOINCREMENT spoofed as a COMMENT in the stored CREATE text is refused", () => {
+    // The AUTOINCREMENT bit has no pragma, so it is probed as a token in the stored CREATE
+    // text — which must not read `/* AUTOINCREMENT */` (a comment, no semantics: the rowid
+    // reuse behavior genuinely differs) as the keyword. Comments are stripped before probing;
+    // the remaining text-level vectors (the word inside a string DEFAULT or an identifier)
+    // necessarily change a column tuple and fail the column signature instead.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec(`CREATE TABLE errors (
+      id INTEGER PRIMARY KEY /* AUTOINCREMENT */,
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      scope TEXT NOT NULL,
+      organization TEXT, repository TEXT, branch TEXT,
+      package_name TEXT, version TEXT,
+      message TEXT NOT NULL,
+      occurred_at TEXT NOT NULL
+    )`);
+    d.exec(`INSERT INTO errors (run_id, scope, message, occurred_at) VALUES ('r','s','m','t'), ('r2','s','m','t')`);
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "errors")).toBe(2);
+  });
+
+  test("an AUTOINCREMENT lookalike inside a CHECK string or a quoted constraint name is refused", () => {
+    // The sibling vectors of the comment spoof: the token can also live in a string literal
+    // inside a CHECK body, or as a QUOTED constraint name — none of which any structured
+    // pragma reports. The probe must strip literals and quoted identifiers too (mirroring
+    // read()'s stripping); SQLite's parser rejects the BARE keyword as an identifier, so a
+    // token that survives the stripping can only be the real AUTOINCREMENT clause.
+    const buildClone = (path: string, extraClause: string): void => {
+      const d = new Database(path, { create: true, strict: true });
+      d.exec("PRAGMA journal_mode = delete;");
+      d.exec(`CREATE TABLE errors (
+        id INTEGER PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        scope TEXT NOT NULL,
+        organization TEXT, repository TEXT, branch TEXT,
+        package_name TEXT, version TEXT,
+        message TEXT NOT NULL,
+        occurred_at TEXT NOT NULL${extraClause}
+      )`);
+      d.exec(`INSERT INTO errors (run_id, scope, message, occurred_at) VALUES ('r','s','m','t'), ('r2','s','m','t')`);
+      d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      d.close();
+    };
+    for (const clause of [",\n CHECK ('autoincrement' <> version)", ',\n CONSTRAINT "AUTOINCREMENT" CHECK (1)'] as const) {
+      const path = nextFile();
+      buildClone(path, clause);
+      const before = fileState(path);
+
+      expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+      const after = fileState(path);
+      expect(after.journalMode).toBe("delete");
+      expect(after.sidecars).toEqual([]);
+      expect(after.objects).toEqual(before.objects);
+      expect(rowCount(path, "errors")).toBe(2);
+    }
+  });
+
+  test("an api_cache clone whose PRIMARY KEY sorts a column DESC is refused", () => {
+    // index_info reports the key columns but not their SORT DIRECTION — a clone identical in
+    // every other respect can invert an index order. index_xinfo's desc (and coll) close it.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA journal_mode = delete;");
+    d.exec(`CREATE TABLE api_cache (
+      method TEXT NOT NULL, url TEXT NOT NULL, variant_hash TEXT NOT NULL,
+      etag TEXT, response_body TEXT, cached_at TEXT NOT NULL,
+      PRIMARY KEY (method DESC, url, variant_hash))`);
+    d.exec(`INSERT INTO api_cache VALUES ('GET', 'https://x', '', NULL, '{}', '2026-01-01T00:00:00.000Z')`);
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual([]);
+    expect(after.objects).toEqual(before.objects);
+    expect(rowCount(path, "api_cache")).toBe(1);
+  });
+
+  test("a nonzero application_id is affirmative foreign provenance — refused even with PERFECT shapes", () => {
+    // application_id is SQLite's designated file-type marker: another application stamps it
+    // nonzero; this tool never writes it, and every database it ever produced reads 0. A
+    // nonzero id therefore proves the file is someone else's, even when the schema is a
+    // byte-perfect structural clone (built here by the tool itself, then re-marked).
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close();
+    const w = new Database(path, { strict: true });
+    w.exec("PRAGMA journal_mode = delete;");
+    w.exec("PRAGMA application_id = 252006674"); // 0x0F055112 — Fossil's registered id
+    w.close();
+    const before = fileState(path);
+
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true, purgeCache: true })).toThrow(DbError);
+
+    const after = fileState(path);
+    expect(after.journalMode).toBe("delete");
+    expect(after.sidecars).toEqual(before.sidecars);
+    expect(after.userVersion).toBe(SCHEMA_VERSION);
+    expect(after.objects).toEqual(before.objects);
   });
 
   test("a delimiter-collision column name cannot forge an audit table's shape signature", () => {
@@ -902,6 +1362,66 @@ describe("isOwnedOrEmpty — the writable-open backstop's guard", () => {
     d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     expect(isOwnedOrEmpty(d)).toBe(false);
     d.close();
+  });
+
+  test("a full audit set restamped user_version=0 fails (a dump/restore that lost its pragmas was never ours)", () => {
+    // The backstop must enforce the same version floor as the preflight: our stamps are
+    // transactional, so real audit tables under uv 0 mean the header pragmas were lost — the
+    // preflight refuses that file (dump/restore test above), and the backstop must not be the
+    // weaker gate that a checkpoint race could slip it through.
+    const db = mem();
+    raw(db).exec("PRAGMA user_version = 0");
+    expect(isOwnedOrEmpty(raw(db))).toBe(false);
+    db.close();
+  });
+
+  test("a full audit set stamped PAST this tool's version fails (no reference shape can verify it)", () => {
+    const db = mem();
+    raw(db).exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+    expect(isOwnedOrEmpty(raw(db))).toBe(false);
+    db.close();
+  });
+
+  test("an object-free database stamped PAST this tool's version fails even the EMPTY arm", () => {
+    // Lockstep with the preflight, which checks the version before its empty arm: a future
+    // tool's stamped-but-empty shell is "upgrade the tool" territory, never "ours to create".
+    // (Live, the writable open's own version gate fires before the backstop — this pins the
+    // exported predicate itself.)
+    const d = new Database(":memory:", { strict: true });
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+    expect(isOwnedOrEmpty(d)).toBe(false);
+    d.close();
+  });
+
+  test("a nonzero application_id fails both arms (foreign provenance beats shapes AND emptiness)", () => {
+    // The full-shape arm: a perfect structural clone marked by another application is theirs.
+    const marked = mem();
+    raw(marked).exec("PRAGMA application_id = 252006674");
+    expect(isOwnedOrEmpty(raw(marked))).toBe(false);
+    marked.close();
+    // The EMPTY arm: an object-free file with a nonzero id is another application's freshly
+    // initialized database (header written before any DDL), never "ours to create".
+    const shell = new Database(":memory:", { strict: true });
+    shell.exec("PRAGMA application_id = 252006674");
+    expect(isOwnedOrEmpty(shell)).toBe(false);
+    shell.close();
+  });
+
+  test("the --fresh-preserved caches pass with REAL shapes and fail with foreign shapes under the same names", () => {
+    // Both halves of the fresh-preserved question, at the backstop: our own --fresh-crash
+    // leftover must stay adoptable, a stranger's file wearing the same two names must not.
+    const ours = mem();
+    for (const t of ["run_unit_head", "dependency_findings", "usage_findings", "errors", "work_queue", "runs"])
+      raw(ours).exec(`DROP TABLE ${t}`);
+    expect(isOwnedOrEmpty(raw(ours))).toBe(true);
+    ours.close();
+
+    const forged = new Database(":memory:", { strict: true });
+    forged.exec("CREATE TABLE api_cache (cache_key TEXT PRIMARY KEY, payload BLOB)");
+    forged.exec("CREATE TABLE package_api_surface (pkg TEXT NOT NULL, region TEXT)");
+    forged.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    expect(isOwnedOrEmpty(forged)).toBe(false);
+    forged.close();
   });
 });
 
@@ -1907,6 +2427,49 @@ describe("openReadOnly (CV5 read seam)", () => {
     expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/missing the runs table/);
   });
 
+  test("an object-free v2-stamped file keeps the migrate-first message (ownership's empty arm admits it)", () => {
+    // A v2-era --fresh --purge-cache crash shell: zero objects, still stamped 2. Ownership
+    // (which precedes the older-version gate) must not misread it as foreign — the migrate
+    // advice is truthful here, because the writable open adopts and rebuilds an empty file.
+    const path = nextFile();
+    const shell = new Database(path, { create: true, strict: true });
+    shell.exec("PRAGMA user_version = 2");
+    shell.close();
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/once to migrate/);
+  });
+
+  test("a foreign file wearing audit table names over foreign shapes is refused as NOT OURS — never advised to run audit", () => {
+    // Read-path parity with the ownership preflight. Pre-fix the caches-only clone got
+    // "missing the runs table — run `bun run audit` once to repair it": dead-end advice, since
+    // the audit's own preflight refuses the file. The full clone was worse — it passed every
+    // up-front check and would only fail raw (or render garbage) mid-report.
+    const cachesOnly = nextFile();
+    let d = new Database(cachesOnly, { create: true, strict: true });
+    d.exec("CREATE TABLE api_cache (cache_key TEXT PRIMARY KEY, payload BLOB)");
+    d.exec("CREATE TABLE package_api_surface (pkg TEXT NOT NULL, region TEXT)");
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    expect(() => AuditDb.openReadOnly({ sqlitePath: cachesOnly })).toThrow(/did not create/);
+
+    const fullClone = nextFile();
+    d = new Database(fullClone, { create: true, strict: true });
+    for (const t of AUDIT_TABLE_NAMES) d.exec(`CREATE TABLE ${t} (id INTEGER PRIMARY KEY, note TEXT NOT NULL)`);
+    d.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    d.close();
+    expect(() => AuditDb.openReadOnly({ sqlitePath: fullClone })).toThrow(/did not create/);
+
+    // An OLDER-stamped foreign file must get the same ownership refusal, NOT the migrate-first
+    // advice — "run `bun run audit` once to migrate it" is a dead end when the audit's own
+    // preflight refuses the file. (Ownership therefore precedes the older-version gate; the
+    // NEWER gate stays first — a future database is "upgrade the tool", never "not ours".)
+    const v2Clone = nextFile();
+    d = new Database(v2Clone, { create: true, strict: true });
+    d.exec("CREATE TABLE api_cache (cache_key TEXT PRIMARY KEY, payload BLOB)");
+    d.exec("PRAGMA user_version = 2");
+    d.close();
+    expect(() => AuditDb.openReadOnly({ sqlitePath: v2Clone })).toThrow(/did not create/);
+  });
+
   test(":memory: is refused (nothing to read), and containment applies to reads too", () => {
     expect(() => AuditDb.openReadOnly({ sqlitePath: ":memory:" })).toThrow(DbError);
     expect(() => AuditDb.openReadOnly({ sqlitePath: "/tmp/escape.db" })).toThrow(ReadOnlyViolation);
@@ -1984,6 +2547,7 @@ describe("open — current-version self-heal repairs a missing v3 column", () =>
     const path = nextFile();
     const db1 = AuditDb.open({ sqlitePath: path });
     const { runId } = db1.startRun(runInput());
+    db1.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
     db1.completeRun(runId);
     db1.close();
     // Forge the dead-end state: v3 stamp, v2-shaped run_unit_head (no is_default_branch).
@@ -1993,9 +2557,13 @@ describe("open — current-version self-heal repairs a missing v3 column", () =>
     forge.close();
     expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/is_default_branch/);
 
-    // openReadOnly's remediation is "run bun run audit" — the writer open MUST actually fix it.
+    // openReadOnly's remediation is "run bun run audit" — the writer open MUST actually fix it,
+    // by ALTER (rows ride through; the damaged-away value honestly reads NULL), never by a
+    // drop-and-recreate that would pass a column check while deleting the head rows.
     const db2 = AuditDb.open({ sqlitePath: path });
     expect(db2.getRun(runId)?.status).toBe("completed"); // data preserved
+    expect(raw(db2).query("SELECT branch, commit_sha, is_default_branch FROM run_unit_head").all())
+      .toEqual([{ branch: "main", commit_sha: "s", is_default_branch: null }]);
     db2.close();
     const reader = AuditDb.openReadOnly({ sqlitePath: path }); // and reads work again
     expect(reader.getRun(runId)?.status).toBe("completed");
