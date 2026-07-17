@@ -425,24 +425,27 @@ CREATE TABLE IF NOT EXISTS run_unit_head (
   organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
   commit_sha TEXT NOT NULL DEFAULT '',  -- '' for every NON-scanned disposition (never scanned)
   status TEXT NOT NULL DEFAULT 'scanned'
-    CHECK (status IN ('scanned','skipped-cutoff','past-cap')),  -- per-run, immutable: lets the
-                                       -- report count each disposition for THIS run alone
-                                       -- (work_queue is mutable and cross-run). 'past-cap' (v4):
-                                       -- eligible but past maxBranchesPerRepo — recorded for
-                                       -- report VISIBILITY only; its work_queue row is untouched,
-                                       -- so a later cap-order shift promotes it without a rescan.
-                                       -- NOTE 'skipped-cutoff' covers TWO dispositions,
-                                       -- disambiguated by policy_status (below) — never count the
-                                       -- whole status as cutoff skips.
+    CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap')),  -- per-run,
+                                       -- immutable: lets the report count each disposition for THIS
+                                       -- run alone (work_queue is mutable and cross-run).
+                                       -- 'past-cap' (v4): eligible but past maxBranchesPerRepo —
+                                       -- recorded for report VISIBILITY only; its work_queue row is
+                                       -- untouched, so a later cap-order shift promotes it without a
+                                       -- rescan. 'policy-excluded' (v4): dropped by branch allow/deny.
+                                       -- The four are DISJOINT — status alone identifies the
+                                       -- disposition; no read surface needs a second column to tell
+                                       -- a policy exclusion from a genuine cutoff skip. It is named
+                                       -- to match the live JSONL 'skip-policy' unit action.
   is_default_branch INTEGER,           -- tri-state 1/0/NULL (v3): whether this branch was the
                                        -- repo's default branch at discovery time (§5.B).
                                        -- NULL = unknown (pre-v3 rows); the report renders NULL
                                        -- as its own state — never coerce it to 0
   policy_status TEXT                   -- v4, branch allow/deny: NULL = policy said nothing.
     CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
-                                       -- LOAD-BEARING: NOT NULL does NOT mean "excluded". On a
-                                       -- 'skipped-cutoff' row it means policy DROPPED the branch;
-                                       -- on a 'scanned' row it is the COUNTERFACTUAL carried by a
+                                       -- LOAD-BEARING: NOT NULL does NOT mean "excluded". It names
+                                       -- WHICH rule decided, and is REQUIRED on a 'policy-excluded'
+                                       -- row and FORBIDDEN on 'skipped-cutoff'/'past-cap' (both
+                                       -- enforced by CHECK); on a 'scanned' row it is the COUNTERFACTUAL carried by a
                                        -- default branch policy would have dropped but which is
                                        -- scanned anyway (the default is always scanned). Read surfaces MUST decide via
                                        -- BOTH status and policy_status (scripts/policyDisposition.ts
@@ -764,9 +767,9 @@ B. Discover & prioritize branches: via `gh api graphql` querying
    branch the operator explicitly asked for could be silently dropped by a branch they
    explicitly excluded. `excludeBranches` (deny) is evaluated before `branches` (allow) — deny
    wins — and a policy-dropped NON-default head is recorded for THIS run as a
-   `status='skipped-cutoff'` row carrying a non-null `policy_status` (its own disposition,
-   disambiguated from a genuine cutoff skip by that column; commit_sha=''), and enqueued
-   `skipped` like a cutoff skip. Policy exclusion NEVER applies to the default branch (below).
+   `status='policy-excluded'` row carrying the deciding `policy_status` (its own disposition,
+   distinct from a genuine cutoff skip; commit_sha=''), and enqueued
+   `skipped` like a cutoff skip (that queue models "no scan needed", not why). Policy exclusion NEVER applies to the default branch (below).
    A malformed glob that throws at match time is FATAL, never "no match" — a denied branch must
    never be silently scanned.
    THEN, over the policy-eligible set only: filter out branches whose
@@ -1359,10 +1362,9 @@ summary.
 Summary derivation — ALL per-run from the IMMUTABLE `run_unit_head` slice for the reported
 run (NEVER from the mutable work_queue, which is cross-run): `branchesScanned` =
 COUNT(*) WHERE run_id=R AND status='scanned'; `branchesSkippedByCutoff` = COUNT WHERE
-run_id=R AND status='skipped-cutoff' **AND policy_status IS NULL** — GENUINE cutoff only:
-the policy-excluded disposition REUSES the 'skipped-cutoff' status, so counting the whole
-status would silently fold policy exclusions into cutoff skips; `branchesExcludedByPolicy`
-= COUNT WHERE status='skipped-cutoff' AND policy_status IS NOT NULL; `branchesPastCap` =
+run_id=R AND status='skipped-cutoff' — GENUINE cutoff only, because a policy exclusion carries
+its OWN status and can never be folded in by an under-specified filter;
+`branchesExcludedByPolicy` = COUNT WHERE status='policy-excluded'; `branchesPastCap` =
 COUNT WHERE status='past-cap'. Those four counts partition the RECORDED rows exactly once
 each. `branchesErrored` counts DISTINCT branches carrying a scope='scan' errors[] entry that
 hold NO row (a scan that fails BEFORE the scanned-row upsert writes no disposition row; within

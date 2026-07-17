@@ -50,12 +50,12 @@ export function generateFixtureExports(outputDir: string): { runId: string } {
     // These give the run_unit_head export + its recipe real branch-policy rows to read in CI.
     db.upsertRunUnitHead({
       runId, organization: "acme", repository: "web", branch: "wip/experiment", commitSha: "",
-      status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny",
+      status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny",
       policyMatchedPattern: "wip/*", scannedCommitDate: "2025-06-01T12:00:00Z",
     });
     db.upsertRunUnitHead({
       runId, organization: "acme", repository: "mobile", branch: "sandbox", commitSha: "",
-      status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-allow",
+      status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-allow",
       policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z",
     });
     db.upsertRunUnitHead({

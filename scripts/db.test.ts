@@ -2762,7 +2762,7 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
   test("G8: past-cap and policy-excluded rows must be a definite non-default (never null)", () => {
     const db = fresh();
     expect(() => seed(db, { status: "past-cap", commitSha: "", isDefaultBranch: null })).toThrow(/must have is_default_branch=false/);
-    expect(() => seed(db, { status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-allow", isDefaultBranch: null })).toThrow(/must have is_default_branch=false/);
+    expect(() => seed(db, { status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-allow", isDefaultBranch: null })).toThrow(/must have is_default_branch=false/);
     // a PLAIN cutoff-skip (no policy) may still be null — the pre-v3/unknown case — and is accepted.
     seed(db, { status: "skipped-cutoff", commitSha: "", isDefaultBranch: null });
     expect(rowOf(db).d).toBeNull();
@@ -2788,8 +2788,8 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     seed(db, { branch: "n1", isDefaultBranch: false, commitSha: "s" }); //                                     non-default scanned, no-exclusion
     seed(db, { branch: "n2", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "" }); //            non-default cutoff-skipped
     seed(db, { branch: "n3", isDefaultBranch: false, status: "past-cap", commitSha: "" }); //                  non-default past-cap
-    seed(db, { branch: "n4", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "feat/*" }); // excluded by deny
-    seed(db, { branch: "n5", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-allow" }); //                               excluded by allow
+    seed(db, { branch: "n4", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "feat/*" }); // excluded by deny
+    seed(db, { branch: "n5", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-allow" }); //                               excluded by allow
     const all = raw(db)
       .query(`SELECT branch, status, policy_status AS ps, policy_matched_pattern AS pat FROM run_unit_head ORDER BY branch`)
       .all();
@@ -2800,8 +2800,8 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
       { branch: "n1", status: "scanned", ps: null, pat: null },
       { branch: "n2", status: "skipped-cutoff", ps: null, pat: null },
       { branch: "n3", status: "past-cap", ps: null, pat: null },
-      { branch: "n4", status: "skipped-cutoff", ps: "excluded-by-deny", pat: "feat/*" },
-      { branch: "n5", status: "skipped-cutoff", ps: "excluded-by-allow", pat: null },
+      { branch: "n4", status: "policy-excluded", ps: "excluded-by-deny", pat: "feat/*" },
+      { branch: "n5", status: "policy-excluded", ps: "excluded-by-allow", pat: null },
     ]);
     db.close();
   });
@@ -2856,7 +2856,7 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
 
   test("transition: a non-default DENIED branch that BECOMES default is scanned but RETAINS the deny counterfactual", () => {
     const db = fresh();
-    seed(db, { isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "b" });
+    seed(db, { isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "b" });
     // remote default moved onto this branch: now scanned (the default is always scanned), policy counterfactual retained.
     seed(db, { isDefaultBranch: true, status: "scanned", commitSha: "sha-now", policyStatus: "excluded-by-deny", policyMatchedPattern: "b", scannedCommitDate: "2025-07-07T00:00:00Z" });
     expect(rowOf(db)).toMatchObject({ status: "scanned", d: 1, ps: "excluded-by-deny", pat: "b", sha: "sha-now" });
@@ -2868,8 +2868,8 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     seed(db, { branch: "c", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", scannedCommitDate: "2020-01-01T00:00:00Z" });
     seed(db, { branch: "c", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", scannedCommitDate: "2020-02-02T00:00:00Z" });
     expect(rowOf(db, "c").scd).toBe("2020-02-02T00:00:00Z");
-    seed(db, { branch: "e", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "old*" });
-    seed(db, { branch: "e", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "new*" });
+    seed(db, { branch: "e", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "old*" });
+    seed(db, { branch: "e", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "new*" });
     expect(rowOf(db, "e").pat).toBe("new*");
     db.close();
   });
@@ -2919,8 +2919,8 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
       ["scan-allow",    { status: "scanned",        commitSha: "sha-D", isDefaultBranch: true,  policyStatus: "excluded-by-allow", policyMatchedPattern: null, scannedCommitDate: "2025-04-04T00:00:00Z" }],
       ["cutoff",        { status: "skipped-cutoff", commitSha: "",      isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2019-01-01T00:00:00Z" }],
       ["past-cap",      { status: "past-cap",       commitSha: "",      isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2018-01-01T00:00:00Z" }],
-      ["excl-deny",     { status: "skipped-cutoff", commitSha: "",      isDefaultBranch: false, policyStatus: "excluded-by-deny",  policyMatchedPattern: "x*", scannedCommitDate: "2017-01-01T00:00:00Z" }],
-      ["excl-allow",    { status: "skipped-cutoff", commitSha: "",      isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null, scannedCommitDate: "2016-01-01T00:00:00Z" }],
+      ["excl-deny",     { status: "policy-excluded", commitSha: "",      isDefaultBranch: false, policyStatus: "excluded-by-deny",  policyMatchedPattern: "x*", scannedCommitDate: "2017-01-01T00:00:00Z" }],
+      ["excl-allow",    { status: "policy-excluded", commitSha: "",      isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null, scannedCommitDate: "2016-01-01T00:00:00Z" }],
     ];
     const proj = (s: State) => ({
       status: s.status,
@@ -3197,7 +3197,7 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     (db.query(`PRAGMA table_info(${t})`).all() as Array<{ name: string }>).map((c) => c.name);
   const uv = (db: Database): number => (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
 
-  test("fresh-create is exactly ours-v4: 10 cols, status admits {scanned,skipped-cutoff,past-cap}, policy CHECKs enforced", () => {
+  test("fresh-create is exactly ours-v4: 10 cols, status admits {scanned,skipped-cutoff,policy-excluded,past-cap}, policy CHECKs enforced", () => {
     const path = nextFile();
     const db = AuditDb.open({ sqlitePath: path });
     const r = raw(db);
@@ -3208,9 +3208,19 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status) VALUES ('${runId}','o','r','b1','past-cap')`)).not.toThrow();
     expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status) VALUES ('${runId}','o','r','b2','reused')`)).toThrow();
     // deny requires a matched pattern; a foreign policy_status rejected; a valid deny+pattern OK.
-    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status) VALUES ('${runId}','o','r','b3','skipped-cutoff','excluded-by-deny')`)).toThrow();
-    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status,policy_matched_pattern) VALUES ('${runId}','o','r','b4','skipped-cutoff','excluded-by-deny','dep*')`)).not.toThrow();
-    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status) VALUES ('${runId}','o','r','b5','skipped-cutoff','bogus')`)).toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status) VALUES ('${runId}','o','r','b3','policy-excluded','excluded-by-deny')`)).toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status,policy_matched_pattern) VALUES ('${runId}','o','r','b4','policy-excluded','excluded-by-deny','dep*')`)).not.toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status) VALUES ('${runId}','o','r','b5','policy-excluded','bogus')`)).toThrow();
+    // status ↔ policy_status agreement, enforced IN SQL and not only at the write chokepoint: a
+    // policy-excluded row must name the rule that dropped it, and a cutoff/cap row carries no verdict
+    // at all (policy runs BEFORE cutoff/cap). These are the CHECKs that make "which rows are genuine
+    // cutoff skips?" answerable by `status` alone — the point of giving the disposition its own token.
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status) VALUES ('${runId}','o','r','b6','policy-excluded')`)).toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status) VALUES ('${runId}','o','r','b7','skipped-cutoff','excluded-by-allow')`)).toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status) VALUES ('${runId}','o','r','b8','past-cap','excluded-by-allow')`)).toThrow();
+    // ...but a SCANNED row still may: the default-branch override's counterfactual verdict (§3), which
+    // is exactly why policy_status survives as its own column rather than collapsing into status.
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status,policy_matched_pattern) VALUES ('${runId}','o','r','b9','scanned','excluded-by-deny','rel*')`)).not.toThrow();
     db.close();
   });
 
@@ -3751,11 +3761,13 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     forgeRuh(path, `CREATE TABLE run_unit_head (
       run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
       branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'scanned' CHECK/* g1 */(status/* g2 */IN ('scanned','skipped-cutoff','past-cap')),
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK/* g1 */(status/* g2 */IN ('scanned','skipped-cutoff','policy-excluded','past-cap')),
       is_default_branch INTEGER,
       policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
       policy_matched_pattern TEXT, scanned_commit_date TEXT,
       CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      CHECK (status <> 'policy-excluded' OR policy_status IS NOT NULL),
+      CHECK (status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL),
       PRIMARY KEY (run_id, organization, repository, branch))`); // no ix_ruh_loc -> ours-v4-missing-index -> repaired
     const db = AuditDb.open({ sqlitePath: path }); // accepted (comments are trivia) + self-heals the index
     db.close();

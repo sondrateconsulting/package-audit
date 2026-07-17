@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AuditDb, nowIso } from "./db.ts";
+import { AuditDb, nowIso, type UnitHeadStatus } from "./db.ts";
 import { downgradeToFaithfulV2 } from "./testFixtures.ts";
 import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
@@ -128,7 +128,7 @@ describe("buildReport (§7)", () => {
       configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
-    const head = (branch: string, status: "scanned" | "skipped-cutoff" | "past-cap", extra: {
+    const head = (branch: string, status: UnitHeadStatus, extra: {
       isDefaultBranch?: boolean | null; policyStatus?: "excluded-by-deny" | "excluded-by-allow" | null; policyMatchedPattern?: string | null;
     } = {}): void => {
       db.upsertRunUnitHead({
@@ -148,8 +148,8 @@ describe("buildReport (§7)", () => {
     head("release/9.0", "scanned", { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: hostilePattern });
     head("stale", "skipped-cutoff"); // genuine cutoff (no policy) — is_default_branch may stay null
     // policy-excluded + past-cap rows are known non-defaults → is_default_branch MUST be false
-    head("feature/x", "skipped-cutoff", { isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*" });
-    head("wip/y", "skipped-cutoff", { isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null }); // allow-list miss
+    head("feature/x", "policy-excluded", { isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*" });
+    head("wip/y", "policy-excluded", { isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null }); // allow-list miss
     head("over-cap", "past-cap", { isDefaultBranch: false });
     db.completeRun(runId);
     const report = buildReport(db, db.getRun(runId)!) as any;
@@ -204,9 +204,12 @@ describe("buildReport (§7)", () => {
   test("the scan-scope ledger FAILS CLOSED on a policy-bearing row that is neither excluded nor an override", () => {
     // The ledger must decide via BOTH shared predicates, never `isDefaultOverride(h) ? … : "excluded"` —
     // that binary form would re-define "excluded" as "policy-bearing but not an override", a second
-    // definition competing with policyDisposition.ts. assertRunUnitHeadInvariants makes this shape
-    // unreachable through the write path (a past-cap row must carry policy_status null), so it is forged
-    // with a raw handle to prove the READ surface fails closed on its own rather than mislabelling.
+    // definition competing with policyDisposition.ts. This shape is unreachable through BOTH the write
+    // chokepoint AND a v4 CHECK (a past-cap row must carry policy_status null) — so the forge below
+    // SUSPENDS check enforcement to prove the READ surface fails closed on its OWN. That is not a
+    // contrived state: the guard's job is to defend a row that never passed our writer (a foreign or
+    // sibling file that survived classification, or a disposition added later without updating this
+    // surface), and the pragma is the only way to reach it now that the schema forbids it.
     // Same ./data containment idiom as the provenance test below (§0 forbids writes outside ./data).
     const dataExistedBefore = existsSync("./data");
     const dbRoot = `./data/.reporttest-ledger-${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -216,8 +219,11 @@ describe("buildReport (§7)", () => {
       const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
       db.completeRun(runId);
       db.close();
-      // forge past-cap + policy_status: the write path forbids it, the CHECK constraints permit it
+      // forge past-cap + policy_status: forbidden by the write path AND by a v4 CHECK, so enforcement
+      // is suspended for this one INSERT (the pragma is connection-scoped and never touches the file's
+      // schema — AuditDb.open below re-reads the same CHECKs and still classifies the file as ours-v4).
       const forge = new Database(sqlitePath, { strict: true });
+      forge.exec("PRAGMA ignore_check_constraints = ON");
       forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'past-cap', 0, 'excluded-by-deny', 'weird', '2025-06-01T00:00:00Z')`).run(runId);
       forge.close();
       const db2 = AuditDb.open({ sqlitePath });

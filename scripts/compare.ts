@@ -195,7 +195,7 @@ export interface CompareEnvelope {
 
 // Two branch states share the same policy ATTRIBUTION iff both the policy_status
 // (excluded-by-deny / excluded-by-allow / null) and the causing pattern match. Deliberately does NOT
-// compare the row's `status` column (scanned / skipped-cutoff / past-cap): the callers have already
+// compare the row's `status` column (scanned / skipped-cutoff / policy-excluded / past-cap): the callers have already
 // established the disposition via policyApplied/defaultOverride, and this answers the narrower
 // question "did the policy verdict itself change" — e.g. a branch re-classified from allow-miss to an
 // explicit deny, or a deny whose causing pattern was renamed.

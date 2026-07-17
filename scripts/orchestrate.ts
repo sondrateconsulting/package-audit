@@ -394,16 +394,17 @@ export async function processRepo(
   // where nothing ever recorded it.
   const keyFor = (branch: string): WorkUnitKey => ({ configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch });
 
-  // Policy-excluded (non-default, denied/allow-missed): a NEW skipped-cutoff row carrying the policy
-  // counterfactual, disambiguated in run_unit_head by policy_status. Treated like a cutoff skip for
-  // the work queue (enqueue + 'skipped'). commit_sha='' (never scanned); date = discovered head date.
+  // Policy-excluded (non-default, denied/allow-missed): its OWN run_unit_head disposition, named to
+  // match the 'skip-policy' event emitted just below — the durable row and the live stream call this
+  // one branch the same thing. Treated like a cutoff skip for the WORK QUEUE (enqueue + 'skipped'):
+  // that queue models "no scan needed", not why. commit_sha='' (never scanned); date = discovered head.
   for (const d of plan.policyExcluded) {
     const h = d.head;
     const key = keyFor(h.name);
     const attr = policyAttribution(d.rawPolicyResult);
     db.enqueueUnit(key, runId);
     db.setUnitStatus(key, { status: "skipped", runId, lastCommitSha: "", lastCommitDate: h.committedDate });
-    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "policy-excluded", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-policy", policyStatus: attr.policyStatus });
   }
 

@@ -214,9 +214,9 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
     organizationsScanned: orgs.size,
     repositoriesScanned: repos.size,
     branchesScanned: scannedHeads.length,
-    // GENUINE cutoff only (§5): a skipped-cutoff row with NO policy_status. Policy exclusions reuse the
-    // skipped-cutoff status but are their own disjoint bucket (isPolicyExcluded).
-    branchesSkippedByCutoff: allHeads.filter((h) => h.status === "skipped-cutoff" && h.policy_status === null).length,
+    // The four dispositions partition allHeads by `status` alone (§5) — each row lands in exactly one
+    // bucket, and a policy exclusion is no longer a cutoff skip wearing a disambiguator.
+    branchesSkippedByCutoff: allHeads.filter((h) => h.status === "skipped-cutoff").length,
     branchesExcludedByPolicy: allHeads.filter(isPolicyExcluded).length,
     branchesPastCap: allHeads.filter((h) => h.status === "past-cap").length,
     branchesErrored,

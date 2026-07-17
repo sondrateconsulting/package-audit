@@ -112,10 +112,10 @@ describe("branch allow/deny — end-to-end policy classification seam", () => {
       // the persisted disposition snapshot — the single source both report and export read
       expect(headRows(db, runIdA)).toEqual([
         { branch: "ancient", status: "skipped-cutoff", sha: "", d: 0, ps: null, pat: null },       // genuine cutoff (allow-listed but pre-cutoff)
-        { branch: "deny-me", status: "skipped-cutoff", sha: "", d: 0, ps: "excluded-by-deny", pat: "deny-me" },
+        { branch: "deny-me", status: "policy-excluded", sha: "", d: 0, ps: "excluded-by-deny", pat: "deny-me" },
         { branch: "feature/x", status: "scanned", sha: HEADS[1]!.oid, d: 0, ps: null, pat: null },  // wins cap=1
         { branch: "main", status: "scanned", sha: HEADS[0]!.oid, d: 1, ps: "excluded-by-allow", pat: null }, // default override
-        { branch: "other", status: "skipped-cutoff", sha: "", d: 0, ps: "excluded-by-allow", pat: null },    // allow-list miss
+        { branch: "other", status: "policy-excluded", sha: "", d: 0, ps: "excluded-by-allow", pat: null },    // allow-list miss
         { branch: "overflow", status: "past-cap", sha: "", d: 0, ps: null, pat: null },
       ]);
 
@@ -136,7 +136,7 @@ describe("branch allow/deny — end-to-end policy classification seam", () => {
       const ruhJsonl = readFileSync(join(root, "xray", "run_unit_head.jsonl"), "utf8").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l));
       const byBranch = Object.fromEntries(ruhJsonl.map((r: any) => [r.branch, { status: r.status, ps: r.policy_status, pat: r.policy_matched_pattern }]));
       expect(byBranch["feature/x"]).toEqual({ status: "scanned", ps: null, pat: null });
-      expect(byBranch["deny-me"]).toEqual({ status: "skipped-cutoff", ps: "excluded-by-deny", pat: "deny-me" });
+      expect(byBranch["deny-me"]).toEqual({ status: "policy-excluded", ps: "excluded-by-deny", pat: "deny-me" });
       expect(byBranch["main"]).toEqual({ status: "scanned", ps: "excluded-by-allow", pat: null });
 
       // ---- Run B: additionally deny [feature/x] — overflow is PROMOTED into the freed cap slot ----
@@ -144,7 +144,7 @@ describe("branch allow/deny — end-to-end policy classification seam", () => {
       const evB = await captureJsonl(() => runScan(db, scanClient(root, HEADS, "main"), rt(cfgB, "hashB"), NO_ARGS, null));
       const runIdB = runIdOf(evB);
       const rowsB = Object.fromEntries(headRows(db, runIdB).map((r) => [r["branch"], r]));
-      expect(rowsB["feature/x"]).toMatchObject({ status: "skipped-cutoff", sha: "", ps: "excluded-by-deny", pat: "feature/x" });
+      expect(rowsB["feature/x"]).toMatchObject({ status: "policy-excluded", sha: "", ps: "excluded-by-deny", pat: "feature/x" });
       expect(rowsB["overflow"]).toMatchObject({ status: "scanned", sha: HEADS[2]!.oid, ps: null }); // promoted
       const reportB = buildReport(db, db.getRun(runIdB)!) as any;
       expect(reportB.summary).toMatchObject({ branchesScanned: 2, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 3, branchesPastCap: 0 });
@@ -207,7 +207,7 @@ describe("branch allow/deny — a policy-excluded branch never leaks stale findi
       // Run B denies feature/x → skipped-cutoff + commit_sha='' (the poison's SHA). main stays scanned.
       const runIdB = db.startRun({ configHash: "b", effectiveOwners: [ORG], ownersSource: "configured", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" }).runId;
       db.upsertRunUnitHead(scannedHead(runIdB, "main", MAIN_SHA, true));
-      db.upsertRunUnitHead({ runId: runIdB, organization: ORG, repository: REPO, branch: "feature/x", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*", scannedCommitDate: "2025-06-01T00:00:00Z" });
+      db.upsertRunUnitHead({ runId: runIdB, organization: ORG, repository: REPO, branch: "feature/x", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*", scannedCommitDate: "2025-06-01T00:00:00Z" });
       db.completeRun(runIdB);
 
       // report(B): the positive control surfaces, the excluded branch does NOT (real via commit mismatch,

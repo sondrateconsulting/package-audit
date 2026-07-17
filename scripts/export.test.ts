@@ -330,11 +330,11 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     const D = "2025-06-01T12:00:00Z";
     const base = { runId, organization: "org-a", repository: "svc", scannedCommitDate: D };
     // deny-excluded with a formula-shaped pattern (branch sorts first)
-    db.upsertRunUnitHead({ ...base, branch: "feature-x", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "=cmd|calc" });
+    db.upsertRunUnitHead({ ...base, branch: "feature-x", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "=cmd|calc" });
     // scanned default (policy-clean)
     db.upsertRunUnitHead({ ...base, branch: "main", commitSha: "aaa111", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null });
     // allow-list miss (pattern is NULL → empty CSV / JSON null)
-    db.upsertRunUnitHead({ ...base, branch: "stale", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null });
+    db.upsertRunUnitHead({ ...base, branch: "stale", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null });
     // past the per-repo cap (never carries policy)
     db.upsertRunUnitHead({ ...base, branch: "wip", commitSha: "", status: "past-cap", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null });
     db.completeRun(runId);
@@ -351,9 +351,9 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     const header = "run_id,organization,repository,branch,commit_sha,status,is_default_branch,policy_status,policy_matched_pattern,scanned_commit_date";
     // rows in ORDER BY (run_id, organization, repository, branch); '=cmd|calc' → literal apostrophe
     // prefix (formula defense); is_default_branch is a typed number (never prefixed); NULLs are empty.
-    const feature = `${id},org-a,svc,feature-x,,skipped-cutoff,0,excluded-by-deny,'=cmd|calc,${D}`;
+    const feature = `${id},org-a,svc,feature-x,,policy-excluded,0,excluded-by-deny,'=cmd|calc,${D}`;
     const main = `${id},org-a,svc,main,aaa111,scanned,1,,,${D}`;
-    const stale = `${id},org-a,svc,stale,,skipped-cutoff,0,excluded-by-allow,,${D}`;
+    const stale = `${id},org-a,svc,stale,,policy-excluded,0,excluded-by-allow,,${D}`;
     const wip = `${id},org-a,svc,wip,,past-cap,0,,,${D}`;
     expect(readXray(out, "run_unit_head.csv")).toBe([header, feature, main, stale, wip].join("\r\n") + "\r\n");
     db.close();
@@ -371,7 +371,7 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     expect(lines[0]).toBe(
       JSON.stringify({
         run_id: run.runId, organization: "org-a", repository: "svc", branch: "feature-x",
-        commit_sha: "", status: "skipped-cutoff", is_default_branch: 0,
+        commit_sha: "", status: "policy-excluded", is_default_branch: 0,
         policy_status: "excluded-by-deny", policy_matched_pattern: "=cmd|calc", scanned_commit_date: "2025-06-01T12:00:00Z",
       }),
     );

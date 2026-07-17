@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AuditDb, nowIso, type RunRecord, type UsageType } from "./db.ts";
+import { AuditDb, nowIso, type RunRecord, type UnitHeadStatus, type UsageType } from "./db.ts";
 import {
   COMPARE_DETAIL_CAP, COMPARE_FORMAT_VERSION, COMPARE_HELP, buildCompare, buildNotComparableNotice, compareSummaryText,
   main, parseCompareArgs, runCompare, type CompareEnvelope,
@@ -173,7 +173,7 @@ describe("buildCompare — added/removed sites", () => {
 function phead(
   db: AuditDb, runId: string, branch: string,
   o: {
-    status?: "scanned" | "skipped-cutoff" | "past-cap";
+    status?: UnitHeadStatus;
     isDefaultBranch?: boolean | null;
     policyStatus?: "excluded-by-deny" | "excluded-by-allow" | null;
     pattern?: string | null;
@@ -200,13 +200,13 @@ describe("buildCompare — policy churn", () => {
     phead(db, runB.runId, "main", { isDefaultBranch: true });
     // entering: clean-scanned in A → deny-excluded in B
     phead(db, runA.runId, "entering", { isDefaultBranch: false });
-    phead(db, runB.runId, "entering", { status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
+    phead(db, runB.runId, "entering", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
     // leaving: deny-excluded in A → clean-scanned in B
-    phead(db, runA.runId, "leaving", { status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
+    phead(db, runA.runId, "leaving", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
     phead(db, runB.runId, "leaving", { isDefaultBranch: false });
     // reclass: excluded both sides but the causing pattern changed
-    phead(db, runA.runId, "reclass", { status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
-    phead(db, runB.runId, "reclass", { status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feat/*" });
+    phead(db, runA.runId, "reclass", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
+    phead(db, runB.runId, "reclass", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feat/*" });
     // override-change: default-override carrying a counterfactual in A → plain clean default in B (neither APPLIED)
     phead(db, runA.runId, "trunk", { isDefaultBranch: true, policyStatus: "excluded-by-deny", pattern: "release/*" });
     phead(db, runB.runId, "trunk", { isDefaultBranch: true });
@@ -228,7 +228,7 @@ describe("buildCompare — policy churn", () => {
     expect(churn.enteredExclusion[0]).toEqual({
       organization: "org-a", repository: "svc", branch: "entering",
       runA: { status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, policyApplied: false, defaultOverride: false },
-      runB: { status: "skipped-cutoff", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*", policyApplied: true, defaultOverride: false },
+      runB: { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*", policyApplied: true, defaultOverride: false },
     });
     // reclassified carries the pattern change explicitly
     expect(churn.reclassifiedExclusion[0]!.runA.policyMatchedPattern).toBe("feature/*");
@@ -241,8 +241,10 @@ describe("buildCompare — policy churn", () => {
     // a row gets policyApplied=false + defaultOverride=false — indistinguishable from an ordinary
     // unrestricted branch — and buildPolicyChurn's final else-branch would file it under
     // defaultOverrideChanges, laundering a malformed disposition into a plausible churn entry.
-    // assertRunUnitHeadInvariants forbids this shape at the WRITE chokepoint (a past-cap row must carry
-    // policy_status null), so it is forged with a raw handle to prove the READ surface fails closed.
+    // This shape is forbidden at the WRITE chokepoint AND by a v4 CHECK (a past-cap row must carry
+    // policy_status null), so the forge suspends check enforcement to prove the READ surface fails
+    // closed on its own — defending rows that never passed our writer (a foreign/sibling file that
+    // survived classification, or a later disposition), which is the only way to reach this now.
     const path = nextFile();
     const db = AuditDb.open({ sqlitePath: path });
     const runA = startCompleted(db, ["expo"]);
@@ -251,7 +253,10 @@ describe("buildCompare — policy churn", () => {
     phead(db, runB.runId, "main", { isDefaultBranch: true });
     const runBId = runB.runId;
     db.close();
+    // The pragma is connection-scoped — it never edits the file's schema, so AuditDb.open below still
+    // reads the same CHECKs and classifies the file as ours-v4.
     const forge = new Database(path, { strict: true });
+    forge.exec("PRAGMA ignore_check_constraints = ON");
     forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'past-cap', 0, 'excluded-by-deny', 'weird', '2025-06-01T00:00:00Z')`).run(runBId);
     forge.close();
     const db2 = AuditDb.open({ sqlitePath: path });

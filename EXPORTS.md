@@ -160,7 +160,7 @@ Row order: `package_name, version, export_kind, export_name`
 
 One row per branch that reached a TERMINAL disposition this run — the immutable per-run disposition
 snapshot. Unlike the findings tables, this exports every disposition TYPE (scanned / skipped-cutoff /
-past-cap, plus the branch-policy columns that live largely on the non-scanned rows). A discovered branch
+policy-excluded / past-cap, plus the branch-policy columns that live largely on the non-scanned rows). A discovered branch
 that reached no terminal disposition has NO row here: one whose scan **errored** carries a `scope='scan'`
 entry in the report's `errors[]` (and is counted by the report's `branchesErrored`), while one whose scan
 was **throttle-requeued** is deferred with neither a row nor a new error — it is finished on the next run
@@ -204,13 +204,20 @@ below.)
 
 Row order: `run_id, organization, repository, branch`
 
-Notes: `status` is `scanned` / `skipped-cutoff` / `past-cap`. `policy_status` (`excluded-by-deny` /
-`excluded-by-allow` / null) is the branch allow/deny decision; on a `skipped-cutoff` row it marks a
-policy exclusion, on a `scanned` row it marks a default-branch override. `policy_matched_pattern` is
-the causing deny pattern (null otherwise). `scanned_commit_date` is the scanned commit's date on a
-scanned row, the discovered-head date otherwise (null only for pre-v4 migrated rows).
-`is_default_branch` is `1`/`0`/null: null means UNKNOWN (pre-v3 migrated rows) — never read it as
-"not the default". A `1` row is always `scanned`; `past-cap` and policy-excluded rows are always `0`.
+Notes: `status` is `scanned` / `skipped-cutoff` / `policy-excluded` / `past-cap` — four DISJOINT
+dispositions, so `status` alone answers "why was this branch not scanned", and `WHERE status =
+'policy-excluded'` is the whole filter for branch-policy exclusions. `policy_status`
+(`excluded-by-deny` / `excluded-by-allow` / null) names WHICH rule decided: always present on a
+`policy-excluded` row, always null on `skipped-cutoff` / `past-cap` (policy is applied BEFORE
+cutoff/cap, so those rows never carry a verdict), and on a `scanned` row it marks a **default-branch
+override** — the counterfactual verdict on a branch policy would have dropped but which is always
+scanned anyway. That override is the reason `policy_status` is its own column and not folded into
+`status`: the branch really was scanned, so it belongs in `scanned`, and its verdict is advisory.
+`policy_matched_pattern` is the causing deny pattern (null otherwise). `scanned_commit_date` is the
+scanned commit's date on a scanned row, the discovered-head date otherwise (null only for pre-v4
+migrated rows). `is_default_branch` is `1`/`0`/null: null means UNKNOWN (pre-v3 migrated rows) —
+never read it as "not the default". A `1` row is always `scanned`; `past-cap` and `policy-excluded`
+rows are always `0`.
 
 ## runs
 

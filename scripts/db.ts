@@ -103,7 +103,12 @@ export type OwnersSource = "configured" | "discovered";
 export type RunStatus = "running" | "completed" | "failed";
 export type WorkScope = "org" | "repo" | "branch";
 export type WorkStatus = "pending" | "in_progress" | "done" | "skipped" | "error";
-export type UnitHeadStatus = "scanned" | "skipped-cutoff" | "past-cap";
+// The DISJOINT disposition partition (§3). 'policy-excluded' is its OWN status rather than an
+// overloaded 'skipped-cutoff': a branch dropped by branch allow/deny was not skipped by the cutoff,
+// and the durable vocabulary must name the event the live JSONL stream already calls 'skip-policy'.
+// The default-branch OVERRIDE is deliberately NOT a member — that branch IS scanned and carries only
+// a counterfactual policy_status (see policyDisposition.ts::isDefaultOverride).
+export type UnitHeadStatus = "scanned" | "skipped-cutoff" | "policy-excluded" | "past-cap";
 // The ORTHOGONAL, counterfactual policy decision for a branch (branch allow/deny). Computed for
 // EVERY discovered branch, including the default (whose scan is never blocked). NULL policy_status
 // (the third state) means "no exclusion" and is represented as `null`, not a member here.
@@ -287,13 +292,21 @@ const RUN_UNIT_HEAD_BODY = `
   organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
   commit_sha TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'scanned'
-    CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
+    CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap')),
   is_default_branch INTEGER,
   policy_status TEXT
     CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
   policy_matched_pattern TEXT,
   scanned_commit_date TEXT,
   CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+  -- The status ↔ policy_status agreement, enforced in SQL so no writer (or a future one) can store a
+  -- contradiction the read surfaces would have to guess about: a 'policy-excluded' row names WHICH
+  -- rule dropped it, and a cutoff/cap row carries no policy verdict at all (policy runs BEFORE
+  -- cutoff/cap, so those dispositions are only ever reached by policy-eligible branches). 'scanned'
+  -- is unconstrained here — it is null for the ordinary case and non-null for the default-branch
+  -- override's counterfactual, a distinction assertRunUnitHeadInvariants pins to the known default.
+  CHECK (status <> 'policy-excluded' OR policy_status IS NOT NULL),
+  CHECK (status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL),
   PRIMARY KEY (run_id, organization, repository, branch)
 `;
 
@@ -1171,9 +1184,11 @@ function extractChecks(sql: string): Set<string> {
 }
 // Expected CHECK sets, normalized through the SAME function so our own spacing never matters.
 const RUH_V4_CHECKS = new Set([
-  normalizeCheck("status IN ('scanned','skipped-cutoff','past-cap')"),
+  normalizeCheck("status IN ('scanned','skipped-cutoff','policy-excluded','past-cap')"),
   normalizeCheck("policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')"),
   normalizeCheck("policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL"),
+  normalizeCheck("status <> 'policy-excluded' OR policy_status IS NOT NULL"),
+  normalizeCheck("status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL"),
 ]);
 const RUH_V23_CHECKS = new Set([normalizeCheck("status IN ('scanned','skipped-cutoff')")]);
 const setEquals = (a: Set<string>, b: Set<string>): boolean => a.size === b.size && [...a].every((x) => b.has(x));
@@ -1288,8 +1303,10 @@ function healRunUnitHeadShape(db: Database): void {
       // foreign_key_check cannot detect. Refuse to rebuild in that (unexpected) mixed shape.
       if (hasInboundForeignKey(db, "run_unit_head"))
         fail("run_unit_head has an inbound foreign key — refusing to rebuild it (a DROP would cascade to external rows)");
-      // Rebuild: new v4-shaped table, copy the 7 v3 columns EXPLICITLY (new columns default NULL;
-      // existing 'scanned'/'skipped-cutoff' status values remain valid under the v4 CHECK).
+      // Rebuild: new v4-shaped table, copy the 7 v3 columns EXPLICITLY. New columns default NULL, and a
+      // v3 row's 'scanned'/'skipped-cutoff' status stays valid AND correct under the widened v4 CHECK:
+      // v3 predates branch policy, so no migrated row can be a policy exclusion mislabelled as a
+      // cutoff skip — the null policy_status it inherits is the truth, not a lossy default.
       if (tableExists(db, "run_unit_head__v4_new"))
         fail("migration scratch table run_unit_head__v4_new already exists — aborting rather than clobber it");
       db.exec(`CREATE TABLE run_unit_head__v4_new (${RUN_UNIT_HEAD_BODY});`);
@@ -1546,10 +1563,15 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   } else if (h.policyMatchedPattern !== null) {
     fail(`run_unit_head ${where}: policy_matched_pattern must be null unless excluded-by-deny (policy_status=${h.policyStatus ?? "null"})`);
   }
-  // Cap disposition: past-cap is a cutoff/cap outcome over the policy-ELIGIBLE set — policy
-  // is applied first, so an excluded branch never reaches the cap. A past-cap row never carries policy.
-  if (h.status === "past-cap" && h.policyStatus !== null)
-    fail(`run_unit_head ${where}: past-cap rows must have policy_status null (policy is applied before the cap)`);
+  // status ↔ policy_status agreement (§3). The SQL CHECKs enforce the same two rules; these carry the
+  // diagnosis. A 'policy-excluded' row that named no rule would be the exact state the fail-closed read
+  // guard (policyDisposition.ts) cannot classify — reject it at the write chokepoint instead.
+  if (h.status === "policy-excluded" && h.policyStatus === null)
+    fail(`run_unit_head ${where}: a policy-excluded row requires a policy_status naming the rule that dropped it`);
+  // Cutoff/cap are outcomes over the policy-ELIGIBLE set — policy is applied FIRST, so an excluded
+  // branch never reaches either. Neither disposition ever carries a policy verdict.
+  if ((h.status === "skipped-cutoff" || h.status === "past-cap") && h.policyStatus !== null)
+    fail(`run_unit_head ${where}: ${h.status} rows must have policy_status null (policy is applied before cutoff/cap)`);
   // Default-branch override (the default is always scanned): the ONLY way a policy-excluded branch is still scanned is
   // the default-branch exemption. A scanned row bearing a policy_status MUST be the KNOWN default.
   if (h.status === "scanned" && h.policyStatus !== null && h.isDefaultBranch !== true)
@@ -1568,8 +1590,7 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   // Non-default certainty for cap/policy exclusions (§3): past-cap and policy-excluded rows are, by
   // construction, non-default branches that discovery KNEW about — so is_default_branch is a definite
   // false, never null. (A plain cutoff-skip may still be null for a pre-v3/unknown row.)
-  const isPolicyExcludedSkip = h.status === "skipped-cutoff" && h.policyStatus !== null;
-  if ((h.status === "past-cap" || isPolicyExcludedSkip) && h.isDefaultBranch !== false)
+  if ((h.status === "past-cap" || h.status === "policy-excluded") && h.isDefaultBranch !== false)
     fail(`run_unit_head ${where}: past-cap / policy-excluded rows must have is_default_branch=false (got ${h.isDefaultBranch ?? "null"})`);
 }
 

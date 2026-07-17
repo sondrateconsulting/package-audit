@@ -619,7 +619,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     ], "main");
     await captureJsonl(() => processRepo(db, client, rt(config, "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId)).toEqual([
-      { branch: "dev", status: "skipped-cutoff", sha: "", d: 0, ps: "excluded-by-deny", pat: "dev", scd: "2025-05-01T00:00:00Z" },
+      { branch: "dev", status: "policy-excluded", sha: "", d: 0, ps: "excluded-by-deny", pat: "dev", scd: "2025-05-01T00:00:00Z" },
       { branch: "main", status: "scanned", sha: "o-main", d: 1, ps: null, pat: null, scd: "2025-06-01T00:00:00Z" },
     ]);
     expect(db.getUnit(key("dev"))?.status).toBe("skipped"); // enqueued but never scanned
@@ -688,7 +688,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     ], "main");
     await captureJsonl(() => processRepo(db, client, rt(config, "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId)).toEqual([
-      { branch: "feat", status: "skipped-cutoff", sha: "", d: 0, ps: "excluded-by-allow", pat: null, scd: "2025-05-01T00:00:00Z" },
+      { branch: "feat", status: "policy-excluded", sha: "", d: 0, ps: "excluded-by-allow", pat: null, scd: "2025-05-01T00:00:00Z" },
       { branch: "main", status: "scanned", sha: "o-main", d: 1, ps: null, pat: null, scd: "2025-06-01T00:00:00Z" },
     ]);
     db.close();
@@ -1006,9 +1006,9 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     await captureJsonl(() => processRepo(db, client, rt(config, "h"), runId, "org-a", repo, [], new Set()));
     expect(headRowsOf(db, runId)).toEqual([
       // dev: a non-default allow-list miss → excluded, as before.
-      { branch: "dev", status: "skipped-cutoff", sha: "", d: 0, ps: "excluded-by-allow", pat: null, scd: "2025-05-01T00:00:00Z" },
+      { branch: "dev", status: "policy-excluded", sha: "", d: 0, ps: "excluded-by-allow", pat: null, scd: "2025-05-01T00:00:00Z" },
       // trunk: SCANNED and flagged default. Before the fix this row read
-      // {status:"skipped-cutoff", d:0, ps:"excluded-by-allow"} — the repo's real default, dropped.
+      // {status:"policy-excluded", d:0, ps:"excluded-by-allow"} — the repo's real default, dropped.
       // ps records the COUNTERFACTUAL (policy would have excluded it); the override keeps it eligible.
       { branch: "trunk", status: "scanned", sha: "o-trunk", d: 1, ps: "excluded-by-allow", pat: null, scd: "2025-06-01T00:00:00Z" },
     ]);
