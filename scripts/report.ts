@@ -192,6 +192,13 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
       .filter((k) => !headKeys.has(k)),
   ).size;
 
+  // Validate the WHOLE head set ONCE, then feed the SAME validated array to BOTH derivations below. This
+  // replaces the old reliance on object-literal evaluation order (assertHeadsWellFormed ran INSIDE the
+  // summary property while buildScanScope trusted the raw `heads`), so a property reorder can no longer
+  // route an unguarded row into a count. assertHeadsWellFormed returns its input, so this is behaviourally
+  // identical — it just makes "gate before trust" a data-flow fact instead of a source-order coincidence.
+  const validatedHeads = assertHeadsWellFormed(heads);
+
   return {
     formatVersion: XRAY_FORMAT_VERSION,
     runId,
@@ -202,15 +209,13 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     },
     packages,
     errors,
-    // Validate EVERY head once, before any derivation reads it. Not a filtered subset: the counted set
-    // must be a SUPERSET-safe subset of the guarded set, and keeping the guard at each read site is
-    // exactly how that broke — buildScanScope guards only policy-BEARING rows, while buildSummary
-    // counts by status alone, so a 'policy-excluded' row naming no rule was counted as an exclusion and
-    // never guarded (the report then contradicted itself: branchesExcludedByPolicy=1 with
-    // excludedByDeny+excludedByAllow=0). Sweeping the whole set here makes the two sets impossible to
-    // drift apart. The guard early-returns on the common unlabelled row, so this is one cheap pass.
-    summary: buildSummary(scannedHeads, assertHeadsWellFormed(heads), depRows, usageRows, branchesErrored),
-    scanScope: buildScanScope(heads),
+    // Both derivations consume the SAME validatedHeads (above) — NOT a filtered subset: the guard must
+    // run over the WHOLE set or the two counts drift, which is exactly how it once broke (buildScanScope
+    // guarded only policy-BEARING rows while buildSummary counted by status alone, so a 'policy-excluded'
+    // row naming no rule was counted as an exclusion yet never guarded — branchesExcludedByPolicy=1 with
+    // excludedByDeny+excludedByAllow=0). Sweeping the whole set makes the two impossible to drift apart.
+    summary: buildSummary(scannedHeads, validatedHeads, depRows, usageRows, branchesErrored),
+    scanScope: buildScanScope(validatedHeads),
   };
 }
 
