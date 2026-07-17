@@ -1597,17 +1597,24 @@ export class AuditDb {
     // for a non-:memory: path (an absent file skips straight to creation), inspects the file's BASE
     // IMAGE via deserialize (no SQLite handle on the target), and REFUSES — before this
     // connection's `journal_mode = WAL` pragma and before the --fresh drop — every file it can
-    // prove is not ours to write. What it does NOT guarantee: the base image is a consistent but
-    // possibly STALE snapshot (live/crashed -wal frames are invisible; the zero-object+journal
-    // case is refused as unverifiable) — a state change landing between the preflight and this
-    // open, or visible only through a recovered WAL, is caught by the live backstops inside
-    // initWritableConnection and by the migration's own classify-first transaction. Later
-    // migration-internal failures (the v3→v4 scratch-table collision, the shape asserts, the
-    // post-migration shape/FK fingerprints, or any SQL error) fire AFTER this point, on databases
-    // the preflight accepted as compatible; WAL-converting such a database is normal operation —
-    // a SUCCESSFUL v3→v4 upgrade is preceded by the identical delete→wal flip — and each failing
-    // step rolls back its OWN transaction only: the WAL conversion and any EARLIER committed step
-    // (--fresh) are not undone.
+    // prove is not ours to write. What it does NOT guarantee: the base image is a byte snapshot,
+    // possibly STALE (uncheckpointed -wal frames are invisible; a NON-EMPTY sidecar over a
+    // zero-object base is refused as unverifiable) — a state change landing between the preflight
+    // and this open, or visible only through a recovered WAL, is caught by the live user-version
+    // check and the two LIVE backstops inside initWritableConnection — isOwnedOrEmpty and
+    // assertOpenCompatible, re-run on the writable connection, which reads through the recovered
+    // WAL (the WAL-only sibling-v4 case is assertOpenCompatible's catch: name-level ownedness
+    // passes, and live stamp 4 would skip the migration). Those gates run BEFORE journal_mode=WAL
+    // and BEFORE --fresh, so a rejection by one of them never performs a delete→wal conversion;
+    // states that pass them and reach v3→v4 are re-classified inside the migration transaction,
+    // AFTER WAL setup and any --fresh. A recovered-WAL rejection may still rebuild/modify sidecars
+    // and, on a normal last close, checkpoint the already-WAL file. Later migration-internal
+    // failures (the v3→v4 scratch-table collision, the shape asserts, the post-migration shape/FK
+    // fingerprints, or any SQL error) fire AFTER this point, on databases the preflight accepted
+    // as compatible; WAL-converting such a database is normal operation — a SUCCESSFUL v3→v4
+    // upgrade is preceded by the identical delete→wal flip — and each failing step rolls back its
+    // OWN transaction only: the WAL conversion and any EARLIER committed step (--fresh) are not
+    // undone.
     const userVersion = initWritableConnection(db, path);
 
     if (opts.fresh === true) {
