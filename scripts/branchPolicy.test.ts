@@ -1,7 +1,7 @@
 import { expect, test, describe } from "bun:test";
 import {
   compileBranchPolicy, BranchPolicyError, PolicyMatchError, evaluateBranchPolicy, classifyBranch,
-  coverageForName, type CompiledPattern, type CompiledBranchPolicy,
+  isBranchPolicyEligible, coverageForName, type CompiledPattern, type CompiledBranchPolicy,
 } from "./branchPolicy.ts";
 
 const names = (list: readonly CompiledPattern[] | null): string[] | null =>
@@ -118,15 +118,17 @@ describe("classifyBranch — default override preserves the counterfactual", () 
   test("a non-default denied branch is ineligible", () => {
     // "dep*" matches "dependabot" ('*' does not cross '/', so no slash in the name)
     const p = compileBranchPolicy(null, ["dep*"]);
-    expect(classifyBranch(p, "dependabot", "main")).toEqual({
-      isDefaultBranch: false, eligible: false,
+    const c = classifyBranch(p, "dependabot", "main");
+    expect(c).toEqual({
+      isDefaultBranch: false,
       rawPolicyResult: { kind: "excluded-by-deny", matchedPattern: "dep*" },
     });
+    expect(isBranchPolicyEligible(c)).toBe(false); // derived by the shared helper, no stored flag
   });
   test("a non-default denied branch using '**' matches across '/'", () => {
     // to deny slash-containing bot branches, the operator uses '**' (crosses '/')
     const p = compileBranchPolicy(null, ["dependabot/**"]);
-    expect(classifyBranch(p, "dependabot/npm/x", "main").eligible).toBe(false);
+    expect(isBranchPolicyEligible(classifyBranch(p, "dependabot/npm/x", "main"))).toBe(false);
     expect(classifyBranch(p, "dependabot/npm/x", "main").rawPolicyResult).toEqual({
       kind: "excluded-by-deny", matchedPattern: "dependabot/**",
     });
@@ -134,16 +136,16 @@ describe("classifyBranch — default override preserves the counterfactual", () 
   test("the default branch stays eligible even when policy WOULD deny it (raw result kept)", () => {
     const c = classifyBranch(compileBranchPolicy(null, ["main"]), "main", "main");
     expect(c.isDefaultBranch).toBe(true);
-    expect(c.eligible).toBe(true);
+    expect(isBranchPolicyEligible(c)).toBe(true);
     expect(c.rawPolicyResult).toEqual({ kind: "excluded-by-deny", matchedPattern: "main" });
   });
   test("the default branch stays eligible under an allowlist it does not match", () => {
     const c = classifyBranch(compileBranchPolicy(["release/*"], []), "main", "main");
-    expect(c.eligible).toBe(true);
+    expect(isBranchPolicyEligible(c)).toBe(true);
     expect(c.rawPolicyResult).toEqual({ kind: "excluded-by-allow" });
   });
   test("a non-default allowlisted branch is eligible", () => {
-    expect(classifyBranch(compileBranchPolicy(["release/*"], []), "release/2", "main").eligible).toBe(true);
+    expect(isBranchPolicyEligible(classifyBranch(compileBranchPolicy(["release/*"], []), "release/2", "main"))).toBe(true);
   });
 });
 

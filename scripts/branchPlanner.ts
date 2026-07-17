@@ -4,7 +4,7 @@
 // consume a cap slot that an allowed older branch could have used (§5.B). Pure — no I/O, no DB.
 
 import type { BranchHead, BranchSnapshot } from "./github.ts";
-import { classifyBranch, coverageForName, type CompiledBranchPolicy, type PolicyResult, type RepoPolicyCoverage } from "./branchPolicy.ts";
+import { classifyBranch, coverageForName, isBranchPolicyEligible, type CompiledBranchPolicy, type PolicyResult, type RepoPolicyCoverage } from "./branchPolicy.ts";
 import type { PolicyStatus } from "./db.ts";
 
 // §5.B classification, pure: heads arrive sorted committedDate DESC. The repo's DEFAULT branch
@@ -134,7 +134,7 @@ export function planRepoBranches(
   const policyExcluded: BranchDecision[] = [];
   for (const head of heads) {
     const d = decisions.get(head)!;
-    if (d.isDefaultBranch || d.rawPolicyResult.kind === "no-exclusion") eligibleHeads.push(head);
+    if (isBranchPolicyEligible(d)) eligibleHeads.push(head);
     else policyExcluded.push(d);
   }
   const plan = classifyBranchPlan(eligibleHeads, cutoffDate, maxBranchesPerRepo, defaultBranch);
@@ -184,7 +184,7 @@ export function planPolicyDiagnostics(plan: RepoBranchPlan): PlanPolicyDiagnosti
   let excludedByDeny = 0;
   let excludedByAllow = 0;
   for (const d of plan.policyExcluded) {
-    if (d.isDefaultBranch || d.rawPolicyResult.kind === "no-exclusion")
+    if (isBranchPolicyEligible(d))
       throw new Error(`internal: policyExcluded carries a default/no-exclusion branch ${d.head.name} (planner bucket-wiring bug)`);
     if (d.rawPolicyResult.kind === "excluded-by-deny") excludedByDeny++;
     else excludedByAllow++;

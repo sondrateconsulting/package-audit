@@ -158,14 +158,13 @@ export function evaluateBranchPolicy(policy: CompiledBranchPolicy, name: string)
     : { kind: "excluded-by-allow" };
 }
 
-// A branch's full classification. `eligible` is the AUTHORITATIVE scan-eligibility: the default
-// branch is ALWAYS eligible; a non-default branch is eligible iff policy did not exclude it.
-// `rawPolicyResult` is the RAW/counterfactual policy decision — for the default branch it may be
-// `excluded-by-*` while `eligible` stays true. Anything deciding whether to SCAN must read
-// `eligible`, never `rawPolicyResult` alone.
+// A branch's full classification: whether it's the repo default, plus its RAW/counterfactual policy
+// decision. There is NO stored `eligible` flag — scan-eligibility is DERIVED by isBranchPolicyEligible
+// (below), so a classification can never store a defaultness/eligibility contradiction. `rawPolicyResult`
+// may be `excluded-by-*` even for the default branch (whose scan is never blocked) — so anything deciding
+// whether to SCAN must call isBranchPolicyEligible, never read `rawPolicyResult.kind` alone.
 export interface BranchClassification {
   readonly isDefaultBranch: boolean;
-  readonly eligible: boolean;
   readonly rawPolicyResult: PolicyResult;
 }
 
@@ -197,11 +196,18 @@ export function classifyBranch(
 ): BranchClassification {
   const isDefaultBranch = name === defaultBranch;
   const rawPolicyResult = evaluateBranchPolicy(policy, name);
-  return {
-    isDefaultBranch,
-    eligible: isDefaultBranch || rawPolicyResult.kind === "no-exclusion",
-    rawPolicyResult,
-  };
+  return { isDefaultBranch, rawPolicyResult };
+}
+
+// DERIVED scan-eligibility — there is no stored flag, so this ONE formula is the sole definition: the
+// default branch is ALWAYS eligible; every other branch is eligible iff policy did not exclude it. A
+// Pick so BOTH a BranchClassification (classifyBranch) and a BranchDecision (branchPlanner) are judged
+// by it — the planner's eligible/excluded split and its impossible-bucket guard call this instead of
+// re-deriving the boolean inline, so the fact can never drift between the producer and its consumers.
+export function isBranchPolicyEligible(
+  c: Pick<BranchClassification, "isDefaultBranch" | "rawPolicyResult">,
+): boolean {
+  return c.isDefaultBranch || c.rawPolicyResult.kind === "no-exclusion";
 }
 
 // Every pattern in `list` that matches `name` (exact OR glob), in canonical order. May throw
