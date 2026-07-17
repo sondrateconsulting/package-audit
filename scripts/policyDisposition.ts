@@ -140,7 +140,7 @@ export function assertRunUnitHeadSound(r: PolicyDispositionRow, where: string): 
   // policy_matched_pattern ↔ deny, both directions (the SQL CHECK covers neither the empty case nor
   // the converse).
   if (r.policy_status === "excluded-by-deny") {
-    if (r.policy_matched_pattern === null || r.policy_matched_pattern.length === 0)
+    if (r.policy_matched_pattern === null || r.policy_matched_pattern.length === 0 || r.policy_matched_pattern.startsWith("!"))
       throw new Error(`internal: run_unit_head ${where} is excluded-by-deny but names no causing pattern (policy_matched_pattern=${JSON.stringify(r.policy_matched_pattern)})`);
   } else if (r.policy_matched_pattern !== null) {
     throw new Error(`internal: run_unit_head ${where} carries policy_matched_pattern=${JSON.stringify(r.policy_matched_pattern)} on policy_status=${JSON.stringify(r.policy_status)} — only a deny names a causing pattern`);
