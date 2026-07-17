@@ -114,8 +114,11 @@ export function assertRunUnitHeadSound(r: PolicyDispositionRow, where: string): 
   // disposition claiming migrated provenance is impossible, and treating it as exempt from the native
   // rules (as the default⇒scanned scoping below does) would launder exactly the rows that most need
   // gating (round-4 finding, reproduced: NULL-date policy-excluded/past-cap were counted and emitted).
-  if ((r.status === "policy-excluded" || r.status === "past-cap") && r.scanned_commit_date === null)
-    throw new Error(`internal: run_unit_head ${where} is ${r.status} with a NULL scanned_commit_date — v4-native dispositions cannot be migrated rows`);
+  // ...and the same holds for the policy COLUMNS: they are v4-only too, so a policy-BEARING row of
+  // any status claiming migrated provenance is equally impossible (round-5: a scanned default
+  // override with a NULL date slipped the status-only version of this rule).
+  if ((r.status === "policy-excluded" || r.status === "past-cap" || r.policy_status !== null) && r.scanned_commit_date === null)
+    throw new Error(`internal: run_unit_head ${where} is ${r.status}${r.policy_status !== null ? ` carrying policy_status=${JSON.stringify(r.policy_status)}` : ""} with a NULL scanned_commit_date — v4-native data cannot be a migrated row`);
   // policy_matched_pattern ↔ deny, both directions (the SQL CHECK covers neither the empty case nor
   // the converse).
   if (r.policy_status === "excluded-by-deny") {

@@ -255,7 +255,16 @@ describe("buildReport (§7)", () => {
       forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'policy-excluded', 0, 'excluded-by-deny', 'rel*', NULL)`).run(runId);
       forge.close();
       const db2 = AuditDb.open({ sqlitePath });
-      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/cannot be migrated rows/);
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/cannot be a migrated row/);
+      // Round-5's shape: the policy COLUMNS are v4-only too — a scanned default override with NULL
+      // provenance is equally impossible and must not slip a status-only version of the rule.
+      const forge2 = new Database(sqlitePath, { strict: true });
+      forge2.query(`DELETE FROM run_unit_head`).run();
+      forge2.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'main', 'abc', 'scanned', 1, 'excluded-by-deny', 'rel*', NULL)`).run(runId);
+      forge2.close();
+      const db3 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db3, db3.getRun(runId)!)).toThrow(/carrying policy_status.*cannot be a migrated row/);
+      db3.close();
       db2.close();
     } finally {
       rmSync(dbRoot, { recursive: true, force: true });
