@@ -1051,8 +1051,9 @@ function ruhHasUnexpectedDependents(db: Database): boolean {
 function ruhPkBinaryCollation(db: Database): boolean {
   const pk = db.query("SELECT name FROM pragma_index_list('run_unit_head') WHERE origin='pk'").get() as { name: string } | null;
   if (pk === null) return false; // no composite-PK autoindex — not our shape
-  const cols = db.query("SELECT coll FROM pragma_index_xinfo(?) WHERE key = 1").all(pk.name) as Array<{ coll: string | null }>;
-  return cols.length === 4 && cols.every((c) => (c.coll ?? "BINARY").toUpperCase() === "BINARY");
+  const cols = db.query('SELECT coll, "desc" AS d FROM pragma_index_xinfo(?) WHERE key = 1').all(pk.name) as Array<{ coll: string | null; d: number }>;
+  // desc joined coll in round 5: a DESC PK member is a different scan order under the same key set.
+  return cols.length === 4 && cols.every((c) => (c.coll ?? "BINARY").toUpperCase() === "BINARY" && c.d === 0);
 }
 
 // Does ANY other table declare a foreign key REFERENCING `target`? A rebuild that DROPs `target` with
@@ -1284,6 +1285,14 @@ function classifyRunUnitHead(db: Database): RuhClass {
     return { kind: "incompatible", reason: "run_unit_head declares a COLLATE clause — our shape never does (a non-BINARY collation changes CHECK and comparison semantics)" };
   if (sql !== null && hasStrictToken(sql))
     return { kind: "incompatible", reason: "run_unit_head is declared STRICT — our shape never is (STRICT changes type-affinity semantics)" };
+  // ON CONFLICT clauses (e.g. PK/NOT NULL ... ON CONFLICT REPLACE) silently turn constraint hits
+  // into row replacement/mutation, and DEFERRABLE FKs defer enforcement to COMMIT — both change
+  // write semantics invisibly to every structural probe (round-5, each demonstrated as adopted).
+  // Our DDL never declares either token.
+  if (sql !== null && sqlHasBareToken(sql, "conflict"))
+    return { kind: "incompatible", reason: "run_unit_head declares an ON CONFLICT clause — our shape never does (it silently changes constraint-violation behavior)" };
+  if (sql !== null && sqlHasBareToken(sql, "deferrable"))
+    return { kind: "incompatible", reason: "run_unit_head declares a DEFERRABLE foreign key — our shape never does (it defers enforcement to COMMIT)" };
   if (colsMatch(cols, RUH_V4_COLSPEC)) {
     if (!checksEqual(checks, RUH_V4_CHECKS))
       return { kind: "incompatible", reason: "run_unit_head has the v4 columns but not the exact v4 CHECK set" };

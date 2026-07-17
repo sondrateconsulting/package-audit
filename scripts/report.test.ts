@@ -239,6 +239,29 @@ describe("buildReport (§7)", () => {
   // buildReportInner exists to prevent: the guard used to run only over policy-BEARING rows, while the
   // summary counts by status alone, so these were counted (or labelled) without ever being validated.
 
+  test("the ledger FAILS CLOSED on a BLOB smuggled into a text column — non-STRICT storage, foreign runtime type", () => {
+    // SQLite without STRICT stores any type; bun:sqlite returns a Uint8Array the row type never
+    // admits (round-5: a one-byte BLOB deny pattern exported as {"0":120}).
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-blob-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'policy-excluded', 0, 'excluded-by-deny', x'78', '2025-06-01T00:00:00Z')`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/foreign runtime type/);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
   test("the ledger FAILS CLOSED on a v4-native disposition claiming MIGRATED provenance (NULL date)", () => {
     // v3 had only scanned/skipped-cutoff, so a policy-excluded row with the migrated-row NULL
     // sentinel is impossible provenance — and the NULL would otherwise exempt it from the native

@@ -3807,6 +3807,22 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/wrong definition|incompatible/);
   });
 
+  test("fingerprint: an ON CONFLICT clause is rejected — it silently changes constraint-violation behavior", () => {
+    const path = nextFile();
+    forgeRuh(path, v4Ruh({ pk: "PRIMARY KEY (run_id, organization, repository, branch) ON CONFLICT REPLACE" }));
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/ON CONFLICT/);
+  });
+  test("fingerprint: a DEFERRABLE foreign key is rejected — enforcement deferred to COMMIT", () => {
+    const path = nextFile();
+    forgeRuh(path, v4Ruh({ cols: V4_RUH_PARTS.cols.replace("REFERENCES runs(run_id)", "REFERENCES runs(run_id) DEFERRABLE INITIALLY DEFERRED") }));
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/DEFERRABLE/);
+  });
+  test("fingerprint: a DESC member of the composite PRIMARY KEY is rejected", () => {
+    const path = nextFile();
+    forgeRuh(path, v4Ruh({ pk: "PRIMARY KEY (run_id, organization DESC, repository, branch)" }));
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/primary key|incompatible/);
+  });
+
   // Direct pins for extractChecks' trivia handling — the property the DEFAULT-string fixture above
   // cannot reach (SQL quote-doubling makes exact-match acceptance impossible through a literal).
   test("extractChecks: CHECK-like text inside a string literal or comment yields NO checks; real ones are extracted with duplicates preserved", () => {

@@ -97,6 +97,17 @@ export function policyStatusOrThrow(r: PolicyDispositionRow, where: string): Pol
 // All are states the chokepoint forbids — but it runs at WRITE time, not here. Fail, never guess: the
 // inference this module exists to prevent is "policy-bearing and not an override, therefore excluded".
 export function assertRunUnitHeadSound(r: PolicyDispositionRow, where: string): void {
+  // RUNTIME types first: the table is not STRICT, so SQLite happily stores a BLOB in any of these
+  // columns and bun:sqlite hands it over as a Uint8Array the TypeScript row type never admits
+  // (round-5: a one-byte BLOB deny pattern exported as {"0":120}). A declared type is not a check.
+  if (typeof r.status !== "string" || typeof r.commit_sha !== "string")
+    throw new Error(`internal: run_unit_head ${where} has a non-string status/commit_sha — non-STRICT storage smuggled a foreign runtime type`);
+  if ((r.policy_status !== null && typeof r.policy_status !== "string") ||
+      (r.policy_matched_pattern !== null && typeof r.policy_matched_pattern !== "string") ||
+      (r.scanned_commit_date !== null && typeof r.scanned_commit_date !== "string"))
+    throw new Error(`internal: run_unit_head ${where} has a non-string policy/date column — non-STRICT storage smuggled a foreign runtime type`);
+  if (r.is_default_branch !== null && !Number.isInteger(r.is_default_branch))
+    throw new Error(`internal: run_unit_head ${where} has a non-integer is_default_branch — non-STRICT storage smuggled a foreign runtime type`);
   if (!isKnownStatus(r.status))
     throw new Error(`internal: run_unit_head ${where} has status=${JSON.stringify(r.status)}, outside the four known dispositions — it belongs to no report bucket`);
   if (r.policy_status !== null && !isKnownPolicyStatus(r.policy_status))
