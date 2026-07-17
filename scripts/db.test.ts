@@ -2677,6 +2677,16 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     db.close();
   });
 
+  test("G1b: a '!'-prefixed pattern is rejected at the WRITE chokepoint — the read gate refuses it, so storing it would poison the run", () => {
+    // Reviewer-found asymmetry: the read gate (assertRunUnitHeadSound) refuses a stored '!' pattern,
+    // but the chokepoint accepted it — so a buggy future writer could durably store a row that makes
+    // every later report/compare/default-export throw FOREVER for that run. Fail at write instead.
+    // (compileBranchPolicy already rejects leading-'!' at config load; this guards the DIRECT door.)
+    const db = fresh();
+    expect(() => seed(db, { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: "!release/**" })).toThrow(/names no causing pattern|'!'/);
+    db.close();
+  });
+
   test("G2: a pattern without excluded-by-deny is rejected (allow-miss and no-exclusion carry none)", () => {
     const db = fresh();
     expect(() => seed(db, { isDefaultBranch: true, policyStatus: "excluded-by-allow", policyMatchedPattern: "feat/*" })).toThrow(/must be null unless excluded-by-deny/);

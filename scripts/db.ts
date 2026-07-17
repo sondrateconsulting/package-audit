@@ -1624,10 +1624,15 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   if (!isIsoInstant(h.scannedCommitDate))
     fail(`run_unit_head ${where}: scanned_commit_date must be an ISO instant (got ${JSON.stringify(h.scannedCommitDate.slice(0, 40))})`);
   // Policy pattern (PROMPT.md §3): a deny row MUST name a real, NON-EMPTY causing pattern (the deny CHECK
-  // only enforces IS NOT NULL, and '' passes it). Every non-deny disposition carries NO pattern.
+  // only enforces IS NOT NULL, and '' passes it). Every non-deny disposition carries NO pattern. The
+  // '!' rejection MIRRORS the read gate (policyDisposition.ts::assertRunUnitHeadSound) exactly: a '!'
+  // prefix is config syntax, never a stored pattern (compileBranchPolicy rejects it at load), and the
+  // gate refuses it on read — so accepting it HERE would durably store a row every later
+  // report/compare/default-export throws on. The chokepoint and the gate must agree, or the tool can
+  // poison its own database; keep the two predicates in lockstep.
   if (h.policyStatus === "excluded-by-deny") {
-    if (h.policyMatchedPattern === null || h.policyMatchedPattern.length === 0)
-      fail(`run_unit_head ${where}: excluded-by-deny requires a non-empty policy_matched_pattern`);
+    if (h.policyMatchedPattern === null || h.policyMatchedPattern.length === 0 || h.policyMatchedPattern.startsWith("!"))
+      fail(`run_unit_head ${where}: excluded-by-deny requires a non-empty policy_matched_pattern without the '!' config prefix (got ${JSON.stringify(h.policyMatchedPattern)})`);
   } else if (h.policyMatchedPattern !== null) {
     fail(`run_unit_head ${where}: policy_matched_pattern must be null unless excluded-by-deny (policy_status=${h.policyStatus ?? "null"})`);
   }
