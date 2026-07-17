@@ -1711,16 +1711,25 @@ export class AuditDb {
           `database schema version ${userVersion} is older than this tool's ${SCHEMA_VERSION} — ` +
             "run `bun run audit` once to migrate it, then retry",
         );
-      // Schema sanity up front: a foreign file, or one missing an audit table or the expected v4
-      // run_unit_head shape, must fail HERE with an actionable message, not later with a raw "no
-      // such table"/"no such column" mid-query. openReadOnly cannot migrate, so it DISTINGUISHES an
-      // INCOMPATIBLE database (a different-build v4 — use the matching build or a new db path) from a
-      // merely under-repaired one (run `bun run audit` once). The stamp is == SCHEMA_VERSION here
-      // (both < and > are rejected above), so any non-ours-v4 shape is a genuine mismatch.
-      // The INCOMPATIBILITY discriminator runs FIRST — a foreign/sibling database (e.g. runs.outcome)
-      // must get the incompatible message even when it is ALSO missing an audit table, because "run
-      // bun run audit" cannot repair it (the writer open rejects the same file). Only after that do we
-      // give the missing-table repair advice for a genuinely under-repaired ours database.
+      // Schema sanity up front: an INCOMPATIBLE database — a sibling/foreign run_unit_head shape,
+      // the known runs.outcome sibling marker, an inbound FK into run_unit_head, or run_unit_head
+      // missing beside runs — or one missing an audit table must fail HERE with an actionable
+      // message, not later with a raw "no such table"/"no such column" mid-query. OWNERSHIP is
+      // deliberately NOT re-proven on the read path: a file the WRITER refuses solely for carrying
+      // an extra non-audit table (assertOwnedDatabase) still opens read-only — a readonly
+      // connection creates/adopts no schema objects (its filesystem residuals are sidecar-level
+      // only: it may create missing -wal/-shm files or mutate an existing -shm wal-index), and
+      // refusing the read would deny report access to real audit data. openReadOnly cannot
+      // migrate, so it DISTINGUISHES an INCOMPATIBLE database (a different-build v4 — use the
+      // matching build or a new db path) from a merely under-repaired one (run `bun run audit`
+      // once). The stamp is == SCHEMA_VERSION here (both < and > are rejected above), so for a
+      // PRESENT run_unit_head any shape other than the ours-v4 forms (± the repairable missing
+      // ix_ruh_loc) is a genuine mismatch.
+      // The INCOMPATIBILITY discriminator runs FIRST — a database caught by these gates (e.g.
+      // runs.outcome) must get the incompatible message even when it is ALSO missing an audit
+      // table, because "run bun run audit" cannot repair it (the writer open rejects the same
+      // file). Only after that does the missing-table advice fire — advice that presumes the file
+      // is otherwise ours/repairable, which this read path does not re-prove.
       const incompatible = (why: string): never =>
         fail(`database is incompatible with this tool build (${why}) — use the matching tool build or a new database path`);
       const cls = classifyRunUnitHead(db);
