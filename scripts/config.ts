@@ -92,11 +92,17 @@ function optBool(o: Record<string, unknown>, key: string, dflt: boolean): boolea
   if (!isBool(v)) fail(`${key} must be a boolean`);
   return v;
 }
+// Items must be NON-EMPTY strings: config.schema.json declares minLength 1 on every array this
+// helper backs (excludeOrganizations, excludeDirGlobs), and an empty org name or glob is always
+// operator error — "" as a glob matches nothing and as an org name is unresolvable.
 function optStringArray(o: Record<string, unknown>, key: string, dflt: string[]): string[] {
   const v = o[key];
   if (v === undefined || v === null) return [...dflt];
-  if (!Array.isArray(v) || !v.every(isString)) fail(`${key} must be an array of strings`);
-  return v as string[];
+  if (!Array.isArray(v)) fail(`${key} must be an array of strings`);
+  return (v as unknown[]).map((el, i) => {
+    if (!isString(el) || el.length === 0) fail(`${key}[${i}] must be a non-empty string`);
+    return el as string;
+  });
 }
 
 // ---- unknown-key rejection (strict at every object level) ---------------------------------
@@ -153,8 +159,13 @@ function normalizeGithubHost(o: Record<string, unknown>): string {
 function normalizeOrganizations(o: Record<string, unknown>): string[] | null {
   const v = o["organizations"];
   if (v === undefined || v === null) return null; // discover mode
-  if (!Array.isArray(v) || !v.every(isString)) fail(`organizations must be null or an array of strings`);
-  return v as string[]; // [] = configured-empty (distinct from null); [..] = allowlist
+  if (!Array.isArray(v)) fail(`organizations must be null or an array of strings`);
+  // [] = configured-empty (distinct from null); [..] = allowlist. Items must be non-empty
+  // (schema: minLength 1) — an empty org name is always operator error.
+  return (v as unknown[]).map((el, i) => {
+    if (!isString(el) || el.length === 0) fail(`organizations[${i}] must be a non-empty string`);
+    return el as string;
+  });
 }
 
 // A branch-policy pattern (exact name or Bun glob) at index i of `listName`. Rejects a non-string,

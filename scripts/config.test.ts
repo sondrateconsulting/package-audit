@@ -81,10 +81,23 @@ describe("validateAndNormalize — validation failures", () => {
     ["branches not null and not array", { ...baseRaw(), branches: "main" }],
     ["excludeBranches not an array", { ...baseRaw(), excludeBranches: "dependabot/*" }],
     ["non-string branch element", { ...baseRaw(), branches: [123] }],
+    ["empty-string organization", { ...baseRaw(), organizations: ["acme", ""] }],
+    ["non-string organization element", { ...baseRaw(), organizations: [42] }],
+    ["empty-string excludeOrganization", { ...baseRaw(), excludeOrganizations: [""] }],
+    ["empty-string excludeDirGlob", { ...baseRaw(), excludeDirGlobs: ["**/dist/**", ""] }],
     ["non-object root", 42 as unknown as Record<string, unknown>],
   ];
   for (const [name, raw, env] of bad)
     test(name, () => expect(() => norm(raw, env)).toThrow(ConfigError));
+
+  test("empty-string item diagnostics name the key and the index", () => {
+    expect(() => norm({ ...baseRaw(), organizations: ["acme", ""] }))
+      .toThrow(/organizations\[1\] must be a non-empty string/);
+    expect(() => norm({ ...baseRaw(), excludeOrganizations: [""] }))
+      .toThrow(/excludeOrganizations\[0\] must be a non-empty string/);
+    expect(() => norm({ ...baseRaw(), excludeDirGlobs: ["**/dist/**", ""] }))
+      .toThrow(/excludeDirGlobs\[1\] must be a non-empty string/);
+  });
 });
 
 describe("computeConfigHash — determinism + scope", () => {
@@ -412,6 +425,18 @@ describe("config.schema.json ↔ runtime sync", () => {
   });
   test("packages.items requires exactly name", () => {
     expect(schema["properties"]["packages"]["items"]["required"]).toEqual(["name"]);
+  });
+  test("every items.minLength constraint in the schema is runtime-enforced ([\"\"] throws)", () => {
+    // Derived FROM the schema, then pinned: a new string-array key gaining items.minLength must be
+    // added to the expected list (loud), and every listed key must actually reject an empty item at
+    // runtime — so schema/code drift on array items fails here instead of shipping.
+    const constrained = Object.entries<Record<string, any>>(schema["properties"])
+      .filter(([, prop]) => prop["items"]?.["type"] === "string" && prop["items"]?.["minLength"] >= 1)
+      .map(([key]) => key)
+      .sort();
+    expect(constrained).toEqual(["branches", "excludeBranches", "excludeDirGlobs", "excludeOrganizations", "organizations"]);
+    for (const key of constrained)
+      expect(() => norm({ ...baseRaw(), [key]: [""] })).toThrow(ConfigError);
   });
   test("every schema 'default' annotation equals the actual runtime default", () => {
     // required keys only, so every optional field falls back to its runtime default; a schema
