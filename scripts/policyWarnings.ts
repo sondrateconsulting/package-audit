@@ -7,13 +7,16 @@
 // (branchPolicy.ts's fail-closed contract states the throw scope). Warnings are ADVISORY: they
 // never fail a run, and are NOT recorded in the DB / errors / report.
 //
-// The surface answers ONE question: is a rule you configured doing nothing? A rule can be dead two
-// ways, and both warn: it matched no branch at all, or (deny only) its only matches were DEFAULT
-// branches, which are always scanned — so it excluded nothing. The second is the more surprising:
-// the rule matched and was overridden anyway. It is not redundant with the "N default-branch policy
-// override(s)" count, which is branch-level, folds deny and allow together, cannot show that a
-// SPECIFIC pattern was globally dead, and is printed only by `--plan` (runSummaryText omits it, so a
-// real run would otherwise report nothing at all).
+// The surface answers ONE question: did your policy do something OTHER than what you'd assume? Two of
+// the three kinds report a DEAD rule — it matched no branch at all, or (deny only) its only matches
+// were DEFAULT branches, which are always scanned, so it excluded nothing. The second is the more
+// surprising: the rule matched and was overridden anyway. It is not redundant with the "N
+// default-branch policy override(s)" count, which is branch-level, folds deny and allow together,
+// cannot show that a SPECIFIC pattern was globally dead, and is printed only by `--plan`
+// (runSummaryText omits it, so a real run would otherwise report nothing at all).
+// `empty-allowlist` is the INVERSE and must not be described as a dead rule: `branches: []` is doing a
+// great deal — dropping every non-default branch — and warns because that is easy to write by accident,
+// not because it is inert.
 import type { CompiledBranchPolicy, RepoPolicyCoverage } from "./branchPolicy.ts";
 
 export type PolicyWarning =

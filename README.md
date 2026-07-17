@@ -137,7 +137,7 @@ Every field is documented in [config.schema.json](config.schema.json) (your edit
 
 ### Branch policy
 
-`branches` (allowlist) and `excludeBranches` (denylist) select branches by name — exact strings or Bun globs, case-sensitive, never regex. `*` does not cross `/` but `**` does, so `release/**` catches `release/v2/rc1` and `release/*` does not. A leading `!` is rejected (no negation). Both are root-level; the unrelated `concurrency.branches` is a parallelism limit.
+`branches` (allowlist) and `excludeBranches` (denylist) select branches by name — exact strings or Bun globs, case-sensitive, never regex. `*` does not cross `/` but `**` does, so `release/**` catches `release/v2/rc1` and `release/*` does not. A leading `!` is rejected (no negation). Both are root-level — `concurrency.branches` is an unrelated setting that merely shares the word.
 
 Precedence:
 
@@ -157,7 +157,7 @@ Policy is applied **before** cutoff and cap, so a denied recent branch never con
 
 Every non-default branch stays eligible except `release/…` at any depth — but a repository whose *default* is `release/2.x` is still scanned.
 
-Editing either list changes `config_hash`, so the next audit starts a fresh run rather than resuming; the old hash's queue rows survive and are reused if you change back (reordering or duplicating entries changes nothing — the lists are canonicalized). Preview with `bun run audit --plan`, which also warns, advisorily, about an empty allowlist, a pattern that matched no discovered branch, and a deny pattern whose only matches were default branches.
+Editing either list changes `config_hash`, so the next audit starts a fresh run rather than resuming; the old hash's queue rows survive and are reused if you change back (reordering or duplicating entries changes nothing — the lists are canonicalized). Preview with `bun run audit --plan`. It also prints advisory warnings: two for a rule that is doing nothing (a pattern that matched no discovered branch; a deny pattern whose only matches were default branches), and one for `branches: []`, which is the opposite — a rule doing a great deal, since it drops every non-default branch.
 
 ## Reading a run
 

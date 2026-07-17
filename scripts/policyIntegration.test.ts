@@ -165,7 +165,7 @@ describe("branch allow/deny — end-to-end policy classification seam", () => {
 describe("branch allow/deny — a policy-excluded branch never leaks stale findings (regression pin)", () => {
   // Global finding rows are keyed by (org, repo, branch, commit) and shared across runs. Run A scanned
   // feature/x (findings at its real SHA); a POISON pair sits at commit_sha='' (the SHA a non-scanned
-  // row carries). Run B excludes feature/x → its head row is skipped-cutoff + commit_sha=''. Run B's
+  // row carries). Run B excludes feature/x → its head row is policy-excluded + commit_sha=''. Run B's
   // report/export must surface NEITHER: the real finding fails the commit conjunct, the poison fails
   // ONLY the status='scanned' conjunct — so this test is what makes that predicate load-bearing.
   const ORG = "org-a", REPO = "svc";
@@ -204,7 +204,7 @@ describe("branch allow/deny — a policy-excluded branch never leaks stale findi
       const aBranches = new Set(reportA.packages[0].usageByRepo.map((u: any) => u.branch));
       expect(aBranches.has("feature/x")).toBe(true); // non-vacuous: feature/x DID have findings when scanned
 
-      // Run B denies feature/x → skipped-cutoff + commit_sha='' (the poison's SHA). main stays scanned.
+      // Run B denies feature/x → policy-excluded + commit_sha='' (the poison's SHA). main stays scanned.
       const runIdB = db.startRun({ configHash: "b", effectiveOwners: [ORG], ownersSource: "configured", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" }).runId;
       db.upsertRunUnitHead(scannedHead(runIdB, "main", MAIN_SHA, true));
       db.upsertRunUnitHead({ runId: runIdB, organization: ORG, repository: REPO, branch: "feature/x", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*", scannedCommitDate: "2025-06-01T00:00:00Z" });

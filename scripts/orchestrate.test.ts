@@ -608,7 +608,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
   const badGlobError = new Error("bad glob"); // the exact injected cause — used to prove identity on rethrow
   const throwingPolicy = { include: null, exclude: [{ pattern: "boom*", glob: throwingGlob(badGlobError) }] };
 
-  test("a denied NON-default branch persists as skipped-cutoff + policy attribution, and is never scanned", async () => {
+  test("a denied NON-default branch persists as policy-excluded + policy attribution, and is never scanned", async () => {
     const root = mkdtempSync(join(tmpdir(), "policy-deny-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);

@@ -235,6 +235,42 @@ describe("buildReport (§7)", () => {
     }
   });
 
+  // The two shapes the ledger's OWN filter used to hide. Both are regressions the whole-set sweep in
+  // buildReportInner exists to prevent: the guard used to run only over policy-BEARING rows, while the
+  // summary counts by status alone, so these were counted (or labelled) without ever being validated.
+  test.each([
+    [
+      "policy-excluded naming NO rule is counted as an exclusion — it must not slip past the guard's null-policy early return",
+      `'policy-excluded', 0, NULL, NULL`,
+      /is status='policy-excluded' but carries no policy_status/,
+    ],
+    [
+      "a SCANNED policy row that is not the default is schema-VALID (scanned may carry a counterfactual) but must not be guessed into an override",
+      `'scanned', 0, 'excluded-by-deny', 'rel*'`,
+      /scanned row carrying policy_status.*but is_default_branch=0/,
+    ],
+  ])("the ledger FAILS CLOSED: %s", (_name, values, expected) => {
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-guard-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.exec("PRAGMA ignore_check_constraints = ON"); // only the first shape needs this; the second is schema-valid
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', ${values}, '2025-06-01T00:00:00Z')`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(expected);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
   test("the scan-scope ledger FAILS CLOSED on an OUT-OF-BAND policy_status literal (never stamped into the emitted JSON)", () => {
     // The sibling test above forges an unrecognised SHAPE; this forges an unrecognised VALUE. Both
     // shared predicates and assertKnownPolicyDisposition discriminate on (status, policy_status IS NOT

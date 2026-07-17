@@ -202,9 +202,23 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     },
     packages,
     errors,
-    summary: buildSummary(scannedHeads, heads, depRows, usageRows, branchesErrored),
+    // Validate EVERY head once, before any derivation reads it. Not a filtered subset: the counted set
+    // must be a SUPERSET-safe subset of the guarded set, and keeping the guard at each read site is
+    // exactly how that broke — buildScanScope guards only policy-BEARING rows, while buildSummary
+    // counts by status alone, so a 'policy-excluded' row naming no rule was counted as an exclusion and
+    // never guarded (the report then contradicted itself: branchesExcludedByPolicy=1 with
+    // excludedByDeny+excludedByAllow=0). Sweeping the whole set here makes the two sets impossible to
+    // drift apart. The guard early-returns on the common unlabelled row, so this is one cheap pass.
+    summary: buildSummary(scannedHeads, assertHeadsWellFormed(heads), depRows, usageRows, branchesErrored),
     scanScope: buildScanScope(heads),
   };
+}
+
+// The whole-set fail-closed sweep (PROMPT.md §7). Returns its input so it composes at the call site —
+// there is no path to a derived count that skips it.
+function assertHeadsWellFormed(heads: HeadRow[]): HeadRow[] {
+  for (const h of heads) assertKnownPolicyDisposition(h, `${h.organization}/${h.repository}@${h.branch}`);
+  return heads;
 }
 
 function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[], branchesErrored: number): ReportSummary {

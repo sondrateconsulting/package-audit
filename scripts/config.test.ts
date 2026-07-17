@@ -99,8 +99,8 @@ describe("validateAndNormalize — validation failures", () => {
       .toThrow(/excludeDirGlobs\[1\] must be a non-empty string/);
   });
 
-  // `organizations` and `branches` each name a root-level allowlist AND a concurrency parallelism
-  // limit. The hint fires only when the VALUE fits the sibling — a wrong hint is worse than none.
+  // `organizations` and `branches` each name a root-level allowlist AND a key under `concurrency`.
+  // The hint fires only when the VALUE fits the sibling — a wrong hint is worse than none.
   describe("sibling-key hints for the root/concurrency name collision", () => {
     const conc = (over: Record<string, unknown>) =>
       ({ ...baseRaw(), concurrency: { organizations: 3, repositories: 6, branches: 4, ...over } });
@@ -112,14 +112,16 @@ describe("validateAndNormalize — validation failures", () => {
         .toThrow(/concurrency\.organizations must be a positive integer — for a list of organization names you likely meant the root-level "organizations" allowlist/);
     });
 
+    // Only maxBranchesPerRepo is DESCRIBED: concurrency.branches is validated but never consumed at
+    // runtime, so calling it a parallelism control would be a fresh false claim (see config.ts).
     test("a NUMBER under root branches names BOTH numeric twins — guessing between them would be a coin flip", () => {
       expect(() => norm({ ...baseRaw(), branches: 4 }))
-        .toThrow(/branches must be null or an array of strings — for a number you likely meant "concurrency\.branches" \(per-repo branch parallelism\) or "maxBranchesPerRepo" \(the per-repo branch cap\)/);
+        .toThrow(/branches must be null or an array of strings — for a number you likely meant "maxBranchesPerRepo" \(the per-repo branch cap\) or "concurrency\.branches"/);
     });
 
     test("a NUMBER under root organizations names its one twin", () => {
       expect(() => norm({ ...baseRaw(), organizations: 3 }))
-        .toThrow(/organizations must be null or an array of strings — for a number you likely meant "concurrency\.organizations" \(owner-level parallelism\)/);
+        .toThrow(/organizations must be null or an array of strings — for a number you likely meant "concurrency\.organizations"/);
     });
 
     test("SILENT when the value fits no sibling: the base error stands alone", () => {

@@ -337,6 +337,10 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     db.upsertRunUnitHead({ ...base, branch: "stale", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null });
     // past the per-repo cap (never carries policy)
     db.upsertRunUnitHead({ ...base, branch: "wip", commitSha: "", status: "past-cap", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null });
+    // A GENUINE cutoff skip — the fourth disposition. Without it the golden proved only three, while its
+    // header claimed four: policy exclusions moved to their own status and took the last skipped-cutoff
+    // row with them.
+    db.upsertRunUnitHead({ ...base, branch: "ancient", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null });
     db.completeRun(runId);
     return db.getRun(runId)!;
   }
@@ -351,11 +355,12 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     const header = "run_id,organization,repository,branch,commit_sha,status,is_default_branch,policy_status,policy_matched_pattern,scanned_commit_date";
     // rows in ORDER BY (run_id, organization, repository, branch); '=cmd|calc' → literal apostrophe
     // prefix (formula defense); is_default_branch is a typed number (never prefixed); NULLs are empty.
+    const ancient = `${id},org-a,svc,ancient,,skipped-cutoff,0,,,${D}`; // the GENUINE cutoff skip
     const feature = `${id},org-a,svc,feature-x,,policy-excluded,0,excluded-by-deny,'=cmd|calc,${D}`;
     const main = `${id},org-a,svc,main,aaa111,scanned,1,,,${D}`;
     const stale = `${id},org-a,svc,stale,,policy-excluded,0,excluded-by-allow,,${D}`;
     const wip = `${id},org-a,svc,wip,,past-cap,0,,,${D}`;
-    expect(readXray(out, "run_unit_head.csv")).toBe([header, feature, main, stale, wip].join("\r\n") + "\r\n");
+    expect(readXray(out, "run_unit_head.csv")).toBe([header, ancient, feature, main, stale, wip].join("\r\n") + "\r\n");
     db.close();
   });
 
@@ -366,13 +371,22 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     await capture(() => exportRun(db, run, out, { raw: false }));
     const content = readXray(out, "run_unit_head.jsonl");
     const lines = content.split("\n").filter((l) => l.length > 0);
-    expect(lines).toHaveLength(4);
-    // exact first line (feature-x): keys in registry order, is_default_branch a JSON number, pattern byte-faithful
-    expect(lines[0]).toBe(
+    expect(lines).toHaveLength(5);
+    // exact feature-x line (2nd by branch order): keys in registry order, is_default_branch a JSON
+    // number, pattern byte-faithful. The 1st line is the genuine cutoff skip, asserted below.
+    expect(lines[1]).toBe(
       JSON.stringify({
         run_id: run.runId, organization: "org-a", repository: "svc", branch: "feature-x",
         commit_sha: "", status: "policy-excluded", is_default_branch: 0,
         policy_status: "excluded-by-deny", policy_matched_pattern: "=cmd|calc", scanned_commit_date: "2025-06-01T12:00:00Z",
+      }),
+    );
+    // The GENUINE cutoff skip: same NULL policy columns as a scanned row, distinguished by status alone.
+    expect(lines[0]).toBe(
+      JSON.stringify({
+        run_id: run.runId, organization: "org-a", repository: "svc", branch: "ancient",
+        commit_sha: "", status: "skipped-cutoff", is_default_branch: 0,
+        policy_status: null, policy_matched_pattern: null, scanned_commit_date: "2025-06-01T12:00:00Z",
       }),
     );
     // no formula-defense apostrophe in JSONL; the scanned default carries JSON null policy columns

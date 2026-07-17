@@ -169,7 +169,7 @@ describe("buildCompare — added/removed sites", () => {
 });
 
 // A policy-aware run_unit_head writer for policy-churn tests. Honors the write invariants:
-// scanned+policy → default; skipped/past-cap policy → non-default; deny → non-empty pattern.
+// scanned+policy → default; policy-excluded → non-default; cutoff/past-cap → no policy; deny → non-empty pattern.
 function phead(
   db: AuditDb, runId: string, branch: string,
   o: {
@@ -263,6 +263,38 @@ describe("buildCompare — policy churn", () => {
     expect(() => buildCompare(db2, db2.getRun(runA.runId)!, db2.getRun(runB.runId)!)).toThrow(
       /neither a policy exclusion nor a default-branch override/,
     );
+    db2.close();
+  });
+
+  // The other two disagreements the shared guard rejects. compare already runs it over EVERY head (it
+  // never filtered to policy-bearing rows), so these pin that it stays that way — the report's ledger
+  // regressed on exactly this by guarding a filtered subset while counting the full set.
+  test.each([
+    [
+      "policy-excluded naming NO rule",
+      `'policy-excluded', 0, NULL, NULL`,
+      /is status='policy-excluded' but carries no policy_status/,
+    ],
+    [
+      "a SCANNED policy row that is not the default (schema-valid, still not an override)",
+      `'scanned', 0, 'excluded-by-deny', 'rel*'`,
+      /scanned row carrying policy_status.*but is_default_branch=0/,
+    ],
+  ])("policy churn FAILS CLOSED on %s", (_name, values, expected) => {
+    const path = nextFile();
+    const db = AuditDb.open({ sqlitePath: path });
+    const runA = startCompleted(db, ["expo"]);
+    const runB = startCompleted(db, ["expo"]);
+    phead(db, runA.runId, "main", { isDefaultBranch: true });
+    phead(db, runB.runId, "main", { isDefaultBranch: true });
+    const runBId = runB.runId;
+    db.close();
+    const forge = new Database(path, { strict: true });
+    forge.exec("PRAGMA ignore_check_constraints = ON"); // only the first shape needs it; the second is schema-valid
+    forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', ${values}, '2025-06-01T00:00:00Z')`).run(runBId);
+    forge.close();
+    const db2 = AuditDb.open({ sqlitePath: path });
+    expect(() => buildCompare(db2, db2.getRun(runA.runId)!, db2.getRun(runB.runId)!)).toThrow(expected);
     db2.close();
   });
 

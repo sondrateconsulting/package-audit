@@ -76,16 +76,21 @@ const isBool = (v: unknown): v is boolean => typeof v === "boolean";
 const isPosInt = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 1;
 
 // ---- sibling-key hints for the two names that exist at BOTH levels ---------------------------
-// `organizations` and `branches` each name a root-level ALLOWLIST *and* a `concurrency` PARALLELISM
-// limit — two unrelated settings, one word. config.schema.json warns about the collision inline, but
-// nobody reads a schema description while staring at a startup failure, so the error itself says
-// where the value belongs (the same "name where each thing goes" idea as the `!`-rejection below).
+// `organizations` and `branches` each name a root-level ALLOWLIST *and* a key under `concurrency` —
+// two unrelated settings, one word. config.schema.json notes the collision inline, but nobody reads a
+// schema description while staring at a startup failure, so the error itself says where the value
+// belongs (the same "name where each thing goes" idea as the `!`-rejection below).
 // Both hints fire ONLY when the value's shape actually fits the sibling: a wrong hint — telling
 // someone they meant the other key when they simply mistyped this one — is worse than no hint.
 // `concurrency.repositories` has no root-level twin and never hints.
+// The hints name a DESTINATION and deliberately do not describe what the concurrency keys DO: only
+// `concurrency.repositories` is read at runtime (github.ts's global in-flight cap); `organizations`
+// and `branches` are validated, required, and then never consumed — owners/repos/branches are all
+// iterated sequentially. Calling them parallelism controls here would be a fresh false claim on top
+// of the schema's existing one.
 
 // A LIST of non-empty names under `concurrency.<k>` can only have been meant as the root-level
-// allowlist: a parallelism limit is never a list. Unambiguous, so name the one key it must be.
+// allowlist: a count is never a list. Unambiguous, so name the one key it must be.
 // A '!'-prefixed entry is rejected by the root allowlist too (glob negation is unsupported), so
 // pointing there would just trade one error for another — stay silent instead.
 function concurrencyListHint(key: string, v: unknown): string {
@@ -95,15 +100,16 @@ function concurrencyListHint(key: string, v: unknown): string {
   return ` — for a list of ${noun} names you likely meant the root-level "${key}" allowlist`;
 }
 
-// A positive integer under a root-level allowlist key is the mirror-image mix-up. `organizations`
-// has exactly one numeric twin; `branches` has TWO plausible ones (per-repo parallelism vs the
-// per-repo cap) and guessing between them would be a coin flip, so name both and let the operator
-// pick. Any other numeric shape (0, negative, float) fits no sibling and gets no hint.
+// A positive integer under a root-level allowlist key is the mirror-image mix-up. `organizations` has
+// exactly one numeric twin; `branches` has TWO plausible ones and guessing between them would be a coin
+// flip, so name both and let the operator pick. Only `maxBranchesPerRepo` is described, because it is
+// the only one of the three whose behavior can be stated truthfully (see the note above).
+// Any other numeric shape (0, negative, float) fits no sibling and gets no hint.
 function allowlistNumberHint(key: "organizations" | "branches", v: unknown): string {
   if (!isPosInt(v)) return "";
   return key === "branches"
-    ? ` — for a number you likely meant "concurrency.branches" (per-repo branch parallelism) or "maxBranchesPerRepo" (the per-repo branch cap)`
-    : ` — for a number you likely meant "concurrency.organizations" (owner-level parallelism)`;
+    ? ` — for a number you likely meant "maxBranchesPerRepo" (the per-repo branch cap) or "concurrency.branches"`
+    : ` — for a number you likely meant "concurrency.organizations"`;
 }
 
 function reqString(o: Record<string, unknown>, key: string, ctx: string): string {

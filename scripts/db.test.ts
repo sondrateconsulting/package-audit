@@ -3517,31 +3517,60 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     f.close();
   }
 
-  test("CHECK tokenizer: a v4-shaped table whose status CHECK also admits 'reused' via an OR-clause is rejected", () => {
-    const path = nextFile();
-    forgeRuh(path, `CREATE TABLE run_unit_head (
-      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
+  // The CURRENT ours-v4 run_unit_head DDL, assembled from overridable parts. Every negative fixture
+  // below builds from this and mutates EXACTLY the one property its test names, inheriting the rest.
+  //
+  // This helper exists because hand-copying the whole body per test silently rotted them: when the v4
+  // CHECK set grew 'policy-excluded' plus the two status↔policy_status constraints, every hardcoded
+  // copy became a CHECK mismatch — so each test still saw 'incompatible' and still passed, but for the
+  // WRONG reason, and would have kept passing if the PK / column-type / GENERATED / UNIQUE / collation
+  // guard it actually names had regressed. A shared source of truth makes that impossible: if the real
+  // v4 shape changes again, these fixtures follow it and keep testing their own property.
+  const V4_RUH_PARTS = {
+    cols: `run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
       branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap') OR status IN ('reused')),
+      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap')),
       is_default_branch INTEGER,
       policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
-      policy_matched_pattern TEXT, scanned_commit_date TEXT,
-      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
-      PRIMARY KEY (run_id, organization, repository, branch))`);
+      policy_matched_pattern TEXT, scanned_commit_date TEXT`,
+    checks: `CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      CHECK (status <> 'policy-excluded' OR policy_status IS NOT NULL),
+      CHECK (status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL)`,
+    pk: `PRIMARY KEY (run_id, organization, repository, branch)`,
+  };
+  const v4Ruh = (over: Partial<typeof V4_RUH_PARTS> = {}): string => {
+    const p = { ...V4_RUH_PARTS, ...over };
+    return `CREATE TABLE run_unit_head (\n      ${[p.cols, p.checks, p.pk].filter((x) => x !== "").join(",\n      ")})`;
+  };
+
+  // The CONTROL for every negative fixture below. If the helper's UNMUTATED output were not accepted as
+  // ours-v4, each variant would be rejected by the helper's own drift rather than by the property its
+  // test names, and the whole block would be vacuous — exactly what happened while the bodies were
+  // hardcoded and the real v4 CHECK set moved out from under them. This test is what makes the
+  // rejections below evidence rather than coincidence.
+  test("control: the v4Ruh helper's UNMUTATED output IS ours-v4 (so each variant below is rejected only by its own mutation)", () => {
+    const path = nextFile();
+    forgeRuh(path, v4Ruh());
+    const db = AuditDb.open({ sqlitePath: path }); // accepted: the shape equals SCHEMA_SQL's run_unit_head
+    db.close();
+  });
+
+  test("CHECK tokenizer: a v4-shaped table whose status CHECK also admits 'reused' via an OR-clause is rejected", () => {
+    const path = nextFile();
+    // ONLY difference from ours-v4: the status CHECK is widened with an OR-clause admitting 'reused'.
+    forgeRuh(path, v4Ruh({
+      cols: V4_RUH_PARTS.cols.replace(
+        "CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap'))",
+        "CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap') OR status IN ('reused'))",
+      ),
+    }));
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
     expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/incompatible/); // --fresh cannot destroy it
   });
 
   test("fingerprint: v4 columns + CHECKs but NO composite primary key is rejected (not silently adopted)", () => {
     const path = nextFile();
-    forgeRuh(path, `CREATE TABLE run_unit_head (
-      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
-      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
-      is_default_branch INTEGER,
-      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
-      policy_matched_pattern TEXT, scanned_commit_date TEXT,
-      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL))`); // no PRIMARY KEY
+    forgeRuh(path, v4Ruh({ pk: "" })); // ONLY difference from ours-v4: no PRIMARY KEY
     // Shape-level ownership (colSig pk positions + the missing pk autoindex) refuses this on the
     // preflight as "did not create"; the classifier's PK checks remain the layered in-gate backstop.
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
@@ -3631,16 +3660,9 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
 
   test("fingerprint: a v4 table with an extra GENERATED column is rejected (table_xinfo, not table_info)", () => {
     const path = nextFile();
-    forgeRuh(path, `CREATE TABLE run_unit_head (
-      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
-      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
-      is_default_branch INTEGER,
-      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
-      policy_matched_pattern TEXT, scanned_commit_date TEXT,
-      extra TEXT GENERATED ALWAYS AS (branch) VIRTUAL,
-      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
-      PRIMARY KEY (run_id, organization, repository, branch))`);
+    // ONLY difference from ours-v4: one extra GENERATED column (invisible to table_info).
+    forgeRuh(path, v4Ruh({ cols: `${V4_RUH_PARTS.cols},
+      extra TEXT GENERATED ALWAYS AS (branch) VIRTUAL` }));
     // Ownership's colSig reads table_xinfo too, so the hidden column now also fails the
     // preflight shape proof ("did not create"); the classifier remains the in-gate backstop.
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
@@ -3705,44 +3727,23 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
 
   test("fingerprint: is_default_branch declared TEXT (wrong type) is rejected", () => {
     const path = nextFile();
-    forgeRuh(path, `CREATE TABLE run_unit_head (
-      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
-      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
-      is_default_branch TEXT,
-      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
-      policy_matched_pattern TEXT, scanned_commit_date TEXT,
-      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
-      PRIMARY KEY (run_id, organization, repository, branch))`);
+    // ONLY difference from ours-v4: is_default_branch declared TEXT instead of INTEGER.
+    forgeRuh(path, v4Ruh({ cols: V4_RUH_PARTS.cols.replace("is_default_branch INTEGER", "is_default_branch TEXT") }));
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
   });
 
   test("fingerprint: an extra table-level UNIQUE constraint (its autoindex) is rejected", () => {
     const path = nextFile();
-    forgeRuh(path, `CREATE TABLE run_unit_head (
-      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
-      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
-      is_default_branch INTEGER,
-      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
-      policy_matched_pattern TEXT, scanned_commit_date TEXT,
-      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
-      UNIQUE(commit_sha),
-      PRIMARY KEY (run_id, organization, repository, branch))`);
+    // ONLY difference from ours-v4: an extra table-level UNIQUE (and thus its autoindex).
+    forgeRuh(path, v4Ruh({ checks: `${V4_RUH_PARTS.checks},
+      UNIQUE(commit_sha)` }));
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
   });
 
   test("fingerprint: a NOCASE primary-key collation is rejected (would conflate case-distinct keys)", () => {
     const path = nextFile();
-    forgeRuh(path, `CREATE TABLE run_unit_head (
-      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
-      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('scanned','skipped-cutoff','past-cap')),
-      is_default_branch INTEGER,
-      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
-      policy_matched_pattern TEXT, scanned_commit_date TEXT,
-      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
-      PRIMARY KEY (run_id, organization COLLATE NOCASE, repository, branch))`);
+    // ONLY difference from ours-v4: a NOCASE collation on one primary-key column.
+    forgeRuh(path, v4Ruh({ pk: "PRIMARY KEY (run_id, organization COLLATE NOCASE, repository, branch)" }));
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible|collation/);
   });
 

@@ -281,7 +281,7 @@ and "not the default branch" are distinct report states); the step runs the idem
 CREATEs FIRST (a `--fresh` drop on a v2 database removes `run_unit_head` while the preserved caches
 keep the file non-empty, so the step must recreate missing tables before its ALTER), then stamps 3.
 Then the v3→v4 step, a crash-atomic REBUILD rather than an ALTER (SQLite cannot ALTER a CHECK, and
-v4 widens the status CHECK to admit 'past-cap'): in ONE transaction it creates a scratch table
+v4 widens the status CHECK to admit 'past-cap' and 'policy-excluded', and adds two status↔policy_status CHECKs): in ONE transaction it creates a scratch table
 carrying the v4 body, copies the v3 columns explicitly BY NAME, drops the old table, renames the
 scratch into place, re-fingerprints the result and re-checks FK integrity, and only then stamps 4.
 The step also FAILS every pre-existing RUNNING run — a migration-boundary rule — because a pre-v4
@@ -467,8 +467,25 @@ CREATE TABLE IF NOT EXISTS run_unit_head (
                                        -- the write chokepoint (assertRunUnitHeadInvariants) rejects
                                        -- the empty pattern, and also enforces the converse — every
                                        -- NON-deny disposition carries policy_matched_pattern NULL
+  CHECK (status <> 'policy-excluded' OR policy_status IS NOT NULL),
+                                       -- v4, TABLE-level: a policy exclusion MUST name the rule that
+                                       -- dropped it. The one policy-bearing status whose verdict
+                                       -- could be missing — and the read guard's null-policy early
+                                       -- return would wave it straight through
+  CHECK (status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL),
+                                       -- v4, TABLE-level: policy runs BEFORE cutoff/cap, so those
+                                       -- dispositions are only ever reached by policy-ELIGIBLE
+                                       -- branches and can never carry a verdict. 'scanned' is
+                                       -- deliberately unconstrained: it is NULL for the ordinary row
+                                       -- and NON-null for the default-branch override's
+                                       -- counterfactual (§3) — the reason policy_status survives as
+                                       -- its own column instead of collapsing into status
   PRIMARY KEY (run_id, organization, repository, branch)
 );
+-- NOTE: these five CHECKs are the v4 IDENTITY. db.ts::normalizeCheck fingerprints the exact token
+-- set to tell ours-v4 from a sibling build's v4 (adopting a foreign one, or destroying it under
+-- --fresh, are both unacceptable) — so an implementation that omits or reworks any of them produces
+-- a shape this tool REFUSES, not a compatible one.
 CREATE TABLE IF NOT EXISTS api_cache (
   method TEXT NOT NULL,                -- 'GET' (REST). GraphQL branch-discovery is never
                                        -- cached (always live, §resumability), so no 'POST' rows
