@@ -497,7 +497,7 @@ const RUN_UNIT_HEAD_V3_BODY = `
   PRIMARY KEY (run_id, organization, repository, branch)
 `;
 const referenceShapesByVersion = new Map<number, Map<string, string>>();
-function tableShapesAt(version: number): Map<string, string> {
+export function tableShapesAt(version: number): Map<string, string> {
   const cached = referenceShapesByVersion.get(version);
   if (cached !== undefined) return cached;
   const ref = new Database(":memory:", { strict: true });
@@ -608,7 +608,21 @@ function tableShape(db: Database, table: string): string {
     .replace(/`[^`]*`/g, "``")
     .replace(/\[[^\]]*\]/g, "[]");
   const autoinc = /\bautoincrement\b/i.test(ddl) ? 1 : 0;
-  return JSON.stringify({ wr: meta?.wr ?? 0, strict: meta?.strict ?? 0, autoinc, cols: colSig, fks: fkSig, idx: idxSig });
+  // CHECK bodies + the pragma-invisible tokens join the fingerprint (review-reproduced: a sibling
+  // `runs` whose status CHECK also admitted 'archived' — columns OURS exactly — was ADOPTED and
+  // --fresh dropped its rows; a COLLATE NOCASE column on a cache table survived every structural
+  // pragma). Both sides of the ownership comparison run THIS code — era reference schemas vs the
+  // disk file — so the expected CHECK multisets stay era-coupled with no hand-maintained per-table
+  // constants, and the independent control test pins the reference counts plus a literal body so
+  // the oracle cannot go circular. Every reference era is token-FREE (control-pinned), so plain
+  // equality forces the disk side token-free too; the token list is presence-of-any, never treated
+  // as sufficient identity on its own. extractChecks output is already normalizeCheck'd; sorted so
+  // declaration order can never matter (SQLite cannot ALTER-add a table CHECK, but sorting costs
+  // nothing and guards a future rebuild that reorders).
+  const rawSql = sqlRow?.sql ?? "";
+  const checks = extractChecks(rawSql).slice().sort();
+  const tokens = ["collate", "strict", "conflict", "deferrable", "match"].filter((t) => sqlHasBareToken(rawSql, t));
+  return JSON.stringify({ wr: meta?.wr ?? 0, strict: meta?.strict ?? 0, autoinc, cols: colSig, fks: fkSig, idx: idxSig, checks, tokens });
 }
 
 // The ownership question for a NON-EMPTY database: is every table present one of OURS, in a
@@ -1094,7 +1108,7 @@ function skipQuoted(sql: string, i: number): number {
 // Normalize a CHECK expression for set comparison: lowercase the UNQUOTED tokens and drop comments,
 // but preserve single-quoted string LITERALS (and quoted identifiers) verbatim — their case is
 // significant to SQLite's default BINARY comparison ('SCANNED' is a different value than 'scanned').
-function normalizeCheck(expr: string): string {
+export function normalizeCheck(expr: string): string {
   let out = "";
   let i = 0;
   const n = expr.length;
