@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso } from "./db.ts";
+import { downgradeToFaithfulV2 } from "./testFixtures.ts";
 import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
 import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
@@ -495,31 +496,12 @@ describe("runReport zero-write on a missing database", () => {
     const dbRoot = `./data/.reporttest-v2-${process.pid}-${Math.random().toString(36).slice(2)}`;
     const root = mkdtempSync(join(tmpdir(), "report-v2db-"));
     try {
-      // Faithful v2 file: a current create with run_unit_head rebuilt to the v2 era SHAPE
-      // before the v2 stamp. openReadOnly's ownership check precedes its version gate, so a
-      // fixture must actually BE a v2 database — a file whose run_unit_head matches no stamped
-      // era is refused as not-ours, which is a different test's contract.
+      // Faithful v2 file (shared fixture — see testFixtures.ts for why a rebuild, not a
+      // column drop): openReadOnly's ownership check precedes its version gate, so the fixture
+      // must actually BE a v2 database.
       const sqlitePath = join(dbRoot, "audit.db");
       AuditDb.open({ sqlitePath }).close(); // create a real current-version db…
-      const bump = new Database(sqlitePath, { strict: true });
-      // Faithful v2 file: run_unit_head rebuilt to its TRUE v2 era body before the v2 stamp — a
-      // current-schema table cannot be column-dropped into an era shape (its table-level CHECKs
-      // reference the policy columns and no ALTER can un-widen the status CHECK), and a
-      // non-era-shaped file is refused as not-ours, which is a different test's contract.
-      bump.exec(`CREATE TABLE run_unit_head__v2 (
-        run_id TEXT NOT NULL REFERENCES runs(run_id),
-        organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
-        commit_sha TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'scanned'
-          CHECK (status IN ('scanned','skipped-cutoff')),
-        PRIMARY KEY (run_id, organization, repository, branch))`);
-      bump.exec(`INSERT INTO run_unit_head__v2 (run_id, organization, repository, branch, commit_sha, status)
-        SELECT run_id, organization, repository, branch, commit_sha, status FROM run_unit_head`);
-      bump.exec("DROP TABLE run_unit_head");
-      bump.exec("ALTER TABLE run_unit_head__v2 RENAME TO run_unit_head");
-      bump.exec("CREATE INDEX IF NOT EXISTS ix_ruh_loc ON run_unit_head(organization, repository, branch, commit_sha)");
-      bump.exec("PRAGMA user_version = 2"); // …then stamp it old (ownership precedes the version gate)
-      bump.close();
+      downgradeToFaithfulV2(sqlitePath); // …then rebuild it to the v2 era + old stamp
       const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
       expect(() => runReport(cfg, null)).toThrow(/run `bun run audit` once to migrate/);
       expect(existsSync(join(root, "output"))).toBe(false); // refused before any artifact write

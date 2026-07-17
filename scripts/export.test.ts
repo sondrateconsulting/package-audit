@@ -2,8 +2,8 @@ import { expect, test, describe, afterAll, spyOn } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database } from "bun:sqlite";
 import { AuditDb, type RunRecord } from "./db.ts";
+import { downgradeToFaithfulV2 } from "./testFixtures.ts";
 import { ArgsError } from "./args.ts";
 import {
   EXPORT_HELP, EXPORT_REGISTRY, EXPORT_TABLE_NAMES, RAW_EXPORT_WARNING,
@@ -510,25 +510,9 @@ describe("runExport guards (mirroring runReport, notices to stdout only)", () =>
     try {
       const sqlitePath = join(dbRoot, "audit.db");
       AuditDb.open({ sqlitePath }).close(); // create a real current-version db…
-      const bump = new Database(sqlitePath, { strict: true });
-      // Faithful v2 file: run_unit_head rebuilt to its TRUE v2 era body before the v2 stamp — a
-      // current-schema table cannot be column-dropped into an era shape (its table-level CHECKs
-      // reference the policy columns and no ALTER can un-widen the status CHECK), and a
-      // non-era-shaped file is refused as not-ours, which is a different test's contract.
-      bump.exec(`CREATE TABLE run_unit_head__v2 (
-        run_id TEXT NOT NULL REFERENCES runs(run_id),
-        organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
-        commit_sha TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'scanned'
-          CHECK (status IN ('scanned','skipped-cutoff')),
-        PRIMARY KEY (run_id, organization, repository, branch))`);
-      bump.exec(`INSERT INTO run_unit_head__v2 (run_id, organization, repository, branch, commit_sha, status)
-        SELECT run_id, organization, repository, branch, commit_sha, status FROM run_unit_head`);
-      bump.exec("DROP TABLE run_unit_head");
-      bump.exec("ALTER TABLE run_unit_head__v2 RENAME TO run_unit_head");
-      bump.exec("CREATE INDEX IF NOT EXISTS ix_ruh_loc ON run_unit_head(organization, repository, branch, commit_sha)");
-      bump.exec("PRAGMA user_version = 2"); // …then stamp it old (ownership precedes the version gate)
-      bump.close();
+      // Faithful v2 file (shared fixture — see testFixtures.ts for why a rebuild, not a column
+      // drop): rebuilt to the v2 era + old stamp (ownership precedes the version gate).
+      downgradeToFaithfulV2(sqlitePath);
       const cfg = config(sqlitePath, join(root, "output"));
       expect(() => runExport(cfg, { runId: null, raw: false })).toThrow(/run `bun run audit` once to migrate/);
       expect(existsSync(join(root, "output"))).toBe(false); // refused before any artifact write

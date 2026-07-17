@@ -95,14 +95,20 @@ function optBool(o: Record<string, unknown>, key: string, dflt: boolean): boolea
 // Items must be NON-EMPTY strings: config.schema.json declares minLength 1 on every array this
 // helper backs (excludeOrganizations, excludeDirGlobs), and an empty org name or glob is always
 // operator error — "" as a glob matches nothing and as an org name is unresolvable.
+// ONE definition of the per-item rule every string-array config key shares (schema: items
+// minLength 1). Three different array validators consume it (optStringArray,
+// normalizeOrganizations, validateBranchPattern) and the schema-sync test pins every
+// constrained key against it, so the predicate and message cannot drift apart per key.
+function assertNonEmptyStringItem(v: unknown, label: string, i: number): string {
+  if (!isString(v) || v.length === 0) fail(`${label}[${i}] must be a non-empty string`);
+  return v;
+}
+
 function optStringArray(o: Record<string, unknown>, key: string, dflt: string[]): string[] {
   const v = o[key];
   if (v === undefined || v === null) return [...dflt];
   if (!Array.isArray(v)) fail(`${key} must be an array of strings`);
-  return (v as unknown[]).map((el, i) => {
-    if (!isString(el) || el.length === 0) fail(`${key}[${i}] must be a non-empty string`);
-    return el as string;
-  });
+  return (v as unknown[]).map((el, i) => assertNonEmptyStringItem(el, key, i));
 }
 
 // ---- unknown-key rejection (strict at every object level) ---------------------------------
@@ -162,10 +168,7 @@ function normalizeOrganizations(o: Record<string, unknown>): string[] | null {
   if (!Array.isArray(v)) fail(`organizations must be null or an array of strings`);
   // [] = configured-empty (distinct from null); [..] = allowlist. Items must be non-empty
   // (schema: minLength 1) — an empty org name is always operator error.
-  return (v as unknown[]).map((el, i) => {
-    if (!isString(el) || el.length === 0) fail(`organizations[${i}] must be a non-empty string`);
-    return el as string;
-  });
+  return (v as unknown[]).map((el, i) => assertNonEmptyStringItem(el, "organizations", i));
 }
 
 // A branch-policy pattern (exact name or Bun glob) at index i of `listName`. Rejects a non-string,
@@ -179,8 +182,7 @@ function normalizeOrganizations(o: Record<string, unknown>): string[] | null {
 // unmatched-pattern warning, and the policy engine still fails closed on any match-time throw —
 // see branchPolicy.ts.)
 function validateBranchPattern(v: unknown, listName: string, i: number): string {
-  if (!isString(v) || v.length === 0) fail(`${listName}[${i}] must be a non-empty string`);
-  const s = v as string;
+  const s = assertNonEmptyStringItem(v, listName, i);
   if (s.startsWith("!"))
     fail(`${listName}[${i}] must not start with "!" — glob negation is not supported; put branches to INCLUDE in "branches" and branches to EXCLUDE in "excludeBranches": ${JSON.stringify(s)}`);
   return s;

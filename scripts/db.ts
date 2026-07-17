@@ -892,7 +892,7 @@ export function assertOwnedDatabase(path: string): void {
       // of OUR OWN database classifies as compatible, and the writable open re-checks on its own
       // connection (isOwnedOrEmpty + assertOpenCompatible inside initWritableConnection; the
       // migration classifies again inside its transaction) through any recovered WAL.
-      assertOpenCompatible(db, readUserVersion(db));
+      assertOpenCompatible(db, uv); // uv read above; the deserialized image is read-only, so it cannot have changed
       return;
     }
     fail(
@@ -1315,19 +1315,25 @@ export function migrateV3toV4(db: Database): void {
     // authoritative; the config_hash is unchanged by design, so completed work_queue units still
     // skip-as-current (estate/branch discovery reruns; content rescans do not).
     if (tableExists(db, "runs")) db.exec(`UPDATE runs SET status='failed' WHERE status='running'`);
-    // Recreate ix_ruh_loc + any other missing object (idempotent) — AFTER the table-specific step so
-    // a rebuild's fresh table gets its index here.
-    db.exec(SCHEMA_SQL);
-    // Post-migration fingerprint + FK integrity before stamping: the migration MUST have produced
-    // OUR exact v4 shape, with no orphaned rows.
-    const after = classifyRunUnitHead(db);
-    if (after.kind !== "ours-v4")
-      fail(`v3→v4 migration did not produce the expected run_unit_head shape (got '${after.kind}')`);
-    const orphans = db.query(`PRAGMA foreign_key_check(run_unit_head)`).all();
-    if (orphans.length > 0)
-      fail(`v3→v4 migration left ${orphans.length} orphaned run_unit_head row(s) — aborting`);
+    verifyRunUnitHeadFingerprint(db, "v3→v4 migration");
     setUserVersion(db, V4_TARGET_VERSION);
   })();
+}
+
+// The post-heal verification shared by migrateV3toV4 and the current-stamp self-heal: recreate
+// any missing object (idempotent — AFTER the table-specific step so a rebuild's fresh table gets
+// its index here), then fingerprint + FK integrity before the caller commits/stamps: the step
+// MUST have produced OUR exact v4 shape, with no orphaned rows. Runs INSIDE the caller's
+// transaction. ONE definition on purpose — the two callers' teeth must never drift apart (the
+// self-heal copy previously duplicated this block verbatim).
+function verifyRunUnitHeadFingerprint(db: Database, label: string): void {
+  db.exec(SCHEMA_SQL);
+  const after = classifyRunUnitHead(db);
+  if (after.kind !== "ours-v4")
+    fail(`${label} did not produce the expected run_unit_head shape (got '${after.kind}')`);
+  const orphans = db.query(`PRAGMA foreign_key_check(run_unit_head)`).all();
+  if (orphans.length > 0)
+    fail(`${label} left ${orphans.length} orphaned run_unit_head row(s) — aborting`);
 }
 
 // Throw (fail) if the on-disk shape is INCOMPATIBLE with its stamp — a foreign/sibling database that
@@ -1704,18 +1710,13 @@ export class AuditDb {
       // damage — e.g. a partial restore that regressed run_unit_head to its v2/v3 body) is
       // deliberately admitted as healable, per the ownership span's contract. The heal runs the
       // same rebuild the v3→v4 migration uses (rows riding through; damaged-away values honestly
-      // read NULL); SCHEMA_SQL then recreates any missing table/index, and the post-heal
-      // fingerprint + FK check mirror the migration's own teeth. This is a repair, NOT a version
-      // crossing — the stamp is already current, so no run is failed here (the migration-boundary
-      // rule belongs to migrateV3toV4 alone).
+      // read NULL); verifyRunUnitHeadFingerprint then recreates any missing table/index and runs
+      // the SAME post-heal fingerprint + FK teeth as the migration (one definition, no drift).
+      // This is a repair, NOT a version crossing — the stamp is already current, so no run is
+      // failed here (the migration-boundary rule belongs to migrateV3toV4 alone).
       db.transaction(() => {
         healRunUnitHeadShape(db);
-        db.exec(SCHEMA_SQL);
-        const after = classifyRunUnitHead(db);
-        if (after.kind !== "ours-v4")
-          fail(`self-heal did not produce the expected run_unit_head shape (got '${after.kind}')`);
-        const orphans = db.query(`PRAGMA foreign_key_check(run_unit_head)`).all();
-        if (orphans.length > 0) fail(`self-heal left ${orphans.length} orphaned run_unit_head row(s) — aborting`);
+        verifyRunUnitHeadFingerprint(db, "self-heal");
       })();
     }
     return new AuditDb(db);
