@@ -922,7 +922,7 @@ describe("throttle wait clamping (§4 hardening)", () => {
     // The malformed-envelope check must run AFTER classifyGraphql: a 5xx's retry semantics come from
     // the STATUS, and hardening the ok path must not convert a transient outage into a fatal error.
     const { client, sleeps } = makeClient([
-      ok(http(503, {}, `{"errors":"boom"}`)),
+      err(http(503, {}, `{"errors":"boom"}`), "gh: HTTP 503"), // gh exits 1 on any HTTP error status
       ok(http(200, {}, `{"data":{"x":1}}`)),
     ]);
     const data = await client.graphql("query{x}", {});
@@ -1590,6 +1590,9 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
   });
   test("a non-object JSON root on 200 fails closed instead of returning undefined", async () => {
+    // "null" is gh-realistic at exit 0; the array/string/number roots are DELIBERATELY SYNTHETIC
+    // full bodies (gh's own unmarshal fails on them and would emit headers-only stdout + exit 1)
+    // — they pin OUR non-object-root rejection against a hostile/changed transport.
     for (const b of ["null", "[]", `"x"`, "42"]) {
       const { client } = makeClient([ok(http(200, {}, b))]);
       await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
@@ -1655,6 +1658,9 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
     expect(calls.length).toBe(1);
   });
   test("a TRUNCATED graphql body fails closed without any exit-code guard — a JSON-object prefix is never valid JSON", async () => {
+    // DELIBERATELY SYNTHETIC stdout shape: gh buffers graphql JSON before printing, so a real
+    // read failure yields headers-only stdout + exit 1. The partial body pins the JSON-prefix
+    // fail-closed property itself against a hostile/changed transport that streams instead.
     const { client } = makeClient([
       err(http(200, {}, `{"data":{"x":1}`), "read: connection reset"), // mid-stream cut: brace never closes
     ]);
