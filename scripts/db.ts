@@ -958,16 +958,20 @@ function migrateV2toV3(db: Database): void {
 // run_unit_head/runs is classified `incompatible` and rejected — never adopted, and (because the
 // gate runs on a READ-ONLY preflight before any drop) never destroyed by --fresh.
 
-interface ColSpec { readonly name: string; readonly type: string; readonly notnull: 0 | 1; readonly pk: number; }
+interface ColSpec { readonly name: string; readonly type: string; readonly notnull: 0 | 1; readonly pk: number; readonly dflt: string | null; }
 // Ordered column specs per version. pk = 1-based position in the composite PRIMARY KEY, else 0. `type`
 // is validated too: e.g. an `is_default_branch TEXT` foreign column would store the bound integer as
 // '1' and break the report's strict `=== 1` check.
+// dflt is the DECLARED default's literal SQL text via table_xinfo (round-4: a sibling with
+// commit_sha DEFAULT 'foreign-default' was structurally identical everywhere else and was ADOPTED —
+// after which --fresh would have destroyed it. Defaults change what future INSERTs mean, so they are
+// part of the identity.)
 const RUH_V4_COLSPEC: readonly ColSpec[] = [
-  { name: "run_id", type: "TEXT", notnull: 1, pk: 1 }, { name: "organization", type: "TEXT", notnull: 1, pk: 2 },
-  { name: "repository", type: "TEXT", notnull: 1, pk: 3 }, { name: "branch", type: "TEXT", notnull: 1, pk: 4 },
-  { name: "commit_sha", type: "TEXT", notnull: 1, pk: 0 }, { name: "status", type: "TEXT", notnull: 1, pk: 0 },
-  { name: "is_default_branch", type: "INTEGER", notnull: 0, pk: 0 }, { name: "policy_status", type: "TEXT", notnull: 0, pk: 0 },
-  { name: "policy_matched_pattern", type: "TEXT", notnull: 0, pk: 0 }, { name: "scanned_commit_date", type: "TEXT", notnull: 0, pk: 0 },
+  { name: "run_id", type: "TEXT", notnull: 1, pk: 1, dflt: null }, { name: "organization", type: "TEXT", notnull: 1, pk: 2, dflt: null },
+  { name: "repository", type: "TEXT", notnull: 1, pk: 3, dflt: null }, { name: "branch", type: "TEXT", notnull: 1, pk: 4, dflt: null },
+  { name: "commit_sha", type: "TEXT", notnull: 1, pk: 0, dflt: "''" }, { name: "status", type: "TEXT", notnull: 1, pk: 0, dflt: "'scanned'" },
+  { name: "is_default_branch", type: "INTEGER", notnull: 0, pk: 0, dflt: null }, { name: "policy_status", type: "TEXT", notnull: 0, pk: 0, dflt: null },
+  { name: "policy_matched_pattern", type: "TEXT", notnull: 0, pk: 0, dflt: null }, { name: "scanned_commit_date", type: "TEXT", notnull: 0, pk: 0, dflt: null },
 ];
 const RUH_V3_COLSPEC: readonly ColSpec[] = RUH_V4_COLSPEC.slice(0, 7); // through is_default_branch
 const RUH_V2_COLSPEC: readonly ColSpec[] = RUH_V4_COLSPEC.slice(0, 6); // through status (pre is_default_branch)
@@ -976,27 +980,30 @@ const RUH_V2_COLSPEC: readonly ColSpec[] = RUH_V4_COLSPEC.slice(0, 6); // throug
 // (pragma_table_xinfo(?), pragma_foreign_key_list(?), …) rather than interpolating the table name
 // into `PRAGMA foo(name)`. An interpolated name is a SQL-injection vector when the name comes from
 // the catalog (e.g. a maliciously named child table in the inbound-FK scan).
-interface ColInfo { readonly name: string; readonly type: string; readonly notnull: number; readonly pk: number; readonly hidden: number; }
+interface ColInfo { readonly name: string; readonly type: string; readonly notnull: number; readonly pk: number; readonly hidden: number; readonly dflt: string | null; }
 // Columns via table_xinfo (NOT table_info) so GENERATED/hidden columns are visible: a foreign table
 // with our 10 ordinary columns plus an extra generated column, or a generated runs.outcome, must not
 // pass as ours. Names + declared types lowercased/uppercased for case-insensitive comparison.
 function tableXinfo(db: Database, table: string): ColInfo[] {
-  return (db.query('SELECT name, type, "notnull" AS nn, pk, hidden FROM pragma_table_xinfo(?)').all(table) as Array<{
-    name: string; type: string; nn: number; pk: number; hidden: number;
-  }>).map((r) => ({ name: r.name.toLowerCase(), type: (r.type ?? "").toUpperCase(), notnull: r.nn, pk: r.pk, hidden: r.hidden }));
+  return (db.query('SELECT name, type, "notnull" AS nn, pk, hidden, dflt_value AS dflt FROM pragma_table_xinfo(?)').all(table) as Array<{
+    name: string; type: string; nn: number; pk: number; hidden: number; dflt: string | null;
+  }>).map((r) => ({ name: r.name.toLowerCase(), type: (r.type ?? "").toUpperCase(), notnull: r.nn, pk: r.pk, hidden: r.hidden, dflt: r.dflt }));
 }
 // Every column must be ORDINARY (hidden === 0) AND match the spec by name / declared type / NOT NULL
 // / PK position.
 function colsMatch(actual: ColInfo[], spec: readonly ColSpec[]): boolean {
   return actual.length === spec.length &&
     actual.every((a) => a.hidden === 0) &&
-    spec.every((s, i) => actual[i]!.name === s.name && actual[i]!.type === s.type && actual[i]!.notnull === s.notnull && actual[i]!.pk === s.pk);
+    spec.every((s, i) => actual[i]!.name === s.name && actual[i]!.type === s.type && actual[i]!.notnull === s.notnull && actual[i]!.pk === s.pk && actual[i]!.dflt === s.dflt);
 }
 
-function foreignKeys(db: Database, table: string): Array<{ from: string; table: string; to: string }> {
-  return (db.query('SELECT "from" AS "from", "table" AS "table", "to" AS "to" FROM pragma_foreign_key_list(?)').all(table) as Array<{
-    from: string; table: string; to: string | null;
-  }>).map((r) => ({ from: r.from.toLowerCase(), table: r.table.toLowerCase(), to: (r.to ?? "").toLowerCase() }));
+// on_update/on_delete are part of the identity: an ON DELETE CASCADE sibling silently deletes child
+// rows on run pruning — adopting it changes write semantics without any structural difference the
+// colspec could see (round-4 class).
+function foreignKeys(db: Database, table: string): Array<{ from: string; table: string; to: string; onUpdate: string; onDelete: string }> {
+  return (db.query('SELECT "from" AS "from", "table" AS "table", "to" AS "to", on_update AS ou, on_delete AS od FROM pragma_foreign_key_list(?)').all(table) as Array<{
+    from: string; table: string; to: string | null; ou: string; od: string;
+  }>).map((r) => ({ from: r.from.toLowerCase(), table: r.table.toLowerCase(), to: (r.to ?? "").toLowerCase(), onUpdate: r.ou.toUpperCase(), onDelete: r.od.toUpperCase() }));
 }
 
 // ix_ruh_loc's state ON run_unit_head: "ok" = OUR index (non-UNIQUE, explicitly created, over exactly
@@ -1019,10 +1026,11 @@ function ruhIndexState(db: Database): "ok" | "absent" | "wrong" {
   if (list.uniq !== 0 || list.origin !== "c" || list.partial !== 0) return "wrong"; // UNIQUE / auto / PARTIAL
   // Columns IN ORDER (seqno), exactly (organization, repository, branch, commit_sha) — a reversed
   // index has different query coverage.
-  const c = (db.query("SELECT name FROM pragma_index_info('ix_ruh_loc') ORDER BY seqno").all() as Array<{ name: string }>).map((r) =>
-    r.name.toLowerCase(),
-  );
-  return c.length === 4 && c[0] === "organization" && c[1] === "repository" && c[2] === "branch" && c[3] === "commit_sha" ? "ok" : "wrong";
+  // index_xinfo, not index_info: names alone accepted a DESC (or re-collated) index of the right
+  // columns — different scan order/comparison semantics under the same name (round-4 class).
+  const c = (db.query("SELECT name, \"desc\" AS d, coll FROM pragma_index_xinfo('ix_ruh_loc') WHERE key = 1 ORDER BY seqno").all() as Array<{ name: string; d: number; coll: string | null }>);
+  const namesOk = c.length === 4 && c[0]!.name.toLowerCase() === "organization" && c[1]!.name.toLowerCase() === "repository" && c[2]!.name.toLowerCase() === "branch" && c[3]!.name.toLowerCase() === "commit_sha";
+  return namesOk && c.every((x) => x.d === 0 && (x.coll ?? "BINARY").toUpperCase() === "BINARY") ? "ok" : "wrong";
 }
 
 // run_unit_head must carry NO unexpected dependent objects: a trigger, or any index other than the
@@ -1119,7 +1127,7 @@ function normalizeCheck(expr: string): string {
 // foreign table cannot smuggle the expected CHECK text through a DEFAULT string. Returns EVERY
 // normalized body, DUPLICATES PRESERVED — a Set here once collapsed a doubled CHECK into the exact
 // expected set, so a foreign table whose constraint text was not ours could classify as ours.
-function extractChecks(sql: string): string[] {
+export function extractChecks(sql: string): string[] {  // exported for direct unit tests (quote/comment-skip pins)
   const out: string[] = [];
   const n = sql.length;
   let i = 0;
@@ -1190,7 +1198,11 @@ function extractChecks(sql: string): string[] {
 // collation: table_xinfo's declared type omits COLLATE, and only the PK autoindex exposes one via
 // pragma_index_xinfo — a `status TEXT COLLATE NOCASE` sibling (under which 'SCANNED' satisfies the
 // lowercase CHECK) was accepted by every structural probe until this scan.
-function hasCollateToken(sql: string): boolean {
+// A STRICT table changes type-affinity semantics; our DDL never declares it. (WITHOUT ROWID needs no
+// scan: it drops the PK autoindex, so ruhPkBinaryCollation already rejects it as "missing".)
+function hasStrictToken(sql: string): boolean { return sqlHasBareToken(sql, "strict"); }
+function hasCollateToken(sql: string): boolean { return sqlHasBareToken(sql, "collate"); }
+function sqlHasBareToken(sql: string, token: string): boolean {
   const n = sql.length;
   let i = 0;
   while (i < n) {
@@ -1198,7 +1210,7 @@ function hasCollateToken(sql: string): boolean {
     if (c === "'" || c === '"' || c === "`" || c === "[") { i = skipQuoted(sql, i); continue; }
     if (c === "-" && sql[i + 1] === "-") { while (i < n && sql[i] !== "\n") i++; continue; }
     if (c === "/" && sql[i + 1] === "*") { i += 2; while (i < n && !(sql[i] === "*" && sql[i + 1] === "/")) i++; i += 2; continue; }
-    if ((c === "c" || c === "C") && sql.slice(i, i + 7).toLowerCase() === "collate" && !/\w/.test(sql[i - 1] ?? " ") && !/\w/.test(sql[i + 7] ?? " ")) return true;
+    if (sql.slice(i, i + token.length).toLowerCase() === token && !/\w/.test(sql[i - 1] ?? " ") && !/\w/.test(sql[i + token.length] ?? " ")) return true;
     i++;
   }
   return false;
@@ -1253,7 +1265,8 @@ function classifyRunUnitHead(db: Database): RuhClass {
   const sql = tableCreateSql(db, "run_unit_head");
   const checks = sql === null ? [] : extractChecks(sql);
   const fks = foreignKeys(db, "run_unit_head");
-  const fkOk = fks.length === 1 && fks[0]!.from === "run_id" && fks[0]!.table === "runs" && fks[0]!.to === "run_id";
+  const fkOk = fks.length === 1 && fks[0]!.from === "run_id" && fks[0]!.table === "runs" && fks[0]!.to === "run_id" &&
+    fks[0]!.onUpdate === "NO ACTION" && fks[0]!.onDelete === "NO ACTION";
   if (!fkOk)
     return { kind: "incompatible", reason: "run_unit_head lacks the exact run_id→runs(run_id) foreign key" };
   // Unexpected triggers or extra secondary indexes would be SILENTLY dropped by the rebuild — refuse
@@ -1269,6 +1282,8 @@ function classifyRunUnitHead(db: Database): RuhClass {
   // dedicated rejection (and its fixture keeps exercising that probe, not this scan).
   if (sql !== null && hasCollateToken(sql))
     return { kind: "incompatible", reason: "run_unit_head declares a COLLATE clause — our shape never does (a non-BINARY collation changes CHECK and comparison semantics)" };
+  if (sql !== null && hasStrictToken(sql))
+    return { kind: "incompatible", reason: "run_unit_head is declared STRICT — our shape never is (STRICT changes type-affinity semantics)" };
   if (colsMatch(cols, RUH_V4_COLSPEC)) {
     if (!checksEqual(checks, RUH_V4_CHECKS))
       return { kind: "incompatible", reason: "run_unit_head has the v4 columns but not the exact v4 CHECK set" };

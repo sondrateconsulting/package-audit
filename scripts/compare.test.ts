@@ -269,6 +269,26 @@ describe("buildCompare — policy churn", () => {
   // The other two disagreements the shared guard rejects. compare already runs it over EVERY head (it
   // never filtered to policy-bearing rows), so these pin that it stays that way — the report's ledger
   // regressed on exactly this by guarding a filtered subset while counting the full set.
+
+  test("policy churn FAILS CLOSED on a NON-NULL scanned_commit_date that is not an ISO instant", () => {
+    // Same domain rule as the report side: a non-null date claims NATIVE provenance and gates
+    // policyChurn availability, so garbage must refuse, not launder (round-4 finding, reproduced).
+    const path = nextFile();
+    const db = AuditDb.open({ sqlitePath: path });
+    const runA = startCompleted(db, ["expo"]);
+    const runB = startCompleted(db, ["expo"]);
+    phead(db, runA.runId, "main", { isDefaultBranch: true });
+    phead(db, runB.runId, "main", { isDefaultBranch: true });
+    const runBId = runB.runId;
+    db.close();
+    const forge = new Database(path, { strict: true });
+    forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', 'abc', 'scanned', 0, NULL, NULL, 'not-an-iso-date')`).run(runBId);
+    forge.close();
+    const db2 = AuditDb.open({ sqlitePath: path });
+    expect(() => buildCompare(db2, db2.getRun(runA.runId)!, db2.getRun(runB.runId)!)).toThrow(/not an ISO instant/);
+    db2.close();
+  });
+
   test.each([
     [
       "policy-excluded naming NO rule",
@@ -343,6 +363,13 @@ describe("buildCompare — policy churn", () => {
       "past-cap with UNKNOWN defaultness — past-cap is v4-native and always a definite non-default",
       `'', 'past-cap', NULL, NULL, NULL`,
       /past-cap rows are always a definite non-default/,
+    ],
+    [
+      // No SQL CHECK covers this column, so 2 is schema-valid — and report.ts's `=== 1` coercion
+      // would silently relabel it "not the default" (round-4 finding, reproduced).
+      "is_default_branch=2 — outside the tri-state; coercion would launder it to false",
+      `'abc', 'scanned', 2, NULL, NULL`,
+      /has is_default_branch=2 — the tri-state is 1\/0\/NULL/,
     ],
   ])("policy churn FAILS CLOSED on %s", (_name, values, expected) => {
     const path = nextFile();

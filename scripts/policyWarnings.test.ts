@@ -109,12 +109,12 @@ describe("policyWarningLines (advisory summary rendering)", () => {
     const lines = policyWarningLines(warnings);
     expect(lines[0]).toBe("  Branch-policy warnings: 2 (advisory)");
     expect(lines[1]).toContain("empty allowlist: only repository default branches are policy-eligible");
-    expect(lines[2]).toContain('deny pattern "weird\\"quote" matched no discovered branch'); // quote escaped by JSON.stringify
+    expect(lines[2]).toContain('deny pattern "weird\\"quote" matched no branch discovered THIS RUN'); // quote escaped by JSON.stringify
   });
   test("default-only-deny explains WHY it did nothing, and does not claim the pattern caused an override", () => {
     const lines = policyWarningLines([{ kind: "default-only-deny", pattern: "main" }]);
     expect(lines[1]).toBe(
-      '    deny pattern "main" matched only discovered default branches — the default branch is always scanned, so it excluded nothing',
+      '    deny pattern "main" matched only default branches discovered THIS RUN — the default branch is always scanned, so it excluded nothing here (a resumed run may retain older exclusions it caused)',
     );
   });
 });

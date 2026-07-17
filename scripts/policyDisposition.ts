@@ -14,7 +14,8 @@
 // also read rows that never passed our writer — a foreign or sibling database that survived
 // classification, a disposition added later, a hand-edited file — so anything the chokepoint asserts
 // about a row's shape is re-asserted HERE. Validate every field or one of them is the next hole.
-import type { PolicyStatus, UnitHeadStatus } from "./db.ts"; // type-only: erased, so this module stays a runtime leaf
+import type { PolicyStatus, UnitHeadStatus } from "./db.ts";
+import { isIsoInstant } from "./isoDate.ts";
 
 export interface PolicyDispositionRow {
   readonly status: string; // validated against UnitHeadStatus below — NOT trusted as one
@@ -36,11 +37,15 @@ export interface PolicyDispositionRow {
   readonly scanned_commit_date: string | null;
 }
 
-// `as const satisfies` ties this list to UnitHeadStatus: add a status token to db.ts without updating
-// this gate and the file stops compiling. (A bare `readonly string[]` would silently drift — the exact
-// gap review flagged.)
-const KNOWN_STATUSES = ["scanned", "skipped-cutoff", "policy-excluded", "past-cap"] as const satisfies readonly UnitHeadStatus[];
-const isKnownStatus = (v: string): v is UnitHeadStatus => (KNOWN_STATUSES as readonly string[]).includes(v);
+// Record<UnitHeadStatus, true> is the EXHAUSTIVE compile-time link: a token added to db.ts's union
+// makes this object MISSING a required key (error), and a token removed makes one EXCESS (error).
+// (`satisfies readonly UnitHeadStatus[]` only checked membership, not coverage — an extended union
+// compiled clean, which review proved by execution.)
+const KNOWN_STATUS_MAP = {
+  "scanned": true, "skipped-cutoff": true, "policy-excluded": true, "past-cap": true,
+} as const satisfies Record<UnitHeadStatus, true>;
+const KNOWN_STATUSES = Object.keys(KNOWN_STATUS_MAP);
+const isKnownStatus = (v: string): v is UnitHeadStatus => KNOWN_STATUSES.includes(v);
 const isKnownPolicyStatus = (v: string | null): v is PolicyStatus => v === "excluded-by-deny" || v === "excluded-by-allow";
 
 // A branch actually DROPPED by policy — its own disposition in the disjoint partition (PROMPT.md §3),
@@ -73,6 +78,10 @@ export function policyStatusOrThrow(r: PolicyDispositionRow, where: string): Pol
 //   - a status outside the known four — it belongs to NO disposition bucket, silently breaking the
 //     partition the counts rest on (and is exactly how a future 'error' status would first arrive);
 //   - a policy_status outside the known two — a bogus token is otherwise counted AND emitted;
+//   - an is_default_branch outside 1/0/NULL (the column has no SQL CHECK, so 2 is schema-valid and
+//     the read surfaces' `=== 1` coercion would silently relabel it "not the default");
+//   - a NON-NULL scanned_commit_date that is not an ISO instant (garbage there is otherwise trusted
+//     as NATIVE provenance and reported as 'complete');
 //   - a policy_matched_pattern that is not a real deny pattern — the SQL deny CHECK enforces only
 //     IS NOT NULL (so '' passes) and has NO converse (so an allow-exclusion may carry a deny pattern);
 //     the ledger would otherwise report a causing pattern that caused nothing, or an empty one;
@@ -92,6 +101,21 @@ export function assertRunUnitHeadSound(r: PolicyDispositionRow, where: string): 
     throw new Error(`internal: run_unit_head ${where} has status=${JSON.stringify(r.status)}, outside the four known dispositions — it belongs to no report bucket`);
   if (r.policy_status !== null && !isKnownPolicyStatus(r.policy_status))
     throw new Error(`internal: run_unit_head ${where} has policy_status=${JSON.stringify(r.policy_status)}, outside the known domain`);
+  // Column DOMAINS before any relational rule — the two review round 4 proved were missing. The
+  // is_default_branch column has NO SQL CHECK, so 2 (or -1) is schema-valid; the read surfaces coerce
+  // `=== 1` to false, silently relabelling an unknown flag as "not the default". And a NON-NULL
+  // scanned_commit_date is trusted as native provenance, so garbage there reported scanScope
+  // provenance 'complete' — the same laundering the write chokepoint blocks with the SAME validator.
+  if (r.is_default_branch !== null && r.is_default_branch !== 0 && r.is_default_branch !== 1)
+    throw new Error(`internal: run_unit_head ${where} has is_default_branch=${JSON.stringify(r.is_default_branch)} — the tri-state is 1/0/NULL, nothing else`);
+  if (r.scanned_commit_date !== null && !isIsoInstant(r.scanned_commit_date))
+    throw new Error(`internal: run_unit_head ${where} has scanned_commit_date=${JSON.stringify(r.scanned_commit_date.slice(0, 40))} — not an ISO instant (NULL is the one legal non-date, the migrated-row sentinel)`);
+  // The NULL sentinel means "migrated from v3" — and v3 had only scanned/skipped-cutoff. A v4-native
+  // disposition claiming migrated provenance is impossible, and treating it as exempt from the native
+  // rules (as the default⇒scanned scoping below does) would launder exactly the rows that most need
+  // gating (round-4 finding, reproduced: NULL-date policy-excluded/past-cap were counted and emitted).
+  if ((r.status === "policy-excluded" || r.status === "past-cap") && r.scanned_commit_date === null)
+    throw new Error(`internal: run_unit_head ${where} is ${r.status} with a NULL scanned_commit_date — v4-native dispositions cannot be migrated rows`);
   // policy_matched_pattern ↔ deny, both directions (the SQL CHECK covers neither the empty case nor
   // the converse).
   if (r.policy_status === "excluded-by-deny") {

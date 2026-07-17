@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, assertOwnedDatabase, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, migrateV3toV4, nowIso, type RunInput, type RunUnitHeadInput } from "./db.ts";
+import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, assertOwnedDatabase, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, migrateV3toV4, nowIso, type RunInput, type RunUnitHeadInput, extractChecks } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 
@@ -3632,11 +3632,12 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
 
   test("CHECK tokenizer: expected CHECK text hidden in a DEFAULT string does NOT satisfy the fingerprint", () => {
     const path = nextFile();
-    // The DEFAULT string embeds the ENTIRE current 5-CHECK text (built from the same parts the
-    // control uses, so it can never silently lag the real set — the rot that made the old fixture
-    // vacuous: it embedded the obsolete 3-token text, so rejection proved only set mismatch). If the
-    // tokenizer ever read string contents, it would extract an exact fingerprint match and ACCEPT
-    // this CHECK-less table, failing this test loudly.
+    // The DEFAULT string embeds the current 5-CHECK text. HONEST SCOPE: SQL doubles the quotes
+    // inside the literal, so even a broken tokenizer that scanned string contents could not extract
+    // an exact fingerprint match from here — this fixture proves only that CHECK-like text in a
+    // DEFAULT does not corrupt classification of a CHECK-less table. The string-boundary property
+    // itself is pinned DIRECTLY by the extractChecks unit tests below (found in review round 4:
+    // a string-scanning extractChecks mutant still passed this fixture).
     const embedded = [
       "CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap'))",
       "CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow'))",
@@ -3777,6 +3778,42 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     forgeRuh(path, v4Ruh({ checks: `${V4_RUH_PARTS.checks},
       CHECK (status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL)` }));
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/not the exact v4 CHECK set/);
+  });
+
+  // Round-4 identity gaps, each demonstrated by ADOPTION before the fix. Every fixture is a v4Ruh
+  // single-property mutation, anchored by the control above.
+  test("fingerprint: a foreign column DEFAULT is rejected — defaults change what future INSERTs mean", () => {
+    const path = nextFile();
+    forgeRuh(path, v4Ruh({ cols: V4_RUH_PARTS.cols.replace("commit_sha TEXT NOT NULL DEFAULT ''", "commit_sha TEXT NOT NULL DEFAULT 'foreign-default'") }));
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+  });
+  test("fingerprint: a foreign FK action (ON DELETE CASCADE) is rejected — it changes write semantics", () => {
+    const path = nextFile();
+    forgeRuh(path, v4Ruh({ cols: V4_RUH_PARTS.cols.replace("REFERENCES runs(run_id)", "REFERENCES runs(run_id) ON DELETE CASCADE") }));
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/foreign key/);
+  });
+  test("fingerprint: a STRICT table is rejected — STRICT changes type-affinity semantics", () => {
+    const path = nextFile();
+    forgeRuh(path, v4Ruh() + " STRICT");
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/STRICT/);
+  });
+  test("index: a DESC column in ix_ruh_loc is rejected — same name, different scan semantics", () => {
+    const path = nextFile();
+    buildNativeV4(path);
+    const f = new Database(path, { strict: true });
+    f.exec("DROP INDEX ix_ruh_loc");
+    f.exec("CREATE INDEX ix_ruh_loc ON run_unit_head(organization DESC, repository, branch, commit_sha)");
+    f.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/wrong definition|incompatible/);
+  });
+
+  // Direct pins for extractChecks' trivia handling — the property the DEFAULT-string fixture above
+  // cannot reach (SQL quote-doubling makes exact-match acceptance impossible through a literal).
+  test("extractChecks: CHECK-like text inside a string literal or comment yields NO checks; real ones are extracted with duplicates preserved", () => {
+    expect(extractChecks("CREATE TABLE t (a TEXT DEFAULT 'CHECK (x IN (1))')")).toEqual([]);
+    expect(extractChecks("CREATE TABLE t (a TEXT /* CHECK (x IN (1)) */, b TEXT -- CHECK (y IN (2))\n)")).toEqual([]);
+    const two = extractChecks("CREATE TABLE t (a TEXT, CHECK (a <> ''), CHECK (a <> ''))");
+    expect(two.length).toBe(2); // duplicates PRESERVED — the multiset comparison depends on it
   });
 
   test("index: an ix_ruh_loc on a DIFFERENT table (global name squat) is rejected, not treated as repairable-absent", () => {

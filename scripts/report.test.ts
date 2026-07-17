@@ -238,6 +238,55 @@ describe("buildReport (§7)", () => {
   // The two shapes the ledger's OWN filter used to hide. Both are regressions the whole-set sweep in
   // buildReportInner exists to prevent: the guard used to run only over policy-BEARING rows, while the
   // summary counts by status alone, so these were counted (or labelled) without ever being validated.
+
+  test("the ledger FAILS CLOSED on a v4-native disposition claiming MIGRATED provenance (NULL date)", () => {
+    // v3 had only scanned/skipped-cutoff, so a policy-excluded row with the migrated-row NULL
+    // sentinel is impossible provenance — and the NULL would otherwise exempt it from the native
+    // rules (round-4 finding, reproduced: it was counted and emitted).
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-nulldate-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'policy-excluded', 0, 'excluded-by-deny', 'rel*', NULL)`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/cannot be migrated rows/);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test("the ledger FAILS CLOSED on a NON-NULL scanned_commit_date that is not an ISO instant", () => {
+    // A non-null date is what marks a row NATIVE (vs the migrated-row NULL sentinel), and it feeds
+    // scanScope provenance — garbage here reported provenance 'complete' (round-4 finding,
+    // reproduced). The write chokepoint validates with the SAME shared isIsoInstant.
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-date-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', 'abc', 'scanned', 0, NULL, NULL, 'not-an-iso-date')`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/not an ISO instant/);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
   test.each([
     [
       "policy-excluded naming NO rule is counted as an exclusion — it must not slip past the guard's null-policy early return",
@@ -312,6 +361,13 @@ describe("buildReport (§7)", () => {
       "past-cap with UNKNOWN defaultness — past-cap is v4-native and always a definite non-default",
       `'', 'past-cap', NULL, NULL, NULL`,
       /past-cap rows are always a definite non-default/,
+    ],
+    [
+      // No SQL CHECK covers this column, so 2 is schema-valid — and report.ts's `=== 1` coercion
+      // would silently relabel it "not the default" (round-4 finding, reproduced).
+      "is_default_branch=2 — outside the tri-state; coercion would launder it to false",
+      `'abc', 'scanned', 2, NULL, NULL`,
+      /has is_default_branch=2 — the tri-state is 1\/0\/NULL/,
     ],
   ])("the ledger FAILS CLOSED: %s", (_name, values, expected) => {
     const dataExistedBefore = existsSync("./data");

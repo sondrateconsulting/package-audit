@@ -77,7 +77,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["organizations", "repositories", "branches"],
-      "description": "Fan-out bounds. Only 'repositories' is consumed today (a GLOBAL in-flight cap on gh requests); 'organizations' and 'branches' are RESERVED — validated and required, but never read. Excluded from config_hash (tuning speed never orphans resumable work).",
+      "description": "Request cap + reserved keys. Only 'repositories' is consumed today (a GLOBAL in-flight cap on gh requests); 'organizations' and 'branches' are RESERVED — validated and required, but never read. Excluded from config_hash (tuning speed never orphans resumable work).",
       "properties": {
         "organizations": { "type": "integer", "minimum": 1 },
         "repositories": { "type": "integer", "minimum": 1 },

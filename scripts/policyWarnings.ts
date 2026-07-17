@@ -6,6 +6,10 @@
 // exactly what THIS advisory surface — the unmatched-pattern warning — reports as dead
 // (branchPolicy.ts's fail-closed contract states the throw scope). Warnings are ADVISORY: they
 // never fail a run, and are NOT recorded in the DB / errors / report.
+// SCOPE: coverage comes from THIS invocation's discovery only. A RESUMED run retains prior
+// invocations' run_unit_head rows (reconciliation prunes deleted branches, never re-evaluates
+// patterns), so a pattern can be dead NOW while a retained row still records an exclusion it caused
+// EARLIER — the summary may honestly show both. The rendered lines say "THIS RUN" for that reason.
 //
 // The surface answers ONE question: did your policy do something OTHER than what you'd assume? Two of
 // the three kinds report a DEAD rule — it matched no branch at all, or (deny only) its only matches
@@ -78,8 +82,8 @@ export function policyWarningLines(warnings: readonly PolicyWarning[]): string[]
   for (const w of warnings) {
     if (w.kind === "empty-allowlist") lines.push(`    empty allowlist: only repository default branches are policy-eligible`);
     else if (w.kind === "default-only-deny")
-      lines.push(`    deny pattern ${JSON.stringify(w.pattern)} matched only discovered default branches — the default branch is always scanned, so it excluded nothing`);
-    else lines.push(`    ${w.direction} pattern ${JSON.stringify(w.pattern)} matched no discovered branch`);
+      lines.push(`    deny pattern ${JSON.stringify(w.pattern)} matched only default branches discovered THIS RUN — the default branch is always scanned, so it excluded nothing here (a resumed run may retain older exclusions it caused)`);
+    else lines.push(`    ${w.direction} pattern ${JSON.stringify(w.pattern)} matched no branch discovered THIS RUN`);
   }
   return lines;
 }
