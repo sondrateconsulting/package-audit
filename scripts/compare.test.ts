@@ -276,6 +276,38 @@ describe("buildCompare — policy churn", () => {
       /is status='policy-excluded' but carries no policy_status/,
     ],
     [
+      // Premise 6's mirror image: the default is ALWAYS scanned, so it can never be an exclusion.
+      // Schema-valid (no CHECK covers defaultness — one there could fail a v3 row at migration time),
+      // which is exactly why the read guard has to carry this rule.
+      "policy-excluded on a DEFAULT branch — schema-valid, and it contradicts default-always-scanned",
+      `'policy-excluded', 1, 'excluded-by-deny', 'rel*'`,
+      /is status='policy-excluded' with is_default_branch=1 — the default branch is always scanned/,
+    ],
+    [
+      "policy-excluded with UNKNOWN defaultness (null) — a policy exclusion is always a definite non-default",
+      `'policy-excluded', NULL, 'excluded-by-deny', 'rel*'`,
+      /is status='policy-excluded' with is_default_branch=null/,
+    ],
+    [
+      // The DDL's deny CHECK has no converse, so this is schema-VALID — and the ledger would report a
+      // causing pattern that never caused anything.
+      "an allow-exclusion carrying a deny pattern — schema-valid, and the pattern is fiction",
+      `'policy-excluded', 0, 'excluded-by-allow', 'rel*'`,
+      /carries policy_matched_pattern.*only a deny names a causing pattern/,
+    ],
+    [
+      "a BOGUS policy token — otherwise counted AND emitted as if it were a real verdict",
+      `'policy-excluded', 0, 'excluded-by-vibes', NULL`,
+      /policy_status="excluded-by-vibes", outside the known domain/,
+    ],
+    [
+      // A status outside the four belongs to NO bucket, so the counts silently stop summing — this is
+      // also exactly how a future 'error' disposition would arrive.
+      "an UNKNOWN status with no policy — it would land in no disposition bucket at all",
+      `'reused', 0, NULL, NULL`,
+      /status="reused", outside the four known dispositions/,
+    ],
+    [
       "a SCANNED policy row that is not the default (schema-valid, still not an override)",
       `'scanned', 0, 'excluded-by-deny', 'rel*'`,
       /scanned row carrying policy_status.*but is_default_branch=0/,

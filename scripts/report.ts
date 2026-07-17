@@ -15,7 +15,7 @@ import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } f
 import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
 import { logLine } from "./log.ts";
-import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition, checkedPolicyStatus } from "./policyDisposition.ts";
+import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition, policyStatusOrThrow } from "./policyDisposition.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
 import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -267,8 +267,8 @@ function buildScanScope(allHeads: HeadRow[]): ScanScope {
       // ternary's else-branch and be mislabelled EXCLUDED. Fail closed instead of guessing.
       disposition: dispositionOf(h),
       // CHECKED, never `as`-cast: dispositionOf's guard above validates this row's SHAPE and stops
-      // there, so the literal itself is only a promise until something reads it. See checkedPolicyStatus.
-      policyStatus: checkedPolicyStatus(h, `${h.organization}/${h.repository}@${h.branch}`),
+      // there, so the literal itself is only a promise until something reads it. See policyStatusOrThrow.
+      policyStatus: policyStatusOrThrow(h, `${h.organization}/${h.repository}@${h.branch}`),
       matchedPattern: h.policy_matched_pattern,
     }))
     .sort((a, b) => cmp(`${a.organization}\0${a.repository}\0${a.branch}`, `${b.organization}\0${b.repository}\0${b.branch}`));

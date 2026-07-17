@@ -24,7 +24,7 @@
 import { existsSync } from "node:fs";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type AuditDbReader, type PolicyStatus, type RunRecord } from "./db.ts";
-import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition, checkedPolicyStatus } from "./policyDisposition.ts";
+import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition, policyStatusOrThrow } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
@@ -279,7 +279,7 @@ function siteKey(r: UsageRowDb): string {
 interface PolicyBranchState {
   readonly status: string;
   readonly isDefaultBranch: boolean | null;
-  // The CLOSED set, not a bare string: every value here is checked by checkedPolicyStatus at
+  // The CLOSED set, not a bare string: every value here is checked by policyStatusOrThrow at
   // construction, so the churn entries this feeds cannot carry a literal outside db.ts's union.
   readonly policyStatus: PolicyStatus | null;
   readonly policyMatchedPattern: string | null;
@@ -333,7 +333,7 @@ function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
           // The guard above settles the row's SHAPE and stops there; this settles the LITERAL, which
           // churn compares (policyStateEq) and emits. Null stays null and is checked no further — an
           // unrestricted branch is the common case, and only a policy-BEARING row makes a claim.
-          policyStatus: h.policy_status === null ? null : checkedPolicyStatus(h, where),
+          policyStatus: h.policy_status === null ? null : policyStatusOrThrow(h, where),
           policyMatchedPattern: h.policy_matched_pattern,
           policyApplied: isPolicyExcluded(h),
           defaultOverride: isDefaultOverride(h),

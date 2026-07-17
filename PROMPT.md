@@ -197,6 +197,10 @@ Fail fast with actionable remediation if any of these fail:
    (REST) AND `resources.graphql` (branch discovery uses the separate GraphQL bucket)
    and adapt concurrency down if either is low. (`resources.search` is not consumed —
    discovery uses paginated REST, §5.A, not the search API — so it need not be tracked.)
+   AS BUILT: preflight RECORDS both figures and emits them on the `preflight` event; it
+   does NOT adapt concurrency — nothing reads the quota again. Live throttling is handled
+   reactively instead (§4's retry/pause budget and the requeue-throttle deferral), so the
+   quota is operator-facing information today, not a control input.
 8. Sufficient disk space for ephemeral clones.
 Emit "Preflight OK" plus, if resuming, existing row counts and last run id/time.
 
@@ -658,6 +662,13 @@ work bounded by `concurrency.*`:
 - one subagent per org (enumerate repos/branches),
 - one per repo (branch lists, cutoff filter, candidate files),
 - one per branch (fetch manifests/lockfiles, scan usage).
+AS BUILT — this is build strategy, not a description of the shipped runtime: all three
+levels are iterated SEQUENTIALLY. The only `concurrency.*` value read is `repositories`,
+and it is not a per-repo fan-out either — it is the GLOBAL in-flight cap on gh requests
+(github.ts's semaphore). `concurrency.organizations` and `concurrency.branches` are thus
+validated, required, and never consumed: they are this section's fan-out, unbuilt. Whether
+to implement it or drop the two dead keys is an OPEN decision; until it is made, nothing
+may describe them as active controls (config.schema.json marks both RESERVED).
 CRITICAL: Subagents COMPUTE and return structured JSON; a SINGLE coordinator
 performs all SQLite writes (single-writer pattern). Do not bet on multi-process WAL
 writer safety. Additionally, delegate genuinely NON-DETERMINISTIC comprehension to a
@@ -1395,7 +1406,13 @@ resumed one. A THROTTLE-REQUEUED branch is deferred, not terminal: it writes nei
 a NEW error, and with no prior same-run error it is in no count (an earlier invocation's
 append-only error still counts it — the resumed-run divergence above). Decide policy dispositions ONLY via both status and policy_status
 (scripts/policyDisposition.ts); `policy_status IS NOT NULL` alone is never a proxy for
-"excluded" (a scanned default branch carries the counterfactual). `repositoriesScanned` =
+"excluded" (a scanned default branch carries the counterfactual). The guard validates the
+WHOLE row, not just those two columns: `is_default_branch` is load-bearing in BOTH
+directions — a 'policy-excluded' row must be a definite non-default (the default is always
+scanned, so it can never be an exclusion) and a scanned policy-bearing row must be the
+known default — and `policy_matched_pattern` may appear only on a deny. Those four rules
+are read-time only: a SQL CHECK over is_default_branch could reject a v3 row at migration
+time, so failing an UPGRADE to defend against a forged row is the wrong trade. `repositoriesScanned` =
 COUNT(DISTINCT organization||'/'||repository) and `organizationsScanned` =
 COUNT(DISTINCT organization) — both over run_id=R AND status='scanned' rows (matching
 branchesScanned semantics; a repo/org whose every branch was cutoff-skipped is NOT

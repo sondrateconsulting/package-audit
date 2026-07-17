@@ -77,11 +77,11 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["organizations", "repositories", "branches"],
-      "description": "Fan-out bounds. Excluded from config_hash (tuning speed never orphans resumable work).",
+      "description": "Fan-out bounds. Only 'repositories' is consumed today (a GLOBAL in-flight cap on gh requests); 'organizations' and 'branches' are RESERVED — validated and required, but never read. Excluded from config_hash (tuning speed never orphans resumable work).",
       "properties": {
         "organizations": { "type": "integer", "minimum": 1 },
         "repositories": { "type": "integer", "minimum": 1 },
-        "branches": { "type": "integer", "minimum": 1, "description": "Per-repo branch fan-out concurrency (a parallelism limit — unrelated to the root-level 'branches' allow/deny list)." }
+        "branches": { "type": "integer", "minimum": 1, "description": "RESERVED — validated and required, but NOT consumed at runtime: branches are scanned sequentially today. Unrelated to the root-level 'branches' allow/deny list, which shares only the name." }
       }
     },
     "packages": {
