@@ -14,7 +14,7 @@ cd package-audit
 bun install   # required: `typescript` powers the .d.ts/source scanners at runtime; dev-only `@types/bun` + `zod` (report-schema tests)
 ```
 
-1. **Edit [config.json](config.json)** — set the packages you track. Your editor validates it against [config.schema.json](config.schema.json) via the `$schema` key, and unknown keys are rejected at startup (close typos get a did-you-mean hint). One scoping decision matters up front: `"organizations": null` (the default) is discovery mode — the tool enumerates *every* organization your gh token is a member of and scans all of them. Right for "audit everything I can see"; wrong for a client engagement run under a token with memberships outside the engagement. For engagements, set an explicit allowlist: `"organizations": ["client-org"]`.
+1. **Edit [config.json](config.json)** — set the packages you track. Your editor validates it against [config.schema.json](config.schema.json) via the `$schema` key, and unknown keys are rejected at startup (close typos get a did-you-mean hint). One *owner*-scoping decision matters up front: `"organizations": null` (the default) is discovery mode — the tool enumerates *every* organization your gh token is a member of and scans all of them. Right for "audit everything I can see"; wrong for a client engagement run under a token with memberships outside the engagement. For engagements, set an explicit allowlist: `"organizations": ["client-org"]`. Branch scope is a separate lever — see [Branch policy](#branch-policy).
 
 2. **Preview the scope** — resolves owners and discovers repos/branches, prints what *would* be scanned, and exits. Opens no database, writes nothing, fetches no file content:
 
@@ -134,6 +134,30 @@ jq -s 'group_by(.usage_type) | map({usage_type: .[0].usage_type, sites: length})
 ## Configuration
 
 Every field is documented in [config.schema.json](config.schema.json) (your editor shows the descriptions inline). Unknown keys are **rejected at startup** — close typos get a did-you-mean hint — so a typo can never silently widen or narrow the scan. Config file precedence: `--config <path>` > `CONFIG_PATH` env var > `./config.json`.
+
+### Branch policy
+
+`branches` (allowlist) and `excludeBranches` (denylist) select branches by name — exact strings or Bun globs, case-sensitive, never regex. `*` does not cross `/` but `**` does, so `release/**` catches `release/v2/rc1` and `release/*` does not. A leading `!` is rejected (no negation). Both are root-level; the unrelated `concurrency.branches` is a parallelism limit.
+
+Precedence:
+
+1. **A repository's default branch is always eligible** — exempt from both lists, and from `cutoffDate` and `maxBranchesPerRepo`. A default a rule *would* have dropped is scanned anyway, and the report records that counterfactual verdict.
+2. **Deny beats allow** — for every other branch.
+
+`branches` is tri-state: omitted or `null` is unrestricted (deny still applies); `[]` leaves only default branches; a non-empty list restricts eligibility to matches. `excludeBranches` omitted, `null`, or `[]` all mean no deny rules. Eligible is not scanned: surviving non-defaults still face the cutoff and the cap.
+
+Policy is applied **before** cutoff and cap, so a denied recent branch never consumes a cap slot an allowed older branch could have used — and it is recorded as `policy-excluded`, never as a cutoff skip.
+
+```json
+{
+  "branches": null,
+  "excludeBranches": ["release/**"]
+}
+```
+
+Every non-default branch stays eligible except `release/…` at any depth — but a repository whose *default* is `release/2.x` is still scanned.
+
+Editing either list changes `config_hash`, so the next audit starts a fresh run rather than resuming; the old hash's queue rows survive and are reused if you change back (reordering or duplicating entries changes nothing — the lists are canonicalized). Preview with `bun run audit --plan`, which also warns, advisorily, about an empty allowlist, a pattern that matched no discovered branch, and a deny pattern whose only matches were default branches.
 
 ## Reading a run
 
