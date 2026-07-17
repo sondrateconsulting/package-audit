@@ -18,6 +18,11 @@ import type { PolicyStatus, UnitHeadStatus } from "./db.ts";
 import { isIsoInstant } from "./isoDate.ts";
 
 export interface PolicyDispositionRow {
+  // The identity trio is validated too: report/compare/export COUNT and EMIT these, and a BLOB
+  // branch (schema-valid in a non-STRICT table) was counted and exported (round 6).
+  readonly organization: string;
+  readonly repository: string;
+  readonly branch: string;
   readonly status: string; // validated against UnitHeadStatus below — NOT trusted as one
   readonly policy_status: string | null; // validated against PolicyStatus below — NOT trusted as one
   readonly policy_matched_pattern: string | null;
@@ -100,6 +105,8 @@ export function assertRunUnitHeadSound(r: PolicyDispositionRow, where: string): 
   // RUNTIME types first: the table is not STRICT, so SQLite happily stores a BLOB in any of these
   // columns and bun:sqlite hands it over as a Uint8Array the TypeScript row type never admits
   // (round-5: a one-byte BLOB deny pattern exported as {"0":120}). A declared type is not a check.
+  if (typeof r.organization !== "string" || typeof r.repository !== "string" || typeof r.branch !== "string")
+    throw new Error(`internal: run_unit_head ${where} has a non-string identity column — non-STRICT storage smuggled a foreign runtime type`);
   if (typeof r.status !== "string" || typeof r.commit_sha !== "string")
     throw new Error(`internal: run_unit_head ${where} has a non-string status/commit_sha — non-STRICT storage smuggled a foreign runtime type`);
   if ((r.policy_status !== null && typeof r.policy_status !== "string") ||

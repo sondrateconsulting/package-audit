@@ -1000,10 +1000,10 @@ function colsMatch(actual: ColInfo[], spec: readonly ColSpec[]): boolean {
 // on_update/on_delete are part of the identity: an ON DELETE CASCADE sibling silently deletes child
 // rows on run pruning — adopting it changes write semantics without any structural difference the
 // colspec could see (round-4 class).
-function foreignKeys(db: Database, table: string): Array<{ from: string; table: string; to: string; onUpdate: string; onDelete: string }> {
-  return (db.query('SELECT "from" AS "from", "table" AS "table", "to" AS "to", on_update AS ou, on_delete AS od FROM pragma_foreign_key_list(?)').all(table) as Array<{
-    from: string; table: string; to: string | null; ou: string; od: string;
-  }>).map((r) => ({ from: r.from.toLowerCase(), table: r.table.toLowerCase(), to: (r.to ?? "").toLowerCase(), onUpdate: r.ou.toUpperCase(), onDelete: r.od.toUpperCase() }));
+function foreignKeys(db: Database, table: string): Array<{ from: string; table: string; to: string; onUpdate: string; onDelete: string; match: string }> {
+  return (db.query('SELECT "from" AS "from", "table" AS "table", "to" AS "to", on_update AS ou, on_delete AS od, "match" AS m FROM pragma_foreign_key_list(?)').all(table) as Array<{
+    from: string; table: string; to: string | null; ou: string; od: string; m: string;
+  }>).map((r) => ({ from: r.from.toLowerCase(), table: r.table.toLowerCase(), to: (r.to ?? "").toLowerCase(), onUpdate: r.ou.toUpperCase(), onDelete: r.od.toUpperCase(), match: r.m.toUpperCase() }));
 }
 
 // ix_ruh_loc's state ON run_unit_head: "ok" = OUR index (non-UNIQUE, explicitly created, over exactly
@@ -1267,7 +1267,7 @@ function classifyRunUnitHead(db: Database): RuhClass {
   const checks = sql === null ? [] : extractChecks(sql);
   const fks = foreignKeys(db, "run_unit_head");
   const fkOk = fks.length === 1 && fks[0]!.from === "run_id" && fks[0]!.table === "runs" && fks[0]!.to === "run_id" &&
-    fks[0]!.onUpdate === "NO ACTION" && fks[0]!.onDelete === "NO ACTION";
+    fks[0]!.onUpdate === "NO ACTION" && fks[0]!.onDelete === "NO ACTION" && fks[0]!.match === "NONE"; // MATCH joined in round 6
   if (!fkOk)
     return { kind: "incompatible", reason: "run_unit_head lacks the exact run_id→runs(run_id) foreign key" };
   // Unexpected triggers or extra secondary indexes would be SILENTLY dropped by the rebuild — refuse
