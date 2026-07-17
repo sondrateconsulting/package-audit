@@ -1116,10 +1116,11 @@ function normalizeCheck(expr: string): string {
 
 // Extract EVERY top-level CHECK(...) expression from a table's stored CREATE sql. Fully quote/
 // comment-aware: `CHECK (`, `)`, and quotes inside string literals or identifiers are ignored, so a
-// foreign table cannot smuggle the expected CHECK text through a DEFAULT string. Returns the set of
-// NORMALIZED bodies — a foreign CHECK with extra values or OR-clauses is thus distinguished.
-function extractChecks(sql: string): Set<string> {
-  const out = new Set<string>();
+// foreign table cannot smuggle the expected CHECK text through a DEFAULT string. Returns EVERY
+// normalized body, DUPLICATES PRESERVED — a Set here once collapsed a doubled CHECK into the exact
+// expected set, so a foreign table whose constraint text was not ours could classify as ours.
+function extractChecks(sql: string): string[] {
+  const out: string[] = [];
   const n = sql.length;
   let i = 0;
   while (i < n) {
@@ -1173,7 +1174,7 @@ function extractChecks(sql: string): Set<string> {
           else if (cc === ")") depth--;
           k++;
         }
-        out.add(normalizeCheck(sql.slice(start, k - 1)));
+        out.push(normalizeCheck(sql.slice(start, k - 1)));
         i = k;
         continue;
       }
@@ -1182,16 +1183,44 @@ function extractChecks(sql: string): Set<string> {
   }
   return out;
 }
-// Expected CHECK sets, normalized through the SAME function so our own spacing never matters.
-const RUH_V4_CHECKS = new Set([
+// Does the CREATE sql contain a bare COLLATE token outside strings/comments/quoted identifiers?
+// Same trivia-skipping walk as extractChecks, so a DEFAULT string containing the word cannot trip
+// it. Our own DDL (every version) declares NO collation anywhere — the PK's BINARY is the implicit
+// default — so ANY occurrence is a foreign shape. This is the only witness for a NON-PK column
+// collation: table_xinfo's declared type omits COLLATE, and only the PK autoindex exposes one via
+// pragma_index_xinfo — a `status TEXT COLLATE NOCASE` sibling (under which 'SCANNED' satisfies the
+// lowercase CHECK) was accepted by every structural probe until this scan.
+function hasCollateToken(sql: string): boolean {
+  const n = sql.length;
+  let i = 0;
+  while (i < n) {
+    const c = sql[i]!;
+    if (c === "'" || c === '"' || c === "`" || c === "[") { i = skipQuoted(sql, i); continue; }
+    if (c === "-" && sql[i + 1] === "-") { while (i < n && sql[i] !== "\n") i++; continue; }
+    if (c === "/" && sql[i + 1] === "*") { i += 2; while (i < n && !(sql[i] === "*" && sql[i + 1] === "/")) i++; i += 2; continue; }
+    if ((c === "c" || c === "C") && sql.slice(i, i + 7).toLowerCase() === "collate" && !/\w/.test(sql[i - 1] ?? " ") && !/\w/.test(sql[i + 7] ?? " ")) return true;
+    i++;
+  }
+  return false;
+}
+
+// Expected CHECK MULTISETS, normalized through the SAME function so our own spacing never matters.
+// Arrays compared as sorted sequences, never Sets: set-equality collapsed a duplicated foreign CHECK
+// into the exact expected set.
+const RUH_V4_CHECKS: readonly string[] = [
   normalizeCheck("status IN ('scanned','skipped-cutoff','policy-excluded','past-cap')"),
   normalizeCheck("policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')"),
   normalizeCheck("policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL"),
   normalizeCheck("status <> 'policy-excluded' OR policy_status IS NOT NULL"),
   normalizeCheck("status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL"),
-]);
-const RUH_V23_CHECKS = new Set([normalizeCheck("status IN ('scanned','skipped-cutoff')")]);
-const setEquals = (a: Set<string>, b: Set<string>): boolean => a.size === b.size && [...a].every((x) => b.has(x));
+];
+const RUH_V23_CHECKS: readonly string[] = [normalizeCheck("status IN ('scanned','skipped-cutoff')")];
+const checksEqual = (actual: readonly string[], expected: readonly string[]): boolean => {
+  if (actual.length !== expected.length) return false;
+  const a = [...actual].sort();
+  const b = [...expected].sort();
+  return a.every((x, i) => x === b[i]);
+};
 
 function tableCreateSql(db: Database, table: string): string | null {
   const row = db.query("SELECT sql FROM sqlite_schema WHERE type='table' AND name = ? COLLATE NOCASE").get(table) as
@@ -1222,7 +1251,7 @@ function classifyRunUnitHead(db: Database): RuhClass {
   if (!tableExists(db, "run_unit_head")) return { kind: "absent" };
   const cols = tableXinfo(db, "run_unit_head");
   const sql = tableCreateSql(db, "run_unit_head");
-  const checks = sql === null ? new Set<string>() : extractChecks(sql);
+  const checks = sql === null ? [] : extractChecks(sql);
   const fks = foreignKeys(db, "run_unit_head");
   const fkOk = fks.length === 1 && fks[0]!.from === "run_id" && fks[0]!.table === "runs" && fks[0]!.to === "run_id";
   if (!fkOk)
@@ -1235,8 +1264,13 @@ function classifyRunUnitHead(db: Database): RuhClass {
   // keys). ruhPkBinaryCollation covers both "no composite PK" and "present but non-BINARY".
   if (!ruhPkBinaryCollation(db))
     return { kind: "incompatible", reason: "run_unit_head's composite primary key is missing or uses a non-BINARY collation" };
+  // COLLATE anywhere in the CREATE sql = foreign, on EVERY recognized shape (no version of our DDL
+  // ever declared one). Ordered AFTER the PK probe so an index-level PK collation keeps its own
+  // dedicated rejection (and its fixture keeps exercising that probe, not this scan).
+  if (sql !== null && hasCollateToken(sql))
+    return { kind: "incompatible", reason: "run_unit_head declares a COLLATE clause — our shape never does (a non-BINARY collation changes CHECK and comparison semantics)" };
   if (colsMatch(cols, RUH_V4_COLSPEC)) {
-    if (!setEquals(checks, RUH_V4_CHECKS))
+    if (!checksEqual(checks, RUH_V4_CHECKS))
       return { kind: "incompatible", reason: "run_unit_head has the v4 columns but not the exact v4 CHECK set" };
     const idx = ruhIndexState(db);
     if (idx === "wrong")
@@ -1248,14 +1282,14 @@ function classifyRunUnitHead(db: Database): RuhClass {
   // (the predecessor may legitimately lack it; the rebuild recreates it).
   const predIdxWrong = ruhIndexState(db) === "wrong";
   if (colsMatch(cols, RUH_V3_COLSPEC)) {
-    if (!setEquals(checks, RUH_V23_CHECKS))
+    if (!checksEqual(checks, RUH_V23_CHECKS))
       return { kind: "incompatible", reason: "run_unit_head has the v3 columns but not the exact v3 CHECK set" };
     if (predIdxWrong)
       return { kind: "incompatible", reason: "run_unit_head (v3) has an ix_ruh_loc index with the wrong definition" };
     return { kind: "exact-v3" };
   }
   if (colsMatch(cols, RUH_V2_COLSPEC)) {
-    if (!setEquals(checks, RUH_V23_CHECKS))
+    if (!checksEqual(checks, RUH_V23_CHECKS))
       return { kind: "incompatible", reason: "run_unit_head has the v2 columns but not the exact v2 CHECK set" };
     if (predIdxWrong)
       return { kind: "incompatible", reason: "run_unit_head (v2) has an ix_ruh_loc index with the wrong definition" };

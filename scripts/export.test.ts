@@ -1,4 +1,5 @@
 import { expect, test, describe, afterAll, spyOn } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -670,5 +671,29 @@ describe("api-surface export requires the completion marker (F5)", () => {
       rmSync(out, { recursive: true, force: true });
       db.close();
     }
+  });
+});
+
+describe("export — run_unit_head soundness gate (same whole-row rules as report/compare)", () => {
+  test("the DEFAULT export REFUSES a schema-valid malformed row; --raw stays the forensic escape hatch", () => {
+    mkdirSync(DB_ROOT, { recursive: true });
+    const path = join(DB_ROOT, "guard-gate.db");
+    const db = AuditDb.open({ sqlitePath: path });
+    const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    db.completeRun(runId);
+    db.close();
+    // A DEFAULT branch marked policy-excluded: no SQL CHECK covers defaultness, so NO pragma is
+    // needed — the read gate is this row's only defense, and before it existed the default export
+    // shipped exactly this row to CSV while buildReport refused the same database.
+    const f = new Database(path, { strict: true });
+    f.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'main', '', 'policy-excluded', 1, 'excluded-by-deny', 'rel*', '2025-06-01T00:00:00Z')`).run(runId);
+    f.close();
+    const db2 = AuditDb.open({ sqlitePath: path });
+    const run = db2.getRun(runId)!;
+    const out = mkdtempSync(join(tmpdir(), "export-gate-"));
+    expect(() => exportRun(db2, run, out, { raw: false })).toThrow(/the default branch is always scanned/);
+    expect(() => exportRun(db2, run, out, { raw: true })).not.toThrow(); // forensic dump: deliberately ungated
+    db2.close();
+    rmSync(out, { recursive: true, force: true });
   });
 });

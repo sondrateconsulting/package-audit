@@ -16,6 +16,7 @@ import { ArtifactBundle, XRAY_DIR_NAME } from "./artifactWrite.ts";
 import { toCsv, type CsvCell } from "./csvWrite.ts";
 import { parseSemver } from "./semver.ts";
 import { logLine } from "./log.ts";
+import { assertRunUnitHeadSound } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
@@ -349,6 +350,12 @@ function collectRunScoped(db: AuditDbReader, run: RunRecord): ExportSnapshot[] {
     `SELECT ${selectList(RUN_UNIT_HEAD_COLUMNS)} FROM run_unit_head WHERE run_id = ?
      ORDER BY ${orderByClause(RUN_UNIT_HEAD_ORDER_BY)}`,
   ).all(run.runId) as RunUnitHeadExportRow[];
+  // The default export COUNTS and EMITS these rows, so it applies the same whole-row soundness gate
+  // as report/compare — otherwise a malformed row the report refuses to summarize (e.g. a DEFAULT
+  // branch marked policy-excluded) still ships to spreadsheets/DuckDB as if it were fact. `--raw`
+  // stays deliberately ungated: it is the loudly-labelled forensic escape hatch, and gating it would
+  // make a corrupted database impossible to inspect with the tool's own exporter.
+  for (const h of runUnitHead) assertRunUnitHeadSound(h, `${h.organization}/${h.repository}@${h.branch}`);
 
   // Registry-EXHAUSTIVE assembly (map EXPORT_TABLE_NAMES): the Record type forces a row source for
   // every registry table, so a future table can never appear in --raw/EXPORTS.md yet silently vanish

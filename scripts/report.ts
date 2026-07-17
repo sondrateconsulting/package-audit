@@ -15,7 +15,7 @@ import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } f
 import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
 import { logLine } from "./log.ts";
-import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition, policyStatusOrThrow } from "./policyDisposition.ts";
+import { isPolicyExcluded, isDefaultOverride, assertRunUnitHeadSound, policyStatusOrThrow } from "./policyDisposition.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
 import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -217,7 +217,7 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
 // The whole-set fail-closed sweep (PROMPT.md §7). Returns its input so it composes at the call site —
 // there is no path to a derived count that skips it.
 function assertHeadsWellFormed(heads: HeadRow[]): HeadRow[] {
-  for (const h of heads) assertKnownPolicyDisposition(h, `${h.organization}/${h.repository}@${h.branch}`);
+  for (const h of heads) assertRunUnitHeadSound(h, `${h.organization}/${h.repository}@${h.branch}`);
   return heads;
 }
 
@@ -243,7 +243,7 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
 // case lives in policyDisposition.ts (the ONE definition) so this surface and compare's policy churn
 // cannot drift apart on what an unrecognised policy-bearing row means.
 function dispositionOf(h: HeadRow): "scanned-default-override" | "excluded" {
-  assertKnownPolicyDisposition(h, `${h.organization}/${h.repository}@${h.branch}`);
+  assertRunUnitHeadSound(h, `${h.organization}/${h.repository}@${h.branch}`);
   return isDefaultOverride(h) ? "scanned-default-override" : "excluded";
 }
 

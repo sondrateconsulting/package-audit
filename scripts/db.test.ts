@@ -3632,9 +3632,19 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
 
   test("CHECK tokenizer: expected CHECK text hidden in a DEFAULT string does NOT satisfy the fingerprint", () => {
     const path = nextFile();
+    // The DEFAULT string embeds the ENTIRE current 5-CHECK text (built from the same parts the
+    // control uses, so it can never silently lag the real set — the rot that made the old fixture
+    // vacuous: it embedded the obsolete 3-token text, so rejection proved only set mismatch). If the
+    // tokenizer ever read string contents, it would extract an exact fingerprint match and ACCEPT
+    // this CHECK-less table, failing this test loudly.
+    const embedded = [
+      "CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap'))",
+      "CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow'))",
+      V4_RUH_PARTS.checks,
+    ].join(", ").replace(/'/g, "''");
     forgeRuh(path, `CREATE TABLE run_unit_head (
       run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
-      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT 'CHECK (status IN (''scanned'',''skipped-cutoff'',''past-cap''))',
+      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '${embedded}',
       status TEXT NOT NULL DEFAULT 'scanned', is_default_branch INTEGER,
       policy_status TEXT, policy_matched_pattern TEXT, scanned_commit_date TEXT,
       PRIMARY KEY (run_id, organization, repository, branch))`); // NO real CHECKs — text is only in a default
@@ -3646,15 +3656,15 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
 
   test("CHECK case: a status CHECK with UPPERCASE literal values is rejected (would break lowercase writes)", () => {
     const path = nextFile();
-    forgeRuh(path, `CREATE TABLE run_unit_head (
-      run_id TEXT NOT NULL REFERENCES runs(run_id), organization TEXT NOT NULL, repository TEXT NOT NULL,
-      branch TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'scanned' CHECK (status IN ('SCANNED','SKIPPED-CUTOFF','PAST-CAP')),
-      is_default_branch INTEGER,
-      policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
-      policy_matched_pattern TEXT, scanned_commit_date TEXT,
-      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
-      PRIMARY KEY (run_id, organization, repository, branch))`);
+    // ONLY difference from ours-v4: the status CHECK's literals are UPPERCASE. Everything else —
+    // including both new status↔policy_status CHECKs — is the current shape, so rejection can only
+    // come from literal case (normalizeCheck deliberately never case-folds literals).
+    forgeRuh(path, v4Ruh({
+      cols: V4_RUH_PARTS.cols.replace(
+        "CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap'))",
+        "CHECK (status IN ('SCANNED','SKIPPED-CUTOFF','POLICY-EXCLUDED','PAST-CAP'))",
+      ),
+    }));
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
   });
 
@@ -3745,6 +3755,28 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     // ONLY difference from ours-v4: a NOCASE collation on one primary-key column.
     forgeRuh(path, v4Ruh({ pk: "PRIMARY KEY (run_id, organization COLLATE NOCASE, repository, branch)" }));
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible|collation/);
+  });
+
+  test("fingerprint: a NOCASE collation on a NON-PK column (status) is rejected — no structural probe can see it", () => {
+    const path = nextFile();
+    // ONLY difference from ours-v4: `status` declares COLLATE NOCASE. Under NOCASE, 'SCANNED'
+    // satisfies the lowercase status CHECK — the uppercase-literal defense is moot on such a sibling
+    // — and table_xinfo's declared type omits COLLATE, so only the CREATE-sql token scan catches it.
+    // This shape was ACCEPTED before that scan existed (found by adversarial review, verified live).
+    forgeRuh(path, v4Ruh({ cols: V4_RUH_PARTS.cols.replace(
+      "status TEXT NOT NULL DEFAULT 'scanned'",
+      "status TEXT COLLATE NOCASE NOT NULL DEFAULT 'scanned'",
+    ) }));
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/COLLATE clause/);
+  });
+
+  test("fingerprint: a DUPLICATED member of the exact CHECK set is rejected (multiset, never Set, comparison)", () => {
+    const path = nextFile();
+    // ONLY difference from ours-v4: one expected CHECK appears TWICE. Set-equality collapsed this
+    // ({A,A,B,C,D,E} == {A..E}) and adopted a table whose constraint text was not ours.
+    forgeRuh(path, v4Ruh({ checks: `${V4_RUH_PARTS.checks},
+      CHECK (status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL)` }));
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/not the exact v4 CHECK set/);
   });
 
   test("index: an ix_ruh_loc on a DIFFERENT table (global name squat) is rejected, not treated as repairable-absent", () => {

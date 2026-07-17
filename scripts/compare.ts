@@ -24,7 +24,7 @@
 import { existsSync } from "node:fs";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type AuditDbReader, type PolicyStatus, type RunRecord } from "./db.ts";
-import { isPolicyExcluded, isDefaultOverride, assertKnownPolicyDisposition, policyStatusOrThrow } from "./policyDisposition.ts";
+import { isPolicyExcluded, isDefaultOverride, assertRunUnitHeadSound, policyStatusOrThrow } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
@@ -324,7 +324,7 @@ function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
       // defaultOverrideChanges ("neither applied, but the counterfactual changed") — laundering a
       // malformed disposition into a plausible-looking churn entry.
       const where = `${h.organization}/${h.repository}@${h.branch}`;
-      assertKnownPolicyDisposition(h, where);
+      assertRunUnitHeadSound(h, where);
       return [
         `${h.organization}\0${h.repository}\0${h.branch}`,
         {

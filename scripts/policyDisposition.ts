@@ -1,111 +1,130 @@
-// policyDisposition.ts — the ONE definition of what a run_unit_head row's policy columns MEAN for the
-// read surfaces (report counts, HTML scan-scope panel, compare churn). The load-bearing subtlety:
-// `policy_status IS NOT NULL` does NOT mean "excluded from scanning" — a SCANNED default branch carries
-// the counterfactual policy_status too (the default-branch override, PROMPT.md §3). So the two states must be
-// distinguished by BOTH status and policy_status. Shared so report/HTML/compare can never drift.
+// policyDisposition.ts — the ONE read-time soundness gate for a run_unit_head row, and the ONE
+// definition of what its policy columns MEAN (report counts, HTML scan-scope panel, compare churn,
+// the export snapshot). The load-bearing subtlety: `policy_status IS NOT NULL` does NOT mean "excluded
+// from scanning" — a SCANNED default branch carries the counterfactual policy_status too (the
+// default-branch override, PROMPT.md §3). So the two states are distinguished by BOTH status and
+// policy_status. Shared so every read surface applies the same gate and can never drift.
 //
-// The guard below validates the WHOLE row, exhaustively, rather than the one rule a caller happens to
-// care about. That is deliberate and was learned the hard way: three separate rounds of review each
-// found another half-checked symmetry (a policy-excluded row with no verdict; a scanned policy row that
-// was not the default; a policy-EXCLUDED row that WAS the default; an allow-exclusion carrying a deny
-// pattern). Each was a rule the WRITE chokepoint enforces and this read guard did not. Anything the
-// chokepoint asserts about a row's shape must be re-asserted here, because these surfaces also read rows
-// that never passed our writer — a foreign or sibling file that survived classification, a disposition
-// added later, or a hand-edited database. Validate every field or one of them will be the next hole.
+// The gate validates the WHOLE row, not the one rule a caller happens to care about. That is the
+// lesson of this module's history: round after round of review found another half-checked symmetry
+// (a policy-excluded row with no verdict; a scanned policy row that was not the default; a
+// policy-EXCLUDED DEFAULT; an allow-exclusion carrying a deny pattern; a bogus policy token; an
+// unknown status; a scanned row with an empty commit_sha that leaked findings). Each was a rule the
+// WRITE chokepoint (assertRunUnitHeadInvariants) enforces and this read gate did not. These surfaces
+// also read rows that never passed our writer — a foreign or sibling database that survived
+// classification, a disposition added later, a hand-edited file — so anything the chokepoint asserts
+// about a row's shape is re-asserted HERE. Validate every field or one of them is the next hole.
 import type { PolicyStatus, UnitHeadStatus } from "./db.ts"; // type-only: erased, so this module stays a runtime leaf
 
 export interface PolicyDispositionRow {
   readonly status: string; // validated against UnitHeadStatus below — NOT trusted as one
   readonly policy_status: string | null; // validated against PolicyStatus below — NOT trusted as one
   readonly policy_matched_pattern: string | null;
-  // Tri-state 1/0/NULL. Required because both policy predicates are CLAIMS about defaultness: without
-  // it a read surface can only guess, and SQL cannot help — the CHECKs deliberately leave `scanned`
-  // free to carry a counterfactual, so a scanned+policy row with is_default_branch=0 is schema-VALID.
+  // Tri-state 1/0/NULL. Load-bearing in BOTH directions (a policy-excluded row must be a definite
+  // non-default; a scanned policy-bearing row must be the known default), and SQL cannot help: the
+  // CHECKs leave `scanned` free to carry a counterfactual, so a scanned+policy row with
+  // is_default_branch=0 is schema-VALID and reaches this gate.
   readonly is_default_branch: number | null;
+  // A scanned row pins a real commit; every non-scanned disposition stores ''. The report/export
+  // findings join is `status='scanned'` matched on commit_sha, so a scanned row with commit_sha=''
+  // joins findings parked at the empty SHA — a stale/poison leak. The gate is that join's only defense.
+  readonly commit_sha: string;
+  // NULL ONLY on a v3→v4-migrated row (the pre-upgrade provenance sentinel). Used to scope the
+  // default⇒scanned rule to NATIVE rows: the migration copies v3 rows verbatim, so a CHECK — or an
+  // ungated read rule — that a real pre-v4 row might violate would fail an UPGRADE to defend against a
+  // forged row. A native row always carries a real date (non-scanned rows get the discovered-head date).
+  readonly scanned_commit_date: string | null;
 }
 
-const KNOWN_STATUSES: readonly string[] = ["scanned", "skipped-cutoff", "policy-excluded", "past-cap"];
-const isKnownPolicyStatus = (v: string | null): v is PolicyStatus =>
-  v === "excluded-by-deny" || v === "excluded-by-allow";
+// `as const satisfies` ties this list to UnitHeadStatus: add a status token to db.ts without updating
+// this gate and the file stops compiling. (A bare `readonly string[]` would silently drift — the exact
+// gap review flagged.)
+const KNOWN_STATUSES = ["scanned", "skipped-cutoff", "policy-excluded", "past-cap"] as const satisfies readonly UnitHeadStatus[];
+const isKnownStatus = (v: string): v is UnitHeadStatus => (KNOWN_STATUSES as readonly string[]).includes(v);
+const isKnownPolicyStatus = (v: string | null): v is PolicyStatus => v === "excluded-by-deny" || v === "excluded-by-allow";
 
 // A branch actually DROPPED by policy — its own disposition in the disjoint partition (PROMPT.md §3),
-// named identically to the live JSONL stream's `action:'skip-policy'` event for the same branch.
-// The status alone is authoritative for CALLERS only because assertKnownPolicyDisposition has already
-// refused every row whose status, verdict, pattern or defaultness disagree. Callers MUST run that guard
-// over every row they count or label — never a filtered subset (see its contract).
+// named identically to the live JSONL stream's `action:'skip-policy'` event. The status alone is
+// authoritative for CALLERS only because assertRunUnitHeadSound has already refused every row whose
+// status, verdict, pattern, defaultness or commit disagree. Run that gate over EVERY row first.
 export const isPolicyExcluded = (r: PolicyDispositionRow): boolean => r.status === "policy-excluded";
 
-// A branch policy WOULD have dropped but which was scanned anyway because it is the default branch
-// (the default is always scanned): a scanned row carrying a counterfactual policy_status. Overlaps `branchesScanned` — it
-// is a DIAGNOSTIC, never part of the disjoint disposition partition. This is the reason `policy_status`
-// cannot be collapsed into `status`: the override's verdict is counterfactual, and the branch IS scanned.
+// A branch policy WOULD have dropped but which was scanned anyway because it is the default (the
+// default is always scanned): a scanned row carrying a counterfactual policy_status. Overlaps
+// `branchesScanned` — a DIAGNOSTIC, never part of the disjoint partition. This is the reason
+// policy_status cannot collapse into status: the override's verdict is counterfactual, the branch IS scanned.
 export const isDefaultOverride = (r: PolicyDispositionRow): boolean =>
   r.status === "scanned" && r.policy_status !== null && r.is_default_branch === 1;
 
-// The row's verdict, NARROWED. Use this instead of casting `policy_status` into the union: a cast
-// asserts a domain nobody checked, and a bogus token then escapes into output typed as if it were valid.
-// Safe to call only on a row that passed the guard; it re-checks anyway, because a guard that ran
-// somewhere else is not a type.
+// The row's verdict, NARROWED — use instead of casting `policy_status` into the union. A cast asserts a
+// domain nobody checked, and a bogus token then escapes into output typed as if it were valid. Safe to
+// call only after the gate; it re-checks anyway, because a gate that ran elsewhere is not a type.
 export function policyStatusOrThrow(r: PolicyDispositionRow, where: string): PolicyStatus {
   if (isKnownPolicyStatus(r.policy_status)) return r.policy_status;
-  throw new Error(
-    `internal: run_unit_head ${where} has policy_status=${JSON.stringify(r.policy_status)}, outside the known domain`,
-  );
+  throw new Error(`internal: run_unit_head ${where} has policy_status=${JSON.stringify(r.policy_status)}, outside the known domain`);
 }
 
-// FAIL-CLOSED guard for any read surface that COUNTS or LABELS a run_unit_head row. Callers must run it
-// over EVERY row, not a policy-bearing subset: `isPolicyExcluded` keys on status alone, so a filtered
-// caller can count a row this guard never saw (exactly the drift that let a 'policy-excluded' row naming
-// no rule be counted as an exclusion while the scan-scope ledger omitted it).
+// FAIL-CLOSED whole-row gate for any read surface that COUNTS, LABELS, or EMITS a run_unit_head row —
+// report, compare, AND the export snapshot. Callers run it over EVERY row, never a filtered subset:
+// `isPolicyExcluded` keys on status alone, so a filtered caller can count a row this gate never saw
+// (the drift that let a 'policy-excluded' row naming no rule be counted while the ledger omitted it).
 //
-// It rejects every disagreement the write chokepoint forbids:
-//   - a status outside the known four — it would land in NO disposition bucket, silently breaking the
-//     partition the report's counts rest on (and a later 'error' status would arrive exactly this way);
+// It rejects every disagreement the write chokepoint forbids that a read surface could be fooled by:
+//   - a status outside the known four — it belongs to NO disposition bucket, silently breaking the
+//     partition the counts rest on (and is exactly how a future 'error' status would first arrive);
 //   - a policy_status outside the known two — a bogus token is otherwise counted AND emitted;
-//   - a policy_matched_pattern on anything but a deny — the SQL CHECK only enforces deny ⇒ pattern, not
-//     the converse, so an allow-exclusion carrying a deny pattern is schema-VALID and the ledger would
-//     report a causing pattern that never caused anything;
-//   - 'policy-excluded' with NO verdict, or on a row that is not a definite non-default: the default is
-//     ALWAYS scanned (Premise 6), so it can never be a policy exclusion;
-//   - a SCANNED policy-bearing row that is not the known default — the mirror image;
+//   - a policy_matched_pattern that is not a real deny pattern — the SQL deny CHECK enforces only
+//     IS NOT NULL (so '' passes) and has NO converse (so an allow-exclusion may carry a deny pattern);
+//     the ledger would otherwise report a causing pattern that caused nothing, or an empty one;
+//   - a scanned row with commit_sha='' or a non-scanned row with a commit_sha — the findings join
+//     depends on this partition, and a scanned empty-commit row leaks findings parked at '';
+//   - a NATIVE default branch that is not scanned — the default is always scanned (Premise 6). Gated on
+//     scanned_commit_date (native rows only), so a migrated pre-v4 row can never fail an upgrade here;
+//   - a past-cap row that is not a definite non-default (past-cap is v4-native-only, so unconditional);
+//   - 'policy-excluded' with no verdict, or on anything but a definite non-default (the default can
+//     never be an exclusion);
+//   - a scanned policy-bearing row that is not the known default;
 //   - a policy_status on a cutoff/cap row, which policy never reaches (it runs first).
-// The defaultness and pattern-converse rules are deliberately NOT SQL CHECKs: a CHECK over
-// is_default_branch could reject a v3 row at migration time (the rebuild copies rows verbatim, and a
-// pre-v4 file's shape is history), so failing an UPGRADE to defend against a forged row would trade a
-// real risk for a hypothetical one. They live here, where refusing costs one report.
-// Fail, never guess: the inference this module exists to prevent is "policy-bearing and not an
-// override, therefore excluded".
-export function assertKnownPolicyDisposition(r: PolicyDispositionRow, where: string): void {
-  if (!KNOWN_STATUSES.includes(r.status))
-    throw new Error(
-      `internal: run_unit_head ${where} has status=${JSON.stringify(r.status)}, outside the four known dispositions — it belongs to no report bucket`,
-    );
+// All are states the chokepoint forbids — but it runs at WRITE time, not here. Fail, never guess: the
+// inference this module exists to prevent is "policy-bearing and not an override, therefore excluded".
+export function assertRunUnitHeadSound(r: PolicyDispositionRow, where: string): void {
+  if (!isKnownStatus(r.status))
+    throw new Error(`internal: run_unit_head ${where} has status=${JSON.stringify(r.status)}, outside the four known dispositions — it belongs to no report bucket`);
   if (r.policy_status !== null && !isKnownPolicyStatus(r.policy_status))
-    throw new Error(
-      `internal: run_unit_head ${where} has policy_status=${JSON.stringify(r.policy_status)}, outside the known domain`,
-    );
-  if (r.policy_matched_pattern !== null && r.policy_status !== "excluded-by-deny")
-    throw new Error(
-      `internal: run_unit_head ${where} carries policy_matched_pattern=${JSON.stringify(r.policy_matched_pattern)} on policy_status=${JSON.stringify(r.policy_status)} — only a deny names a causing pattern`,
-    );
+    throw new Error(`internal: run_unit_head ${where} has policy_status=${JSON.stringify(r.policy_status)}, outside the known domain`);
+  // policy_matched_pattern ↔ deny, both directions (the SQL CHECK covers neither the empty case nor
+  // the converse).
+  if (r.policy_status === "excluded-by-deny") {
+    if (r.policy_matched_pattern === null || r.policy_matched_pattern.length === 0)
+      throw new Error(`internal: run_unit_head ${where} is excluded-by-deny but names no causing pattern (policy_matched_pattern=${JSON.stringify(r.policy_matched_pattern)})`);
+  } else if (r.policy_matched_pattern !== null) {
+    throw new Error(`internal: run_unit_head ${where} carries policy_matched_pattern=${JSON.stringify(r.policy_matched_pattern)} on policy_status=${JSON.stringify(r.policy_status)} — only a deny names a causing pattern`);
+  }
+  // commit_sha ↔ scanned (the findings-join partition).
+  if (r.status === "scanned") {
+    if (r.commit_sha === "")
+      throw new Error(`internal: run_unit_head ${where} is scanned but has commit_sha='' — the findings join would attach rows parked at the empty SHA`);
+  } else if (r.commit_sha !== "") {
+    throw new Error(`internal: run_unit_head ${where} is ${r.status} but has commit_sha=${JSON.stringify(r.commit_sha)} — only a scanned row pins a commit`);
+  }
+  // Default is always scanned (Premise 6) — NATIVE rows only (a migrated row carries a NULL date, and
+  // pre-v4 semantics are history this gate must not re-litigate).
+  if (r.is_default_branch === 1 && r.status !== "scanned" && r.scanned_commit_date !== null)
+    throw new Error(`internal: run_unit_head ${where} is is_default_branch=1 but status=${JSON.stringify(r.status)} — the default branch is always scanned`);
+  // past-cap first exists in v4, so its non-default certainty is safe to assert unconditionally.
+  if (r.status === "past-cap" && r.is_default_branch !== 0)
+    throw new Error(`internal: run_unit_head ${where} is past-cap with is_default_branch=${r.is_default_branch ?? "null"} — past-cap rows are always a definite non-default`);
+  // ---- policy disposition classification -------------------------------------------------------
   if (r.status === "policy-excluded") {
     if (r.policy_status === null)
-      throw new Error(
-        `internal: run_unit_head ${where} is status='policy-excluded' but carries no policy_status — the rule that dropped it is unknowable`,
-      );
+      throw new Error(`internal: run_unit_head ${where} is status='policy-excluded' but carries no policy_status — the rule that dropped it is unknowable`);
     if (r.is_default_branch !== 0)
-      throw new Error(
-        `internal: run_unit_head ${where} is status='policy-excluded' with is_default_branch=${r.is_default_branch ?? "null"} — the default branch is always scanned and can never be a policy exclusion`,
-      );
+      throw new Error(`internal: run_unit_head ${where} is status='policy-excluded' with is_default_branch=${r.is_default_branch ?? "null"} — the default branch is always scanned and can never be a policy exclusion`);
     return;
   }
   if (r.policy_status === null) return; // the common, unlabelled case
   if (r.status === "scanned" && r.is_default_branch !== 1)
-    throw new Error(
-      `internal: run_unit_head ${where} is a scanned row carrying policy_status=${JSON.stringify(r.policy_status)} but is_default_branch=${r.is_default_branch ?? "null"} — only the default branch is scanned despite a policy verdict`,
-    );
+    throw new Error(`internal: run_unit_head ${where} is a scanned row carrying policy_status=${JSON.stringify(r.policy_status)} but is_default_branch=${r.is_default_branch ?? "null"} — only the default branch is scanned despite a policy verdict`);
   if (isDefaultOverride(r)) return;
-  throw new Error(
-    `internal: run_unit_head ${where} carries policy_status=${JSON.stringify(r.policy_status)} on status=${JSON.stringify(r.status)} — neither a policy exclusion nor a default-branch override`,
-  );
+  throw new Error(`internal: run_unit_head ${where} carries policy_status=${JSON.stringify(r.policy_status)} on status=${JSON.stringify(r.status)} — neither a policy exclusion nor a default-branch override`);
 }

@@ -202,7 +202,10 @@ Fail fast with actionable remediation if any of these fail:
    reactively instead (§4's retry/pause budget and the requeue-throttle deferral), so the
    quota is operator-facing information today, not a control input.
 8. Sufficient disk space for ephemeral clones.
-Emit "Preflight OK" plus, if resuming, existing row counts and last run id/time.
+   AS BUILT: no disk-space probe exists (preflight.ts checks tools/auth/scope evidence/env/
+   quota/registry reachability only), and nothing emits a "Preflight OK" line or prior-run
+   stats — the machine surface is the `preflight` JSONL event; resume context surfaces on
+   the `run` event. This item is spec-not-yet-built.
 
 ================================================================================
 3. DURABILITY & RESUMABILITY (SQLite is the source of truth)
@@ -679,9 +682,10 @@ If subagents are unavailable, run the SAME workflow sequentially in the same ord
 but keep code structured (pure functions) so it could parallelize later.
 
 RATE-LIMIT & THROTTLING (all gh calls go through the github.ts wrapper, so this is
-enforced in one place): the `concurrency.*` fan-out (e.g. 3 orgs × 6 repos × 4 branches)
-can trip GitHub's rate limits, so cap TOTAL in-flight `gh` processes with one GLOBAL
-semaphore (not just per-level). The wrapper reads the relevant response headers
+enforced in one place): a parallel `concurrency.*` fan-out (e.g. 3 orgs × 6 repos × 4
+branches — the §4 STRATEGY above, not the shipped sequential runtime) could trip GitHub's
+rate limits, so the wrapper caps TOTAL in-flight `gh` processes with one GLOBAL semaphore
+(sized by `concurrency.repositories`, the only concurrency.* key the runtime reads). The wrapper reads the relevant response headers
 (`x-ratelimit-remaining`/`x-ratelimit-reset`/`Retry-After`/`x-github-sso`) via `gh api -i`
 (as §2.3/§3 already do). Two distinct retryable throttles, handled the same way (the
 wrapper WAITS through the computed window and RETRIES the request IN PLACE, up to its
@@ -719,7 +723,9 @@ plan-mode owner-discovery escape stays fatal) but with different wait computatio
   header block for `x-ratelimit-*`/`Retry-After` and the trailing JSON for the body,
   never relying on gh `--paginate`/`--slurp` (which interleave the two). Track the primary
 `core` vs `graphql` buckets separately (§2.7) and pause a bucket when its remaining quota
-nears zero.
+nears zero. AS BUILT: bucket-aware tracking exists, but pausing is REACTIVE only — the
+wrapper honors Retry-After/reset waits inside the §4 retry/pause budget and then defers
+work via requeue-throttle; nothing watches `remaining` to pause BEFORE a limit is hit.
 
 ================================================================================
 5. WORKFLOW
@@ -1410,9 +1416,13 @@ append-only error still counts it — the resumed-run divergence above). Decide 
 WHOLE row, not just those two columns: `is_default_branch` is load-bearing in BOTH
 directions — a 'policy-excluded' row must be a definite non-default (the default is always
 scanned, so it can never be an exclusion) and a scanned policy-bearing row must be the
-known default — and `policy_matched_pattern` may appear only on a deny. Those four rules
-are read-time only: a SQL CHECK over is_default_branch could reject a v3 row at migration
-time, so failing an UPGRADE to defend against a forged row is the wrong trade. `repositoriesScanned` =
+known default — `policy_matched_pattern` must be a REAL deny pattern (non-empty, never on
+a non-deny), `commit_sha` must agree with `status` (only a scanned row pins one — the
+findings join's soundness), and unknown status/policy tokens are refused outright. These
+rules are read-time only, and the default⇒scanned direction is scoped to NATIVE rows
+(non-NULL scanned_commit_date): a SQL CHECK a real pre-v4 row might violate would fail an
+UPGRADE to defend against a forged row — the wrong trade; a read-time refusal costs one
+report. `repositoriesScanned` =
 COUNT(DISTINCT organization||'/'||repository) and `organizationsScanned` =
 COUNT(DISTINCT organization) — both over run_id=R AND status='scanned' rows (matching
 branchesScanned semantics; a repo/org whose every branch was cutoff-skipped is NOT
