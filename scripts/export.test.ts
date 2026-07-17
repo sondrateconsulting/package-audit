@@ -440,7 +440,8 @@ describe("runExport guards (mirroring runReport, notices to stdout only)", () =>
       const sqlitePath = join(dbRoot, "audit.db");
       AuditDb.open({ sqlitePath }).close(); // create a real v3 db…
       const bump = new Database(sqlitePath, { strict: true });
-      bump.exec("PRAGMA user_version = 2"); // …then stamp it old
+      bump.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch"); // …downgrade to the v2 shape
+      bump.exec("PRAGMA user_version = 2"); // …then stamp it old (ownership precedes the version gate)
       bump.close();
       const cfg = config(sqlitePath, join(root, "output"));
       expect(() => runExport(cfg, { runId: null, raw: false })).toThrow(/run `bun run audit` once to migrate/);
