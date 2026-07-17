@@ -113,8 +113,10 @@ be null when no resolution was possible. `lockfile_lines` is a JSON array serial
 ## usage_findings
 
 One row per usage site. `export_name` is empty for whole-module usage (namespace,
-side-effect, whole-require, re-export) and for CLI invocations; `context` is set only for
-CLI usage (script name, Dockerfile stage, or file kind).
+side-effect, whole-require, whole dynamic-import, re-export) and for CLI invocations;
+`context` is set only for CLI usage (script name, Dockerfile stage, or file kind);
+`dependency_key` is empty only for CLI invocations (imports always carry the resolving
+manifest key).
 
 | column | type |
 |---|---|
@@ -207,6 +209,8 @@ Notes: `status` is `scanned` / `skipped-cutoff` / `past-cap`. `policy_status` (`
 policy exclusion, on a `scanned` row it marks a default-branch override. `policy_matched_pattern` is
 the causing deny pattern (null otherwise). `scanned_commit_date` is the scanned commit's date on a
 scanned row, the discovered-head date otherwise (null only for pre-v4 migrated rows).
+`is_default_branch` is `1`/`0`/null: null means UNKNOWN (pre-v3 migrated rows) — never read it as
+"not the default". A `1` row is always `scanned`; `past-cap` and policy-excluded rows are always `0`.
 
 ## runs
 

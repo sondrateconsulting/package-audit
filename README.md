@@ -2,7 +2,7 @@
 
 *A dependency coupling report for your whole org.*
 
-<!-- hero screenshot: flagship dossier (P4: public-org data only) — captured in launch phase -->
+<!-- hero screenshot: flagship dossier (public-org data only) — captured in launch phase -->
 
 package-audit is an operator-run instrument that measures org-wide coupling of the npm packages you track: which of a package's exports your repos actually import and use, where, at which lockfile-resolved (or explicitly range-resolved) versions — every finding pinned to a commit SHA with a clickable permalink. You run it to completion on your own machine (Bun + SQLite, driving the `gh` CLI, [read-only by construction](#trust-why-it-cannot-write-to-your-org)) and it ships the answer as a document: a deterministic JSON report today, with an editorial HTML dossier, CSV/JSONL exports, and run comparison landing in this release cycle — all backed by a durable local database. We couldn't find another operator-run instrument that measures per-export usage across an org's repositories and branches and hands back a commit-pinned evidence document — code search platforms can measure usage too, as queries and dashboards on running infrastructure, and dependency scanners tell you *that* you depend on something; this ships *how deeply* as a standalone document and dataset, with receipts.
 
@@ -33,7 +33,7 @@ The finished run writes `output/run-<run_id>.json` and `output/latest.json`. A l
 ### HTML dossier (`report --html`)
 
 `bun run report --html` additionally renders one self-contained HTML dossier per tracked package plus an `index.html` into `output/xray/`: an executive sentence, five decision cards, a usage-sorted API-surface table, a repo×export matrix, and collapsible permalinked evidence drawers (a package with no usage in the scanned slice renders a coverage-only empty state instead) — default-branch headline metrics (labeled all-branch fallback when attribution is unknown), printable, light + dark themes, no external resources. `--run-id <id>` renders a historical run's dossiers.
-<!-- hero screenshot for the README is captured from the flagship dossier in the launch phase (P4) -->
+<!-- hero screenshot for the README is captured from the flagship dossier in the launch phase -->
 
 ### Data exports (`export`)
 
@@ -41,7 +41,7 @@ The finished run writes `output/run-<run_id>.json` and `output/latest.json`. A l
 
 ### Run comparison (`compare`)
 
-`bun run compare <runA> <runB>` prints a deterministic run-diff as one JSON line: usage sites added and removed per export, repos entering and leaving — headline counts scoped to default branches when attribution is known (otherwise all branches, with an explicit note), plus all-branch detail. Note: `--fresh` erases run history, so runs from before a `--fresh` cannot be compared; keep the data directory if you want trends.
+`bun run compare <runA> <runB>` prints a deterministic run-diff as one JSON line: usage sites added and removed per export, repos entering and leaving — headline counts scoped to default branches when attribution is known (otherwise all branches, with an explicit note), plus all-branch detail, and a branch-policy churn dimension — branches that entered or left policy exclusion between the two runs, exclusions reclassified (deny/allow flipped or the causing pattern changed), and default-branch override changes — reported as unavailable (with the reason) when either run predates the policy-provenance schema or recorded no heads. Note: `--fresh` erases run history, so runs from before a `--fresh` cannot be compared; keep the data directory if you want trends.
 
 ## Prerequisites
 

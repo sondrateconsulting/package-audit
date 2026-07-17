@@ -103,7 +103,7 @@ below).
                                        //   projection omits both keys when neither is configured.
   "excludeBranches": [],               // denylist, same syntax. DENY WINS over `branches`. The DEFAULT
                                        //   branch is ALWAYS eligible regardless of either list
-                                       //   (Premise 6); it records the counterfactual instead — a
+                                       //   (always scanned); it records the counterfactual instead — a
                                        //   policy_status on a SCANNED row is the default-branch
                                        //   override, NOT an exclusion (§3).
   "cutoffDate": "2024-01-01",          // ISO date; ignore non-default branches with no commits since this
@@ -436,7 +436,7 @@ CREATE TABLE IF NOT EXISTS run_unit_head (
                                        -- 'skipped-cutoff' row it means policy DROPPED the branch;
                                        -- on a 'scanned' row it is the COUNTERFACTUAL carried by a
                                        -- default branch policy would have dropped but which is
-                                       -- scanned anyway (Premise 6). Read surfaces MUST decide via
+                                       -- scanned anyway (the default is always scanned). Read surfaces MUST decide via
                                        -- BOTH status and policy_status (scripts/policyDisposition.ts
                                        -- is the one definition), never policy_status alone.
   policy_matched_pattern TEXT,         -- v4: the exact configured pattern that caused an
@@ -518,7 +518,7 @@ Resumability rules:
   NOT mean is "this run says nothing about it", and the two cases differ: a PAST-CAP branch DOES
   get a FRESH `run_unit_head` row this run (`status='past-cap'`, commit_sha='') recorded purely
   for report VISIBILITY — the work queue is left untouched, so a later cap-order shift promotes it
-  without a re-scan; a DELETED branch is not surfaced at all, and §11 reconciliation prunes any row
+  without a re-scan; a DELETED branch is not surfaced at all, and stale-row reconciliation prunes any row
   a prior resume-invocation of THIS run left for it (earlier runs' rows are immutable and stay). That
   prune is REPO-SCOPED, and deliberately so: it runs inside the per-repo path, so it can only speak for
   repos this run re-discovered AND kept. A repo that dropped out of the kept set between invocations —
@@ -531,7 +531,7 @@ Resumability rules:
   reproducible (§7's `branchesSkippedByCutoff`) — it is NOT left in this retain-prior-state
   path. A THIRD retain-prior-state case exists on RESUME (same-name stale head): a still-live
   branch whose head ADVANCED between invocations and whose re-scan then ERRORS or THROTTLES
-  writes no row this attempt, so §11's name-keyed prune retains the row from the earlier
+  writes no row this attempt, so reconciliation's name-keyed prune retains the row from the earlier
   invocation — WHATEVER its disposition, pinned to the OLDER evaluation — and the run reports
   the branch under that PRIOR disposition. A prior scanned row reads "scanned at the old head";
   a prior NON-scanned row (e.g. `skipped-cutoff` recorded when the old head sat below the
@@ -1289,7 +1289,7 @@ summary.
 ```jsonc
 {
   "formatVersion": 2,                            // XRAY_FORMAT_VERSION — the report/export/HTML
-                                                 //   artifact-set version (§10). REQUIRED, and
+                                                 //   artifact-set version. REQUIRED, and
                                                  //   INDEPENDENT of the compare format version
   "runId": "...",
   "generatedAt": "...",                          // COALESCE(runs.completed_at, runs.started_at) of
@@ -1335,7 +1335,14 @@ summary.
                "branchesSkippedByCutoff":0,"branchesExcludedByPolicy":0,"branchesPastCap":0,
                "branchesErrored":0,"totalDependencyFindings":0,"totalUsageFindings":0 },
   "scanScope": { "excludedByDeny":0,"excludedByAllow":0,"defaultBranchPolicyOverrides":0,
-                 "policyBranches":[ ... ],"provenance":"complete" }  // branch allow/deny diagnostics
+                 "policyBranches":[ ... ],"provenance":"complete" }  // branch allow/deny diagnostics;
+                                                 //   provenance: 'complete' | 'pre-upgrade' —
+                                                 //   'complete' only for a run with ≥1 recorded head,
+                                                 //   all carrying a non-null scanned_commit_date;
+                                                 //   'pre-upgrade' when any head's date is NULL (a
+                                                 //   v3→v4-migrated run, §3's sentinel) OR the run
+                                                 //   recorded zero heads — the scope counts may then
+                                                 //   understate what that run actually evaluated
 }
 ```
 Summary derivation — ALL per-run from the IMMUTABLE `run_unit_head` slice for the reported
