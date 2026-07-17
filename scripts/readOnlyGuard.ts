@@ -198,13 +198,21 @@ export function assertGraphqlQueryIsReadOnly(rest: string[]): void {
 }
 
 // ---- git ----------------------------------------------------------------------------
-// The tool ONLY ever spawns `git clone` (§5.C fallback) and `git rev-parse HEAD`. The verb
-// allowlist is exactly those (plus --version). Because git accepts unambiguous long-option
-// ABBREVIATIONS (`--templ` = `--template`, `--dep` = `--depth`), a denylist is unsafe — so
-// clone uses a strict EXACT-OPTION ALLOWLIST of only the hardening flags the wrapper emits,
-// and rev-parse forbids every flag. (Read verbs like show/cat-file are excluded entirely:
-// they accept --output/--textconv/--filters, which would breach read-only.)
-const GIT_READ = new Set(["clone", "rev-parse", "--version"]);
+// The tool ONLY ever spawns `git clone` (§5.C fallback), `git rev-parse HEAD`, and ONE fixed
+// `git show` form (the clone-HEAD committer date, §4). The verb allowlist is exactly those (plus
+// --version). Because git accepts unambiguous long-option ABBREVIATIONS (`--templ` = `--template`,
+// `--dep` = `--depth`), a denylist is unsafe — so clone uses a strict EXACT-OPTION ALLOWLIST of only
+// the hardening flags the wrapper emits, rev-parse forbids every flag, and `show` is pinned to ONE
+// exact raw-argv tuple (below). Other read verbs (cat-file, log) stay excluded entirely — they
+// accept --output/--textconv/--filters, which would breach read-only.
+const GIT_READ = new Set(["clone", "rev-parse", "show", "--version"]);
+// The tool runs EXACTLY ONE `show` form: read a cloned HEAD's committer date (the
+// clone-fallback scan). There is NO general show/log parser — that would reopen --output/textconv/
+// --ext-diff/alternate-format/revision surface. Instead an EXACT raw-argv allowlist: --no-patch
+// suppresses diff machinery, --no-show-signature avoids invoking GPG, --no-notes avoids notes
+// lookups, %cI is the strict-ISO committer date. Anything else (reordered, extra args, -C, a
+// different format, a revision other than HEAD) is rejected.
+const GIT_SHOW_DATE_ARGV = ["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"];
 // clone options, split by arity: VALUE flags consume the following token as their value
 // (git does too, even if that token looks like a flag), BOOL flags stand alone.
 const GIT_CLONE_VALUE = new Set(["--depth", "--branch", "--template"]);
@@ -229,6 +237,16 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
     // the tool only runs `git rev-parse HEAD`; NO option is needed, so reject every flag
     // (incl. --git-dir/--work-tree and any abbreviation) — only bare positionals allowed.
     for (const a of args.slice(1)) if (a.startsWith("-")) deny(`git rev-parse option ${a}`);
+    return;
+  }
+
+  if (verb === "show") {
+    // Compare the RAW argv (NOT canon'd — canon splits `--format=%cI` into two tokens): the ONLY
+    // permitted show is the exact commit-date tuple. No option parser, no abbreviations, no reorder.
+    const ok =
+      rawArgs.length === GIT_SHOW_DATE_ARGV.length &&
+      rawArgs.every((a, i) => a === GIT_SHOW_DATE_ARGV[i]);
+    if (!ok) deny("git show is restricted to the exact commit-date form");
     return;
   }
 

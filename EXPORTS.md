@@ -1,6 +1,6 @@
 # EXPORTS.md — the data contract for `bun run export`
 
-`export` writes run-scoped snapshots of the four audit tables as CSV **and** JSONL under
+`export` writes run-scoped snapshots of the five audit tables as CSV **and** JSONL under
 `<outputDir>/xray/`, plus a `manifest.json` written last. This document is the contract for
 those files. It is **sync-tested against the code**: the column tables and row-order lines
 below are parsed by `scripts/exportsDoc.test.ts` and compared to the column registry in
@@ -26,7 +26,7 @@ Run selection: `--run-id <id>`, or the latest completed reportable run by defaul
 
 ## `--raw`: the forensic escape hatch
 
-`--raw` dumps **every row of the four tables** — including introspection marker rows, rows from
+`--raw` dumps **every row of the five tables** — including introspection marker rows, rows from
 other runs and other configs, and rows superseded by later scans. Filenames gain a `raw-`
 prefix and the export emits a loud `warning` JSONL event. Raw dumps are for forensics; the
 run-scoped default is the supported contract. **Stale data warning:** raw rows may span
@@ -39,6 +39,7 @@ multiple runs and configurations — never treat a raw dump as any single run's 
 | `dependency_findings.csv` / `.jsonl` | manifest/lockfile declarations of tracked packages |
 | `usage_findings.csv` / `.jsonl` | usage sites (imports/requires/re-exports/CLI invocations) |
 | `package_api_surface.csv` / `.jsonl` | introspected exports/bins per (package, version) |
+| `run_unit_head.csv` / `.jsonl` | the run's per-branch disposition snapshot — every branch (scanned / cutoff-skipped / past-cap / policy-excluded) with its branch-policy attribution |
 | `runs.csv` / `.jsonl` | the selected run's metadata row |
 | `manifest.json` | `{formatVersion, runId, artifacts:[{path, kind, sha256, bytes}]}` — written **last**; artifacts in `xray/` not listed in a coherent manifest are swept by the next generation |
 
@@ -72,9 +73,9 @@ Row order is total (each table's full unique key) and documented per table below
 
 ## Versioning
 
-The manifest's `formatVersion` (currently 1) covers the artifact set, the manifest shape,
+The manifest's `formatVersion` (currently 2) covers the artifact set, the manifest shape,
 and the column contract below. Any breaking change to this contract bumps it; bumping it is
-the one sanctioned way the golden fixtures change.
+the one sanctioned way the golden fixtures change. (v2 added the `run_unit_head` table.)
 
 ## dependency_findings
 
@@ -112,8 +113,10 @@ be null when no resolution was possible. `lockfile_lines` is a JSON array serial
 ## usage_findings
 
 One row per usage site. `export_name` is empty for whole-module usage (namespace,
-side-effect, whole-require, re-export) and for CLI invocations; `context` is set only for
-CLI usage (script name, Dockerfile stage, or file kind).
+side-effect, whole-require, whole dynamic-import, re-export) and for CLI invocations;
+`context` is set only for CLI usage (script name, Dockerfile stage, or file kind);
+`dependency_key` is empty only for CLI invocations (imports always carry the resolving
+manifest key).
 
 | column | type |
 |---|---|
@@ -152,6 +155,69 @@ shared across runs.
 | introspected_at | string |
 
 Row order: `package_name, version, export_kind, export_name`
+
+## run_unit_head
+
+One row per branch that reached a TERMINAL disposition this run — the immutable per-run disposition
+snapshot. Unlike the findings tables, this exports every disposition TYPE (scanned / skipped-cutoff /
+policy-excluded / past-cap, plus the branch-policy columns that live largely on the non-scanned rows). A discovered branch
+that reached no terminal disposition has NO row here: one whose scan **errored** carries a `scope='scan'`
+entry in the report's `errors[]` (and is counted by the report's `branchesErrored`), while one whose scan
+was **throttle-requeued** is deferred with neither a row nor a new error — it is finished on the next run
+(on a resume, an EARLIER invocation's append-only error still counts a rowless branch in `branchesErrored`).
+Scoped to the selected run only (`--raw` dumps all runs).
+
+On a **resumed** run (one interrupted and re-invoked, which reuses the same `run_id`), the report's
+`branchesErrored` counts precisely "errored branches holding no row here" — which is looser than
+"every branch whose scan errored", in **both** directions. `errors[]` is append-only and is never
+reconciled, while the rows in *this* table **are** pruned for branches gone since an earlier invocation —
+though only within a repo this run re-discovered and kept: the prune runs per repo, so a repo that dropped
+out of the kept set entirely (deleted, renamed, newly archived/fork-filtered, or displaced past
+`maxReposPerOrg`) is never revisited and keeps its prior rows.
+So a branch that errored in an earlier invocation and reached no row-bearing disposition in the final one
+— deleted, throttle-requeued on retry, or its repo's discovery failed — is still counted there while
+correctly holding no row here. Conversely, a branch that kept a row from an earlier invocation and then
+errored in a later one is **not** counted there: the row you see here already places it in that
+disposition, and counting it twice would double-count one discovered branch.
+
+This table itself stays exact either way: every row is a disposition the run genuinely recorded. Note a
+**scanned** row may be pinned to an older head than the branch's current one (same-name stale head): its
+`commit_sha` and `scanned_commit_date` name the commit that was actually scanned, which on a resumed run
+may predate the live head. The same retention is disposition-agnostic — a resumed run whose re-scan of an
+advanced head failed keeps the branch's prior row whatever its `status`, so e.g. a `skipped-cutoff` row can
+describe an older evaluation of a branch whose current head has since passed the cutoff. (On a NON-scanned
+row `commit_sha` is `''` and `scanned_commit_date` is the discovered-head date — see the column notes
+below.)
+
+| column | type |
+|---|---|
+| run_id | string |
+| organization | string |
+| repository | string |
+| branch | string |
+| commit_sha | string |
+| status | string |
+| is_default_branch | nullable-number |
+| policy_status | nullable-string |
+| policy_matched_pattern | nullable-string |
+| scanned_commit_date | nullable-string |
+
+Row order: `run_id, organization, repository, branch`
+
+Notes: `status` is `scanned` / `skipped-cutoff` / `policy-excluded` / `past-cap` — four DISJOINT
+dispositions, so `status` alone answers "why was this branch not scanned", and `WHERE status =
+'policy-excluded'` is the whole filter for branch-policy exclusions. `policy_status`
+(`excluded-by-deny` / `excluded-by-allow` / null) names WHICH rule decided: always present on a
+`policy-excluded` row, always null on `skipped-cutoff` / `past-cap` (policy is applied BEFORE
+cutoff/cap, so those rows never carry a verdict), and on a `scanned` row it marks a **default-branch
+override** — the counterfactual verdict on a branch policy would have dropped but which is always
+scanned anyway. That override is the reason `policy_status` is its own column and not folded into
+`status`: the branch really was scanned, so it belongs in `scanned`, and its verdict is advisory.
+`policy_matched_pattern` is the causing deny pattern (null otherwise). `scanned_commit_date` is the
+scanned commit's date on a scanned row, the discovered-head date otherwise (null only for pre-v4
+migrated rows). `is_default_branch` is `1`/`0`/null: null means UNKNOWN (pre-v3 migrated rows) —
+never read it as "not the default". A `1` row is always `scanned`; `past-cap` and `policy-excluded`
+rows are always `0`.
 
 ## runs
 

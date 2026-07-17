@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb } from "./db.ts";
+import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import { buildReport } from "./report.ts";
 import { ArtifactBundle, ArtifactWriteError } from "./artifactWrite.ts";
 import {
@@ -46,8 +47,8 @@ const FIXED_CTX: DossierContext = {
   runId: "run-fixture",
   generatedAt: T0,
   config: { cutoffDate: "2024-01-01", githubHost: "github.com", organizations: ["org-a"] },
-  summary: { repositoriesScanned: 2, branchesScanned: 3, branchesSkippedByCutoff: 1 },
-  formatVersion: 1,
+  summary: { repositoriesScanned: 2, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+  formatVersion: XRAY_FORMAT_VERSION,
 };
 
 // Seed idiom from report.test.ts, with deterministic timestamps and a DEFAULT-BRANCH unit plus a
@@ -60,8 +61,8 @@ function seed(db: AuditDb) {
   });
   const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
   const dev = { organization: "org-a", repository: "svc", branch: "dev", commitSha: "abc999def0000" };
-  db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true });
-  db.upsertRunUnitHead({ runId, ...dev, status: "scanned", isDefaultBranch: false });
+  db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+  db.upsertRunUnitHead({ runId, ...dev, status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
   db.upsertDependencyFinding({
     runId, ...main, dateFetched: T0, packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
     manifestPath: "package.json", manifestLine: 5, manifestPermalink: "https://github.com/org-a/svc/blob/abc123def4567/package.json#L5",
@@ -138,8 +139,8 @@ const syntheticPkg = (units: DossierUnit[], over: Partial<DossierPackage> = {}):
 // now emitted as a `<https://…>` angle-bracket autolink (was a bare URL through mdCell) so a path
 // with `(`/`)` keeps a correct link destination. Copy-markdown `<template>` bytes only (dossier
 // golden); the visible dossier HTML permalink (permalinkAnchor) is byte-unchanged.
-const GOLDEN_DOSSIER_SHA256 = "ef784e8cca60ddf3c16e2b069959485846cd7a44fedbe09ddf9f53940f4d502c";
-const GOLDEN_EMPTY_SHA256 = "dbf98a9aa63bc94212e930355cc8fcc87e28804080caa55ead1299fc6eda9a34";
+const GOLDEN_DOSSIER_SHA256 = "1b82113ec0f20fdfb49475f0457dd2c294a5d211bdb4da874ec019b123fac93a";
+const GOLDEN_EMPTY_SHA256 = "36ccb2eccf26d98e30bf1c10a0337c6b78cd9a8f1ea6466a5c880c2e9010e97c";
 
 describe("renderDossier — determinism and golden bytes", () => {
   test("double-render byte equality (same DB, two builds, two renders)", () => {
@@ -161,13 +162,30 @@ describe("renderDossier — determinism and golden bytes", () => {
   });
 });
 
+describe("renderDossier — footer scan-scope receipt (§5)", () => {
+  test("policy counts drive a compact receipt linking the run index; absent when nothing was dropped", () => {
+    const [pkg] = fixturePackages();
+    // default fixture: no policy exclusions, no cap deferrals → NO receipt clause
+    const plain = renderDossier(pkg!, FIXED_CTX);
+    expect(plain).not.toContain("excluded by policy");
+    expect(plain).not.toContain("index.html#scan-scope");
+    // once policy drops or the cap defers branches, the footer carries the receipt + the anchor link
+    const withPolicy = renderDossier(pkg!, {
+      ...FIXED_CTX,
+      summary: { ...FIXED_CTX.summary, branchesExcludedByPolicy: 4, branchesPastCap: 2 },
+    });
+    expect(withPolicy).toContain("4 excluded by policy, 2 past cap");
+    expect(withPolicy).toContain('<a href="index.html#scan-scope">scan scope</a>');
+  });
+});
+
 describe("renderDossier — content contract on the real report object", () => {
   const pkg = fixturePackages()[0]!;
   const html = renderDossier(pkg, FIXED_CTX);
 
-  test("executive sentence restates headline aggregates with CT1 vocabulary", () => {
+  test("executive sentence restates headline aggregates with the binding vocabulary", () => {
     expect(html).toContain("expo is imported by 1 repository (default branches) across 3 usage sites, concentrated in 1 export.");
-    expect(html).not.toContain("call site"); // CT1: usage sites, never invocation wording
+    expect(html).not.toContain("call site"); // binding vocabulary: usage sites, never invocation wording
   });
 
   test("fixed section ids + copy-as-markdown mirrors exist for each section", () => {
@@ -180,7 +198,7 @@ describe("renderDossier — content contract on the real report object", () => {
 
   test("decision cards: default-branch headlines with the also-seen annotation and honest totals", () => {
     expect(html).toContain("also seen on 1 other branch"); // dev
-    expect(html).toContain("of attributed usage in the top 3 exports"); // concentration label (CV3)
+    expect(html).toContain("of attributed usage in the top 3 exports"); // concentration label
     expect(html).toContain("(whole-module): 1 usage site"); // counted whole-module card line
     expect(html).toContain("1 repository across all branches"); // honest total
   });
@@ -224,8 +242,8 @@ describe("renderDossier — content contract on the real report object", () => {
   });
 
   test("format version: meta tag + footer line", () => {
-    expect(html).toContain('<meta name="xray-format-version" content="1">');
-    expect(html).toContain("report-format version 1");
+    expect(html).toContain(`<meta name="xray-format-version" content="${XRAY_FORMAT_VERSION}">`);
+    expect(html).toContain(`report-format version ${XRAY_FORMAT_VERSION}`);
     expect(html).toContain("run run-fixture");
   });
 
@@ -242,7 +260,7 @@ describe("renderDossier — content contract on the real report object", () => {
   });
 });
 
-describe("the one static script + CSP (CEO addendum 5/7)", () => {
+describe("the one static script + CSP", () => {
   const html = renderDossier(fixturePackages()[0]!, FIXED_CTX);
 
   test("CSP hash sync: an independent recompute matches the exported hash and the meta tag", () => {
@@ -280,8 +298,8 @@ describe("adversarial fixture — hostile snippets, paths, branch names (escape-
     });
     const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
     const hostileBranch = { organization: "org-a", repository: "svc", branch: `dev"><img src=x onerror=alert(2)>`, commitSha: "abc999def0000" };
-    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true });
-    db.upsertRunUnitHead({ runId, ...hostileBranch, status: "scanned", isDefaultBranch: false });
+    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    db.upsertRunUnitHead({ runId, ...hostileBranch, status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const use = (unit: typeof main, exportName: string, file: string, line: number, snippet: string, permalink?: string) =>
       db.upsertUsageFinding({
         runId, ...unit, packageName: "evil", dependencyKey: "evil", usageType: "named-import", exportName,
@@ -346,7 +364,7 @@ describe("copy-as-markdown: hostile identifiers cannot inject links/images (H1)"
       trackedPackages: ["evil"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
     const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
-    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const use = (exportName: string, file: string, line: number) =>
       db.upsertUsageFinding({
         runId, ...main, packageName: "evil", dependencyKey: "evil", usageType: "named-import", exportName,
@@ -389,7 +407,7 @@ describe("bidi controls in a hostile export name are neutralized in observation 
       trackedPackages: ["evil"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
     const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
-    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const use = (exportName: string, file: string, line: number) =>
       db.upsertUsageFinding({
         runId, ...main, packageName: "evil", dependencyKey: "evil", usageType: "named-import", exportName,
@@ -456,7 +474,7 @@ describe("dossierFilename — sanitization against the artifact name grammar", (
   });
 });
 
-describe("empty state (CEO addendum 12 + CT4)", () => {
+describe("designed empty state (coverage receipts)", () => {
   const pkg = fixturePackages()[1]!; // left-pad: tracked, zero findings
   const html = renderDossier(pkg, FIXED_CTX);
 
@@ -471,7 +489,7 @@ describe("empty state (CEO addendum 12 + CT4)", () => {
 
   test("keeps the byte-identical static script and the format-version footer", () => {
     expect(html).toContain(`<script>${STATIC_SCRIPT}</script>`);
-    expect(html).toContain("report-format version 1");
+    expect(html).toContain(`report-format version ${XRAY_FORMAT_VERSION}`);
     const detailed = renderDossierDetailed(pkg, FIXED_CTX);
     expect(detailed.observationsStatus).toBe("emitted");
     expect(detailed.observationCount).toBe(0);
@@ -488,7 +506,7 @@ describe("partial state — versionsSeen entries missing from apiSurface", () =>
       manifestPath: "package.json", manifestLine: 3, manifestPermalink: "https://github.com/org-a/svc2/blob/def456abc7890/package.json#L3",
       declaredVersion: "^49.0.0", resolvedVersion: "49.0.0", resolvedVersionSource: "lockfile",
     });
-    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456abc7890", status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456abc7890", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const report = buildReport(db, run);
     db.close();
     const html = renderDossier(report.packages[0]!, FIXED_CTX);
@@ -499,7 +517,7 @@ describe("partial state — versionsSeen entries missing from apiSurface", () =>
   });
 });
 
-describe("default-branch tri-state (E1/CT5)", () => {
+describe("default-branch tri-state", () => {
   test("ANY isDefaultBranch=null unit → visible band + all-branches fallback headlines", () => {
     const pkg = syntheticPkg([
       syntheticUnit({ branch: "main", isDefaultBranch: null, apiUsage: [syntheticUsage("a", "src/a.ts", 1)] }),
@@ -634,7 +652,7 @@ describe("evidence wall — cap, honest totals, anchor stability", () => {
   });
 });
 
-describe("chaos fixture (CV9): 10k usage sites", () => {
+describe("chaos fixture: 10k usage sites", () => {
   test("renders to completion within a generous bound and under 15MB", () => {
     // 200 exports × 50 sites = 10,000 usage sites across 20 default-branch repos. Deterministic
     // loops, no randomness.
@@ -757,7 +775,7 @@ test("the CLI usage location cell is wrapped in .loc so a hostile repo/file name
     trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
   });
   const main = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def4567" };
-  db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true });
+  db.upsertRunUnitHead({ runId, ...main, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
   db.upsertUsageFinding({
     runId, ...main, packageName: "expo", dependencyKey: "expo", usageType: "cli", exportName: "",
     context: "npx expo", filePath: "scripts/‮lmth.evil", lineNumber: 1,

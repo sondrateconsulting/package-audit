@@ -1,5 +1,4 @@
-// reportHtml.ts — the editorial coupling dossier renderer (design §Recommended-Approach item 2 +
-// CEO addenda 1/5/6/7/12/13, CT1/CT4/CT5, E1/CV3). PURE: renderDossier(pkg, ctx) is a function of
+// reportHtml.ts — the editorial coupling dossier renderer. PURE: renderDossier(pkg, ctx) is a function of
 // its arguments ALONE — no wall clock, no randomness, no env reads, no locale-dependent
 // formatting (integers via String(), never toLocaleString) — so identical input yields identical
 // bytes (golden + double-render tested).
@@ -13,10 +12,10 @@
 // script-src hash is computed FROM that constant at module load, so the policy can never drift
 // from the script it authorizes.
 //
-// VOCABULARY (CT1, binding): "usage sites" / "import and use" — the scanner records
+// VOCABULARY (binding): "usage sites" / "import and use" — the scanner records
 // import/require/re-export/CLI usage, never invocation expressions.
 //
-// SCOPE SEMANTICS (CT5 + E1 tri-state): headline numbers count units with isDefaultBranch===true
+// SCOPE SEMANTICS (default-branch tri-state): headline numbers count units with isDefaultBranch===true
 // ONLY, with an "also seen on N other branches" annotation from the rest. If ANY unit carries
 // isDefaultBranch===null (pre-v3 rows), headlines FALL BACK to all-branches counts behind a
 // visible band — never a silent undercount.
@@ -81,6 +80,34 @@ export interface DossierSummary {
   readonly repositoriesScanned: number;
   readonly branchesScanned: number;
   readonly branchesSkippedByCutoff: number;
+  readonly branchesExcludedByPolicy: number; // branch allow/deny (§5)
+  readonly branchesPastCap: number;
+}
+// Branch allow/deny scan-scope diagnostics (§5). Defined here (the render layer) so both the report
+// data layer (report.ts, structurally assignable) and the index renderer share ONE shape without a
+// report.ts ↔ reportHtml.ts import cycle. reportSchema.ts's scanScopeSchema is test-synced to it.
+export interface PolicyBranchRow {
+  readonly organization: string;
+  readonly repository: string;
+  readonly branch: string;
+  readonly disposition: "excluded" | "scanned-default-override";
+  readonly policyStatus: "excluded-by-deny" | "excluded-by-allow";
+  readonly matchedPattern: string | null;
+}
+export interface ScanScope {
+  readonly excludedByDeny: number;
+  readonly excludedByAllow: number;
+  readonly defaultBranchPolicyOverrides: number;
+  readonly policyBranches: readonly PolicyBranchRow[];
+  // "pre-upgrade" = the scan scope is UNVERIFIABLE, from EITHER of two causes (report.ts::buildScanScope
+  // maps both to this one value, and the label is deliberately not a claim about which):
+  //   - a head carries a NULL scanned_commit_date — a run migrated from before v4, whose scanner never
+  //     persisted past-cap branches and had no branch policy; or
+  //   - the run recorded ZERO heads, so there is no sentinel row to judge provenance by at all.
+  // Either way the "past the per-repo cap" and policy counts may UNDERSTATE what the run omitted; the
+  // panel says so rather than presenting a false authoritative zero. "complete" is the normal case, and
+  // requires a v4-native run with at least one recorded head.
+  readonly provenance: "complete" | "pre-upgrade";
 }
 export interface DossierContext {
   readonly runId: string;
@@ -96,11 +123,12 @@ export interface DossierReport {
   readonly config: DossierConfig;
   readonly packages: readonly DossierPackage[];
   readonly summary: DossierSummary;
+  readonly scanScope: ScanScope;
 }
 
 // ---- constants --------------------------------------------------------------------------------
 
-// Rank cap for evidence drawers and the CLI table (CEO addendum 1): top-N rows with honest
+// Rank cap for evidence drawers and the CLI table: top-N rows with honest
 // totals; the evidence drawers additionally carry a standing pointer to the full exports.
 export const EVIDENCE_CAP = 25;
 // Matrix overflow rule: beyond this many attributed export columns, keep the top
@@ -108,7 +136,7 @@ export const EVIDENCE_CAP = 25;
 // pseudo-column sits outside this budget.
 export const MATRIX_MAX_EXPORT_COLUMNS = 40;
 
-// THE one static script (CEO addenda 5+7). Exactly two behaviors, both data-free:
+// THE one static script. Exactly two behaviors, both data-free:
 //   (a) open every ancestor <details> of the location.hash target on load and on hashchange, so
 //       deep links into evidence drawers reveal their content;
 //   (b) copy-as-markdown: a click on button[data-copy-target] reads the PRE-RENDERED markdown
@@ -303,7 +331,7 @@ export function computeDossierModel(pkg: DossierPackage): DossierModel {
   const unsortedGroups = [...byExport.entries()].map(([exportName, sites]) => {
     // Collapse to one evidence row per (repo, file, line); the primary occurrence is the
     // headline one (smallest branch name) when it exists, else the smallest branch overall —
-    // every other branch becomes the row's 'also on' annotation (CT5).
+    // every other branch becomes the row's 'also on' annotation (default-branch headline rule).
     const byOcc = new Map<string, typeof sites>();
     for (const s of sites) {
       const k = `${repoKeyOf(s.u)}\0${s.row.file}\0${s.row.line}`;
@@ -376,7 +404,7 @@ export function computeDossierModel(pkg: DossierPackage): DossierModel {
   const latestSurfaceExports = latestVersion === null ? [] : pkg.apiSurface[latestVersion]!.exports.map((e) => ({ name: e.name, kind: e.kind }));
   const missingSurfaceVersions = pkg.versionsSeen.filter((v) => !Object.hasOwn(pkg.apiSurface, v));
 
-  // ---- hotspots (headline scope; whole-module bucket counts in BOTH factors, CV3)
+  // ---- hotspots (headline scope; whole-module bucket counts in BOTH factors)
   const perRepo = new Map<string, { exports: Set<string>; sites: number }>();
   for (const s of raw) {
     if (!s.headline) continue;
@@ -474,7 +502,7 @@ const num = (v: number): string => esc(String(v));
 const plural = (count: number, singular: string, pluralForm?: string): string =>
   `${count} ${count === 1 ? singular : (pluralForm ?? `${singular}s`)}`;
 
-// Editorial print-report direction (CEO addendum 13): serif display for the exec sentence,
+// Editorial print-report direction: serif display for the exec sentence,
 // system sans body, tabular numerals on sans-rendered counts (serif card headlines keep
 // Georgia's old-style figures — deliberate), ONE semantic accent (hotspots/warning
 // bands), restrained hairlines. Dark values under prefers-color-scheme; @media print comes LAST
@@ -483,7 +511,7 @@ const plural = (count: number, singular: string, pluralForm?: string): string =>
 // ::details-content / content-visibility escape hatch is not cross-browser yet), so evidence
 // rows are rendered TWICE — once inside the native <details> drawer (screen; carries the anchor
 // ids) and once inside a .print-drawer block (display:none on screen, block in print; no ids, so
-// ids stay unique). That keeps drawers native on screen and complete on paper (CEO addendum 6).
+// ids stay unique). That keeps drawers native on screen and complete on paper.
 const PAGE_CSS = `
 :root { color-scheme: light dark; --bg:#faf9f6; --ink:#1c1b19; --muted:#6b675f; --accent:#a34808; --hairline:#dcd8cf; --card:#ffffff; --code-bg:#f1efe9; }
 @media (prefers-color-scheme: dark) {
@@ -866,10 +894,18 @@ function renderBands(m: DossierModel): string {
 }
 
 function renderFooter(ctx: DossierContext): string {
-  return `<footer>package usage x-ray · report-format version ${num(ctx.formatVersion)} · run ${esc(ctx.runId)} · generated ${esc(ctx.generatedAt)}</footer>`;
+  const s = ctx.summary;
+  // Compact global scan-scope receipt: shown only when policy actually dropped
+  // or deferred branches. The full per-branch ledger lives in the run index's #scan-scope panel — a
+  // package-centric dossier does not duplicate it N times (the href is a static literal, no injection).
+  const policyReceipt =
+    s.branchesExcludedByPolicy > 0 || s.branchesPastCap > 0
+      ? ` · ${num(s.branchesExcludedByPolicy)} excluded by policy, ${num(s.branchesPastCap)} past cap — <a href="index.html#scan-scope">scan scope</a>`
+      : "";
+  return `<footer>package usage x-ray · report-format version ${num(ctx.formatVersion)} · run ${esc(ctx.runId)} · generated ${esc(ctx.generatedAt)}${policyReceipt}</footer>`;
 }
 
-// The designed EMPTY state (CEO addendum 12 + CT4): coverage receipts, never "not coupled" —
+// The designed EMPTY state: coverage receipts, never "not coupled" —
 // scanning is fail-open and caps/cutoff bound the scanned slice, so absence of findings is a
 // statement about the slice, not the estate.
 function renderEmptyBody(pkg: DossierPackage, ctx: DossierContext): string {
@@ -894,12 +930,12 @@ function renderEmptyBody(pkg: DossierPackage, ctx: DossierContext): string {
 
 export interface DossierRenderResult {
   readonly html: string;
-  readonly observationsStatus: "emitted" | "omitted"; // omitted = fact derivation or rule evaluation threw (CEO addendum 8 fallback)
+  readonly observationsStatus: "emitted" | "omitted"; // omitted = fact derivation or rule evaluation threw (designed fallback)
   readonly observationCount: number;
 }
 
 // Returns the html PLUS the observations outcome, so the coordinator's per-dossier JSONL event
-// (CEO addendum 10) can report emitted|omitted without re-deriving anything.
+// can report emitted|omitted without re-deriving anything.
 export function renderDossierDetailed(pkg: DossierPackage, ctx: DossierContext): DossierRenderResult {
   const title = `${pkg.name} — package usage dossier`;
   const m = computeDossierModel(pkg);

@@ -11,7 +11,11 @@ import { readdirSync, lstatSync, readFileSync, existsSync, rmSync } from "node:f
 import { join, dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
-import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchHead } from "./github.ts";
+import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchSnapshot, type BranchDiscoveryOutcome } from "./github.ts";
+import { planRepoBranches, planPolicyDiagnostics, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
+import { PolicyMatchError, type CompiledBranchPolicy, type RepoPolicyCoverage } from "./branchPolicy.ts";
+import { discovered, discoveryFailed, type DiscoveryOutcome } from "./discovery.ts";
+import { computePolicyWarnings, isEmptyAllowlist, policyWarningLines, type PolicyWarning } from "./policyWarnings.ts";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseArgs, ORCHESTRATE_HELP, ORCHESTRATE_USAGE, type OrchestrateArgs } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -24,6 +28,15 @@ import { introspectVersion, fetchPackument, resolveRangeToVersion, type Packumen
 import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
 import { logLine } from "./log.ts";
+
+// The three values that TOGETHER define one coherent scan/plan: the config, its hash, and the
+// compiled branch policy. Threaded as ONE object through runScan/processOwner/processRepo/runPlan so
+// the policy can never be dropped or mismatched against its config.
+export interface AuditRuntime {
+  readonly config: Config;
+  readonly configHash: string;
+  readonly branchPolicy: CompiledBranchPolicy;
+}
 
 // ---- per-unit read helpers ------------------------------------------------------------------
 // API reader: SHA-pinned raw fetch (≤100MB) for blob entries. Non-blobs (submodule/symlink)
@@ -99,7 +112,8 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     process.stdout.write(ORCHESTRATE_HELP + "\n");
     return;
   }
-  const { config, configHash } = await loadConfig(argv);
+  const { config, configHash, branchPolicy } = await loadConfig(argv);
+  const runtime: AuditRuntime = { config, configHash, branchPolicy };
   const trackedNames = config.packages.map((p) => p.name);
 
   logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
@@ -114,7 +128,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
   if (args.plan) {
     const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories });
-    await runPlan(planClient, config, preflight.githubLogin);
+    await runPlan(planClient, runtime, preflight.githubLogin);
     return;
   }
 
@@ -124,7 +138,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories });
 
   try {
-    await runScan(db, client, config, configHash, args, preflight.githubLogin);
+    await runScan(db, client, runtime, args, preflight.githubLogin);
   } finally {
     db.close();
   }
@@ -133,30 +147,49 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
 // §8 step 7's "concise human-readable summary": stderr only — stdout stays pure JSONL. The
 // counters are the report's own §7 summary block (the imported ReportSummary type), labels
 // matching the report field names.
-export function runSummaryText(runId: string, s: ReportSummary, errorCount: number, reportPath: string): string {
+export function runSummaryText(
+  runId: string, s: ReportSummary, errorCount: number, reportPath: string, warnings: readonly PolicyWarning[] = [],
+): string {
   return [
     "",
     `AUDIT COMPLETE — run ${runId}`,
     `  Organizations scanned:  ${s.organizationsScanned}`,
     `  Repositories scanned:   ${s.repositoriesScanned}`,
-    `  Branches scanned:       ${s.branchesScanned} (${s.branchesSkippedByCutoff} skipped by cutoff)`,
+    `  Branches scanned:       ${s.branchesScanned} (${s.branchesSkippedByCutoff} skipped by cutoff · ${s.branchesExcludedByPolicy} excluded by policy · ${s.branchesPastCap} past cap · ${s.branchesErrored} scan-errored)`,
     `  Dependency findings:    ${s.totalDependencyFindings}`,
     `  Usage findings:         ${s.totalUsageFindings}`,
     `  Errors recorded:        ${errorCount} (fail-soft; details in the report's errors[])`,
     `  Report:                 ${reportPath} (+ latest.json)`,
+    ...policyWarningLines(warnings),
     "",
   ].join("\n");
+}
+
+// Compute AND emit the advisory dead-rule warnings, then return the FULL advisory array for the
+// summary. Shared by runScan and runPlan so their warning sets can never drift (run/plan parity is a
+// load-bearing property). These events are logged here (pure set algebra over the coverage collected
+// during discovery — no glob runs); the empty-allowlist event is emitted separately at mode
+// entry, and re-listed first in the returned array for the human summary.
+function emitPolicyWarnings(branchPolicy: CompiledBranchPolicy, coverages: readonly RepoPolicyCoverage[]): PolicyWarning[] {
+  const dead = computePolicyWarnings(branchPolicy, coverages);
+  for (const w of dead) logLine({ event: "policy-warning", ...w });
+  return [...(isEmptyAllowlist(branchPolicy) ? [{ kind: "empty-allowlist" } as const] : []), ...dead];
 }
 
 // The full scan lifecycle (§0/§1/§3/§5/§8), after preflight opened the db + caching client.
 // EXPORTED for tests: the site-(a) owner-discovery throttle contract — end cleanly WITHOUT
 // starting a run — is pinned here (a run started on throttle would leave a phantom run row).
 export async function runScan(
-  db: AuditDb, client: GithubClient, config: Config, configHash: string,
+  db: AuditDb, client: GithubClient, runtime: AuditRuntime,
   args: OrchestrateArgs, personalLogin: string | null,
 ): Promise<void> {
+  const { config, configHash } = runtime;
   // §0 startup: sweep stale temp dirs from a prior crash.
   client.sweepStaleTempDirs();
+
+  // The empty-allowlist warning is UNCONDITIONAL — emit it at mode entry so it fires even if the
+  // run then early-returns on an owner-discovery throttle. Retained for the end-of-run summary.
+  if (isEmptyAllowlist(runtime.branchPolicy)) logLine({ event: "policy-warning", kind: "empty-allowlist" });
 
   // §1 effective owner resolution (discovery runs every invocation). A throttle here is
   // TRANSIENT (§4): end the run cleanly and let the next invocation re-discover, rather than
@@ -196,10 +229,22 @@ export async function runScan(
   const cliTermSets = await discoverCliTerms(db, client, config, runId);
   logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
 
-  // §5.A/§5.B discover + process, deterministically.
-  for (const owner of owners) {
-    await processOwner(db, client, config, runId, configHash, owner, personalLogin, cliTermSets, nonRegistrySkipSeen);
+  // §5.A/§5.B discover + process, deterministically. A PolicyMatchError (a compiled branch matcher
+  // THREW at match time — fail-closed) is a GLOBAL config defect — never a per-repo soft error — so
+  // it ABORTS the whole run: mark the run failed (excluded from latest selection) and rethrow the
+  // ORIGINAL operator-facing error unchanged (it is registered in KNOWN_OPERATOR_ERRORS).
+  const coverages: RepoPolicyCoverage[] = [];
+  try {
+    for (const owner of owners) {
+      coverages.push(...(await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen)));
+    }
+  } catch (e) {
+    if (e instanceof PolicyMatchError) db.failRun(runId);
+    throw e;
   }
+
+  // Emit the unmatched-pattern warnings (before completeRun/done) and build the summary array.
+  const warnings = emitPolicyWarnings(runtime.branchPolicy, coverages);
 
   // §5.E introspection reconciliation over the run's reportable slice.
   await reconcileIntrospection(db, client, config, runId);
@@ -214,7 +259,7 @@ export async function runScan(
   const summary = emitted.report.summary;
   const errorCount = emitted.report.errors.length;
   logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount });
-  process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path));
+  process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path, warnings));
 }
 
 // ---- owner resolution + branch classification (shared by the run and --plan paths) -----------
@@ -250,124 +295,153 @@ export async function resolveOwnersWithDiscovery(
   }
 }
 
-// §5.B classification, pure: heads arrive sorted committedDate DESC. The repo's DEFAULT branch
-// (matched by name; known from §5.A discovery) is ALWAYS eligible — exempt from BOTH the cutoff
-// filter and the cap — so the default-branch view the report's headline metrics depend on is
-// never silently absent (CV2: a dormant default behind active feature branches, or one past the
-// cap, must still be scanned). Every OTHER still-live branch before cutoffDate is
-// `cutoffSkipped` (regardless of the cap); the after-cutoff survivors are `eligible` up to
-// maxBranchesPerRepo (the cap counts NON-default branches only, so a repo can yield cap+1
-// eligible units); older survivors past the cap are `pastCap` (they retain prior state and are
-// not surfaced this run). Order within each group preserves the input order. A defaultBranch
-// not among the live heads admits nothing — heads are never synthesized.
-export interface BranchPlan {
-  readonly cutoffSkipped: readonly BranchHead[];
-  readonly eligible: readonly BranchHead[];
-  readonly pastCap: readonly BranchHead[];
-}
-export function classifyBranchPlan(
-  heads: BranchHead[], cutoffDate: string, maxBranchesPerRepo: number, defaultBranch: string,
-): BranchPlan {
-  const cutoffSkipped: BranchHead[] = [];
-  const eligible: BranchHead[] = [];
-  const pastCap: BranchHead[] = [];
-  let nonDefaultEligible = 0;
-  for (const h of heads) {
-    if (h.name === defaultBranch) eligible.push(h);
-    else if (h.committedDate.slice(0, 10) < cutoffDate) cutoffSkipped.push(h);
-    else if (nonDefaultEligible < maxBranchesPerRepo) {
-      eligible.push(h);
-      nonDefaultEligible++;
-    } else pastCap.push(h);
-  }
-  return { cutoffSkipped, eligible, pastCap };
-}
+// Branch classification (policy → cutoff/cap) lives in ./branchPlanner.ts (the ONE shared planner
+// used by BOTH processRepo and runPlan, so their dispositions/counts can never diverge). Repo
+// discovery stays here.
 
 // Discover ONE owner's repos and process each (§5.A). EXPORTED for tests: the repo-discovery
 // throttle policy (inside discoverOwnerRepos) must stay pinned at this call boundary.
 export async function processOwner(
-  db: AuditDb, client: GithubClient, config: Config, runId: string, configHash: string,
+  db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, personalLogin: string | null, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-): Promise<void> {
-  const isPersonal = config.includePersonalNamespace && owner === personalLogin;
-  const kept = await discoverOwnerRepos(db, client, config, runId, owner, isPersonal);
-  for (const repo of kept) {
-    await processRepo(db, client, config, runId, configHash, owner, repo, cliTermSets, nonRegistrySkipSeen);
+): Promise<RepoPolicyCoverage[]> {
+  const isPersonal = runtime.config.includePersonalNamespace && owner === personalLogin;
+  const outcome = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
+  if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
+  // Collect each successfully-discovered repo's coverage (null = its branch discovery failed) so the
+  // run-level warning finalizer sees exactly the patterns exercised against real branches.
+  const coverages: RepoPolicyCoverage[] = [];
+  for (const repo of outcome.items) {
+    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen);
+    if (cov !== null) coverages.push(cov);
   }
+  return coverages;
 }
 
 // §5.A run-path repo discovery for one owner, fail-soft: a failure records the DB error row AND
-// emits the matching JSONL `discovery` event (org-scoped — no `repo` field), then yields [] so
-// the owner loop simply moves on. A ThrottleExhausted is TRANSIENT (§4): discovery re-runs next
-// invocation, so it logs a requeue event and yields [] with NO permanent errors row. Exported
-// for tests (scripted client + real in-memory DB); processOwner is its only runtime caller. The
-// --plan twin lives in runPlan, deliberately separate — plan mode has no DB and counts failures
-// into its totals instead.
+// emits the matching JSONL `discovery` event (org-scoped — no `repo` field), then returns a FAILED
+// DiscoveryOutcome so the owner loop simply moves on. A ThrottleExhausted is TRANSIENT (§4):
+// discovery re-runs next invocation, so it logs a requeue event and returns a failed outcome with NO
+// permanent errors row. Exported for tests (scripted client + real in-memory DB); processOwner is its
+// only runtime caller. The --plan twin lives in runPlan, deliberately separate — plan mode has no DB
+// and counts failures into its totals instead.
 export async function discoverOwnerRepos(
   db: AuditDb, client: GithubClient, config: Config, runId: string, owner: string, isPersonal: boolean,
-): Promise<RepoInfo[]> {
+): Promise<DiscoveryOutcome<RepoInfo>> {
   let repos: RepoInfo[];
   try {
     repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
   } catch (e) {
     // §4: a throttle during repo discovery is TRANSIENT — no permanent errors row (discovery
-    // re-runs next invocation). Any other error is a permanent discovery failure.
+    // re-runs next invocation). Any other error is a permanent discovery failure. Either way the
+    // outcome is a FAILURE (never a genuinely-empty owner) — the caller must not treat it as "done".
     if (e instanceof ThrottleExhausted) {
       logLine({ event: "discovery", org: owner, action: "requeue-throttle", message: (e as Error).message });
-      return [];
+      return discoveryFailed("throttled");
     }
     const message = `repo discovery failed: ${(e as Error).message}`;
     db.insertError({ runId, scope: "discovery", organization: owner, message });
     logLine({ event: "discovery", org: owner, error: message });
-    return [];
+    return discoveryFailed("failed");
   }
-  return filterSortCapRepos(repos, {
+  return discovered(filterSortCapRepos(repos, {
     includeArchived: config.includeArchived, includeForks: config.includeForks, maxReposPerOrg: config.maxReposPerOrg,
-  });
+  }));
 }
 
-// Discover a repo's branches, apply the cutoff + cap, and process/skip each branch unit (§5.B/§3).
-// Exported for the wiring tests (scripted client + real in-memory DB) — the throttle-requeue
-// policy in the catches below must stay pinned; processOwner is its only runtime caller.
-export async function processRepo(
-  db: AuditDb, client: GithubClient, config: Config, runId: string, configHash: string,
-  owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-): Promise<void> {
-  let heads: BranchHead[];
+// Branch-head discovery for ONE repo as a typed outcome — extracted so both the run (here) and
+// reconciliation consume the SAME failed-vs-genuinely-empty distinction. Same fail-soft policy: a throttle
+// requeues with no errors row (transient); any other error records a permanent discovery-failure row.
+export async function discoverBranchHeads(
+  db: AuditDb, client: GithubClient, runId: string, repo: RepoInfo,
+): Promise<BranchDiscoveryOutcome> {
   try {
-    heads = await client.listBranchHeads(repo.organization, repo.name);
+    // listBranchHeads validates the snapshot's coherence INSIDE this try on purpose: an incoherent
+    // snapshot must become a discovery FAILURE (errors row + retained rows + no reconcile), not an
+    // exception escaping past the outcome boundary where no error is recorded and the run can be left
+    // resumable-but-wrong.
+    return { ok: true, snapshot: await client.listBranchHeads(repo.organization, repo.name) };
   } catch (e) {
-    // §4: a throttle during branch discovery is TRANSIENT — no permanent errors row (the
-    // next run re-discovers). Any other error is a permanent discovery failure.
     if (e instanceof ThrottleExhausted) {
       logLine({ event: "discovery", org: repo.organization, repo: repo.name, action: "requeue-throttle", message: (e as Error).message });
-      return;
+      return discoveryFailed("throttled");
     }
     const message = `branch discovery failed: ${(e as Error).message}`;
     db.insertError({ runId, scope: "discovery", organization: repo.organization, repository: repo.name, message });
     logLine({ event: "discovery", org: repo.organization, repo: repo.name, error: message });
-    return;
+    return discoveryFailed("failed");
   }
-  const plan = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
-  // Discovery KNOWS the default branch (§5.A), so every head row this run writes carries a
-  // definite true/false — NULL is reserved for pre-v3 rows where nothing ever recorded it.
-  const isDefault = (h: BranchHead): boolean => h.name === repo.defaultBranch;
-  for (const h of plan.cutoffSkipped) {
-    const key: WorkUnitKey = { configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch: h.name };
+}
+
+// Discover a repo's branches, apply policy + cutoff + cap, and process/skip each branch unit
+// (PROMPT.md §5.B/§3). Returns the repo's policy COVERAGE on a successful discovery (folded into the run's
+// unmatched-pattern warnings), or null when branch discovery failed/throttled. Exported for the wiring tests;
+// processOwner is its only runtime caller.
+export async function processRepo(
+  db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
+  owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+): Promise<RepoPolicyCoverage | null> {
+  const { config, configHash, branchPolicy } = runtime;
+  const outcome = await discoverBranchHeads(db, client, runId, repo);
+  if (!outcome.ok) return null; // failed/throttled — this repo isn't "discovered"; contributes no coverage
+  const heads = outcome.snapshot.heads;
+  // Classify the WHOLE repo up-front (policy → cutoff/cap) via the ONE shared planner. This runs
+  // OUTSIDE the discovery catch and BEFORE any per-branch write, so a match-time PolicyMatchError
+  // aborts before this repo is half-classified (runScan then fails the run and rethrows).
+  const plan = planRepoBranches(outcome.snapshot, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo);
+  // Discovery KNOWS the default branch (§5.B — resolved from the same snapshot as these heads), so
+  // every head row this run writes carries a definite true/false — NULL is reserved for pre-v3 rows
+  // where nothing ever recorded it.
+  const keyFor = (branch: string): WorkUnitKey => ({ configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch });
+
+  // Policy-excluded (non-default, denied/allow-missed): its OWN run_unit_head disposition, named to
+  // match the 'skip-policy' event emitted just below — the durable row and the live stream call this
+  // one branch the same thing. Treated like a cutoff skip for the WORK QUEUE (enqueue + 'skipped'):
+  // that queue models "no scan needed", not why. commit_sha='' (never scanned); date = discovered head.
+  for (const d of plan.policyExcluded) {
+    const h = d.head;
+    const key = keyFor(h.name);
+    const attr = policyAttribution(d.rawPolicyResult);
     db.enqueueUnit(key, runId);
     db.setUnitStatus(key, { status: "skipped", runId, lastCommitSha: "", lastCommitDate: h.committedDate });
-    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: isDefault(h) });
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "policy-excluded", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
+    logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-policy", policyStatus: attr.policyStatus });
+  }
+
+  // Cutoff-skipped (policy-eligible, before cutoff): policy null (an eligible non-default branch is
+  // by construction no-exclusion; the default is never cutoff-skipped).
+  for (const d of plan.cutoffSkipped) {
+    const h = d.head;
+    const key = keyFor(h.name);
+    db.enqueueUnit(key, runId);
+    db.setUnitStatus(key, { status: "skipped", runId, lastCommitSha: "", lastCommitDate: h.committedDate });
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "skipped-cutoff", isDefaultBranch: d.isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-cutoff" });
   }
-  // plan.pastCap: after-cutoff past the cap → retain prior state, not surfaced this run.
-  for (const h of plan.eligible) {
-    const key: WorkUnitKey = { configHash, scope: "branch", organization: repo.organization, repository: repo.name, branch: h.name };
+
+  // Past-cap (policy-eligible, after cutoff, past the cap): record ONLY a run_unit_head row for report
+  // visibility — do NOT enqueue or touch the work queue, so a prior 'done' scan survives and a later
+  // run can promote this branch (cap-order shift) without a re-scan.
+  for (const d of plan.pastCap) {
+    const h = d.head;
+    db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "past-cap", isDefaultBranch: d.isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
+    logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "past-cap" });
+  }
+
+  // To-scan (default + within-cap after-cutoff). Only the DEFAULT may carry a policy counterfactual
+  // (the override); a non-default to-scan branch is necessarily no-exclusion (asserted, fail-closed).
+  for (const d of plan.toScan) {
+    const h = d.head;
+    if (!d.isDefaultBranch && d.rawPolicyResult.kind !== "no-exclusion")
+      throw new Error(`internal: non-default scanned branch ${repo.organization}/${repo.name}@${h.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
+    const key = keyFor(h.name);
+    const attr = policyAttribution(d.rawPolicyResult); // (null, null) unless the default-branch override
     db.enqueueUnit(key, runId);
     const unit = db.getUnit(key);
-    // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is
-    // reused (skip-as-current) — still upsert run_unit_head for THIS run so the report includes it.
+    // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is reused
+    // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate.
     if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
-      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: isDefault(h) });
+      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
       db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
       logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
       continue;
@@ -375,8 +449,8 @@ export async function processRepo(
 
     db.setUnitStatus(key, { status: "in_progress", runId });
     try {
-      const scannedCommit = await processUnit(db, client, config, runId, repo, h, cliTermSets, nonRegistrySkipSeen);
-      db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scannedCommit, lastCommitDate: h.committedDate, errorMessage: null });
+      const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
+      db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
     } catch (e) {
       if (e instanceof ThrottleExhausted) {
         // §4: throttle exhaustion is NOT a permanent unit failure — put the unit back to
@@ -391,26 +465,82 @@ export async function processRepo(
       }
     }
   }
+  // Stale-row reconciliation: this repo was discovered COMPLETELY (ok:true, reached only past the early
+  // `!outcome.ok` return; listBranchHeads fails closed on any structural incompleteness, so `heads` is
+  // the exact live branch set for THIS discovery snapshot). Prune this run's stale run_unit_head rows —
+  // phantom branches a prior resume-invocation recorded that no longer exist. Scoped to this
+  // (run_id, org, repo); a failed/throttled repo never reaches here and is retained. Reconciliation
+  // reflects the DISCOVERY-TIME snapshot, not the state at this instant, so the keep-set can be stale
+  // in both directions — an accepted TOCTOU for this single-user tool (no permanent data loss; the next
+  // run re-discovers and re-reconciles). Membership in `heads` is what decides, so there are exactly
+  // three cases:
+  //   - PRESENT in the keep-set → the row is RETAINED, whatever happened after discovery. A branch
+  //     deleted in that window keeps its row this run (a phantom the next run prunes).
+  //   - ABSENT and it never had a row (created after discovery) → nothing to prune, nothing lost; it is
+  //     simply recorded next run.
+  //   - ABSENT but it DOES hold a row from an earlier invocation of this run → the row is PRUNED. This
+  //     is the sharp edge, and it does not require the branch to still be gone: one deleted BEFORE this
+  //     discovery and RECREATED before the DELETE below is live again by the time we prune, yet its
+  //     prior row goes anyway (the keep-set no longer names it). Accepted: the row is re-recorded on the
+  //     next run, and global findings persist — only the per-run disposition row lapses.
+  // Note the direction: presence PROTECTS. Reconciliation can only delete rows for names discovery did
+  // not return — so a stale keep-set errs toward retaining, except in that third case.
+  //
+  // SIBLING ACCEPTED-STALENESS (same-name stale head). On a RESUME: a branch whose head ADVANCED since a
+  // prior invocation, whose re-scan then errors (the insertError arm above) or throttles (the requeue
+  // arm), writes no row this attempt — and the name-keyed prune RETAINS the prior row, WHATEVER its
+  // disposition, pinned to the OLDER evaluation. The report counts the branch under that PRIOR
+  // disposition: scanned at the old head — or still skipped-cutoff/past-cap/policy-excluded from the
+  // older evaluation, even though the head became eligible this attempt (cutoff-skip via an advanced
+  // head; past-cap via a cap-order shift; policy-excluded only when the branch also BECAME the
+  // default, the one override policy permits). Accepted, because:
+  //   - it is stale, not wrong: a scanned row and its findings describe a real scan of a real commit —
+  //     commit_sha + scanned_commit_date say WHICH (PROMPT.md's report-head invariant defines commit_sha
+  //     as "the head it reported", never "the live head") — and a non-scanned row's commit_sha='' +
+  //     discovered-head date describe the older evaluation it records.
+  //   - it is NOT a regression: before reconciliation existed there was no prune at all, so the row was retained
+  //     identically. The prune is a mitigation this feature ADDED (it removes deleted-branch phantoms
+  //     that used to persist forever); it is not the cause.
+  //   - it self-heals: the unit is left error/pending, never done, so the next run re-scans and re-upserts
+  //     at the live head.
+  // A head-SHA-aware prune is REJECTED: it would delete the clone-fallback path's legitimate rows (whose
+  // commit_sha is the clone's real HEAD, deliberately != the discovered h.oid — see processUnit) and the
+  // commit_sha='' sentinels the non-scanned dispositions rely on, hiding a real branch's real findings
+  // entirely rather than reporting them one commit late.
+  // Sharp edge worth knowing: the ERROR variant is loud (an errors[] row + a JSONL `action:"error"`
+  // line, visible beside the stale row), but the THROTTLE variant writes neither — only a stdout
+  // requeue line — so a completed run can present the old head with no in-report signal. Related: the
+  // retained row also masks that branch from the report's branchesErrored, which counts only errored
+  // branches holding NO row (see report.ts).
+  const pruned = db.reconcileRunUnitHead(runId, repo.organization, repo.name, heads.map((h) => h.name));
+  if (pruned > 0)
+    logLine({ event: "reconciliation", target: "run_unit_head", runId, org: repo.organization, repo: repo.name, action: "prune-stale", pruned });
+
+  return plan.coverage; // a SUCCESSFULLY-discovered repo (even if empty) — folds into the run's warnings
 }
 
 // Scan ONE branch unit: fetch the tree (clone fallback on truncation), run the §5.C-H pipeline,
 // and WRITE every finding + the run_unit_head snapshot (single-writer).
 async function processUnit(
   db: AuditDb, client: GithubClient, config: Config, runId: string,
-  repo: RepoInfo, h: BranchHead, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-): Promise<string> {
+  repo: RepoInfo, decision: BranchDecision, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+): Promise<{ commitSha: string; committedDate: string }> {
+  const h = decision.head;
   const tree = await client.fetchTreeRecursive(repo.organization, repo.name, h.treeOid);
   let entries: TreeEntry[];
   let readFile: (path: string, entry: TreeEntry) => Promise<string | null>;
   let cloneDir: string | null = null;
-  // The ACTUAL scanned commit: the discovery head (h.oid) for the API path, or the clone's real
-  // HEAD for the fallback (the branch may have moved between GraphQL discovery and the clone; all
-  // findings/permalinks/run_unit_head must pin to what was truly scanned, §5.C).
+  // The ACTUAL scanned commit + its date: the discovery head (h.oid / h.committedDate) for the API
+  // path, or the clone's real HEAD for the fallback (the branch may have moved between GraphQL
+  // discovery and the clone; all findings/permalinks/run_unit_head AND the persisted
+  // scanned_commit_date must pin to what was truly scanned, §5.C/§4).
   let commitSha = h.oid;
+  let committedDate = h.committedDate;
   if (tree.truncated) {
     const cloned = await client.cloneShallow(repo.organization, repo.name, h.name);
     cloneDir = cloned.dir;
     commitSha = cloned.headSha;
+    committedDate = cloned.headCommittedDate;
     entries = walkClone(cloned.dir);
     readFile = cloneReader(cloned.dir);
   } else {
@@ -455,10 +585,20 @@ async function processUnit(
       db.insertError({ runId, scope: "introspection", packageName: s.packageName, version: s.rawSpec, message: skipMessage });
       logLine({ event: "introspection", packageName: s.packageName, version: s.rawSpec, error: skipMessage });
     }
-    db.upsertRunUnitHead({ runId, organization: loc.organization, repository: loc.repository, branch: loc.branch, commitSha: loc.commitSha, status: "scanned", isDefaultBranch: h.name === repo.defaultBranch });
+    // Scanned snapshot with policy attribution (§3): only the DEFAULT branch may carry a policy
+    // counterfactual (the override) — a non-default to-scan branch is no-exclusion, so map() yields
+    // (null, null). scanned_commit_date is the ACTUAL scanned commit's date (the clone HEAD's own
+    // date under fallback, never the possibly-stale discovered date).
+    const attr = policyAttribution(decision.rawPolicyResult);
+    db.upsertRunUnitHead({
+      runId, organization: loc.organization, repository: loc.repository, branch: loc.branch,
+      commitSha: loc.commitSha, status: "scanned", isDefaultBranch: decision.isDefaultBranch,
+      policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern,
+      scannedCommitDate: committedDate,
+    });
 
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: commitSha, action: "scanned", deps: result.dependencyFindings.length, usage: result.usageFindings.length, cli: result.cliFindings.length });
-    return commitSha;
+    return { commitSha, committedDate };
   } finally {
     if (cloneDir !== null) {
       // the clone lives under a run temp dir (pkg-audit-*/clone) — remove that temp dir, but
@@ -615,7 +755,7 @@ export async function discoverCliTerms(db: AuditDb, client: GithubClient, config
   return sets;
 }
 
-// ---- §8 --plan: preview the scan scope with ZERO writes ---------------------------------------
+// ---- --plan: preview the scan scope with ZERO writes ------------------------------------------
 // No DB open (so no api_cache reads/writes), no content fetches, no clones, and no registry
 // packument/tarball fetches — preflight's registry REACHABILITY probe (§2.5) is the only registry
 // contact, and it carries no auth beyond the configured header. The caller passes a CACHE-LESS
@@ -630,16 +770,29 @@ export interface PlanTotals {
   readonly branchesEligible: number;
   readonly branchesSkippedByCutoff: number;
   readonly branchesPastCap: number;
+  readonly branchesExcludedByPolicy: number;
+  // Branch-policy diagnostics (the plan-mode analog of the report's scanScope sub-counts).
+  // OVERLAYS, not partition buckets: excludedByDeny + excludedByAllow === branchesExcludedByPolicy;
+  // defaultBranchPolicyOverrides <= branchesEligible (default branches a policy would have excluded).
+  readonly excludedByDeny: number;
+  readonly excludedByAllow: number;
+  readonly defaultBranchPolicyOverrides: number;
   readonly discoveryErrors: number;
 }
-export async function runPlan(client: GithubClient, config: Config, personalLogin: string): Promise<PlanTotals> {
+export async function runPlan(client: GithubClient, runtime: AuditRuntime, personalLogin: string): Promise<PlanTotals> {
+  const { config, branchPolicy } = runtime;
+  // Warning parity: the empty-allowlist warning is emitted at mode entry, unconditionally, exactly as in
+  // runScan — so --plan and the real run produce identical policy-warning events for the same config.
+  if (isEmptyAllowlist(branchPolicy)) logLine({ event: "policy-warning", kind: "empty-allowlist" });
   // The zero-write contract is enforced, not assumed: a caching client would write api_cache rows
   // into the DB during discovery. This is an internal contract violation (a bug, not an operator
   // error), so a plain Error with a stack is the right rendering.
   if (client.cachesToDb) throw new Error("runPlan requires a cache-less client (db: null) — plan mode must not write api_cache");
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 
-  let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, discoveryErrors = 0;
+  let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, branchesExcludedByPolicy = 0, discoveryErrors = 0;
+  let excludedByDeny = 0, excludedByAllow = 0, defaultBranchPolicyOverrides = 0; // policy diagnostics (overlays)
+  const coverages: RepoPolicyCoverage[] = []; // per successfully-discovered repo, for the warning finalizer
   for (const owner of owners) {
     const isPersonal = config.includePersonalNamespace && owner === personalLogin;
     let repos: RepoInfo[];
@@ -656,45 +809,77 @@ export async function runPlan(client: GithubClient, config: Config, personalLogi
     });
     reposKept += kept.length;
     for (const repo of kept) {
-      let heads: BranchHead[];
+      // --plan has no DB, so it consumes the client directly rather than via discoverBranchHeads. It
+      // must still take the default branch from the SAME snapshot as the heads (§5.B) — a --plan that
+      // sourced it differently from the run would report a scan scope the run would not produce.
+      let snapshot: BranchSnapshot;
       try {
-        heads = await client.listBranchHeads(repo.organization, repo.name);
+        snapshot = await client.listBranchHeads(repo.organization, repo.name);
       } catch (e) {
         discoveryErrors++;
         logLine({ event: "plan", org: repo.organization, repo: repo.name, error: `branch discovery failed: ${(e as Error).message}` });
         continue;
       }
-      const p = classifyBranchPlan(heads, config.cutoffDate, config.maxBranchesPerRepo, repo.defaultBranch);
-      branchesEligible += p.eligible.length;
+      // The SAME shared planner the real run uses, so --plan and the run can never disagree (§5).
+      // branchesEligible counts toScan (default + within-cap after-cutoff); policy-excluded is its own
+      // disjoint bucket. A match-time PolicyMatchError propagates FATAL (no DB to mark; main exits 1).
+      const p = planRepoBranches(snapshot, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo);
+      const diag = planPolicyDiagnostics(p); // fail-closed deny/allow split + default-override count
+      coverages.push(p.coverage); // this repo was discovered successfully (even if empty) — warning coverage
+      branchesEligible += p.toScan.length;
       branchesSkippedByCutoff += p.cutoffSkipped.length;
       branchesPastCap += p.pastCap.length;
+      branchesExcludedByPolicy += p.policyExcluded.length;
+      excludedByDeny += diag.excludedByDeny;
+      excludedByAllow += diag.excludedByAllow;
+      defaultBranchPolicyOverrides += diag.defaultBranchPolicyOverrides;
       logLine({
         event: "plan", org: repo.organization, repo: repo.name,
-        branchesEligible: p.eligible.length, branchesSkippedByCutoff: p.cutoffSkipped.length, branchesPastCap: p.pastCap.length,
+        branchesEligible: p.toScan.length, branchesSkippedByCutoff: p.cutoffSkipped.length,
+        branchesPastCap: p.pastCap.length, branchesExcludedByPolicy: p.policyExcluded.length,
+        excludedByDeny: diag.excludedByDeny, excludedByAllow: diag.excludedByAllow,
+        defaultBranchPolicyOverrides: diag.defaultBranchPolicyOverrides,
       });
     }
   }
 
-  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, discoveryErrors };
+  // Emit the unmatched-pattern warnings (before plan-summary) — identical to runScan's set.
+  const warnings = emitPolicyWarnings(branchPolicy, coverages);
+
+  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, excludedByDeny, excludedByAllow, defaultBranchPolicyOverrides, discoveryErrors };
   logLine({ event: "plan-summary", ...totals });
-  process.stderr.write(planSummaryText(config, totals));
+  process.stderr.write(planSummaryText(config, totals, warnings));
   return totals;
 }
 
 // The human-facing plan block goes to STDERR so stdout stays pure JSONL for pipes/agents.
 // The param names only the three config fields the text actually reads (interface segregation —
 // tests can pass the narrow literal instead of forging a full Config).
-export function planSummaryText(config: Pick<Config, "cutoffDate" | "maxBranchesPerRepo" | "packages">, t: PlanTotals): string {
+export function planSummaryText(
+  config: Pick<Config, "cutoffDate" | "maxBranchesPerRepo" | "packages">, t: PlanTotals, warnings: readonly PolicyWarning[] = [],
+): string {
   const lines = [
     "",
     "PLAN — preview only: no database opened, nothing scanned, nothing written",
     `  Owners (${t.ownersSource}):  ${t.owners.join(", ")}`,
     `  Repos:                ${t.reposDiscovered} discovered, ${t.reposKept} kept after archive/fork filters and caps`,
     `  Branches:             ${t.branchesEligible} eligible to scan (a real run may skip already-current ones)`,
-    `                        ${t.branchesSkippedByCutoff} skipped by cutoff (< ${config.cutoffDate}) · ${t.branchesPastCap} past the per-repo cap (${config.maxBranchesPerRepo})`,
+    `                        ${t.branchesSkippedByCutoff} skipped by cutoff (< ${config.cutoffDate}) · ${t.branchesPastCap} past the per-repo cap (${config.maxBranchesPerRepo}) · ${t.branchesExcludedByPolicy} excluded by branch policy`,
+    // Policy breakdown, shown only when policy actually removed or overrode branches. Wording avoids
+    // "scanned" (the plan header promises nothing is scanned); overrides are flagged as already-eligible.
+    ...(t.branchesExcludedByPolicy > 0 || t.defaultBranchPolicyOverrides > 0
+      ? [`  Policy detail:        ${t.excludedByDeny} excluded by deny · ${t.excludedByAllow} excluded as not allow-listed · ${t.defaultBranchPolicyOverrides} default-branch policy override(s) (already counted as eligible)`]
+      : []),
     `  Packages tracked:     ${config.packages.map((p) => p.name).join(", ")}`,
     `  Discovery errors:     ${t.discoveryErrors}`,
-    `  Next:                 bun run audit   (narrow scope first via "organizations" in the config if this is broader than intended)`,
+    ...policyWarningLines(warnings),
+    // Names the two coarse POSITIVE selectors for the dimensions the block above actually reports —
+    // owners and branches. Deliberately not a lever inventory: excludeOrganizations, excludeBranches,
+    // cutoffDate, maxReposPerOrg and maxBranchesPerRepo all narrow too, but they refine a universe
+    // rather than define it, and a hint listing every lever tells you nothing. "organizations" stays
+    // first because it is the real blast radius (discovery mode enumerates every org the token can
+    // see); branch policy never shrinks the repo set and cannot exclude a default branch.
+    `  Next:                 bun run audit   (if broader than intended, narrow the root-level allowlists first: "organizations" and/or "branches")`,
     "",
   ];
   return lines.join("\n");

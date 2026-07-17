@@ -40,6 +40,14 @@ describe("validateAndNormalize — happy path + defaults", () => {
     expect(norm({ ...baseRaw(), organizations: [] }).organizations).toEqual([]);
     expect(norm({ ...baseRaw(), organizations: null }).organizations).toBeNull();
   });
+  test("branches null (default) / [] / [..] normalize distinctly; excludeBranches defaults to []", () => {
+    expect(norm(baseRaw()).branches).toBeNull();
+    expect(norm(baseRaw()).excludeBranches).toEqual([]);
+    expect(norm({ ...baseRaw(), branches: [] }).branches).toEqual([]);
+    expect(norm({ ...baseRaw(), branches: ["main", "release/*"] }).branches).toEqual(["main", "release/*"]);
+    expect(norm({ ...baseRaw(), excludeBranches: null }).excludeBranches).toEqual([]);
+    expect(norm({ ...baseRaw(), excludeBranches: ["dependabot/*"] }).excludeBranches).toEqual(["dependabot/*"]);
+  });
   test("registryUrl trailing slash canonicalized in hash", () => {
     const a = hashOf({ ...baseRaw(), packages: [{ name: "x", registryUrl: "https://r.example.com/" }] });
     const b = hashOf({ ...baseRaw(), packages: [{ name: "x", registryUrl: "https://r.example.com" }] });
@@ -66,14 +74,97 @@ describe("validateAndNormalize — validation failures", () => {
     ["missing concurrency field", { ...baseRaw(), concurrency: { organizations: 3, repositories: 6 } }],
     ["missing paths", { ...baseRaw(), paths: undefined }],
     ["githubHost with scheme", { ...baseRaw(), githubHost: "https://gh.com" }],
+    ["empty-string branch pattern", { ...baseRaw(), branches: ["main", ""] }],
+    ["empty-string excludeBranch pattern", { ...baseRaw(), excludeBranches: [""] }],
+    ["leading-! branch pattern (negation unsupported)", { ...baseRaw(), branches: ["!main"] }],
+    ["leading-! excludeBranch pattern", { ...baseRaw(), excludeBranches: ["!release/*"] }],
+    ["branches not null and not array", { ...baseRaw(), branches: "main" }],
+    ["excludeBranches not an array", { ...baseRaw(), excludeBranches: "dependabot/*" }],
+    ["non-string branch element", { ...baseRaw(), branches: [123] }],
+    ["empty-string organization", { ...baseRaw(), organizations: ["acme", ""] }],
+    ["non-string organization element", { ...baseRaw(), organizations: [42] }],
+    ["empty-string excludeOrganization", { ...baseRaw(), excludeOrganizations: [""] }],
+    ["empty-string excludeDirGlob", { ...baseRaw(), excludeDirGlobs: ["**/dist/**", ""] }],
     ["non-object root", 42 as unknown as Record<string, unknown>],
   ];
   for (const [name, raw, env] of bad)
     test(name, () => expect(() => norm(raw, env)).toThrow(ConfigError));
+
+  test("empty-string item diagnostics name the key and the index", () => {
+    expect(() => norm({ ...baseRaw(), organizations: ["acme", ""] }))
+      .toThrow(/organizations\[1\] must be a non-empty string/);
+    expect(() => norm({ ...baseRaw(), excludeOrganizations: [""] }))
+      .toThrow(/excludeOrganizations\[0\] must be a non-empty string/);
+    expect(() => norm({ ...baseRaw(), excludeDirGlobs: ["**/dist/**", ""] }))
+      .toThrow(/excludeDirGlobs\[1\] must be a non-empty string/);
+  });
+
+  // `organizations` and `branches` each name a root-level allowlist AND a key under `concurrency`.
+  // The hint fires only when the VALUE fits the sibling — a wrong hint is worse than none.
+  describe("sibling-key hints for the root/concurrency name collision", () => {
+    const conc = (over: Record<string, unknown>) =>
+      ({ ...baseRaw(), concurrency: { organizations: 3, repositories: 6, branches: 4, ...over } });
+
+    test("a LIST under concurrency.<k> points at the root-level allowlist of that name", () => {
+      expect(() => norm(conc({ branches: ["main", "release/*"] })))
+        .toThrow(/concurrency\.branches must be a positive integer — for a list of branch names you likely meant the root-level "branches" allowlist/);
+      expect(() => norm(conc({ organizations: ["acme"] })))
+        .toThrow(/concurrency\.organizations must be a positive integer — for a list of organization names you likely meant the root-level "organizations" allowlist/);
+    });
+
+    // Only maxBranchesPerRepo is DESCRIBED: concurrency.branches is validated but never consumed at
+    // runtime, so calling it a parallelism control would be a fresh false claim (see config.ts).
+    test("a NUMBER under root branches names BOTH numeric twins — guessing between them would be a coin flip", () => {
+      expect(() => norm({ ...baseRaw(), branches: 4 }))
+        .toThrow(/branches must be null or an array of strings — for a number you likely meant "maxBranchesPerRepo" \(the per-repo branch cap\) or "concurrency\.branches"/);
+    });
+
+    test("a NUMBER under root organizations names its one twin", () => {
+      expect(() => norm({ ...baseRaw(), organizations: 3 }))
+        .toThrow(/organizations must be null or an array of strings — for a number you likely meant "concurrency\.organizations"/);
+    });
+
+    test("SILENT when the value fits no sibling: the base error stands alone", () => {
+      expect(() => norm({ ...baseRaw(), branches: { a: 1 } })).toThrow(/^branches must be null or an array of strings$/);
+      expect(() => norm({ ...baseRaw(), organizations: "acme" })).toThrow(/^organizations must be null or an array of strings$/);
+      // 0 is not a positive integer — it fits neither concurrency.branches nor maxBranchesPerRepo.
+      expect(() => norm({ ...baseRaw(), branches: 0 })).toThrow(/^branches must be null or an array of strings$/);
+      expect(() => norm(conc({ branches: "4" }))).toThrow(/^concurrency\.branches must be a positive integer$/);
+    });
+
+    test("SILENT for a '!'-prefixed list — the root allowlist would reject it too, so the hint would trade one error for another", () => {
+      expect(() => norm(conc({ branches: ["!main"] }))).toThrow(/^concurrency\.branches must be a positive integer$/);
+    });
+
+    test("concurrency.repositories has no root-level twin and never hints", () => {
+      expect(() => norm(conc({ repositories: ["a"] }))).toThrow(/^concurrency\.repositories must be a positive integer$/);
+    });
+  });
 });
 
 describe("computeConfigHash — determinism + scope", () => {
   test("same config → same hash", () => expect(hashOf(baseRaw())).toBe(hashOf(baseRaw())));
+
+  // UPGRADE REGRESSION PIN: the work queue is keyed by config_hash. A config that configures NO branch
+  // policy scans exactly what it scanned before the policy feature existed, so its hash MUST NOT change —
+  // otherwise every existing user's completed units are orphaned on upgrade and a full rescan is forced.
+  // (The pre-v4 RUNNING run itself is failed at the v3→v4 boundary BY DESIGN — see migrateV3toV4's
+  // boundary rule — but its completed units skip-as-current in the new run precisely because this
+  // hash is stable.) This literal was verified byte-equal against the pre-feature
+  // implementation at 81d79a1: the hashed projection omits branches/excludeBranches when neither is set.
+  test("a policy-FREE config keeps its PRE-FEATURE hash (legacy work_queue reuse survives the upgrade)", () => {
+    expect(hashOf(baseRaw())).toBe("86b8d1c1c68298fbe85dbe5012e9a7110ae3ed260ccf3c468ab920d62d8efe8b");
+    // explicitly writing the legacy defaults is still the same policy → still the same hash
+    expect(hashOf({ ...baseRaw(), branches: null, excludeBranches: [] })).toBe(hashOf(baseRaw()));
+  });
+
+  test("any CONFIGURED branch policy changes the hash, and null (unrestricted) stays distinct from [] (default-only)", () => {
+    const free = hashOf(baseRaw());
+    const emptyAllowlist = hashOf({ ...baseRaw(), branches: [] });
+    const denyOnly = hashOf({ ...baseRaw(), excludeBranches: ["dev"] });
+    const allowlist = hashOf({ ...baseRaw(), branches: ["main"] });
+    expect(new Set([free, emptyAllowlist, denyOnly, allowlist]).size).toBe(4); // all four are distinct scopes
+  });
   test("key insertion order does not change the hash", () => {
     const b = baseRaw();
     const reordered = Object.fromEntries(Object.entries(b).reverse());
@@ -103,6 +194,22 @@ describe("computeConfigHash — determinism + scope", () => {
     expect(hashOf(baseRaw())).not.toBe(hashOf({ ...baseRaw(), cutoffDate: "2023-01-01" })));
   test("organizations null vs [] produce DIFFERENT hashes", () =>
     expect(hashOf({ ...baseRaw(), organizations: null })).not.toBe(hashOf({ ...baseRaw(), organizations: [] })));
+  test("branches null vs [] produce DIFFERENT hashes", () =>
+    expect(hashOf({ ...baseRaw(), branches: null })).not.toBe(hashOf({ ...baseRaw(), branches: [] })));
+  test("branches reorder/dupe does not change the hash", () => {
+    const a = hashOf({ ...baseRaw(), branches: ["a", "b"] });
+    const b = hashOf({ ...baseRaw(), branches: ["b", "a", "a"] });
+    expect(a).toBe(b);
+  });
+  test("excludeBranches reorder/dupe does not change the hash", () => {
+    const a = hashOf({ ...baseRaw(), excludeBranches: ["x", "y"] });
+    const b = hashOf({ ...baseRaw(), excludeBranches: ["y", "x", "x"] });
+    expect(a).toBe(b);
+  });
+  test("branches change DOES change the hash", () =>
+    expect(hashOf({ ...baseRaw(), branches: ["main"] })).not.toBe(hashOf({ ...baseRaw(), branches: ["develop"] })));
+  test("excludeBranches change DOES change the hash", () =>
+    expect(hashOf(baseRaw())).not.toBe(hashOf({ ...baseRaw(), excludeBranches: ["dependabot/*"] })));
   test("includeForks change DOES change the hash", () =>
     expect(hashOf(baseRaw())).not.toBe(hashOf({ ...baseRaw(), includeForks: true })));
   test("registryAuthEnvVar NAME participates but token VALUE does not", () => {
@@ -166,6 +273,20 @@ describe("loadConfig — file I/O", () => {
     expect(loaded.config.packages[0]!.name).toBe("expo");
     expect(loaded.configHash).toMatch(/^[0-9a-f]{64}$/);
     expect(loaded.configPath).toBe(p);
+  });
+  test("loadConfig compiles the branch policy onto LoadedConfig (canonical order)", async () => {
+    const p = join(dir, "policy.json");
+    writeFileSync(p, JSON.stringify({ ...baseRaw(), branches: ["release/*", "main"], excludeBranches: ["dependabot/*"] }));
+    const loaded = await loadConfig(["--config", p], {});
+    expect(loaded.branchPolicy.include?.map((c) => c.pattern)).toEqual(["main", "release/*"]);
+    expect(loaded.branchPolicy.exclude.map((c) => c.pattern)).toEqual(["dependabot/*"]);
+  });
+  test("loadConfig leaves branchPolicy.include null when branches is omitted (unrestricted)", async () => {
+    const p = join(dir, "nopolicy.json");
+    writeFileSync(p, JSON.stringify(baseRaw()));
+    const loaded = await loadConfig(["--config", p], {});
+    expect(loaded.branchPolicy.include).toBeNull();
+    expect(loaded.branchPolicy.exclude).toEqual([]);
   });
   test("missing file throws ConfigError", async () => {
     await expect(loadConfig(["--config", join(dir, "nope.json")], {})).rejects.toThrow(ConfigError);
@@ -347,6 +468,23 @@ describe("config.schema.json ↔ runtime sync", () => {
   test("packages.items requires exactly name", () => {
     expect(schema["properties"]["packages"]["items"]["required"]).toEqual(["name"]);
   });
+  test("every items.minLength constraint in the schema is runtime-enforced ([\"\"] and [42] throw)", () => {
+    // Derived FROM the schema, then pinned: a new string-array key gaining items.minLength must be
+    // added to the expected list (loud), and every listed key must actually reject an empty item
+    // AND a non-string item at runtime (the schema declares items.type "string" for all of them,
+    // and the keys route through THREE different validators — optStringArray,
+    // normalizeOrganizations, validateBranchPattern — so per-key coverage is what keeps them in
+    // lockstep). Schema/code drift on array items fails here instead of shipping.
+    const constrained = Object.entries<Record<string, any>>(schema["properties"])
+      .filter(([, prop]) => prop["items"]?.["type"] === "string" && prop["items"]?.["minLength"] >= 1)
+      .map(([key]) => key)
+      .sort();
+    expect(constrained).toEqual(["branches", "excludeBranches", "excludeDirGlobs", "excludeOrganizations", "organizations"]);
+    for (const key of constrained) {
+      expect(() => norm({ ...baseRaw(), [key]: [""] })).toThrow(ConfigError);
+      expect(() => norm({ ...baseRaw(), [key]: [42] })).toThrow(ConfigError);
+    }
+  });
   test("every schema 'default' annotation equals the actual runtime default", () => {
     // required keys only, so every optional field falls back to its runtime default; a schema
     // 'default' that drifts from the code would silently mislead operators editing config.json.
@@ -364,7 +502,8 @@ describe("config.schema.json ↔ runtime sync", () => {
       githubHost: config.githubHost, organizations: config.organizations,
       excludeOrganizations: config.excludeOrganizations, includePersonalNamespace: config.includePersonalNamespace,
       includeForks: config.includeForks, includeArchived: config.includeArchived,
-      maxReposPerOrg: config.maxReposPerOrg, excludeDirGlobs: config.excludeDirGlobs,
+      maxReposPerOrg: config.maxReposPerOrg, branches: config.branches,
+      excludeBranches: config.excludeBranches, excludeDirGlobs: config.excludeDirGlobs,
     };
     const pkgRuntimeDefaults: Record<string, unknown> = {
       registryUrl: pkg.registryUrl, registryAuthEnvVar: pkg.registryAuthEnvVar,

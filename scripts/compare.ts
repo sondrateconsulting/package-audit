@@ -5,7 +5,7 @@
 // {"notComparable":…} notice on the stdout JSONL contract and exits 0 (consumers branch on the
 // parsed field, not the exit code — the runReport precedent).
 //
-// Semantics (CT5):
+// Semantics (default-branch headline rule):
 // - Each run's slice is usage_findings joined through the IMMUTABLE run_unit_head snapshot
 //   (run_id = that run, status='scanned', matching org/repo/branch/commit_sha — report.ts's join,
 //   NEVER findings.run_id) filtered to THAT run's tracked_packages.
@@ -23,7 +23,8 @@
 
 import { existsSync } from "node:fs";
 import { loadConfig, type Config } from "./config.ts";
-import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
+import { AuditDb, type AuditDbReader, type PolicyStatus, type RunRecord } from "./db.ts";
+import { isPolicyExcluded, isDefaultOverride, assertRunUnitHeadSound, policyStatusOrThrow } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
@@ -144,12 +145,108 @@ export interface ComparePackage {
   reposLeaving: CompareRepoEntry[];
 }
 
+// Branch allow/deny compare-format version — INDEPENDENT of XRAY_FORMAT_VERSION (a compare-only shape
+// change bumps only this). v2 adds the top-level policyChurn dimension.
+export const COMPARE_FORMAT_VERSION = 2 as const;
+
+// One branch's policy disposition on each side of the compare (§5). Present in exactly one churn category.
+export interface PolicyChurnEntry {
+  readonly organization: string;
+  readonly repository: string;
+  readonly branch: string;
+  readonly runA: PolicyBranchState;
+  readonly runB: PolicyBranchState;
+}
+// The top-level policy-churn dimension. `available:false` when EITHER run predates v4 (a migration-null
+// scanned_commit_date = unknown policy provenance; a naive diff would fabricate churn). Only branch
+// keys present in BOTH runs are classified; one-sided keys are counted, never churned.
+export type PolicyChurn =
+  // "pre-v4-policy-data": a run MIGRATED from before v4 (a NULL scanned_commit_date sentinel) — its policy
+  // provenance is unknowable. "no-recorded-heads": a run that recorded no heads at all; it may be perfectly
+  // native-v4, so it must NOT be labelled pre-v4 — there is simply nothing to compare.
+  | { readonly available: false; readonly reason: "pre-v4-policy-data" | "no-recorded-heads" }
+  | {
+      readonly available: true;
+      readonly summary: {
+        readonly branchesCompared: number;
+        readonly branchesOnlyInRunA: number;
+        readonly branchesOnlyInRunB: number;
+        readonly enteredExclusion: number;
+        readonly leftExclusion: number;
+        readonly reclassifiedExclusion: number;
+        readonly defaultOverrideChanges: number;
+        readonly detailCapped?: true; // any category's detail array truncated to COMPARE_DETAIL_CAP (totals stay full)
+      };
+      readonly enteredExclusion: readonly PolicyChurnEntry[]; // policy went from not-applied → applied
+      readonly leftExclusion: readonly PolicyChurnEntry[]; //    applied → not-applied
+      readonly reclassifiedExclusion: readonly PolicyChurnEntry[]; // applied both sides, deny/allow|pattern changed
+      readonly defaultOverrideChanges: readonly PolicyChurnEntry[]; // not applied either side, counterfactual changed
+    };
+
 export interface CompareEnvelope {
   compare: {
-    formatVersion: 1;
+    formatVersion: typeof COMPARE_FORMAT_VERSION;
     runA: CompareRunInfo;
     runB: CompareRunInfo;
     packages: ComparePackage[];
+    policyChurn: PolicyChurn;
+  };
+}
+
+// Two branch states share the same policy ATTRIBUTION iff both the policy_status
+// (excluded-by-deny / excluded-by-allow / null) and the causing pattern match. Deliberately does NOT
+// compare the row's `status` column (scanned / skipped-cutoff / policy-excluded / past-cap): the callers have already
+// established the disposition via policyApplied/defaultOverride, and this answers the narrower
+// question "did the policy verdict itself change" — e.g. a branch re-classified from allow-miss to an
+// explicit deny, or a deny whose causing pattern was renamed.
+function policyStateEq(a: PolicyBranchState, b: PolicyBranchState): boolean {
+  return a.policyStatus === b.policyStatus && a.policyMatchedPattern === b.policyMatchedPattern;
+}
+
+// Classify per-branch policy churn between two run slices. Compares only branch keys present in BOTH
+// runs (a branch absent from one run cannot be "entering/leaving" exclusion — absence has many causes).
+function buildPolicyChurn(a: RunSlice, b: RunSlice): PolicyChurn {
+  // A pre-v4 gap on EITHER side wins over a mere empty-run gap: it is the more specific (and more
+  // actionable) explanation for why policy churn cannot be computed.
+  const gap = a.policyProvenanceGap === "pre-v4-policy-data" || b.policyProvenanceGap === "pre-v4-policy-data"
+    ? "pre-v4-policy-data"
+    : (a.policyProvenanceGap ?? b.policyProvenanceGap);
+  if (gap !== null) return { available: false, reason: gap };
+  const entered: PolicyChurnEntry[] = [], left: PolicyChurnEntry[] = [];
+  const reclassified: PolicyChurnEntry[] = [], overrideChanges: PolicyChurnEntry[] = [];
+  let onlyA = 0, onlyB = 0, compared = 0;
+  for (const key of b.policyByBranch.keys()) if (!a.policyByBranch.has(key)) onlyB++;
+  for (const [key, sa] of a.policyByBranch) {
+    const sb = b.policyByBranch.get(key);
+    if (sb === undefined) { onlyA++; continue; }
+    compared++;
+    const parts = key.split("\0");
+    const entry: PolicyChurnEntry = { organization: parts[0]!, repository: parts[1]!, branch: parts[2]!, runA: sa, runB: sb };
+    if (!sa.policyApplied && sb.policyApplied) entered.push(entry);
+    else if (sa.policyApplied && !sb.policyApplied) left.push(entry);
+    else if (sa.policyApplied && sb.policyApplied) { if (!policyStateEq(sa, sb)) reclassified.push(entry); }
+    else if (!policyStateEq(sa, sb)) overrideChanges.push(entry); // neither applied, but counterfactual changed
+  }
+  const sortE = (arr: PolicyChurnEntry[]): PolicyChurnEntry[] =>
+    arr.sort((x, y) => cmp(x.organization, y.organization) || cmp(x.repository, y.repository) || cmp(x.branch, y.branch));
+  // Sort BEFORE capping; per-category cap so one category can't consume another's allowance; the
+  // summary totals stay UNCAPPED (honest), the detail arrays are truncated.
+  const enteredFull = sortE(entered), leftFull = sortE(left), reclassFull = sortE(reclassified), overrideFull = sortE(overrideChanges);
+  const cap = COMPARE_DETAIL_CAP;
+  const detailCapped =
+    enteredFull.length > cap || leftFull.length > cap || reclassFull.length > cap || overrideFull.length > cap;
+  return {
+    available: true,
+    summary: {
+      branchesCompared: compared, branchesOnlyInRunA: onlyA, branchesOnlyInRunB: onlyB,
+      enteredExclusion: enteredFull.length, leftExclusion: leftFull.length,
+      reclassifiedExclusion: reclassFull.length, defaultOverrideChanges: overrideFull.length,
+      ...(detailCapped ? { detailCapped: true as const } : {}),
+    },
+    enteredExclusion: enteredFull.slice(0, cap),
+    leftExclusion: leftFull.slice(0, cap),
+    reclassifiedExclusion: reclassFull.slice(0, cap),
+    defaultOverrideChanges: overrideFull.slice(0, cap),
   };
 }
 
@@ -162,6 +259,9 @@ interface UsageRowDb {
 interface HeadRow {
   organization: string; repository: string; branch: string; commit_sha: string; status: string;
   is_default_branch: number | null; // 1/0/NULL — NULL = unknown (pre-v3 run rows)
+  policy_status: string | null; // branch allow/deny (§5) — 'excluded-by-deny' | 'excluded-by-allow' | NULL
+  policy_matched_pattern: string | null;
+  scanned_commit_date: string | null; // NULL only for pre-v4 migrated rows → unknown policy provenance
 }
 
 function unitKey(o: string, r: string, b: string, c: string): string {
@@ -174,21 +274,72 @@ function siteKey(r: UsageRowDb): string {
   return [r.organization, r.repository, r.branch, r.usage_type, r.export_name, r.file_path, String(r.line_number), r.context].join("\0");
 }
 
+// The per-branch policy disposition state used by policy churn (keyed by org/repo/branch, NOT commit —
+// churn tracks a branch's policy across runs regardless of the commit it pointed at).
+interface PolicyBranchState {
+  readonly status: string;
+  readonly isDefaultBranch: boolean | null;
+  // The CLOSED set, not a bare string: every value here is checked by policyStatusOrThrow at
+  // construction, so the churn entries this feeds cannot carry a literal outside db.ts's union.
+  readonly policyStatus: PolicyStatus | null;
+  readonly policyMatchedPattern: string | null;
+  readonly policyApplied: boolean; // isPolicyExcluded — actually dropped by policy
+  readonly defaultOverride: boolean; // isDefaultOverride — scanned default carrying the counterfactual
+}
+
 interface RunSlice {
   byPackage: Map<string, Map<string, UsageRowDb>>; // package → siteKey → representative row
   flags: Map<string, boolean | null>; // unitKey → tri-state default-branch flag (scanned heads)
   hasNullFlag: boolean; // ANY head row of the run with is_default_branch NULL (pre-v3)
+  policyByBranch: Map<string, PolicyBranchState>; // (org\0repo\0branch) → policy disposition (policy churn)
+  policyProvenanceGap: "pre-v4-policy-data" | "no-recorded-heads" | null; // why churn is unavailable; null = provenance sound
 }
 
 function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
   const heads = db.read(
-    `SELECT organization, repository, branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ?`,
+    `SELECT organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date FROM run_unit_head WHERE run_id = ?`,
   ).all(run.runId) as HeadRow[];
   const hasNullFlag = heads.some((h) => h.is_default_branch === null);
+  // No positive v4 policy provenance, and the two causes are DISTINCT: a migrated pre-v4 run (the NULL
+  // scanned_commit_date sentinel) vs a run with ZERO heads (e.g. all branch discovery failed) — the empty
+  // case carries no sentinel row at all, so `.some()` alone would falsely report provenance as present,
+  // and calling it "pre-v4" would misstate the schema of a perfectly native-v4 empty run.
+  const policyProvenanceGap: "pre-v4-policy-data" | "no-recorded-heads" | null =
+    heads.some((h) => h.scanned_commit_date === null)
+      ? "pre-v4-policy-data"
+      : heads.length === 0
+        ? "no-recorded-heads"
+        : null;
   const flags = new Map<string, boolean | null>(
     heads
       .filter((h) => h.status === "scanned")
       .map((h) => [unitKey(h.organization, h.repository, h.branch, h.commit_sha), h.is_default_branch === null ? null : h.is_default_branch === 1]),
+  );
+  const policyByBranch = new Map<string, PolicyBranchState>(
+    heads.map((h) => {
+      // Fail closed on a policy-bearing row that is neither an exclusion nor a default override — the
+      // same guard the report's scan-scope ledger applies, from the same shared definition. Without it
+      // such a row gets policyApplied=false + defaultOverride=false, i.e. exactly the shape of an
+      // ordinary unrestricted branch, and buildPolicyChurn's final else-branch would file it under
+      // defaultOverrideChanges ("neither applied, but the counterfactual changed") — laundering a
+      // malformed disposition into a plausible-looking churn entry.
+      const where = `${h.organization}/${h.repository}@${h.branch}`;
+      assertRunUnitHeadSound(h, where);
+      return [
+        `${h.organization}\0${h.repository}\0${h.branch}`,
+        {
+          status: h.status,
+          isDefaultBranch: h.is_default_branch === null ? null : h.is_default_branch === 1,
+          // The guard above settles the row's SHAPE and stops there; this settles the LITERAL, which
+          // churn compares (policyStateEq) and emits. Null stays null and is checked no further — an
+          // unrestricted branch is the common case, and only a policy-BEARING row makes a claim.
+          policyStatus: h.policy_status === null ? null : policyStatusOrThrow(h, where),
+          policyMatchedPattern: h.policy_matched_pattern,
+          policyApplied: isPolicyExcluded(h),
+          defaultOverride: isDefaultOverride(h),
+        },
+      ];
+    }),
   );
 
   // The run-scoped slice: findings joined through the immutable snapshot (report.ts's join),
@@ -224,7 +375,7 @@ function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
     const key = siteKey(row);
     if (!sites.has(key)) sites.set(key, row);
   }
-  return { byPackage, flags, hasNullFlag };
+  return { byPackage, flags, hasNullFlag, policyByBranch, policyProvenanceGap };
 }
 
 const EMPTY_SITES: ReadonlyMap<string, UsageRowDb> = new Map();
@@ -251,7 +402,7 @@ const entryCmp = (a: CompareSiteEntry, b: CompareSiteEntry): number =>
   cmp(a.exportName, b.exportName) || cmp(a.context, b.context);
 
 // Repos with ≥1 in-scope usage site of the package in this slice. Scope = default-branch sites
-// only (the CT5 headline rule), widened to all branches under the pre-v3 fallback.
+// only (the default-branch headline rule), widened to all branches under the pre-v3 fallback.
 function scopedRepos(sites: ReadonlyMap<string, UsageRowDb>, flags: Map<string, boolean | null>, incomplete: boolean): Map<string, CompareRepoEntry> {
   const repos = new Map<string, CompareRepoEntry>();
   for (const row of sites.values()) {
@@ -319,10 +470,11 @@ export function buildCompare(db: AuditDbReader, runA: RunRecord, runB: RunRecord
     const names = [...new Set([...runA.trackedPackages, ...runB.trackedPackages])].sort(cmp);
     return {
       compare: {
-        formatVersion: 1 as const,
+        formatVersion: COMPARE_FORMAT_VERSION,
         runA: runInfo(runA),
         runB: runInfo(runB),
         packages: names.map((name) => buildPackageDiff(name, a, b, incomplete)),
+        policyChurn: buildPolicyChurn(a, b),
       },
     };
   });
@@ -379,7 +531,7 @@ export function runCompare(config: Config, runIdA: string, runIdB: string): { li
   if (sqlitePath === ":memory:" || !existsSync(sqlitePath))
     return { line: `${JSON.stringify(buildNotComparableNotice({ kind: "missing-db", path: sqlitePath }))}\n` };
 
-  // Pure READ — openReadOnly can never create, migrate, or write the database (CV5).
+  // Pure READ — openReadOnly can never create, migrate, or write the database.
   const db = AuditDb.openReadOnly({ sqlitePath });
   try {
     const entries: Array<readonly [string, RunRecord | null]> = [

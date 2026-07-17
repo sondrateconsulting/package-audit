@@ -93,6 +93,19 @@ below).
                                        //   scanned repo's .npmrc
     }
   ],
+  "branches": null,                    // branch allow/deny (§5.B): allowlist of exact names or Bun
+                                       //   globs. null/omitted = UNRESTRICTED (every branch eligible,
+                                       //   subject to cutoff/cap); [] = ONLY the default branch is
+                                       //   eligible; a leading '!' is rejected (no glob negation).
+                                       //   null and [] are DIFFERENT and both meaningful: [] makes the
+                                       //   policy CONFIGURED, which config_hash keys on — a POLICY-FREE
+                                       //   config must keep its PRE-FEATURE hash, so the hashed
+                                       //   projection omits both keys when neither is configured.
+  "excludeBranches": [],               // denylist, same syntax. DENY WINS over `branches`. The DEFAULT
+                                       //   branch is ALWAYS eligible regardless of either list
+                                       //   (always scanned); it records the counterfactual instead — a
+                                       //   policy_status on a SCANNED row is the default-branch
+                                       //   override, NOT an exclusion (§3).
   "cutoffDate": "2024-01-01",          // ISO date; ignore non-default branches with no commits since this
   "maxBranchesPerRepo": 25,
   "maxReposPerOrg": null,              // null = unlimited
@@ -184,8 +197,15 @@ Fail fast with actionable remediation if any of these fail:
    (REST) AND `resources.graphql` (branch discovery uses the separate GraphQL bucket)
    and adapt concurrency down if either is low. (`resources.search` is not consumed —
    discovery uses paginated REST, §5.A, not the search API — so it need not be tracked.)
+   AS BUILT: preflight RECORDS both figures and emits them on the `preflight` event; it
+   does NOT adapt concurrency — nothing reads the quota again. Live throttling is handled
+   reactively instead (§4's retry/pause budget and the requeue-throttle deferral), so the
+   quota is operator-facing information today, not a control input.
 8. Sufficient disk space for ephemeral clones.
-Emit "Preflight OK" plus, if resuming, existing row counts and last run id/time.
+   AS BUILT: no disk-space probe exists (preflight.ts checks tools/auth/scope evidence/env/
+   quota/registry reachability only), and nothing emits a "Preflight OK" line or prior-run
+   stats — the machine surface is the `preflight` JSONL event; resume context surfaces on
+   the `run` event. This item is spec-not-yet-built.
 
 ================================================================================
 3. DURABILITY & RESUMABILITY (SQLite is the source of truth)
@@ -219,7 +239,8 @@ check is filesystem-read-only by construction. (A plain readonly open of a WAL d
 the `-shm` wal-index and fails outright on an own WAL file copied without its sidecars; SQLite's
 `immutable=1` URI would also work but `file:` URI support is missing from some bun releases.) The predicate, first match
 wins: (1) no file, or a file with NO objects at all → ours to create (an empty database belongs to
-no one, and is also what our own interrupted create leaves behind) — but ONLY when no journal
+no one, and is also what our own interrupted create leaves behind) — unless its STAMP is newer
+than this build (refused on the image as incompatible), and ONLY when no journal
 could be hiding a schema: `immutable` reads the base file alone, and a WAL database whose writer
 crashed or is still running can hold its entire committed schema in `-wal` frames over a
 zero-object base, so a zero-object base beside a NON-EMPTY `-wal` (or rollback `-journal`) is
@@ -228,10 +249,17 @@ audit-named, and there are NO views or triggers — this tool creates neither, a
 execute a stranger's writes inside our migration) AND the present tables form a set this tool can
 actually leave on disk (every DDL batch is one transaction, so only the FULL audit set or the
 `--fresh`-preserved caches are reachable — a lone generic `errors` table with a plausible
-migration counter is neither; EXCEPTION: a stamped (v2..current) file with a PARTIAL set stays on the
-migrate-and-repair path — openReadOnly's documented remediation — when every present table carries
-the exact shape of the schema its STAMP names: full table_xinfo rows (names, types, NOT NULL,
-defaults, PK positions, hidden/generated kinds) plus rowid-ness and STRICT-ness, compared
+migration counter is neither; EXCEPTION: a stamped (v2..current) file with a PARTIAL or
+era-damaged set stays on the migrate-and-repair path — openReadOnly's documented remediation —
+when every present table carries the exact shape of SOME stamped schema version (v2..current),
+evaluated PER TABLE: a shape BELOW the stamp is externally-damaged-but-healable (the writable
+open repairs it shape-keyed), a RECOGNIZED shape ABOVE the stamp is the tool's own mid-upgrade
+crash remnant (the v2→v3 step commits current-shape CREATEs together with stamp 3) and
+fast-forwards (one partial set is nonetheless rejected downstream by the compatibility gate on
+both opens: `run_unit_head` missing while `runs` survives — see §3): full table_xinfo rows
+(names, types, NOT NULL, defaults, PK positions, hidden/generated kinds) plus rowid-ness,
+STRICT-ness, FOREIGN KEY structure grouped per constraint, PK/UNIQUE index structure (sort
+direction + collation; operator-created indexes tolerated) and AUTOINCREMENT, compared
 order-independently against a `:memory:` build of the schema so the reference cannot drift;
 matching NAMES alone would admit a foreign table wearing our labels) → ours; (3) anything else → REFUSE, untouched, with an actionable
 error naming the file. The internal-object exemption matches the literal `sqlite_` prefix
@@ -259,9 +287,37 @@ database the next open resumes from. Current chain: the additive v2→v3 step �
 and "not the default branch" are distinct report states); the step runs the idempotent new-shape
 CREATEs FIRST (a `--fresh` drop on a v2 database removes `run_unit_head` while the preserved caches
 keep the file non-empty, so the step must recreate missing tables before its ALTER), then stamps 3.
-A current-version (v3) database self-heals idempotently on open: re-run the new-shape CREATEs and
-re-apply the additive column set, so a file missing a table or the `is_default_branch` column is
-repaired rather than left a dead end.
+Then the v3→v4 step, a crash-atomic REBUILD rather than an ALTER (SQLite cannot ALTER a CHECK, and
+v4 widens the status CHECK to admit 'past-cap' and 'policy-excluded', and adds two status↔policy_status CHECKs): in ONE transaction it creates a scratch table
+carrying the v4 body, copies the v3 columns explicitly BY NAME, drops the old table, renames the
+scratch into place, re-fingerprints the result and re-checks FK integrity, and only then stamps 4.
+The step also FAILS every pre-existing RUNNING run — a migration-boundary rule — because a pre-v4
+run's scope may have left NO `run_unit_head` rows at all (pre-v4 never recorded past-cap rows, and
+a repo whose scans all errored wrote nothing): such a repo carries no NULL sentinel, so RESUMING
+that run under v4 could report authoritative provenance over an unknowable pre-v4 scope. The next
+invocation starts a fresh all-v4 run; the unchanged config_hash lets its completed work-queue
+units skip-as-current.
+Its three new columns (`policy_status`, `policy_matched_pattern`, `scanned_commit_date`) are NULL on
+backfilled rows BY CONSTRUCTION — a pre-v4 run recorded no branch policy and never persisted
+past-cap branches — so a NULL `scanned_commit_date` is the sentinel marking that run's scan
+scope UNVERIFIABLE (§7 `provenance`), never a claim that it excluded nothing. A STRUCTURAL
+shape classifier inspects an existing `run_unit_head` (columns via `table_xinfo`, CHECKs, FKs,
+indexes) up to TWICE before any migration: on the ownership preflight's deserialized base image
+BEFORE any writable open (an incompatibility visible there is refused with no SQLite handle ever
+opened on the target; a preflight rejection stops after that one inspection),
+and again on the writable connection — through any recovered WAL — before the WAL journal-mode
+flip and before `--fresh`, so an incompatible state committed only into `-wal` frames (a sibling
+build's v4 over a common v3 base) is still refused before it can be adopted or dropped, at the
+documented cost of sidecar recovery on that file.
+A current-version (v4) database self-heals idempotently on open, SHAPE-keyed: re-run the
+new-shape CREATEs, so a file missing a table or the `ix_ruh_loc` index is repaired rather than
+left a dead end, and a `run_unit_head` regressed to a RECOGNIZED predecessor era (the v2/v3 body
+— external damage) is healed by the same rebuild the v3→v4 migration uses, rows riding through —
+subject to the compatibility gates; in particular, `run_unit_head` missing while `runs` survives
+is rejected as INCOMPATIBLE (recreating an empty provenance table under surviving runs would
+silently un-scope their reports — the same gate the read path applies), and the v4 policy columns
+carry CHECKs and cannot be column-repaired — a v4 `run_unit_head` missing ONE of them matches no
+stamped era and is REJECTED, not silently patched (era-shape heal, never partial-v4 patching).
 `runs.tracked_packages` is persisted EXACTLY from config at run creation, so every run carries the
 correct, exact package set and the report invariant (`package_name IN json_each(tracked_packages)`)
 stays unqualified and sound. A run row carrying `tracked_packages='[]'` is explicitly NOT reportable
@@ -374,17 +430,69 @@ CREATE TABLE IF NOT EXISTS usage_findings (
 CREATE TABLE IF NOT EXISTS run_unit_head (
   run_id TEXT NOT NULL REFERENCES runs(run_id),
   organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
-  commit_sha TEXT NOT NULL DEFAULT '',  -- '' for skipped-cutoff branches (never scanned)
+  commit_sha TEXT NOT NULL DEFAULT '',  -- '' for every NON-scanned disposition (never scanned)
   status TEXT NOT NULL DEFAULT 'scanned'
-    CHECK (status IN ('scanned','skipped-cutoff')),  -- per-run, immutable: lets the report
-                                       -- count scanned vs cutoff-skipped branches for THIS run
-                                       -- alone (work_queue is mutable and cross-run)
+    CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap')),  -- per-run,
+                                       -- immutable: lets the report count each disposition for THIS
+                                       -- run alone (work_queue is mutable and cross-run).
+                                       -- 'past-cap' (v4): eligible but past maxBranchesPerRepo —
+                                       -- recorded for report VISIBILITY only; its work_queue row is
+                                       -- untouched, so a later cap-order shift promotes it without a
+                                       -- rescan. 'policy-excluded' (v4): dropped by branch allow/deny.
+                                       -- The four are DISJOINT — status alone identifies the
+                                       -- disposition; no read surface needs a second column to tell
+                                       -- a policy exclusion from a genuine cutoff skip. It is named
+                                       -- to match the live JSONL 'skip-policy' unit action.
   is_default_branch INTEGER,           -- tri-state 1/0/NULL (v3): whether this branch was the
                                        -- repo's default branch at discovery time (§5.B).
                                        -- NULL = unknown (pre-v3 rows); the report renders NULL
                                        -- as its own state — never coerce it to 0
+  policy_status TEXT                   -- v4, branch allow/deny: NULL = policy said nothing.
+    CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+                                       -- LOAD-BEARING: NOT NULL does NOT mean "excluded". It names
+                                       -- WHICH rule decided, and is REQUIRED on a 'policy-excluded'
+                                       -- row and FORBIDDEN on 'skipped-cutoff'/'past-cap' (both
+                                       -- enforced by CHECK); on a 'scanned' row it is the COUNTERFACTUAL carried by a
+                                       -- default branch policy would have dropped but which is
+                                       -- scanned anyway (the default is always scanned). Read surfaces MUST decide via
+                                       -- BOTH status and policy_status (scripts/policyDisposition.ts
+                                       -- is the one definition), never policy_status alone.
+  policy_matched_pattern TEXT,         -- v4: the exact configured pattern that caused an
+                                       -- 'excluded-by-deny'; NULL for every other disposition
+                                       -- (an allow-list MISS names no single pattern)
+  scanned_commit_date TEXT,            -- v4. On a SCANNED row: the committed date of the commit
+                                       -- ACTUALLY scanned (the clone's real HEAD on the clone
+                                       -- fallback, §5.C — which may differ from the discovered
+                                       -- head). On every NON-scanned row (commit_sha=''): the
+                                       -- DISCOVERED head's date, so a skipped/excluded/past-cap
+                                       -- branch still records how recent it was. NULL only on rows
+                                       -- backfilled by the v3→v4 migration — which is what makes a
+                                       -- run's scan-scope provenance unverifiable (§7 `provenance`)
+  CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+                                       -- v4, TABLE-level: a deny MUST name its causing pattern.
+                                       -- Only IS NOT NULL is expressible here, so '' still passes;
+                                       -- the write chokepoint (assertRunUnitHeadInvariants) rejects
+                                       -- the empty pattern, and also enforces the converse — every
+                                       -- NON-deny disposition carries policy_matched_pattern NULL
+  CHECK (status <> 'policy-excluded' OR policy_status IS NOT NULL),
+                                       -- v4, TABLE-level: a policy exclusion MUST name the rule that
+                                       -- dropped it. The one policy-bearing status whose verdict
+                                       -- could be missing — and the read guard's null-policy early
+                                       -- return would wave it straight through
+  CHECK (status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL),
+                                       -- v4, TABLE-level: policy runs BEFORE cutoff/cap, so those
+                                       -- dispositions are only ever reached by policy-ELIGIBLE
+                                       -- branches and can never carry a verdict. 'scanned' is
+                                       -- deliberately unconstrained: it is NULL for the ordinary row
+                                       -- and NON-null for the default-branch override's
+                                       -- counterfactual (§3) — the reason policy_status survives as
+                                       -- its own column instead of collapsing into status
   PRIMARY KEY (run_id, organization, repository, branch)
 );
+-- NOTE: these five CHECKs are the v4 IDENTITY. db.ts::normalizeCheck fingerprints the exact token
+-- set to tell ours-v4 from a sibling build's v4 (adopting a foreign one, or destroying it under
+-- --fresh, are both unacceptable) — so an implementation that omits or reworks any of them produces
+-- a shape this tool REFUSES, not a compatible one.
 CREATE TABLE IF NOT EXISTS api_cache (
   method TEXT NOT NULL,                -- 'GET' (REST). GraphQL branch-discovery is never
                                        -- cached (always live, §resumability), so no 'POST' rows
@@ -440,12 +548,36 @@ Resumability rules:
   remote (no longer a live ref) or fell past `maxBranchesPerRepo` (only the most-recent N
   non-default heads are kept; the repo's DEFAULT branch is always processed, §5.B) — is
   neither re-evaluated nor re-scanned this run; it simply retains its
-  prior `done` state and historical findings/snapshot — this is intended, not an error (its
-  usage is genuinely stale), and it just isn't refreshed into new runs. A still-live non-default branch
+  prior `done` WORK-QUEUE state and its historical findings — this is intended, not an error
+  (its usage is genuinely stale), and it just isn't refreshed into new runs. What "retains" does
+  NOT mean is "this run says nothing about it", and the two cases differ: a PAST-CAP branch DOES
+  get a FRESH `run_unit_head` row this run (`status='past-cap'`, commit_sha='') recorded purely
+  for report VISIBILITY — the work queue is left untouched, so a later cap-order shift promotes it
+  without a re-scan; a DELETED branch is not surfaced at all, and stale-row reconciliation prunes any row
+  a prior resume-invocation of THIS run left for it (earlier runs' rows are immutable and stay). That
+  prune is REPO-SCOPED, and deliberately so: it runs inside the per-repo path, so it can only speak for
+  repos this run re-discovered AND kept. A repo that dropped out of the kept set between invocations —
+  deleted, renamed, newly archived/fork-filtered, or displaced past `maxReposPerOrg` — is never
+  revisited, so ALL its prior rows survive. The reconciliation guarantee is therefore "a re-discovered
+  repo's rows match its live branches", never "the run's rows match the live estate".
+  A still-live non-default branch
   whose head fell BEFORE `cutoffDate` is DIFFERENT: §5.B DOES surface it and records it THIS
   run as `skipped-cutoff` in `run_unit_head` (commit_sha=''), so it stays per-run
   reproducible (§7's `branchesSkippedByCutoff`) — it is NOT left in this retain-prior-state
-  path.
+  path. A THIRD retain-prior-state case exists on RESUME (same-name stale head): a still-live
+  branch whose head ADVANCED between invocations and whose re-scan then ERRORS or THROTTLES
+  writes no row this attempt, so reconciliation's name-keyed prune retains the row from the earlier
+  invocation — WHATEVER its disposition, pinned to the OLDER evaluation — and the run reports
+  the branch under that PRIOR disposition. A prior scanned row reads "scanned at the old head";
+  a prior NON-scanned row (e.g. `skipped-cutoff` recorded when the old head sat below the
+  cutoff) keeps the branch in its old bucket even though the advanced head became eligible.
+  Like the cases above this is intended, not an error: each retained row is per-run
+  reproducible and truthful about what its own invocation decided (a scanned row's commit_sha
+  is "the head it reported", never "the live head" — the report-head invariant below; a
+  non-scanned row's commit_sha='' and discovered-head date describe the older evaluation), and
+  the unit is left `error`/`pending` so the next run refreshes it. A head-SHA-aware prune is deliberately NOT used: it would delete
+  the clone-fallback path's legitimate rows (commit_sha = the clone's real HEAD, which may
+  differ from the discovered head by design, §5.C) and the commit_sha='' sentinels.
 - Report-head invariant (co-designed with the skip predicate): as each unit is
   processed (scanned OR skipped-as-current), the run upserts `run_unit_head(run_id, org,
   repo, branch, commit_sha=the head it reported)`. Findings accumulate across commits
@@ -518,7 +650,10 @@ Resumability rules:
   any lock-taking statement), NO journal_mode pragma, NO DDL, NO migration, no directory
   creation. A database whose `user_version` is older than the tool refuses with an
   actionable "run `bun run audit` once to migrate" error (reads never migrate); newer
-  refuses with "upgrade the tool"; missing tables and the v3 is_default_branch column are detected up front. Note a
+  refuses with "upgrade the tool"; ownership and the structural `run_unit_head` classifier
+  re-run up front (a sibling/foreign shape refuses as incompatible; a recognized
+  predecessor-era shape — e.g. missing the v4 policy columns — advises "run `bun run audit`
+  once to repair"; missing tables are named individually). Note a
   readonly WAL open may still create `-wal`/`-shm` sidecars beside the (path-contained)
   database file — the seam is no-DDL/no-write, not literally zero-filesystem-effect.
 
@@ -530,6 +665,13 @@ work bounded by `concurrency.*`:
 - one subagent per org (enumerate repos/branches),
 - one per repo (branch lists, cutoff filter, candidate files),
 - one per branch (fetch manifests/lockfiles, scan usage).
+AS BUILT — this is build strategy, not a description of the shipped runtime: all three
+levels are iterated SEQUENTIALLY. The only `concurrency.*` value read is `repositories`,
+and it is not a per-repo fan-out either — it is the GLOBAL in-flight cap on gh requests
+(github.ts's semaphore). `concurrency.organizations` and `concurrency.branches` are thus
+validated, required, and never consumed: they are this section's fan-out, unbuilt. Whether
+to implement it or drop the two dead keys is an OPEN decision; until it is made, nothing
+may describe them as active controls (config.schema.json marks both RESERVED).
 CRITICAL: Subagents COMPUTE and return structured JSON; a SINGLE coordinator
 performs all SQLite writes (single-writer pattern). Do not bet on multi-process WAL
 writer safety. Additionally, delegate genuinely NON-DETERMINISTIC comprehension to a
@@ -540,9 +682,10 @@ If subagents are unavailable, run the SAME workflow sequentially in the same ord
 but keep code structured (pure functions) so it could parallelize later.
 
 RATE-LIMIT & THROTTLING (all gh calls go through the github.ts wrapper, so this is
-enforced in one place): the `concurrency.*` fan-out (e.g. 3 orgs × 6 repos × 4 branches)
-can trip GitHub's rate limits, so cap TOTAL in-flight `gh` processes with one GLOBAL
-semaphore (not just per-level). The wrapper reads the relevant response headers
+enforced in one place): a parallel `concurrency.*` fan-out (e.g. 3 orgs × 6 repos × 4
+branches — the §4 STRATEGY above, not the shipped sequential runtime) could trip GitHub's
+rate limits, so the wrapper caps TOTAL in-flight `gh` processes with one GLOBAL semaphore
+(sized by `concurrency.repositories`, the only concurrency.* key the runtime reads). The wrapper reads the relevant response headers
 (`x-ratelimit-remaining`/`x-ratelimit-reset`/`Retry-After`/`x-github-sso`) via `gh api -i`
 (as §2.3/§3 already do). Two distinct retryable throttles, handled the same way (the
 wrapper WAITS through the computed window and RETRIES the request IN PLACE, up to its
@@ -580,7 +723,9 @@ plan-mode owner-discovery escape stays fatal) but with different wait computatio
   header block for `x-ratelimit-*`/`Retry-After` and the trailing JSON for the body,
   never relying on gh `--paginate`/`--slurp` (which interleave the two). Track the primary
 `core` vs `graphql` buckets separately (§2.7) and pause a bucket when its remaining quota
-nears zero.
+nears zero. AS BUILT: bucket-aware tracking exists, but pausing is REACTIVE only — the
+wrapper honors Retry-After/reset waits inside the §4 retry/pause budget and then defers
+work via requeue-throttle; nothing watches `remaining` to pause BEFORE a limit is hit.
 
 ================================================================================
 5. WORKFLOW
@@ -611,11 +756,27 @@ A. Resolve the effective owner list per the NORMATIVE algorithm in §1 (base set
    `pushed_at` DESC (nulls last), and TAKE the first N when maxReposPerOrg is finite (all
    when null). The REST shape is snake_case (`pushed_at`, `archived`, `fork`,
    `default_branch` as a flat STRING) — map it into the one internal shape the rest of the
-   workflow uses. maxReposPerOrg applies per OWNER (incl. the personal namespace).
+   workflow uses, but DELIBERATELY DROP `default_branch`: this listing is a DIFFERENT (older)
+   EPOCH than §5.B branch discovery — the whole owner is listed up front, then each repo's
+   heads are discovered one at a time — so carrying its default-branch name forward would let
+   a default renamed in that window be treated as non-default, and under branch policy the
+   always-eligible exemption would then miss the repo's REAL default and silently exclude it.
+   §5.B resolves the default instead. There is NO REST fallback: a fallback would reintroduce
+   the stale epoch at exactly the moment the authoritative source is unavailable.
+   maxReposPerOrg applies per OWNER (incl. the personal namespace).
 B. Discover & prioritize branches: via `gh api graphql` querying
    refs(refPrefix:"refs/heads/", first:100, after:$endCursor) with
    target{...on Commit{committedDate,oid,tree{oid}}} and `pageInfo{hasNextPage endCursor}`
-   (the `tree.oid` is the commit's ROOT TREE SHA, needed by §5.C's git/trees call).
+   (the `tree.oid` is the commit's ROOT TREE SHA, needed by §5.C's git/trees call), PLUS
+   `defaultBranchRef{name}` on the SAME `repository` node — so the default branch is resolved
+   from the same snapshot as the heads, at no extra request. The two halves are validated
+   TOGETHER and fail closed: `defaultBranchRef` ABSENT from a page is malformed (we asked for
+   it) and is NOT the same as an explicit `null`, which legitimately means "this repo has no
+   commits"; the name is re-asserted on EVERY page (a mid-pagination change means the
+   classification authority itself moved); a non-null default MUST name one of the discovered
+   heads; and a null default paired with any head is rejected. An incoherent snapshot becomes
+   a discovery FAILURE (an errors row — loud, and the repo is retained, never reconciled)
+   rather than a silently mis-planned repo.
    GitHub's `RefOrderField` cannot order heads by commit date server-side (only
    ALPHABETICAL, or TAG_COMMIT_DATE for tags), so ENUMERATE ALL PAGES — a repo with >100
    branches would otherwise silently lose branches. As in §5.A, PAGINATE IN TYPESCRIPT
@@ -626,17 +787,38 @@ B. Discover & prioritize branches: via `gh api graphql` querying
    entirely so the variable defaults to null (GraphQL `after: null` = first page; do NOT
    pass an empty string); on later calls pass the returned non-null cursor. Read each page's rate-limit headers (§4), concatenate
    `data.repository.refs.nodes`, and continue while `pageInfo.hasNextPage`. ALSO check each page BODY for
-   `errors[].type == 'RATE_LIMITED'` (§4 — GraphQL throttles arrive as HTTP 200). THEN
-   sort client-side by committedDate DESC (most-recent FIRST), filter out branches whose
+   `errors[].type == 'RATE_LIMITED'` (§4 — GraphQL throttles arrive as HTTP 200). Validate
+   each head's `committedDate` as a real ISO instant, not merely a non-empty string: it is
+   UNTRUSTED input that steers selection (the cutoff compares its first ten characters
+   LEXICALLY), so a malformed value would silently misclassify rather than fail — and note
+   `Date.parse` is NOT that check, since it NORMALIZES hour 24 to the next day and rolls
+   Feb 30 over to March 2 instead of rejecting either.
+   THEN sort client-side by committedDate DESC (most-recent FIRST).
+   APPLY BRANCH POLICY FIRST — BEFORE the cutoff filter and BEFORE the cap. This ordering is
+   load-bearing, not incidental: policy runs over the raw head set, and only the surviving
+   (policy-eligible) heads are then cutoff-filtered and capped. Were the cap applied first, a
+   DENIED recent branch would consume a cap slot an ALLOWED older branch could have used, so a
+   branch the operator explicitly asked for could be silently dropped by a branch they
+   explicitly excluded. `excludeBranches` (deny) is evaluated before `branches` (allow) — deny
+   wins — and a policy-dropped NON-default head is recorded for THIS run as a
+   `status='policy-excluded'` row carrying the deciding `policy_status` (its own disposition,
+   distinct from a genuine cutoff skip; commit_sha=''), and enqueued
+   `skipped` like a cutoff skip (that queue models "no scan needed", not why). Policy exclusion NEVER applies to the default branch (below).
+   A malformed glob that throws at match time is FATAL, never "no match" — a denied branch must
+   never be silently scanned.
+   THEN, over the policy-eligible set only: filter out branches whose
    last commit is BEFORE cutoffDate (do not inspect at all — record them as `work_queue`
    status `skipped` AND upsert a `run_unit_head` row for THIS run with
-   `status='skipped-cutoff'`, commit_sha='', so §7's branchesSkippedByCutoff is per-run
+   `status='skipped-cutoff'` and `policy_status` NULL, commit_sha='', so §7's
+   branchesSkippedByCutoff — which counts GENUINE cutoff only — is per-run
    reproducible), and cap at maxBranchesPerRepo. EXCEPTION: the repo's DEFAULT branch
-   (known from §5.A discovery) is ALWAYS eligible — exempt from both the cutoff filter
+   (resolved by §5.B from the SAME snapshot as these heads — never from §5.A's older REST
+   listing) is ALWAYS eligible — exempt from both the cutoff filter
    and the cap (the cap counts the remaining branches, so a repo can yield cap+1
    eligible units) — the default-branch view the report's headline metrics depend on
    must never be silently absent; a default branch not among the live heads admits
-   nothing. Record `is_default_branch` (1/0, §3) on every `run_unit_head` upsert —
+   nothing (and §5.B rejects that snapshot outright, so a live run never plans one).
+   Record `is_default_branch` (1/0, §3) on every `run_unit_head` upsert —
    discovery always knows it, so live runs never write NULL. The `oid` is the live head the §3 skip predicate compares against —
    obtaining it here costs zero extra requests.
 C. Locate manifests read-only. Build the API path in TypeScript (github.ts) —
@@ -948,7 +1130,10 @@ Entrypoints:
     #   unknown/valueless arguments are rejected, never silently defaulted
     # --html: ALSO render one HTML dossier per tracked package + index into <outputDir>/xray/
   bun run scripts/export.ts [--config <path>] [--run-id <id>] [--raw] [--help]
-    # run-scoped CSV/JSONL snapshots of the four audit tables into <outputDir>/xray/;
+    # run-scoped CSV/JSONL snapshots of the FIVE audit tables into <outputDir>/xray/
+    #   (dependency_findings, package_api_surface, run_unit_head, runs, usage_findings —
+    #    run_unit_head is exported so the per-run branch dispositions, incl. the branch
+    #    allow/deny columns, are inspectable outside the report; see EXPORTS.md);
     #   --raw: forensic full-table dump (every row, raw- prefixed)
   bun run scripts/compare.ts <runIdA> <runIdB> [--config <path>] [--help]
     # deterministic run-to-run usage diff (two COMPLETED run ids) — one JSON line on stdout
@@ -1151,6 +1336,9 @@ it, §5.E.) A run with no findings still emits the full shape with empty arrays 
 summary.
 ```jsonc
 {
+  "formatVersion": 2,                            // XRAY_FORMAT_VERSION — the report/export/HTML
+                                                 //   artifact-set version. REQUIRED, and
+                                                 //   INDEPENDENT of the compare format version
   "runId": "...",
   "generatedAt": "...",                          // COALESCE(runs.completed_at, runs.started_at) of
                                                  //   the reported run — a persisted SQLite value,
@@ -1192,13 +1380,49 @@ summary.
                                                  //   organization/repository/branch (repo/branch-scoped) or
                                                  //   packageName/version (§5.E per-version introspection)
   "summary": { "organizationsScanned":0,"repositoriesScanned":0,"branchesScanned":0,
-               "branchesSkippedByCutoff":0,"totalDependencyFindings":0,"totalUsageFindings":0 }
+               "branchesSkippedByCutoff":0,"branchesExcludedByPolicy":0,"branchesPastCap":0,
+               "branchesErrored":0,"totalDependencyFindings":0,"totalUsageFindings":0 },
+  "scanScope": { "excludedByDeny":0,"excludedByAllow":0,"defaultBranchPolicyOverrides":0,
+                 "policyBranches":[ ... ],"provenance":"complete" }  // branch allow/deny diagnostics;
+                                                 //   provenance: 'complete' | 'pre-upgrade' —
+                                                 //   'complete' only for a run with ≥1 recorded head,
+                                                 //   all carrying a non-null scanned_commit_date;
+                                                 //   'pre-upgrade' when any head's date is NULL (a
+                                                 //   v3→v4-migrated run, §3's sentinel) OR the run
+                                                 //   recorded zero heads — the scope counts may then
+                                                 //   understate what that run actually evaluated
 }
 ```
 Summary derivation — ALL per-run from the IMMUTABLE `run_unit_head` slice for the reported
 run (NEVER from the mutable work_queue, which is cross-run): `branchesScanned` =
 COUNT(*) WHERE run_id=R AND status='scanned'; `branchesSkippedByCutoff` = COUNT WHERE
-run_id=R AND status='skipped-cutoff'; `repositoriesScanned` =
+run_id=R AND status='skipped-cutoff' — GENUINE cutoff only, because a policy exclusion carries
+its OWN status and can never be folded in by an under-specified filter;
+`branchesExcludedByPolicy` = COUNT WHERE status='policy-excluded'; `branchesPastCap` =
+COUNT WHERE status='past-cap'. Those four counts partition the RECORDED rows exactly once
+each. `branchesErrored` counts DISTINCT branches carrying a scope='scan' errors[] entry that
+hold NO row (a scan that fails BEFORE the scanned-row upsert writes no disposition row; within
+a single fresh-scan invocation, a step failing AFTER the row committed — the success-log write
+or the work-queue 'done' update — can leave an errors[] entry beside the row, and the no-row
+rule then keeps that branch out of branchesErrored while its row counts it as scanned) — read
+it as exactly that, since on a RESUMED run it diverges from "every branch whose scan errored"
+in both directions (see scripts/report.ts). Together the five account for every branch that
+reached a TERMINAL outcome — an equality on a single-invocation run, an upper bound on a
+resumed one. A THROTTLE-REQUEUED branch is deferred, not terminal: it writes neither a row nor
+a NEW error, and with no prior same-run error it is in no count (an earlier invocation's
+append-only error still counts it — the resumed-run divergence above). Decide policy dispositions ONLY via both status and policy_status
+(scripts/policyDisposition.ts); `policy_status IS NOT NULL` alone is never a proxy for
+"excluded" (a scanned default branch carries the counterfactual). The guard validates the
+WHOLE row, not just those two columns: `is_default_branch` is load-bearing in BOTH
+directions — a 'policy-excluded' row must be a definite non-default (the default is always
+scanned, so it can never be an exclusion) and a scanned policy-bearing row must be the
+known default — `policy_matched_pattern` must be a REAL deny pattern (non-empty, never on
+a non-deny), `commit_sha` must agree with `status` (only a scanned row pins one — the
+findings join's soundness), and unknown status/policy tokens are refused outright. These
+rules are read-time only, and the default⇒scanned direction is scoped to NATIVE rows
+(non-NULL scanned_commit_date): a SQL CHECK a real pre-v4 row might violate would fail an
+UPGRADE to defend against a forged row — the wrong trade; a read-time refusal costs one
+report. `repositoriesScanned` =
 COUNT(DISTINCT organization||'/'||repository) and `organizationsScanned` =
 COUNT(DISTINCT organization) — both over run_id=R AND status='scanned' rows (matching
 branchesScanned semantics; a repo/org whose every branch was cutoff-skipped is NOT

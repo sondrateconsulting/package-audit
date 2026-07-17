@@ -1,5 +1,5 @@
-// ciExportFixture.ts — generate a SYNTHETIC export fixture for the CI recipe job (CT8).
-// Builds an in-memory audit database from made-up data (publish hygiene P4: nothing here
+// ciExportFixture.ts — generate a SYNTHETIC export fixture for the CI recipe job.
+// Builds an in-memory audit database from made-up data (publish hygiene: nothing here
 // derives from any real estate), then writes the real run-scoped exports into ./output/xray/
 // through the production exportRun — the exact artifacts the README's "Analyze the exports"
 // recipes read. CI then executes every recipe VERBATIM against these files with a SHA-pinned
@@ -26,7 +26,10 @@ export function generateFixtureExports(outputDir: string): { runId: string } {
     ];
     for (const u of units) {
       const { isDefault, ...unit } = u;
-      db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: isDefault });
+      db.upsertRunUnitHead({
+        runId, ...unit, status: "scanned", isDefaultBranch: isDefault,
+        policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z",
+      });
       db.upsertDependencyFinding({
         runId, ...unit, dateFetched: T, packageName: "expo", dependencyKey: "expo",
         dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 11,
@@ -42,6 +45,24 @@ export function generateFixtureExports(outputDir: string): { runId: string } {
         snippet: 'import { registerRootComponent } from "expo";', foundAt: T,
       });
     }
+    // Policy-bearing heads (no findings — an excluded/deferred branch is never scanned): a deny
+    // exclusion with a causing pattern, an allow-list miss (NULL pattern), and a past-cap deferral.
+    // These give the run_unit_head export + its recipe real branch-policy rows to read in CI.
+    db.upsertRunUnitHead({
+      runId, organization: "acme", repository: "web", branch: "wip/experiment", commitSha: "",
+      status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny",
+      policyMatchedPattern: "wip/*", scannedCommitDate: "2025-06-01T12:00:00Z",
+    });
+    db.upsertRunUnitHead({
+      runId, organization: "acme", repository: "mobile", branch: "sandbox", commitSha: "",
+      status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-allow",
+      policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z",
+    });
+    db.upsertRunUnitHead({
+      runId, organization: "acme", repository: "mobile", branch: "archive-2019", commitSha: "",
+      status: "past-cap", isDefaultBranch: false, policyStatus: null,
+      policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z",
+    });
     // whole-module usage, a CLI invocation, and a HOSTILE snippet (formula + comma + quote)
     db.upsertUsageFinding({
       runId, organization: "acme", repository: "web", branch: "main",

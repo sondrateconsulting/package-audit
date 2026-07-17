@@ -1,9 +1,10 @@
 import { expect, test, describe, afterAll, spyOn } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database } from "bun:sqlite";
 import { AuditDb, type RunRecord } from "./db.ts";
+import { downgradeToFaithfulV2 } from "./testFixtures.ts";
 import { ArgsError } from "./args.ts";
 import {
   EXPORT_HELP, EXPORT_REGISTRY, EXPORT_TABLE_NAMES, RAW_EXPORT_WARNING,
@@ -74,7 +75,7 @@ function seedTwoRuns(db: AuditDb): { oldRun: RunRecord; newRun: RunRecord } {
   };
   const { runId: r1 } = db.startRun(input);
   const oldUnit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "aaa111" };
-  db.upsertRunUnitHead({ runId: r1, ...oldUnit, status: "scanned", isDefaultBranch: true });
+  db.upsertRunUnitHead({ runId: r1, ...oldUnit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
   db.upsertDependencyFinding({
     runId: r1, ...oldUnit, dateFetched: T1, packageName: "expo", dependencyKey: "expo",
     dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 3,
@@ -105,7 +106,7 @@ function seedTwoRuns(db: AuditDb): { oldRun: RunRecord; newRun: RunRecord } {
   Bun.sleepSync(2); // distinct started_at, so latestReportableRun deterministically picks run 2
   const { runId: r2 } = db.startRun(input);
   const newUnit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "bbb222" };
-  db.upsertRunUnitHead({ runId: r2, ...newUnit, status: "scanned", isDefaultBranch: true });
+  db.upsertRunUnitHead({ runId: r2, ...newUnit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
   db.upsertDependencyFinding({
     runId: r2, ...newUnit, dateFetched: T2, packageName: "expo", dependencyKey: "expo",
     dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 5,
@@ -138,6 +139,7 @@ const config = (sqlitePath: string, outputDir: string): Config => ({
   cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
   includeArchived: false, includeForks: false, includePersonalNamespace: false,
   maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],
+  branches: null, excludeBranches: [],
   packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
   paths: { sqlitePath, outputDir },
 });
@@ -177,7 +179,7 @@ describe("parseExportArgs", () => {
 });
 
 describe("EXPORT_REGISTRY ↔ live schema sync (the runtime half of the Equal<> type sync)", () => {
-  test("registry keys cover exactly the four export tables", () => {
+  test("registry keys cover exactly the five export tables", () => {
     expect([...EXPORT_TABLE_NAMES].map(String).sort()).toEqual(Object.keys(EXPORT_REGISTRY).sort());
   });
 
@@ -196,8 +198,10 @@ describe("EXPORT_REGISTRY ↔ live schema sync (the runtime half of the Equal<> 
           expect(`${table}.${n}@${idx}`).not.toBe(`${table}.${n}@-1`);
           from = idx + 1;
         }
-        // the ONLY declared columns not exported are the AUTOINCREMENT ids (storage detail)
-        expect(declared.filter((n) => !names.includes(n))).toEqual(table === "runs" ? [] : ["id"]);
+        // the ONLY declared columns not exported are the AUTOINCREMENT ids (storage detail). runs and
+        // run_unit_head have no surrogate id (composite PKs), so ALL their columns are exported.
+        const noId = table === "runs" || table === "run_unit_head";
+        expect(declared.filter((n) => !names.includes(n))).toEqual(noId ? [] : ["id"]);
         // ORDER BY keys are registry columns (the chain the contract documents)
         for (const k of orderBy) expect(names).toContain(k);
       }
@@ -227,7 +231,7 @@ describe("exportRun — run-scoped snapshot (default)", () => {
     expect(runs[0]!["tracked_packages"]).toBe('["expo"]'); // TEXT column exported verbatim
 
     const summary = JSON.parse(result.line) as Record<string, unknown>;
-    expect(summary).toEqual({ event: "export-summary", runId: newRun.runId, raw: false, artifacts: 8, swept: [] });
+    expect(summary).toEqual({ event: "export-summary", runId: newRun.runId, raw: false, artifacts: 10, swept: [] });
     db.close();
   });
 
@@ -252,11 +256,12 @@ describe("exportRun — run-scoped snapshot (default)", () => {
     const out = nextOutputDir();
     const { out: stdout, err } = await capture(() => exportRun(db, newRun, out, { raw: false }));
     const events = stdout.split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
-    expect(events).toHaveLength(8);
+    expect(events).toHaveLength(10);
     expect(events.every((e) => e["event"] === "export")).toBe(true);
     expect(events.map((e) => `${e["table"]}.${e["format"]}`)).toEqual([
       "dependency_findings.csv", "dependency_findings.jsonl",
       "package_api_surface.csv", "package_api_surface.jsonl",
+      "run_unit_head.csv", "run_unit_head.jsonl",
       "runs.csv", "runs.jsonl",
       "usage_findings.csv", "usage_findings.jsonl",
     ]);
@@ -314,6 +319,85 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     }
     db.close();
   });
+
+  // Seed ONE completed run whose run_unit_head carries all four dispositions + the nullable policy
+  // columns, one deny pattern shaped like a spreadsheet formula. Exercises the new export table's
+  // row output, ORDER BY, nullable→empty/JSON-null mapping, typed-number cells, and CSV formula defense.
+  function seedPolicyHeads(db: AuditDb): RunRecord {
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const D = "2025-06-01T12:00:00Z";
+    const base = { runId, organization: "org-a", repository: "svc", scannedCommitDate: D };
+    // deny-excluded with a formula-shaped pattern (branch sorts first)
+    db.upsertRunUnitHead({ ...base, branch: "feature-x", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "=cmd|calc" });
+    // scanned default (policy-clean)
+    db.upsertRunUnitHead({ ...base, branch: "main", commitSha: "aaa111", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null });
+    // allow-list miss (pattern is NULL → empty CSV / JSON null)
+    db.upsertRunUnitHead({ ...base, branch: "stale", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null });
+    // past the per-repo cap (never carries policy)
+    db.upsertRunUnitHead({ ...base, branch: "wip", commitSha: "", status: "past-cap", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null });
+    // A GENUINE cutoff skip — the fourth disposition. Without it the golden proved only three, while its
+    // header claimed four: policy exclusions moved to their own status and took the last skipped-cutoff
+    // row with them.
+    db.upsertRunUnitHead({ ...base, branch: "ancient", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null });
+    db.completeRun(runId);
+    return db.getRun(runId)!;
+  }
+
+  test("run_unit_head.csv: every disposition, nullable→empty, typed-number cells, formula defense on the deny pattern", async () => {
+    const db = mem();
+    const run = seedPolicyHeads(db);
+    const out = nextOutputDir();
+    await capture(() => exportRun(db, run, out, { raw: false }));
+    const id = run.runId;
+    const D = "2025-06-01T12:00:00Z";
+    const header = "run_id,organization,repository,branch,commit_sha,status,is_default_branch,policy_status,policy_matched_pattern,scanned_commit_date";
+    // rows in ORDER BY (run_id, organization, repository, branch); '=cmd|calc' → literal apostrophe
+    // prefix (formula defense); is_default_branch is a typed number (never prefixed); NULLs are empty.
+    const ancient = `${id},org-a,svc,ancient,,skipped-cutoff,0,,,${D}`; // the GENUINE cutoff skip
+    const feature = `${id},org-a,svc,feature-x,,policy-excluded,0,excluded-by-deny,'=cmd|calc,${D}`;
+    const main = `${id},org-a,svc,main,aaa111,scanned,1,,,${D}`;
+    const stale = `${id},org-a,svc,stale,,policy-excluded,0,excluded-by-allow,,${D}`;
+    const wip = `${id},org-a,svc,wip,,past-cap,0,,,${D}`;
+    expect(readXray(out, "run_unit_head.csv")).toBe([header, ancient, feature, main, stale, wip].join("\r\n") + "\r\n");
+    db.close();
+  });
+
+  test("run_unit_head.jsonl: registry key order, byte-faithful pattern (no defense apostrophe), JSON null/number", async () => {
+    const db = mem();
+    const run = seedPolicyHeads(db);
+    const out = nextOutputDir();
+    await capture(() => exportRun(db, run, out, { raw: false }));
+    const content = readXray(out, "run_unit_head.jsonl");
+    const lines = content.split("\n").filter((l) => l.length > 0);
+    expect(lines).toHaveLength(5);
+    // exact feature-x line (2nd by branch order): keys in registry order, is_default_branch a JSON
+    // number, pattern byte-faithful. The 1st line is the genuine cutoff skip, asserted below.
+    expect(lines[1]).toBe(
+      JSON.stringify({
+        run_id: run.runId, organization: "org-a", repository: "svc", branch: "feature-x",
+        commit_sha: "", status: "policy-excluded", is_default_branch: 0,
+        policy_status: "excluded-by-deny", policy_matched_pattern: "=cmd|calc", scanned_commit_date: "2025-06-01T12:00:00Z",
+      }),
+    );
+    // The GENUINE cutoff skip: same NULL policy columns as a scanned row, distinguished by status alone.
+    expect(lines[0]).toBe(
+      JSON.stringify({
+        run_id: run.runId, organization: "org-a", repository: "svc", branch: "ancient",
+        commit_sha: "", status: "skipped-cutoff", is_default_branch: 0,
+        policy_status: null, policy_matched_pattern: null, scanned_commit_date: "2025-06-01T12:00:00Z",
+      }),
+    );
+    // no formula-defense apostrophe in JSONL; the scanned default carries JSON null policy columns
+    expect(content).toContain('"policy_matched_pattern":"=cmd|calc"');
+    expect(content).toContain('"branch":"main","commit_sha":"aaa111","status":"scanned","is_default_branch":1,"policy_status":null,"policy_matched_pattern":null');
+    for (const line of lines) {
+      expect(Object.keys(JSON.parse(line) as object)).toEqual(EXPORT_REGISTRY.run_unit_head.columns.map((c) => c.name));
+    }
+    db.close();
+  });
 });
 
 describe("exportRun --raw (forensic full-table dump)", () => {
@@ -332,6 +416,7 @@ describe("exportRun --raw (forensic full-table dump)", () => {
       "manifest.json",
       "raw-dependency_findings.csv", "raw-dependency_findings.jsonl",
       "raw-package_api_surface.csv", "raw-package_api_surface.jsonl",
+      "raw-run_unit_head.csv", "raw-run_unit_head.jsonl",
       "raw-runs.csv", "raw-runs.jsonl",
       "raw-usage_findings.csv", "raw-usage_findings.jsonl",
     ]);
@@ -349,7 +434,7 @@ describe("exportRun --raw (forensic full-table dump)", () => {
     expect(manifest.runId).toBe(newRun.runId);
 
     expect(err).toContain("RAW EXPORT");
-    expect(JSON.parse(result.line)).toMatchObject({ event: "export-summary", raw: true, artifacts: 8 });
+    expect(JSON.parse(result.line)).toMatchObject({ event: "export-summary", raw: true, artifacts: 10 });
     db.close();
   });
 });
@@ -369,11 +454,12 @@ describe("bundle integration (xray/ containment, manifest, sweep)", () => {
       runId: string; artifacts: Array<{ path: string; kind: string }>;
     };
     expect(manifest.runId).toBe(newRun.runId);
-    expect(manifest.artifacts).toHaveLength(8);
+    expect(manifest.artifacts).toHaveLength(10);
     expect(manifest.artifacts.every((a) => a.kind === "export")).toBe(true);
     expect(manifest.artifacts.map((a) => a.path)).toEqual([
       "dependency_findings.csv", "dependency_findings.jsonl",
       "package_api_surface.csv", "package_api_surface.jsonl",
+      "run_unit_head.csv", "run_unit_head.jsonl",
       "runs.csv", "runs.jsonl",
       "usage_findings.csv", "usage_findings.jsonl",
     ]);
@@ -438,11 +524,10 @@ describe("runExport guards (mirroring runReport, notices to stdout only)", () =>
     const root = mkdtempSync(join(tmpdir(), "export-v2db-"));
     try {
       const sqlitePath = join(dbRoot, "audit.db");
-      AuditDb.open({ sqlitePath }).close(); // create a real v3 db…
-      const bump = new Database(sqlitePath, { strict: true });
-      bump.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch"); // …downgrade to the v2 shape
-      bump.exec("PRAGMA user_version = 2"); // …then stamp it old (ownership precedes the version gate)
-      bump.close();
+      AuditDb.open({ sqlitePath }).close(); // create a real current-version db…
+      // Faithful v2 file (shared fixture — see testFixtures.ts for why a rebuild, not a column
+      // drop): rebuilt to the v2 era + old stamp (ownership precedes the version gate).
+      downgradeToFaithfulV2(sqlitePath);
       const cfg = config(sqlitePath, join(root, "output"));
       expect(() => runExport(cfg, { runId: null, raw: false })).toThrow(/run `bun run audit` once to migrate/);
       expect(existsSync(join(root, "output"))).toBe(false); // refused before any artifact write
@@ -517,12 +602,12 @@ describe("head-join discrimination (dual-review round 1)", () => {
       foundAt: T1,
     };
     const { runId: rA } = db.startRun(input);
-    db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.upsertUsageFinding({ runId: rA, ...finding });
     db.completeRun(rA);
     Bun.sleepSync(2);
     const { runId: rB } = db.startRun(input);
-    db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.upsertUsageFinding({ runId: rB, ...finding }); // same UNIQUE key → run_id moves to rB
     db.completeRun(rB);
 
@@ -556,7 +641,7 @@ describe("api-surface export requires the completion marker (F5)", () => {
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
     const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "aaa111" };
-    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     for (const version of ["1.0.0", "2.0.0"]) {
       db.upsertDependencyFinding({
         runId, ...unit, dateFetched: "2026-01-01T00:00:00.000Z", packageName: "expo", dependencyKey: version === "1.0.0" ? "expo" : "expo-alias",
@@ -586,5 +671,29 @@ describe("api-surface export requires the completion marker (F5)", () => {
       rmSync(out, { recursive: true, force: true });
       db.close();
     }
+  });
+});
+
+describe("export — run_unit_head soundness gate (same whole-row rules as report/compare)", () => {
+  test("the DEFAULT export REFUSES a schema-valid malformed row; --raw stays the forensic escape hatch", () => {
+    mkdirSync(DB_ROOT, { recursive: true });
+    const path = join(DB_ROOT, "guard-gate.db");
+    const db = AuditDb.open({ sqlitePath: path });
+    const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    db.completeRun(runId);
+    db.close();
+    // A DEFAULT branch marked policy-excluded: no SQL CHECK covers defaultness, so NO pragma is
+    // needed — the read gate is this row's only defense, and before it existed the default export
+    // shipped exactly this row to CSV while buildReport refused the same database.
+    const f = new Database(path, { strict: true });
+    f.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'main', '', 'policy-excluded', 1, 'excluded-by-deny', 'rel*', '2025-06-01T00:00:00Z')`).run(runId);
+    f.close();
+    const db2 = AuditDb.open({ sqlitePath: path });
+    const run = db2.getRun(runId)!;
+    const out = mkdtempSync(join(tmpdir(), "export-gate-"));
+    expect(() => exportRun(db2, run, out, { raw: false })).toThrow(/the default branch is always scanned/);
+    expect(() => exportRun(db2, run, out, { raw: true })).not.toThrow(); // forensic dump: deliberately ungated
+    db2.close();
+    rmSync(out, { recursive: true, force: true });
   });
 });

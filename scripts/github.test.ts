@@ -252,19 +252,24 @@ describe("path encoding + repo shaping", () => {
   test("encodeContentsPath encodes per segment, preserving '/'", () => {
     expect(encodeContentsPath("src dir/ü#?.ts")).toBe("src%20dir/%C3%BC%23%3F.ts");
   });
-  test("mapRestRepo maps the snake_case REST shape", () => {
+  test("mapRestRepo maps the snake_case REST shape and IGNORES default_branch (a stale epoch)", () => {
     const repo = mapRestRepo({
       name: "r", owner: { login: "o" }, default_branch: "main",
       pushed_at: "2024-06-01T00:00:00Z", archived: false, fork: true, private: true,
     });
+    // toEqual is exact, so this pins the ABSENCE of any default-branch field: the REST listing is a
+    // different (older) epoch than §5.B branch discovery, and letting its default_branch reach the
+    // planner is what allowed a renamed default to be policy-excluded. The default comes from
+    // listBranchHeads' snapshot instead — there is deliberately no REST fallback.
     expect(repo).toEqual({
-      name: "r", organization: "o", defaultBranch: "main",
+      name: "r", organization: "o",
       pushedAt: "2024-06-01T00:00:00Z", archived: false, fork: true, isPrivate: true,
     });
+    expect(Object.hasOwn(repo, "defaultBranch")).toBe(false);
   });
   test("filterSortCapRepos: client-side fork/archived policy, pushed_at DESC nulls last, cap", () => {
     const mk = (name: string, pushedAt: string | null, extra: Partial<RepoInfo> = {}): RepoInfo => ({
-      name, organization: "o", defaultBranch: "main", pushedAt, archived: false, fork: false, isPrivate: false, ...extra,
+      name, organization: "o", pushedAt, archived: false, fork: false, isPrivate: false, ...extra,
     });
     const repos = [
       mk("old", "2023-01-01T00:00:00Z"),
@@ -509,6 +514,41 @@ describe("throttle wait clamping (§4 hardening)", () => {
     expect(data).toEqual({ x: 1 });
     expect(sleeps.length).toBeGreaterThanOrEqual(1);
     expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
+  });
+
+  test("graphql 200 with a PRESENT-but-non-array errors field fails closed — never coerced to 'no errors'", async () => {
+    // GraphQL spec: a present `errors` member is an array. A response carrying coherent data plus
+    // errors:"garbage" must NOT classify ok: the error signal we were meant to see is unreadable,
+    // and an ok:true branch discovery feeds the reconcile PRUNE — a coerced-away failure
+    // could turn a partial result into row deletion. Fail closed instead.
+    const { client } = makeClient([ok(http(200, {}, `{"data":{"x":1},"errors":"garbage"}`))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(GithubApiError);
+  });
+
+  test("a malformed errors field does NOT preempt status evidence: 503+garbage stays transient (retries to success)", async () => {
+    // The malformed-envelope check must run AFTER classifyGraphql: a 5xx's retry semantics come from
+    // the STATUS, and hardening the ok path must not convert a transient outage into a fatal error.
+    const { client, sleeps } = makeClient([
+      ok(http(503, {}, `{"errors":"boom"}`)),
+      ok(http(200, {}, `{"data":{"x":1}}`)),
+    ]);
+    const data = await client.graphql("query{x}", {});
+    expect(data).toEqual({ x: 1 });
+    expect(sleeps.length).toBeGreaterThanOrEqual(1); // it actually took the transient retry path
+  });
+
+  test("a malformed errors field does NOT preempt SSO evidence: 403+x-github-sso stays fatal WITH ssoRequired", async () => {
+    const { client } = makeClient([
+      ok(http(403, { "x-ratelimit-remaining": "5", "x-github-sso": "required" }, `{"errors":"garbage"}`)),
+    ]);
+    let caught: unknown;
+    try {
+      await client.graphql("query{x}", {});
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).ssoRequired).toBe(true); // the SSO remediation signal survives
   });
 
   test("MAX_TOTAL_PAUSE_MS is 8 hours (independent literal pins the magnitude)", () => {
@@ -844,6 +884,20 @@ describe("cloneShallow temp-dir cleanup on failure", () => {
     expect(cloneRunDirs(root)).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
+  test("a clone whose date-capture (show) fails also cleans up", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
+    const { client } = makeClient([ok(""), ok("abc123def\n"), err("", "fatal: bad object", 128)], { tempRoot: root });
+    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/committer date failed/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("a non-ISO committer date is rejected and cleans up (a garbled read must not poison provenance)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
+    const { client } = makeClient([ok(""), ok("abc123def\n"), ok("not-a-date\n")], { tempRoot: root });
+    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/non-ISO committer date/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
 
   test("a cleanup failure never masks the original clone error", async () => {
     // rmSync's force only suppresses ENOENT — an EACCES/EBUSY from the cleanup walk must not
@@ -1102,16 +1156,14 @@ describe("graphql", () => {
 });
 
 describe("listBranchHeads (§5.B)", () => {
-  test("paginates with endCursor (omitted on first page), sorts committedDate DESC, skips non-commits", async () => {
+  test("paginates with endCursor (omitted on first page), sorts committedDate DESC, resolves the default", async () => {
     const page1 = {
       data: {
         repository: {
+          defaultBranchRef: { name: "main" },
           refs: {
             pageInfo: { hasNextPage: true, endCursor: "CUR1" },
-            nodes: [
-              { name: "old", target: { oid: "o1", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t1" } } },
-              { name: "weird", target: {} }, // non-commit target — skipped
-            ],
+            nodes: [{ name: "old", target: { oid: "o1", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t1" } } }],
           },
         },
       },
@@ -1119,6 +1171,7 @@ describe("listBranchHeads (§5.B)", () => {
     const page2 = {
       data: {
         repository: {
+          defaultBranchRef: { name: "main" },
           refs: {
             pageInfo: { hasNextPage: false, endCursor: null },
             nodes: [{ name: "main", target: { oid: "o2", committedDate: "2024-06-01T00:00:00Z", tree: { oid: "t2" } } }],
@@ -1127,16 +1180,167 @@ describe("listBranchHeads (§5.B)", () => {
       },
     };
     const { client, calls } = makeClient([ok(http(200, {}, JSON.stringify(page1))), ok(http(200, {}, JSON.stringify(page2)))]);
-    const heads = await client.listBranchHeads("o", "r");
-    expect(heads.map((h) => h.name)).toEqual(["main", "old"]);
-    expect(heads[0]!.treeOid).toBe("t2");
+    const snapshot = await client.listBranchHeads("o", "r");
+    expect(snapshot.heads.map((h) => h.name)).toEqual(["main", "old"]);
+    expect(snapshot.heads[0]!.treeOid).toBe("t2");
+    expect(snapshot.defaultBranch).toBe("main"); // from the SAME snapshot as the heads, not the REST listing
     expect(calls[0]!.args.some((a) => a.startsWith("endCursor="))).toBe(false); // first page omits it
     expect(calls[1]!.args).toContain("endCursor=CUR1");
   });
+
+  // Pins the QUERY, not just the response handling. A scripted fixture answers whatever it is asked, so
+  // every assertion above would still pass if the query silently stopped requesting defaultBranchRef and
+  // the field were served from a stale fixture — this is the only check that the wire request is right.
+  test("the GraphQL query actually requests defaultBranchRef on the repository node", async () => {
+    const { client, calls } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: null, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } }))),
+    ]);
+    await client.listBranchHeads("o", "r");
+    const queryArg = calls[0]!.args.find((a) => a.startsWith("query="))!;
+    expect(queryArg).toContain("defaultBranchRef{name}");
+  });
+
+  // FAIL-CLOSED completeness (load-bearing for run_unit_head reconciliation): an understated branch set would
+  // make the prune delete live branches, so a malformed node or a silently-truncated page must THROW
+  // (→ discovery 'failed' → the repo is retained, never reconciled) rather than return a partial list.
+  // `defaultBranchRef: null` (a repo with no commits) is the neutral default here so these fixtures
+  // exercise the node/pagination guards rather than tripping the default-branch guards first.
+  const refsPage = (over: Record<string, unknown>, repoOver: Record<string, unknown> = {}) =>
+    ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: null, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [], ...over }, ...repoOver } } })));
+  test("a non-Commit / malformed node throws instead of being silently dropped", async () => {
+    const { client } = makeClient([refsPage({ nodes: [{ name: "weird", target: {} }] })]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed branch-head node/);
+  });
+  test("an EMPTY target string (oid/committedDate/tree.oid) is malformed — must not slip through as a valid head", async () => {
+    // an empty committedDate would classify as cutoff-skipped then trip the non-empty-date write
+    // invariant OUTSIDE the fail-soft path; an empty oid drives an invalid scan. Both must fail here.
+    for (const target of [
+      { oid: "", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } },
+      { oid: "o", committedDate: "", tree: { oid: "t" } },
+      { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "" } },
+    ]) {
+      const { client } = makeClient([refsPage({ nodes: [{ name: "x", target }] })]);
+      await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed branch-head node/);
+    }
+  });
+  test("hasNextPage=true with no follow-up cursor throws (would otherwise truncate silently)", async () => {
+    const { client } = makeClient([refsPage({ pageInfo: { hasNextPage: true, endCursor: null } })]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/no follow-up endCursor/);
+  });
+  test("a missing/non-boolean hasNextPage throws (cannot prove the page set is complete)", async () => {
+    const { client } = makeClient([refsPage({ pageInfo: { endCursor: null } })]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/hasNextPage missing\/non-boolean/);
+  });
+  test("a non-array nodes field throws (a page's branches cannot be treated as empty)", async () => {
+    const { client } = makeClient([refsPage({ nodes: null })]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/missing a nodes array/);
+  });
+  test("a duplicate branch name across pages throws (unstable pagination)", async () => {
+    const dup = { name: "main", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } };
+    const { client } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [dup] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [dup] } } } }))),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/duplicate branch/);
+  });
+
+  // ---- default-branch resolution (§5.B): the snapshot's two halves must be coherent -------------
+  // The default's ALWAYS-eligible exemption is decided by `headName === defaultBranch`, so a default
+  // that is wrong, unresolved, or paired with the wrong head set would let a restrictive policy drop a
+  // repo's real default SILENTLY. Every incoherence therefore fails closed (→ discovery 'failed' → an
+  // errors row → the repo is retained and never reconciled) rather than degrading.
+  test("a page that OMITS defaultBranchRef throws — absent is not the same as null", async () => {
+    // We asked for the field; a clean 200 without it is structurally malformed (a real schema or
+    // permission failure would have surfaced in GraphQL `errors` and been rejected upstream). Explicit
+    // null is a legal answer ("this repo has no default"); silence is not.
+    const { client } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } }))),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/omits defaultBranchRef/);
+  });
+  test("defaultBranchRef null + ZERO heads is the legal empty repo (not an error)", async () => {
+    const { client } = makeClient([refsPage({})]);
+    await expect(client.listBranchHeads("o", "r")).resolves.toEqual({ heads: [], defaultBranch: null });
+  });
+  test("defaultBranchRef null + a live head throws (cannot plan a repo with no default)", async () => {
+    // With no default, NO head can win the always-eligible exemption, so `branches: []` would exclude
+    // every branch and the repo would silently yield zero units. A loud error beats that.
+    const { client } = makeClient([
+      refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] }),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/null but 1 head\(s\) were discovered/);
+  });
+  test("a malformed defaultBranchRef (missing/empty name) throws", async () => {
+    for (const ref of [{}, { name: "" }, { name: 42 }]) {
+      const { client } = makeClient([refsPage({}, { defaultBranchRef: ref })]);
+      await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed defaultBranchRef/);
+    }
+  });
+  test("a default branch ABSENT from the discovered heads throws (incoherent snapshot)", async () => {
+    // e.g. the default is 'trunk' but no 'trunk' head came back — the two halves describe different
+    // repo states, so no head could be classified default and policy would exclude the real one.
+    const { client } = makeClient([
+      refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] }, { defaultBranchRef: { name: "trunk" } }),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/is absent from the discovered heads/);
+  });
+  test("a null→named defaultBranchRef transition mid-pagination throws (the null is not 'unset')", async () => {
+    // The re-assertion compares against the FIRST page's value including an explicit null, so a repo
+    // that gains a default mid-walk is caught too — null is a read answer, not "not yet known".
+    const { client } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: null, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ name: "main", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] } } } }))),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/changed mid-pagination/);
+  });
+  test("defaultBranchRef ABSENT on a LATER page throws (every page is validated, not just page 1)", async () => {
+    const { client } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [{ name: "main", target: { oid: "o", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t" } } }] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } }))),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/omits defaultBranchRef/);
+  });
+  test("a non-ISO / impossible committedDate throws — it steers cutoff selection, so non-empty is not enough", async () => {
+    // The date is compared LEXICALLY (`committedDate.slice(0,10) < cutoffDate`), so a malformed value
+    // is never caught downstream: "2025-99-99…" simply sorts as far-future and the branch is silently
+    // classified ELIGIBLE. 2025-02-30 is the case a bare Date.parse would MISS — it rolls over to
+    // March 2 rather than failing, so an impossible calendar date would be recorded as real.
+    // T24:00:00Z is the one a Date.parse-based check MISSES for the opposite reason: hour 24 is a legal
+    // ISO end-of-day spelling that Date.parse NORMALIZES to 00:00 the next day — so the value would be
+    // accepted while its slice(0,10) names a different day than the instant it denotes. Explicit
+    // component bounds, not Date.parse, are what reject it. 2025-02-30 covers the rollover direction.
+    for (const bad of ["2025-99-99T99:99:99Z", "2025-02-30T00:00:00Z", "2025-13-01T00:00:00Z", "2025-06-01T25:00:00Z", "2025-06-01T24:00:00Z", "2025-06-01T24:00:00+00:00", "2025-06-01T00:60:00Z", "2025-06-01T00:00:60Z", "2025-06-00T00:00:00Z", "2025-06-32T00:00:00Z", "2025-00-01T00:00:00Z", "2025-06-01T00:00:00+99:00", "2025-06-01T00:00:00+00:99", "2025-06-01", "yesterday"]) {
+      const { client } = makeClient([
+        refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: bad, tree: { oid: "t" } } }] }, { defaultBranchRef: { name: "dev" } }),
+      ]);
+      await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/non-ISO committedDate/);
+    }
+  });
+  test("a legitimate OFFSET-bearing date is accepted (git emits them; the UTC day may differ)", async () => {
+    // Guards against over-validating: comparing toISOString() would reject this, because 02:00+05:00
+    // is the PREVIOUS day in UTC. Validity is judged on the components as written.
+    const { client } = makeClient([
+      refsPage({ nodes: [{ name: "dev", target: { oid: "o", committedDate: "2025-06-01T02:00:00+05:00", tree: { oid: "t" } } }] }, { defaultBranchRef: { name: "dev" } }),
+    ]);
+    const snap = await client.listBranchHeads("o", "r");
+    expect(snap.heads[0]!.committedDate).toBe("2025-06-01T02:00:00+05:00"); // preserved verbatim, never normalized
+  });
+
+  test("a default branch that CHANGES mid-pagination throws (the classification authority moved)", async () => {
+    // Membership alone cannot catch this when both names stay live: page 1 says main is default, page 2
+    // says trunk, and both are in the head set. Unlike the rejected totalCount cross-check (which trips
+    // on unrelated branch churn), a default disagreement means the authority itself changed mid-walk.
+    const { client } = makeClient([
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: { pageInfo: { hasNextPage: true, endCursor: "C1" }, nodes: [{ name: "main", target: { oid: "o1", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "t1" } } }] } } } }))),
+      ok(http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "trunk" }, refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ name: "trunk", target: { oid: "o2", committedDate: "2024-02-01T00:00:00Z", tree: { oid: "t2" } } }] } } } }))),
+    ]);
+    await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/changed mid-pagination/);
+  });
+
   // same poisoned-pagination class as restGetPagedArray: the cursor chain must be bounded.
   const cursorPage = (cursor: string) =>
     ok(http(200, {}, JSON.stringify({
-      data: { repository: { refs: { pageInfo: { hasNextPage: true, endCursor: cursor }, nodes: [] } } },
+      data: { repository: { defaultBranchRef: null, refs: { pageInfo: { hasNextPage: true, endCursor: cursor }, nodes: [] } } },
     })));
   test("a repeated endCursor throws instead of looping", async () => {
     const { client, calls } = makeClient([cursorPage("CUR1"), cursorPage("CUR1")]);
@@ -1156,13 +1360,15 @@ describe("listBranchHeads (§5.B)", () => {
 });
 
 describe("hardened clone (§0/§5.C)", () => {
-  test("emits exactly the hardened argv, pins git config, and records the fetched SHA", async () => {
+  test("emits exactly the hardened argv, pins git config, and records the fetched SHA + committer date", async () => {
     const { client, calls } = makeClient([
       ok(""), // clone
       ok("abc123def\n"), // rev-parse HEAD
+      ok("2025-06-01T12:34:56+00:00\n"), // show --format=%cI HEAD (the scanned commit's date)
     ]);
-    const { dir, headSha } = await client.cloneShallow("org-a", "repo-b", "release/1.x");
+    const { dir, headSha, headCommittedDate } = await client.cloneShallow("org-a", "repo-b", "release/1.x");
     expect(headSha).toBe("abc123def");
+    expect(headCommittedDate).toBe("2025-06-01T12:34:56+00:00"); // strict-ISO, offset preserved verbatim
     expect(dir.startsWith(TEST_TMP)).toBe(true);
     // a SUCCESSFUL clone must keep its run dir (the failure-only cleanup must not be a finally):
     // downstream walkClone/cloneReader read this dir, so deleting it would silently zero findings.
@@ -1187,6 +1393,11 @@ describe("hardened clone (§0/§5.C)", () => {
     const rev = calls[1]!;
     expect(rev.args).toEqual(["rev-parse", "HEAD"]);
     expect(rev.opts.cwd).toBe(dir); // §0: git itself may run with cwd inside the clone
+
+    const showDate = calls[2]!;
+    // the EXACT commit-date tuple readOnlyGuard permits — cwd inside the clone, no argv -C
+    expect(showDate.args).toEqual(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"]);
+    expect(showDate.opts.cwd).toBe(dir);
   });
   test("clone failure surfaces stderr as a GithubApiError", async () => {
     const { client } = makeClient([err("", "fatal: repository not found")]);

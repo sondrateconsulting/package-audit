@@ -44,7 +44,12 @@ export const XRAY_DIR_NAME = "xray";
 // Bumping this is the ONE sanctioned way golden files change. (The pre-launch addition of
 // per-entry `kind` tags was deliberately absorbed into v1 — no manifest had shipped yet;
 // after launch, any manifest-shape change bumps this.)
-export const XRAY_FORMAT_VERSION = 1;
+// v2 (branch allow/deny): the report JSON gains formatVersion + scanScope + policy summary counts,
+// a new run_unit_head export table, and the HTML scan-scope panel — an artifact-set change.
+// `as const` is documentary, not load-bearing (a const number literal already infers the literal type)
+// — it states, at the definition, that consumers may PIN to this exact version: reportSchema's
+// z.literal() and EmittedReport.formatVersion both do. Mirrors compare.ts's COMPARE_FORMAT_VERSION.
+export const XRAY_FORMAT_VERSION = 2 as const;
 
 // Injectable failure seam for the crash-behavior tests; production always uses node:fs.
 export interface AtomicWriteIo {

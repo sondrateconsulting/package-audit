@@ -15,6 +15,10 @@ import { z } from "zod";
 // module never touches the DB: the enum literals below are pinned to db.ts's unions at compile
 // time, so a new/renamed member on either side fails `bun run typecheck` instead of drifting.
 import type { ExportKind, UsageType } from "./db.ts";
+// Runtime value import — a plain numeric const, NO cycle (artifactWrite imports only node built-ins +
+// readOnlyGuard). Pins formatVersion below so the schema is a TRUE shape discriminator: a v2-shaped
+// report mislabeled formatVersion:1 must FAIL validation, and a version bump auto-updates the literal.
+import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 
 const semverish = z.string().min(1);
 // The nowIso canonical form (db.ts validates writes against the same shape) — every timestamp
@@ -161,15 +165,37 @@ export const summarySchema = z
   .strictObject({
     organizationsScanned: z.number().int().min(0).describe("DISTINCT orgs among the run's scanned branch snapshots"),
     repositoriesScanned: z.number().int().min(0).describe("DISTINCT org/repo among scanned snapshots"),
-    branchesScanned: z.number().int().min(0).describe("run_unit_head rows with status='scanned' (includes skipped-as-current units)"),
-    branchesSkippedByCutoff: z.number().int().min(0).describe("Still-live branches whose head predates cutoffDate this run"),
+    branchesScanned: z.number().int().min(0).describe("run_unit_head rows with status='scanned' (includes skipped-as-current + scanned default-override units)"),
+    branchesSkippedByCutoff: z.number().int().min(0).describe("GENUINE cutoff skips: run_unit_head rows with status='skipped-cutoff' (a policy exclusion is its own status, never counted here)"),
+    branchesExcludedByPolicy: z.number().int().min(0).describe("Branch allow/deny exclusions: run_unit_head rows with status='policy-excluded'"),
+    branchesPastCap: z.number().int().min(0).describe("Eligible branches past the per-repo cap (not scanned this run)"),
+    branchesErrored: z.number().int().min(0).describe("DISTINCT branches carrying a scope='scan' errors[] entry this run that hold NO run_unit_head disposition row — read it as exactly that, not as 'every branch whose scan errored'. The two coincide on a single-invocation run, except that a post-persistence step (the success-log write or the work-queue 'done' update) throwing after the scanned row committed can leave both a row and an errors[] entry for one branch — the persisted scanned row counts it under branchesScanned while the row-key exclusion keeps it out of branchesErrored, so the summary counts it exactly once; on a RESUMED run they diverge BOTH ways. More: a branch that errored in an earlier invocation and reached no row-bearing disposition in the final one (deleted, throttle-requeued, or its repo's discovery failed) is still counted, because errors[] is append-only and never reconciled. Less: a branch holding a row from an earlier invocation that errors in a later one is NOT counted — its retained row already places it in that row's disposition bucket, and counting it here too would count one discovered branch twice"),
     totalDependencyFindings: z.number().int().min(0),
     totalUsageFindings: z.number().int().min(0),
   })
-  .describe("Per-run totals derived from the immutable run_unit_head snapshot — never from the mutable work queue");
+  .describe("Per-run disposition counts + finding totals, from the immutable run_unit_head snapshot. The four disposition counts partition the RECORDED run_unit_head rows exactly once each (exact, unconditionally); together with branchesErrored they account for the branches that reached a TERMINAL outcome (scanned + skippedByCutoff + excludedByPolicy + pastCap + errored) — as an EQUALITY on a single-invocation run, and as an UPPER BOUND on a resumed run, where a branch that errored in an earlier invocation and reached no row-bearing disposition in the final one is still counted in errored (see branchesErrored, whose relationship to 'branches whose scan errored' is looser than its name suggests on a resume, in BOTH directions). A branch whose scan was THROTTLE-REQUEUED is deferred, not terminal — it holds no row and no error, and is finished on the next run, so it appears in no count here; that carve-out is absolute only within a single invocation, since a branch that errored in an earlier one carries an error and so is counted despite being deferred");
+
+export const policyBranchSchema = z.strictObject({
+  organization: z.string(),
+  repository: z.string(),
+  branch: z.string(),
+  disposition: z.enum(["excluded", "scanned-default-override"]),
+  policyStatus: z.enum(["excluded-by-deny", "excluded-by-allow"]),
+  matchedPattern: z.string().nullable().describe("The causing deny pattern; null for an allow-miss / default-override-by-allow"),
+});
+export const scanScopeSchema = z
+  .strictObject({
+    excludedByDeny: z.number().int().min(0),
+    excludedByAllow: z.number().int().min(0),
+    defaultBranchPolicyOverrides: z.number().int().min(0).describe("OVERLAPPING diagnostic (within branchesScanned): scanned default branches policy would have excluded"),
+    policyBranches: z.array(policyBranchSchema).describe("Every head with a policy_status, sorted (organization, repository, branch)"),
+    provenance: z.enum(["complete", "pre-upgrade"]).describe("'complete' ONLY for a v4-native run with at least one recorded head. 'pre-upgrade' means the scan scope is UNVERIFIABLE, from either of two causes: the run was migrated from before v4 (a head carries a NULL scanned_commit_date, and pre-v4 runs never persisted past-cap branches and had no branch policy), OR the run recorded ZERO heads, so there is no sentinel row to judge provenance by at all. Either way the past-cap + policy counts may UNDERSTATE what the run omitted — the value is a warning that the counts are not authoritative, not a claim about which cause applies"),
+  })
+  .describe("Branch allow/deny scan-scope diagnostics (§5) — SEPARATE from the disjoint summary counts (subcounts overlap)");
 
 export const reportSchema = z
   .strictObject({
+    formatVersion: z.literal(XRAY_FORMAT_VERSION).describe("XRAY_FORMAT_VERSION — the report/export/HTML artifact-set version; PINNED so this schema is a true shape discriminator"),
     runId: z.string().describe("The reported run's identifier (report --run-id <id> re-emits it)"),
     generatedAt: isoUtc.describe("completed_at of the run (started_at fallback for a --run-id report of a non-completed run)"),
     config: z.strictObject({
@@ -182,6 +208,7 @@ export const reportSchema = z
     packages: z.array(packageReportSchema).describe("Sorted by name"),
     errors: z.array(reportErrorSchema).describe("Sorted (occurredAt, id)"),
     summary: summarySchema,
+    scanScope: scanScopeSchema,
   })
   .describe("The §7 consolidated report: deterministic, byte-reproducible, generated from SQLite alone");
 

@@ -25,6 +25,12 @@ export const KNOWN_OPERATOR_ERRORS: ReadonlySet<string> = new Set([
   //                       config-triggerable when two tracked packages sanitize/alias to one
   //                       dossier filename — and a non-real xray/ dir (symlink or non-directory); lifecycle bugs there
   //                       are plain Errors and keep their stacks)
+  "PolicyMatchError", // branchPolicy.ts — a configured branch glob's compiled matcher threw at
+  //                     .match() time (a pattern Bun.Glob accepted at construction; none is
+  //                     currently known to do this — the class is fail-closed insurance).
+  //                     Operator-actionable (fix the pattern); the run driver fails the run and
+  //                     rethrows it UNCHANGED (unlike BranchPolicyError, which loadConfig always
+  //                     converts to ConfigError).
 ]);
 
 export function isKnownOperatorError(e: unknown): e is Error {

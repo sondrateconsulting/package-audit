@@ -12,6 +12,8 @@ import {
   assertReadOnlyGh, assertReadOnlyGit, assertReadOnlyTar, assertSpawnAllowed, assertContained,
 } from "./readOnlyGuard.ts";
 import type { AuditDb } from "./db.ts";
+import type { DiscoveryFailure } from "./discovery.ts";
+import { isIsoInstant } from "./isoDate.ts";
 
 // ---- errors -----------------------------------------------------------------------------
 // Non-retryable API failure (404, permission, SSO enforcement, poisoned redirect, …) — the
@@ -555,10 +557,20 @@ export function encodeContentsPath(path: string): string {
 }
 
 // ---- §5.A repo shaping (pure) ---------------------------------------------------------------
+// NOTE: RepoInfo deliberately carries NO default-branch name. The REST listing's `default_branch` is a
+// DIFFERENT EPOCH from §5.B branch discovery — the owner loop lists every repo up-front, then discovers
+// each repo's heads one at a time, so the REST value can be minutes-to-hours stale by the time a repo is
+// planned. That staleness is not benign under branch policy: default-ness is decided by NAME equality
+// (branchPolicy.ts::classifyBranch) and the default's ALWAYS-eligible exemption rides on it, so a default
+// renamed in that window (main → trunk) would make the REAL default look non-default and a restrictive
+// policy (e.g. `branches: []`) would exclude it — the repo would silently yield zero scanned units.
+// The default branch is therefore resolved from the SAME GraphQL snapshot as the heads (BranchSnapshot,
+// listBranchHeads). There is no REST fallback ON PURPOSE: a fallback would reintroduce the stale epoch
+// at exactly the moment the authoritative source is unavailable, and keeping both sources would only add
+// a "they disagree" decision tree without making either one true.
 export interface RepoInfo {
   name: string;
   organization: string;
-  defaultBranch: string;
   pushedAt: string | null;
   archived: boolean;
   fork: boolean;
@@ -569,7 +581,6 @@ export function mapRestRepo(raw: Record<string, unknown>): RepoInfo {
   return {
     name: String(raw["name"] ?? ""),
     organization: String(owner?.["login"] ?? ""),
-    defaultBranch: String(raw["default_branch"] ?? ""),
     pushedAt: typeof raw["pushed_at"] === "string" ? raw["pushed_at"] : null,
     archived: raw["archived"] === true,
     fork: raw["fork"] === true,
@@ -601,6 +612,24 @@ export interface BranchHead {
   committedDate: string;
   treeOid: string;
 }
+
+// §5.B: ONE repo's live branch state, from ONE GraphQL snapshot. `heads` and `defaultBranch` are a
+// PAIR and must never be separated: the default's always-eligible exemption is decided by matching
+// `defaultBranch` against a head NAME, so pairing a head list with a default resolved at a different
+// moment is exactly the stale-epoch bug RepoInfo's note describes. Both fields are validated together
+// and fail closed (listBranchHeads) — a snapshot that escapes is COMPLETE and internally coherent:
+//   - `defaultBranch === null` ⇔ `heads` is EMPTY (a repo with no commits has no default branch).
+//   - a non-null `defaultBranch` is guaranteed to NAME one of `heads` (validated post-pagination).
+// Consumers therefore never synthesize, guess, or fall back to a default.
+export interface BranchSnapshot {
+  readonly heads: readonly BranchHead[];
+  readonly defaultBranch: string | null;
+}
+
+// §5.B discovery outcome. A specialized success arm (a snapshot, not a bare list) unioned with the
+// SHARED DiscoveryFailure, so the "a failed scope carries no partial data / is never reconciled" rule
+// stays declared in exactly one place (discovery.ts) even though this scope's payload isn't a list.
+export type BranchDiscoveryOutcome = { readonly ok: true; readonly snapshot: BranchSnapshot } | DiscoveryFailure;
 
 // ---- semaphore ------------------------------------------------------------------------------
 class Semaphore {
@@ -1052,14 +1081,33 @@ export class GithubClient {
       }
       let body: { data?: unknown; errors?: GraphqlErrorEntry[] } = {};
       try {
-        body = JSON.parse(parsed.body) as typeof body;
+        // A non-object root (null / array / primitive — JSON.parse("null") SUCCEEDS) carries neither
+        // data nor a readable errors member; normalize it to {} exactly like unparseable JSON, so the
+        // property reads below cannot TypeError and a missing `data` is rejected structurally
+        // downstream.
+        const parsedBody: unknown = JSON.parse(parsed.body);
+        body = parsedBody !== null && typeof parsedBody === "object" && !Array.isArray(parsedBody) ? (parsedBody as typeof body) : {};
       } catch {
         body = {};
       }
+      // GraphQL spec: a PRESENT `errors` member is an ARRAY. A present-but-non-array errors field
+      // means the failure signal we were meant to read is unreadable — coercing it to "no errors"
+      // would be fail-OPEN: an ok:true branch discovery feeds the reconcile PRUNE (reconcileRunUnitHead), so a
+      // swallowed error signal could turn a partial result into row deletion. classifyGraphql still
+      // runs FIRST with errors=[]: status/header evidence (5xx retry, throttle, SSO-fatal) keeps its
+      // semantics, and the malformed envelope only preempts the OK path below.
+      const errorsMalformed = body.errors !== undefined && !Array.isArray(body.errors);
       const errors = Array.isArray(body.errors) ? body.errors : [];
       // §4: GraphQL throttles can arrive as HTTP 200 with body errors — check BOTH.
       const cls = classifyGraphql(parsed.status, parsed.headers, errors, this.now());
-      if (cls.kind === "ok") return body.data;
+      if (cls.kind === "ok") {
+        if (errorsMalformed)
+          throw new GithubApiError(
+            "graphql: response carries a malformed (non-array) errors field — refusing to treat it as success",
+            { status: parsed.status, endpoint: "graphql" },
+          );
+        return body.data;
+      }
       if (cls.kind === "fatal")
         throw new GithubApiError(`graphql: ${cls.message}`, { status: cls.status, endpoint: "graphql", ssoRequired: cls.ssoRequired });
       if (cls.kind === "primary") {
@@ -1090,13 +1138,33 @@ export class GithubClient {
 
   // §5.B: enumerate ALL ref pages (RefOrderField cannot order heads by commit date), then sort
   // committedDate DESC client-side. Cutoff filtering/capping is the orchestrator's job.
-  async listBranchHeads(org: string, repo: string): Promise<BranchHead[]> {
+  //
+  // `defaultBranchRef{name}` rides the ALREADY-queried `repository` node — no extra request, no extra
+  // rate-limit cost — so the default branch is resolved from the SAME snapshot as the heads rather than
+  // from the far older REST listing (see RepoInfo's note: a default renamed in that window would let a
+  // restrictive policy silently exclude the repo's real default). This is the ONLY producer of the
+  // default-branch name.
+  async listBranchHeads(org: string, repo: string): Promise<BranchSnapshot> {
     const query =
-      "query($owner:String!,$name:String!,$endCursor:String){repository(owner:$owner,name:$name){refs(refPrefix:\"refs/heads/\",first:100,after:$endCursor){pageInfo{hasNextPage endCursor}nodes{name target{...on Commit{oid committedDate tree{oid}}}}}}}";
+      "query($owner:String!,$name:String!,$endCursor:String){repository(owner:$owner,name:$name){defaultBranchRef{name}refs(refPrefix:\"refs/heads/\",first:100,after:$endCursor){pageInfo{hasNextPage endCursor}nodes{name target{...on Commit{oid committedDate tree{oid}}}}}}}";
     const heads: BranchHead[] = [];
+    // The default branch as of PAGE 1, then re-asserted identical on every later page. `undefined` = no
+    // page read yet (distinct from a read `null`, which legitimately means "repo has no default").
+    let defaultBranch: string | null | undefined = undefined;
     // same poisoned-pagination bound as restGetPagedArray: a response controls the next
     // cursor, so a repeated or endless cursor chain must fail closed, not loop unbounded.
     const seenCursors = new Set<string>();
+    // FAIL-CLOSED completeness (load-bearing for run_unit_head reconciliation, which prunes rows
+    // for branches ABSENT from this set): the returned name set must be the COMPLETE, exact branch
+    // list. A silently-dropped node or a silently-truncated pagination would understate it and delete
+    // a live branch's row. So a malformed node, a missing/non-boolean hasNextPage, a hasNextPage=true
+    // with no follow-up cursor, or a duplicate name across pages all THROW (→ discovery 'failed' →
+    // the repo is retained, never reconciled) rather than returning a partial list. The guarantee is
+    // STRUCTURAL — every page followed to hasNextPage:false, every node well-formed. It rests on
+    // GitHub's own pagination contract (hasNextPage:false ⇒ no more refs); a hypothetical GitHub-side
+    // bug returning hasNextPage:false while omitting a live ref is outside this guard (and, if it ever
+    // occurred, is transient and self-healing — findings persist and the next run re-discovers).
+    const seenNames = new Set<string>();
     let cursor: string | null = null;
     for (;;) {
       // loop-top cap = at most MAX_PAGES fetches, the same semantics as restGetPagedArray
@@ -1106,29 +1174,123 @@ export class GithubClient {
       const fields: Record<string, string> = { owner: org, name: repo };
       if (cursor !== null) fields["endCursor"] = cursor; // omit entirely on the first page (§5.B)
       const data = (await this.graphql(query, fields)) as {
-        repository?: { refs?: { pageInfo?: { hasNextPage?: boolean; endCursor?: string | null }; nodes?: unknown[] } } | null;
+        repository?: {
+          defaultBranchRef?: { name?: unknown } | null;
+          refs?: { pageInfo?: { hasNextPage?: boolean; endCursor?: string | null }; nodes?: unknown[] };
+        } | null;
       } | null;
-      const refs = data?.repository?.refs;
+      const repository = data?.repository;
+      const refs = repository?.refs;
       if (refs === undefined || refs === null)
         throw new GithubApiError(`graphql returned no refs for ${org}/${repo}`, { endpoint: "graphql" });
-      for (const node of refs.nodes ?? []) {
+      // --- default-branch resolution, fail-closed and page-consistent -------------------------------
+      // ABSENT vs NULL are different failures and must not be conflated. We ASKED for the field, so a
+      // clean 200 that omits it entirely is structurally malformed (stale fixture, proxy, or schema
+      // drift) — a real permission/schema error would have surfaced in GraphQL `errors` and been
+      // rejected by this.graphql() already. Object.hasOwn (not `in`) states the wire contract exactly:
+      // an own property, not one inherited from a prototype.
+      if (repository === undefined || repository === null || !Object.hasOwn(repository, "defaultBranchRef"))
+        throw new GithubApiError(`refs page omits defaultBranchRef for ${org}/${repo}`, { endpoint: "graphql" });
+      const ref = repository.defaultBranchRef;
+      let pageDefault: string | null;
+      // LEGAL — but "no commits" is not the only way to get here: an unborn/dangling HEAD also
+      // yields null. The heads-vs-default coherence check below is what separates the two.
+      if (ref === null) pageDefault = null;
+      else if (typeof ref?.name === "string" && ref.name.length > 0) pageDefault = ref.name;
+      else throw new GithubApiError(`malformed defaultBranchRef for ${org}/${repo}`, { endpoint: "graphql" });
+      // Re-assert on EVERY page. Pagination is not atomic, so the default can be reassigned mid-walk;
+      // unlike the (rejected) totalCount cross-check — which trips on unrelated branch churn and says
+      // nothing about whether the collected names are valid — a default-name DISAGREEMENT means the
+      // classification authority itself changed underneath us, which is precisely the fact the
+      // always-eligible exemption depends on. Failing the rare administrative rename is the correct
+      // trade: the repo is retained, never reconciled, and the next run reads one coherent snapshot.
+      if (defaultBranch === undefined) defaultBranch = pageDefault;
+      else if (defaultBranch !== pageDefault)
+        throw new GithubApiError(
+          `defaultBranchRef changed mid-pagination for ${org}/${repo} (${JSON.stringify(defaultBranch)} → ${JSON.stringify(pageDefault)})`,
+          { endpoint: "graphql" },
+        );
+      if (!Array.isArray(refs.nodes))
+        throw new GithubApiError(`refs page missing a nodes array for ${org}/${repo}`, { endpoint: "graphql" });
+      for (const node of refs.nodes) {
         const n = node as { name?: string; target?: { oid?: string; committedDate?: string; tree?: { oid?: string } } };
-        if (n.name && n.target?.oid && n.target.committedDate && n.target.tree?.oid)
-          heads.push({ name: n.name, oid: n.target.oid, committedDate: n.target.committedDate, treeOid: n.target.tree.oid });
+        // Every refs/heads/* head is a complete Commit; a malformed/non-Commit node is anomalous and
+        // must not be silently skipped (see the completeness note above). Every field must be a
+        // NON-EMPTY string — an empty oid/date/tree.oid is malformed (an empty committedDate would
+        // otherwise classify as cutoff-skipped and then trip upsertRunUnitHead's non-empty-date
+        // invariant OUTSIDE the fail-soft discovery path, aborting the whole run).
+        if (typeof n.name !== "string" || n.name.length === 0 ||
+            typeof n.target?.oid !== "string" || n.target.oid.length === 0 ||
+            typeof n.target.committedDate !== "string" || n.target.committedDate.length === 0 ||
+            typeof n.target.tree?.oid !== "string" || n.target.tree.oid.length === 0)
+          throw new GithubApiError(`malformed branch-head node for ${org}/${repo}`, { endpoint: "graphql" });
+        // Non-empty is NOT enough for the DATE: it steers cutoff/cap selection lexically and is then
+        // persisted, so an impossible value would silently change WHAT GETS SCANNED rather than fail
+        // (see isIsoInstant). Same fail-closed posture as every other guard in this loop.
+        if (!isIsoInstant(n.target.committedDate))
+          throw new GithubApiError(
+            `branch ${JSON.stringify(n.name)} of ${org}/${repo} has a non-ISO committedDate: ${JSON.stringify(n.target.committedDate.slice(0, 40))}`,
+            { endpoint: "graphql" },
+          );
+        if (seenNames.has(n.name))
+          throw new GithubApiError(`duplicate branch ${JSON.stringify(n.name)} across pages for ${org}/${repo}`, { endpoint: "graphql" });
+        seenNames.add(n.name);
+        heads.push({ name: n.name, oid: n.target.oid, committedDate: n.target.committedDate, treeOid: n.target.tree.oid });
       }
-      if (refs.pageInfo?.hasNextPage === true && typeof refs.pageInfo.endCursor === "string") {
-        const next = refs.pageInfo.endCursor;
-        if (seenCursors.has(next))
-          throw new GithubApiError(`refs pagination cursor cycle for ${org}/${repo}`, { endpoint: "graphql" });
-        seenCursors.add(next);
-        cursor = next;
-      } else {
-        break;
-      }
+      const pageInfo = refs.pageInfo;
+      if (typeof pageInfo?.hasNextPage !== "boolean")
+        throw new GithubApiError(`refs pageInfo.hasNextPage missing/non-boolean for ${org}/${repo}`, { endpoint: "graphql" });
+      if (!pageInfo.hasNextPage) break;
+      const next = pageInfo.endCursor;
+      if (typeof next !== "string" || next.length === 0)
+        throw new GithubApiError(`refs hasNextPage=true but no follow-up endCursor for ${org}/${repo}`, { endpoint: "graphql" });
+      if (seenCursors.has(next))
+        throw new GithubApiError(`refs pagination cursor cycle for ${org}/${repo}`, { endpoint: "graphql" });
+      seenCursors.add(next);
+      cursor = next;
     }
-    return heads.sort((a, b) =>
+    // The loop always executes at least once and every arm above either assigns or throws.
+    if (defaultBranch === undefined)
+      throw new GithubApiError(`internal: defaultBranchRef unresolved for ${org}/${repo}`, { endpoint: "graphql" });
+    // --- snapshot coherence (fail-closed) --------------------------------------------------------
+    // The two fields must describe the SAME repo state, because every downstream default-branch
+    // decision is `headName === defaultBranch`. Both directions are checked, and BOTH throw rather
+    // than degrade: a caller cannot tell a wrong default from a right one, so an incoherent snapshot
+    // must not escape at all. Throwing yields discovery 'failed' → an errors row (LOUD, unlike the
+    // silent mis-scan it replaces) → the repo is retained and never reconciled (the prune stays safe).
+    if (defaultBranch !== null && !seenNames.has(defaultBranch))
+      throw new GithubApiError(
+        `defaultBranchRef ${JSON.stringify(defaultBranch)} is absent from the discovered heads of ${org}/${repo}`,
+        { endpoint: "graphql" },
+      );
+    // A repo with heads but no default is anomalous (GitHub resolves HEAD to a live ref). We do NOT
+    // claim it is impossible — an unborn/dangling HEAD on an imported or mirrored repo is the kind of
+    // edge that would land here. Be precise about the cost: such a repo errors EVERY run and is never
+    // scanned until an operator fixes it. That is loud and PERMANENT-until-remediated — NOT
+    // self-healing (unlike a throttle or a transient API failure, no amount of re-running clears it).
+    // Three options; the third is the one worth arguing:
+    //   (1) plan it with NO default — rejected: no head wins the always-eligible exemption, so a
+    //       restrictive policy drops the whole repo SILENTLY. Strictly worse than erroring.
+    //   (2) fall back to the REST default — rejected: a stale epoch (see RepoInfo), and by
+    //       construction it no longer reaches this layer at all.
+    //   (3) scan every head, overriding policy AND cutoff AND cap, plus a warning — rejected on the
+    //       merits, not by omission. Overriding policy alone would not even deliver the guarantee (the
+    //       unknown default could still be cutoff-skipped or past-cap), so it must override all three
+    //       — i.e. override an INTENTIONAL scope limiter (`branches: []` means "default only") and
+    //       spend the operator's API quota, clone bandwidth and runtime on a repo they asked to
+    //       narrow. It still could not record `is_default_branch` truthfully or identify the default's
+    //       policy override, so it buys an under-specified scan at real cost.
+    // So: fail closed. A loud error the operator can see and fix beats a silent under-report in an
+    // auditor whose entire value is "we scanned your default branches".
+    if (defaultBranch === null && heads.length > 0)
+      throw new GithubApiError(
+        `defaultBranchRef is null but ${heads.length} head(s) were discovered for ${org}/${repo}`,
+        { endpoint: "graphql" },
+      );
+    heads.sort((a, b) =>
       a.committedDate !== b.committedDate ? (a.committedDate < b.committedDate ? 1 : -1) : a.name < b.name ? -1 : 1,
     );
+    return { heads, defaultBranch };
   }
 
   // ---- contents / tree / blob (§5.C; SHA-pinned = immutable = zero-network cache hits) ----
@@ -1202,7 +1364,7 @@ export class GithubClient {
     return dir;
   }
 
-  async cloneShallow(org: string, repo: string, branch: string): Promise<{ dir: string; headSha: string }> {
+  async cloneShallow(org: string, repo: string, branch: string): Promise<{ dir: string; headSha: string; headCommittedDate: string }> {
     const runDir = this.makeRunTempDir();
     const dest = join(runDir, "clone");
     assertContained(dest, [this.tempRoot]); // §0: clone dest containment BEFORE spawning
@@ -1219,7 +1381,24 @@ export class GithubClient {
       const rev = await this.git(["rev-parse", "HEAD"], dest);
       if (rev.exitCode !== 0)
         throw new GithubApiError(`git rev-parse HEAD failed in ${dest}: ${rev.stderr.trim().slice(0, 300)}`, { endpoint: url });
-      return { dir: dest, headSha: rev.stdout.trim() };
+      // §4 (branch allow/deny): the ACTUAL scanned commit's date. The clone HEAD may be AHEAD of the
+      // GraphQL-discovered head (the branch moved between discovery and clone), so its date must be
+      // read from the clone — not reused from discovery. This exact argv is the ONLY `show` form
+      // readOnlyGuard permits (--no-patch/--no-notes/--no-show-signature suppress diff/notes/GPG; %cI
+      // is the strict-ISO committer date). A capture failure reclaims the tree via the catch below.
+      const dateRes = await this.git(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"], dest);
+      if (dateRes.exitCode !== 0)
+        throw new GithubApiError(`git show HEAD committer date failed in ${dest}: ${dateRes.stderr.trim().slice(0, 300)}`, { endpoint: url });
+      const headCommittedDate = dateRes.stdout.trim();
+      // Exactly one strict-ISO line, offset preserved verbatim (NOT normalized to Z/ms — this joins
+      // the committedDate family feeding scanned_commit_date). A garbled read would poison that
+      // durable provenance. isIsoInstant, not a bare shape regex: the shape alone admits impossible
+      // CALENDAR values (2025-02-30, which Date.parse silently rolls over rather than rejecting).
+      // Planning already happened — the cutoff was judged on the DISCOVERED head date, never on this
+      // value — so the poison risk here is the run's durable scan-scope ledger, not selection.
+      if (!isIsoInstant(headCommittedDate))
+        throw new GithubApiError(`git show HEAD returned a non-ISO committer date in ${dest}: ${JSON.stringify(headCommittedDate.slice(0, 80))}`, { endpoint: url });
+      return { dir: dest, headSha: rev.stdout.trim(), headCommittedDate };
     } catch (e) {
       // a failed/timed-out clone can leave a multi-GB partial tree — reclaim it NOW rather
       // than at the next run's startup sweep (the caller only cleans up on success). The

@@ -4,6 +4,7 @@ import { AuditDb } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
 import { STATIC_SCRIPT, dossierFilename, type DossierReport, type DossierUnit } from "./reportHtml.ts";
+import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 
 const T0 = "2026-01-01T00:00:00.000Z";
 
@@ -17,7 +18,7 @@ function fixtureReport(): DossierReport {
     trackedPackages: ["@expo/vector-icons", "left-pad"], cutoffDate: "2024-01-01", githubHost: "github.com",
   });
   const unit = { organization: "org-a", repository: "app", branch: "main", commitSha: "abc123def4567" };
-  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true });
+  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
   db.upsertDependencyFinding({
     runId, ...unit, dateFetched: T0, packageName: "@expo/vector-icons", dependencyKey: "@expo/vector-icons",
     dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 5,
@@ -38,7 +39,7 @@ function fixtureReport(): DossierReport {
   return { ...report, runId: "run-fixture", generatedAt: T0 };
 }
 
-const OPTS = { formatVersion: 1 };
+const OPTS = { formatVersion: XRAY_FORMAT_VERSION };
 
 // sha256 of the rendered fixture index. SANCTIONED-CHANGE RULE: this pin may only change in a
 // commit that bumps the report-format version (XRAY_FORMAT_VERSION) — any other diff is an
@@ -47,7 +48,7 @@ const OPTS = { formatVersion: 1 };
 // re-pass bidi-isolation rule moved these bytes. Same sanction rule as reportHtml.test.ts.
 // PRE-LAUNCH RE-PIN (M4 bidi fix): `.branchnote` gains `unicode-bidi:isolate` in the shared
 // PAGE_CSS, shifting the index bytes too. CSS-only.
-const GOLDEN_INDEX_SHA256 = "49d6bfa856007e1e2eb94b13fe17fae4fbb40b75e3ac8fd4934490fa2159f6b0";
+const GOLDEN_INDEX_SHA256 = "f0083ae7cee2dcfff907b64d7d3b9650e5c5556ab06de81f9e41968add38ca40";
 
 describe("renderIndex — copy-as-markdown neutralizes a hostile value through the real render path", () => {
   // Package names are validated and versionsSeen is the valid-semver slice, so a payload cannot
@@ -113,13 +114,13 @@ describe("renderIndex", () => {
   });
 
   test("format version: meta tag + footer line; copy-as-markdown mirror for the table", () => {
-    expect(html).toContain('<meta name="xray-format-version" content="1">');
-    expect(html).toContain("report-format version 1");
+    expect(html).toContain(`<meta name="xray-format-version" content="${XRAY_FORMAT_VERSION}">`);
+    expect(html).toContain(`report-format version ${XRAY_FORMAT_VERSION}`);
     expect(html).toContain('data-copy-target="packages"');
     expect(html).toContain('<template id="packages-md">');
   });
 
-  test("CT1 vocabulary: usage sites, never invocation wording", () => {
+  test("vocabulary: usage sites, never invocation wording", () => {
     expect(html).toContain("usage sites");
     expect(html).not.toContain("call site");
   });
@@ -131,7 +132,8 @@ describe("renderIndex — edge states", () => {
     generatedAt: T0,
     config: { cutoffDate: "2024-01-01", githubHost: "github.com", organizations: ["org-a"] },
     packages,
-    summary: { repositoriesScanned: 0, branchesScanned: 0, branchesSkippedByCutoff: 0 },
+    summary: { repositoriesScanned: 0, branchesScanned: 0, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+    scanScope: { excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "complete" },
   });
 
   test("no tracked packages: a designed empty table state", () => {
@@ -152,6 +154,56 @@ describe("renderIndex — edge states", () => {
     const html = renderIndex(baseReport([{ name: "pkg", versionsSeen: [], apiSurface: {}, usageByRepo: [unit] }]), OPTS);
     expect(html).toContain('<span class="branchnote">*</span>');
     expect(html).toContain("* default branch unknown for this run — counts cover all scanned branches; re-run the audit to record it.");
+  });
+
+  test("scan-scope panel: disposition ledger, subcounts, and esc() on hostile branch names + deny patterns", () => {
+    const report: DossierReport = {
+      ...baseReport([]),
+      summary: { repositoriesScanned: 1, branchesScanned: 2, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 2, branchesPastCap: 1 },
+      scanScope: {
+        excludedByDeny: 1, excludedByAllow: 1, defaultBranchPolicyOverrides: 1,
+        policyBranches: [
+          // hostile branch name AND hostile deny pattern — both must be escaped
+          { organization: "org-a", repository: "svc", branch: "<img src=x onerror=alert(1)>", disposition: "excluded", policyStatus: "excluded-by-deny", matchedPattern: "feature/<script>*" },
+          { organization: "org-a", repository: "svc", branch: "wip", disposition: "excluded", policyStatus: "excluded-by-allow", matchedPattern: null },
+          { organization: "org-a", repository: "svc", branch: "main", disposition: "scanned-default-override", policyStatus: "excluded-by-deny", matchedPattern: "release/*" },
+        ],
+        provenance: "complete",
+      },
+    };
+    const html = renderIndex(report, OPTS);
+    // XSS: the raw hostile markup must NOT reach the document; only the escaped form does
+    expect(html).not.toContain("<img src=x onerror=alert(1)>");
+    expect(html).not.toContain("feature/<script>*");
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(html).toContain("feature/&lt;script&gt;*");
+    // the panel, the disjoint counts, and the deny/allow/override subcounts
+    expect(html).toContain("Scan scope &amp; branch policy");
+    expect(html).toContain("2 branches scanned");
+    expect(html).toContain("2 excluded by branch policy");
+    expect(html).toContain("1 past the per-repo cap");
+    expect(html).toContain("policy detail: 1 denied · 1 not allow-listed · 1 scanned default-branch override(s)");
+    // per-row disposition labels; a NULL pattern renders as an em dash, not a stray "code" tag
+    expect(html).toContain("excluded (deny)");
+    expect(html).toContain("excluded (not allow-listed)");
+    expect(html).toContain("scanned (default-branch override)");
+    expect(html).toContain("<td>—</td>");
+    // a v4-native report carries no pre-upgrade caveat
+    expect(html).not.toContain("were not fully recorded");
+  });
+
+  test("scan-scope panel: an unverifiable-provenance run (pre-v4 OR zero-head) caveats the understated counts", () => {
+    const complete = renderIndex(baseReport([]), OPTS);
+    expect(complete).not.toContain("were not fully recorded"); // default fixture is v4-native
+    const preUpgrade: DossierReport = {
+      ...baseReport([]),
+      summary: { repositoriesScanned: 1, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+      scanScope: { excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "pre-upgrade" },
+    };
+    const html = renderIndex(preUpgrade, OPTS);
+    // the false authoritative zeros are explicitly caveated
+    expect(html).toContain("were not fully recorded for this run");
+    expect(html).toContain("may understate what it omitted");
   });
 
   test("INDEX_FILENAME matches the artifact name grammar", () => {

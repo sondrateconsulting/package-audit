@@ -12,9 +12,11 @@ import { assertContained } from "./readOnlyGuard.ts";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
 import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
-import { dossierFilename, renderDossierDetailed, type DossierContext } from "./reportHtml.ts";
+import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
 import { logLine } from "./log.ts";
+import { isPolicyExcluded, isDefaultOverride, assertRunUnitHeadSound, policyStatusOrThrow } from "./policyDisposition.ts";
+import { assertNever } from "./assertNever.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
 import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -37,6 +39,9 @@ interface UsageRowDb {
 interface HeadRow {
   organization: string; repository: string; branch: string; commit_sha: string; status: string;
   is_default_branch: number | null; // 1/0/NULL — NULL = unknown (pre-v3 run rows)
+  policy_status: string | null; // 'excluded-by-deny' | 'excluded-by-allow' | NULL (PROMPT.md §3)
+  policy_matched_pattern: string | null; // the causing deny pattern; NULL for allow-miss / no-policy
+  scanned_commit_date: string | null; // NULL only for pre-v4 migrated rows → scan-scope provenance sentinel
 }
 
 function unitKey(o: string, r: string, b: string, c: string): string {
@@ -51,9 +56,56 @@ export interface ReportSummary {
   repositoriesScanned: number;
   branchesScanned: number;
   branchesSkippedByCutoff: number;
+  // Branch allow/deny (§5): the disjoint disposition partition. The four disposition counts partition the
+  // run_unit_head rows this run RECORDED, exactly once each. (That clause is unconditional and exact.)
+  // Together with branchesErrored they account for the branches that reached a TERMINAL outcome:
+  //   discovered (terminal) = branchesScanned + branchesSkippedByCutoff + branchesExcludedByPolicy
+  //                           + branchesPastCap + branchesErrored   — EXACT on a SINGLE-INVOCATION run.
+  //   discovered (terminal) <= that sum                             — on a RESUMED run; see branchesErrored
+  //                                                                   for exactly which branches inflate it.
+  // branchesScanned INCLUDES scanned default-override rows (they WERE scanned). branchesSkippedByCutoff is
+  // GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket.
+  branchesExcludedByPolicy: number;
+  branchesPastCap: number;
+  // Counts EXACTLY this: distinct (org, repo, branch) with a scope='scan' errors[] entry for this run
+  // that hold NO run_unit_head disposition row. Read it as that, and not as "every branch whose scan
+  // errored" — on a SINGLE-INVOCATION run the two coincide (a to-scan branch that reaches a TERMINAL
+  // outcome gets a row or an errors[] entry; the one composite case is a step failing AFTER the
+  // scanned row committed — the success-log write or the work-queue 'done' update — which can leave
+  // an errors[] entry beside the row: the persisted row counts that branch under branchesScanned,
+  // and the row-key exclusion below keeps it out of THIS count, so it still counts exactly once),
+  // but on a RESUMED run they diverge in BOTH directions.
+  //
+  // A resumed run REUSES the run_id (db.startRun), so errors[] and run_unit_head both span invocations.
+  // errors[] is append-only and is NEVER reconciled; run_unit_head rows ARE pruned (reconcileRunUnitHead).
+  //
+  //   MORE than the errored set: a branch that errored in an EARLIER invocation and reached no
+  //   row-bearing disposition in the final one is still counted — whether it is now gone (deleted),
+  //   deferred (throttle-requeued on retry), or unvisited (its repo's discovery failed). Stated as this
+  //   membership rule on purpose: "overcounts by exactly the deleted branches" would be false.
+  //
+  //   LESS than the errored set: a branch holding a row from an EARLIER invocation that errors in a
+  //   LATER one is NOT counted here — the row-key exclusion below drops it. That is deliberate and
+  //   correct: its retained row already places it in that row's disposition bucket, and counting it here
+  //   too would count one discovered branch TWICE and break the partition. This is the same-name
+  //   stale-head case; see the reconciliation note in orchestrate.ts::processRepo.
+  //
+  // So the exclusion is what keeps every discovered branch counted at most once, which is why the
+  // identity above stays an UPPER BOUND (never a double-count) rather than an equality on a resume.
+  //
+  // Throttle carve-out, precisely: a branch throttle-requeued with NO prior error has neither a row nor
+  // an error — deferred, not terminal, finished next run — so it is in no count. That holds absolutely
+  // only WITHIN a single invocation; after an earlier-invocation error the branch DOES carry an error
+  // and so IS counted here, despite being deferred rather than terminal.
+  branchesErrored: number;
   totalDependencyFindings: number;
   totalUsageFindings: number;
 }
+
+// ScanScope + PolicyBranchRow are defined in reportHtml.ts (the render layer, to avoid an import
+// cycle) and imported above. Semantics (§5): excludedByDeny+excludedByAllow = branchesExcludedByPolicy;
+// defaultBranchPolicyOverrides OVERLAPS branchesScanned (scanned default branches policy would have
+// excluded). policyBranches lists every row carrying a policy_status, sorted (org, repo, branch).
 
 // Top-level envelope of the emitted report. `packages` is typed as the exact shape buildPackage
 // emits, which (by construction — see report.ts's apiSurface typing) stays assignable to the
@@ -63,12 +115,17 @@ export interface ReportSummary {
 // cli, dateFetched — a superset of the renderer's view) is preserved for run-<id>.json; its JSON
 // contract is separately enforced by reportSchema.ts in tests. errors[] stays untyped (leaf only).
 export interface EmittedReport {
+  // PINNED to the constant, not a bare `number` (the COMPARE_FORMAT_VERSION precedent): this shape IS
+  // v2, so a build that emitted some other version here would be mislabelling itself, and reportSchema
+  // — the authoritative contract, but a TEST-ONLY one by design — would only catch it in the suite.
+  formatVersion: typeof XRAY_FORMAT_VERSION; // the report/export/HTML artifact-set version
   runId: string;
   generatedAt: string;
   config: { packages: string[]; cutoffDate: string; githubHost: string; organizations: string[]; organizationsSource: string };
   packages: ReadonlyArray<ReturnType<typeof buildPackage>>;
   errors: unknown[];
   summary: ReportSummary;
+  scanScope: ScanScope; // branch allow/deny diagnostics (§5) — separate from the disjoint summary counts
 }
 
 // Build the whole §7 report object for a run from SQLite alone. Works on the read-only handle;
@@ -83,7 +140,7 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   const tracked = JSON.stringify(run.trackedPackages);
 
   // scanned snapshot heads for this run (skipped-cutoff carry commit_sha='' and no findings).
-  const heads = db.read(`SELECT organization, repository, branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ?`).all(runId) as HeadRow[];
+  const heads = db.read(`SELECT organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date FROM run_unit_head WHERE run_id = ?`).all(runId) as HeadRow[];
   const scannedHeads = heads.filter((h) => h.status === "scanned");
   const scannedKeys = new Set(scannedHeads.map((h) => unitKey(h.organization, h.repository, h.branch, h.commit_sha)));
   // Tri-state default-branch flag per scanned unit (§5.B): true/false from v3 runs, null for
@@ -124,7 +181,27 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     packageName: e["package_name"], version: e["version"], message: e["message"], occurredAt: e["occurred_at"],
   }));
 
+  // §5: branches DISCOVERED but holding no disposition row because their scan ERRORED this run — each has
+  // a scope='scan' errors[] entry. Counted so the disposition buckets + branchesErrored reconcile to the
+  // discovered heads. A branch with BOTH a scan error AND a row (e.g. scanned on an earlier resume attempt,
+  // errored on this one) is already a disposition and is excluded here — hence the row-key exclusion.
+  const headKeys = new Set(heads.map((h) => `${h.organization}\0${h.repository}\0${h.branch}`));
+  const branchesErrored = new Set(
+    errors
+      .filter((e) => e.scope === "scan" && typeof e.branch === "string" && e.branch !== "")
+      .map((e) => `${String(e.organization)}\0${String(e.repository)}\0${String(e.branch)}`)
+      .filter((k) => !headKeys.has(k)),
+  ).size;
+
+  // Validate the WHOLE head set ONCE, then feed the SAME validated array to BOTH derivations below. This
+  // replaces the old reliance on object-literal evaluation order (assertHeadsWellFormed ran INSIDE the
+  // summary property while buildScanScope trusted the raw `heads`), so a property reorder can no longer
+  // route an unguarded row into a count. assertHeadsWellFormed returns its input, so this is behaviourally
+  // identical — it just makes "gate before trust" a data-flow fact instead of a source-order coincidence.
+  const validatedHeads = assertHeadsWellFormed(heads);
+
   return {
+    formatVersion: XRAY_FORMAT_VERSION,
     runId,
     generatedAt: run.completedAt ?? run.startedAt, // §7: COALESCE(completed_at, started_at)
     config: {
@@ -133,20 +210,104 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     },
     packages,
     errors,
-    summary: buildSummary(scannedHeads, heads, depRows, usageRows),
+    // Both derivations consume the SAME validatedHeads (above) — NOT a filtered subset: the guard must
+    // run over the WHOLE set or the two counts drift, which is exactly how it once broke (buildScanScope
+    // guarded only policy-BEARING rows while buildSummary counted by status alone, so a 'policy-excluded'
+    // row naming no rule was counted as an exclusion yet never guarded — branchesExcludedByPolicy=1 with
+    // excludedByDeny+excludedByAllow=0). Sweeping the whole set makes the two impossible to drift apart.
+    summary: buildSummary(scannedHeads, validatedHeads, depRows, usageRows, branchesErrored),
+    scanScope: buildScanScope(validatedHeads),
   };
 }
 
-function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[]): ReportSummary {
+// The whole-set fail-closed sweep (PROMPT.md §7). Returns its input so it composes at the call site —
+// there is no path to a derived count that skips it.
+function assertHeadsWellFormed(heads: HeadRow[]): HeadRow[] {
+  for (const h of heads) assertRunUnitHeadSound(h, `${h.organization}/${h.repository}@${h.branch}`);
+  return heads;
+}
+
+function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[], branchesErrored: number): ReportSummary {
   const orgs = new Set(scannedHeads.map((h) => h.organization));
   const repos = new Set(scannedHeads.map((h) => `${h.organization}/${h.repository}`));
   return {
     organizationsScanned: orgs.size,
     repositoriesScanned: repos.size,
     branchesScanned: scannedHeads.length,
+    // The four dispositions partition allHeads by `status` alone (§5) — each row lands in exactly one
+    // bucket, and a policy exclusion is no longer a cutoff skip wearing a disambiguator.
     branchesSkippedByCutoff: allHeads.filter((h) => h.status === "skipped-cutoff").length,
+    branchesExcludedByPolicy: allHeads.filter(isPolicyExcluded).length,
+    branchesPastCap: allHeads.filter((h) => h.status === "past-cap").length,
+    branchesErrored,
     totalDependencyFindings: depRows.length,
     totalUsageFindings: usageRows.length,
+  };
+}
+
+// The ledger's disposition for ONE policy-bearing row, via the shared predicates only. The fail-closed
+// case lives in policyDisposition.ts (the ONE definition) so this surface and compare's policy churn
+// cannot drift apart on what an unrecognised policy-bearing row means.
+function dispositionOf(h: HeadRow): "scanned-default-override" | "excluded" {
+  assertRunUnitHeadSound(h, `${h.organization}/${h.repository}@${h.branch}`);
+  return isDefaultOverride(h) ? "scanned-default-override" : "excluded";
+}
+
+// Scan-scope diagnostics (PROMPT.md §7 scanScope). policyBranches lists every head with a policy_status (both the excluded
+// rows and the scanned default-overrides), deterministically sorted by (org, repo, branch).
+function buildScanScope(allHeads: HeadRow[]): ScanScope {
+  const policyRows = allHeads.filter((h) => h.policy_status !== null);
+  const policyBranches: PolicyBranchRow[] = policyRows
+    .map((h) => ({
+      organization: h.organization,
+      repository: h.repository,
+      branch: h.branch,
+      // BOTH shared predicates, never a `policy_status !== null` ternary. A binary
+      // `isDefaultOverride(h) ? override : excluded` would silently re-define "excluded" HERE as
+      // "policy-bearing but not an override" — a second definition competing with
+      // policyDisposition.ts, which exists precisely because that conflation is load-bearing
+      // (invariant: a non-null policy_status does NOT mean excluded). The write-path invariants
+      // (assertRunUnitHeadInvariants) make a third shape unreachable today — a past-cap row must carry
+      // policy_status null, and a scanned policy-bearing row must be the default — but those run at the
+      // WRITE chokepoint, not here, and a future disposition (e.g. an 'error' status) would land in the
+      // ternary's else-branch and be mislabelled EXCLUDED. Fail closed instead of guessing.
+      disposition: dispositionOf(h),
+      // CHECKED, never `as`-cast: dispositionOf's guard above validates this row's SHAPE and stops
+      // there, so the literal itself is only a promise until something reads it. See policyStatusOrThrow.
+      policyStatus: policyStatusOrThrow(h, `${h.organization}/${h.repository}@${h.branch}`),
+      matchedPattern: h.policy_matched_pattern,
+    }))
+    .sort((a, b) => cmp(`${a.organization}\0${a.repository}\0${a.branch}`, `${b.organization}\0${b.repository}\0${b.branch}`));
+  // Deny/allow sub-counts via an EXHAUSTIVE switch over the NARROWED policy_status, never a raw-string
+  // `=== "excluded-by-deny"` compare. The day PolicyStatus gains a member, a policy-excluded row carrying
+  // it would silently count in branchesExcludedByPolicy (buildSummary) yet in NEITHER sub-count, breaking
+  // the excludedByDeny+excludedByAllow == branchesExcludedByPolicy identity with no error — the compile-time
+  // analog of the run path's planPolicyDiagnostics sum-check. assertNever makes that day a BUILD error.
+  // policyStatusOrThrow narrows only the literal; the whole-row soundness gate already ran (validatedHeads
+  // upstream), so every isPolicyExcluded row here is validated and its policy_status is a known member.
+  let excludedByDeny = 0;
+  let excludedByAllow = 0;
+  for (const h of allHeads) {
+    if (!isPolicyExcluded(h)) continue;
+    const status = policyStatusOrThrow(h, `${h.organization}/${h.repository}@${h.branch}`);
+    switch (status) {
+      case "excluded-by-deny": excludedByDeny++; break;
+      case "excluded-by-allow": excludedByAllow++; break;
+      default: assertNever(status, "policy status");
+    }
+  }
+  return {
+    excludedByDeny,
+    excludedByAllow,
+    defaultBranchPolicyOverrides: allHeads.filter(isDefaultOverride).length,
+    policyBranches,
+    // Provenance is trustworthy ONLY for a v4-native run with at least one recorded head. A migrated
+    // pre-v4 run (the NULL scanned_commit_date backfilled by migrateV3toV4) never persisted past-cap
+    // branches and had no branch policy; a ZERO-head run carries no sentinel row at all, so its
+    // provenance is simply unverifiable (same treatment as compare.ts loadRunSlice). Either way the
+    // cap/policy counts may UNDERSTATE reality — flag it, don't present a false authoritative 0.
+    provenance:
+      allHeads.length === 0 || allHeads.some((h) => h.scanned_commit_date === null) ? "pre-upgrade" : "complete",
   };
 }
 
@@ -287,9 +448,9 @@ export function buildNotReportableNotice(runIdArg: string | null, missingDbPath?
 // AuditDb.open would create data/audit.db (create:true) and the emit path would mkdir outputDir;
 // a first report must touch NOTHING and just say so. So we exist-check before opening: a missing
 // database short-circuits with the notReportable notice and zero filesystem effect.
-// `report --html` (T3-T6): render one self-contained dossier per tracked package plus the
+// `report --html`: render one self-contained dossier per tracked package plus the
 // index, through the ArtifactBundle (kind "dossier" — export artifacts of the SAME run are
-// adopted, never swept). One JSONL event per dossier (T7), with the observations fallback
+// adopted, never swept). One JSONL event per dossier, with the observations fallback
 // VISIBLE (observations: "emitted"|"omitted"), then a dossier-summary event. The rendered
 // dossier/index bytes are a pure function of the report object; the caller already holds it, so
 // no re-query can disagree with run-<id>.json.
@@ -299,7 +460,7 @@ export function emitDossiers(report: EmittedReport, outputDir: string): { dossie
     generatedAt: report.generatedAt,
     config: report.config,
     summary: report.summary,
-    formatVersion: XRAY_FORMAT_VERSION,
+    formatVersion: report.formatVersion,
   };
   const bundle = new ArtifactBundle(outputDir, "dossier");
   let dossiers = 0;
@@ -315,7 +476,7 @@ export function emitDossiers(report: EmittedReport, outputDir: string): { dossie
       bytes: record.bytes, observations: observationsStatus, observationCount,
     });
   }
-  bundle.write(INDEX_FILENAME, renderIndex(report, { formatVersion: XRAY_FORMAT_VERSION }));
+  bundle.write(INDEX_FILENAME, renderIndex(report, { formatVersion: report.formatVersion }));
   const { swept } = bundle.finalize({ runId: report.runId });
   logLine({ event: "dossier-summary", runId: report.runId, dossiers, index: join(outputDir, XRAY_DIR_NAME, INDEX_FILENAME), swept });
   return { dossiers, swept };
@@ -331,7 +492,7 @@ export function runReport(config: Config, runIdArg: string | null, opts: { html?
     // code — and this matches the exit-0 behavior of the DB-present notReportable cases below.
     return { line: `${JSON.stringify(buildNotReportableNotice(runIdArg, sqlitePath))}\n` };
   }
-  // CV5: report is a pure READ — it must never create, migrate, or write the database. A
+  // Report is a pure READ — it must never create, migrate, or write the database. A
   // too-old schema renders the actionable "run `bun run audit` once to migrate" DbError.
   const db = AuditDb.openReadOnly({ sqlitePath });
   try {

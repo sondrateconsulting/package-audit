@@ -2,7 +2,7 @@
 
 *A dependency coupling report for your whole org.*
 
-<!-- hero screenshot: flagship dossier (P4: public-org data only) — captured in launch phase -->
+<!-- hero screenshot: flagship dossier (public-org data only) — captured in launch phase -->
 
 package-audit is an operator-run instrument that measures org-wide coupling of the npm packages you track: which of a package's exports your repos actually import and use, where, at which lockfile-resolved (or explicitly range-resolved) versions — every finding pinned to a commit SHA with a clickable permalink. You run it to completion on your own machine (Bun + SQLite, driving the `gh` CLI, [read-only by construction](#trust-why-it-cannot-write-to-your-org)) and it ships the answer as a document: a deterministic JSON report today, with an editorial HTML dossier, CSV/JSONL exports, and run comparison landing in this release cycle — all backed by a durable local database. We couldn't find another operator-run instrument that measures per-export usage across an org's repositories and branches and hands back a commit-pinned evidence document — code search platforms can measure usage too, as queries and dashboards on running infrastructure, and dependency scanners tell you *that* you depend on something; this ships *how deeply* as a standalone document and dataset, with receipts.
 
@@ -14,7 +14,7 @@ cd package-audit
 bun install   # required: `typescript` powers the .d.ts/source scanners at runtime; dev-only `@types/bun` + `zod` (report-schema tests)
 ```
 
-1. **Edit [config.json](config.json)** — set the packages you track. Your editor validates it against [config.schema.json](config.schema.json) via the `$schema` key, and unknown keys are rejected at startup (close typos get a did-you-mean hint). One scoping decision matters up front: `"organizations": null` (the default) is discovery mode — the tool enumerates *every* organization your gh token is a member of and scans all of them. Right for "audit everything I can see"; wrong for a client engagement run under a token with memberships outside the engagement. For engagements, set an explicit allowlist: `"organizations": ["client-org"]`.
+1. **Edit [config.json](config.json)** — set the packages you track. Your editor validates it against [config.schema.json](config.schema.json) via the `$schema` key, and unknown keys are rejected at startup (close typos get a did-you-mean hint). One *owner*-scoping decision matters up front: `"organizations": null` (the default) is discovery mode — the tool enumerates *every* organization your gh token is a member of and scans all of them. Right for "audit everything I can see"; wrong for a client engagement run under a token with memberships outside the engagement. For engagements, set an explicit allowlist: `"organizations": ["client-org"]`. Branch scope is a separate lever — see [Branch policy](#branch-policy).
 
 2. **Preview the scope** — resolves owners and discovers repos/branches, prints what *would* be scanned, and exits. Opens no database, writes nothing, fetches no file content:
 
@@ -33,15 +33,15 @@ The finished run writes `output/run-<run_id>.json` and `output/latest.json`. A l
 ### HTML dossier (`report --html`)
 
 `bun run report --html` additionally renders one self-contained HTML dossier per tracked package plus an `index.html` into `output/xray/`: an executive sentence, five decision cards, a usage-sorted API-surface table, a repo×export matrix, and collapsible permalinked evidence drawers (a package with no usage in the scanned slice renders a coverage-only empty state instead) — default-branch headline metrics (labeled all-branch fallback when attribution is unknown), printable, light + dark themes, no external resources. `--run-id <id>` renders a historical run's dossiers.
-<!-- hero screenshot for the README is captured from the flagship dossier in the launch phase (P4) -->
+<!-- hero screenshot for the README is captured from the flagship dossier in the launch phase -->
 
 ### Data exports (`export`)
 
-`bun run export` writes run-scoped CSV + JSONL snapshots of the four audit tables (plus a `manifest.json`) into `output/xray/` — the same run-selection and snapshot semantics as the report, portable into Sheets, Excel, DuckDB, and jq. `--run-id <id>` exports a historical run; `--raw` is a loudly-labeled full-table forensic dump. The column-by-column contract is [EXPORTS.md](EXPORTS.md) (sync-tested against the writers). See [Analyze the exports](#analyze-the-exports) below.
+`bun run export` writes run-scoped CSV + JSONL snapshots of the five audit tables (plus a `manifest.json`) into `output/xray/` — the same run-selection and snapshot semantics as the report, portable into Sheets, Excel, DuckDB, and jq. `--run-id <id>` exports a historical run; `--raw` is a loudly-labeled full-table forensic dump. The column-by-column contract is [EXPORTS.md](EXPORTS.md) (sync-tested against the writers). See [Analyze the exports](#analyze-the-exports) below.
 
 ### Run comparison (`compare`)
 
-`bun run compare <runA> <runB>` prints a deterministic run-diff as one JSON line: usage sites added and removed per export, repos entering and leaving — headline counts scoped to default branches when attribution is known (otherwise all branches, with an explicit note), plus all-branch detail. Note: `--fresh` erases run history, so runs from before a `--fresh` cannot be compared; keep the data directory if you want trends.
+`bun run compare <runA> <runB>` prints a deterministic run-diff as one JSON line: usage sites added and removed per export, repos entering and leaving — headline counts scoped to default branches when attribution is known (otherwise all branches, with an explicit note), plus all-branch detail, and a branch-policy churn dimension — branches that entered or left policy exclusion between the two runs, exclusions reclassified (deny/allow flipped or the causing pattern changed), and default-branch override changes — reported as unavailable (with the reason) when either run predates the policy-provenance schema or recorded no heads. Note: `--fresh` erases run history, so runs from before a `--fresh` cannot be compared; keep the data directory if you want trends.
 
 ## Prerequisites
 
@@ -103,6 +103,16 @@ GROUP BY resolved_version
 ORDER BY declarations DESC, resolved_version;
 ```
 
+Branches excluded by branch policy, by disposition and causing pattern:
+
+```sql
+SELECT policy_status, policy_matched_pattern, COUNT(*) AS branches
+FROM 'output/xray/run_unit_head.csv'
+WHERE status = 'policy-excluded'
+GROUP BY policy_status, policy_matched_pattern
+ORDER BY policy_status, policy_matched_pattern;
+```
+
 Published exports nobody imports (per the scanned slice):
 
 ```sql
@@ -125,9 +135,33 @@ jq -s 'group_by(.usage_type) | map({usage_type: .[0].usage_type, sites: length})
 
 Every field is documented in [config.schema.json](config.schema.json) (your editor shows the descriptions inline). Unknown keys are **rejected at startup** — close typos get a did-you-mean hint — so a typo can never silently widen or narrow the scan. Config file precedence: `--config <path>` > `CONFIG_PATH` env var > `./config.json`.
 
+### Branch policy
+
+`branches` (allowlist) and `excludeBranches` (denylist) select branches by name — exact strings or Bun globs, case-sensitive, never regex. `*` does not cross `/` but `**` does, so `release/**` catches `release/v2/rc1` and `release/*` does not. A leading `!` is rejected (no negation). Both are root-level — `concurrency.branches` is an unrelated setting that merely shares the word.
+
+Precedence:
+
+1. **A repository's default branch is always eligible** — exempt from both lists, and from `cutoffDate` and `maxBranchesPerRepo`. A default a rule *would* have dropped is scanned anyway, and the report records that counterfactual verdict.
+2. **Deny beats allow** — for every other branch.
+
+`branches` is tri-state: omitted or `null` is unrestricted (deny still applies); `[]` leaves only default branches; a non-empty list restricts eligibility to matches. `excludeBranches` omitted, `null`, or `[]` all mean no deny rules. Eligible is not scanned: surviving non-defaults still face the cutoff and the cap.
+
+Policy is applied **before** cutoff and cap, so a denied recent branch never consumes a cap slot an allowed older branch could have used — and it is recorded as `policy-excluded`, never as a cutoff skip.
+
+```json
+{
+  "branches": null,
+  "excludeBranches": ["release/**"]
+}
+```
+
+Every non-default branch stays eligible except `release/…` at any depth — but a repository whose *default* is `release/2.x` is still scanned.
+
+Configuring a policy changes `config_hash`, so the next audit starts a fresh run rather than resuming; the old hash's queue rows survive and are reused if you change back. Not every edit counts: the lists are canonicalized, so reordering or duplicating entries changes nothing, and a policy-free spelling hashes the same either way (`excludeBranches: []` and `null` are identical; `branches: []` is a configured policy and does differ from `null`). Preview with `bun run audit --plan`. It also prints advisory warnings: two for a rule that is doing nothing (a pattern that matched no discovered branch; a deny pattern whose only matches were default branches), and one for `branches: []`, which is the opposite — a rule doing a great deal, since it drops every non-default branch.
+
 ## Reading a run
 
-**stdout is pure JSONL during audit and plan runs** — one structured event per line, safe to pipe. Vocabulary: `config`, `preflight`, `owners`, `run`, `rescan-branch`, `cli-terms`, `plan`, `plan-summary`, `unit` (actions `scanned`, `skip-current`, `skip-cutoff`, `error`, `requeue-throttle`), `discovery`, `introspection`, `warning` (emitted when `--fresh` drops completed runs), `owner-discovery-throttled`, `done`. When GitHub rate-limiting persists past the retry budget, throttled work is **deferred, not failed**: a `unit` or `discovery` line carries `action` `requeue-throttle`, and an `owner-discovery-throttled` event carries `action` `retry-next-run` — the affected units are finished on the next run (a resumed run skips already-scanned units).
+**stdout is pure JSONL during audit and plan runs** — one structured event per line, safe to pipe. Vocabulary: `config`, `preflight`, `owners`, `run`, `rescan-branch`, `cli-terms`, `plan`, `plan-summary`, `unit` (actions `scanned`, `skip-current`, `skip-cutoff`, `skip-policy`, `past-cap`, `error`, `requeue-throttle`), `reconciliation` (action `prune-stale` — a repo-scoped line emitted when a resume prunes `run_unit_head` rows for branches deleted since a prior invocation, so a re-discovered repo's rows reflect its live branch set; the prune runs per repo, so a repo that is itself no longer discovered or kept this run — deleted, renamed, newly archived/fork-filtered, or displaced past `maxReposPerOrg` — is never revisited and keeps its prior rows), `discovery`, `introspection`, `warning` (emitted when `--fresh` drops completed runs), `policy-warning` (advisory branch-policy notices — kinds `unmatched-pattern` for a configured `branches`/`excludeBranches` pattern that matched no branch discovered this run, `default-only-deny` for an `excludeBranches` pattern whose only matches were default branches (which are always scanned, so it excluded nothing) — both rules doing nothing — and `empty-allowlist`, the opposite: `branches: []` drops every non-default branch), `owner-discovery-throttled`, `done`. When GitHub rate-limiting persists past the retry budget, throttled work is **deferred, not failed**: a `unit` or `discovery` line carries `action` `requeue-throttle`, and an `owner-discovery-throttled` event carries `action` `retry-next-run` — the affected units are finished on the next run (a resumed run skips already-scanned units).
 
 The presentation commands emit their own events: `report --html` writes one `dossier` line per package (`observations: emitted|omitted` makes the fallback visible) plus a `dossier-summary`; `export` writes one `export` line per artifact plus an `export-summary` (and a `warning` under `--raw`). Note `output/xray/` holds one run's artifacts at a time — regenerating either surface for a different run sweeps the other's stale files (re-run it with the same `--run-id`; the database keeps everything).
 

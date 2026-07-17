@@ -142,7 +142,7 @@ describe("evaluateObservations", () => {
 
   test("restatement-only vocabulary: no recommendations, predictions, difficulty judgments, or invocation wording", () => {
     // Render every rule's template against the full baseline facts and scan for banned words.
-    // 'call site(s)' is banned by CT1; the rest are the never-editorialize constraint.
+    // 'call site(s)' is banned by the binding vocabulary rule; the rest are the never-editorialize constraint.
     const banned = /\b(should|recommend|must|easy|hard|difficult|risky|likely|predict|consider|suggests|indicates|implies|migrate soon|migration|invoked|call sites?)\b/i;
     for (const rule of RULES) {
       const text = rule.template(facts({ repoCount: 1, singleRepoName: "org-a/app" }));
@@ -231,7 +231,7 @@ describe("deriveFacts — flattening the renderer's model", () => {
     expect(f.latestSurfaceExportCount).toBe(2);
     expect(f.usedFromLatestSurfaceCount).toBe(1); // A is in the latest surface, C is not headline
     expect(f.hotspotRepo).toBe("org-a/app");
-    expect(f.hotspotExportCount).toBe(2); // A + the whole-module bucket (CV3)
+    expect(f.hotspotExportCount).toBe(2); // A + the whole-module bucket
     expect(f.hotspotSiteCount).toBe(3);
   });
 

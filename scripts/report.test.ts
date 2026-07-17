@@ -3,9 +3,11 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AuditDb, nowIso } from "./db.ts";
+import { AuditDb, nowIso, type UnitHeadStatus } from "./db.ts";
+import { downgradeToFaithfulV2 } from "./testFixtures.ts";
 import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
+import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import type { Config } from "./config.ts";
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
@@ -20,8 +22,8 @@ function seed(db: AuditDb) {
   });
   const now = nowIso();
   const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
-  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null });
-  db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null });
+  db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+  db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
   db.upsertDependencyFinding({
     runId, ...unit, dateFetched: now, packageName: "expo", dependencyKey: "expo", dependencyType: "dependencies",
     manifestPath: "package.json", manifestLine: 5, manifestPermalink: "https://github.com/org-a/svc/blob/abc123def/package.json#L5",
@@ -78,7 +80,13 @@ describe("buildReport (§7)", () => {
 
     expect(report.summary).toEqual({
       organizationsScanned: 1, repositoriesScanned: 1, branchesScanned: 1,
-      branchesSkippedByCutoff: 1, totalDependencyFindings: 1, totalUsageFindings: 2,
+      branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
+      totalDependencyFindings: 1, totalUsageFindings: 2,
+    });
+    // new top-level report fields
+    expect(report.formatVersion).toBe(XRAY_FORMAT_VERSION);
+    expect(report.scanScope).toEqual({
+      excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "complete",
     });
     db.close();
   });
@@ -102,7 +110,7 @@ describe("buildReport (§7)", () => {
         manifestPath: "package.json", manifestLine: 1, manifestPermalink: `https://github.com/org-a/${repository}/blob/sha/package.json#L1`,
         declaredVersion: "^50.0.0",
       });
-      db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository, branch: "main", commitSha: `sha-${repository}`, status: "scanned", isDefaultBranch });
+      db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository, branch: "main", commitSha: `sha-${repository}`, status: "scanned", isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     };
     mk("r-default", true);
     mk("r-feature", false);
@@ -112,6 +120,416 @@ describe("buildReport (§7)", () => {
     );
     expect(flags).toEqual({ svc: null, "r-default": true, "r-feature": false });
     db.close();
+  });
+
+  test("disposition partition + scanScope across all four buckets (deny/allow/default-override/past-cap)", () => {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const head = (branch: string, status: UnitHeadStatus, extra: {
+      isDefaultBranch?: boolean | null; policyStatus?: "excluded-by-deny" | "excluded-by-allow" | null; policyMatchedPattern?: string | null;
+    } = {}): void => {
+      db.upsertRunUnitHead({
+        runId, organization: "org-a", repository: "svc", branch,
+        commitSha: status === "scanned" ? `sha-${branch}` : "",
+        status, isDefaultBranch: extra.isDefaultBranch ?? null,
+        policyStatus: extra.policyStatus ?? null, policyMatchedPattern: extra.policyMatchedPattern ?? null,
+        // required non-null on every write: scanned commit's date on a scanned row, discovered-head date otherwise
+        scannedCommitDate: "2025-06-01T12:00:00Z",
+      });
+    };
+    // 3 scanned (one a default-branch override that a deny pattern would otherwise exclude),
+    // 1 genuine cutoff, 1 deny-excluded, 1 allow-miss-excluded, 1 past-cap → 7 heads total.
+    head("main", "scanned", { isDefaultBranch: true });
+    head("develop", "scanned", { isDefaultBranch: false });
+    const hostilePattern = "release/<img src=x onerror=alert(1)>*"; // carried verbatim in the JSON model
+    head("release/9.0", "scanned", { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: hostilePattern });
+    head("stale", "skipped-cutoff"); // genuine cutoff (no policy) — is_default_branch may stay null
+    // policy-excluded + past-cap rows are known non-defaults → is_default_branch MUST be false
+    head("feature/x", "policy-excluded", { isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*" });
+    head("wip/y", "policy-excluded", { isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null }); // allow-list miss
+    head("over-cap", "past-cap", { isDefaultBranch: false });
+    db.completeRun(runId);
+    const report = buildReport(db, db.getRun(runId)!) as any;
+
+    const s = report.summary;
+    expect(s).toMatchObject({
+      branchesScanned: 3, // includes the default-override row
+      branchesSkippedByCutoff: 1, // genuine cutoff ONLY (policy exclusions are their own bucket)
+      branchesExcludedByPolicy: 2,
+      branchesPastCap: 1,
+    });
+    // the four disposition buckets are a disjoint partition of every discovered head
+    const totalHeads = 7;
+    expect(s.branchesScanned + s.branchesSkippedByCutoff + s.branchesExcludedByPolicy + s.branchesPastCap).toBe(totalHeads);
+
+    expect(report.scanScope).toEqual({
+      excludedByDeny: 1, // feature/x — the default-override deny does NOT count as an exclusion
+      excludedByAllow: 1, // wip/y
+      defaultBranchPolicyOverrides: 1, // release/9.0
+      policyBranches: [
+        { organization: "org-a", repository: "svc", branch: "feature/x", disposition: "excluded", policyStatus: "excluded-by-deny", matchedPattern: "feature/*" },
+        { organization: "org-a", repository: "svc", branch: "release/9.0", disposition: "scanned-default-override", policyStatus: "excluded-by-deny", matchedPattern: hostilePattern },
+        { organization: "org-a", repository: "svc", branch: "wip/y", disposition: "excluded", policyStatus: "excluded-by-allow", matchedPattern: null },
+      ],
+      provenance: "complete", // every head carries a non-null scanned_commit_date
+    });
+    // hostile pattern is carried BYTE-VERBATIM in the data model — escaping is the HTML layer's job
+    expect(report.scanScope.policyBranches[1].matchedPattern).toBe(hostilePattern);
+    db.close();
+  });
+
+  test("partition counts RECORDED disposition rows only — a scan-errored discovered branch is in errors[], not a bucket", () => {
+    const db = mem();
+    const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    // 'main' reached a terminal disposition (scanned). 'feature' was discovered + eligible but its scan
+    // ERRORED — it writes NO run_unit_head row (only an errors[] entry), so it is in no disposition bucket.
+    db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "main", commitSha: "sha-main", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T00:00:00Z" });
+    db.insertError({ runId, scope: "scan", organization: "org-a", repository: "svc", branch: "feature", message: "tree fetch failed" });
+    db.completeRun(runId);
+    const report = buildReport(db, db.getRun(runId)!) as any;
+    // the four disposition buckets sum to the RECORDED rows (1: main) — 'feature' is in none of them…
+    expect(report.summary).toMatchObject({ branchesScanned: 1, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0 });
+    // …it is counted as ERRORED instead, so the summary reconciles to BOTH discovered heads
+    expect(report.summary.branchesErrored).toBe(1);
+    const s = report.summary;
+    expect(s.branchesScanned + s.branchesSkippedByCutoff + s.branchesExcludedByPolicy + s.branchesPastCap + s.branchesErrored).toBe(2);
+    // and 'feature' carries its scan failure in errors[]
+    expect(report.errors.some((e: any) => e.branch === "feature" && e.scope === "scan")).toBe(true);
+    db.close();
+  });
+
+  test("the scan-scope ledger FAILS CLOSED on a policy-bearing row that is neither excluded nor an override", () => {
+    // The ledger must decide via BOTH shared predicates, never `isDefaultOverride(h) ? … : "excluded"` —
+    // that binary form would re-define "excluded" as "policy-bearing but not an override", a second
+    // definition competing with policyDisposition.ts. This shape is unreachable through BOTH the write
+    // chokepoint AND a v4 CHECK (a past-cap row must carry policy_status null) — so the forge below
+    // SUSPENDS check enforcement to prove the READ surface fails closed on its OWN. That is not a
+    // contrived state: the guard's job is to defend a row that never passed our writer (a foreign or
+    // sibling file that survived classification, or a disposition added later without updating this
+    // surface), and the pragma is the only way to reach it now that the schema forbids it.
+    // Same ./data containment idiom as the provenance test below (§0 forbids writes outside ./data).
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-ledger-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      // forge past-cap + policy_status: forbidden by the write path AND by a v4 CHECK, so enforcement
+      // is suspended for this one INSERT (the pragma is connection-scoped and never touches the file's
+      // schema — AuditDb.open below re-reads the same CHECKs and still classifies the file as ours-v4).
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.exec("PRAGMA ignore_check_constraints = ON");
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'past-cap', 0, 'excluded-by-deny', 'weird', '2025-06-01T00:00:00Z')`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/neither a policy exclusion nor a default-branch override/);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  // The two shapes the ledger's OWN filter used to hide. Both are regressions the whole-set sweep in
+  // buildReportInner exists to prevent: the guard used to run only over policy-BEARING rows, while the
+  // summary counts by status alone, so these were counted (or labelled) without ever being validated.
+
+  test("the ledger FAILS CLOSED on a BLOB smuggled into a text column — non-STRICT storage, foreign runtime type", () => {
+    // SQLite without STRICT stores any type; bun:sqlite returns a Uint8Array the row type never
+    // admits (round-5: a one-byte BLOB deny pattern exported as {"0":120}).
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-blob-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'policy-excluded', 0, 'excluded-by-deny', x'78', '2025-06-01T00:00:00Z')`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/foreign runtime type/);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test("the ledger FAILS CLOSED on a v4-native disposition claiming MIGRATED provenance (NULL date)", () => {
+    // v3 had only scanned/skipped-cutoff, so a policy-excluded row with the migrated-row NULL
+    // sentinel is impossible provenance — and the NULL would otherwise exempt it from the native
+    // rules (round-4 finding, reproduced: it was counted and emitted).
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-nulldate-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'policy-excluded', 0, 'excluded-by-deny', 'rel*', NULL)`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/cannot be a migrated row/);
+      // Round-5's shape: the policy COLUMNS are v4-only too — a scanned default override with NULL
+      // provenance is equally impossible and must not slip a status-only version of the rule.
+      const forge2 = new Database(sqlitePath, { strict: true });
+      forge2.query(`DELETE FROM run_unit_head`).run();
+      forge2.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'main', 'abc', 'scanned', 1, 'excluded-by-deny', 'rel*', NULL)`).run(runId);
+      forge2.close();
+      const db3 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db3, db3.getRun(runId)!)).toThrow(/carrying policy_status.*cannot be a migrated row/);
+      db3.close();
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test("the ledger FAILS CLOSED on a NON-NULL scanned_commit_date that is not an ISO instant", () => {
+    // A non-null date is what marks a row NATIVE (vs the migrated-row NULL sentinel), and it feeds
+    // scanScope provenance — garbage here reported provenance 'complete' (round-4 finding,
+    // reproduced). The write chokepoint validates with the SAME shared isIsoInstant.
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-date-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', 'abc', 'scanned', 0, NULL, NULL, 'not-an-iso-date')`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/not an ISO instant/);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test.each([
+    [
+      "policy-excluded naming NO rule is counted as an exclusion — it must not slip past the guard's null-policy early return",
+      `'', 'policy-excluded', 0, NULL, NULL`,
+      /is status='policy-excluded' but carries no policy_status/,
+    ],
+    [
+      // Premise 6's mirror image: the default is ALWAYS scanned, so it can never be an exclusion.
+      // Schema-valid (no CHECK covers defaultness — one there could fail a v3 row at migration time),
+      // which is exactly why the read guard has to carry this rule.
+      "policy-excluded on a DEFAULT branch — schema-valid, and it contradicts default-always-scanned",
+      `'', 'policy-excluded', 1, 'excluded-by-deny', 'rel*'`,
+      // Caught by the GENERAL native default⇒scanned rule (which orders first); the policy-
+      // excluded-SPECIFIC defaultness rule keeps direct coverage via the UNKNOWN-defaultness case.
+      /is is_default_branch=1 but status="policy-excluded"/,
+    ],
+    [
+      "policy-excluded with UNKNOWN defaultness (null) — a policy exclusion is always a definite non-default",
+      `'', 'policy-excluded', NULL, 'excluded-by-deny', 'rel*'`,
+      /is status='policy-excluded' with is_default_branch=null/,
+    ],
+    [
+      // The DDL's deny CHECK has no converse, so this is schema-VALID — and the ledger would report a
+      // causing pattern that never caused anything.
+      "an allow-exclusion carrying a deny pattern — schema-valid, and the pattern is fiction",
+      `'', 'policy-excluded', 0, 'excluded-by-allow', 'rel*'`,
+      /carries policy_matched_pattern.*only a deny names a causing pattern/,
+    ],
+    [
+      "a BOGUS policy token — otherwise counted AND emitted as if it were a real verdict",
+      `'', 'policy-excluded', 0, 'excluded-by-vibes', NULL`,
+      /policy_status="excluded-by-vibes", outside the known domain/,
+    ],
+    [
+      // A status outside the four belongs to NO bucket, so the counts silently stop summing — this is
+      // also exactly how a future 'error' disposition would arrive.
+      "an UNKNOWN status with no policy — it would land in no disposition bucket at all",
+      `'', 'reused', 0, NULL, NULL`,
+      /status="reused", outside the four known dispositions/,
+    ],
+    [
+      "a SCANNED policy row that is not the default is schema-VALID (scanned may carry a counterfactual) but must not be guessed into an override",
+      `'abc123', 'scanned', 0, 'excluded-by-deny', 'rel*'`,
+      /scanned row carrying policy_status.*but is_default_branch=0/,
+    ],
+    [
+      // Schema-valid: commit_sha has no CHECK at all. Without this rule the findings join attaches
+      // rows parked at the empty SHA — the poison-leak reproduced in round 3.
+      "a SCANNED row with commit_sha='' — the findings join would attach rows parked at the empty SHA",
+      `'', 'scanned', 0, NULL, NULL`,
+      /is scanned but has commit_sha=''/,
+    ],
+    [
+      "a NON-scanned row carrying a commit_sha — only a scanned row pins a commit",
+      `'abc123', 'skipped-cutoff', 0, NULL, NULL`,
+      /only a scanned row pins a commit/,
+    ],
+    [
+      // The SQL deny CHECK is IS NOT NULL, so '' satisfies it — schema-valid.
+      "a deny exclusion with an EMPTY causing pattern — '' passes the SQL CHECK but names nothing",
+      `'', 'policy-excluded', 0, 'excluded-by-deny', ''`,
+      /is excluded-by-deny but names no causing pattern/,
+    ],
+    [
+      // The OTHER half of that OR: a leading '!' is Bun.Glob NEGATION syntax, rejected at config load
+      // (config.ts::validateBranchPattern) and so never a real stored pattern. Schema-VALID ('!release/**' IS NOT
+      // NULL → the deny CHECK passes), which is exactly why the read guard must carry it: the write
+      // chokepoint's G1b pins the same rule (db.test.ts), but the read matrices previously forged only
+      // the empty-string case, so dropping just the startsWith("!") clause would slip past every test.
+      "a deny exclusion whose stored pattern is '!'-prefixed — config-negation syntax, never a stored pattern",
+      `'', 'policy-excluded', 0, 'excluded-by-deny', '!release/**'`,
+      /is excluded-by-deny but names no causing pattern/,
+    ],
+    [
+      // The forge writes a REAL scanned_commit_date, so the row claims to be NATIVE v4 — and a native
+      // default is always scanned (a v3-migrated row's NULL date exempts it from this rule).
+      "a NATIVE default branch that is not scanned — Premise 6 enforced on the read path",
+      `'', 'skipped-cutoff', 1, NULL, NULL`,
+      /is is_default_branch=1 but status="skipped-cutoff"/,
+    ],
+    [
+      "past-cap with UNKNOWN defaultness — past-cap is v4-native and always a definite non-default",
+      `'', 'past-cap', NULL, NULL, NULL`,
+      /past-cap rows are always a definite non-default/,
+    ],
+    [
+      // No SQL CHECK covers this column, so 2 is schema-valid — and report.ts's `=== 1` coercion
+      // would silently relabel it "not the default" (round-4 finding, reproduced).
+      "is_default_branch=2 — outside the tri-state; coercion would launder it to false",
+      `'abc', 'scanned', 2, NULL, NULL`,
+      /has is_default_branch=2 — the tri-state is 1\/0\/NULL/,
+    ],
+  ])("the ledger FAILS CLOSED: %s", (_name, values, expected) => {
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-guard-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.exec("PRAGMA ignore_check_constraints = ON"); // only the first shape needs this; the second is schema-valid
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', ${values}, '2025-06-01T00:00:00Z')`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(expected);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test("the scan-scope ledger FAILS CLOSED on an OUT-OF-BAND policy_status literal (never stamped into the emitted JSON)", () => {
+    // The test.each above forges disagreeing SHAPES; this forges an unrecognised VALUE on a shape the
+    // gate otherwise accepts (policy-excluded, definite non-default, no pattern, native date). The
+    // whole-row gate validates the literal itself: a bogus token belongs to NO verdict and must never
+    // be counted or stamped into policyBranches[].policyStatus, which is typed as exactly two
+    // literals. Nothing produces this today (the v4 column CHECK constrains the value and
+    // classifyRunUnitHead refuses a table whose CHECK set differs), hence the forge past the CHECK —
+    // this is the read-side backstop for a value that arrived out of band; policyStatusOrThrow at the
+    // stamping site is the second layer that keeps the emitted type a promise the code checks.
+    // Same ./data containment idiom as the sibling (§0 forbids writes outside ./data).
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-literal-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      db.completeRun(runId);
+      db.close();
+      // ignore_check_constraints is what makes this forge possible at all: the column CHECK genuinely
+      // rejects this literal, so the write path AND SQLite both have to be stepped around to simulate
+      // external damage / a future status.
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.exec("PRAGMA ignore_check_constraints = ON");
+      forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'sideways', '', 'policy-excluded', 0, 'excluded-by-sideways', null, '2025-06-01T00:00:00Z')`).run(runId);
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/outside the known domain/);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test("RESUME: a branch holding a RETAINED row that errors later is NOT in branchesErrored (no double-count)", () => {
+    // The resumed-run shape the single-invocation test above cannot reach. A resumed run reuses the
+    // run_id, so errors[] and run_unit_head both span invocations:
+    //   invocation 1 — main scanned@A, writing a row.
+    //   invocation 2 — main advanced to B; the re-scan errors. No new row, and reconciliation's name-keyed prune
+    //                  RETAINS invocation 1's row (main is still a live branch).
+    // main therefore holds BOTH a row and a scan error. It is counted ONCE — in branchesScanned, via the
+    // retained row — and NOT in branchesErrored. Deliberate: counting it in both would count one
+    // discovered branch twice and break the partition. This is exactly why branchesErrored must be read
+    // as "errored branches holding no row" and NOT as "every branch whose scan errored" (see report.ts).
+    const db = mem();
+    const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "main", commitSha: "sha-A", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-05-01T00:00:00Z" });
+    db.insertError({ runId, scope: "scan", organization: "org-a", repository: "svc", branch: "main", message: "tree boom at sha-B" });
+    db.completeRun(runId);
+    const report = buildReport(db, db.getRun(runId)!) as any;
+    expect(report.summary.branchesErrored).toBe(0); // suppressed by the row-key exclusion — NOT a bug
+    expect(report.summary.branchesScanned).toBe(1); // counted here instead, at the OLDER head
+    // the error stays visible to a reader, so the tension is not hidden — only the COUNT omits it
+    expect(report.errors.some((e: any) => e.branch === "main" && e.scope === "scan")).toBe(true);
+    // and the branch is counted exactly ONCE across the buckets + errored (the partition holds)
+    const s = report.summary;
+    expect(s.branchesScanned + s.branchesSkippedByCutoff + s.branchesExcludedByPolicy + s.branchesPastCap + s.branchesErrored).toBe(1);
+    db.close();
+  });
+
+  test("a completed run with ZERO heads has unverifiable provenance → 'pre-upgrade', never a false 'complete'", () => {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    db.completeRun(runId); // reportable, but no run_unit_head rows were ever written (e.g. all discovery failed)
+    const report = buildReport(db, db.getRun(runId)!) as any;
+    // zero heads carry NO sentinel, so `.some()` is vacuously false — must NOT be reported as complete
+    expect(report.scanScope.provenance).toBe("pre-upgrade");
+    expect(report.summary.branchesScanned).toBe(0);
+    db.close();
+  });
+
+  test("a migrated pre-v4 run (NULL scanned_commit_date sentinel) marks scanScope provenance 'pre-upgrade'", () => {
+    // file-backed: the forge trick (a NULL scanned_commit_date the write path forbids) needs a real
+    // DB handle. Same ./data containment idiom as the runReport file tests below.
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-prov-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const run = seed(db); // heads carry non-null dates → a fresh run would be "complete"
+      db.close();
+      const forge = new Database(sqlitePath, { strict: true });
+      forge.exec("UPDATE run_unit_head SET scanned_commit_date = NULL"); // the pre-v4 migration state
+      forge.close();
+      const db2 = AuditDb.open({ sqlitePath });
+      const report = buildReport(db2, db2.getRun(run.runId)!) as any;
+      expect(report.scanScope.provenance).toBe("pre-upgrade");
+      // the counts still render (best-available) — provenance is what tells the reader they understate
+      expect(report.summary.branchesScanned).toBe(1);
+      db2.close();
+    } finally {
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
   });
 
   test("a version whose introspection FAILED (no marker) is omitted from apiSurface but kept in versionsSeen", () => {
@@ -124,7 +542,7 @@ describe("buildReport (§7)", () => {
       manifestPath: "package.json", manifestLine: 3, manifestPermalink: "https://github.com/org-a/svc2/blob/def456/package.json#L3",
       declaredVersion: "^49.0.0", resolvedVersion: "49.0.0", resolvedVersionSource: "lockfile",
     });
-    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456", status: "scanned", isDefaultBranch: null });
+    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc2", branch: "main", commitSha: "def456", status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     const report = buildReport(db, run) as any;
     const pkg = report.packages[0];
     expect(pkg.versionsSeen).toEqual(["49.0.0", "50.0.7"]); // both present, semver-sorted
@@ -159,6 +577,18 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
     const run = seed(db);
     const drifted = { ...buildReport(db, run), extraField: 1 };
     expect(reportSchema.safeParse(drifted).success).toBe(false);
+    db.close();
+  });
+  test("formatVersion is PINNED to XRAY_FORMAT_VERSION — a mislabeled v-shape fails the discriminator", () => {
+    const db = mem();
+    const run = seed(db);
+    const report = buildReport(db, run);
+    expect(report.formatVersion).toBe(XRAY_FORMAT_VERSION);
+    expect(reportSchema.safeParse(report).success).toBe(true); // the real version validates
+    // a v2-shaped report mislabeled as another version must NOT pass the authoritative contract
+    for (const wrong of [1, -1, 999]) {
+      expect(reportSchema.safeParse({ ...report, formatVersion: wrong }).success).toBe(false);
+    }
     db.close();
   });
   test("the REAL not-reportable notice (all three branches) matches its schema", () => {
@@ -246,6 +676,7 @@ describe("runReport zero-write on a missing database", () => {
     cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
     includeArchived: false, includeForks: false, includePersonalNamespace: false,
     maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],
+    branches: null, excludeBranches: [],
     packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
     // both under root, which starts empty — any create/mkdir would leave a trace
     paths: { sqlitePath: join(root, "data", "audit.db"), outputDir: join(root, "output") },
@@ -275,7 +706,7 @@ describe("runReport zero-write on a missing database", () => {
   // Contrast case: when the database OPENS but holds no completed run, report must still write
   // the notice to output/latest.json — proving the missing-db guard only short-circuits the
   // genuinely-absent case and does not suppress a real (if empty) report. runReport now opens
-  // READ-ONLY (CV5), which refuses :memory:, so the empty DB must be a real FILE — and §0
+  // READ-ONLY, which refuses :memory:, so the empty DB must be a real FILE — and §0
   // write-containment pins file DBs to ./data|./output relative to CWD, hence the db.test.ts
   // TEST_ROOT idiom here (created and removed carefully so fresh checkouts stay pristine).
   test("DB opens but no completed run: writes the notice to latest.json, no run file", () => {
@@ -303,17 +734,12 @@ describe("runReport zero-write on a missing database", () => {
     const dbRoot = `./data/.reporttest-v2-${process.pid}-${Math.random().toString(36).slice(2)}`;
     const root = mkdtempSync(join(tmpdir(), "report-v2db-"));
     try {
-      // Faithful v2 file: a v3 create downgraded to the v2 SHAPE (drop the v3 column) before
-      // the v2 stamp. openReadOnly's ownership check precedes its version gate, so a fixture
-      // must actually BE a v2 database — a v3-shaped file merely wearing the stamp is a state
-      // the tool never produces (migration stamps atomically with the ALTER) and is refused
-      // as not-ours, which is a different test's contract.
+      // Faithful v2 file (shared fixture — see testFixtures.ts for why a rebuild, not a
+      // column drop): openReadOnly's ownership check precedes its version gate, so the fixture
+      // must actually BE a v2 database.
       const sqlitePath = join(dbRoot, "audit.db");
-      AuditDb.open({ sqlitePath }).close(); // create a real v3 db…
-      const bump = new Database(sqlitePath, { strict: true });
-      bump.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch"); // …downgrade to the v2 shape
-      bump.exec("PRAGMA user_version = 2"); // …then stamp it old
-      bump.close();
+      AuditDb.open({ sqlitePath }).close(); // create a real current-version db…
+      downgradeToFaithfulV2(sqlitePath); // …then rebuild it to the v2 era + old stamp
       const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
       expect(() => runReport(cfg, null)).toThrow(/run `bun run audit` once to migrate/);
       expect(existsSync(join(root, "output"))).toBe(false); // refused before any artifact write
@@ -342,6 +768,7 @@ describe("report --html wiring (emitDossiers + runReport integration)", () => {
     cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
     includeArchived: false, includeForks: false, includePersonalNamespace: false,
     maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],
+    branches: null, excludeBranches: [],
     packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
     paths: { sqlitePath: join(root, "data", "audit.db"), outputDir: join(root, "output") },
   });
@@ -476,13 +903,13 @@ describe("buildReport — run-scope head-join discrimination (M7)", () => {
       declaredVersion: "^50.0.0", resolvedVersion: "50.0.9", resolvedVersionSource: "lockfile" as const,
     };
     const { runId: rA } = db.startRun(input);
-    db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.upsertUsageFinding({ runId: rA, ...usage });
     db.upsertDependencyFinding({ runId: rA, ...dep });
     db.completeRun(rA);
     Bun.sleepSync(2);
     const { runId: rB } = db.startRun(input);
-    db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true });
+    db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.upsertUsageFinding({ runId: rB, ...usage }); // same UNIQUE key → uf.run_id moves to rB
     db.upsertDependencyFinding({ runId: rB, ...dep }); // same UNIQUE key → df.run_id moves to rB
     db.completeRun(rB);
