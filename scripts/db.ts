@@ -528,11 +528,12 @@ export function tableShapesAt(version: number): Map<string, string> {
 // table matching every column tuple but missing our FK/UNIQUE/AUTOINCREMENT semantics would
 // compare equal. Index/FK signatures deliberately drop declaration-order artifacts (autoindex
 // numbering, the fk id itself) while KEEPING per-constraint grouping and in-constraint column
-// order, sorted across constraints. Still not FULL DDL equality: CHECK constraint bodies,
-// collations, ON CONFLICT clauses, FK deferrability and FK MATCH clauses stay invisible (all live only in SQL
-// text, whose exact matching would be brittle against legitimate ALTER-rewritten histories) —
-// the residual false-positive is a table matching columns AND constraint structure exactly,
-// differing only in those. (PRAGMA cannot bind — `table` is validated against
+// order, sorted across constraints. CHECK constraint bodies and the pragma-invisible tokens
+// (collations, STRICT, ON CONFLICT, FK deferrability, FK MATCH) ALSO count now — they join the
+// fingerprint below via extractChecks + sqlHasBareToken over the stored CREATE text, so a sibling
+// differing only in a CHECK body or one of those clauses no longer compares equal. The residual
+// false-positive is now only a table matching columns, constraint structure, CHECK multiset AND
+// token-freedom exactly (an exact clone). (PRAGMA cannot bind — `table` is validated against
 // AUDIT_TABLE_SET, same contract as columnExists. Index names come from index_list's own
 // output over those fixed audit table names, and an autoindex name embeds its table's name —
 // so the names reaching index_xinfo contain no quote characters; they are interpolated with
@@ -660,9 +661,9 @@ function tableShape(db: Database, table: string): string {
 // rejected by the compatibility gate on both opens (see assertOpenCompatible gate b). What a
 // subset can never do is carry a non-audit shape. A real database of ours matches by
 // construction: creates, migrations and self-heals all run the same SCHEMA_SQL the
-// references derive from. (Shape is still not FULL DDL equality — CHECK bodies, collations,
-// ON CONFLICT clauses, FK deferrability and FK MATCH clauses are invisible, though FKs, PK/UNIQUE structure and
-// AUTOINCREMENT do count — see tableShape. hasForeignObjects separately rejects every
+// references derive from. (Shape now includes CHECK bodies and the pragma-invisible tokens —
+// collations, STRICT, ON CONFLICT, FK deferrability, FK MATCH — alongside FKs, PK/UNIQUE structure
+// and AUTOINCREMENT; see tableShape. hasForeignObjects separately rejects every
 // non-table object kind and every non-audit table name, so what remains adoptable is exactly:
 // audit-named tables in owned shapes under an owned stamp.)
 function hasOwnedTableSet(db: Database): boolean {
