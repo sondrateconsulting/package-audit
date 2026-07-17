@@ -98,6 +98,46 @@ describe("validateAndNormalize — validation failures", () => {
     expect(() => norm({ ...baseRaw(), excludeDirGlobs: ["**/dist/**", ""] }))
       .toThrow(/excludeDirGlobs\[1\] must be a non-empty string/);
   });
+
+  // `organizations` and `branches` each name a root-level allowlist AND a concurrency parallelism
+  // limit. The hint fires only when the VALUE fits the sibling — a wrong hint is worse than none.
+  describe("sibling-key hints for the root/concurrency name collision", () => {
+    const conc = (over: Record<string, unknown>) =>
+      ({ ...baseRaw(), concurrency: { organizations: 3, repositories: 6, branches: 4, ...over } });
+
+    test("a LIST under concurrency.<k> points at the root-level allowlist of that name", () => {
+      expect(() => norm(conc({ branches: ["main", "release/*"] })))
+        .toThrow(/concurrency\.branches must be a positive integer — for a list of branch names you likely meant the root-level "branches" allowlist/);
+      expect(() => norm(conc({ organizations: ["acme"] })))
+        .toThrow(/concurrency\.organizations must be a positive integer — for a list of organization names you likely meant the root-level "organizations" allowlist/);
+    });
+
+    test("a NUMBER under root branches names BOTH numeric twins — guessing between them would be a coin flip", () => {
+      expect(() => norm({ ...baseRaw(), branches: 4 }))
+        .toThrow(/branches must be null or an array of strings — for a number you likely meant "concurrency\.branches" \(per-repo branch parallelism\) or "maxBranchesPerRepo" \(the per-repo branch cap\)/);
+    });
+
+    test("a NUMBER under root organizations names its one twin", () => {
+      expect(() => norm({ ...baseRaw(), organizations: 3 }))
+        .toThrow(/organizations must be null or an array of strings — for a number you likely meant "concurrency\.organizations" \(owner-level parallelism\)/);
+    });
+
+    test("SILENT when the value fits no sibling: the base error stands alone", () => {
+      expect(() => norm({ ...baseRaw(), branches: { a: 1 } })).toThrow(/^branches must be null or an array of strings$/);
+      expect(() => norm({ ...baseRaw(), organizations: "acme" })).toThrow(/^organizations must be null or an array of strings$/);
+      // 0 is not a positive integer — it fits neither concurrency.branches nor maxBranchesPerRepo.
+      expect(() => norm({ ...baseRaw(), branches: 0 })).toThrow(/^branches must be null or an array of strings$/);
+      expect(() => norm(conc({ branches: "4" }))).toThrow(/^concurrency\.branches must be a positive integer$/);
+    });
+
+    test("SILENT for a '!'-prefixed list — the root allowlist would reject it too, so the hint would trade one error for another", () => {
+      expect(() => norm(conc({ branches: ["!main"] }))).toThrow(/^concurrency\.branches must be a positive integer$/);
+    });
+
+    test("concurrency.repositories has no root-level twin and never hints", () => {
+      expect(() => norm(conc({ repositories: ["a"] }))).toThrow(/^concurrency\.repositories must be a positive integer$/);
+    });
+  });
 });
 
 describe("computeConfigHash — determinism + scope", () => {

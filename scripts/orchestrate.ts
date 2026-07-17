@@ -873,7 +873,13 @@ export function planSummaryText(
     `  Packages tracked:     ${config.packages.map((p) => p.name).join(", ")}`,
     `  Discovery errors:     ${t.discoveryErrors}`,
     ...policyWarningLines(warnings),
-    `  Next:                 bun run audit   (narrow scope first via "organizations" in the config if this is broader than intended)`,
+    // Names the two coarse POSITIVE selectors for the dimensions the block above actually reports —
+    // owners and branches. Deliberately not a lever inventory: excludeOrganizations, excludeBranches,
+    // cutoffDate, maxReposPerOrg and maxBranchesPerRepo all narrow too, but they refine a universe
+    // rather than define it, and a hint listing every lever tells you nothing. "organizations" stays
+    // first because it is the real blast radius (discovery mode enumerates every org the token can
+    // see); branch policy never shrinks the repo set and cannot exclude a default branch.
+    `  Next:                 bun run audit   (if broader than intended, narrow the root-level allowlists first: "organizations" and/or "branches")`,
     "",
   ];
   return lines.join("\n");

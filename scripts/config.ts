@@ -75,6 +75,37 @@ const isString = (v: unknown): v is string => typeof v === "string";
 const isBool = (v: unknown): v is boolean => typeof v === "boolean";
 const isPosInt = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 1;
 
+// ---- sibling-key hints for the two names that exist at BOTH levels ---------------------------
+// `organizations` and `branches` each name a root-level ALLOWLIST *and* a `concurrency` PARALLELISM
+// limit — two unrelated settings, one word. config.schema.json warns about the collision inline, but
+// nobody reads a schema description while staring at a startup failure, so the error itself says
+// where the value belongs (the same "name where each thing goes" idea as the `!`-rejection below).
+// Both hints fire ONLY when the value's shape actually fits the sibling: a wrong hint — telling
+// someone they meant the other key when they simply mistyped this one — is worse than no hint.
+// `concurrency.repositories` has no root-level twin and never hints.
+
+// A LIST of non-empty names under `concurrency.<k>` can only have been meant as the root-level
+// allowlist: a parallelism limit is never a list. Unambiguous, so name the one key it must be.
+// A '!'-prefixed entry is rejected by the root allowlist too (glob negation is unsupported), so
+// pointing there would just trade one error for another — stay silent instead.
+function concurrencyListHint(key: string, v: unknown): string {
+  if (key !== "organizations" && key !== "branches") return "";
+  if (!Array.isArray(v) || !v.every((x) => isString(x) && x.length > 0 && !x.startsWith("!"))) return "";
+  const noun = key === "branches" ? "branch" : "organization";
+  return ` — for a list of ${noun} names you likely meant the root-level "${key}" allowlist`;
+}
+
+// A positive integer under a root-level allowlist key is the mirror-image mix-up. `organizations`
+// has exactly one numeric twin; `branches` has TWO plausible ones (per-repo parallelism vs the
+// per-repo cap) and guessing between them would be a coin flip, so name both and let the operator
+// pick. Any other numeric shape (0, negative, float) fits no sibling and gets no hint.
+function allowlistNumberHint(key: "organizations" | "branches", v: unknown): string {
+  if (!isPosInt(v)) return "";
+  return key === "branches"
+    ? ` — for a number you likely meant "concurrency.branches" (per-repo branch parallelism) or "maxBranchesPerRepo" (the per-repo branch cap)`
+    : ` — for a number you likely meant "concurrency.organizations" (owner-level parallelism)`;
+}
+
 function reqString(o: Record<string, unknown>, key: string, ctx: string): string {
   const v = o[key];
   if (!isString(v) || v.length === 0) fail(`${ctx}.${key} must be a non-empty string`);
@@ -165,7 +196,7 @@ function normalizeGithubHost(o: Record<string, unknown>): string {
 function normalizeOrganizations(o: Record<string, unknown>): string[] | null {
   const v = o["organizations"];
   if (v === undefined || v === null) return null; // discover mode
-  if (!Array.isArray(v)) fail(`organizations must be null or an array of strings`);
+  if (!Array.isArray(v)) fail(`organizations must be null or an array of strings${allowlistNumberHint("organizations", v)}`);
   // [] = configured-empty (distinct from null); [..] = allowlist. Items must be non-empty
   // (schema: minLength 1) — an empty org name is always operator error.
   return (v as unknown[]).map((el, i) => assertNonEmptyStringItem(el, "organizations", i));
@@ -193,7 +224,7 @@ function validateBranchPattern(v: unknown, listName: string, i: number): string 
 function normalizeBranches(o: Record<string, unknown>): string[] | null {
   const v = o["branches"];
   if (v === undefined || v === null) return null;
-  if (!Array.isArray(v)) fail(`branches must be null or an array of strings`);
+  if (!Array.isArray(v)) fail(`branches must be null or an array of strings${allowlistNumberHint("branches", v)}`);
   return (v as unknown[]).map((el, i) => validateBranchPattern(el, "branches", i));
 }
 
@@ -257,7 +288,7 @@ function normalizeConcurrency(o: Record<string, unknown>): Concurrency {
   rejectUnknownKeys(c, CONFIG_CONCURRENCY_KEYS, "$.concurrency");
   const read = (k: keyof Concurrency): number => {
     const v = (c as Record<string, unknown>)[k];
-    if (!isPosInt(v)) fail(`concurrency.${k} must be a positive integer`);
+    if (!isPosInt(v)) fail(`concurrency.${k} must be a positive integer${concurrencyListHint(k, v)}`);
     return v as number;
   };
   return { organizations: read("organizations"), repositories: read("repositories"), branches: read("branches") };
