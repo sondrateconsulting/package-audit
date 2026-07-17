@@ -200,15 +200,15 @@ describe("buildCompare — policy churn", () => {
     phead(db, runB.runId, "main", { isDefaultBranch: true });
     // entering: clean-scanned in A → deny-excluded in B
     phead(db, runA.runId, "entering", { isDefaultBranch: false });
-    phead(db, runB.runId, "entering", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
+    phead(db, runB.runId, "entering", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "enter*" });
     // leaving: deny-excluded in A → clean-scanned in B
-    phead(db, runA.runId, "leaving", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
+    phead(db, runA.runId, "leaving", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "leav*" });
     phead(db, runB.runId, "leaving", { isDefaultBranch: false });
     // reclass: excluded both sides but the causing pattern changed
-    phead(db, runA.runId, "reclass", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
-    phead(db, runB.runId, "reclass", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feat/*" });
+    phead(db, runA.runId, "reclass", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "rec*" });
+    phead(db, runB.runId, "reclass", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "reclass" });
     // override-change: default-override carrying a counterfactual in A → plain clean default in B (neither APPLIED)
-    phead(db, runA.runId, "trunk", { isDefaultBranch: true, policyStatus: "excluded-by-deny", pattern: "release/*" });
+    phead(db, runA.runId, "trunk", { isDefaultBranch: true, policyStatus: "excluded-by-deny", pattern: "tr*" });
     phead(db, runB.runId, "trunk", { isDefaultBranch: true });
     // only-in-A and only-in-B branches are NOT classified (absence has many causes)
     phead(db, runA.runId, "gone", { isDefaultBranch: false });
@@ -228,11 +228,11 @@ describe("buildCompare — policy churn", () => {
     expect(churn.enteredExclusion[0]).toEqual({
       organization: "org-a", repository: "svc", branch: "entering",
       runA: { status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, policyApplied: false, defaultOverride: false },
-      runB: { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*", policyApplied: true, defaultOverride: false },
+      runB: { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "enter*", policyApplied: true, defaultOverride: false },
     });
     // reclassified carries the pattern change explicitly
-    expect(churn.reclassifiedExclusion[0]!.runA.policyMatchedPattern).toBe("feature/*");
-    expect(churn.reclassifiedExclusion[0]!.runB.policyMatchedPattern).toBe("feat/*");
+    expect(churn.reclassifiedExclusion[0]!.runA.policyMatchedPattern).toBe("rec*");
+    expect(churn.reclassifiedExclusion[0]!.runB.policyMatchedPattern).toBe("reclass");
     db.close();
   });
 

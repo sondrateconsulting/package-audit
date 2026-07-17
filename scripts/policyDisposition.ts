@@ -13,7 +13,15 @@
 // WRITE chokepoint (assertRunUnitHeadInvariants) enforces and this read gate did not. These surfaces
 // also read rows that never passed our writer — a foreign or sibling database that survived
 // classification, a disposition added later, a hand-edited file — so anything the chokepoint asserts
-// about a row's shape is re-asserted HERE. Validate every field or one of them is the next hole.
+// about a row's SHAPE is re-asserted HERE. Validate every field or one of them is the next hole.
+//
+// ONE deliberate exception: the chokepoint's SEMANTIC pattern↔branch verification (a stored deny
+// pattern must actually match its branch, via the live glob engine) is NOT re-asserted here. This
+// gate stays glob-free on purpose: Bun.Glob semantics are version-sensitive, so re-evaluating
+// HISTORY under a newer engine could refuse rows that were true when written. The trust boundary is
+// therefore write-time: rows written by a build carrying that verifier are match-attested; rows
+// from before it (or from raw-SQL edits, which nothing attests) are legacy-unattested — readable,
+// counted, and never re-matched.
 import type { PolicyStatus, UnitHeadStatus } from "./db.ts";
 import { isIsoInstant } from "./isoDate.ts";
 

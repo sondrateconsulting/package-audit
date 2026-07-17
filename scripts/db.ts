@@ -17,6 +17,7 @@ import { dirname, resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { logLine } from "./log.ts";
 import { isIsoInstant } from "./isoDate.ts";
+import { PolicyMatchError, patternMatchesBranch } from "./branchPolicy.ts"; // leaf import: write-time attribution coherence
 
 export class DbError extends Error {
   constructor(message: string) {
@@ -1666,6 +1667,22 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   if (h.policyStatus === "excluded-by-deny") {
     if (h.policyMatchedPattern === null || h.policyMatchedPattern.length === 0 || h.policyMatchedPattern.startsWith("!"))
       fail(`run_unit_head ${where}: excluded-by-deny requires a non-empty policy_matched_pattern without the '!' config prefix (got ${JSON.stringify(h.policyMatchedPattern)})`);
+    // SEMANTIC coherence, not just shape (external consult, option A): the stored pattern must
+    // actually MATCH the branch it claims to have excluded — and the scanned default-override's
+    // counterfactual pattern must match the default's name the same way. Verified HERE because
+    // write time is the only point where the matcher, the branch name, and the attribution
+    // coexist; the read gate stays deliberately glob-free (re-evaluating history under a NEWER
+    // Bun could refuse rows that were true when written — rows written before this verifier are
+    // legacy-unattested, readable, never re-matched). A mismatch throws PolicyMatchError — the
+    // FATAL class the run driver fails the whole run on — never DbError, which the per-unit
+    // catch would downgrade to an ordinary scan error.
+    if (!patternMatchesBranch(h.policyMatchedPattern, h.branch))
+      throw new PolicyMatchError(
+        "excludeBranches",
+        h.policyMatchedPattern,
+        h.branch,
+        new Error("stored policy_matched_pattern does not match the branch it claims to have excluded (write-time attribution incoherence)"),
+      );
   } else if (h.policyMatchedPattern !== null) {
     fail(`run_unit_head ${where}: policy_matched_pattern must be null unless excluded-by-deny (policy_status=${h.policyStatus ?? "null"})`);
   }

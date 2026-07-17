@@ -452,6 +452,10 @@ export async function processRepo(
       const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
       db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
     } catch (e) {
+      // A PolicyMatchError is FATAL by contract (the run driver fails the whole run on it) — it
+      // must never be downgraded to an ordinary per-unit scan error here. Today it can arise from
+      // the write chokepoint's attribution-coherence verification inside processUnit's upserts.
+      if (e instanceof PolicyMatchError) throw e;
       if (e instanceof ThrottleExhausted) {
         // §4: throttle exhaustion is NOT a permanent unit failure — put the unit back to
         // pending so a LATER run retries it. No same-run spin: this loop visits each unit

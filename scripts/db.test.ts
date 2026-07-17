@@ -2694,6 +2694,37 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     db.close();
   });
 
+  test("G1c: a deny pattern that does NOT match its branch is rejected at write — as the FATAL PolicyMatchError, never a downgradeable DbError", () => {
+    // Semantic coherence, not just shape (consult option A): write time is the only point where the
+    // matcher, the branch name, and the attribution coexist. The read gate stays glob-free by
+    // design — re-evaluating history under a newer Bun could refuse rows that were true when
+    // written — so the write chokepoint is the one verifier.
+    const db = fresh();
+    expect(() => seed(db, { status: "policy-excluded", isDefaultBranch: false, commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "release/*" })).toThrow(/failed to match branch/);
+    // the throw must be the fatal policy class (the run driver fails the whole run on it), not DbError
+    try {
+      seed(db, { status: "policy-excluded", isDefaultBranch: false, commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "release/*" });
+      throw new Error("unreachable: mismatched pattern was accepted");
+    } catch (e) {
+      expect((e as Error).name).toBe("PolicyMatchError");
+    }
+    // matching attributions still write: a real glob match…
+    seed(db, { organization: "o", repository: "r", branch: "release/x", status: "policy-excluded", isDefaultBranch: false, commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "release/*" });
+    // …the scanned default-override (pattern must match the DEFAULT's name)…
+    seed(db, { branch: "main", commitSha: "sha-main", status: "scanned", isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: "ma*" });
+    // …and EXACT equality short-circuits without invoking the glob engine at all, so a
+    // metacharacter-hostile spelling that names the branch literally verifies ("[" matches nothing
+    // as a glob on the pinned Bun — only the exact-first pass can accept it).
+    seed(db, { branch: "[", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "[" });
+    db.close();
+  });
+
+  test("G1c-override: a scanned default-override whose counterfactual pattern does not match the default is rejected", () => {
+    const db = fresh();
+    expect(() => seed(db, { branch: "main", commitSha: "sha-main", status: "scanned", isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: "rel*" })).toThrow(/failed to match branch/);
+    db.close();
+  });
+
   test("G1: excluded-by-deny with an empty or null pattern is rejected (the deny CHECK admits '')", () => {
     const db = fresh();
     expect(() => seed(db, { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: "" })).toThrow(/non-empty policy_matched_pattern/);
@@ -2764,7 +2795,7 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
 
   test("G3: a past-cap row carrying a policy_status is rejected (policy precedes the cap)", () => {
     const db = fresh();
-    expect(() => seed(db, { status: "past-cap", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "x" })).toThrow(/past-cap rows must have policy_status null/);
+    expect(() => seed(db, { status: "past-cap", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "b" })).toThrow(/past-cap rows must have policy_status null/);
     db.close();
   });
 
@@ -2824,7 +2855,7 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     seed(db, { branch: "n1", isDefaultBranch: false, commitSha: "s" }); //                                     non-default scanned, no-exclusion
     seed(db, { branch: "n2", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "" }); //            non-default cutoff-skipped
     seed(db, { branch: "n3", isDefaultBranch: false, status: "past-cap", commitSha: "" }); //                  non-default past-cap
-    seed(db, { branch: "n4", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "feat/*" }); // excluded by deny
+    seed(db, { branch: "n4", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "n*" }); // excluded by deny
     seed(db, { branch: "n5", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-allow" }); //                               excluded by allow
     const all = raw(db)
       .query(`SELECT branch, status, policy_status AS ps, policy_matched_pattern AS pat FROM run_unit_head ORDER BY branch`)
@@ -2836,7 +2867,7 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
       { branch: "n1", status: "scanned", ps: null, pat: null },
       { branch: "n2", status: "skipped-cutoff", ps: null, pat: null },
       { branch: "n3", status: "past-cap", ps: null, pat: null },
-      { branch: "n4", status: "policy-excluded", ps: "excluded-by-deny", pat: "feat/*" },
+      { branch: "n4", status: "policy-excluded", ps: "excluded-by-deny", pat: "n*" },
       { branch: "n5", status: "policy-excluded", ps: "excluded-by-allow", pat: null },
     ]);
     db.close();
@@ -2904,9 +2935,9 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     seed(db, { branch: "c", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", scannedCommitDate: "2020-01-01T00:00:00Z" });
     seed(db, { branch: "c", isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", scannedCommitDate: "2020-02-02T00:00:00Z" });
     expect(rowOf(db, "c").scd).toBe("2020-02-02T00:00:00Z");
-    seed(db, { branch: "e", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "old*" });
-    seed(db, { branch: "e", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "new*" });
-    expect(rowOf(db, "e").pat).toBe("new*");
+    seed(db, { branch: "e", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "e*" });
+    seed(db, { branch: "e", isDefaultBranch: false, status: "policy-excluded", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "e" });
+    expect(rowOf(db, "e").pat).toBe("e");
     db.close();
   });
 
@@ -2951,11 +2982,11 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     const states: ReadonlyArray<readonly [string, State]> = [
       ["scan-plain",    { status: "scanned",        commitSha: "sha-A", isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2025-01-01T00:00:00Z" }],
       ["scan-default",  { status: "scanned",        commitSha: "sha-B", isDefaultBranch: true,  policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2025-02-02T00:00:00Z" }],
-      ["scan-deny",     { status: "scanned",        commitSha: "sha-C", isDefaultBranch: true,  policyStatus: "excluded-by-deny",  policyMatchedPattern: "d*", scannedCommitDate: "2025-03-03T00:00:00Z" }],
+      ["scan-deny",     { status: "scanned",        commitSha: "sha-C", isDefaultBranch: true,  policyStatus: "excluded-by-deny",  policyMatchedPattern: "?*", scannedCommitDate: "2025-03-03T00:00:00Z" }],
       ["scan-allow",    { status: "scanned",        commitSha: "sha-D", isDefaultBranch: true,  policyStatus: "excluded-by-allow", policyMatchedPattern: null, scannedCommitDate: "2025-04-04T00:00:00Z" }],
       ["cutoff",        { status: "skipped-cutoff", commitSha: "",      isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2019-01-01T00:00:00Z" }],
       ["past-cap",      { status: "past-cap",       commitSha: "",      isDefaultBranch: false, policyStatus: null,                policyMatchedPattern: null, scannedCommitDate: "2018-01-01T00:00:00Z" }],
-      ["excl-deny",     { status: "policy-excluded", commitSha: "",      isDefaultBranch: false, policyStatus: "excluded-by-deny",  policyMatchedPattern: "x*", scannedCommitDate: "2017-01-01T00:00:00Z" }],
+      ["excl-deny",     { status: "policy-excluded", commitSha: "",      isDefaultBranch: false, policyStatus: "excluded-by-deny",  policyMatchedPattern: "*", scannedCommitDate: "2017-01-01T00:00:00Z" }],
       ["excl-allow",    { status: "policy-excluded", commitSha: "",      isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null, scannedCommitDate: "2016-01-01T00:00:00Z" }],
     ];
     const proj = (s: State) => ({
