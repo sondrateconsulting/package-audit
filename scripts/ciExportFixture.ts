@@ -1,5 +1,5 @@
-// ciExportFixture.ts — generate a SYNTHETIC export fixture for the CI recipe job (CT8).
-// Builds an in-memory audit database from made-up data (publish hygiene P4: nothing here
+// ciExportFixture.ts — generate a SYNTHETIC export fixture for the CI recipe job.
+// Builds an in-memory audit database from made-up data (publish hygiene: nothing here
 // derives from any real estate), then writes the real run-scoped exports into ./output/xray/
 // through the production exportRun — the exact artifacts the README's "Analyze the exports"
 // recipes read. CI then executes every recipe VERBATIM against these files with a SHA-pinned

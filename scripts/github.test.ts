@@ -519,7 +519,7 @@ describe("throttle wait clamping (§4 hardening)", () => {
   test("graphql 200 with a PRESENT-but-non-array errors field fails closed — never coerced to 'no errors'", async () => {
     // GraphQL spec: a present `errors` member is an array. A response carrying coherent data plus
     // errors:"garbage" must NOT classify ok: the error signal we were meant to see is unreadable,
-    // and post-§11 an ok:true branch discovery feeds the reconcile PRUNE — a coerced-away failure
+    // and an ok:true branch discovery feeds the reconcile PRUNE — a coerced-away failure
     // could turn a partial result into row deletion. Fail closed instead.
     const { client } = makeClient([ok(http(200, {}, `{"data":{"x":1},"errors":"garbage"}`))]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(GithubApiError);
@@ -1200,7 +1200,7 @@ describe("listBranchHeads (§5.B)", () => {
     expect(queryArg).toContain("defaultBranchRef{name}");
   });
 
-  // FAIL-CLOSED completeness (load-bearing for T11 reconciliation): an understated branch set would
+  // FAIL-CLOSED completeness (load-bearing for run_unit_head reconciliation): an understated branch set would
   // make the prune delete live branches, so a malformed node or a silently-truncated page must THROW
   // (→ discovery 'failed' → the repo is retained, never reconciled) rather than return a partial list.
   // `defaultBranchRef: null` (a repo with no commits) is the neutral default here so these fixtures

@@ -1569,7 +1569,7 @@ describe("corrupted database files fail closed with OUR context, never a raw SQL
 });
 
 // Synchronous stdout JSONL capture (open() is sync — orchestrate.test.ts's helper is async).
-// Keeps the E3 fresh-drop warning out of the test runner's real stdout, and returns the
+// Keeps the fresh-drop warning out of the test runner's real stdout, and returns the
 // parsed events for the warning suites below.
 function captureStdout(fn: () => void): Array<Record<string, unknown>> {
   const chunks: string[] = [];
@@ -1927,7 +1927,7 @@ describe("errors + run_unit_head", () => {
   });
 });
 
-describe("reconcileRunUnitHead (§11 stale-row prune)", () => {
+describe("reconcileRunUnitHead (stale-row prune)", () => {
   const scanned = (db: AuditDb, runId: string, org: string, repo: string, branch: string): void =>
     db.upsertRunUnitHead({ runId, organization: org, repository: repo, branch, commitSha: `sha-${branch}`, status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
   const branchesOf = (db: AuditDb, runId: string, org: string, repo: string): string[] =>
@@ -2511,7 +2511,7 @@ describe("migration — v2 → v3 (version-stepped, CRITICAL round-trip)", () =>
   });
 });
 
-describe("--fresh drop-time warning (E3)", () => {
+describe("--fresh drop-time warning", () => {
   test("--fresh over completed runs emits ONE warning event with the dropped count", () => {
     const path = nextFile();
     const db1 = AuditDb.open({ sqlitePath: path });
@@ -2679,7 +2679,7 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     db.close();
   });
 
-  test("G7: a KNOWN default branch may not be non-scanned (Premise 6: the default is always scanned)", () => {
+  test("G7: a KNOWN default branch may not be non-scanned (the default is always scanned)", () => {
     const db = fresh();
     expect(() => seed(db, { status: "skipped-cutoff", commitSha: "", isDefaultBranch: true })).toThrow(/default branch is always scanned/);
     expect(() => seed(db, { status: "past-cap", commitSha: "", isDefaultBranch: true })).toThrow(/default branch is always scanned/);
@@ -2784,7 +2784,7 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
   test("transition: a non-default DENIED branch that BECOMES default is scanned but RETAINS the deny counterfactual", () => {
     const db = fresh();
     seed(db, { isDefaultBranch: false, status: "skipped-cutoff", commitSha: "", policyStatus: "excluded-by-deny", policyMatchedPattern: "b" });
-    // remote default moved onto this branch: now scanned (Premise 6), policy counterfactual retained.
+    // remote default moved onto this branch: now scanned (the default is always scanned), policy counterfactual retained.
     seed(db, { isDefaultBranch: true, status: "scanned", commitSha: "sha-now", policyStatus: "excluded-by-deny", policyMatchedPattern: "b", scannedCommitDate: "2025-07-07T00:00:00Z" });
     expect(rowOf(db)).toMatchObject({ status: "scanned", d: 1, ps: "excluded-by-deny", pat: "b", sha: "sha-now" });
     db.close();
@@ -2881,7 +2881,7 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
   });
 });
 
-describe("openReadOnly (CV5 read seam)", () => {
+describe("openReadOnly (read seam)", () => {
   // A cleanly-written CURRENT-version (v4) database with one completed run, for the happy paths
   // (AuditDb.open fresh-creates at SCHEMA_VERSION, so this tracks the current schema, not v3).
   function buildCurrentV4Db(path: string): string {

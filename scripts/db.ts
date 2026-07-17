@@ -1450,7 +1450,7 @@ export interface AuditDbReader {
   close(): void;
 }
 
-// Write-boundary invariants for run_unit_head (branch allow/deny §3 row mapping). The DB CHECKs are
+// Write-boundary invariants for run_unit_head (the PROMPT.md §3 row mapping). The DB CHECKs are
 // necessary but NOT sufficient (e.g. the deny CHECK admits policy_matched_pattern=''); these guards
 // run at the single write chokepoint (upsertRunUnitHead), so no row that violates the §3 mapping is
 // ever persisted regardless of caller. All fail-fast. scanned_commit_date is REQUIRED non-null on
@@ -1488,7 +1488,7 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   if (!h.scannedCommitDate) fail(`run_unit_head ${where}: a non-empty scanned_commit_date is required`);
   if (!isIsoInstant(h.scannedCommitDate))
     fail(`run_unit_head ${where}: scanned_commit_date must be an ISO instant (got ${JSON.stringify(h.scannedCommitDate.slice(0, 40))})`);
-  // Policy pattern (§2a / §3): a deny row MUST name a real, NON-EMPTY causing pattern (the deny CHECK
+  // Policy pattern (PROMPT.md §3): a deny row MUST name a real, NON-EMPTY causing pattern (the deny CHECK
   // only enforces IS NOT NULL, and '' passes it). Every non-deny disposition carries NO pattern.
   if (h.policyStatus === "excluded-by-deny") {
     if (h.policyMatchedPattern === null || h.policyMatchedPattern.length === 0)
@@ -1496,11 +1496,11 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   } else if (h.policyMatchedPattern !== null) {
     fail(`run_unit_head ${where}: policy_matched_pattern must be null unless excluded-by-deny (policy_status=${h.policyStatus ?? "null"})`);
   }
-  // Cap disposition (§2 / §12): past-cap is a cutoff/cap outcome over the policy-ELIGIBLE set — policy
+  // Cap disposition: past-cap is a cutoff/cap outcome over the policy-ELIGIBLE set — policy
   // is applied first, so an excluded branch never reaches the cap. A past-cap row never carries policy.
   if (h.status === "past-cap" && h.policyStatus !== null)
     fail(`run_unit_head ${where}: past-cap rows must have policy_status null (policy is applied before the cap)`);
-  // Default-branch override (§2, Premise 6): the ONLY way a policy-excluded branch is still scanned is
+  // Default-branch override (the default is always scanned): the ONLY way a policy-excluded branch is still scanned is
   // the default-branch exemption. A scanned row bearing a policy_status MUST be the KNOWN default.
   if (h.status === "scanned" && h.policyStatus !== null && h.isDefaultBranch !== true)
     fail(`run_unit_head ${where}: a scanned row with a policy_status must be the default branch (is_default_branch=${h.isDefaultBranch ?? "null"})`);
@@ -1511,7 +1511,7 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   } else if (h.commitSha !== "") {
     fail(`run_unit_head ${where}: a ${h.status} row must have commit_sha='' (got ${JSON.stringify(h.commitSha)})`);
   }
-  // Default is always scanned (§3, Premise 6): classifyBranchPlan always keeps the default in the
+  // Default is always scanned (PROMPT.md §3): classifyBranchPlan always keeps the default in the
   // eligible set, so a known-default branch is never cutoff-skipped or past-cap.
   if (h.isDefaultBranch === true && h.status !== "scanned")
     fail(`run_unit_head ${where}: the default branch is always scanned, never ${h.status}`);
@@ -2073,7 +2073,7 @@ export class AuditDb {
       );
   }
 
-  // §11 reconciliation (schema-neutral): after a repo's branches are COMPLETELY re-discovered
+  // Stale-row reconciliation (schema-neutral): after a repo's branches are COMPLETELY re-discovered
   // (BranchDiscoveryOutcome ok:true, whose snapshot listBranchHeads guarantees is the exact live set), prune this
   // run's run_unit_head rows for branches no longer present — the phantom rows a resume leaves when a
   // branch is deleted between invocations. Scoped to (run_id, org, repo): it can NEVER touch another
@@ -2093,7 +2093,7 @@ export class AuditDb {
   // advanced head became eligible — its commit_sha='' and discovered-head date describe that older
   // evaluation. This is STALE, not WRONG: every retained row is truthful about what its own invocation
   // decided, and the work_queue unit is left error/pending so the next run re-scans and refreshes it.
-  // Accepted, not overlooked — see processRepo's §11 note for the rejected alternative.
+  // Accepted, not overlooked — see processRepo's reconciliation note for the rejected alternative.
   //
   // SCOPE, stated precisely because the surrounding docs used to over-claim it: the caller invokes this
   // ONCE PER RE-DISCOVERED REPO, so what it guarantees is "a re-discovered repo's rows match its live

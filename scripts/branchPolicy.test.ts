@@ -69,7 +69,7 @@ describe("compileBranchPolicy — compiled globs carry live Bun semantics", () =
 // BranchPolicyError is the leaf error loadConfig() re-wraps as ConfigError. Bun.Glob accepts most
 // malformed strings at construction (e.g. "[") and only fails at match time, so this construction
 // catch is a defensive/forward-compat guard rather than the primary validation — the real
-// protection is the classifier's fail-closed match-time handling (T3). We assert the type is
+// protection is the classifier's fail-closed match-time handling. We assert the type is
 // well-formed and throwable so the wrapping contract in config.ts is meaningful.
 describe("BranchPolicyError", () => {
   test("is an Error subclass with a stable name", () => {

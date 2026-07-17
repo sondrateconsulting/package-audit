@@ -183,9 +183,9 @@ describe("renderDossier — content contract on the real report object", () => {
   const pkg = fixturePackages()[0]!;
   const html = renderDossier(pkg, FIXED_CTX);
 
-  test("executive sentence restates headline aggregates with CT1 vocabulary", () => {
+  test("executive sentence restates headline aggregates with the binding vocabulary", () => {
     expect(html).toContain("expo is imported by 1 repository (default branches) across 3 usage sites, concentrated in 1 export.");
-    expect(html).not.toContain("call site"); // CT1: usage sites, never invocation wording
+    expect(html).not.toContain("call site"); // binding vocabulary: usage sites, never invocation wording
   });
 
   test("fixed section ids + copy-as-markdown mirrors exist for each section", () => {
@@ -198,7 +198,7 @@ describe("renderDossier — content contract on the real report object", () => {
 
   test("decision cards: default-branch headlines with the also-seen annotation and honest totals", () => {
     expect(html).toContain("also seen on 1 other branch"); // dev
-    expect(html).toContain("of attributed usage in the top 3 exports"); // concentration label (CV3)
+    expect(html).toContain("of attributed usage in the top 3 exports"); // concentration label
     expect(html).toContain("(whole-module): 1 usage site"); // counted whole-module card line
     expect(html).toContain("1 repository across all branches"); // honest total
   });
@@ -260,7 +260,7 @@ describe("renderDossier — content contract on the real report object", () => {
   });
 });
 
-describe("the one static script + CSP (CEO addendum 5/7)", () => {
+describe("the one static script + CSP", () => {
   const html = renderDossier(fixturePackages()[0]!, FIXED_CTX);
 
   test("CSP hash sync: an independent recompute matches the exported hash and the meta tag", () => {
@@ -474,7 +474,7 @@ describe("dossierFilename — sanitization against the artifact name grammar", (
   });
 });
 
-describe("empty state (CEO addendum 12 + CT4)", () => {
+describe("designed empty state (coverage receipts)", () => {
   const pkg = fixturePackages()[1]!; // left-pad: tracked, zero findings
   const html = renderDossier(pkg, FIXED_CTX);
 
@@ -517,7 +517,7 @@ describe("partial state — versionsSeen entries missing from apiSurface", () =>
   });
 });
 
-describe("default-branch tri-state (E1/CT5)", () => {
+describe("default-branch tri-state", () => {
   test("ANY isDefaultBranch=null unit → visible band + all-branches fallback headlines", () => {
     const pkg = syntheticPkg([
       syntheticUnit({ branch: "main", isDefaultBranch: null, apiUsage: [syntheticUsage("a", "src/a.ts", 1)] }),
@@ -652,7 +652,7 @@ describe("evidence wall — cap, honest totals, anchor stability", () => {
   });
 });
 
-describe("chaos fixture (CV9): 10k usage sites", () => {
+describe("chaos fixture: 10k usage sites", () => {
   test("renders to completion within a generous bound and under 15MB", () => {
     // 200 exports × 50 sites = 10,000 usage sites across 20 default-branch repos. Deterministic
     // loops, no randomness.

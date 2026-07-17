@@ -25,7 +25,7 @@ const unrestricted = compileBranchPolicy(null, []);
 // first head", or a hardcoded "main") is exactly what would hide a default-resolution defect.
 const snap = (heads: readonly BranchHead[], defaultBranch: string | null): BranchSnapshot => ({ heads, defaultBranch });
 
-describe("planRepoBranches — policy is applied BEFORE cutoff/cap (§1/§12)", () => {
+describe("planRepoBranches — policy is applied BEFORE cutoff/cap", () => {
   test("no policy: matches the bare cutoff/cap split, policyExcluded empty", () => {
     const p = planRepoBranches(snap(HEADS, "main"), unrestricted, "2024-01-01", 25);
     expect(names(p.toScan)).toEqual(["main", "feat-a", "feat-b"]);
@@ -36,7 +36,7 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap (§1/§12)", 
     expect(p.toScan.every((d) => d.rawPolicyResult.kind === "no-exclusion")).toBe(true);
   });
 
-  test("a DENIED newest non-default branch frees its cap slot for an allowed OLDER branch (the §12 proof)", () => {
+  test("a DENIED newest non-default branch frees its cap slot for an allowed OLDER branch (the cap-slot proof)", () => {
     // cap = 1 non-default. Without policy, feat-a (newest non-default) would take the slot and feat-b
     // would be past-cap. Denying feat-a must instead admit feat-b — a denied branch consumes no slot.
     const policy = compileBranchPolicy(null, ["feat-a"]);
@@ -59,7 +59,7 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap (§1/§12)", 
     expect(names(p.cutoffSkipped)).toEqual([]);
   });
 
-  test("an EMPTY allowlist (branches:[]) eliminates every non-default but KEEPS the default (Premise 6)", () => {
+  test("an EMPTY allowlist (branches:[]) eliminates every non-default but KEEPS the default (always scanned)", () => {
     const policy = compileBranchPolicy([], []); // allow NOTHING
     const p = planRepoBranches(snap(HEADS, "main"), policy, "2024-01-01", 25);
     expect(names(p.toScan)).toEqual(["main"]); // ONLY the default survives
@@ -72,7 +72,7 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap (§1/§12)", 
   test("the DEFAULT branch denied by policy STAYS eligible but records the counterfactual", () => {
     const policy = compileBranchPolicy(null, ["main", "feat-a"]); // deny includes the default
     const p = planRepoBranches(snap(HEADS, "main"), policy, "2024-01-01", 25);
-    expect(names(p.toScan)).toContain("main"); // never dropped (Premise 6)
+    expect(names(p.toScan)).toContain("main"); // never dropped (the default is always scanned)
     const mainDecision = p.toScan.find((d) => d.head.name === "main")!;
     expect(mainDecision.isDefaultBranch).toBe(true);
     expect(mainDecision.rawPolicyResult).toEqual({ kind: "excluded-by-deny", matchedPattern: "main" }); // the "would have denied" fact
@@ -102,7 +102,7 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap (§1/§12)", 
   test('a malformed pattern Bun ACCEPTS (deny "[") is NOT fatal: it matches nothing, denies nothing, and coverage reports it dead', () => {
     // Pins the OTHER half of the fail-closed contract's scope (branchPolicy.ts): the promise covers
     // globs that THROW at .match() time; "[" compiles and (as pinned here) matches neither the
-    // default nor a feature head, so it must exclude nothing and land in NO coverage set — the §8
+    // default nor a feature head, so it must exclude nothing and land in NO coverage set — the advisory
     // unmatched-pattern warning is its surface.
     // Bun.Glob-VERSION-SENSITIVE (CI pins 1.3.14): if a Bun upgrade starts rejecting "[" at
     // construction, this test goes red so the load/validation story is re-decided consciously.
@@ -152,7 +152,7 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap (§1/§12)", 
   });
 });
 
-describe("planRepoBranches — coverage sweep (§8/§12)", () => {
+describe("planRepoBranches — coverage sweep", () => {
   test("coverage unions every pattern that matched ANY raw head; unmatched patterns are absent", () => {
     const policy = compileBranchPolicy(null, ["feat-a", "nope*"]); // deny feat-a; 'nope*' matches nothing
     const p = planRepoBranches(snap(HEADS, "main"), policy, "2024-01-01", 25);
@@ -176,7 +176,7 @@ describe("planRepoBranches — coverage sweep (§8/§12)", () => {
     expect(p.coverage.branches.slice().sort()).toEqual(["main", "recent1", "recent2", "stale"]);
   });
 
-  test("a SHADOWED malformed glob (never the winner, invoked ONLY by coverage) fails fast (§12)", () => {
+  test("a SHADOWED malformed glob (never the winner, invoked ONLY by coverage) fails fast", () => {
     // deny ['main' exact, 'z*' throwing]. For head 'main' the winner is the exact 'main' — z* is never
     // invoked for classification — but the coverage sweep DOES call z*.match('main') and it throws.
     const policy = rawPolicy(null, [cp("main", new Bun.Glob("main")), cp("z*", throwingGlob(new Error("shadowed")))]);
@@ -184,7 +184,7 @@ describe("planRepoBranches — coverage sweep (§8/§12)", () => {
   });
 });
 
-describe("planPolicyDiagnostics — §5 plan sub-counts (deny/allow split + default override)", () => {
+describe("planPolicyDiagnostics — plan sub-counts (deny/allow split + default override)", () => {
   test("derives the deny/allow split and default-branch override from a real plan", () => {
     // allowlist keep/* + deny deny-me. main (default) is not allow-listed → override; deny-me → deny;
     // other → allow-miss; keep/a → eligible.

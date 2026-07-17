@@ -133,7 +133,7 @@ describe("assertReadOnlyGit", () => {
   test("clone -ufoo throws", () =>
     throws(() => assertReadOnlyGit(sh("clone -ufoo --depth 1 --single-branch --branch m --no-tags --no-recurse-submodules --template= u d"))));
   test("clone missing hardening throws", () => throws(() => assertReadOnlyGit(["clone", "url", "dir"])));
-  // `show` is allowed ONLY as the exact commit-date tuple (branch allow/deny §4 clone-fallback date).
+  // `show` is allowed ONLY as the exact commit-date tuple (the clone-fallback commit date).
   const SHOW_DATE = ["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"];
   test("the exact commit-date show tuple passes", () => ok(() => assertReadOnlyGit(SHOW_DATE)));
   test("bare `show HEAD` rejected (not the exact tuple)", () => throws(() => assertReadOnlyGit(["show", "HEAD"])));

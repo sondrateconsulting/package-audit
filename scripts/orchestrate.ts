@@ -31,7 +31,7 @@ import { logLine } from "./log.ts";
 
 // The three values that TOGETHER define one coherent scan/plan: the config, its hash, and the
 // compiled branch policy. Threaded as ONE object through runScan/processOwner/processRepo/runPlan so
-// the policy can never be dropped or mismatched against its config (branch allow/deny §12).
+// the policy can never be dropped or mismatched against its config.
 export interface AuditRuntime {
   readonly config: Config;
   readonly configHash: string;
@@ -165,7 +165,7 @@ export function runSummaryText(
   ].join("\n");
 }
 
-// Compute AND emit the §8 unmatched-pattern warnings, then return the FULL advisory array for the
+// Compute AND emit the advisory unmatched-pattern warnings, then return the FULL advisory array for the
 // summary. Shared by runScan and runPlan so their warning sets can never drift (run/plan parity is a
 // load-bearing property). The unmatched events are logged here (pure set-difference over the coverage
 // collected during discovery — no glob runs); the empty-allowlist event is emitted separately at mode
@@ -187,7 +187,7 @@ export async function runScan(
   // §0 startup: sweep stale temp dirs from a prior crash.
   client.sweepStaleTempDirs();
 
-  // §8: the empty-allowlist warning is UNCONDITIONAL — emit it at mode entry so it fires even if the
+  // The empty-allowlist warning is UNCONDITIONAL — emit it at mode entry so it fires even if the
   // run then early-returns on an owner-discovery throttle. Retained for the end-of-run summary.
   if (isEmptyAllowlist(runtime.branchPolicy)) logLine({ event: "policy-warning", kind: "empty-allowlist" });
 
@@ -243,7 +243,7 @@ export async function runScan(
     throw e;
   }
 
-  // §8: emit the unmatched-pattern warnings (before completeRun/done) and build the summary array.
+  // Emit the unmatched-pattern warnings (before completeRun/done) and build the summary array.
   const warnings = emitPolicyWarnings(runtime.branchPolicy, coverages);
 
   // §5.E introspection reconciliation over the run's reportable slice.
@@ -309,7 +309,7 @@ export async function processOwner(
   const outcome = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
   if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
   // Collect each successfully-discovered repo's coverage (null = its branch discovery failed) so the
-  // run-level §8 warning finalizer sees exactly the patterns exercised against real branches.
+  // run-level warning finalizer sees exactly the patterns exercised against real branches.
   const coverages: PolicyCoverage[] = [];
   for (const repo of outcome.items) {
     const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen);
@@ -320,7 +320,7 @@ export async function processOwner(
 
 // §5.A run-path repo discovery for one owner, fail-soft: a failure records the DB error row AND
 // emits the matching JSONL `discovery` event (org-scoped — no `repo` field), then returns a FAILED
-// DiscoveryOutcome so the owner loop simply moves on (§9). A ThrottleExhausted is TRANSIENT (§4):
+// DiscoveryOutcome so the owner loop simply moves on. A ThrottleExhausted is TRANSIENT (§4):
 // discovery re-runs next invocation, so it logs a requeue event and returns a failed outcome with NO
 // permanent errors row. Exported for tests (scripted client + real in-memory DB); processOwner is its
 // only runtime caller. The --plan twin lives in runPlan, deliberately separate — plan mode has no DB
@@ -349,8 +349,8 @@ export async function discoverOwnerRepos(
   }));
 }
 
-// Branch-head discovery for ONE repo as a typed outcome (§9) — extracted so both the run (here) and
-// T11 consume the SAME failed-vs-genuinely-empty distinction. Same fail-soft policy: a throttle
+// Branch-head discovery for ONE repo as a typed outcome — extracted so both the run (here) and
+// reconciliation consume the SAME failed-vs-genuinely-empty distinction. Same fail-soft policy: a throttle
 // requeues with no errors row (transient); any other error records a permanent discovery-failure row.
 export async function discoverBranchHeads(
   db: AuditDb, client: GithubClient, runId: string, repo: RepoInfo,
@@ -374,8 +374,8 @@ export async function discoverBranchHeads(
 }
 
 // Discover a repo's branches, apply policy + cutoff + cap, and process/skip each branch unit
-// (§5.B/§3/§8). Returns the repo's policy COVERAGE on a successful discovery (folded into the run's
-// §8 warnings), or null when branch discovery failed/throttled. Exported for the wiring tests;
+// (PROMPT.md §5.B/§3). Returns the repo's policy COVERAGE on a successful discovery (folded into the run's
+// unmatched-pattern warnings), or null when branch discovery failed/throttled. Exported for the wiring tests;
 // processOwner is its only runtime caller.
 export async function processRepo(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
@@ -464,7 +464,7 @@ export async function processRepo(
       }
     }
   }
-  // §11 reconciliation: this repo was discovered COMPLETELY (ok:true, reached only past the early
+  // Stale-row reconciliation: this repo was discovered COMPLETELY (ok:true, reached only past the early
   // `!outcome.ok` return; listBranchHeads fails closed on any structural incompleteness, so `heads` is
   // the exact live branch set for THIS discovery snapshot). Prune this run's stale run_unit_head rows —
   // phantom branches a prior resume-invocation recorded that no longer exist. Scoped to this
@@ -497,7 +497,7 @@ export async function processRepo(
   //     commit_sha + scanned_commit_date say WHICH (PROMPT.md's report-head invariant defines commit_sha
   //     as "the head it reported", never "the live head") — and a non-scanned row's commit_sha='' +
   //     discovered-head date describe the older evaluation it records.
-  //   - it is NOT a regression: before §11 existed there was no prune at all, so the row was retained
+  //   - it is NOT a regression: before reconciliation existed there was no prune at all, so the row was retained
   //     identically. The prune is a mitigation this feature ADDED (it removes deleted-branch phantoms
   //     that used to persist forever); it is not the cause.
   //   - it self-heals: the unit is left error/pending, never done, so the next run re-scans and re-upserts
@@ -515,7 +515,7 @@ export async function processRepo(
   if (pruned > 0)
     logLine({ event: "reconciliation", target: "run_unit_head", runId, org: repo.organization, repo: repo.name, action: "prune-stale", pruned });
 
-  return plan.coverage; // a SUCCESSFULLY-discovered repo (even if empty) — folds into the run's §8 warnings
+  return plan.coverage; // a SUCCESSFULLY-discovered repo (even if empty) — folds into the run's warnings
 }
 
 // Scan ONE branch unit: fetch the tree (clone fallback on truncation), run the §5.C-H pipeline,
@@ -754,7 +754,7 @@ export async function discoverCliTerms(db: AuditDb, client: GithubClient, config
   return sets;
 }
 
-// ---- §8 --plan: preview the scan scope with ZERO writes ---------------------------------------
+// ---- --plan: preview the scan scope with ZERO writes ------------------------------------------
 // No DB open (so no api_cache reads/writes), no content fetches, no clones, and no registry
 // packument/tarball fetches — preflight's registry REACHABILITY probe (§2.5) is the only registry
 // contact, and it carries no auth beyond the configured header. The caller passes a CACHE-LESS
@@ -770,7 +770,7 @@ export interface PlanTotals {
   readonly branchesSkippedByCutoff: number;
   readonly branchesPastCap: number;
   readonly branchesExcludedByPolicy: number;
-  // §5 branch-policy diagnostics (the plan-mode analog of the report's scanScope sub-counts).
+  // Branch-policy diagnostics (the plan-mode analog of the report's scanScope sub-counts).
   // OVERLAYS, not partition buckets: excludedByDeny + excludedByAllow === branchesExcludedByPolicy;
   // defaultBranchPolicyOverrides <= branchesEligible (default branches a policy would have excluded).
   readonly excludedByDeny: number;
@@ -780,7 +780,7 @@ export interface PlanTotals {
 }
 export async function runPlan(client: GithubClient, runtime: AuditRuntime, personalLogin: string): Promise<PlanTotals> {
   const { config, branchPolicy } = runtime;
-  // §8 parity: the empty-allowlist warning is emitted at mode entry, unconditionally, exactly as in
+  // Warning parity: the empty-allowlist warning is emitted at mode entry, unconditionally, exactly as in
   // runScan — so --plan and the real run produce identical policy-warning events for the same config.
   if (isEmptyAllowlist(branchPolicy)) logLine({ event: "policy-warning", kind: "empty-allowlist" });
   // The zero-write contract is enforced, not assumed: a caching client would write api_cache rows
@@ -790,8 +790,8 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 
   let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, branchesExcludedByPolicy = 0, discoveryErrors = 0;
-  let excludedByDeny = 0, excludedByAllow = 0, defaultBranchPolicyOverrides = 0; // §5 policy diagnostics (overlays)
-  const coverages: PolicyCoverage[] = []; // per successfully-discovered repo, for the §8 warning finalizer
+  let excludedByDeny = 0, excludedByAllow = 0, defaultBranchPolicyOverrides = 0; // policy diagnostics (overlays)
+  const coverages: PolicyCoverage[] = []; // per successfully-discovered repo, for the warning finalizer
   for (const owner of owners) {
     const isPersonal = config.includePersonalNamespace && owner === personalLogin;
     let repos: RepoInfo[];
@@ -824,7 +824,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
       // disjoint bucket. A match-time PolicyMatchError propagates FATAL (no DB to mark; main exits 1).
       const p = planRepoBranches(snapshot, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo);
       const diag = planPolicyDiagnostics(p); // fail-closed deny/allow split + default-override count
-      coverages.push(p.coverage); // this repo was discovered successfully (even if empty) — §8 coverage
+      coverages.push(p.coverage); // this repo was discovered successfully (even if empty) — warning coverage
       branchesEligible += p.toScan.length;
       branchesSkippedByCutoff += p.cutoffSkipped.length;
       branchesPastCap += p.pastCap.length;
@@ -842,7 +842,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
     }
   }
 
-  // §8: emit the unmatched-pattern warnings (before plan-summary) — identical to runScan's set.
+  // Emit the unmatched-pattern warnings (before plan-summary) — identical to runScan's set.
   const warnings = emitPolicyWarnings(branchPolicy, coverages);
 
   const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, excludedByDeny, excludedByAllow, defaultBranchPolicyOverrides, discoveryErrors };
@@ -864,7 +864,7 @@ export function planSummaryText(
     `  Repos:                ${t.reposDiscovered} discovered, ${t.reposKept} kept after archive/fork filters and caps`,
     `  Branches:             ${t.branchesEligible} eligible to scan (a real run may skip already-current ones)`,
     `                        ${t.branchesSkippedByCutoff} skipped by cutoff (< ${config.cutoffDate}) · ${t.branchesPastCap} past the per-repo cap (${config.maxBranchesPerRepo}) · ${t.branchesExcludedByPolicy} excluded by branch policy`,
-    // §5 policy breakdown, shown only when policy actually removed or overrode branches. Wording avoids
+    // Policy breakdown, shown only when policy actually removed or overrode branches. Wording avoids
     // "scanned" (the plan header promises nothing is scanned); overrides are flagged as already-eligible.
     ...(t.branchesExcludedByPolicy > 0 || t.defaultBranchPolicyOverrides > 0
       ? [`  Policy detail:        ${t.excludedByDeny} excluded by deny · ${t.excludedByAllow} excluded as not allow-listed · ${t.defaultBranchPolicyOverrides} default-branch policy override(s) (already counted as eligible)`]

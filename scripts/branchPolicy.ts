@@ -1,8 +1,7 @@
 // branchPolicy.ts — branch allow/deny policy engine.
 //
-// T2 scope: EAGER compilation of the configured pattern lists into a CompiledBranchPolicy that the
-// classifier (T3) and pattern sweep (T7) consume. The winner/coverage MATCHING APIs are added in
-// T3; this file starts as the compilation half only.
+// EAGER compilation of the configured pattern lists into a CompiledBranchPolicy that the
+// classifier and the pattern-coverage sweep consume, plus the winner/coverage matching APIs.
 //
 // This module is a dependency LEAF: it imports nothing from config.ts (no Config, no ConfigError,
 // no hashing), so config.ts can import IT — loadConfig() calls compileBranchPolicy() and wraps
@@ -10,14 +9,15 @@
 // patternCanonical module, so a compiled policy iterates patterns in exactly the order the hash
 // was computed over.
 //
-// FAIL-CLOSED CONTRACT (critical — see the v4 mapping spec §9): Bun.Glob silently ACCEPTS
+// FAIL-CLOSED CONTRACT (critical — PROMPT.md §5.B: a glob that throws at match time is FATAL,
+// never "no match"): Bun.Glob silently ACCEPTS
 // malformed patterns. `new Bun.Glob("[")` does NOT throw — at construction OR at .match() time
 // (`Bun.Glob("[").match(...)` returns false in the pinned branchPlanner test): an ACCEPTED
 // malformed pattern is matched normally and may match some names or none (on Bun 1.4, `{a,[}`
 // matches `a`); one that matches nothing surfaces via the advisory unmatched-pattern warning
 // (when it stays uncovered and at least one repo was discovered). So eager construction here
 // catches ONLY the patterns Bun throws on AT CONSTRUCTION — it is NOT a complete validator, and
-// does not promise that every malformed pattern is rejected at load. The classifier (T3) MUST wrap every .match() call and turn any exception
+// does not promise that every malformed pattern is rejected at load. The classifier MUST wrap every .match() call and turn any exception
 // into a FATAL policy-evaluation error — NEVER `false`, because `false` is fail-OPEN for an
 // exclude (a denied branch would be silently scanned). Empty-string and leading-"!" patterns are
 // rejected earlier, at config validation (config.ts), as a deliberate policy-language restriction.
@@ -35,8 +35,8 @@ export class BranchPolicyError extends Error {
 
 // One compiled pattern: its canonical source string plus the compiled Bun.Glob. Every pattern is
 // compiled — there is no "pure literal" shortcut, because detecting a pure literal would duplicate
-// Bun's glob grammar and drift from it. (T3's winner match still checks exact string equality
-// FIRST; the compiled glob is what the fall-through and the T7 coverage sweep use.)
+// Bun's glob grammar and drift from it. (The winner match still checks exact string equality
+// FIRST; the compiled glob is what the fall-through and the coverage sweep use.)
 export interface CompiledPattern {
   readonly pattern: string;
   readonly glob: Bun.Glob;
@@ -52,7 +52,7 @@ export interface CompiledBranchPolicy {
 
 function compileList(patterns: readonly string[], listName: string): readonly CompiledPattern[] {
   // Canonicalize FIRST, with the SAME canonicalizer config_hash uses, so the compiled order (which
-  // determines T3's "first canonical-order glob" winner) matches the hash's view and never depends
+  // determines the "first canonical-order glob" winner) matches the hash's view and never depends
   // on config-file order.
   return sortedDedup(patterns).map((pattern) => {
     let glob: Bun.Glob;
@@ -82,9 +82,9 @@ export function compileBranchPolicy(
   };
 }
 
-// ---- T3: matching ---------------------------------------------------------------------------
-// The winner/coverage APIs the classifier (T3) and pattern sweep (T7) consume. They take a NAME
-// (not a BranchHead) so this module stays a leaf; the run driver (T6) attaches the head.
+// ---- matching --------------------------------------------------------------------------------
+// The winner/coverage APIs the classifier and the pattern sweep consume. They take a NAME
+// (not a BranchHead) so this module stays a leaf; the run driver (orchestrate.ts) attaches the head.
 
 // Which configured list a pattern came from — threaded through matching so a fatal match-time
 // error names the operator-relevant list.
@@ -97,7 +97,7 @@ type PolicyListKind = "branches" | "excludeBranches";
 // throw becomes this error, NEVER a `false` result
 // (false for an exclude would be fail-OPEN: a denied branch silently scanned). Unlike
 // BranchPolicyError (always converted to ConfigError at load), this surfaces DIRECTLY: the run
-// driver (T6) calls db.failRun() and rethrows it unchanged, so it is registered in
+// driver (orchestrate.ts) calls db.failRun() and rethrows it unchanged, so it is registered in
 // KNOWN_OPERATOR_ERRORS and rendered message-only.
 export class PolicyMatchError extends Error {
   readonly listKind: PolicyListKind;
@@ -182,9 +182,9 @@ export interface BranchClassification {
 // outcome.
 //
 // Note what that equivalence means, because it is easy to misread as a safety property: it is NOT one.
-// With no default, `isDefaultBranch` is false for EVERY head, which is precisely the Premise-6
-// violation (nothing wins the always-eligible exemption, so a restrictive policy excludes the whole
-// repo). This function CANNOT fail closed on that — from here "no default" and "not the default" are
+// With no default, `isDefaultBranch` is false for EVERY head, which violates the rule that the
+// default branch is always scanned (nothing wins the always-eligible exemption, so a restrictive
+// policy excludes the whole repo). This function CANNOT fail closed on that — from here "no default" and "not the default" are
 // indistinguishable. Two callers upstream are what actually prevent it: listBranchHeads rejects an
 // incoherent snapshot on the wire, and planRepoBranches refuses (`defaultBranch == null`, loose, so
 // `undefined` is caught too) to plan heads with no default. Do not weaken either on the assumption
@@ -218,9 +218,9 @@ function coverageList(
   return out;
 }
 
-// Coverage for BOTH lists, kept SEPARATE (the same string may legally appear in both). T7 unions
-// each list's matches across all discovered names to find configured patterns that matched
-// nothing. An unrestricted (`include === null`) or empty include has no patterns to cover.
+// Coverage for BOTH lists, kept SEPARATE (the same string may legally appear in both). The
+// unmatched-pattern warning sweep unions each list's matches across all discovered names to find
+// configured patterns that matched nothing. An unrestricted (`include === null`) or empty include has no patterns to cover.
 export interface PolicyCoverage {
   readonly branches: readonly string[];
   readonly excludeBranches: readonly string[];

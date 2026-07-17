@@ -1,7 +1,7 @@
-// branchPlanner.ts — the ONE shared branch planner (branch allow/deny §1/§12). Both the real scan
+// branchPlanner.ts — the ONE shared branch planner (PROMPT.md §5.B). Both the real scan
 // (processRepo) and --plan (runPlan) classify branches through THIS module so their dispositions and
 // counts can never diverge. Policy is applied BEFORE cutoff/cap: a denied recent branch must never
-// consume a cap slot that an allowed older branch could have used (§12). Pure — no I/O, no DB.
+// consume a cap slot that an allowed older branch could have used (§5.B). Pure — no I/O, no DB.
 
 import type { BranchHead, BranchSnapshot } from "./github.ts";
 import { classifyBranch, coverageForName, type CompiledBranchPolicy, type PolicyResult, type PolicyCoverage } from "./branchPolicy.ts";
@@ -11,7 +11,7 @@ import type { PolicyStatus } from "./db.ts";
 // (matched by name; resolved by §5.B discovery from the SAME snapshot as these heads — never from the
 // older §5.A REST listing, see github.ts::BranchSnapshot) is ALWAYS eligible — exempt from BOTH the cutoff
 // filter and the cap — so the default-branch view the report's headline metrics depend on is
-// never silently absent (CV2: a dormant default behind active feature branches, or one past the
+// never silently absent (a dormant default behind active feature branches, or one past the
 // cap, must still be scanned). Every OTHER still-live branch before cutoffDate is
 // `cutoffSkipped` (regardless of the cap); the after-cutoff survivors are `eligible` up to
 // maxBranchesPerRepo (the cap counts NON-default branches only, so a repo can yield cap+1
@@ -45,7 +45,7 @@ export function classifyBranchPlan(
   return { cutoffSkipped, eligible, pastCap };
 }
 
-// A branch's full T6 disposition: the head, whether it's the repo default, and its RAW
+// A branch's full disposition: the head, whether it's the repo default, and its RAW
 // (counterfactual) policy decision. `rawPolicyResult` may be `excluded-by-*` even for a branch that
 // is scanned (the default-branch override) — the report records it as the "would have been excluded"
 // fact. Which BUCKET a decision lands in encodes the cutoff/cap reason, so no separate field is needed.
@@ -55,7 +55,8 @@ export interface BranchDecision {
   readonly rawPolicyResult: PolicyResult;
 }
 
-// Every discovered head lands in EXACTLY one bucket (a disjoint partition — the §5 count identity).
+// Every discovered head lands in EXACTLY one bucket (a disjoint partition — the disposition-count
+// identity the report's scanScope counts rest on).
 // toScan/cutoffSkipped/pastCap are the cutoff/cap split of the POLICY-ELIGIBLE heads; policyExcluded
 // are the NON-default heads policy dropped (they never reach cutoff/cap).
 export interface RepoBranchPlan {
@@ -63,14 +64,14 @@ export interface RepoBranchPlan {
   readonly cutoffSkipped: readonly BranchDecision[];
   readonly pastCap: readonly BranchDecision[];
   readonly policyExcluded: readonly BranchDecision[];
-  // The UNION over this repo's raw heads of every configured pattern that matched ≥1 head (§8 coverage,
-  // per list). Folded into the run-level warning finalizer: a configured pattern absent from EVERY
+  // The UNION over this repo's raw heads of every configured pattern that matched ≥1 head (warning-sweep
+  // coverage, per list). Folded into the run-level warning finalizer: a configured pattern absent from EVERY
   // discovered repo's coverage matched nothing and warrants an "unmatched-pattern" warning.
   readonly coverage: PolicyCoverage;
 }
 
 // Classify every head — policy FIRST, then cutoff/cap over ONLY the policy-eligible set. Also sweeps
-// coverage over EVERY raw head (§8/§12). classifyBranch and coverageForName may throw PolicyMatchError
+// unmatched-pattern coverage over EVERY raw head. classifyBranch and coverageForName may throw PolicyMatchError
 // (a glob that THROWS at .match() time, fail-closed) — and coverage invokes patterns the WINNER
 // matcher shadows, so a shadowed throwing glob fails HERE. This runs the WHOLE repo up-front, before
 // any per-branch write, so such a throw aborts before this repo is half-classified; callers must let
@@ -78,7 +79,7 @@ export interface RepoBranchPlan {
 // scanned). The fail-closed promise is scoped to the THROW class only: a malformed pattern Bun.Glob
 // ACCEPTS without throwing (e.g. "[") is not an error anywhere — whatever it matches is applied
 // normally ("[" matches nothing in the pinned test), and a pattern that matched NOTHING surfaces
-// as a §8 unmatched-pattern warning (branchPolicy.ts's fail-closed contract states this scope; the
+// as an advisory unmatched-pattern warning (branchPolicy.ts's fail-closed contract states this scope; the
 // "[" pin test in branchPlanner.test.ts executes it).
 export function planRepoBranches(
   snapshot: BranchSnapshot,
@@ -87,7 +88,7 @@ export function planRepoBranches(
   maxBranchesPerRepo: number,
 ): RepoBranchPlan {
   const { heads, defaultBranch } = snapshot;
-  // FAIL-CLOSED snapshot invariant (§12). listBranchHeads already rejects this pairing, so reaching it
+  // FAIL-CLOSED snapshot invariant. listBranchHeads already rejects this pairing, so reaching it
   // means the snapshot did not come from a validated discovery — a hand-built test double, or a future
   // caller that reassembled `heads` and `defaultBranch` from different sources (exactly the stale-epoch
   // mistake BranchSnapshot exists to make unrepresentable). Planning it would be actively dangerous:
@@ -112,7 +113,7 @@ export function planRepoBranches(
   for (const head of heads) {
     const c = classifyBranch(policy, head.name, defaultBranch);
     decisions.set(head, { head, isDefaultBranch: c.isDefaultBranch, rawPolicyResult: c.rawPolicyResult });
-    // Coverage (§8): EVERY pattern that matched this head, both lists. Separate from the winner used
+    // Coverage (for the unmatched-pattern warning): EVERY pattern that matched this head, both lists. Separate from the winner used
     // above (which short-circuits) — so a pattern shadowed for classification is still exercised here.
     const cov = coverageForName(policy, head.name);
     for (const p of cov.branches) matchedInclude.add(p);
@@ -120,7 +121,7 @@ export function planRepoBranches(
   }
   // Stable-filter to the policy-eligible heads (order preserved), then cutoff/cap ONLY those. A
   // non-default excluded head is dropped here — before nonDefaultEligible can increment for it — so
-  // it cannot strand an allowed older branch behind the cap (§12).
+  // it cannot strand an allowed older branch behind the cap (policy-before-cutoff/cap, PROMPT.md §5.B).
   const eligibleHeads: BranchHead[] = [];
   const policyExcluded: BranchDecision[] = [];
   for (const head of heads) {
@@ -137,7 +138,7 @@ export function planRepoBranches(
 }
 
 // Map a branch's RAW policy decision to the persisted (policy_status, policy_matched_pattern) pair
-// (§3). Only `excluded-by-deny` carries a pattern; `no-exclusion` carries neither. Applied
+// (PROMPT.md §3). Only `excluded-by-deny` carries a pattern; `no-exclusion` carries neither. Applied
 // unconditionally to scanned decisions — it yields (null, null) for the common eligible case.
 export function policyAttribution(r: PolicyResult): {
   policyStatus: PolicyStatus | null;
@@ -153,7 +154,7 @@ export function policyAttribution(r: PolicyResult): {
   }
 }
 
-// §5 branch-policy diagnostics for the --plan surface — the plan-mode analog of the report's
+// Branch-policy diagnostics for the --plan surface — the plan-mode analog of the report's
 // scanScope sub-counts (report.ts buildScanScope). `excludedByDeny`/`excludedByAllow` split the
 // disjoint `policyExcluded` bucket; `defaultBranchPolicyOverrides` counts default branches a policy
 // WOULD have excluded but that stay eligible (the override — an OVERLAPPING diagnostic within

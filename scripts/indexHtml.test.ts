@@ -120,7 +120,7 @@ describe("renderIndex", () => {
     expect(html).toContain('<template id="packages-md">');
   });
 
-  test("CT1 vocabulary: usage sites, never invocation wording", () => {
+  test("vocabulary: usage sites, never invocation wording", () => {
     expect(html).toContain("usage sites");
     expect(html).not.toContain("call site");
   });

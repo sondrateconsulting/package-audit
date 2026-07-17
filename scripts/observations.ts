@@ -7,9 +7,9 @@
 //
 // FALLBACK (launch never hinges on this layer): tryEvaluateObservations catches ANY throw during
 // evaluation and returns { omitted: true } — the caller renders the dossier without the section,
-// and the coordinator's JSONL event makes the omission visible (CEO addendum 10).
+// and the coordinator's JSONL event makes the omission visible.
 //
-// VOCABULARY (CT1): "usage sites" / "import and use" — never invocation wording.
+// VOCABULARY (binding): "usage sites" / "import and use" — never invocation wording.
 
 import type { DossierModel } from "./reportHtml.ts"; // type-only: no runtime cycle with the renderer
 

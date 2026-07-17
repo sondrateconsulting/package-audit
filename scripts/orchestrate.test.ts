@@ -65,7 +65,7 @@ describe("classifyBranchPlan (§5.B cutoff + cap)", () => {
   });
 });
 
-describe("classifyBranchPlan — the DEFAULT branch is always eligible (§5.B/CV2)", () => {
+describe("classifyBranchPlan — the DEFAULT branch is always eligible (§5.B)", () => {
   test("a default branch OLDER than the cutoff is eligible, never cutoff-skipped", () => {
     const heads = [
       head("feature", "2025-06-01T00:00:00Z"),
@@ -219,7 +219,7 @@ async function captureJsonl(fn: () => Promise<unknown>): Promise<Array<Record<st
   return chunks.join("").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
-describe("runPlan cache-less client guard (§8 --plan zero-write)", () => {
+describe("runPlan cache-less client guard (--plan zero-write)", () => {
   test("rejects a caching (db-backed) client before any discovery call", async () => {
     const root = mkdtempSync(join(tmpdir(), "plan-guard-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
@@ -524,7 +524,7 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     });
 
     // run_unit_head: stale → skipped-cutoff (empty sha), main+dev → scanned at their live heads with
-    // the REAL default-branch flag (1 for main, 0 otherwise), and feat → a NEW past-cap row (T6: a
+    // the REAL default-branch flag (1 for main, 0 otherwise), and feat → a NEW past-cap row (a
     // past-cap branch is now recorded for report visibility, though its work queue stays untouched).
     const headRows = db.read(`SELECT branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
     expect(headRows).toEqual([
@@ -581,7 +581,7 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
   });
 });
 
-describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
+describe("processRepo / runScan — branch allow/deny wiring", () => {
   // defaultBranch is REQUIRED and explicit: inferring it (a hardcoded "main", or "the first head")
   // would make a fixture agree with whatever the code resolved and hide a default-resolution defect.
   const graphqlHeads = (nodes: Array<{ name: string; oid: string; date: string }>, defaultBranch: string | null): string =>
@@ -715,7 +715,7 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("clone-fallback with a MOVED branch: both run_unit_head AND work_queue pin the clone HEAD's sha+date (P0)", async () => {
+  test("clone-fallback with a MOVED branch: both run_unit_head AND work_queue pin the clone HEAD's sha+date", async () => {
     const root = mkdtempSync(join(tmpdir(), "clone-move-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
@@ -733,7 +733,7 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     expect(headRowsOf(db, runId)).toEqual([
       { branch: "main", status: "scanned", sha: "o-moved", d: 1, ps: null, pat: null, scd: "2025-06-15T09:00:00+00:00" },
     ]);
-    const unit = db.getUnit(key("main")); // the work-queue pair matches (the P0 fix: no stale date)
+    const unit = db.getUnit(key("main")); // the work-queue pair matches (the stale-date fix)
     expect(unit?.lastCommitSha).toBe("o-moved");
     expect(unit?.lastCommitDate).toBe("2025-06-15T09:00:00+00:00");
     db.close();
@@ -759,7 +759,7 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("§5 plan diagnostics: deny/allow sub-counts + default override, over all four dispositions", async () => {
+  test("plan diagnostics: deny/allow sub-counts + default override, over all four dispositions", async () => {
     const root = mkdtempSync(join(tmpdir(), "plan-diag-"));
     // allowlist keep/* + deny deny-me, cap=1. main (default) is NOT in the allowlist → a scanned
     // default-branch OVERRIDE. deny-me → excluded-by-deny; other → excluded-by-allow. keep/a wins the
@@ -785,7 +785,7 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     expect(t.branchesPastCap).toBe(1);         // keep/b
     expect(t.branchesExcludedByPolicy).toBe(2); // deny-me + other
     expect(t.branchesEligible + t.branchesSkippedByCutoff + t.branchesPastCap + t.branchesExcludedByPolicy).toBe(6);
-    // the §5 diagnostic overlays
+    // the plan diagnostic overlays
     expect(t.excludedByDeny).toBe(1);
     expect(t.excludedByAllow).toBe(1);
     expect(t.defaultBranchPolicyOverrides).toBe(1); // main
@@ -801,7 +801,7 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  // ---- §8 policy warnings (T7) ----
+  // ---- policy warnings ----
   // A client serving one org repo (svc) + the given branch heads + an empty tree (so a scanned unit
   // runs to zero findings). Distinguishes the GraphQL head query, the git-trees fetch, and the repo list.
   const fullClient = (root: string, heads: Array<{ name: string; oid: string; date: string }>, defaultBranch: string | null): GithubClient =>
@@ -935,11 +935,11 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  // ---- §11 stale-row reconciliation ----
+  // ---- stale-row reconciliation ----
   const staleHead = (db: AuditDb, runId: string, branch: string, over: Partial<Parameters<AuditDb["upsertRunUnitHead"]>[0]> = {}): void =>
     db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch, commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T00:00:00Z", ...over });
 
-  test("§11: a resumed repo prunes rows for branches deleted since a prior invocation, and logs it once", async () => {
+  test("reconciliation: a resumed repo prunes rows for branches deleted since a prior invocation, and logs it once", async () => {
     const root = mkdtempSync(join(tmpdir(), "recon-prune-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
@@ -954,7 +954,7 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("§11: a FAILED branch discovery skips reconciliation — prior rows are RETAINED (transient failure != deletion)", async () => {
+  test("reconciliation: a FAILED branch discovery skips reconciliation — prior rows are RETAINED (transient failure != deletion)", async () => {
     const root = mkdtempSync(join(tmpdir(), "recon-fail-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
@@ -968,7 +968,7 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("§11: a still-live branch whose scan FAILS keeps its prior row (keep-set is live NAMES, not rows written)", async () => {
+  test("reconciliation: a still-live branch whose scan FAILS keeps its prior row (keep-set is live NAMES, not rows written)", async () => {
     const root = mkdtempSync(join(tmpdir(), "recon-scanfail-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
@@ -992,7 +992,7 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
   // policy the always-eligible exemption then missed it and the repo yielded ZERO scanned units,
   // silently. These pin the fix at BOTH consumers of the shared planner (the run and --plan), because
   // runPlan calls listBranchHeads directly and a shared-planner test cannot catch bad source wiring.
-  test("a default RENAMED since the REST listing is still scanned under branches:[] (Premise 6)", async () => {
+  test("a default RENAMED since the REST listing is still scanned under branches:[] (always scanned)", async () => {
     const root = mkdtempSync(join(tmpdir(), "stale-default-scan-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
@@ -1049,9 +1049,9 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  // T11 boundary: an INCOHERENT snapshot must fail discovery, never reconcile. Pairs with the
+  // Reconciliation boundary: an INCOHERENT snapshot must fail discovery, never reconcile. Pairs with the
   // legitimate-empty case below — together they prove the fix did not turn "empty" into "failed".
-  test("§11: a snapshot with heads but NO default fails discovery — prior rows retained, no prune", async () => {
+  test("reconciliation: a snapshot with heads but NO default fails discovery — prior rows retained, no prune", async () => {
     const root = mkdtempSync(join(tmpdir(), "recon-nodefault-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
@@ -1065,7 +1065,7 @@ describe("processRepo / runScan — branch allow/deny wiring (T6)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("§11: the legitimate EMPTY repo (no heads, no default) still reconciles and prunes", async () => {
+  test("reconciliation: the legitimate EMPTY repo (no heads, no default) still reconciles and prunes", async () => {
     const root = mkdtempSync(join(tmpdir(), "recon-empty-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
@@ -1105,7 +1105,7 @@ describe("planSummaryText", () => {
     packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
   };
 
-  // a full PlanTotals with all-zero §5 diagnostics; spread + override per test
+  // a full PlanTotals with all-zero policy diagnostics; spread + override per test
   const totals: PlanTotals = {
     owners: ["org-a", "org-b"], ownersSource: "discovered",
     reposDiscovered: 42, reposKept: 37,
@@ -1127,18 +1127,18 @@ describe("planSummaryText", () => {
     expect(text).toMatch(/Discovery errors:\s+0\b/);
   });
 
-  test("§5 policy detail line: shown with the deny/allow split + override count when policy removed branches", () => {
+  test("policy detail line: shown with the deny/allow split + override count when policy removed branches", () => {
     const text = planSummaryText(config, { ...totals, branchesExcludedByPolicy: 3, excludedByDeny: 2, excludedByAllow: 1, defaultBranchPolicyOverrides: 1 });
     expect(text).toContain("Policy detail:        2 excluded by deny · 1 excluded as not allow-listed · 1 default-branch policy override(s) (already counted as eligible)");
   });
 
-  test("§5 policy detail line: shown for an override-only plan (no exclusions, but a policy would have excluded the default)", () => {
+  test("policy detail line: shown for an override-only plan (no exclusions, but a policy would have excluded the default)", () => {
     const text = planSummaryText(config, { ...totals, defaultBranchPolicyOverrides: 2 });
     expect(text).toContain("0 excluded by deny · 0 excluded as not allow-listed · 2 default-branch policy override(s)");
   });
 
-  test("§5 policy detail line: SUPPRESSED when no policy activity (no exclusions, no overrides)", () => {
-    const text = planSummaryText(config, totals); // all §5 diagnostics zero
+  test("policy detail line: SUPPRESSED when no policy activity (no exclusions, no overrides)", () => {
+    const text = planSummaryText(config, totals); // all policy diagnostics zero
     expect(text).not.toContain("Policy detail:");
   });
 });
@@ -1291,7 +1291,7 @@ describe("processRepo throttle requeue (§4)", () => {
   });
 });
 
-describe("same-name stale-head retention is DISPOSITION-AGNOSTIC (§11)", () => {
+describe("same-name stale-head retention is DISPOSITION-AGNOSTIC", () => {
   test("a prior skipped-cutoff row survives a failed re-scan of the now-eligible advanced head", async () => {
     // Round-4 review finding: the retention docs used to describe the retained row as "scanned at
     // the old head" — but retention is name-keyed and disposition-agnostic. Invocation 1: the

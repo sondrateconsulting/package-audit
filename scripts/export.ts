@@ -160,7 +160,7 @@ const USAGE_FINDINGS_COLUMNS = [
   { name: "found_at", type: "string" },
 ] as const satisfies readonly ExportColumn[];
 
-// The per-run branch disposition snapshot (branch allow/deny §5). Unlike the findings tables, this
+// The per-run branch disposition snapshot. Unlike the findings tables, this
 // exports EVERY disposition — scanned, genuine cutoff-skip, past-cap, and policy-excluded — because
 // the whole point of the policy columns is the NON-scanned rows. Columns are in RUN_UNIT_HEAD_BODY
 // (SCHEMA_SQL) order; is_default_branch and the three v4 policy/date columns are nullable.
@@ -471,7 +471,7 @@ export function runExport(config: Config, opts: { runId: string | null; raw: boo
   if (sqlitePath === ":memory:" || !existsSync(sqlitePath)) {
     return { line: `${JSON.stringify(buildNotExportableNotice(opts.runId, sqlitePath))}\n` };
   }
-  // CV5: export is a pure READ — openReadOnly never creates, migrates, or writes the database.
+  // Export is a pure READ — openReadOnly never creates, migrates, or writes the database.
   const db = AuditDb.openReadOnly({ sqlitePath });
   try {
     const run = opts.runId !== null ? db.getRun(opts.runId) : db.latestReportableRun();

@@ -626,7 +626,7 @@ export interface BranchSnapshot {
   readonly defaultBranch: string | null;
 }
 
-// §5.B/§9 discovery outcome. A specialized success arm (a snapshot, not a bare list) unioned with the
+// §5.B discovery outcome. A specialized success arm (a snapshot, not a bare list) unioned with the
 // SHARED DiscoveryFailure, so the "a failed scope carries no partial data / is never reconciled" rule
 // stays declared in exactly one place (discovery.ts) even though this scope's payload isn't a list.
 export type BranchDiscoveryOutcome = { readonly ok: true; readonly snapshot: BranchSnapshot } | DiscoveryFailure;
@@ -1092,7 +1092,7 @@ export class GithubClient {
       }
       // GraphQL spec: a PRESENT `errors` member is an ARRAY. A present-but-non-array errors field
       // means the failure signal we were meant to read is unreadable — coercing it to "no errors"
-      // would be fail-OPEN: an ok:true branch discovery feeds the reconcile PRUNE (§11), so a
+      // would be fail-OPEN: an ok:true branch discovery feeds the reconcile PRUNE (reconcileRunUnitHead), so a
       // swallowed error signal could turn a partial result into row deletion. classifyGraphql still
       // runs FIRST with errors=[]: status/header evidence (5xx retry, throttle, SSO-fatal) keeps its
       // semantics, and the malformed envelope only preempts the OK path below.
@@ -1154,7 +1154,7 @@ export class GithubClient {
     // same poisoned-pagination bound as restGetPagedArray: a response controls the next
     // cursor, so a repeated or endless cursor chain must fail closed, not loop unbounded.
     const seenCursors = new Set<string>();
-    // FAIL-CLOSED completeness (load-bearing for T11 run_unit_head reconciliation, which prunes rows
+    // FAIL-CLOSED completeness (load-bearing for run_unit_head reconciliation, which prunes rows
     // for branches ABSENT from this set): the returned name set must be the COMPLETE, exact branch
     // list. A silently-dropped node or a silently-truncated pagination would understate it and delete
     // a live branch's row. So a malformed node, a missing/non-boolean hasNextPage, a hasNextPage=true
@@ -1257,7 +1257,7 @@ export class GithubClient {
     // decision is `headName === defaultBranch`. Both directions are checked, and BOTH throw rather
     // than degrade: a caller cannot tell a wrong default from a right one, so an incoherent snapshot
     // must not escape at all. Throwing yields discovery 'failed' → an errors row (LOUD, unlike the
-    // silent mis-scan it replaces) → the repo is retained and never reconciled (T11 stays safe).
+    // silent mis-scan it replaces) → the repo is retained and never reconciled (the prune stays safe).
     if (defaultBranch !== null && !seenNames.has(defaultBranch))
       throw new GithubApiError(
         `defaultBranchRef ${JSON.stringify(defaultBranch)} is absent from the discovered heads of ${org}/${repo}`,

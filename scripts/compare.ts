@@ -5,7 +5,7 @@
 // {"notComparable":…} notice on the stdout JSONL contract and exits 0 (consumers branch on the
 // parsed field, not the exit code — the runReport precedent).
 //
-// Semantics (CT5):
+// Semantics (default-branch headline rule):
 // - Each run's slice is usage_findings joined through the IMMUTABLE run_unit_head snapshot
 //   (run_id = that run, status='scanned', matching org/repo/branch/commit_sha — report.ts's join,
 //   NEVER findings.run_id) filtered to THAT run's tracked_packages.
@@ -274,7 +274,7 @@ function siteKey(r: UsageRowDb): string {
   return [r.organization, r.repository, r.branch, r.usage_type, r.export_name, r.file_path, String(r.line_number), r.context].join("\0");
 }
 
-// The per-branch policy disposition state used by §5 churn (keyed by org/repo/branch, NOT commit —
+// The per-branch policy disposition state used by policy churn (keyed by org/repo/branch, NOT commit —
 // churn tracks a branch's policy across runs regardless of the commit it pointed at).
 interface PolicyBranchState {
   readonly status: string;
@@ -289,7 +289,7 @@ interface RunSlice {
   byPackage: Map<string, Map<string, UsageRowDb>>; // package → siteKey → representative row
   flags: Map<string, boolean | null>; // unitKey → tri-state default-branch flag (scanned heads)
   hasNullFlag: boolean; // ANY head row of the run with is_default_branch NULL (pre-v3)
-  policyByBranch: Map<string, PolicyBranchState>; // (org\0repo\0branch) → policy disposition (§5 churn)
+  policyByBranch: Map<string, PolicyBranchState>; // (org\0repo\0branch) → policy disposition (policy churn)
   policyProvenanceGap: "pre-v4-policy-data" | "no-recorded-heads" | null; // why churn is unavailable; null = provenance sound
 }
 
@@ -396,7 +396,7 @@ const entryCmp = (a: CompareSiteEntry, b: CompareSiteEntry): number =>
   cmp(a.exportName, b.exportName) || cmp(a.context, b.context);
 
 // Repos with ≥1 in-scope usage site of the package in this slice. Scope = default-branch sites
-// only (the CT5 headline rule), widened to all branches under the pre-v3 fallback.
+// only (the default-branch headline rule), widened to all branches under the pre-v3 fallback.
 function scopedRepos(sites: ReadonlyMap<string, UsageRowDb>, flags: Map<string, boolean | null>, incomplete: boolean): Map<string, CompareRepoEntry> {
   const repos = new Map<string, CompareRepoEntry>();
   for (const row of sites.values()) {
@@ -525,7 +525,7 @@ export function runCompare(config: Config, runIdA: string, runIdB: string): { li
   if (sqlitePath === ":memory:" || !existsSync(sqlitePath))
     return { line: `${JSON.stringify(buildNotComparableNotice({ kind: "missing-db", path: sqlitePath }))}\n` };
 
-  // Pure READ — openReadOnly can never create, migrate, or write the database (CV5).
+  // Pure READ — openReadOnly can never create, migrate, or write the database.
   const db = AuditDb.openReadOnly({ sqlitePath });
   try {
     const entries: Array<readonly [string, RunRecord | null]> = [

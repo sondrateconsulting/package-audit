@@ -310,7 +310,7 @@ describe("ArtifactBundle — sweep confinement", () => {
     writeFileSync(join(xray, "removed-package-dossier.html"), "stale");
     writeFileSync(join(xray, ".tmp-crashed-123"), "partial");
     // DECOYS in the manifest-OWNED directory's PARENT: report history + an operator file.
-    // outputDir accumulates run-*.json by design — a flat sweep would delete it (E2).
+    // outputDir accumulates run-*.json by design — a flat sweep would delete it.
     writeFileSync(join(out, "run-77.json"), '{"history":true}');
     writeFileSync(join(out, "latest.json"), '{"latest":true}');
     writeFileSync(join(out, "operator-notes.txt"), "keep me");

@@ -168,7 +168,7 @@ describe("buildCompare — added/removed sites", () => {
   });
 });
 
-// A policy-aware run_unit_head writer for §5 churn tests. Honors the write invariants:
+// A policy-aware run_unit_head writer for policy-churn tests. Honors the write invariants:
 // scanned+policy → default; skipped/past-cap policy → non-default; deny → non-empty pattern.
 function phead(
   db: AuditDb, runId: string, branch: string,
@@ -190,7 +190,7 @@ function phead(
   });
 }
 
-describe("buildCompare — §5 policy churn", () => {
+describe("buildCompare — policy churn", () => {
   test("classifies entered / left / reclassified / default-override-change; counts branches only in one run", () => {
     const db = mem();
     const runA = startCompleted(db, ["expo"]);
@@ -294,7 +294,7 @@ describe("buildCompare — §5 policy churn", () => {
   });
 });
 
-describe("buildCompare — default-branch headline (CT5)", () => {
+describe("buildCompare — default-branch headline", () => {
   test("a site added on a feature branch is listed with isDefaultBranch:false but NOT counted in the summary", () => {
     const db = mem();
     const runA = startCompleted(db, ["expo"]);

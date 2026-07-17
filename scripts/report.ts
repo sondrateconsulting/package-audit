@@ -38,7 +38,7 @@ interface UsageRowDb {
 interface HeadRow {
   organization: string; repository: string; branch: string; commit_sha: string; status: string;
   is_default_branch: number | null; // 1/0/NULL — NULL = unknown (pre-v3 run rows)
-  policy_status: string | null; // 'excluded-by-deny' | 'excluded-by-allow' | NULL (branch allow/deny §3)
+  policy_status: string | null; // 'excluded-by-deny' | 'excluded-by-allow' | NULL (PROMPT.md §3)
   policy_matched_pattern: string | null; // the causing deny pattern; NULL for allow-miss / no-policy
   scanned_commit_date: string | null; // NULL only for pre-v4 migrated rows → scan-scope provenance sentinel
 }
@@ -87,7 +87,7 @@ export interface ReportSummary {
   //   LATER one is NOT counted here — the row-key exclusion below drops it. That is deliberate and
   //   correct: its retained row already places it in that row's disposition bucket, and counting it here
   //   too would count one discovered branch TWICE and break the partition. This is the same-name
-  //   stale-head case; see the §11 note in orchestrate.ts::processRepo.
+  //   stale-head case; see the reconciliation note in orchestrate.ts::processRepo.
   //
   // So the exclusion is what keeps every discovered branch counted at most once, which is why the
   // identity above stays an UPPER BOUND (never a double-count) rather than an equality on a resume.
@@ -114,7 +114,7 @@ export interface ReportSummary {
 // cli, dateFetched — a superset of the renderer's view) is preserved for run-<id>.json; its JSON
 // contract is separately enforced by reportSchema.ts in tests. errors[] stays untyped (leaf only).
 export interface EmittedReport {
-  formatVersion: number; // XRAY_FORMAT_VERSION — the report/export/HTML artifact-set version (§10)
+  formatVersion: number; // XRAY_FORMAT_VERSION — the report/export/HTML artifact-set version
   runId: string;
   generatedAt: string;
   config: { packages: string[]; cutoffDate: string; githubHost: string; organizations: string[]; organizationsSource: string };
@@ -230,7 +230,7 @@ function dispositionOf(h: HeadRow): "scanned-default-override" | "excluded" {
   return isDefaultOverride(h) ? "scanned-default-override" : "excluded";
 }
 
-// §5 scan-scope diagnostics. policyBranches lists every head with a policy_status (both the excluded
+// Scan-scope diagnostics (PROMPT.md §7 scanScope). policyBranches lists every head with a policy_status (both the excluded
 // rows and the scanned default-overrides), deterministically sorted by (org, repo, branch).
 function buildScanScope(allHeads: HeadRow[]): ScanScope {
   const policyRows = allHeads.filter((h) => h.policy_status !== null);
@@ -405,9 +405,9 @@ export function buildNotReportableNotice(runIdArg: string | null, missingDbPath?
 // AuditDb.open would create data/audit.db (create:true) and the emit path would mkdir outputDir;
 // a first report must touch NOTHING and just say so. So we exist-check before opening: a missing
 // database short-circuits with the notReportable notice and zero filesystem effect.
-// `report --html` (T3-T6): render one self-contained dossier per tracked package plus the
+// `report --html`: render one self-contained dossier per tracked package plus the
 // index, through the ArtifactBundle (kind "dossier" — export artifacts of the SAME run are
-// adopted, never swept). One JSONL event per dossier (T7), with the observations fallback
+// adopted, never swept). One JSONL event per dossier, with the observations fallback
 // VISIBLE (observations: "emitted"|"omitted"), then a dossier-summary event. The rendered
 // dossier/index bytes are a pure function of the report object; the caller already holds it, so
 // no re-query can disagree with run-<id>.json.
@@ -449,7 +449,7 @@ export function runReport(config: Config, runIdArg: string | null, opts: { html?
     // code — and this matches the exit-0 behavior of the DB-present notReportable cases below.
     return { line: `${JSON.stringify(buildNotReportableNotice(runIdArg, sqlitePath))}\n` };
   }
-  // CV5: report is a pure READ — it must never create, migrate, or write the database. A
+  // Report is a pure READ — it must never create, migrate, or write the database. A
   // too-old schema renders the actionable "run `bun run audit` once to migrate" DbError.
   const db = AuditDb.openReadOnly({ sqlitePath });
   try {

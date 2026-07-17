@@ -1,4 +1,4 @@
-// policyIntegration.test.ts — the branch allow/deny END-TO-END seam (T10). Everything else tests one
+// policyIntegration.test.ts — the branch allow/deny END-TO-END seam. Everything else tests one
 // layer; this proves the layers COMPOSE. Two scenarios:
 //   1. The policy classification seam: `runScan` (the real scan path, scripted GitHub client, empty
 //      trees so scanned units run to zero findings) → the persisted run_unit_head dispositions →
@@ -10,7 +10,7 @@
 //      must NOT leak its stale findings into run B's report/export (the findings joins go through run
 //      B's run_unit_head on status='scanned' + matching commit). A synthetic POISON row at commit_sha=''
 //      makes the status='scanned' predicate load-bearing: drop it and the poison leaks. Direct-seeded
-//      per the T10 consult (the read-model join, not upsert*Finding, is what's under test here).
+//      by design (the read-model join, not upsert*Finding, is what's under test here).
 import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -87,7 +87,7 @@ const runIdOf = (events: Array<Record<string, unknown>>): string => {
 const headRows = (db: AuditDb, runId: string): Array<Record<string, unknown>> =>
   db.read(`SELECT branch, status, commit_sha AS sha, is_default_branch AS d, policy_status AS ps, policy_matched_pattern AS pat FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
 
-describe("branch allow/deny — end-to-end policy classification seam (T10)", () => {
+describe("branch allow/deny — end-to-end policy classification seam", () => {
   // Six heads, newest-first (as listBranchHeads supplies). allow-list keep/scan {feature/x, overflow,
   // ancient} + default main; cap=1 non-default. feature/x newer than overflow → wins the cap in run A.
   const HEADS: Head[] = [
@@ -162,7 +162,7 @@ describe("branch allow/deny — end-to-end policy classification seam (T10)", ()
   });
 });
 
-describe("branch allow/deny — a policy-excluded branch never leaks stale findings (T10 regression pin)", () => {
+describe("branch allow/deny — a policy-excluded branch never leaks stale findings (regression pin)", () => {
   // Global finding rows are keyed by (org, repo, branch, commit) and shared across runs. Run A scanned
   // feature/x (findings at its real SHA); a POISON pair sits at commit_sha='' (the SHA a non-scanned
   // row carries). Run B excludes feature/x → its head row is skipped-cutoff + commit_sha=''. Run B's

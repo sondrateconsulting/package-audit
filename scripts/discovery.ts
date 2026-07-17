@@ -1,17 +1,17 @@
-// discovery.ts — the shared outcome type for a discovery scope (branch allow/deny §9). A scope's
+// discovery.ts — the shared outcome type for a discovery scope. A scope's
 // discovery either SUCCEEDS (with a possibly-EMPTY item list) or FAILS (throttled or permanent). This
 // discriminates "discovered, genuinely empty" from "discovery failed" — a distinction the pre-feature
 // code lost by returning `[]` for both. Two consumers branch on `ok`:
-//   - T7 (policy-warning suppression): only a SUCCESSFUL scope counts toward "any repo discovered", and
+//   - policy-warning suppression: only a SUCCESSFUL scope counts toward "any repo discovered", and
 //     "unmatched pattern" warnings are suppressed entirely when zero scopes succeeded.
-//   - T11 (schema-neutral reconciliation): NEVER prune a FAILED scope's rows (a throttle/permission
+//   - stale-row reconciliation (schema-neutral): NEVER prune a FAILED scope's rows (a throttle/permission
 //     failure must not be read as "these branches no longer exist").
-// A FAILED outcome NEVER carries partial items — that is load-bearing for T11's destructive safety.
+// A FAILED outcome NEVER carries partial items — that is load-bearing for reconciliation's destructive safety.
 
 // The FAILURE arm, named so specialized success unions (see BranchDiscoveryOutcome in github.ts) can
 // reuse the EXACT failure semantics instead of re-declaring them. Every discovery scope — whatever its
-// success payload — fails in precisely these two ways, and T11's "never prune a failed scope" rule keys
-// on this shape. Keeping it in ONE place is what makes that rule auditable across scopes.
+// success payload — fails in precisely these two ways, and reconciliation's "never prune a failed scope"
+// rule keys on this shape. Keeping it in ONE place is what makes that rule auditable across scopes.
 export type DiscoveryFailure = { readonly ok: false; readonly reason: "throttled" | "failed" };
 
 // The LIST-payload scope (repo discovery). A scope whose success carries more than a list declares its

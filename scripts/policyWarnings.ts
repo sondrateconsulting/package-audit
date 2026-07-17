@@ -1,4 +1,4 @@
-// policyWarnings.ts — the advisory branch-policy warning contract (§8). PURE: it never invokes a
+// policyWarnings.ts — the advisory branch-policy warning contract. PURE: it never invokes a
 // glob (the matchers ran EAGERLY during discovery, inside planRepoBranches, so a glob that throws at
 // .match() time already failed closed there) — this is only set difference + rendering. A malformed
 // pattern Bun.Glob ACCEPTS without throwing (e.g. "[") is NOT an error anywhere: whatever it matches

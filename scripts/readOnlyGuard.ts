@@ -206,7 +206,7 @@ export function assertGraphqlQueryIsReadOnly(rest: string[]): void {
 // exact raw-argv tuple (below). Other read verbs (cat-file, log) stay excluded entirely — they
 // accept --output/--textconv/--filters, which would breach read-only.
 const GIT_READ = new Set(["clone", "rev-parse", "show", "--version"]);
-// The tool runs EXACTLY ONE `show` form: read a cloned HEAD's committer date (branch allow/deny §4,
+// The tool runs EXACTLY ONE `show` form: read a cloned HEAD's committer date (the
 // clone-fallback scan). There is NO general show/log parser — that would reopen --output/textconv/
 // --ext-diff/alternate-format/revision surface. Instead an EXACT raw-argv allowlist: --no-patch
 // suppresses diff machinery, --no-show-signature avoids invoking GPG, --no-notes avoids notes

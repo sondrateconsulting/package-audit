@@ -82,7 +82,7 @@ describe("buildReport (§7)", () => {
       branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
       totalDependencyFindings: 1, totalUsageFindings: 2,
     });
-    // T8: new top-level report fields
+    // new top-level report fields
     expect(report.formatVersion).toBe(XRAY_FORMAT_VERSION);
     expect(report.scanScope).toEqual({
       excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "complete",
@@ -121,7 +121,7 @@ describe("buildReport (§7)", () => {
     db.close();
   });
 
-  test("§5 disposition partition + scanScope across all four buckets (deny/allow/default-override/past-cap)", () => {
+  test("disposition partition + scanScope across all four buckets (deny/allow/default-override/past-cap)", () => {
     const db = mem();
     const { runId } = db.startRun({
       configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
@@ -180,7 +180,7 @@ describe("buildReport (§7)", () => {
     db.close();
   });
 
-  test("§5 partition counts RECORDED disposition rows only — a scan-errored discovered branch is in errors[], not a bucket", () => {
+  test("partition counts RECORDED disposition rows only — a scan-errored discovered branch is in errors[], not a bucket", () => {
     const db = mem();
     const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
     // 'main' reached a terminal disposition (scanned). 'feature' was discovered + eligible but its scan
@@ -200,7 +200,7 @@ describe("buildReport (§7)", () => {
     db.close();
   });
 
-  test("§5 the scan-scope ledger FAILS CLOSED on a policy-bearing row that is neither excluded nor an override", () => {
+  test("the scan-scope ledger FAILS CLOSED on a policy-bearing row that is neither excluded nor an override", () => {
     // The ledger must decide via BOTH shared predicates, never `isDefaultOverride(h) ? … : "excluded"` —
     // that binary form would re-define "excluded" as "policy-bearing but not an override", a second
     // definition competing with policyDisposition.ts. assertRunUnitHeadInvariants makes this shape
@@ -228,11 +228,11 @@ describe("buildReport (§7)", () => {
     }
   });
 
-  test("§5 RESUME: a branch holding a RETAINED row that errors later is NOT in branchesErrored (no double-count)", () => {
+  test("RESUME: a branch holding a RETAINED row that errors later is NOT in branchesErrored (no double-count)", () => {
     // The resumed-run shape the single-invocation test above cannot reach. A resumed run reuses the
     // run_id, so errors[] and run_unit_head both span invocations:
     //   invocation 1 — main scanned@A, writing a row.
-    //   invocation 2 — main advanced to B; the re-scan errors. No new row, and §11's name-keyed prune
+    //   invocation 2 — main advanced to B; the re-scan errors. No new row, and reconciliation's name-keyed prune
     //                  RETAINS invocation 1's row (main is still a live branch).
     // main therefore holds BOTH a row and a scan error. It is counted ONCE — in branchesScanned, via the
     // retained row — and NOT in branchesErrored. Deliberate: counting it in both would count one
@@ -467,7 +467,7 @@ describe("runReport zero-write on a missing database", () => {
   // Contrast case: when the database OPENS but holds no completed run, report must still write
   // the notice to output/latest.json — proving the missing-db guard only short-circuits the
   // genuinely-absent case and does not suppress a real (if empty) report. runReport now opens
-  // READ-ONLY (CV5), which refuses :memory:, so the empty DB must be a real FILE — and §0
+  // READ-ONLY, which refuses :memory:, so the empty DB must be a real FILE — and §0
   // write-containment pins file DBs to ./data|./output relative to CWD, hence the db.test.ts
   // TEST_ROOT idiom here (created and removed carefully so fresh checkouts stay pristine).
   test("DB opens but no completed run: writes the notice to latest.json, no run file", () => {

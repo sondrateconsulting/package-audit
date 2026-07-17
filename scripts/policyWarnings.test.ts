@@ -4,7 +4,7 @@ import { compileBranchPolicy, type PolicyCoverage } from "./branchPolicy.ts";
 
 const cov = (branches: string[], excludeBranches: string[]): PolicyCoverage => ({ branches, excludeBranches });
 
-describe("isEmptyAllowlist (§8)", () => {
+describe("isEmptyAllowlist", () => {
   test("branches:[] → true; branches:null (unrestricted) → false; non-empty → false", () => {
     expect(isEmptyAllowlist(compileBranchPolicy([], []))).toBe(true);
     expect(isEmptyAllowlist(compileBranchPolicy(null, []))).toBe(false);
@@ -12,7 +12,7 @@ describe("isEmptyAllowlist (§8)", () => {
   });
 });
 
-describe("computeUnmatchedWarnings (§8 pure set-difference)", () => {
+describe("computeUnmatchedWarnings (pure set-difference)", () => {
   test("SUPPRESSED entirely when zero repos discovered (empty coverages)", () => {
     const p = compileBranchPolicy(null, ["never-matches"]);
     expect(computeUnmatchedWarnings(p, [])).toEqual([]);

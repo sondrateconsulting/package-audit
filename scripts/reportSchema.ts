@@ -195,7 +195,7 @@ export const scanScopeSchema = z
 
 export const reportSchema = z
   .strictObject({
-    formatVersion: z.literal(XRAY_FORMAT_VERSION).describe("XRAY_FORMAT_VERSION — the report/export/HTML artifact-set version (§10); PINNED so this schema is a true shape discriminator"),
+    formatVersion: z.literal(XRAY_FORMAT_VERSION).describe("XRAY_FORMAT_VERSION — the report/export/HTML artifact-set version; PINNED so this schema is a true shape discriminator"),
     runId: z.string().describe("The reported run's identifier (report --run-id <id> re-emits it)"),
     generatedAt: isoUtc.describe("completed_at of the run (started_at fallback for a --run-id report of a non-completed run)"),
     config: z.strictObject({
