@@ -17,6 +17,7 @@ import {
   type DossierReport,
   type PolicyBranchRow,
 } from "./reportHtml.ts";
+import { assertNever } from "./assertNever.ts";
 
 // The index's fixed artifact name inside <outputDir>/xray/ (matches the artifact name grammar).
 export const INDEX_FILENAME = "index.html";
@@ -54,7 +55,14 @@ function buildRow(pkg: DossierPackage): IndexRow {
 // branch carrying a policy_status. Every identifier passes through esc() inside a bidi-isolated <code>.
 function policyDispositionLabel(r: PolicyBranchRow): string {
   if (r.disposition === "scanned-default-override") return "scanned (default-branch override)";
-  return r.policyStatus === "excluded-by-deny" ? "excluded (deny)" : "excluded (not allow-listed)";
+  // Exhaustive over the closed PolicyStatus union: a `=== "excluded-by-deny" ? … : …` ternary funnels
+  // any future third status into the allow label with no compiler signal; assertNever makes it a build
+  // error instead. Labels for the two current members are byte-identical to the previous ternary.
+  switch (r.policyStatus) {
+    case "excluded-by-deny": return "excluded (deny)";
+    case "excluded-by-allow": return "excluded (not allow-listed)";
+    default: return assertNever(r.policyStatus, "policyStatus");
+  }
 }
 function renderScanScope(report: DossierReport): string {
   const s = report.summary;
