@@ -61,7 +61,7 @@ const KNOWN_POLICY_STATUSES = Object.keys(KNOWN_POLICY_STATUS_MAP);
 const isKnownPolicyStatus = (v: string | null): v is PolicyStatus => v !== null && KNOWN_POLICY_STATUSES.includes(v);
 
 // A branch actually DROPPED by policy — its own disposition in the disjoint partition (PROMPT.md §3),
-// named identically to the live JSONL stream's `action:'skip-policy'` event. The status alone is
+// corresponding to the live JSONL stream's `action:'skip-policy'` event. The status alone is
 // authoritative for CALLERS only because assertRunUnitHeadSound has already refused every row whose
 // status, verdict, pattern, defaultness or commit disagree. Run that gate over EVERY row first.
 export const isPolicyExcluded = (r: PolicyDispositionRow): boolean => r.status === "policy-excluded";
