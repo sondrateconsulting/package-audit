@@ -68,8 +68,12 @@ export interface ReportSummary {
   branchesPastCap: number;
   // Counts EXACTLY this: distinct (org, repo, branch) with a scope='scan' errors[] entry for this run
   // that hold NO run_unit_head disposition row. Read it as that, and not as "every branch whose scan
-  // errored" — on a SINGLE-INVOCATION run the two coincide (a to-scan branch either gets a row or
-  // errors, never both), but on a RESUMED run they diverge in BOTH directions.
+  // errored" — on a SINGLE-INVOCATION run the two coincide (a to-scan branch that reaches a TERMINAL
+  // outcome gets a row or an errors[] entry; the one composite case is a step failing AFTER the
+  // scanned row committed — the success-log write or the work-queue 'done' update — which can leave
+  // an errors[] entry beside the row: the persisted row counts that branch under branchesScanned,
+  // and the row-key exclusion below keeps it out of THIS count, so it still counts exactly once),
+  // but on a RESUMED run they diverge in BOTH directions.
   //
   // A resumed run REUSES the run_id (db.startRun), so errors[] and run_unit_head both span invocations.
   // errors[] is append-only and is NEVER reconciled; run_unit_head rows ARE pruned (reconcileRunUnitHead).

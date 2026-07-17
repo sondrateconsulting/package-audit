@@ -232,7 +232,8 @@ check is filesystem-read-only by construction. (A plain readonly open of a WAL d
 the `-shm` wal-index and fails outright on an own WAL file copied without its sidecars; SQLite's
 `immutable=1` URI would also work but `file:` URI support is missing from some bun releases.) The predicate, first match
 wins: (1) no file, or a file with NO objects at all → ours to create (an empty database belongs to
-no one, and is also what our own interrupted create leaves behind) — but ONLY when no journal
+no one, and is also what our own interrupted create leaves behind) — unless its STAMP is newer
+than this build (refused on the image as incompatible), and ONLY when no journal
 could be hiding a schema: `immutable` reads the base file alone, and a WAL database whose writer
 crashed or is still running can hold its entire committed schema in `-wal` frames over a
 zero-object base, so a zero-object base beside a NON-EMPTY `-wal` (or rollback `-journal`) is
@@ -288,7 +289,7 @@ past-cap branches — so a NULL `scanned_commit_date` is the sentinel marking th
 scope UNVERIFIABLE (§7 `provenance`), never a claim that it excluded nothing. A STRUCTURAL
 shape classifier inspects an existing `run_unit_head` (columns via `table_xinfo`, CHECKs, FKs,
 indexes) TWICE: on the ownership preflight's deserialized base image BEFORE any writable open
-(an incompatibility visible there is refused with zero file handles ever opened on the target),
+(an incompatibility visible there is refused with no SQLite handle ever opened on the target),
 and again on the writable connection — through any recovered WAL — before the WAL journal-mode
 flip and before `--fresh`, so an incompatible state committed only into `-wal` frames (a sibling
 build's v4 over a common v3 base) is still refused before it can be adopted or dropped, at the
@@ -1341,12 +1342,16 @@ status would silently fold policy exclusions into cutoff skips; `branchesExclude
 = COUNT WHERE status='skipped-cutoff' AND policy_status IS NOT NULL; `branchesPastCap` =
 COUNT WHERE status='past-cap'. Those four counts partition the RECORDED rows exactly once
 each. `branchesErrored` counts DISTINCT branches carrying a scope='scan' errors[] entry that
-hold NO row (a scan that errors writes no disposition row) — read it as exactly that, since
-on a RESUMED run it diverges from "every branch whose scan errored" in both directions
-(see scripts/report.ts). Together the five account for every branch that reached a TERMINAL
-outcome — an equality on a single-invocation run, an upper bound on a resumed one. A
-THROTTLE-REQUEUED branch is deferred, not terminal: it writes neither a row nor an error and
-is in no count. Decide policy dispositions ONLY via both status and policy_status
+hold NO row (a scan that fails BEFORE the scanned-row upsert writes no disposition row; within
+a single fresh-scan invocation, a step failing AFTER the row committed — the success-log write
+or the work-queue 'done' update — can leave an errors[] entry beside the row, and the no-row
+rule then keeps that branch out of branchesErrored while its row counts it as scanned) — read
+it as exactly that, since on a RESUMED run it diverges from "every branch whose scan errored"
+in both directions (see scripts/report.ts). Together the five account for every branch that
+reached a TERMINAL outcome — an equality on a single-invocation run, an upper bound on a
+resumed one. A THROTTLE-REQUEUED branch is deferred, not terminal: it writes neither a row nor
+a NEW error, and with no prior same-run error it is in no count (an earlier invocation's
+append-only error still counts it — the resumed-run divergence above). Decide policy dispositions ONLY via both status and policy_status
 (scripts/policyDisposition.ts); `policy_status IS NOT NULL` alone is never a proxy for
 "excluded" (a scanned default branch carries the counterfactual). `repositoriesScanned` =
 COUNT(DISTINCT organization||'/'||repository) and `organizationsScanned` =

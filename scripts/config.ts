@@ -163,8 +163,10 @@ function normalizeOrganizations(o: Record<string, unknown>): string[] | null {
 // — git itself permits refs/heads/!main, so this is our rule, not git's. Documented consequence: a
 // literal branch named "!foo" cannot be listed. The value is rendered via JSON.stringify so a
 // control character in a pattern cannot corrupt the diagnostic. (Glob VALIDITY is not checked here:
-// Bun.Glob accepts malformed patterns like "[" at construction and fails only at match time, so
-// the policy engine fails closed on a match-time throw — see branchPolicy.ts.)
+// Bun.Glob accepts malformed patterns like "[" at construction, and no accepted pattern is known
+// to throw at match time either — a pattern that matches nothing surfaces via the advisory
+// unmatched-pattern warning, and the policy engine still fails closed on any match-time throw —
+// see branchPolicy.ts.)
 function validateBranchPattern(v: unknown, listName: string, i: number): string {
   if (!isString(v) || v.length === 0) fail(`${listName}[${i}] must be a non-empty string`);
   const s = v as string;
@@ -409,7 +411,8 @@ export async function loadConfig(
   }
   const config = validateAndNormalize(raw, env);
   // Eagerly compile the branch policy here — the single load-time preparation boundary — so a
-  // malformed glob surfaces as a ConfigError before any run is created/resumed, never mid-run.
+  // glob REJECTED AT CONSTRUCTION surfaces as a ConfigError before any run is created/resumed,
+  // never mid-run.
   // (This is best-effort: Bun.Glob accepts some malformed patterns at construction; the policy
   // engine fails closed on a match-time throw. See branchPolicy.ts.)
   let branchPolicy: CompiledBranchPolicy;

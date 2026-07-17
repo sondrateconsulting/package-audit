@@ -229,9 +229,9 @@ export async function runScan(
   const cliTermSets = await discoverCliTerms(db, client, config, runId);
   logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
 
-  // §5.A/§5.B discover + process, deterministically. A PolicyMatchError (a malformed branch glob,
-  // fail-closed at match time) is a GLOBAL config defect — never a per-repo soft error — so it
-  // ABORTS the whole run: mark the run failed (excluded from latest selection) and rethrow the
+  // §5.A/§5.B discover + process, deterministically. A PolicyMatchError (a compiled branch matcher
+  // THREW at match time — fail-closed) is a GLOBAL config defect — never a per-repo soft error — so
+  // it ABORTS the whole run: mark the run failed (excluded from latest selection) and rethrow the
   // ORIGINAL operator-facing error unchanged (it is registered in KNOWN_OPERATOR_ERRORS).
   const coverages: PolicyCoverage[] = [];
   try {
@@ -386,7 +386,7 @@ export async function processRepo(
   if (!outcome.ok) return null; // failed/throttled — this repo isn't "discovered"; contributes no coverage
   const heads = outcome.snapshot.heads;
   // Classify the WHOLE repo up-front (policy → cutoff/cap) via the ONE shared planner. This runs
-  // OUTSIDE the discovery catch and BEFORE any per-branch write, so a malformed-glob PolicyMatchError
+  // OUTSIDE the discovery catch and BEFORE any per-branch write, so a match-time PolicyMatchError
   // aborts before this repo is half-classified (runScan then fails the run and rethrows).
   const plan = planRepoBranches(outcome.snapshot, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo);
   // Discovery KNOWS the default branch (§5.B — resolved from the same snapshot as these heads), so
@@ -821,7 +821,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
       }
       // The SAME shared planner the real run uses, so --plan and the run can never disagree (§5).
       // branchesEligible counts toScan (default + within-cap after-cutoff); policy-excluded is its own
-      // disjoint bucket. A malformed-glob PolicyMatchError propagates FATAL (no DB to mark; main exits 1).
+      // disjoint bucket. A match-time PolicyMatchError propagates FATAL (no DB to mark; main exits 1).
       const p = planRepoBranches(snapshot, branchPolicy, config.cutoffDate, config.maxBranchesPerRepo);
       const diag = planPolicyDiagnostics(p); // fail-closed deny/allow split + default-override count
       coverages.push(p.coverage); // this repo was discovered successfully (even if empty) — §8 coverage

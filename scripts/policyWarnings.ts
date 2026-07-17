@@ -1,11 +1,11 @@
 // policyWarnings.ts — the advisory branch-policy warning contract (§8). PURE: it never invokes a
 // glob (the matchers ran EAGERLY during discovery, inside planRepoBranches, so a glob that throws at
 // .match() time already failed closed there) — this is only set difference + rendering. A malformed
-// pattern Bun.Glob ACCEPTS without ever throwing (e.g. "[") is NOT an error anywhere: it matches
-// nothing, and THIS advisory surface — the unmatched-pattern warning — is exactly how the operator
-// learns such a configured pattern is dead (branchPolicy.ts's fail-closed contract states the throw
-// scope). Warnings are ADVISORY: they never fail a run, and are NOT recorded in the DB / errors /
-// report.
+// pattern Bun.Glob ACCEPTS without throwing (e.g. "[") is NOT an error anywhere: whatever it matches
+// applies normally, and a configured pattern that matched NOTHING ("[" in the pinned test) is
+// exactly what THIS advisory surface — the unmatched-pattern warning — reports as dead
+// (branchPolicy.ts's fail-closed contract states the throw scope). Warnings are ADVISORY: they
+// never fail a run, and are NOT recorded in the DB / errors / report.
 import type { CompiledBranchPolicy, PolicyCoverage } from "./branchPolicy.ts";
 
 export type PolicyWarning =

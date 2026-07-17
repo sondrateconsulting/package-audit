@@ -3,8 +3,9 @@ import { planRepoBranches, planPolicyDiagnostics, policyAttribution, classifyBra
 import { compileBranchPolicy, PolicyMatchError, type PolicyResult, type CompiledPattern, type CompiledBranchPolicy } from "./branchPolicy.ts";
 import type { BranchHead, BranchSnapshot } from "./github.ts";
 
-// A glob that THROWS at match time — compileBranchPolicy never produces one (no real pattern throws
-// at Bun.Glob construction, and "[" merely returns false), so the fail-closed test injects one.
+// A glob that THROWS at match time — compileBranchPolicy is not KNOWN to produce one (no accepted
+// pattern is known to throw at .match() on the exercised Bun versions; "[" merely returns false in
+// the pin below), so the fail-closed test injects one.
 const throwingGlob = (thrown: unknown): Bun.Glob => ({ match() { throw thrown; } }) as unknown as Bun.Glob;
 const cp = (pattern: string, glob: Bun.Glob): CompiledPattern => ({ pattern, glob });
 const rawPolicy = (include: readonly CompiledPattern[] | null, exclude: readonly CompiledPattern[]): CompiledBranchPolicy => ({ include, exclude });
@@ -100,8 +101,9 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap (§1/§12)", 
 
   test('a malformed pattern Bun ACCEPTS (deny "[") is NOT fatal: it matches nothing, denies nothing, and coverage reports it dead', () => {
     // Pins the OTHER half of the fail-closed contract's scope (branchPolicy.ts): the promise covers
-    // globs that THROW at .match() time; "[" compiles and returns false for every name, so it must
-    // exclude nothing and land in NO coverage set — the §8 unmatched-pattern warning is its surface.
+    // globs that THROW at .match() time; "[" compiles and (as pinned here) matches neither the
+    // default nor a feature head, so it must exclude nothing and land in NO coverage set — the §8
+    // unmatched-pattern warning is its surface.
     // Bun.Glob-VERSION-SENSITIVE (CI pins 1.3.14): if a Bun upgrade starts rejecting "[" at
     // construction, this test goes red so the load/validation story is re-decided consciously.
     const policy = compileBranchPolicy(null, ["["]);

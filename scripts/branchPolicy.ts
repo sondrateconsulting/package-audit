@@ -11,10 +11,13 @@
 // was computed over.
 //
 // FAIL-CLOSED CONTRACT (critical — see the v4 mapping spec §9): Bun.Glob silently ACCEPTS
-// malformed patterns. `new Bun.Glob("[")` does NOT throw; it fails only at .match() time, and only
-// for some inputs. So eager construction here catches ONLY the patterns Bun throws on AT
-// CONSTRUCTION — it is NOT a complete validator, and does not promise that every malformed pattern
-// is rejected at load. The classifier (T3) MUST wrap every .match() call and turn any exception
+// malformed patterns. `new Bun.Glob("[")` does NOT throw — at construction OR at .match() time
+// (`Bun.Glob("[").match(...)` returns false in the pinned branchPlanner test): an ACCEPTED
+// malformed pattern is matched normally and may match some names or none (on Bun 1.4, `{a,[}`
+// matches `a`); one that matches nothing surfaces via the advisory unmatched-pattern warning
+// (when it stays uncovered and at least one repo was discovered). So eager construction here
+// catches ONLY the patterns Bun throws on AT CONSTRUCTION — it is NOT a complete validator, and
+// does not promise that every malformed pattern is rejected at load. The classifier (T3) MUST wrap every .match() call and turn any exception
 // into a FATAL policy-evaluation error — NEVER `false`, because `false` is fail-OPEN for an
 // exclude (a denied branch would be silently scanned). Empty-string and leading-"!" patterns are
 // rejected earlier, at config validation (config.ts), as a deliberate policy-language restriction.
@@ -88,8 +91,10 @@ export function compileBranchPolicy(
 type PolicyListKind = "branches" | "excludeBranches";
 
 // A fatal, operator-facing policy-evaluation failure: a compiled glob threw at .match() time.
-// Bun.Glob accepts malformed patterns at construction (e.g. "[" does not throw) and can fail only
-// here, data-dependently. We FAIL CLOSED — a throw becomes this error, NEVER a `false` result
+// Bun.Glob accepts malformed patterns at construction, and no ACCEPTED pattern is known to throw
+// at .match() on the Bun versions this project exercises ("[" returns false in the pinned case —
+// the tests forge a throwing matcher to exercise this path). If one ever does, we FAIL CLOSED — a
+// throw becomes this error, NEVER a `false` result
 // (false for an exclude would be fail-OPEN: a denied branch silently scanned). Unlike
 // BranchPolicyError (always converted to ConfigError at load), this surfaces DIRECTLY: the run
 // driver (T6) calls db.failRun() and rethrows it unchanged, so it is registered in

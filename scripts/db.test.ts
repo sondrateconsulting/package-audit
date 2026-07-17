@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { copyFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, migrateV3toV4, nowIso, type RunInput, type RunUnitHeadInput } from "./db.ts";
+import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, assertOwnedDatabase, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, migrateV3toV4, nowIso, type RunInput, type RunUnitHeadInput } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 
@@ -3642,6 +3642,24 @@ describe("live compat backstop — states the base-image preflight cannot see", 
     expect((check.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(4);
     expect((check.query("SELECT COUNT(*) AS n FROM pragma_table_xinfo('run_unit_head')").get() as { n: number }).n).toBe(2); // sibling shape intact
     check.close();
+  });
+
+  test("preflight: an EMPTY file stamped NEWER than this build is refused on the base image, before any writable handle", () => {
+    // The rejection venue is unobservable through AuditDb.open (the post-open readUserVersion
+    // check rejects the same state byte-cleanly with the same message — pinned elsewhere), so the
+    // preflight's zero-handle guarantee is driven directly: assertOwnedDatabase itself must throw.
+    const path = nextFile();
+    const raw = new Database(path, { create: true, strict: true });
+    raw.exec("PRAGMA user_version = 5"); // zero objects, stamp newer than SCHEMA_VERSION (4)
+    raw.close();
+    expect(() => assertOwnedDatabase(path)).toThrow(/newer than this tool's/);
+    // …while an empty file at the CURRENT stamp stays adoptable — the exact on-disk state a
+    // crashed `--fresh --purge-cache` leaves behind (all audit tables dropped, stamp retained).
+    const path2 = nextFile();
+    const raw2 = new Database(path2, { create: true, strict: true });
+    raw2.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    raw2.close();
+    expect(() => assertOwnedDatabase(path2)).not.toThrow();
   });
 
   test("isOwnedOrEmpty rejects a FULL-name-set database stamped below MIN_OWNED_VERSION", () => {

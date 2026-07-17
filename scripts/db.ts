@@ -799,7 +799,12 @@ function assertNoPendingJournal(path: string): void {
       );
   }
 }
-function assertOwnedDatabase(path: string): void {
+// Exported for direct unit tests (the isOwnedOrEmpty / mapReadOnlyOpenError / migrateV3toV4
+// precedent): the rejection VENUE — preflight image vs post-open check — is unobservable through
+// AuditDb.open (both reject byte-cleanly with the same message), so "this seam refuses it before
+// AuditDb.open constructs its writable connection" is only pinnable by driving the function
+// directly.
+export function assertOwnedDatabase(path: string): void {
   if (!existsSync(path)) return; // nothing on disk — the writable open creates it
   let bytes: Buffer;
   try {
@@ -851,6 +856,16 @@ function assertOwnedDatabase(path: string): void {
     const isEmpty = db.query(`SELECT 1 AS x FROM sqlite_master WHERE ${NOT_SQLITE_INTERNAL} LIMIT 1`).get() === null;
     if (isEmpty) {
       assertNoPendingJournal(path);
+      // A zero-(non-internal-)object image is ours to CREATE — but a stamp NEWER than this build
+      // makes it incompatible regardless: refuse here, on the image, before any writable SQLite
+      // handle exists (mirroring the owned arm's check below). Stamps <= SCHEMA_VERSION are
+      // adopted-as-empty — creation re-stamps in its own transaction, and the tool's own crashed
+      // `--fresh --purge-cache` remnant legitimately reads as empty (only internal objects
+      // remain) at its retained pre-drop stamp (--fresh does not touch user_version, so that is
+      // CURRENT only for a current-version input).
+      const uvEmpty = readUserVersion(db);
+      if (uvEmpty > SCHEMA_VERSION)
+        fail(`database schema version ${uvEmpty} is newer than this tool's ${SCHEMA_VERSION} — upgrade the tool`);
       return;
     }
     // The version bounds live inside hasOwnedTableSet, shared with the writable backstop.
@@ -1293,7 +1308,7 @@ export function migrateV3toV4(db: Database): void {
 // MIN_OWNED_VERSION — a pre-v2 non-empty file is refused as not-ours first; there is no pre-v2
 // migration):
 //   1. on the OWNERSHIP preflight's deserialized base image (see assertOwnedDatabase) — a rejection
-//      there happens with ZERO file handles ever opened on the target;
+//      there happens with no SQLite handle ever opened on the target (only a byte read);
 //   2. on the WRITABLE connection, as the live backstop — through any recovered WAL, catching an
 //      incompatible state the base image could not see (see AuditDb.open).
 // Recognizes legitimate predecessors, so a real v2/v3 database is NOT rejected — per-stamp allowed
@@ -1554,8 +1569,9 @@ export class AuditDb {
       path = assertContained(resolved, roots);
       // §0 ownership + migration compatibility: prove the file is ours AND acceptable to the
       // migration BEFORE the writable open below, whose WAL pragma would already have rewritten a
-      // stranger's header. Both checks run on the same deserialized BASE IMAGE — zero file handles
-      // on the target, so a rejection cannot mutate the file, its sidecars, or its journal mode.
+      // stranger's header. Both checks run on the same deserialized BASE IMAGE — no SQLite handle
+      // on the target (only a byte read), so a rejection cannot mutate the file, its sidecars, or
+      // its journal mode.
       // (:memory: needs no proof — a fresh in-memory database is empty by construction and shares
       // nothing with the filesystem.)
       // ACCEPTED LIMITATION (documented, not fixed): a concurrent process could replace the file

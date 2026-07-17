@@ -7,8 +7,9 @@ import {
 const names = (list: readonly CompiledPattern[] | null): string[] | null =>
   list === null ? null : list.map((c) => c.pattern);
 
-// A CompiledPattern whose glob THROWS at match time. compileBranchPolicy never produces one (no
-// real pattern throws at Bun.Glob construction), so fail-closed tests build these by hand.
+// A CompiledPattern whose glob THROWS at match time. compileBranchPolicy is not KNOWN to produce
+// one (no accepted pattern is known to throw at .match() on the Bun versions this project
+// exercises), so fail-closed tests build these by hand.
 const throwingGlob = (thrown: unknown): Bun.Glob =>
   ({ match() { throw thrown; } }) as unknown as Bun.Glob;
 const cp = (pattern: string, glob: Bun.Glob): CompiledPattern => ({ pattern, glob });
