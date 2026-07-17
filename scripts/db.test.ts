@@ -3822,6 +3822,26 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     forgeRuh(path, v4Ruh({ cols: V4_RUH_PARTS.cols.replace("REFERENCES runs(run_id)", "REFERENCES runs(run_id) DEFERRABLE INITIALLY DEFERRED") }));
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/DEFERRABLE/);
   });
+  test("fingerprint: a MATCH clause on the foreign key is rejected — pragma-invisible, so only the token scan can see it", () => {
+    // SQLite PARSES a MATCH clause but never enforces it, and pragma foreign_key_list reports
+    // match='NONE' regardless — so the FK-tuple equality above it is structurally blind to this
+    // clause and every pragma-based probe accepts the file. Reviewer-constructed before the fix:
+    // the sibling was ADOPTED and --fresh DESTROYED its rows. Rows are seeded here so this pin
+    // fails loudly on destruction, not just on classification.
+    const path = nextFile();
+    forgeRuh(path, v4Ruh({ cols: V4_RUH_PARTS.cols.replace("REFERENCES runs(run_id)", "REFERENCES runs(run_id) MATCH FULL") }));
+    const seed = new Database(path, { strict: true });
+    seed.exec("PRAGMA foreign_keys = OFF");
+    seed.exec("INSERT INTO runs (run_id, started_at, status, config_hash, effective_owners, owners_source, tracked_packages, cutoff_date, github_host) VALUES ('r1','2026-01-01T00:00:00.000Z','completed','h','[]','configured','[]','2024-01-01','github.com')");
+    seed.exec("INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES ('r1','org','repo','main','sha','scanned',1,NULL,NULL,'2025-06-01T00:00:00Z')");
+    seed.close();
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/MATCH/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/MATCH/); // --fresh must refuse, not destroy
+    const check = new Database(path, { readonly: true });
+    expect((check.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n).toBe(1); // rows intact
+    expect((check.query("SELECT sql FROM sqlite_schema WHERE name='run_unit_head'").get() as { sql: string }).sql).toContain("MATCH FULL"); // shape untouched
+    check.close();
+  });
   test("fingerprint: a DESC member of the composite PRIMARY KEY is rejected", () => {
     const path = nextFile();
     forgeRuh(path, v4Ruh({ pk: "PRIMARY KEY (run_id, organization DESC, repository, branch)" }));

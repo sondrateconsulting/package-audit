@@ -528,7 +528,7 @@ function tableShapesAt(version: number): Map<string, string> {
 // compare equal. Index/FK signatures deliberately drop declaration-order artifacts (autoindex
 // numbering, the fk id itself) while KEEPING per-constraint grouping and in-constraint column
 // order, sorted across constraints. Still not FULL DDL equality: CHECK constraint bodies,
-// collations, ON CONFLICT clauses and FK deferrability stay invisible (all live only in SQL
+// collations, ON CONFLICT clauses, FK deferrability and FK MATCH clauses stay invisible (all live only in SQL
 // text, whose exact matching would be brittle against legitimate ALTER-rewritten histories) —
 // the residual false-positive is a table matching columns AND constraint structure exactly,
 // differing only in those. (PRAGMA cannot bind — `table` is validated against
@@ -646,7 +646,7 @@ function tableShape(db: Database, table: string): string {
 // subset can never do is carry a non-audit shape. A real database of ours matches by
 // construction: creates, migrations and self-heals all run the same SCHEMA_SQL the
 // references derive from. (Shape is still not FULL DDL equality — CHECK bodies, collations,
-// ON CONFLICT clauses and FK deferrability are invisible, though FKs, PK/UNIQUE structure and
+// ON CONFLICT clauses, FK deferrability and FK MATCH clauses are invisible, though FKs, PK/UNIQUE structure and
 // AUTOINCREMENT do count — see tableShape. hasForeignObjects separately rejects every
 // non-table object kind and every non-audit table name, so what remains adoptable is exactly:
 // audit-named tables in owned shapes under an owned stamp.)
@@ -1267,7 +1267,10 @@ function classifyRunUnitHead(db: Database): RuhClass {
   const checks = sql === null ? [] : extractChecks(sql);
   const fks = foreignKeys(db, "run_unit_head");
   const fkOk = fks.length === 1 && fks[0]!.from === "run_id" && fks[0]!.table === "runs" && fks[0]!.to === "run_id" &&
-    fks[0]!.onUpdate === "NO ACTION" && fks[0]!.onDelete === "NO ACTION" && fks[0]!.match === "NONE"; // MATCH joined in round 6
+    fks[0]!.onUpdate === "NO ACTION" && fks[0]!.onDelete === "NO ACTION" && fks[0]!.match === "NONE";
+  // NB the pragma match leg above is NOT a witness for a declared MATCH clause — SQLite reports
+  // 'NONE' even for MATCH FULL DDL (parsed, never enforced). The bare-token scan below is the
+  // real defense; the pragma leg stays only for a future SQLite that surfaces the clause.
   if (!fkOk)
     return { kind: "incompatible", reason: "run_unit_head lacks the exact run_id→runs(run_id) foreign key" };
   // Unexpected triggers or extra secondary indexes would be SILENTLY dropped by the rebuild — refuse
@@ -1293,6 +1296,13 @@ function classifyRunUnitHead(db: Database): RuhClass {
     return { kind: "incompatible", reason: "run_unit_head declares an ON CONFLICT clause — our shape never does (it silently changes constraint-violation behavior)" };
   if (sql !== null && sqlHasBareToken(sql, "deferrable"))
     return { kind: "incompatible", reason: "run_unit_head declares a DEFERRABLE foreign key — our shape never does (it defers enforcement to COMMIT)" };
+  // MATCH is the third pragma-invisible token: SQLite PARSES a foreign-key MATCH clause but never
+  // enforces it, and foreign_key_list reports match='NONE' regardless — so the FK-tuple equality
+  // above is blind to it and a MATCH FULL sibling passed every structural probe (reviewer-
+  // constructed: adopted, then --fresh destroyed its rows). Our DDL never declares the token; the
+  // bare-token walk cannot be tripped by the policy_matched_pattern identifier (word-boundary guard).
+  if (sql !== null && sqlHasBareToken(sql, "match"))
+    return { kind: "incompatible", reason: "run_unit_head declares a MATCH clause — our shape never does (SQLite parses but ignores it, so no pragma can witness it)" };
   if (colsMatch(cols, RUH_V4_COLSPEC)) {
     if (!checksEqual(checks, RUH_V4_CHECKS))
       return { kind: "incompatible", reason: "run_unit_head has the v4 columns but not the exact v4 CHECK set" };
