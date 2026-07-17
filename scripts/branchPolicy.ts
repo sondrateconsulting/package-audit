@@ -147,8 +147,9 @@ function matchWinner(
 }
 
 // The counterfactual policy decision for a branch NAME, deny-before-allow. Computed for EVERY
-// branch, INCLUDING the default (whose eligibility is overridden in classifyBranch) — so the
-// "would have been denied by X" fact is preserved. May throw PolicyMatchError (fail-closed).
+// branch, INCLUDING the default (whose scan-eligibility is decided by isBranchPolicyEligible, not by
+// this raw verdict) — so the "would have been denied by X" fact is preserved. May throw
+// PolicyMatchError (fail-closed).
 export function evaluateBranchPolicy(policy: CompiledBranchPolicy, name: string): PolicyResult {
   const deny = matchWinner(policy.exclude, "excludeBranches", name);
   if (deny !== null) return { kind: "excluded-by-deny", matchedPattern: deny.pattern };
