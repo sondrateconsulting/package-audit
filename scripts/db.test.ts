@@ -963,11 +963,32 @@ describe("ownership — every database this tool legitimately produces still ope
     AuditDb.openReadOnly({ sqlitePath: path }).close(); // the documented remediation now completes
   });
 
-  test("a v3-stamped database missing a table AND the v3 column heals on one open (mixed-era shapes)", () => {
-    // Externally damaged twice over: `errors` dropped AND run_unit_head stripped back to its v2
-    // shape, stamp still 3. Each present table matches SOME stamped schema's shape (v2 for
-    // run_unit_head, v3 for the rest) — that mixture is provably ours and fully healable, so the
-    // shape check accepts per-table matches across the stamped span rather than demanding one
+  // The frozen historical v3 run_unit_head body (narrow status CHECK, no policy columns), as a
+  // rebuild — used to forge REAL predecessor-era shapes. A v4 table cannot be column-dropped
+  // into an era shape: its table-level CHECKs reference the policy columns (SQLite refuses the
+  // DROP) and no ALTER can un-widen the status CHECK, so a genuine era fixture must rebuild.
+  // The v2 era is this rebuild plus a DROP of is_default_branch (no CHECK references it).
+  const RUH_V3_ERA_REBUILD: readonly string[] = [
+    `CREATE TABLE run_unit_head__era (
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+      commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned'
+        CHECK (status IN ('scanned','skipped-cutoff')),
+      is_default_branch INTEGER,
+      PRIMARY KEY (run_id, organization, repository, branch))`,
+    `INSERT INTO run_unit_head__era (run_id, organization, repository, branch, commit_sha, status, is_default_branch)
+       SELECT run_id, organization, repository, branch, commit_sha, status, is_default_branch FROM run_unit_head`,
+    `DROP TABLE run_unit_head`,
+    `ALTER TABLE run_unit_head__era RENAME TO run_unit_head`,
+    `CREATE INDEX IF NOT EXISTS ix_ruh_loc ON run_unit_head(organization, repository, branch, commit_sha)`,
+  ];
+
+  test("a current-stamped database missing a table AND carrying a v2-era run_unit_head heals on one open (mixed-era shapes)", () => {
+    // Externally damaged twice over: `errors` dropped AND run_unit_head regressed to its TRUE v2
+    // era body, stamp still current. Each present table matches SOME stamped schema's shape (v2
+    // for run_unit_head, v4 for the rest) — that mixture is provably ours and fully healable, so
+    // the shape check accepts per-table matches across the stamped span rather than demanding one
     // uniform era. (Exact-at-stamp matching would refuse this file while openReadOnly still
     // advised "run `bun run audit`" for each half of the damage — a dead end.)
     const path = nextFile();
@@ -975,21 +996,22 @@ describe("ownership — every database this tool legitimately produces still ope
     const { runId } = first.startRun(runInput());
     // A REAL head row must ride through the heal — an empty run_unit_head would let a faulty
     // drop-and-recreate "repair" pass every structural assertion while deleting report data.
-    first.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
+    first.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     first.close();
     const w = new Database(path, { strict: true });
     w.exec("DROP TABLE errors");
-    w.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch");
+    for (const sql of RUH_V3_ERA_REBUILD) w.exec(sql);
+    w.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch"); // v3 era → v2 era
     w.close();
 
     const db = AuditDb.open({ sqlitePath: path });
     try {
       expect(rowCount(path, "runs")).toBe(1); // adopted and healed, not refused or reset
       expect(raw(db).query("SELECT run_id FROM errors").all()).toEqual([]); // re-created
-      // The head row survived the heal; the restored column reads NULL (the external damage
-      // destroyed the stored value — "unknown" is the only honest backfill).
-      expect(raw(db).query("SELECT organization, repository, branch, commit_sha, status, is_default_branch FROM run_unit_head").all())
-        .toEqual([{ organization: "o", repository: "r", branch: "main", commit_sha: "s", status: "scanned", is_default_branch: null }]);
+      // The head row survived the heal; the restored columns read NULL (the external damage
+      // destroyed the stored values — "unknown" is the only honest backfill).
+      expect(raw(db).query("SELECT organization, repository, branch, commit_sha, status, is_default_branch, scanned_commit_date FROM run_unit_head").all())
+        .toEqual([{ organization: "o", repository: "r", branch: "main", commit_sha: "s", status: "scanned", is_default_branch: null, scanned_commit_date: null }]);
     } finally {
       db.close();
     }
@@ -1003,7 +1025,8 @@ describe("ownership — every database this tool legitimately produces still ope
     // DOWN_TRANSFORMS (and the self-heal that makes the new span entry true) fails here loudly,
     // by design.
     const DOWN_TRANSFORMS: Record<number, readonly string[]> = {
-      2: ["ALTER TABLE run_unit_head DROP COLUMN is_default_branch"],
+      2: [...RUH_V3_ERA_REBUILD, "ALTER TABLE run_unit_head DROP COLUMN is_default_branch"],
+      3: RUH_V3_ERA_REBUILD,
     };
     for (let v = 2; v < SCHEMA_VERSION; v++) expect(DOWN_TRANSFORMS[v]?.length ?? 0).toBeGreaterThan(0);
 
@@ -1036,7 +1059,7 @@ describe("ownership — every database this tool legitimately produces still ope
       const path = nextFile();
       const seed = AuditDb.open({ sqlitePath: path }); // current schema…
       const { runId } = seed.startRun(runInput()); // …carrying REAL rows the heal must not lose
-      seed.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
+      seed.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
       seed.close();
       const w = new Database(path, { strict: true });
       for (const sql of DOWN_TRANSFORMS[v]!) w.exec(sql); // …downgraded to era-v shapes…
@@ -1051,11 +1074,14 @@ describe("ownership — every database this tool legitimately produces still ope
       AuditDb.open({ sqlitePath: path }).close(); // must adopt AND heal
       const healed = new Database(path, { readonly: true, strict: true });
       for (const t of AUDIT_TABLE_NAMES) expect(shapeOf(healed, t)).toBe(refShapes.get(t)!);
-      // Rows rode through: the run survived, the head row kept its fields, and the column the
-      // era-v transform destroyed reads NULL (a drop-and-recreate "heal" would fail here).
+      // Rows rode through: the run survived and the head row kept its fields (a drop-and-recreate
+      // "heal" would fail here). Columns the era-v transform destroyed read NULL — every era loses
+      // the v4 policy columns (the seeded scanned_commit_date proves the loss is honest, never
+      // refabricated); the v2 transform additionally loses is_default_branch, while the v3 era
+      // KEEPS it (its body carries the column, so the heal must preserve the stored 1).
       expect((healed.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n).toBe(1);
-      expect(healed.query("SELECT branch, commit_sha, is_default_branch FROM run_unit_head").all())
-        .toEqual([{ branch: "main", commit_sha: "s", is_default_branch: null }]);
+      expect(healed.query("SELECT branch, commit_sha, is_default_branch, scanned_commit_date FROM run_unit_head").all())
+        .toEqual([{ branch: "main", commit_sha: "s", is_default_branch: v >= 3 ? 1 : null, scanned_commit_date: null }]);
       healed.close();
     }
   });
@@ -2396,8 +2422,9 @@ function buildV3TwinDb(path: string): void {
   raw.exec("ALTER TABLE run_unit_head ADD COLUMN is_default_branch INTEGER");
   // LITERAL 3, never SCHEMA_VERSION: this is a native v3-shaped fixture. Stamping SCHEMA_VERSION
   // would falsely claim the current version once the constant bumps (a v3-shaped table stamped v4
-  // is exactly what the compatibility gate rejects). Opening it drives the real v3→v4 migration,
-  // the same path the migrated-v2 database takes, so their reports stay byte-identical.
+  // is treated as current-stamp DAMAGE and healed, not migrated). Opening it drives the real
+  // v3→v4 migration, the same path the migrated-v2 database takes, so their reports stay
+  // byte-identical.
   raw.exec("PRAGMA user_version = 3");
   raw.close();
 }
@@ -3080,7 +3107,7 @@ describe("open — a corrupt v4 run_unit_head (missing a column) is REJECTED, ne
     const path = nextFile();
     const db1 = AuditDb.open({ sqlitePath: path });
     const { runId } = db1.startRun(runInput());
-    db1.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true });
+    db1.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db1.completeRun(runId);
     db1.close();
     // Forge a corrupt shape: current stamp, run_unit_head missing a column. An atomic migration can
@@ -3092,10 +3119,12 @@ describe("open — a corrupt v4 run_unit_head (missing a column) is REJECTED, ne
     forge.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     forge.close();
     // Read-only, writer, AND --fresh all reject it. Critically, --fresh rejects BEFORE dropping
-    // anything (the compatibility gate runs before the destructive path), so the data survives.
-    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/incompatible|not the expected v4 shape/);
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
-    expect(() => AuditDb.open({ sqlitePath: path, fresh: true, purgeCache: true })).toThrow(/incompatible/);
+    // anything (shape-level ownership refuses on the READ-ONLY preflight, before the destructive
+    // path), so the data survives. "v4 minus a column" matches NO stamped era — unlike a genuine
+    // predecessor-era shape it is not healable, so refusal (not repair) is correct.
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/did not create|incompatible|not the expected v4 shape/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true, purgeCache: true })).toThrow(/did not create|incompatible/);
     const check = new Database(path, { readonly: true });
     expect((check.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n).toBe(1); // untouched
     check.close();
@@ -3166,10 +3195,13 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     const forge = new Database(path, { strict: true });
     forge.exec("ALTER TABLE runs ADD COLUMN outcome TEXT"); // a DIFFERENT v4 (sibling branch), still stamped 4
     forge.close();
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
-    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/incompatible/);
-    expect(() => AuditDb.open({ sqlitePath: path, fresh: true, purgeCache: true })).toThrow(/incompatible/);
-    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/incompatible with this tool build/);
+    // The extra runs column fails shape-level ownership on the READ-ONLY preflight ("did not
+    // create", nothing mutated) — the classifier's runs.outcome discriminator remains the layered
+    // in-gate + in-migration backstop for the same marker (pinned direct-drive elsewhere).
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/did not create|incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true, purgeCache: true })).toThrow(/did not create|incompatible/);
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/did not create|incompatible with this tool build/);
     // NOTHING destroyed — the --fresh drops never ran (the gate rejects first).
     const check = new Database(path, { readonly: true });
     expect((check.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n).toBe(1);
@@ -3177,14 +3209,30 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     check.close();
   });
 
-  test("a v4 stamp on a v3-shaped run_unit_head is rejected (an atomic migration cannot produce it)", () => {
+  test("a v4 stamp on a v3-shaped run_unit_head is HEALED by the writer open — rows ride through; the read path advises the repair", () => {
+    // The chain itself cannot produce this state (each step stamps atomically with its reshape),
+    // so it is EXTERNAL damage — and a recognized predecessor era under the current stamp is the
+    // healable class the ownership span deliberately admits (the same arbitration that keeps the
+    // pinned v2-era heals working). Rejecting it while openReadOnly said "run `bun run audit`"
+    // would be a dead end.
     const path = nextFile();
     buildV3TwinDb(path); // v3 shape, stamp 3
     const forge = new Database(path, { strict: true });
     forge.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`); // lie: stamp v4 on a v3 shape
     forge.close();
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible|not the expected v4 shape/);
-    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/incompatible|not the expected v4 shape/);
+    // openReadOnly cannot heal — it names the damage and the remediation…
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/run `bun run audit` once to repair/);
+    // …and the writer open performs it: the same rebuild the real v3→v4 migration uses.
+    const db = AuditDb.open({ sqlitePath: path });
+    const r = raw(db);
+    expect(uv(r)).toBe(SCHEMA_VERSION);
+    expect(r.query("SELECT branch, commit_sha, status, is_default_branch, scanned_commit_date FROM run_unit_head ORDER BY branch").all())
+      .toEqual([
+        { branch: "main", commit_sha: "sha1", status: "scanned", is_default_branch: null, scanned_commit_date: null },
+        { branch: "stale", commit_sha: "", status: "skipped-cutoff", is_default_branch: null, scanned_commit_date: null },
+      ]);
+    db.close();
+    AuditDb.openReadOnly({ sqlitePath: path }).close(); // and reads work again
   });
 
   test("a physically-v4 database stamped v3 is stamped to v4 WITHOUT a rebuild — new-column values preserved", () => {
@@ -3347,7 +3395,9 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
       policy_status TEXT CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
       policy_matched_pattern TEXT, scanned_commit_date TEXT,
       CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL))`); // no PRIMARY KEY
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    // Shape-level ownership (colSig pk positions + the missing pk autoindex) refuses this on the
+    // preflight as "did not create"; the classifier's PK checks remain the layered in-gate backstop.
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
   });
 
   test("case-insensitive gate: a runs.OUTCOME (uppercase) sibling column is still detected and rejected", () => {
@@ -3356,8 +3406,11 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     const f = new Database(path, { strict: true });
     f.exec("ALTER TABLE runs ADD COLUMN OUTCOME TEXT"); // uppercase — SQLite resolves names case-insensitively
     f.close();
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
-    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/incompatible/);
+    // The extra runs column now also fails shape-level ownership on the preflight ("did not
+    // create"); the classifier's case-insensitive outcome discriminator remains the layered
+    // in-gate backstop for the same state (pinned direct-drive below).
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/did not create|incompatible/);
   });
 
   test("inbound FK from a NON-audit table: the ownership preflight refuses the file before --fresh/migration", () => {
@@ -3376,12 +3429,14 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     check.close();
   });
 
-  test("inbound FK from an AUDIT-NAMED table: the compat gate refuses it on the preflight, nothing mutated", () => {
-    // An audit-NAMED carrier passes ownership (the full-set match is name-level), so the inbound-FK
-    // gate (assertOpenCompatible gate c) is what must catch it: the v3→v4 rebuild's DROP of
-    // run_unit_head would otherwise cascade-delete the carrier's rows, and foreign_key_check on the
-    // rebuilt table cannot detect that loss. The journal-mode assertion discriminates THIS gate from
-    // the migration's own in-transaction inbound-FK guard, which only fires after the WAL flip.
+  test("inbound FK from an AUDIT-NAMED table: refused on the preflight, nothing mutated", () => {
+    // The audit-NAMED carrier no longer passes ownership (its rebuilt shape matches no era —
+    // shape-level ownership replaced the old name-level match), so the preflight refuses the file
+    // as "did not create" before anything can mutate; the inbound-FK gate (assertOpenCompatible
+    // gate c) and the migration's in-transaction guard remain the layered backstops for the state
+    // they exist for: the v3→v4 rebuild's DROP of run_unit_head would cascade-delete the
+    // carrier's rows, and foreign_key_check on the rebuilt table cannot detect that loss. The
+    // journal-mode assertion pins that the refusal precedes any WAL flip.
     const path = nextFile();
     buildV3TwinDb(path); // v3, stamp 3 — would otherwise migrate
     const f = new Database(path, { strict: true });
@@ -3390,8 +3445,8 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     f.exec("CREATE TABLE errors (id INTEGER PRIMARY KEY, ruh TEXT REFERENCES run_unit_head(run_id) ON DELETE CASCADE)");
     f.exec("INSERT INTO errors (id, ruh) VALUES (1, 'r1')");
     f.close();
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/foreign key into run_unit_head/);
-    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/foreign key into run_unit_head/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|foreign key into run_unit_head/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/did not create|foreign key into run_unit_head/);
     const check = new Database(path, { readonly: true });
     expect(uv(check)).toBe(3); // untouched
     expect((check.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).not.toBe("wal"); // never WAL-flipped
@@ -3407,7 +3462,10 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
       status TEXT NOT NULL DEFAULT 'scanned', is_default_branch INTEGER,
       policy_status TEXT, policy_matched_pattern TEXT, scanned_commit_date TEXT,
       PRIMARY KEY (run_id, organization, repository, branch))`); // NO real CHECKs — text is only in a default
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    // The forged DEFAULT also differs from ours, so shape-level ownership refuses first ("did not
+    // create"); the quote-aware tokenizer itself stays pinned by the OR-clause test above and the
+    // direct-drive classifier tests (same-DEFAULT, different-CHECK fixtures).
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
   });
 
   test("CHECK case: a status CHECK with UPPERCASE literal values is rejected (would break lowercase writes)", () => {
@@ -3436,7 +3494,9 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
       extra TEXT GENERATED ALWAYS AS (branch) VIRTUAL,
       CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
       PRIMARY KEY (run_id, organization, repository, branch))`);
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    // Ownership's colSig reads table_xinfo too, so the hidden column now also fails the
+    // preflight shape proof ("did not create"); the classifier remains the in-gate backstop.
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
   });
 
   test("gate: run_unit_head absent while runs is present (a partial v4) is rejected — --fresh cannot destroy runs", () => {
@@ -3475,13 +3535,25 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/this tool did not create/);
   });
 
-  test("gate: a v2-shaped run_unit_head stamped v3 is rejected (the chain would skip migrateV2toV3)", () => {
+  test("a v2-shaped run_unit_head stamped v3 is HEALED by the writer open (the skipped v2→v3 delta is repaired shape-keyed)", () => {
+    // At stamp 3 the chain runs only migrateV3toV4, so a v2 shape means the v2→v3 delta is
+    // missing — external damage (the chain stamps atomically with its ALTER). The migration's
+    // exact-v2 arm heals it: restore is_default_branch (NULL = unknown, never 0), then rebuild
+    // exactly like any v3 table. Rows ride through.
     const path = nextFile();
     buildV2Db(path); // v2 shape, stamp 2
     const f = new Database(path, { strict: true });
     f.exec("PRAGMA user_version = 3"); // lie: a v3 stamp on a v2 shape
     f.close();
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible|does not match the stamp/);
+    const db = AuditDb.open({ sqlitePath: path });
+    const r = raw(db);
+    expect(uv(r)).toBe(SCHEMA_VERSION);
+    expect(r.query("SELECT branch, commit_sha, status, is_default_branch, scanned_commit_date FROM run_unit_head ORDER BY branch").all())
+      .toEqual([
+        { branch: "main", commit_sha: "sha1", status: "scanned", is_default_branch: null, scanned_commit_date: null },
+        { branch: "stale", commit_sha: "", status: "skipped-cutoff", is_default_branch: null, scanned_commit_date: null },
+      ]);
+    db.close();
   });
 
   test("fingerprint: is_default_branch declared TEXT (wrong type) is rejected", () => {
@@ -3495,7 +3567,7 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
       policy_matched_pattern TEXT, scanned_commit_date TEXT,
       CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
       PRIMARY KEY (run_id, organization, repository, branch))`);
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
   });
 
   test("fingerprint: an extra table-level UNIQUE constraint (its autoindex) is rejected", () => {
@@ -3510,7 +3582,7 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
       CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
       UNIQUE(commit_sha),
       PRIMARY KEY (run_id, organization, repository, branch))`);
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
   });
 
   test("fingerprint: a NOCASE primary-key collation is rejected (would conflate case-distinct keys)", () => {
@@ -3524,7 +3596,7 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
       policy_matched_pattern TEXT, scanned_commit_date TEXT,
       CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
       PRIMARY KEY (run_id, organization COLLATE NOCASE, repository, branch))`);
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible|collation/);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible|collation/);
   });
 
   test("index: an ix_ruh_loc on a DIFFERENT table (global name squat) is rejected, not treated as repairable-absent", () => {
@@ -3559,7 +3631,10 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     f.exec("PRAGMA foreign_keys = OFF;");
     f.exec("CREATE TABLE ext (id INTEGER PRIMARY KEY, ruh TEXT REFERENCES run_unit_head(run_id))");
     f.close();
-    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/incompatible|foreign key into run_unit_head/);
+    // `ext` is a non-audit table, so the read path's ownership parity gate refuses the file as
+    // "did not create" — consistent with the writer; the inbound-FK discriminator remains the
+    // layered backstop for an audit-named carrier that evades shape ownership.
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/did not create|incompatible|foreign key into run_unit_head/);
   });
 });
 
@@ -3610,10 +3685,10 @@ describe("live compat backstop — states the base-image preflight cannot see", 
     // The base-image counterexample: a sibling build (descended from the same v3) rebuilds
     // run_unit_head incompatibly and stamps 4, but its commit sits entirely in -wal frames over a
     // checkpointed common-v3 base. The deserialize preflight classifies the BASE (exact-v3, stamp
-    // 3) and passes; the LIVE stamp reads 4, so without a live compat re-check the migration would
+    // 3) and passes; the LIVE stamp reads 4, so without a live re-check the migration would
     // never reclassify — the sibling would be silently ADOPTED, and --fresh would DROP its
-    // reshaped tables. The live assertOpenCompatible backstop (before the WAL pragma and --fresh)
-    // must reject it.
+    // reshaped tables. The live backstops (isOwnedOrEmpty + assertOpenCompatible, both before
+    // the WAL pragma and --fresh) must reject it.
     const path = nextFile();
     buildV3TwinDb(path); // checkpointed common v3 base, delete journal
     const snap = `${path}.snap`;
@@ -3634,8 +3709,8 @@ describe("live compat backstop — states the base-image preflight cannot see", 
     rmSync(snap, { force: true });
     rmSync(`${snap}-wal`, { force: true });
     rmSync(`${path}-shm`, { force: true });
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/incompatible/);
-    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/incompatible/); // --fresh cannot drop it
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
+    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/did not create|incompatible/); // --fresh cannot drop it
     // The sibling's data survives (WAL recovery on their file is the documented residual cost —
     // data-preserving; adoption/drop is what must never happen).
     const check = new Database(path, { readonly: true });

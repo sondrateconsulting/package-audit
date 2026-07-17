@@ -242,11 +242,17 @@ audit-named, and there are NO views or triggers — this tool creates neither, a
 execute a stranger's writes inside our migration) AND the present tables form a set this tool can
 actually leave on disk (every DDL batch is one transaction, so only the FULL audit set or the
 `--fresh`-preserved caches are reachable — a lone generic `errors` table with a plausible
-migration counter is neither; EXCEPTION: a stamped (v2..current) file with a PARTIAL set stays on the
-migrate-and-repair path — openReadOnly's documented remediation — when every present table carries
-the exact shape of the schema its STAMP names (one partial set is nonetheless rejected downstream by
-the compatibility gate on both opens: `run_unit_head` missing while `runs` survives — see §3): full table_xinfo rows (names, types, NOT NULL,
-defaults, PK positions, hidden/generated kinds) plus rowid-ness and STRICT-ness, compared
+migration counter is neither; EXCEPTION: a stamped (v2..current) file with a PARTIAL or
+era-damaged set stays on the migrate-and-repair path — openReadOnly's documented remediation —
+when every present table carries the exact shape of SOME stamped schema version (v2..current),
+evaluated PER TABLE: a shape BELOW the stamp is externally-damaged-but-healable (the writable
+open repairs it shape-keyed), a RECOGNIZED shape ABOVE the stamp is the tool's own mid-upgrade
+crash remnant (the v2→v3 step commits current-shape CREATEs together with stamp 3) and
+fast-forwards (one partial set is nonetheless rejected downstream by the compatibility gate on
+both opens: `run_unit_head` missing while `runs` survives — see §3): full table_xinfo rows
+(names, types, NOT NULL, defaults, PK positions, hidden/generated kinds) plus rowid-ness,
+STRICT-ness, FOREIGN KEY structure grouped per constraint, PK/UNIQUE index structure (sort
+direction + collation; operator-created indexes tolerated) and AUTOINCREMENT, compared
 order-independently against a `:memory:` build of the schema so the reference cannot drift;
 matching NAMES alone would admit a foreign table wearing our labels) → ours; (3) anything else → REFUSE, untouched, with an actionable
 error naming the file. The internal-object exemption matches the literal `sqlite_` prefix
@@ -296,13 +302,15 @@ and again on the writable connection — through any recovered WAL — before th
 flip and before `--fresh`, so an incompatible state committed only into `-wal` frames (a sibling
 build's v4 over a common v3 base) is still refused before it can be adopted or dropped, at the
 documented cost of sidecar recovery on that file.
-A current-version (v4) database self-heals idempotently on open: re-run the new-shape CREATEs, so a
-file missing a table or the `ix_ruh_loc` index is repaired rather than left a dead end — subject to
-the compatibility gates; in particular, `run_unit_head` missing while `runs` survives is rejected
-as INCOMPATIBLE (recreating an empty provenance table under surviving runs would silently un-scope
-their reports — the same gate the read path applies), and the v4 policy columns carry CHECKs and
-cannot be column-repaired — a v4 `run_unit_head` missing one is REJECTED before repair, not
-silently patched.
+A current-version (v4) database self-heals idempotently on open, SHAPE-keyed: re-run the
+new-shape CREATEs, so a file missing a table or the `ix_ruh_loc` index is repaired rather than
+left a dead end, and a `run_unit_head` regressed to a RECOGNIZED predecessor era (the v2/v3 body
+— external damage) is healed by the same rebuild the v3→v4 migration uses, rows riding through —
+subject to the compatibility gates; in particular, `run_unit_head` missing while `runs` survives
+is rejected as INCOMPATIBLE (recreating an empty provenance table under surviving runs would
+silently un-scope their reports — the same gate the read path applies), and the v4 policy columns
+carry CHECKs and cannot be column-repaired — a v4 `run_unit_head` missing ONE of them matches no
+stamped era and is REJECTED, not silently patched (era-shape heal, never partial-v4 patching).
 `runs.tracked_packages` is persisted EXACTLY from config at run creation, so every run carries the
 correct, exact package set and the report invariant (`package_name IN json_each(tracked_packages)`)
 stays unqualified and sound. A run row carrying `tracked_packages='[]'` is explicitly NOT reportable

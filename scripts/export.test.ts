@@ -509,9 +509,24 @@ describe("runExport guards (mirroring runReport, notices to stdout only)", () =>
     const root = mkdtempSync(join(tmpdir(), "export-v2db-"));
     try {
       const sqlitePath = join(dbRoot, "audit.db");
-      AuditDb.open({ sqlitePath }).close(); // create a real v3 db…
+      AuditDb.open({ sqlitePath }).close(); // create a real current-version db…
       const bump = new Database(sqlitePath, { strict: true });
-      bump.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch"); // …downgrade to the v2 shape
+      // Faithful v2 file: run_unit_head rebuilt to its TRUE v2 era body before the v2 stamp — a
+      // current-schema table cannot be column-dropped into an era shape (its table-level CHECKs
+      // reference the policy columns and no ALTER can un-widen the status CHECK), and a
+      // non-era-shaped file is refused as not-ours, which is a different test's contract.
+      bump.exec(`CREATE TABLE run_unit_head__v2 (
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+        commit_sha TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'scanned'
+          CHECK (status IN ('scanned','skipped-cutoff')),
+        PRIMARY KEY (run_id, organization, repository, branch))`);
+      bump.exec(`INSERT INTO run_unit_head__v2 (run_id, organization, repository, branch, commit_sha, status)
+        SELECT run_id, organization, repository, branch, commit_sha, status FROM run_unit_head`);
+      bump.exec("DROP TABLE run_unit_head");
+      bump.exec("ALTER TABLE run_unit_head__v2 RENAME TO run_unit_head");
+      bump.exec("CREATE INDEX IF NOT EXISTS ix_ruh_loc ON run_unit_head(organization, repository, branch, commit_sha)");
       bump.exec("PRAGMA user_version = 2"); // …then stamp it old (ownership precedes the version gate)
       bump.close();
       const cfg = config(sqlitePath, join(root, "output"));

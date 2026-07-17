@@ -600,14 +600,21 @@ function tableShape(db: Database, table: string): string {
 //   • above SCHEMA_VERSION has no reference schema here to verify against — false, so the
 //     writable-open backstop fails closed too (assertOwnedDatabase refuses that file earlier,
 //     with the accurate "newer — upgrade the tool" message);
-//   • a table may match the shape of ANY stamped version <= the stamp, evaluated PER TABLE: an
-//     older shape under a newer stamp is the externally-damaged-but-HEALABLE state the
-//     migration/self-heal chain repairs (the pinned case: a v3-stamped run_unit_head missing
-//     is_default_branch — openReadOnly's remediation for it is "run `bun run audit`", which
-//     must keep working; a damaged file can even mix eras per table). The span is sound only
-//     while every accepted older shape has an idempotent repair on the writable open — the
-//     "historical schema shape self-heals" test executes that claim and trips on a
-//     SCHEMA_VERSION bump by design.
+//   • a table may match the shape of ANY stamped version (2..SCHEMA_VERSION), evaluated PER
+//     TABLE. BELOW the stamp: an older shape under a newer stamp is the
+//     externally-damaged-but-HEALABLE state the migration/self-heal chain repairs (the pinned
+//     case: a stamped run_unit_head missing later-era columns — openReadOnly's remediation for
+//     it is "run `bun run audit`", which must keep working; a damaged file can even mix eras
+//     per table). ABOVE the stamp: a NEWER recognized shape under an older stamp is the tool's
+//     OWN crash remnant — migrateV2toV3 commits current-shape (v4) CREATEs together with stamp
+//     3, so a crash before migrateV3toV4's transaction leaves a physically-v4 run_unit_head
+//     under stamp 3 on disk; refusing it would brick the tool's own mid-upgrade database
+//     (assertOpenCompatible and the migration's classify-first arms vet the same states
+//     per-stamp downstream). The span is sound only while every accepted older shape has an
+//     idempotent repair on the writable open — the "historical schema shape self-heals" test
+//     executes that claim and trips on a SCHEMA_VERSION bump by design — and while every
+//     accepted newer shape fast-forwards (the chain's remaining ALTERs are addColumnIfMissing
+//     no-ops and the v3→v4 step PRESERVES a physically-v4 table).
 // Any SUBSET of audit tables passes this predicate (a partial restore must stay repairable —
 // openReadOnly documents "run `bun run audit` once to repair it", and every DDL batch here
 // re-creates what is missing), SUBJECT to the downstream compatibility gates: one deliberate
@@ -628,7 +635,7 @@ function hasOwnedTableSet(db: Database): boolean {
   const uv = readUserVersion(db);
   if (uv < MIN_OWNED_VERSION || uv > SCHEMA_VERSION) return false;
   const eras: Array<Map<string, string>> = [];
-  for (let v = MIN_OWNED_VERSION; v <= uv; v++) eras.push(tableShapesAt(v));
+  for (let v = MIN_OWNED_VERSION; v <= SCHEMA_VERSION; v++) eras.push(tableShapesAt(v));
   return present.every((t) => {
     if (!AUDIT_TABLE_SET.has(t)) return false;
     const shape = tableShape(db, t);
@@ -1245,43 +1252,58 @@ function classifyRunUnitHead(db: Database): RuhClass {
 // AuditDb.open, every state that could make this transaction fail AFTER its destructive swap is
 // now intercepted earlier (ownership preflight, live backstops, classify-first), so the
 // rollback-after-swap property is only pinnable by driving the function on a raw connection.
+// The shape-keyed run_unit_head heal, shared by migrateV3toV4 and the current-stamp self-heal
+// (AuditDb.open's else arm). Classifies the on-disk shape and brings any RECOGNIZED
+// predecessor era to the v4 body, rows riding through; the v4 forms and `absent` are no-ops
+// here (the caller's SCHEMA_SQL recreates what is missing). Runs INSIDE the caller's
+// transaction — a failure rolls the whole step back.
+function healRunUnitHeadShape(db: Database): void {
+  const cls = classifyRunUnitHead(db);
+  switch (cls.kind) {
+    case "ours-v4":
+    case "ours-v4-missing-index":
+      break; // physically v4 already (shape upgraded, stamp equal or lagged): preserve every value, no rebuild
+    case "exact-v2":
+      // A v2 shape reaching this step means migrateV2toV3 did not run for it — either the file
+      // is stamped >= 3 with a damaged-away column (external damage; the chain itself stamps
+      // atomically with its ALTER, so it never produces this) or the shape regressed after the
+      // v2→v3 step. Both are the healable class the ownership span admits: heal the missing
+      // column FIRST — is_default_branch backfills NULL (= unknown), never 0, exactly like the
+      // real v2→v3 migration — then rebuild like any exact-v3 table (fall through).
+      addColumnIfMissing(db, "run_unit_head", "is_default_branch", "INTEGER");
+    // fall through — the table is now exact-v3-shaped
+    case "exact-v3":
+      // A DROP with foreign_keys=ON does an implicit child-row delete that would CASCADE to any
+      // external table referencing run_unit_head — silently mutating rows the later
+      // foreign_key_check cannot detect. Refuse to rebuild in that (unexpected) mixed shape.
+      if (hasInboundForeignKey(db, "run_unit_head"))
+        fail("run_unit_head has an inbound foreign key — refusing to rebuild it (a DROP would cascade to external rows)");
+      // Rebuild: new v4-shaped table, copy the 7 v3 columns EXPLICITLY (new columns default NULL;
+      // existing 'scanned'/'skipped-cutoff' status values remain valid under the v4 CHECK).
+      if (tableExists(db, "run_unit_head__v4_new"))
+        fail("migration scratch table run_unit_head__v4_new already exists — aborting rather than clobber it");
+      db.exec(`CREATE TABLE run_unit_head__v4_new (${RUN_UNIT_HEAD_BODY});`);
+      db.exec(
+        `INSERT INTO run_unit_head__v4_new
+           (run_id, organization, repository, branch, commit_sha, status, is_default_branch)
+         SELECT run_id, organization, repository, branch, commit_sha, status, is_default_branch
+         FROM run_unit_head`,
+      );
+      db.exec("DROP TABLE run_unit_head");
+      db.exec("ALTER TABLE run_unit_head__v4_new RENAME TO run_unit_head");
+      break;
+    case "absent":
+      break; // recognized post---fresh cache-only state: the caller's SCHEMA_SQL creates run_unit_head at v4
+    case "incompatible":
+      // Structurally unreachable through AuditDb.open (the preflight + live compat gates reject
+      // an unrecognized shape first) — kept as the transaction-internal backstop.
+      fail(`run_unit_head is incompatible with this tool build (${cls.reason})`);
+  }
+}
+
 export function migrateV3toV4(db: Database): void {
   db.transaction(() => {
-    const cls = classifyRunUnitHead(db);
-    switch (cls.kind) {
-      case "ours-v4":
-      case "ours-v4-missing-index":
-        break; // physically v4 already (shape upgraded, stamp lagged): preserve every value, no rebuild
-      case "exact-v3":
-        // A DROP with foreign_keys=ON does an implicit child-row delete that would CASCADE to any
-        // external table referencing run_unit_head — silently mutating rows the later
-        // foreign_key_check cannot detect. Refuse to rebuild in that (unexpected) mixed shape.
-        if (hasInboundForeignKey(db, "run_unit_head"))
-          fail("run_unit_head has an inbound foreign key — refusing to rebuild it (a DROP would cascade to external rows)");
-        // Rebuild: new v4-shaped table, copy the 7 v3 columns EXPLICITLY (new columns default NULL;
-        // existing 'scanned'/'skipped-cutoff' status values remain valid under the v4 CHECK).
-        if (tableExists(db, "run_unit_head__v4_new"))
-          fail("migration scratch table run_unit_head__v4_new already exists — aborting rather than clobber it");
-        db.exec(`CREATE TABLE run_unit_head__v4_new (${RUN_UNIT_HEAD_BODY});`);
-        db.exec(
-          `INSERT INTO run_unit_head__v4_new
-             (run_id, organization, repository, branch, commit_sha, status, is_default_branch)
-           SELECT run_id, organization, repository, branch, commit_sha, status, is_default_branch
-           FROM run_unit_head`,
-        );
-        db.exec("DROP TABLE run_unit_head");
-        db.exec("ALTER TABLE run_unit_head__v4_new RENAME TO run_unit_head");
-        break;
-      case "absent":
-        break; // recognized post---fresh cache-only state: SCHEMA_SQL below creates run_unit_head at v4
-      case "exact-v2":
-        // migrateV2toV3 runs BEFORE this in the chain and converts a v2 table to v3, so reaching v4
-        // with a still-v2 shape is a migration-ordering bug — fail rather than silently rebuild.
-        fail("internal: migrateV3toV4 reached a v2-shaped run_unit_head (migrateV2toV3 did not run)");
-        break;
-      case "incompatible":
-        fail(`cannot migrate database to schema v4: ${cls.reason}`);
-    }
+    healRunUnitHeadShape(db);
     // Migration-boundary rule: every pre-v4 RUNNING run is failed —
     // inside this same transaction — so it can never be resumed under v4 semantics. A pre-v4 run's
     // scope may have left NO run_unit_head rows at all (v3 never recorded past-cap rows, and a repo
@@ -1320,9 +1342,11 @@ export function migrateV3toV4(db: Database): void {
 //   2. on the WRITABLE connection, as the live backstop, on every writable AuditDb.open that
 //      reaches it — through any recovered WAL, catching an incompatible state the base image
 //      could not see (see AuditDb.open); a no-op on an empty/new database (no tables yet).
-// Recognizes legitimate predecessors, so a real v2/v3 database is NOT rejected — per-stamp allowed
-// shapes: stamp 2 accepts exact-v2/exact-v3/ours-v4 (each v4 form ± the repairable missing
-// ix_ruh_loc); stamp 3 drops exact-v2; stamp >= 4 accepts only the ours-v4 forms. Both call sites
+// Recognizes legitimate predecessors, so a real v2/v3 database is NOT rejected: every RECOGNIZED
+// era shape (exact-v2/exact-v3/ours-v4 ± the repairable missing ix_ruh_loc) is accepted at every
+// owned stamp — below-stamp shapes because the writable open HEALS them shape-keyed, above-stamp
+// recognized shapes because they are the tool's own crash remnants (see the in-body comment).
+// What rejects here is an UNRECOGNIZED shape or a broken cross-table invariant. Both call sites
 // run BEFORE the WAL pragma and BEFORE --fresh, so a DETECTED incompatibility is rejected before
 // --fresh can drop anything.
 function assertOpenCompatible(db: Database, userVersion: number): void {
@@ -1349,26 +1373,25 @@ function assertOpenCompatible(db: Database, userVersion: number): void {
   if (!ruhPresent) return; // absent + runs also absent -> genuine fresh / post-fresh cache-only state
   const cls = classifyRunUnitHead(db);
   if (cls.kind === "incompatible") reject(cls.reason);
-  // Per-stamp allowed shapes, TIGHTENED in one direction: each step transforms the shape BEFORE
-  // stamping (one transaction each), so the chain can never leave a shape OLDER than its stamp — a
-  // v3 stamp carrying a v2 shape proves migrateV2toV3 was skipped; without --fresh, accepting it
-  // would only defer the failure to migrateV3toV4's exact-v2 rejection. Recognized NEWER shapes are
-  // also accepted at older stamps: the CURRENT chain commits each reshape together with its stamp,
-  // but EARLIER tool builds ran a multi-step chain whose first (legacy) step committed current-shape
-  // CREATEs while stamping only 2 — a crash there left a physically newer table under the older
-  // stamp, and such files exist on disk. Accepting them is safe: the remaining steps' ALTERs are
-  // addColumnIfMissing no-ops, and the v3→v4 step classifies a physically-v4 table as ours-v4
-  // (preserved, no rebuild).
-  // The ours-v4-missing-index form is NOT chain-producible (SCHEMA_SQL creates ix_ruh_loc in the
-  // same transaction as the table); it is accepted separately as REPAIRABLE.
-  const okV4 = cls.kind === "ours-v4" || cls.kind === "ours-v4-missing-index";
-  const allowed =
-    userVersion >= V4_TARGET_VERSION
-      ? okV4
-      : userVersion >= V3_TARGET_VERSION
-        ? okV4 || cls.kind === "exact-v3"
-        : okV4 || cls.kind === "exact-v3" || cls.kind === "exact-v2"; // stamp 2
-  if (!allowed) reject(`run_unit_head shape '${cls.kind}' does not match the stamp`);
+  // Every RECOGNIZED era shape is accepted at every owned stamp — in BOTH stamp directions,
+  // each for its own reason, mirroring hasOwnedTableSet's span:
+  //   • a shape OLDER than its stamp (a v2/v3-shaped run_unit_head under stamp 3/4) is
+  //     externally-damaged-but-HEALABLE: the writable open repairs it shape-keyed (the
+  //     migration's exact-v2/exact-v3 arms and the current-stamp self-heal run the same
+  //     rebuild), rows riding through — the "historical schema shape self-heals" test executes
+  //     that claim per era, so this acceptance can never silently outrun the repair;
+  //   • a RECOGNIZED shape NEWER than its stamp is the tool's OWN crash remnant: migrateV2toV3
+  //     commits current-shape (v4) CREATEs together with stamp 3, so a crash before
+  //     migrateV3toV4's transaction leaves a physically-v4 table under stamp 3 (earlier
+  //     multi-step builds could leave the same under stamp 2). Accepting it is safe: the
+  //     remaining steps' ALTERs are addColumnIfMissing no-ops, and the v3→v4 step classifies a
+  //     physically-v4 table as ours-v4 (preserved, no rebuild).
+  // What this gate REFUSES, at every stamp, is an UNRECOGNIZED shape (cls.kind 'incompatible',
+  // rejected above: a sibling build's different v4, wrong CHECK set, foreign constraints…) — no
+  // heal can be responsible for a shape the tool never produced. After that rejection every
+  // remaining kind is a recognized era form (the ours-v4-missing-index form is NOT
+  // chain-producible — SCHEMA_SQL creates ix_ruh_loc in the same transaction as the table — and
+  // is accepted as REPAIRABLE), so the fall-through here IS the acceptance.
 }
 
 // ---- open ------------------------------------------------------------------------------------
@@ -1673,12 +1696,23 @@ export class AuditDb {
       if (readUserVersion(db) < V3_TARGET_VERSION) migrateV2toV3(db);
       if (readUserVersion(db) < V4_TARGET_VERSION) migrateV3toV4(db);
     } else {
-      // Current-version (v4) self-heal: the compatibility gate already verified the on-disk shape is
-      // ours-v4 (at worst missing only ix_ruh_loc), so recreating any missing table/index suffices.
-      // The v4 policy columns carry CHECKs and cannot be addColumn-repaired — which is exactly why
-      // an actually-incompatible v4 was REJECTED at the gate rather than silently "repaired" here.
+      // Current-stamp (v4) self-heal, SHAPE-keyed: the compatibility gate already rejected every
+      // UNRECOGNIZED shape, but a recognized PREDECESSOR era under the current stamp (external
+      // damage — e.g. a partial restore that regressed run_unit_head to its v2/v3 body) is
+      // deliberately admitted as healable, per the ownership span's contract. The heal runs the
+      // same rebuild the v3→v4 migration uses (rows riding through; damaged-away values honestly
+      // read NULL); SCHEMA_SQL then recreates any missing table/index, and the post-heal
+      // fingerprint + FK check mirror the migration's own teeth. This is a repair, NOT a version
+      // crossing — the stamp is already current, so no run is failed here (the migration-boundary
+      // rule belongs to migrateV3toV4 alone).
       db.transaction(() => {
+        healRunUnitHeadShape(db);
         db.exec(SCHEMA_SQL);
+        const after = classifyRunUnitHead(db);
+        if (after.kind !== "ours-v4")
+          fail(`self-heal did not produce the expected run_unit_head shape (got '${after.kind}')`);
+        const orphans = db.query(`PRAGMA foreign_key_check(run_unit_head)`).all();
+        if (orphans.length > 0) fail(`self-heal left ${orphans.length} orphaned run_unit_head row(s) — aborting`);
       })();
     }
     return new AuditDb(db);
@@ -1733,35 +1767,37 @@ export class AuditDb {
       // Schema sanity up front: an INCOMPATIBLE database — a sibling/foreign run_unit_head shape,
       // the known runs.outcome sibling marker, an inbound FK into run_unit_head, or run_unit_head
       // missing beside runs — or one missing an audit table must fail HERE with an actionable
-      // message, not later with a raw "no such table"/"no such column" mid-query. OWNERSHIP is
-      // deliberately NOT re-proven on the read path: a file the WRITER refuses solely for carrying
-      // an extra non-audit table (assertOwnedDatabase) still opens read-only — a readonly
-      // connection creates/adopts no schema objects (its filesystem residuals are sidecar-level
-      // only: it may create missing -wal/-shm files or mutate an existing -shm wal-index), and
-      // refusing the read would deny report access to real audit data. openReadOnly cannot
-      // migrate, so it DISTINGUISHES an INCOMPATIBLE database (a different-build v4 — use the
-      // matching build or a new db path) from a merely under-repaired one (run `bun run audit`
-      // once). The stamp is == SCHEMA_VERSION here (both < and > are rejected above), so for a
-      // PRESENT run_unit_head any shape other than the ours-v4 forms (± the repairable missing
-      // ix_ruh_loc) is a genuine mismatch.
-      // The INCOMPATIBILITY discriminator runs FIRST — a database caught by these gates (e.g.
-      // runs.outcome) must get the incompatible message even when it is ALSO missing an audit
-      // table, because "run bun run audit" cannot repair it (the writer open rejects the same
-      // file). Only after that does the missing-table advice fire — advice that presumes the file
-      // is otherwise ours/repairable, which this read path does not re-prove.
+      // message, not later with a raw "no such table"/"no such column" mid-query. Ownership was
+      // already re-proven above (isOwnedOrEmpty — shape-level, so most foreign/sibling files are
+      // refused there as "did not create"); what remains for THIS discriminator is the class
+      // ownership's tableShape cannot see (CHECK-body variants) plus the cross-table invariants.
+      // openReadOnly cannot migrate, so it DISTINGUISHES an INCOMPATIBLE database (a
+      // different-build v4 — use the matching build or a new db path) from a merely
+      // under-repaired one (run `bun run audit` once). The stamp is == SCHEMA_VERSION here (both
+      // < and > are rejected above); a PRESENT run_unit_head in a RECOGNIZED predecessor era is
+      // the healable class (repair advice below), while an unrecognized shape is a genuine
+      // mismatch.
+      // The INCOMPATIBILITY discriminator runs FIRST — a database caught by these gates must get
+      // the incompatible message even when it is ALSO missing an audit table, because "run bun
+      // run audit" cannot repair it (the writer open rejects the same file). Only after that does
+      // the missing-table advice fire.
       const incompatible = (why: string): never =>
         fail(`database is incompatible with this tool build (${why}) — use the matching tool build or a new database path`);
       const cls = classifyRunUnitHead(db);
       if (cls.kind === "incompatible") incompatible(cls.reason);
       // The stamp is == SCHEMA_VERSION (4) here (older/newer both rejected above). Mirror the writer
-      // gate's cross-table + shape invariants BEFORE the missing-table advice, since "run bun run
-      // audit" cannot repair any of these (the writer open rejects the same file):
+      // gate's cross-table invariants BEFORE the missing-table advice — "run bun run audit" cannot
+      // repair THESE (the writer open rejects the same file):
       if (!tableExists(db, "run_unit_head") && tableExists(db, "runs"))
         incompatible("run_unit_head is missing while the runs table is present");
       if (tableExists(db, "run_unit_head") && hasInboundForeignKey(db, "run_unit_head"))
         incompatible("an external table has a foreign key into run_unit_head"); // consistent with the writer gate
-      if (tableExists(db, "run_unit_head") && cls.kind !== "ours-v4" && cls.kind !== "ours-v4-missing-index")
-        incompatible(`run_unit_head shape '${cls.kind}'`);
+      // A RECOGNIZED predecessor era under the current stamp is the healable-damage class the
+      // ownership span admits — the WRITER repairs it (shape-keyed self-heal), so the read path
+      // advises the repair rather than declaring the file incompatible (openReadOnly itself
+      // cannot migrate or heal).
+      if (tableExists(db, "run_unit_head") && (cls.kind === "exact-v3" || cls.kind === "exact-v2"))
+        fail("database run_unit_head is missing the v4 policy columns — run `bun run audit` once to repair it, then retry");
       for (const t of AUDIT_TABLES) {
         if (!tableExists(db, t))
           fail(`database is missing the ${t} table — run \`bun run audit\` once to repair it, then retry`);
