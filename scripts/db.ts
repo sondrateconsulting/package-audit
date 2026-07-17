@@ -1935,9 +1935,11 @@ export class AuditDb {
       // the known runs.outcome sibling marker, an inbound FK into run_unit_head, or run_unit_head
       // missing beside runs — or one missing an audit table must fail HERE with an actionable
       // message, not later with a raw "no such table"/"no such column" mid-query. Ownership was
-      // already re-proven above (isOwnedOrEmpty — shape-level, so most foreign/sibling files are
-      // refused there as "did not create"); what remains for THIS discriminator is the class
-      // ownership's tableShape cannot see (CHECK-body variants) plus the cross-table invariants.
+      // already re-proven above (isOwnedOrEmpty — shape-level, and since the whole-DB identity work
+      // its tableShape fingerprints CHECK bodies + the five tokens too, so most foreign/sibling files
+      // are refused there as "did not create"); THIS discriminator is now defense-in-depth for the
+      // run_unit_head shape plus the cross-table invariants it alone owns (the runs.outcome sibling
+      // marker, an inbound FK into run_unit_head, run_unit_head missing beside runs).
       // openReadOnly cannot migrate, so it DISTINGUISHES an INCOMPATIBLE database (a
       // different-build v4 — use the matching build or a new db path) from a merely
       // under-repaired one (run `bun run audit` once). The stamp is == SCHEMA_VERSION here (both
