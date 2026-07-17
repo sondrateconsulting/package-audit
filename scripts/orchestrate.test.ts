@@ -677,6 +677,34 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("runPlan propagates a PolicyMatchError — its listBranchHeads catch never swallows it (the --plan fail-closed twin of runScan)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "plan-throw-"));
+    // Branch discovery SUCCEEDS (so the shared planner runs), then the throwing exclude glob is evaluated.
+    // runPlan try/catches ONLY its two discovery calls (repo discovery, then listBranchHeads);
+    // planRepoBranches runs OUTSIDE both, so a match-time throw must abort the whole plan — NEVER degrade
+    // into a per-repo "branch discovery failed" continue,
+    // which would silently under-report the plan's excluded set. This pins for --plan the exact fail-closed
+    // contract the real-scan path is tested for above; without it, a future widened catch would fail OPEN
+    // untested (the bug class this feature's whole design exists to prevent).
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" }], "dev") };
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy };
+    let thrown: unknown = null;
+    const events = await captureJsonl(async () => {
+      thrown = await runPlan(client, runtime, "rvo").then(() => null, (e: unknown) => e);
+    });
+    // the ORIGINAL error propagates UNCHANGED (object identity on the injected cause), exactly like runScan
+    expect(thrown).toBeInstanceOf(PolicyMatchError);
+    expect((thrown as { cause?: unknown }).cause).toBe(badGlobError);
+    // and it aborted MID-plan — a completed plan would have logged a plan-summary; a fail-open swallow
+    // would have too (with the denied repo silently skipped). Its absence proves the fatal abort.
+    expect(events.some((e) => e["event"] === "plan-summary")).toBe(false);
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("an allow-list MISS persists as excluded-by-allow with a NULL pattern", async () => {
     const root = mkdtempSync(join(tmpdir(), "policy-allow-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });

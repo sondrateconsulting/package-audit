@@ -383,6 +383,16 @@ describe("buildReport (§7)", () => {
       /is excluded-by-deny but names no causing pattern/,
     ],
     [
+      // The OTHER half of that OR: a leading '!' is Bun.Glob NEGATION syntax, rejected at config load
+      // (config.ts::validateBranchPattern) and so never a real stored pattern. Schema-VALID ('!release/**' IS NOT
+      // NULL → the deny CHECK passes), which is exactly why the read guard must carry it: the write
+      // chokepoint's G1b pins the same rule (db.test.ts), but the read matrices previously forged only
+      // the empty-string case, so dropping just the startsWith("!") clause would slip past every test.
+      "a deny exclusion whose stored pattern is '!'-prefixed — config-negation syntax, never a stored pattern",
+      `'', 'policy-excluded', 0, 'excluded-by-deny', '!release/**'`,
+      /is excluded-by-deny but names no causing pattern/,
+    ],
+    [
       // The forge writes a REAL scanned_commit_date, so the row claims to be NATIVE v4 — and a native
       // default is always scanned (a v3-migrated row's NULL date exempts it from this rule).
       "a NATIVE default branch that is not scanned — Premise 6 enforced on the read path",
