@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { copyFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, isOwnedOrEmpty, mapReadOnlyOpenError, nowIso, type RunInput } from "./db.ts";
+import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, nowIso, type RunInput } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 
@@ -237,6 +237,20 @@ function buildForeignDb(path: string, opts: { auditName?: string; userVersion?: 
   d.close();
 }
 
+// Corrupt the sqlite_schema btree root: zero page 1 past the 100-byte file header. The header
+// stays valid — opens succeed and the header pragmas (user_version, application_id) still
+// answer — but the first sqlite_master-backed statement hits the zeroed btree and throws
+// SQLITE_CORRUPT. This is the damage shape the ownership probes can actually meet mid-check:
+// they read schema metadata, never table interior pages, so corrupting a data page would
+// exercise nothing here.
+function corruptSchemaPage(path: string): void {
+  const bytes = readFileSync(path);
+  const raw16 = bytes.readUInt16BE(16); // header page-size field; the stored value 1 means 65536
+  const pageSize = raw16 === 1 ? 65536 : raw16;
+  bytes.fill(0, 100, Math.min(pageSize, bytes.length));
+  writeFileSync(path, bytes);
+}
+
 // The whole-file assertion: refused cleanly, and the file is byte-for-byte as they left it.
 function expectRefusedUnmutated(path: string, before: FileState): void {
   expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
@@ -362,6 +376,26 @@ describe("ownership — a foreign database is refused BEFORE any writable open",
     // detail — either way the refusal must carry ownership-check context, not a raw SQLiteError.
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/not a readable SQLite database|could not inspect it/);
     expect(Buffer.compare(readFileSync(path), before)).toBe(0); // bytes untouched
+    expect(readdirSync(TEST_ROOT).filter((f) => f.startsWith(`${basename(path)}-`))).toEqual([]);
+  });
+
+  test("a zero-object file stamped with a foreign application_id is refused byte-identical (before the empty arm)", () => {
+    // The scenario readApplicationId's own comment names: another application initializes its
+    // header — application_id stamped — before running any DDL. The empty arm ("an empty
+    // database cannot belong to anyone") must never see this file: affirmative foreign
+    // provenance is checked FIRST. Discriminating power (mutation-proven): moving the
+    // application_id check after the empty arm adopts this file — WAL header conversion and
+    // sidecars beside a stranger's file — before the backstop's own application_id line can
+    // refuse the write. Byte-compare is the decisive assertion: it pins the journal-mode
+    // header bytes, the application_id, the stamp, and everything else at once.
+    const path = nextFile();
+    const d = new Database(path, { create: true, strict: true });
+    d.exec("PRAGMA application_id = 252006674"); // the same nonzero stamp the backstop tests use
+    d.close();
+    const before = readFileSync(path);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(DbError);
+    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create/);
+    expect(Buffer.compare(readFileSync(path), before)).toBe(0);
     expect(readdirSync(TEST_ROOT).filter((f) => f.startsWith(`${basename(path)}-`))).toEqual([]);
   });
 
@@ -686,6 +720,24 @@ describe("ownership — every database this tool legitimately produces still ope
     } finally {
       db.close();
     }
+  });
+
+  test("an operator-added CREATE INDEX on an audit table stays tolerated (writable AND read-only opens)", () => {
+    // Pins the tolerance tableShape documents ("a stray operator CREATE INDEX stays
+    // tolerated"): hasForeignObjects counts only tables/views/triggers, and the shape
+    // fingerprint excludes origin-'c' indexes — so an operator's performance index on a
+    // legitimately-produced database must never turn it "foreign". Discriminating power
+    // (mutation-proven): removing the origin-'c' filter refuses this database as "did not
+    // create" on both open paths.
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close();
+    const w = new Database(path, { strict: true });
+    w.exec("CREATE INDEX ix_operator_errors_msg ON errors(message)");
+    w.close();
+    const writer = AuditDb.open({ sqlitePath: path });
+    writer.close();
+    expect(fileState(path).objects).toContain("index:ix_operator_errors_msg"); // survived self-heal, not dropped
+    AuditDb.openReadOnly({ sqlitePath: path }).close();
   });
 
   // --fresh's drop is its own committed transaction, and SCHEMA_SQL re-creates the tables in a
@@ -1422,6 +1474,42 @@ describe("isOwnedOrEmpty — the writable-open backstop's guard", () => {
     forged.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     expect(isOwnedOrEmpty(forged)).toBe(false);
     forged.close();
+  });
+});
+
+describe("corrupted database files fail closed with OUR context, never a raw SQLiteError", () => {
+  test("openReadOnly on a corrupted database surfaces a DbError, not a raw SQLITE_CORRUPT", () => {
+    // The ownership probe's sqlite_master read is the first statement to touch the zeroed
+    // schema btree; before mapReadOnlyOpenError classified the corrupt family, that raw
+    // "database disk image is malformed" SQLiteError reached report/export callers verbatim.
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close();
+    corruptSchemaPage(path);
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(DbError);
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/corrupted or not a SQLite database/);
+  });
+
+  test("the writable init span (PRAGMAs + version gate + backstop) fails closed: DbError, handle closed", () => {
+    // The live trigger is a file changing between the preflight and the writable open (the
+    // documented checkpoint race the backstop exists for) — impractical to fabricate
+    // deterministically end-to-end, the same rationale as isOwnedOrEmpty's own export. Called
+    // directly on a corrupted file: EVERY raw throw inside the init span (here the corrupt
+    // schema btree, met by the first statement that needs it) must come out as a DbError with
+    // ownership-check context AND must close the handle — no leaked writable connection on a
+    // file whose ownership could not be re-verified.
+    const path = nextFile();
+    AuditDb.open({ sqlitePath: path }).close();
+    corruptSchemaPage(path);
+    const db = new Database(path, { strict: true });
+    let caught: unknown;
+    try {
+      initWritableConnection(db, path);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(DbError);
+    expect((caught as Error).message).toMatch(/could not inspect it on the writable connection/);
+    expect(() => db.query("SELECT 1 AS x").get()).toThrow(/closed database/);
   });
 });
 
@@ -2515,8 +2603,16 @@ describe("openReadOnly (CV5 read seam)", () => {
     for (const cant of ["SQLITE_CANTOPEN", "SQLITE_CANTOPEN_ISDIR"]) {
       expect(msg(mapReadOnlyOpenError(err(cant), "p"))).toContain("run `bun run audit` first");
     }
+    // The whole corrupt family plus NOTADB (SQLite's "file is encrypted or is not a database"):
+    // damage met mid-probe must surface as OUR refusal with context — report/export callers were
+    // getting a raw "database disk image is malformed" SQLiteError before this classification.
+    for (const damaged of ["SQLITE_CORRUPT", "SQLITE_CORRUPT_INDEX", "SQLITE_CORRUPT_SEQUENCE", "SQLITE_CORRUPT_VTAB", "SQLITE_NOTADB"]) {
+      const mapped = mapReadOnlyOpenError(err(damaged), "p");
+      expect(mapped).toBeInstanceOf(DbError);
+      expect(msg(mapped)).toContain("corrupted or not a SQLite database");
+    }
     // unknown codes and non-Error shapes pass through VERBATIM (never swallowed)
-    const raw = err("SQLITE_CORRUPT");
+    const raw = err("SQLITE_PERM");
     expect(mapReadOnlyOpenError(raw, "p")).toBe(raw);
     const noCode = new Error("plain");
     expect(mapReadOnlyOpenError(noCode, "p")).toBe(noCode);

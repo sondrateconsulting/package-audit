@@ -428,7 +428,7 @@ function tableShapesAt(version: number): Map<string, string> {
 // would admit a foreign table whose columns merely share ours' names (all-INTEGER types, no
 // constraints, or a WITHOUT ROWID clone). Constraint semantics table_xinfo cannot see count
 // too, from STRUCTURED pragmas: FOREIGN KEY clauses (foreign_key_list), PK/UNIQUE index
-// structure (index_list origin 'pk'/'u' + index_info — origin 'c' is excluded, so a stray
+// structure (index_list origin 'pk'/'u' + index_xinfo — origin 'c' is excluded, so a stray
 // operator CREATE INDEX stays tolerated), and AUTOINCREMENT (the one bit with no pragma,
 // probed as a token in the comment-stripped stored CREATE text) — without these, a foreign
 // table matching every column tuple but missing our FK/UNIQUE/AUTOINCREMENT semantics would
@@ -439,8 +439,10 @@ function tableShapesAt(version: number): Map<string, string> {
 // text, whose exact matching would be brittle against legitimate ALTER-rewritten histories) —
 // the residual false-positive is a table matching columns AND constraint structure exactly,
 // differing only in those. (PRAGMA cannot bind — `table` is validated against
-// AUDIT_TABLE_SET, same contract as columnExists; index names come from index_list's own
-// output and are double-quoted.)
+// AUDIT_TABLE_SET, same contract as columnExists. Index names come from index_list's own
+// output over those fixed audit table names, and an autoindex name embeds its table's name —
+// so the names reaching index_xinfo contain no quote characters; they are interpolated with
+// proper SQL identifier escaping ("" doubling) anyway, as defense in depth.)
 function tableShape(db: Database, table: string): string {
   if (!AUDIT_TABLE_SET.has(table)) fail(`tableShape called for unknown table ${table}`);
   const cols = db.query(`PRAGMA table_xinfo(${table})`).all() as Array<{
@@ -486,7 +488,7 @@ function tableShape(db: Database, table: string): string {
       // different index). key=0 rows are the implementation's trailing rowid/payload columns
       // — not part of the declared constraint — and are excluded.
       const idxCols = (
-        db.query(`PRAGMA index_xinfo(${JSON.stringify(i.name)})`).all() as Array<{
+        db.query(`PRAGMA index_xinfo("${i.name.replaceAll('"', '""')}")`).all() as Array<{
           seqno: number; name: string | null; desc: number; coll: string; key: number;
         }>
       )
@@ -597,8 +599,13 @@ function addColumnIfMissing(db: Database, table: string, column: string, ddl: st
 // (a crashed writer's WAL needs WRITABLE recovery — waiting won't help; the fix is one writable
 // open); the BUSY and CANTOPEN families are matched by PREFIX so extended variants
 // (SQLITE_BUSY_TIMEOUT, SQLITE_BUSY_SNAPSHOT, SQLITE_CANTOPEN_*) classify with their primary
-// code. Anything else is rethrown verbatim. Exported for direct unit tests — the recovery/busy
-// states are impractical to fabricate deterministically in a test fixture.
+// code. The CORRUPT family and NOTADB (SQLite's "file is encrypted or is not a database")
+// classify too: openReadOnly's ownership probe reads sqlite_master before any report query, so
+// a damaged file surfaces HERE — as our refusal with context, not a raw "database disk image
+// is malformed" mid-report. (Damage met LATER, by reader queries after a successful open, is a
+// documented residual: the open-gate cannot vouch for pages it never read.) Anything else is
+// rethrown verbatim. Exported for direct unit tests — the recovery/busy states are impractical
+// to fabricate deterministically in a test fixture.
 export function mapReadOnlyOpenError(e: unknown, path: string): unknown {
   const code = (e as { code?: unknown }).code;
   if (typeof code !== "string") return e;
@@ -611,6 +618,11 @@ export function mapReadOnlyOpenError(e: unknown, path: string): unknown {
     return new DbError(`database at ${path} is busy — an audit appears to be in progress; retry when it finishes`);
   if (code.startsWith("SQLITE_CANTOPEN"))
     return new DbError(`cannot open database at ${path} — run \`bun run audit\` first`);
+  if (code.startsWith("SQLITE_CORRUPT") || code === "SQLITE_NOTADB")
+    return new DbError(
+      `database at ${path} is corrupted or not a SQLite database (${(e as Error).message}) — ` +
+        "restore it from a backup or point `sqlitePath` at an existing audit database",
+    );
   return e;
 }
 
@@ -735,7 +747,10 @@ function assertOwnedDatabase(path: string): void {
   }
   let db: Database;
   try {
-    db = Database.deserialize(bytes, true);
+    // Options overload, NOT the positional boolean: only it can also pass strict — the same
+    // silent-NULL-binding protection every other handle in this file gets, on the one handle
+    // that inspects potentially foreign bytes.
+    db = Database.deserialize(bytes, { readonly: true, strict: true });
   } catch (e) {
     // Not a readable SQLite image (junk bytes, torn mid-write copy, corruption): fail CLOSED —
     // what cannot be inspected cannot be proven ours.
@@ -808,6 +823,57 @@ export interface OpenDbOptions {
   sqlitePath: string;
   fresh?: boolean;
   purgeCache?: boolean;
+}
+
+// The writable connection's INIT span — per-connection PRAGMAs, the version ceiling, then the
+// ownership BACKSTOP, under ONE failure discipline. The backstop is normally unreachable:
+// assertOwnedDatabase already refused every foreign file it could prove. It re-runs the SAME
+// ownedness test (isOwnedOrEmpty) on the WRITABLE connection, which reads THROUGH any
+// recovered WAL — closing what the base-image preflight cannot see: a foreign checkpoint
+// landing between the preflight and this open (the preflight's own wal-guard covers the
+// on-disk case, but not that race). Reaching a refusal here costs sidecar recovery on their
+// file and a checkpoint on close — data-preserving, and strictly better than writing our
+// schema into it. Fires BEFORE --fresh can drop anything.
+// The discipline exists because EVERY statement in this span — the WAL pragma included, which
+// is the first thing to touch the file's pages — can throw raw (SQLITE_CORRUPT and friends)
+// on a file that changed since the preflight. Same contract as assertOwnedDatabase's catch:
+// close the handle (no leaked half-initialized writer), fail CLOSED with ownership-check
+// context, never a raw SQLiteError; our own DbError refusals pass through unwrapped. Returns
+// the verified user_version so open() decides create-vs-migrate-vs-heal without re-reading.
+// Exported for direct unit tests — the live trigger is the same checkpoint race that
+// justifies isOwnedOrEmpty's export.
+export function initWritableConnection(db: Database, path: string): number {
+  try {
+    // busy_timeout FIRST — it is per-connection and must protect the very next statement
+    // (the WAL pragma takes a lock and would otherwise fail immediately under contention).
+    // journal_mode is persistent (in the file header) but re-asserting is harmless;
+    // foreign_keys is per-connection too. All three run OUTSIDE any transaction
+    // (journal_mode cannot change inside one).
+    db.exec("PRAGMA busy_timeout = 5000;");
+    db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA foreign_keys = ON;");
+    const userVersion = readUserVersion(db);
+    if (userVersion > SCHEMA_VERSION)
+      fail(`database schema version ${userVersion} is newer than this tool's ${SCHEMA_VERSION} — upgrade the tool`);
+    if (!isOwnedOrEmpty(db))
+      fail(
+        `refusing to write to ${path}: it is a SQLite database this tool did not create — ` +
+          "point `sqlitePath` at a new or existing audit database instead",
+      );
+    return userVersion;
+  } catch (e) {
+    try {
+      db.close();
+    } catch {
+      // the refusal below is the primary error — a close failure on an already-broken
+      // handle must not mask it
+    }
+    throw e instanceof DbError
+      ? e
+      : new DbError(
+          `refusing to write to ${path}: the ownership check could not inspect it on the writable connection (${(e as Error).message})`,
+        );
+  }
 }
 
 // The narrowed READ surface returned by AuditDb.openReadOnly — the read commands (report,
@@ -890,36 +956,9 @@ export class AuditDb {
     // JSON.stringify / numeric sort comparators / csvCell's number branch — revisit those cast sites
     // first before ever enabling it.
     const db = new Database(path, { create: true, strict: true });
-    // busy_timeout FIRST — it is per-connection and must protect the very next statement
-    // (the WAL pragma takes a lock and would otherwise fail immediately under contention).
-    // journal_mode is persistent (in the file header) but re-asserting is harmless;
-    // foreign_keys is per-connection too. All three run OUTSIDE any transaction
-    // (journal_mode cannot change inside one).
-    db.exec("PRAGMA busy_timeout = 5000;");
-    db.exec("PRAGMA journal_mode = WAL;");
-    db.exec("PRAGMA foreign_keys = ON;");
-
-    const userVersion = readUserVersion(db);
-    if (userVersion > SCHEMA_VERSION) {
-      db.close();
-      fail(`database schema version ${userVersion} is newer than this tool's ${SCHEMA_VERSION} — upgrade the tool`);
-    }
-
-    // BACKSTOP only — assertOwnedDatabase already refused every foreign file it could prove, so
-    // this is normally unreachable. It re-runs the SAME ownedness test (empty, or foreign-free
-    // with an owned-shaped table set) on the WRITABLE connection, which reads THROUGH any recovered
-    // WAL — closing what the base-image preflight cannot see: a foreign checkpoint landing between
-    // the preflight and this open (the preflight's own wal-guard covers the on-disk case, but not
-    // that race). Reaching it costs sidecar recovery on their file and a checkpoint on close —
-    // data-preserving, and strictly better than the alternative of writing our schema into it.
-    // Fires BEFORE --fresh can drop anything.
-    if (!isOwnedOrEmpty(db)) {
-      db.close();
-      fail(
-        `refusing to write to ${path}: it is a SQLite database this tool did not create — ` +
-          "point `sqlitePath` at a new or existing audit database instead",
-      );
-    }
+    // PRAGMAs, version ceiling and the ownership BACKSTOP under one fail-closed discipline —
+    // see initWritableConnection (extracted so its failure contract is directly unit-testable).
+    const userVersion = initWritableConnection(db, path);
 
     if (opts.fresh === true) {
       // Count what --fresh erases INSIDE the drop transaction (a count taken outside could
