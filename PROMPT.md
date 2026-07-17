@@ -1371,7 +1371,9 @@ summary.
         "resolvedVersion":"1.2.4","resolvedVersionSource":"lockfile", // 'lockfile'|'range-resolved'|null
         "lockfile":{"path":"package-lock.json","lines":[451,452],
           "permalink":"https://{githubHost}/org-a/service-x/blob/abc123/package-lock.json#L451-L452"}}],
-      "apiUsage":[{"exportName":"foo","dependencyKey":"@myorg/my-package","usageType":"named-import","file":"src/index.ts","line":12,"permalink":"...","snippet":"import { foo } from '@myorg/my-package';"}],
+      "apiUsage":[{"exportName":"foo","dependencyKey":"@myorg/my-package","usageType":"named-import",
+                   "file":"src/index.ts","line":12,"permalink":"...",
+                   "snippet":"import { foo } from '@myorg/my-package';"}],
       "cliUsage":[{"file":"package.json","line":8,"context":"scripts.build","permalink":"...","snippet":"\"build\": \"my-package build\""}]
     }]
   }],

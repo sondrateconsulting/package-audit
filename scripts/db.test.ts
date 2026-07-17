@@ -2707,7 +2707,9 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
     // every later report/compare/default-export throw FOREVER for that run. Fail at write instead.
     // (compileBranchPolicy already rejects leading-'!' at config load; this guards the DIRECT door.)
     const db = fresh();
-    expect(() => seed(db, { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: "!release/**" })).toThrow(/names no causing pattern|'!'/);
+    // Pinned to the CHOKEPOINT's message specifically (not an alternation with the read gate's) so a
+    // future layer swap cannot let the wrong validator satisfy this write-path test.
+    expect(() => seed(db, { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: "!release/**" })).toThrow(/without the '!' config prefix/);
     db.close();
   });
 
