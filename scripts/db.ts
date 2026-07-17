@@ -1605,6 +1605,25 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
     if (!(k in h)) fail(`run_unit_head ${where}: ${k} is required (key omitted) — it must never default silently`);
     if (h[k] === undefined) fail(`run_unit_head ${where}: ${k} is required, got undefined — it must never default silently`);
   }
+  // RUNTIME types, mirroring the read gate (policyDisposition.ts::assertRunUnitHeadSound — keep the
+  // two in lockstep): the input type is erased at runtime and the table is not STRICT, so a caller
+  // bug passing a Uint8Array (or any non-string) would durably STORE a BLOB the read gate then
+  // refuses forever — and a BLOB runId is worse: run-scoped reads filter WHERE run_id = ?, so the
+  // row silently VANISHES from every report instead of throwing. Status/policy DOMAINS need no
+  // mirror here: their SQL CHECKs reject any non-member (including BLOBs) at INSERT.
+  for (const k of ["runId", "organization", "repository", "branch", "commitSha"] as const) {
+    if (typeof h[k] !== "string")
+      fail(`run_unit_head ${where}: ${k} must be a string at runtime (got ${typeof h[k]}) — a foreign type would be stored as a BLOB the read gate refuses`);
+  }
+  // (isDefaultBranch needs no mirror here: the tri-state domain check below already rejects every
+  // non-true/false/null value at this chokepoint, and G2b pins it.)
+  if (
+    (h.policyStatus !== null && typeof h.policyStatus !== "string") ||
+    (h.policyMatchedPattern !== null && typeof h.policyMatchedPattern !== "string") ||
+    (h.scannedCommitDate !== null && typeof h.scannedCommitDate !== "string")
+  ) {
+    fail(`run_unit_head ${where}: policy/date fields must be string or null at runtime — a foreign type would be stored as a BLOB the read gate refuses`);
+  }
   if (h.isDefaultBranch !== true && h.isDefaultBranch !== false && h.isDefaultBranch !== null)
     fail(`run_unit_head ${where}: is_default_branch must be true, false, or null (got ${JSON.stringify(h.isDefaultBranch)})`);
   // scanned_commit_date is REQUIRED on every fresh upsert (§4): the type enforces non-null, and this

@@ -2670,6 +2670,30 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
   };
 
   // ---- write-boundary guards (§3 mapping enforced at the single chokepoint) ----
+  test.each([
+    ["runId", { runId: new Uint8Array([120]) as unknown as string }],
+    ["organization", { organization: new Uint8Array([120]) as unknown as string }],
+    ["repository", { repository: new Uint8Array([120]) as unknown as string }],
+    ["branch", { branch: new Uint8Array([120]) as unknown as string }],
+    ["commitSha", { commitSha: new Uint8Array([120]) as unknown as string }],
+  ])("G0: a non-string %s is rejected at the WRITE chokepoint (a BLOB row would poison or vanish from every read)", (_k, over) => {
+    // Two reviewers independently proved the asymmetry by execution: the input type is erased at
+    // runtime and the table is not STRICT, so a caller bug passing a Uint8Array stored a BLOB the
+    // read gate then refused FOREVER (identity trio / commit_sha) — and a BLOB runId is worse:
+    // run-scoped reads filter WHERE run_id = ?, so the row silently vanishes instead of throwing.
+    const db = fresh();
+    expect(() => seed(db, over)).toThrow(/must be a string at runtime/);
+    db.close();
+  });
+
+  test("G0b: a BLOB policy field is rejected at the WRITE chokepoint (no raw TypeError, no laundering)", () => {
+    // (a non-boolean isDefaultBranch is already rejected by the tri-state domain check — G2b pins it)
+    const db = fresh();
+    // a Uint8Array pattern has .length (passes non-empty) but no .startsWith — previously a raw TypeError
+    expect(() => seed(db, { policyStatus: "excluded-by-deny", policyMatchedPattern: new Uint8Array([120]) as unknown as string, isDefaultBranch: true })).toThrow(/must be string or null at runtime/);
+    db.close();
+  });
+
   test("G1: excluded-by-deny with an empty or null pattern is rejected (the deny CHECK admits '')", () => {
     const db = fresh();
     expect(() => seed(db, { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: "" })).toThrow(/non-empty policy_matched_pattern/);

@@ -146,8 +146,8 @@ export function assertRunUnitHeadSound(r: PolicyDispositionRow, where: string): 
     throw new Error(`internal: run_unit_head ${where} is ${r.status}${r.policy_status !== null ? ` carrying policy_status=${JSON.stringify(r.policy_status)}` : ""} with a NULL scanned_commit_date — v4-native data cannot be a migrated row`);
   // policy_matched_pattern ↔ deny, both directions (the SQL CHECK covers neither the empty case nor
   // the converse). The write chokepoint (db.ts::assertRunUnitHeadInvariants) enforces the SAME
-  // null/empty/'!' predicate — keep the two in lockstep, or a writable build could durably store a
-  // row this gate then refuses forever.
+  // null/empty/'!' predicate AND the same runtime-type checks as this gate — keep the two in
+  // lockstep, or a writable build could durably store a row this gate then refuses forever.
   if (r.policy_status === "excluded-by-deny") {
     if (r.policy_matched_pattern === null || r.policy_matched_pattern.length === 0 || r.policy_matched_pattern.startsWith("!"))
       throw new Error(`internal: run_unit_head ${where} is excluded-by-deny but names no causing pattern (policy_matched_pattern=${JSON.stringify(r.policy_matched_pattern)})`);
