@@ -16,6 +16,7 @@ import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanS
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
 import { logLine } from "./log.ts";
 import { isPolicyExcluded, isDefaultOverride, assertRunUnitHeadSound, policyStatusOrThrow } from "./policyDisposition.ts";
+import { assertNever } from "./assertNever.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
 import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -277,9 +278,27 @@ function buildScanScope(allHeads: HeadRow[]): ScanScope {
       matchedPattern: h.policy_matched_pattern,
     }))
     .sort((a, b) => cmp(`${a.organization}\0${a.repository}\0${a.branch}`, `${b.organization}\0${b.repository}\0${b.branch}`));
+  // Deny/allow sub-counts via an EXHAUSTIVE switch over the NARROWED policy_status, never a raw-string
+  // `=== "excluded-by-deny"` compare. The day PolicyStatus gains a member, a policy-excluded row carrying
+  // it would silently count in branchesExcludedByPolicy (buildSummary) yet in NEITHER sub-count, breaking
+  // the excludedByDeny+excludedByAllow == branchesExcludedByPolicy identity with no error — the compile-time
+  // analog of the run path's planPolicyDiagnostics sum-check. assertNever makes that day a BUILD error.
+  // policyStatusOrThrow narrows only the literal; the whole-row soundness gate already ran (validatedHeads
+  // upstream), so every isPolicyExcluded row here is validated and its policy_status is a known member.
+  let excludedByDeny = 0;
+  let excludedByAllow = 0;
+  for (const h of allHeads) {
+    if (!isPolicyExcluded(h)) continue;
+    const status = policyStatusOrThrow(h, `${h.organization}/${h.repository}@${h.branch}`);
+    switch (status) {
+      case "excluded-by-deny": excludedByDeny++; break;
+      case "excluded-by-allow": excludedByAllow++; break;
+      default: assertNever(status, "policy status");
+    }
+  }
   return {
-    excludedByDeny: allHeads.filter((h) => isPolicyExcluded(h) && h.policy_status === "excluded-by-deny").length,
-    excludedByAllow: allHeads.filter((h) => isPolicyExcluded(h) && h.policy_status === "excluded-by-allow").length,
+    excludedByDeny,
+    excludedByAllow,
     defaultBranchPolicyOverrides: allHeads.filter(isDefaultOverride).length,
     policyBranches,
     // Provenance is trustworthy ONLY for a v4-native run with at least one recorded head. A migrated
