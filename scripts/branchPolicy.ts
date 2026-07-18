@@ -133,6 +133,29 @@ function safeMatch(p: CompiledPattern, listKind: PolicyListKind, name: string): 
   }
 }
 
+// Write-time attribution verifier (db.ts's chokepoint): does a STORED deny pattern actually match
+// the branch it claims to have excluded? Exact equality first — mirroring matchWinner's pass-1 —
+// so a metacharacter-hostile spelling that names the branch LITERALLY verifies without invoking
+// the glob engine at all; then the same safeMatch every live decision used (fail-closed: an engine
+// throw is a PolicyMatchError, never false). The name carries the contract: this is DENY-ONLY — only
+// deny verdicts persist a causing pattern, so listKind is always "excludeBranches" here. Lives in THIS
+// module so safeMatch stays the sole .match() caller.
+export function denyPatternMatchesBranch(pattern: string, branch: string): boolean {
+  if (pattern === branch) return true;
+  // A CONSTRUCTION throw is fail-closed too — same class as safeMatch's match-time catch, mirroring
+  // compileList's guard — so a foreign/hand-edited row carrying a pattern Bun.Glob rejects surfaces
+  // as the FATAL PolicyMatchError, never a raw error the per-unit catch would downgrade to a soft
+  // scan error. (No pattern is known to throw at construction on the exercised Bun versions; this
+  // keeps the chokepoint's guard total rather than trusting that to stay true.)
+  let glob: Bun.Glob;
+  try {
+    glob = new Bun.Glob(pattern);
+  } catch (cause) {
+    throw new PolicyMatchError("excludeBranches", pattern, branch, cause);
+  }
+  return safeMatch({ pattern, glob }, "excludeBranches", branch);
+}
+
 // Highest-precedence match in a canonical list: exact string equality across the WHOLE list first
 // (no glob invoked — so an exact literal beats a glob that sorts earlier, e.g. "main" beats "*"),
 // then the FIRST canonical-order glob that matches. null if none.

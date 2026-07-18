@@ -17,6 +17,7 @@ import { dirname, resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { logLine } from "./log.ts";
 import { isIsoInstant } from "./isoDate.ts";
+import { PolicyMatchError, denyPatternMatchesBranch } from "./branchPolicy.ts"; // leaf import: write-time attribution coherence
 
 export class DbError extends Error {
   constructor(message: string) {
@@ -497,9 +498,12 @@ const RUN_UNIT_HEAD_V3_BODY = `
   PRIMARY KEY (run_id, organization, repository, branch)
 `;
 const referenceShapesByVersion = new Map<number, Map<string, string>>();
-function tableShapesAt(version: number): Map<string, string> {
+// Returns a COPY (never the memoized instance): referenceShapesByVersion is the ownership oracle
+// hasOwnedTableSet reads, and this is exported for tests — handing out the live Map would let a caller
+// mutate the oracle for the rest of the process. ReadonlyMap so read-only intent is also compiler-checked.
+export function tableShapesAt(version: number): ReadonlyMap<string, string> {
   const cached = referenceShapesByVersion.get(version);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return new Map(cached);
   const ref = new Database(":memory:", { strict: true });
   try {
     ref.exec(SCHEMA_SQL); // the CURRENT (v4) schema
@@ -510,7 +514,7 @@ function tableShapesAt(version: number): Map<string, string> {
     }
     const shapes = new Map(AUDIT_TABLES.map((t) => [t, tableShape(ref, t)]));
     referenceShapesByVersion.set(version, shapes);
-    return shapes;
+    return new Map(shapes);
   } finally {
     ref.close();
   }
@@ -527,11 +531,12 @@ function tableShapesAt(version: number): Map<string, string> {
 // table matching every column tuple but missing our FK/UNIQUE/AUTOINCREMENT semantics would
 // compare equal. Index/FK signatures deliberately drop declaration-order artifacts (autoindex
 // numbering, the fk id itself) while KEEPING per-constraint grouping and in-constraint column
-// order, sorted across constraints. Still not FULL DDL equality: CHECK constraint bodies,
-// collations, ON CONFLICT clauses, FK deferrability and FK MATCH clauses stay invisible (all live only in SQL
-// text, whose exact matching would be brittle against legitimate ALTER-rewritten histories) —
-// the residual false-positive is a table matching columns AND constraint structure exactly,
-// differing only in those. (PRAGMA cannot bind — `table` is validated against
+// order, sorted across constraints. CHECK constraint bodies and the pragma-invisible tokens
+// (collations, STRICT, ON CONFLICT, FK deferrability, FK MATCH) ALSO count now — they join the
+// fingerprint below via extractChecks + sqlHasBareToken over the stored CREATE text, so a sibling
+// differing only in a CHECK body or one of those clauses no longer compares equal. The residual
+// false-positive is now only a table matching columns, constraint structure, CHECK multiset AND
+// token-freedom exactly (an exact clone). (PRAGMA cannot bind — `table` is validated against
 // AUDIT_TABLE_SET, same contract as columnExists. Index names come from index_list's own
 // output over those fixed audit table names, and an autoindex name embeds its table's name —
 // so the names reaching index_xinfo contain no quote characters; they are interpolated with
@@ -608,7 +613,21 @@ function tableShape(db: Database, table: string): string {
     .replace(/`[^`]*`/g, "``")
     .replace(/\[[^\]]*\]/g, "[]");
   const autoinc = /\bautoincrement\b/i.test(ddl) ? 1 : 0;
-  return JSON.stringify({ wr: meta?.wr ?? 0, strict: meta?.strict ?? 0, autoinc, cols: colSig, fks: fkSig, idx: idxSig });
+  // CHECK bodies + the pragma-invisible tokens join the fingerprint (review-reproduced: a sibling
+  // `runs` whose status CHECK also admitted 'archived' — columns OURS exactly — was ADOPTED and
+  // --fresh dropped its rows; a COLLATE NOCASE column on a cache table survived every structural
+  // pragma). Both sides of the ownership comparison run THIS code — era reference schemas vs the
+  // disk file — so the expected CHECK multisets stay era-coupled with no hand-maintained per-table
+  // constants, and the independent control test pins the reference counts plus a literal body so
+  // the oracle cannot go circular. Every reference era is token-FREE (control-pinned), so plain
+  // equality forces the disk side token-free too; the token list is presence-of-any, never treated
+  // as sufficient identity on its own. extractChecks output is already normalizeCheck'd; sorted so
+  // declaration order can never matter (SQLite cannot ALTER-add a table CHECK, but sorting costs
+  // nothing and guards a future rebuild that reorders).
+  const rawSql = sqlRow?.sql ?? "";
+  const checks = extractChecks(rawSql).slice().sort();
+  const tokens = ["collate", "strict", "conflict", "deferrable", "match"].filter((t) => sqlHasBareToken(rawSql, t));
+  return JSON.stringify({ wr: meta?.wr ?? 0, strict: meta?.strict ?? 0, autoinc, cols: colSig, fks: fkSig, idx: idxSig, checks, tokens });
 }
 
 // The ownership question for a NON-EMPTY database: is every table present one of OURS, in a
@@ -645,9 +664,9 @@ function tableShape(db: Database, table: string): string {
 // rejected by the compatibility gate on both opens (see assertOpenCompatible gate b). What a
 // subset can never do is carry a non-audit shape. A real database of ours matches by
 // construction: creates, migrations and self-heals all run the same SCHEMA_SQL the
-// references derive from. (Shape is still not FULL DDL equality — CHECK bodies, collations,
-// ON CONFLICT clauses, FK deferrability and FK MATCH clauses are invisible, though FKs, PK/UNIQUE structure and
-// AUTOINCREMENT do count — see tableShape. hasForeignObjects separately rejects every
+// references derive from. (Shape now includes CHECK bodies and the pragma-invisible tokens —
+// collations, STRICT, ON CONFLICT, FK deferrability, FK MATCH — alongside FKs, PK/UNIQUE structure
+// and AUTOINCREMENT; see tableShape. hasForeignObjects separately rejects every
 // non-table object kind and every non-audit table name, so what remains adoptable is exactly:
 // audit-named tables in owned shapes under an owned stamp.)
 function hasOwnedTableSet(db: Database): boolean {
@@ -657,7 +676,7 @@ function hasOwnedTableSet(db: Database): boolean {
   if (present.length === 0) return false; // zero tables is the empty branch's case, never ours
   const uv = readUserVersion(db);
   if (uv < MIN_OWNED_VERSION || uv > SCHEMA_VERSION) return false;
-  const eras: Array<Map<string, string>> = [];
+  const eras: Array<ReadonlyMap<string, string>> = [];
   for (let v = MIN_OWNED_VERSION; v <= SCHEMA_VERSION; v++) eras.push(tableShapesAt(v));
   return present.every((t) => {
     if (!AUDIT_TABLE_SET.has(t)) return false;
@@ -1094,7 +1113,7 @@ function skipQuoted(sql: string, i: number): number {
 // Normalize a CHECK expression for set comparison: lowercase the UNQUOTED tokens and drop comments,
 // but preserve single-quoted string LITERALS (and quoted identifiers) verbatim — their case is
 // significant to SQLite's default BINARY comparison ('SCANNED' is a different value than 'scanned').
-function normalizeCheck(expr: string): string {
+export function normalizeCheck(expr: string): string {
   let out = "";
   let i = 0;
   const n = expr.length;
@@ -1652,6 +1671,22 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   if (h.policyStatus === "excluded-by-deny") {
     if (h.policyMatchedPattern === null || h.policyMatchedPattern.length === 0 || h.policyMatchedPattern.startsWith("!"))
       fail(`run_unit_head ${where}: excluded-by-deny requires a non-empty policy_matched_pattern without the '!' config prefix (got ${JSON.stringify(h.policyMatchedPattern)})`);
+    // SEMANTIC coherence, not just shape (external consult, option A): the stored pattern must
+    // actually MATCH the branch it claims to have excluded — and the scanned default-override's
+    // counterfactual pattern must match the default's name the same way. Verified HERE because
+    // write time is the only point where the matcher, the branch name, and the attribution
+    // coexist; the read gate stays deliberately glob-free (re-evaluating history under a NEWER
+    // Bun could refuse rows that were true when written — rows written before this verifier are
+    // legacy-unattested, readable, never re-matched). A mismatch throws PolicyMatchError — the
+    // FATAL class the run driver fails the whole run on — never DbError, which the per-unit
+    // catch would downgrade to an ordinary scan error.
+    if (!denyPatternMatchesBranch(h.policyMatchedPattern, h.branch))
+      throw new PolicyMatchError(
+        "excludeBranches",
+        h.policyMatchedPattern,
+        h.branch,
+        new Error("stored policy_matched_pattern does not match the branch it claims to have excluded (write-time attribution incoherence)"),
+      );
   } else if (h.policyMatchedPattern !== null) {
     fail(`run_unit_head ${where}: policy_matched_pattern must be null unless excluded-by-deny (policy_status=${h.policyStatus ?? "null"})`);
   }
@@ -1903,9 +1938,11 @@ export class AuditDb {
       // the known runs.outcome sibling marker, an inbound FK into run_unit_head, or run_unit_head
       // missing beside runs — or one missing an audit table must fail HERE with an actionable
       // message, not later with a raw "no such table"/"no such column" mid-query. Ownership was
-      // already re-proven above (isOwnedOrEmpty — shape-level, so most foreign/sibling files are
-      // refused there as "did not create"); what remains for THIS discriminator is the class
-      // ownership's tableShape cannot see (CHECK-body variants) plus the cross-table invariants.
+      // already re-proven above (isOwnedOrEmpty — shape-level, and since the whole-DB identity work
+      // its tableShape fingerprints CHECK bodies + the five tokens too, so most foreign/sibling files
+      // are refused there as "did not create"); THIS discriminator is now defense-in-depth for the
+      // run_unit_head shape plus the cross-table invariants it alone owns (the runs.outcome sibling
+      // marker, an inbound FK into run_unit_head, run_unit_head missing beside runs).
       // openReadOnly cannot migrate, so it DISTINGUISHES an INCOMPATIBLE database (a
       // different-build v4 — use the matching build or a new db path) from a merely
       // under-repaired one (run `bun run audit` once). The stamp is == SCHEMA_VERSION here (both

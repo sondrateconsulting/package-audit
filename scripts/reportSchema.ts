@@ -181,7 +181,7 @@ export const policyBranchSchema = z.strictObject({
   branch: z.string(),
   disposition: z.enum(["excluded", "scanned-default-override"]),
   policyStatus: z.enum(["excluded-by-deny", "excluded-by-allow"]),
-  matchedPattern: z.string().nullable().describe("The causing deny pattern; null for an allow-miss / default-override-by-allow"),
+  matchedPattern: z.string().nullable().describe("The stored deny-attribution pattern; null for an allow-miss / default-override-by-allow. Writes verify it matches the branch; the read gate does NOT re-match it — report/compare and JSONL export surface the stored value on otherwise-sound pre-verifier or externally-edited rows (the default CSV export still applies its formula-injection defense; malformed rows still fail the read gate on shape), so it is not read-time attested"),
 });
 export const scanScopeSchema = z
   .strictObject({

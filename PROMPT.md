@@ -1371,7 +1371,9 @@ summary.
         "resolvedVersion":"1.2.4","resolvedVersionSource":"lockfile", // 'lockfile'|'range-resolved'|null
         "lockfile":{"path":"package-lock.json","lines":[451,452],
           "permalink":"https://{githubHost}/org-a/service-x/blob/abc123/package-lock.json#L451-L452"}}],
-      "apiUsage":[{"exportName":"foo","dependencyKey":"@myorg/my-package","usageType":"named-import","file":"src/index.ts","line":12,"permalink":"...","snippet":"import { foo } from '@myorg/my-package';"}],
+      "apiUsage":[{"exportName":"foo","dependencyKey":"@myorg/my-package","usageType":"named-import",
+                   "file":"src/index.ts","line":12,"permalink":"...",
+                   "snippet":"import { foo } from '@myorg/my-package';"}],
       "cliUsage":[{"file":"package.json","line":8,"context":"scripts.build","permalink":"...","snippet":"\"build\": \"my-package build\""}]
     }]
   }],
@@ -1419,10 +1421,11 @@ scanned, so it can never be an exclusion) and a scanned policy-bearing row must 
 known default — `policy_matched_pattern` must be a REAL deny pattern (non-empty, never on
 a non-deny), `commit_sha` must agree with `status` (only a scanned row pins one — the
 findings join's soundness), and unknown status/policy tokens are refused outright. These
-rules are read-time only, and the default⇒scanned direction is scoped to NATIVE rows
-(non-NULL scanned_commit_date): a SQL CHECK a real pre-v4 row might violate would fail an
-UPGRADE to defend against a forged row — the wrong trade; a read-time refusal costs one
-report. `repositoriesScanned` =
+rules are re-asserted at read time (the write chokepoint enforces the same shape — the two
+are kept in lockstep), and the default⇒scanned direction is scoped to NATIVE rows
+(non-NULL scanned_commit_date) at the read gate: a SQL CHECK a real pre-v4 row might violate
+would fail an UPGRADE to defend against a forged row — the wrong trade; a read-time refusal
+costs one report. `repositoriesScanned` =
 COUNT(DISTINCT organization||'/'||repository) and `organizationsScanned` =
 COUNT(DISTINCT organization) — both over run_id=R AND status='scanned' rows (matching
 branchesScanned semantics; a repo/org whose every branch was cutoff-skipped is NOT

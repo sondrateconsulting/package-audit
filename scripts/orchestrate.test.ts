@@ -652,6 +652,42 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("a PolicyMatchError from INSIDE processUnit's scanned upsert is RETHROWN, never downgraded to a soft per-unit error", async () => {
+    // The existing propagation tests force the throw from the PLANNER, BEFORE processRepo's per-unit
+    // try/catch. The write-time attribution verifier can instead throw PolicyMatchError from
+    // db.upsertRunUnitHead INSIDE processUnit — the exact path processRepo's `if (e instanceof
+    // PolicyMatchError) throw e` (checked first in the per-unit catch, before the throttle/else arms)
+    // guards. A coherent planner never writes a
+    // mismatch, so inject it at the write boundary: wrap the SCANNED upsert to throw the fatal error.
+    // No pre-seeded work-queue rows → the only scanned upsert is processUnit's (inside the catch), never
+    // the skip-current write that sits outside it. RED without that branch: the generic arm swallows the
+    // error (insertError + status:'error') and processRepo RESOLVES, failing both assertions below.
+    const root = mkdtempSync(join(tmpdir(), "policy-inside-throw-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const injected = new PolicyMatchError("excludeBranches", "x*", "main", new Error("simulated write-time attribution incoherence inside processUnit"));
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+      if (h.status === "scanned") throw injected; // processUnit's scanned write; delegate every other row
+      return realUpsert(h);
+    };
+    const client = scanClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }], "main");
+    let thrown: unknown;
+    await captureJsonl(async () => {
+      try {
+        await processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set());
+      } catch (e) {
+        thrown = e;
+      }
+    });
+    expect(thrown).toBe(injected); // the EXACT object, rethrown unchanged — not re-wrapped, not swallowed
+    // a downgrade would have written a scope='scan' error row and flipped the unit to 'error'; neither may happen
+    expect((db.read(`SELECT COUNT(*) AS n FROM errors WHERE run_id = ? AND scope = 'scan'`).get(runId) as { n: number }).n).toBe(0);
+    expect(db.getUnit(key("main"))?.status).not.toBe("error");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("runScan marks the run FAILED on a PolicyMatchError and rethrows the original", async () => {
     const root = mkdtempSync(join(tmpdir(), "policy-failrun-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });

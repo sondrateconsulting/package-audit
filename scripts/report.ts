@@ -249,6 +249,10 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
 // case lives in policyDisposition.ts (the ONE definition) so this surface and compare's policy churn
 // cannot drift apart on what an unrecognised policy-bearing row means.
 function dispositionOf(h: HeadRow): "scanned-default-override" | "excluded" {
+  // Deliberately re-runs the gate even though buildReportInner's assertHeadsWellFormed already swept
+  // every head: this function LABELS a row, and the label must never outlive a refactor that changes
+  // which caller reaches it first. The gate is cheap, idempotent, and this is the defense-in-depth
+  // layer review chose to keep rather than trust call-order.
   assertRunUnitHeadSound(h, `${h.organization}/${h.repository}@${h.branch}`);
   return isDefaultOverride(h) ? "scanned-default-override" : "excluded";
 }

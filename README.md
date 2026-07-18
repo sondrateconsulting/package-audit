@@ -41,7 +41,7 @@ The finished run writes `output/run-<run_id>.json` and `output/latest.json`. A l
 
 ### Run comparison (`compare`)
 
-`bun run compare <runA> <runB>` prints a deterministic run-diff as one JSON line: usage sites added and removed per export, repos entering and leaving — headline counts scoped to default branches when attribution is known (otherwise all branches, with an explicit note), plus all-branch detail, and a branch-policy churn dimension — branches that entered or left policy exclusion between the two runs, exclusions reclassified (deny/allow flipped or the causing pattern changed), and default-branch override changes — reported as unavailable (with the reason) when either run predates the policy-provenance schema or recorded no heads. Note: `--fresh` erases run history, so runs from before a `--fresh` cannot be compared; keep the data directory if you want trends.
+`bun run compare <runA> <runB>` prints a deterministic run-diff as one JSON line: usage sites added and removed per export, repos entering and leaving — headline counts scoped to default branches when attribution is known (otherwise all branches, with an explicit note), plus all-branch detail, and a branch-policy churn dimension — branches that entered or left policy exclusion between the two runs, exclusions reclassified (deny/allow flipped or the stored matched pattern changed), and default-branch override changes — reported as unavailable (with the reason) when either run predates the policy-provenance schema or recorded no heads. Note: `--fresh` erases run history, so runs from before a `--fresh` cannot be compared; keep the data directory if you want trends.
 
 ## Prerequisites
 
@@ -103,7 +103,9 @@ GROUP BY resolved_version
 ORDER BY declarations DESC, resolved_version;
 ```
 
-Branches excluded by branch policy, by disposition and causing pattern:
+Branches excluded by branch policy, by disposition and matched pattern (grouped on the CSV-exported
+value — a formula-shaped `policy_matched_pattern` is apostrophe-prefixed there; use the JSONL export
+for the byte-faithful value):
 
 ```sql
 SELECT policy_status, policy_matched_pattern, COUNT(*) AS branches

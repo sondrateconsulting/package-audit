@@ -331,7 +331,7 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     const D = "2025-06-01T12:00:00Z";
     const base = { runId, organization: "org-a", repository: "svc", scannedCommitDate: D };
     // deny-excluded with a formula-shaped pattern (branch sorts first)
-    db.upsertRunUnitHead({ ...base, branch: "feature-x", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "=cmd|calc" });
+    db.upsertRunUnitHead({ ...base, branch: "=cmd|calc", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "=cmd|calc" });
     // scanned default (policy-clean)
     db.upsertRunUnitHead({ ...base, branch: "main", commitSha: "aaa111", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null });
     // allow-list miss (pattern is NULL → empty CSV / JSON null)
@@ -354,14 +354,17 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     const id = run.runId;
     const D = "2025-06-01T12:00:00Z";
     const header = "run_id,organization,repository,branch,commit_sha,status,is_default_branch,policy_status,policy_matched_pattern,scanned_commit_date";
-    // rows in ORDER BY (run_id, organization, repository, branch); '=cmd|calc' → literal apostrophe
-    // prefix (formula defense); is_default_branch is a typed number (never prefixed); NULLs are empty.
+    // rows in ORDER BY (run_id, organization, repository, branch); the deny branch is NAMED
+    // '=cmd|calc' so its stored pattern (exact-first write-time verification) is the same
+    // formula-looking value → BOTH cells get the literal apostrophe prefix (formula defense), and
+    // '=' sorts before every letter so the row is FIRST; is_default_branch is a typed number
+    // (never prefixed); NULLs are empty.
+    const feature = `${id},org-a,svc,'=cmd|calc,,policy-excluded,0,excluded-by-deny,'=cmd|calc,${D}`;
     const ancient = `${id},org-a,svc,ancient,,skipped-cutoff,0,,,${D}`; // the GENUINE cutoff skip
-    const feature = `${id},org-a,svc,feature-x,,policy-excluded,0,excluded-by-deny,'=cmd|calc,${D}`;
     const main = `${id},org-a,svc,main,aaa111,scanned,1,,,${D}`;
     const stale = `${id},org-a,svc,stale,,policy-excluded,0,excluded-by-allow,,${D}`;
     const wip = `${id},org-a,svc,wip,,past-cap,0,,,${D}`;
-    expect(readXray(out, "run_unit_head.csv")).toBe([header, ancient, feature, main, stale, wip].join("\r\n") + "\r\n");
+    expect(readXray(out, "run_unit_head.csv")).toBe([header, feature, ancient, main, stale, wip].join("\r\n") + "\r\n");
     db.close();
   });
 
@@ -373,17 +376,17 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     const content = readXray(out, "run_unit_head.jsonl");
     const lines = content.split("\n").filter((l) => l.length > 0);
     expect(lines).toHaveLength(5);
-    // exact feature-x line (2nd by branch order): keys in registry order, is_default_branch a JSON
-    // number, pattern byte-faithful. The 1st line is the genuine cutoff skip, asserted below.
-    expect(lines[1]).toBe(
+    // exact deny line (1st by branch order — '=' sorts before letters): keys in registry order,
+    // is_default_branch a JSON number, branch AND pattern byte-faithful (no defense apostrophe).
+    expect(lines[0]).toBe(
       JSON.stringify({
-        run_id: run.runId, organization: "org-a", repository: "svc", branch: "feature-x",
+        run_id: run.runId, organization: "org-a", repository: "svc", branch: "=cmd|calc",
         commit_sha: "", status: "policy-excluded", is_default_branch: 0,
         policy_status: "excluded-by-deny", policy_matched_pattern: "=cmd|calc", scanned_commit_date: "2025-06-01T12:00:00Z",
       }),
     );
     // The GENUINE cutoff skip: same NULL policy columns as a scanned row, distinguished by status alone.
-    expect(lines[0]).toBe(
+    expect(lines[1]).toBe(
       JSON.stringify({
         run_id: run.runId, organization: "org-a", repository: "svc", branch: "ancient",
         commit_sha: "", status: "skipped-cutoff", is_default_branch: 0,
