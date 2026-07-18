@@ -17,7 +17,7 @@ import { dirname, resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { logLine } from "./log.ts";
 import { isIsoInstant } from "./isoDate.ts";
-import { PolicyMatchError, patternMatchesBranch } from "./branchPolicy.ts"; // leaf import: write-time attribution coherence
+import { PolicyMatchError, denyPatternMatchesBranch } from "./branchPolicy.ts"; // leaf import: write-time attribution coherence
 
 export class DbError extends Error {
   constructor(message: string) {
@@ -498,9 +498,12 @@ const RUN_UNIT_HEAD_V3_BODY = `
   PRIMARY KEY (run_id, organization, repository, branch)
 `;
 const referenceShapesByVersion = new Map<number, Map<string, string>>();
-export function tableShapesAt(version: number): Map<string, string> {
+// Returns a COPY (never the memoized instance): referenceShapesByVersion is the ownership oracle
+// hasOwnedTableSet reads, and this is exported for tests — handing out the live Map would let a caller
+// mutate the oracle for the rest of the process. ReadonlyMap so read-only intent is also compiler-checked.
+export function tableShapesAt(version: number): ReadonlyMap<string, string> {
   const cached = referenceShapesByVersion.get(version);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return new Map(cached);
   const ref = new Database(":memory:", { strict: true });
   try {
     ref.exec(SCHEMA_SQL); // the CURRENT (v4) schema
@@ -511,7 +514,7 @@ export function tableShapesAt(version: number): Map<string, string> {
     }
     const shapes = new Map(AUDIT_TABLES.map((t) => [t, tableShape(ref, t)]));
     referenceShapesByVersion.set(version, shapes);
-    return shapes;
+    return new Map(shapes);
   } finally {
     ref.close();
   }
@@ -673,7 +676,7 @@ function hasOwnedTableSet(db: Database): boolean {
   if (present.length === 0) return false; // zero tables is the empty branch's case, never ours
   const uv = readUserVersion(db);
   if (uv < MIN_OWNED_VERSION || uv > SCHEMA_VERSION) return false;
-  const eras: Array<Map<string, string>> = [];
+  const eras: Array<ReadonlyMap<string, string>> = [];
   for (let v = MIN_OWNED_VERSION; v <= SCHEMA_VERSION; v++) eras.push(tableShapesAt(v));
   return present.every((t) => {
     if (!AUDIT_TABLE_SET.has(t)) return false;
@@ -1677,7 +1680,7 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
     // legacy-unattested, readable, never re-matched). A mismatch throws PolicyMatchError — the
     // FATAL class the run driver fails the whole run on — never DbError, which the per-unit
     // catch would downgrade to an ordinary scan error.
-    if (!patternMatchesBranch(h.policyMatchedPattern, h.branch))
+    if (!denyPatternMatchesBranch(h.policyMatchedPattern, h.branch))
       throw new PolicyMatchError(
         "excludeBranches",
         h.policyMatchedPattern,

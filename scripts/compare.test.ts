@@ -1,6 +1,6 @@
 import { expect, test, describe, afterAll, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso, type RunRecord, type UnitHeadStatus, type UsageType } from "./db.ts";
@@ -9,6 +9,8 @@ import {
   main, parseCompareArgs, runCompare, type CompareEnvelope,
 } from "./compare.ts";
 import { ArgsError } from "./args.ts";
+import { buildReport } from "./report.ts";
+import { exportRun } from "./export.ts";
 import type { Config } from "./config.ts";
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
@@ -428,6 +430,60 @@ describe("buildCompare — policy churn", () => {
     expect(() => buildCompare(db2, db2.getRun(runAId)!, db2.getRun(runBId)!)).toThrow(
       /outside the known domain/,
     );
+    db2.close();
+  });
+
+  test("read gate stays glob-free: a legacy deny row whose pattern does NOT match its branch is read VERBATIM by report, export, AND compare (never re-validated)", () => {
+    // The write chokepoint (assertRunUnitHeadInvariants → denyPatternMatchesBranch) rejects an
+    // excluded-by-deny row whose stored pattern does not match its branch. The read surfaces
+    // DELIBERATELY do not re-run that glob check — Bun.Glob semantics are version-sensitive, so
+    // re-evaluating history under a newer engine could refuse rows that were true when written
+    // (policyDisposition.ts's "ONE deliberate exception"; the write-time-only trust boundary). So a
+    // pre-verifier / raw-SQL / foreign row with an incoherent attribution must stay READABLE and be
+    // surfaced verbatim, never throw. This pins that contract on all three read surfaces at once
+    // (previously exercised only incidentally). Raw-inserted to bypass the chokepoint; the row is
+    // otherwise fully valid — every SQLite CHECK holds. "release/*" does NOT match "legacy".
+    const path = nextFile();
+    const db = AuditDb.open({ sqlitePath: path });
+    const runA = startCompleted(db, ["expo"]);
+    const runB = startCompleted(db, ["expo"]);
+    phead(db, runA.runId, "main", { isDefaultBranch: true });
+    phead(db, runB.runId, "main", { isDefaultBranch: true });
+    phead(db, runA.runId, "legacy", { isDefaultBranch: false }); // clean-scanned in A → ENTERS exclusion in B
+    const [runAId, runBId] = [runA.runId, runB.runId];
+    db.close();
+    const forge = new Database(path, { strict: true }); // raw INSERT bypasses the write chokepoint (every SQLite CHECK still holds)
+    forge
+      .query(
+        `INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date)
+         VALUES (?, 'org-a', 'svc', 'legacy', '', 'policy-excluded', 0, 'excluded-by-deny', 'release/*', '2025-06-01T00:00:00Z')`,
+      )
+      .run(runBId);
+    forge.close();
+    const db2 = AuditDb.open({ sqlitePath: path });
+    const rB = db2.getRun(runBId)!;
+
+    // (1) report surfaces the incoherent attribution verbatim — no re-match, no throw
+    const legacyInReport = buildReport(db2, rB).scanScope.policyBranches.find((b) => b.branch === "legacy");
+    expect(legacyInReport).toEqual({
+      organization: "org-a", repository: "svc", branch: "legacy",
+      disposition: "excluded", policyStatus: "excluded-by-deny", matchedPattern: "release/*",
+    });
+
+    // (2) the default export writes it byte-faithful
+    const out = mkdtempSync(join(tmpdir(), "readgate-export-"));
+    exportRun(db2, rB, out, { raw: false });
+    const legacyLine = readFileSync(join(out, "xray", "run_unit_head.jsonl"), "utf8")
+      .split("\n").filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as { branch: string; policy_matched_pattern: string })
+      .find((r) => r.branch === "legacy");
+    expect(legacyLine?.policy_matched_pattern).toBe("release/*");
+    rmSync(out, { recursive: true, force: true });
+
+    // (3) compare files it under enteredExclusion carrying the incoherent pattern verbatim — no re-validation, no throw
+    const churn = buildCompare(db2, db2.getRun(runAId)!, rB).compare.policyChurn;
+    if (churn.available !== true) throw new Error("expected churn available");
+    expect(churn.enteredExclusion.find((e) => e.branch === "legacy")?.runB.policyMatchedPattern).toBe("release/*");
     db2.close();
   });
 

@@ -137,9 +137,10 @@ function safeMatch(p: CompiledPattern, listKind: PolicyListKind, name: string): 
 // the branch it claims to have excluded? Exact equality first — mirroring matchWinner's pass-1 —
 // so a metacharacter-hostile spelling that names the branch LITERALLY verifies without invoking
 // the glob engine at all; then the same safeMatch every live decision used (fail-closed: an engine
-// throw is a PolicyMatchError, never false). listKind is always "excludeBranches" here — only deny
-// verdicts persist a causing pattern. Lives in THIS module so safeMatch stays the sole .match() caller.
-export function patternMatchesBranch(pattern: string, branch: string): boolean {
+// throw is a PolicyMatchError, never false). The name carries the contract: this is DENY-ONLY — only
+// deny verdicts persist a causing pattern, so listKind is always "excludeBranches" here. Lives in THIS
+// module so safeMatch stays the sole .match() caller.
+export function denyPatternMatchesBranch(pattern: string, branch: string): boolean {
   if (pattern === branch) return true;
   // A CONSTRUCTION throw is fail-closed too — same class as safeMatch's match-time catch, mirroring
   // compileList's guard — so a foreign/hand-edited row carrying a pattern Bun.Glob rejects surfaces

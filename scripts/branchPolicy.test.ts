@@ -1,7 +1,7 @@
 import { expect, test, describe } from "bun:test";
 import {
   compileBranchPolicy, BranchPolicyError, PolicyMatchError, evaluateBranchPolicy, classifyBranch,
-  isBranchPolicyEligible, coverageForName, patternMatchesBranch, type CompiledPattern, type CompiledBranchPolicy,
+  isBranchPolicyEligible, coverageForName, denyPatternMatchesBranch, type CompiledPattern, type CompiledBranchPolicy,
 } from "./branchPolicy.ts";
 
 const names = (list: readonly CompiledPattern[] | null): string[] | null =>
@@ -197,19 +197,19 @@ describe("fail-closed matching — a match-time throw is FATAL, never false", ()
   });
 });
 
-describe("patternMatchesBranch — write-time attribution verifier (db.ts chokepoint)", () => {
+describe("denyPatternMatchesBranch — write-time attribution verifier (db.ts chokepoint)", () => {
   test("exact-first short-circuits before the glob engine — a metacharacter-hostile literal name verifies", () => {
     // "[" matches NOTHING as a glob on the pinned Bun, so only the exact-equality pass can accept it.
-    expect(patternMatchesBranch("[", "[")).toBe(true);
-    expect(patternMatchesBranch("=cmd|calc", "=cmd|calc")).toBe(true);
+    expect(denyPatternMatchesBranch("[", "[")).toBe(true);
+    expect(denyPatternMatchesBranch("=cmd|calc", "=cmd|calc")).toBe(true);
   });
   test("a real glob match returns true; a genuine mismatch returns false (never throws for a well-formed glob)", () => {
-    expect(patternMatchesBranch("release/*", "release/9")).toBe(true);
-    expect(patternMatchesBranch("release/*", "main")).toBe(false);
+    expect(denyPatternMatchesBranch("release/*", "release/9")).toBe(true);
+    expect(denyPatternMatchesBranch("release/*", "main")).toBe(false);
   });
   test("a CONSTRUCTION throw becomes the FATAL PolicyMatchError, never a raw error (fail-closed, guard completeness)", () => {
     // No pattern is known to throw at Bun.Glob CONSTRUCTION on the exercised Bun versions, so force
-    // it deterministically. RED before the guard was added: the raw error escaped patternMatchesBranch
+    // it deterministically. RED before the guard was added: the raw error escaped denyPatternMatchesBranch
     // and the per-unit catch would have downgraded it to a soft scan error instead of failing the run.
     const original = Bun.Glob;
     try {
@@ -220,7 +220,7 @@ describe("patternMatchesBranch — write-time attribution verifier (db.ts chokep
       };
       let caught: unknown;
       try {
-        patternMatchesBranch("dep*", "x"); // pattern !== branch, so construction is reached
+        denyPatternMatchesBranch("dep*", "x"); // pattern !== branch, so construction is reached
       } catch (e) {
         caught = e;
       }
@@ -232,7 +232,7 @@ describe("patternMatchesBranch — write-time attribution verifier (db.ts chokep
       (Bun as { Glob: typeof Bun.Glob }).Glob = original;
     }
     // sanity: the global is restored, so normal matching works again
-    expect(patternMatchesBranch("release/*", "release/1")).toBe(true);
+    expect(denyPatternMatchesBranch("release/*", "release/1")).toBe(true);
   });
 });
 

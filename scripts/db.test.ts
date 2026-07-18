@@ -3800,13 +3800,27 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
       for (const [table, shapeJson] of shapes) {
         const shape = JSON.parse(shapeJson) as { checks?: string[]; tokens?: string[] };
         expect(shape.tokens ?? ["MISSING"]).toEqual([]); // every reference era is token-free
-        const expected = table === "run_unit_head" && version < 4 ? (version < 3 ? 1 : 1) : EXPECTED_CHECK_COUNTS[table]!;
+        const expected = table === "run_unit_head" && version < 4 ? 1 : EXPECTED_CHECK_COUNTS[table]!; // v2 and v3 both carry the single RUH_V23 status CHECK; v4's 5 come from EXPECTED_CHECK_COUNTS
         expect({ table, version, n: (shape.checks ?? []).length }).toEqual({ table, version, n: expected });
       }
     }
     // and one body pinned literally (normalized): the runs status CHECK reviewers proved adoptable when widened
     const v4runs = JSON.parse(tableShapesAt(4).get("runs")!) as { checks: string[] };
     expect(v4runs.checks).toContain(normalizeCheck("status IN ('running','completed','failed')"));
+  });
+
+  test("tableShapesAt hands out a COPY, never the memoized ownership oracle — a caller's mutation cannot corrupt it", () => {
+    // tableShapesAt is exported for tests but referenceShapesByVersion is the same cache production
+    // hasOwnedTableSet reads; returning the live Map would let any caller poison ownership for the rest
+    // of the process. RED before the copy: both calls returned the identical cached instance.
+    const a = tableShapesAt(4);
+    const b = tableShapesAt(4);
+    expect(a).not.toBe(b); // distinct objects…
+    expect([...a.entries()].sort()).toEqual([...b.entries()].sort()); // …with identical contents
+    // The not.toBe gate above throws on the RED path, so the tamper below only ever runs once copies are
+    // in place — mutating the returned map must not survive into a later call (the oracle stays intact).
+    (a as Map<string, string>).set("run_unit_head", "TAMPERED");
+    expect(tableShapesAt(4).get("run_unit_head")).not.toBe("TAMPERED");
   });
 
   test("inbound FK from a NON-audit table: the ownership preflight refuses the file before --fresh/migration", () => {
