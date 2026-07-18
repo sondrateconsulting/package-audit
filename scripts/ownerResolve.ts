@@ -45,7 +45,8 @@ export interface OwnerResolveResult {
 // excludeOrganizations excludes — in its findings, dispositions, or errors[].
 // That prune keys off the STABLE configured denylist, NOT the per-invocation effective/discovered set,
 // so a transiently-undiscovered (but not excluded) owner never loses its rows. Folding the hash instead
-// would orphan ALL legacy resumable work — a strictly worse trade — which is why it stays out.
+// would orphan every case-variant legacy config's resumable work — a strictly worse trade — which is
+// why it stays out.
 export function resolveEffectiveOwners(input: OwnerResolveInput): OwnerResolveResult {
   const configured = input.organizations !== null;
   const base = configured ? input.organizations! : input.discoveredOrgs;

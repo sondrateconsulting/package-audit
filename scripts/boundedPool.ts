@@ -5,10 +5,12 @@
 // bounds how many owner/branch UNITS are dispatched at once, while that bounds how many network
 // subprocesses run at once — the two caps compose (see PROMPT.md §4).
 
-// Minimal abort plumbing (mirrors github.ts's SpawnAbortSignal): the tsconfig lib is ESNext-only, so
-// the platform AbortController/AbortSignal instance types are unavailable here. `Aborter` is the
-// producer a run creates and trips on the first escaping error; `AbortLike` is the read side threaded
-// into workers and the pool so cancellation is observable without dragging in lib.dom.
+// Minimal, purpose-built abort plumbing (mirrors github.ts's SpawnAbortSignal): a bespoke
+// producer/consumer pair whose `onAbort` returns an UNSUBSCRIBE — the exact minimal shape the fan-out
+// needs — rather than the platform AbortSignal's EventTarget (add/removeEventListener) API. (The
+// platform AbortController/AbortSignal ARE available under `types: ["bun"]`; this is a fit-for-purpose
+// choice, not a missing type.) `Aborter` is the producer a run creates and trips on the first escaping error;
+// `AbortLike` is the read side threaded into workers and the pool so cancellation is observable.
 export interface AbortLike {
   readonly aborted: boolean;
   // Register a callback; fires immediately if already aborted. Returns an UNSUBSCRIBE function so a
@@ -46,6 +48,8 @@ export class Aborter implements AbortLike {
   }
   // Idempotent: the first call latches `aborted` and fires every registered callback ONCE; later
   // calls are no-ops. Callbacks are drained (not re-run) so a re-abort cannot double-fire them.
+  // Callbacks must not throw (a thrower would skip the callbacks after it) — ours are trivial
+  // abort-trips, never throwing.
   abort(): void {
     if (this.isAborted) return;
     this.isAborted = true;
@@ -64,13 +68,15 @@ export type PoolResult<R> =
   | { readonly status: "rejected"; readonly reason: unknown }
   | { readonly status: "skipped" };
 
-// Run `worker(item, index)` over `items` with at most `limit` in flight. SETTLE-ALL: a worker that
-// throws is captured as a `rejected` result — it NEVER aborts its siblings and the returned promise
-// NEVER rejects, so the caller can drain every in-flight worker before deciding what an escape means
-// (fail the run / rethrow / record). This is the structured drain §7 depends on: the alternative
-// (bare Promise.all fail-fast) would resolve while sibling fibers still write to the DB, racing
-// db.close(). On abort, in-flight workers DRAIN (their results are kept) and undispatched items are
-// left `skipped` — dispatch stops at the next pull, never mid-worker.
+// Run `worker(item, index)` over `items` with at most `max(1, limit)` in flight (limit is clamped up
+// to 1 so a 0/negative value still runs one worker rather than none; callers pass a validated >= 1).
+// SETTLE-ALL: a worker that throws is captured as a `rejected` result — it NEVER aborts its siblings
+// and the returned promise NEVER rejects, so the caller can drain every in-flight worker before
+// deciding what an escape means (fail the run / rethrow / record). This is the structured drain §7
+// depends on: the alternative (bare Promise.all fail-fast) REJECTS on the first throw while sibling
+// fibers still write to the DB, so the awaiting caller proceeds to db.close() before they drain. On
+// abort, in-flight workers DRAIN (their results are kept) and undispatched items are left `skipped`
+// — dispatch stops at the next pull, never mid-worker.
 export async function boundedPool<T, R>(
   items: readonly T[],
   limit: number,

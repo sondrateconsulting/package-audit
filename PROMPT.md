@@ -608,7 +608,7 @@ Resumability rules:
 - ALL finding writes use `INSERT ... ON CONFLICT DO UPDATE` (upsert) keyed by the
   UNIQUE constraints — never `INSERT OR IGNORE` (so resolved versions stay fresh). Every
   UNIQUE key is now NULL-free (sentinels/`DEFAULT ''`) so the conflict target always fires.
-- Update work_queue status transactionally (single-writer coordinator, §4). Do the
+- Update work_queue status transactionally (one shared writer connection, §4). Do the
   stale-run fail-marking AND its in_progress reset in ONE transaction. Additionally,
   make recovery self-healing: on EVERY startup reset to `pending` any `in_progress` unit
   of the current config whose `last_run_id` is any run now in status `failed` (not just
@@ -682,14 +682,20 @@ fan-out degree. `concurrency.organizations` sizes the owner fan-out pool and
 default (3 / 8 / 4), capped at 64, and excluded from config_hash (tuning never orphans
 resumable work). No mutex is needed: bun:sqlite statements are synchronous and every DB
 read-modify-write is an await-free block, so concurrent fibers never interleave mid-write and
-each branch-unit's rows are distinct.
-CRITICAL: Subagents COMPUTE and return structured JSON; ALL SQLite writes go through the ONE
+each branch-unit's queue/head/finding rows are distinct. The ONE row two fibers can share —
+`api_cache` for identical-content branches (same SHA-pinned key) — is guarded separately (a
+compare-and-delete tombstone + a refuse-to-clobber immutable put, §3 caching), not by row
+distinctness.
+CRITICAL: workers (subagents in this strategy; AS SHIPPED, in-process fibers per the fan-out
+above) COMPUTE and return structured data; ALL SQLite writes go through the ONE
 AuditDb connection (its synchronous statements serialize concurrent fibers without a mutex).
-Do not bet on multi-process WAL writer safety. Additionally, delegate genuinely NON-DETERMINISTIC comprehension to a
-subagent — e.g., disambiguating heavily aliased/namespaced imports, barrel-file
-re-exports, or unusual export patterns — passing only the scoped file context and
-returning structured JSON.
-If subagents are unavailable, run the SAME workflow sequentially in the same order,
+Do not bet on multi-process WAL writer safety. Additionally, this strategy could delegate genuinely
+NON-DETERMINISTIC comprehension to a subagent — e.g., disambiguating heavily aliased/namespaced
+imports, barrel-file re-exports, or unusual export patterns — passing only the scoped file context
+and returning structured JSON; the shipped runtime has not needed it (§5.F usage scanning is
+deterministic in-repo parsing), so no such delegation is built.
+The shipped runtime realizes this fan-out as in-process bounded pools (§5), never literal
+subagents; if neither is available, run the SAME workflow sequentially in the same order,
 but keep code structured (pure functions) so it could parallelize later.
 
 RATE-LIMIT & THROTTLING (all gh calls go through the github.ts wrapper, so this is

@@ -7,12 +7,17 @@
 // AuditDb connection opened here; per-unit reads fan out through the guarded github wrapper.
 // Owners and (per repo) branch-units are fanned out through bounded pools (§5, concurrency.*), but
 // no mutex is needed: bun:sqlite statements are synchronous and every DB read-modify-write below is
-// an await-free block, so concurrent fibers never interleave mid-write and each unit's rows are
-// distinct. Determinism (§6) is the SAME-DB-SAME-RUN guarantee the spec makes (PROMPT.md: "Completion
+// an await-free block, so concurrent fibers never interleave mid-write and each unit's queue/head/
+// finding rows are distinct. The ONE row two units can share — `api_cache` for identical-content
+// branches (same SHA-pinned key) — is guarded separately (compare-and-delete tombstone + a
+// refuse-to-clobber immutable put, github.ts), not by row distinctness. Determinism (§6) is the
+// SAME-DB-SAME-RUN guarantee the spec makes (PROMPT.md: "Completion
 // and DB-write order are unconstrained... determinism is guaranteed by sorting every emitted array on a
 // TOTAL stable key"): report/export sort every emitted array by a total key, so RE-RENDERING a given
 // completed run's DB is byte-identical no matter which fiber wrote each row first. Findings sort by
-// CONTENT, so they additionally reproduce ACROSS runs that scanned the same commits. errors[] does NOT
+// CONTENT, so their ORDER is stable ACROSS runs that scanned the same commits (byte-identity is
+// same-DB-same-run only — a report/export finding still carries per-run wall-clock fields like
+// date_fetched/found_at that differ run-to-run). errors[] does NOT reproduce byte-for-byte across runs
 // and is not claimed to: it sorts by the spec-mandated (occurred_at, id) — a chronological event log
 // whose order and wall-clock timestamps are inherently per-run (occurred_at is wall-clock, so errors[]
 // was never byte-identical across separate runs, fan-out or not; fan-out only changes WHICH order two
@@ -121,9 +126,11 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const trackedNames = config.packages.map((p) => p.name);
 
   logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
-  // §5 effective fan-out widths (both run and --plan). `repositories` is the GLOBAL in-flight
-  // subprocess cap, NOT a repo-loop degree — so at most `repositories` gh/git/tar run at once no
-  // matter how organizations×branches compose. Set-vocabulary event (documented in README).
+  // §5 configured fan-out widths. Emitted for both audit and --plan; in --plan runPlan traverses
+  // owners/repos SEQUENTIALLY, so organizations/branches are reported but not fanned out there (only
+  // repositories, the gh/git/tar subprocess cap, applies in plan mode). `repositories` is the GLOBAL
+  // in-flight subprocess cap, NOT a repo-loop degree — so at most `repositories` gh/git/tar run at
+  // once no matter how organizations×branches compose. Set-vocabulary event (documented in README).
   logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
 
   // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
@@ -297,8 +304,9 @@ export async function runScan(
   // run Aborter promptly (onFatal), which can SKIP a later sibling owner's would-be PolicyMatchError —
   // so that run stays resumable rather than failed. This is benign: a fatal run emits NO report (the
   // throw below precedes completeRun/emitReport) and is never served as "latest" (that filters
-  // status='completed'), and the config defect is DETERMINISTIC — it recurs and fails the next run's
-  // re-scan of the same branch. Guaranteeing failRun on a masked-behind-a-generic-fatal PolicyMatchError
+  // status='completed'), and the config defect is DETERMINISTIC — it recurs and fails the next run
+  // THAT re-scans that branch (a run that never reaches it cannot surface it, but also emits no report
+  // implicating that branch). Guaranteeing failRun on a masked-behind-a-generic-fatal PolicyMatchError
   // would need estate-wide up-front policy validation, out of scope here. The masking already existed
   // pre-fan-out (any abort stops siblings); onFatal only narrows the window.
   const failures = ownerResults.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));

@@ -447,10 +447,12 @@ const CLOCK_SKEW_MS = 5_000;
 export const MAX_PAUSE_MS = 2 * 60 * 60 * 1000;
 const clampPauseMs = (ms: number | null): number | null =>
   ms === null ? null : Math.min(ms, MAX_PAUSE_MS);
-// MAX_PAUSE_MS bounds ONE sleep; this bounds the TOTAL a bucket may sleep per client
-// lifetime — otherwise poison-then-succeed responses keep every call "succeeding" at
-// 5 clamped naps per page, ~417 days across one MAX_PAGES listing. Once spent, further
-// pending pauses fail as ThrottleExhausted instead of sleeping.
+// MAX_PAUSE_MS bounds ONE sleep; this bounds the total WALL-CLOCK a bucket's pause windows may
+// cover per client lifetime — their UNION, so concurrent callers waiting out the SAME window are
+// charged once, not once per caller (the summed per-caller sleep time can exceed this; the funded
+// wall-clock coverage cannot). Otherwise poison-then-succeed responses keep every call "succeeding"
+// at 5 clamped naps per page, ~417 days across one MAX_PAGES listing. Once spent, further pending
+// pauses fail as ThrottleExhausted instead of sleeping.
 export const MAX_TOTAL_PAUSE_MS = 8 * 60 * 60 * 1000;
 
 export function parseRetryAfterMs(value: string | undefined, nowMs: number): number | null {
@@ -1134,10 +1136,11 @@ export class GithubClient {
     // gitconfig, so plan mode truly writes nothing and leaks no pkg-audit-gitcfg-* dir.
     const isVersionProbe = args.length === 1 && args[0] === "--version";
     const env = buildGitEnv(this.baseEnv, isVersionProbe ? devNull : this.ensureGitConfig());
-    // Count the clone against the GLOBAL in-flight cap (§4/§5.6): under fan-out unbounded concurrent
-    // clones would blow temp-dir/fd/memory. Acquire HERE (not inside spawnBounded, which gh already
-    // wraps — a second acquire there would deadlock gh at concurrency 1). Bare slot: git is local
-    // work, not a rate-limit bucket.
+    // Count the clone against the GLOBAL in-flight cap (§4/§5.6): under fan-out a clone per branch-unit
+    // would otherwise reach the composed organizations×branches degree and blow temp-dir/fd/memory.
+    // Acquire HERE (not inside spawnBounded, which gh already wraps — a second acquire there would
+    // deadlock gh at concurrency 1). Bare slot (no bucket): a clone is network work but consumes no
+    // REST/GraphQL quota, so it sits OUTSIDE the rate-limit buckets — only the subprocess cap bounds it.
     const release = await this.sem.acquire();
     try {
       return await this.spawnBounded(this.bins.git, args, { env, cwd });
@@ -1262,8 +1265,12 @@ export class GithubClient {
   //      fan-out the final/overflow pause is bucket-global evidence every OTHER concurrent caller
   //      must see; the exhausted caller simply throws without sleeping it (its loop ends / waitBucket
   //      trips), but siblings must not spawn into a live rate-limit window.
-  //   2. FUND only the uncovered UNION TAIL: delta = candidate − max(now, accountedUntilMs). Two
-  //      callers arming the SAME window charge it once (the second sees delta 0). If funding the tail
+  //   2. FUND only the uncovered UNION TAIL: delta = max(0, published horizon (pausedUntilMs) −
+  //      max(now, accountedUntilMs)) — the horizon, NOT this candidate's raw untilMs (see the funding
+  //      comment below for why). Two callers arming the SAME window charge it once WHEN it was funded
+  //      (the second sees delta 0); if the first publication overflowed the budget the horizon stays
+  //      unfunded, so a later arm re-computes a nonzero delta that re-overflows and funds nothing. If
+  //      funding the tail
   //      would exceed MAX_TOTAL_PAUSE_MS, publish the pause but do NOT advance accountedUntilMs — the
   //      tail stays unfunded and waitBucket throws ThrottleExhausted for it instead of over-sleeping.
   private armBucketPause(bucket: Bucket, untilMs: number, now: number): void {

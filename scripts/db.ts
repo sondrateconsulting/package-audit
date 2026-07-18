@@ -2325,8 +2325,9 @@ export class AuditDb {
 
   // §1 exclusion enforcement for a RESUMED run: drop this run's rows for any owner named in
   // excludeOrganizations, matched CASE-INSENSITIVELY (as ownerResolve folds owners). config_hash
-  // hashes excludeOrganizations exact-case ON PURPOSE (folding it would orphan every legacy config's
-  // resumable work), so a run that STRADDLES the upgrade to case-insensitive exclusion can still hold
+  // hashes excludeOrganizations exact-case ON PURPOSE (folding it would rehash every case-variant
+  // legacy config and orphan its resumable work; canonically-cased configs would hash the same), so a
+  // run that STRADDLES the upgrade to case-insensitive exclusion can still hold
   // rows for an owner a case-variant exclude now removes (e.g. exclude "Acme", earlier-scanned "acme").
   // Pruning them here keeps a resumed run's report from ever surfacing an owner its own
   // excludeOrganizations excludes. BOTH tables that carry an owner into the report are cleaned, in ONE
@@ -2396,7 +2397,8 @@ export class AuditDb {
   // null). This guard closes the persist half of that race; tombstoneApiCacheIfBody closes the tombstone
   // half. Malformed-first is still self-healing: the malformed row is tombstoned to NULL and the next
   // fetch repairs it via the IS NULL branch. Mutable endpoints keep using putApiCache (a newer 200 body
-  // legitimately supersedes the old one). One synchronous UPDATE — atomic on the single-threaded loop.
+  // legitimately supersedes the old one). One synchronous upsert (INSERT … ON CONFLICT DO UPDATE; an
+  // absent row takes the insert path) — atomic on the single-threaded loop.
   putApiCacheImmutable(entry: { method: string; url: string; variantHash: string; etag: string | null; responseBody: string }): void {
     if (entry.method !== "GET") fail(`api_cache is REST-GET only; refusing to cache method ${entry.method}`);
     this.db
