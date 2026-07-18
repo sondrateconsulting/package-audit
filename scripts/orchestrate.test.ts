@@ -313,9 +313,11 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     expect(totals!.reposKept).toBe(3);
     expect(totals!.repositoriesExcluded).toBe(3);
     // Compare plan-excluded events BY OWNER (not by emission order): exactly org-a + org-b emit; org-c does not.
-    const excludedByOrg = new Map(
-      events.filter((e) => e["event"] === "plan-excluded").map((e) => [e["org"] as string, e["repositories"] as string[]]),
-    );
+    const planExcludedRaw = events.filter((e) => e["event"] === "plan-excluded");
+    // Assert the RAW event count FIRST: exactly two events total — one per denying owner, NONE for org-c,
+    // and NONE duplicated. A Map keyed by owner alone would silently collapse a duplicate-per-owner event.
+    expect(planExcludedRaw.length).toBe(2);
+    const excludedByOrg = new Map(planExcludedRaw.map((e) => [e["org"] as string, e["repositories"] as string[]]));
     expect(excludedByOrg.size).toBe(2); // org-c emitted NONE → kills mutation (B); the empty-guard drop would make this 3
     expect(excludedByOrg.get("org-a")).toEqual(["org-a/Legacy-API", "org-a/legacy-portal"]); // original case, raw discovery order
     expect(excludedByOrg.get("org-b")).toEqual(["org-b/legacy-worker"]);

@@ -156,6 +156,16 @@ describe("classifyRepository — exact-first, glob, case-insensitive, fail-close
     expect((caught as RepoPolicyMatchError).pattern).toBe("acme/*");
     expect((caught as RepoPolicyMatchError).ownerRepoLower).toBe("acme/repo");
   });
+  test("the fatal error carries the FOLDED owner/repo even from a MIXED-CASE raw input (the fold runs before the glob)", () => {
+    // Pins the internal fold on the ERROR/glob path, not just the exact-match path: a mixed-case raw
+    // name is folded BEFORE safeMatch runs, so the diagnostic reports the folded form. Without the
+    // internal fold this would carry the raw "AcMe/Repo".
+    const p = [cp("acme/*", throwingGlob(new Error("engine boom")))];
+    let caught: unknown;
+    try { classifyRepository(p, "AcMe/Repo"); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(RepoPolicyMatchError);
+    expect((caught as RepoPolicyMatchError).ownerRepoLower).toBe("acme/repo");
+  });
   test("SINGLE-pass fail-closed: an EARLIER throwing glob aborts even though a LATER exact would match", () => {
     // Locked semantic (design decision tree): classify checks each pattern's exact-equality then its
     // glob, in canonical order — it does NOT do a whole-list exact pass first like branchPolicy. So a
