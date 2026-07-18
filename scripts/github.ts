@@ -1073,21 +1073,38 @@ export class GithubClient {
   // release; `now` is read ONCE and shared by analyze's classification and the arm so both agree on
   // the clock. Returns analyze's control-flow outcome for the caller's loop to act on OUTSIDE the
   // lease (DB writes, transient backoff sleeps, return/throw).
+  //
+  // ATOMIC ADMISSION: acquireRespectingPause re-checks the pause AFTER acquiring the slot, but it
+  // returns the release across an `await` — i.e. a MICROTASK boundary — so a SIBLING fiber holding a
+  // DIFFERENT slot (concurrency ≥ 2) can armBucketPause in the gap between that check and the spawn
+  // below, and this fiber would spawn straight INTO a just-armed rate-limit window (the arm-inside-
+  // lease discipline only closes SAME-slot inheritance, not this different-slot post-check window).
+  // The final re-check here is therefore SYNCHRONOUS and in the SAME tick as the spawn: spawnBounded
+  // invokes this.spawn() synchronously before its first await, so with NO await between the re-check
+  // and spawnBounded nothing can interleave to arm a pause. A pause seen live releases the slot and
+  // re-loops (waitBucket sleeps it out, or ThrottleExhausted terminates the loop for an unfunded
+  // budget-overflow tail — so the loop always makes progress).
   private async ghBucketedAttempt<T>(
     args: string[], bucket: Bucket,
     analyze: (res: SpawnResult, now: number) => { outcome: T; pauseUntilMs: number | null },
   ): Promise<T> {
     assertSpawnAllowed(this.bins.gh, args);
     assertReadOnlyGh(args);
-    const release = await this.acquireRespectingPause(bucket);
-    try {
-      const res = await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
-      const now = this.now();
-      const { outcome, pauseUntilMs } = analyze(res, now);
-      if (pauseUntilMs !== null) this.armBucketPause(bucket, pauseUntilMs, now);
-      return outcome;
-    } finally {
-      release();
+    for (;;) {
+      const release = await this.acquireRespectingPause(bucket);
+      if (bucket.pausedUntilMs > this.now()) {
+        release(); // a pause armed in the acquire→spawn gap — wait it out without holding the slot
+        continue;  // re-loop: acquireRespectingPause sleeps the window, re-acquires, re-checks
+      }
+      try {
+        const res = await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
+        const now = this.now();
+        const { outcome, pauseUntilMs } = analyze(res, now);
+        if (pauseUntilMs !== null) this.armBucketPause(bucket, pauseUntilMs, now);
+        return outcome;
+      } finally {
+        release();
+      }
     }
   }
 
@@ -1388,19 +1405,22 @@ export class GithubClient {
     try {
       return JSON.parse(res.body);
     } catch {
-      this.tombstoneApiCache(endpoint, ""); // the unparseable body was cached before we could see it
+      this.tombstoneApiCache(endpoint, "", res.body); // the unparseable body was cached before we could see it
       throw new GithubApiError(`invalid JSON from ${endpoint}`, { status: res.status, endpoint });
     }
   }
 
   // A 200 body is cached by restGet before endpoint-level validation runs. When validation then
-  // rejects it, overwrite the row with a NULL body: both cache-serving paths (the immutable hit
-  // and the 304 If-None-Match revalidation) require a non-null cached body, so the next call goes
-  // back to the network instead of re-serving the poisoned bytes until --purge-cache. The accept
-  // variant must match the fetch that cached the row — a mismatched variant would tombstone the
-  // wrong row and leave the poisoned one live.
-  private tombstoneApiCache(endpoint: string, accept: string): void {
-    this.db?.putApiCache({ method: "GET", url: this.cacheKey(endpoint), variantHash: accept, etag: null, responseBody: null });
+  // rejects it, null the row's body: both cache-serving paths (the immutable hit and the 304
+  // If-None-Match revalidation) require a non-null cached body, so the next call goes back to the
+  // network instead of re-serving the poisoned bytes until --purge-cache. The accept variant must
+  // match the fetch that cached the row — a mismatched variant would tombstone the wrong row and
+  // leave the poisoned one live. COMPARE-AND-DELETE: pass the exact bytes this fiber read as
+  // malformed (`expectedBody`) so the null lands ONLY if that body is still stored — under fan-out
+  // two fibers share the SAME immutable-SHA row, and a malformed-transient tombstone must not clobber
+  // a sibling's newer VALID write of the same SHA (see db.tombstoneApiCacheIfBody).
+  private tombstoneApiCache(endpoint: string, accept: string, expectedBody: string): void {
+    this.db?.tombstoneApiCacheIfBody({ method: "GET", url: this.cacheKey(endpoint), variantHash: accept, expectedBody });
   }
 
   // TS pagination (§5.A): per-page `gh api -i`, follow Link rel="next" (host-verified,
@@ -1740,8 +1760,10 @@ export class GithubClient {
     } catch (e) {
       // restGet cached this body BEFORE validation could see it; for a SHA-pinned tree the
       // immutable path would re-serve the poisoned bytes forever (--purge-cache was the only
-      // remedy). Tombstone the row so the next call goes back to the network.
-      this.tombstoneApiCache(endpoint, "");
+      // remedy). Tombstone the row so the next call goes back to the network — compare-and-delete on
+      // the exact bytes read (res.body) so a sibling's concurrent VALID write of the same SHA is not
+      // clobbered.
+      this.tombstoneApiCache(endpoint, "", res.body);
       throw e;
     }
   }

@@ -757,6 +757,29 @@ describe("restGet caching + conditional requests", () => {
     db.close();
   });
 
+  test("a malformed-body tombstone does NOT clobber a concurrently-written VALID immutable row (compare-and-delete, §4 fan-out)", async () => {
+    // Under branch fan-out two fibers fetch the SAME immutable SHA (identical-content branches). Fiber A
+    // reads a malformed-TRANSIENT body and heads for the tombstone; fiber B reads the VALID body and
+    // persists it in the window between A's persist and A's tombstone. An UNCONDITIONAL tombstone would
+    // null B's newer valid row → a needless refetch, and churn on the ONE shared immutable-content cache
+    // row the no-mutex "distinct rows" claim excepts. Compare-and-delete tombstones ONLY when the stored
+    // body is still A's malformed bytes, so B's valid write survives. We land B's write DETERMINISTICALLY
+    // by wrapping the tombstone db call to inject the sibling's valid write immediately before it runs.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const validBody = `{"type":"file","sha":"${SHA}","size":12}`;
+    const realTomb = db.tombstoneApiCacheIfBody.bind(db);
+    (db as unknown as { tombstoneApiCacheIfBody: AuditDb["tombstoneApiCacheIfBody"] }).tombstoneApiCacheIfBody = (e) => {
+      // fiber B's concurrent VALID write lands on the same immutable key/variant, just before A tombstones
+      db.putApiCache({ method: "GET", url: e.url, variantHash: e.variantHash, etag: 'W/"v"', responseBody: validBody });
+      realTomb(e); // A's compare-and-delete: expectedBody is the MALFORMED body → must NOT clobber validBody
+    };
+    const { client } = makeClient([ok(http(200, {}, `{bad json`))], { db }); // fiber A: malformed 200
+    await expect(client.fetchFileMeta("o", "r", "package.json", SHA)).rejects.toThrow(/invalid JSON/);
+    const row = db.read("SELECT response_body AS body FROM api_cache").get() as { body: string | null };
+    expect(row.body).toBe(validBody); // the concurrent valid write SURVIVED the malformed tombstone
+    db.close();
+  });
+
   test("restGet: noStore OVERRIDES immutable — a SHA-pinned pre-seeded row is neither served, revalidated, nor overwritten", async () => {
     // `immutable` alone would serve the seeded row with ZERO network; noStore must win — a plain
     // uncached fetch that touches the row in no way (no read, no If-None-Match, no persist). Pins the
@@ -1378,6 +1401,47 @@ describe("concurrency: global cap + concurrent throttle coordination (§4/§5.6 
     // the cache row converged on the body — a later read is a zero-network immutable HIT
     expect(db.getApiCache("GET", `gh3:github.com:${endpoint}`, "")?.responseBody).toBe(body);
     db.close();
+  });
+
+  test("admission seam: a pause armed in the acquire→spawn gap is NOT spawned into (§4 fan-out)", async () => {
+    // The race the synchronous re-check closes: acquireRespectingPause does its final pause check and
+    // then RETURNS across a microtask boundary, so a SIBLING fiber on a different slot can armBucketPause
+    // between that check and ghBucketedAttempt's spawn — the arm-inside-lease discipline only closes the
+    // SAME-slot inheritance, not this different-slot post-check window. We reproduce the gap
+    // DETERMINISTICALLY by wrapping acquireRespectingPause so a pause is armed EXACTLY ONCE right as it
+    // returns the slot — i.e. in the acquire→spawn window a sibling would arm in. The fix's synchronous
+    // re-check (in the SAME tick as the spawn, which spawnBounded issues before its first await) must
+    // catch it: the fiber releases, sleeps the pause, re-acquires, and only THEN spawns — never into a
+    // live rate-limit window. Without the fix the spawn fires while pausedUntilMs > now.
+    const H = 3_600_000;
+    let now = 1_000_000_000_000;
+    let coreRef: { pausedUntilMs: number } | null = null;
+    let spawnedIntoPause = false;
+    const spawn: SpawnFn = async () => {
+      if (coreRef !== null && coreRef.pausedUntilMs > now) spawnedIntoPause = true; // observed at the instant of spawn
+      return ok(http(200, {}, `{"ok":1}`));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl: spawn, nowImpl: () => now,
+      sleepImpl: async (ms) => { now += ms; }, // advancing clock so the injected pause elapses on the re-loop
+      binPaths: BINS, tempRoot: TEST_TMP, concurrency: 2,
+    });
+    const c = client as unknown as {
+      core: { pausedUntilMs: number; accountedUntilMs: number; budgetSpentMs: number };
+      acquireRespectingPause(b: unknown): Promise<() => void>;
+      armBucketPause(b: unknown, until: number, now: number): void;
+    };
+    coreRef = c.core;
+    const realAcquire = c.acquireRespectingPause.bind(c);
+    let armed = false;
+    c.acquireRespectingPause = async (b) => {
+      const release = await realAcquire(b);
+      if (!armed) { armed = true; c.armBucketPause(b, now + H, now); } // a sibling arms in the acquire→spawn gap
+      return release;
+    };
+    const res = await client.restGet("rate_limit");
+    expect(res.body).toBe(`{"ok":1}`);
+    expect(spawnedIntoPause).toBe(false); // the synchronous admission re-check kept the spawn out of the window
   });
 });
 

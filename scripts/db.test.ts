@@ -1694,6 +1694,46 @@ describe("--fresh / --purge-cache", () => {
   });
 });
 
+describe("tombstoneApiCacheIfBody — compare-and-delete (§4 fan-out: no clobber of a concurrent valid write)", () => {
+  test("nulls the row ONLY when the stored body still equals the expected (malformed) bytes", () => {
+    const db = mem();
+    // A sibling's VALID write has already replaced the malformed body this fiber read: the stored body
+    // no longer matches expectedBody, so the tombstone must be a NO-OP (the valid row survives).
+    db.putApiCache({ method: "GET", url: "u", variantHash: "", etag: "v", responseBody: "valid" });
+    db.tombstoneApiCacheIfBody({ method: "GET", url: "u", variantHash: "", expectedBody: "malformed" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBe("valid"); // survived — not clobbered
+    expect(db.getApiCache("GET", "u", "")?.etag).toBe("v");
+    // The poison-defense case: the stored body IS the malformed bytes → tombstoned (body AND etag null).
+    db.putApiCache({ method: "GET", url: "u", variantHash: "", etag: "e", responseBody: "malformed" });
+    db.tombstoneApiCacheIfBody({ method: "GET", url: "u", variantHash: "", expectedBody: "malformed" });
+    const row = db.getApiCache("GET", "u", "");
+    expect(row?.responseBody).toBeNull(); // nulled body disables both cache-serving paths
+    expect(row?.etag).toBeNull();         // and etag suppresses If-None-Match
+    db.close();
+  });
+
+  test("an already-tombstoned (NULL body) row is untouched — NULL never equals the non-null expectedBody", () => {
+    const db = mem();
+    db.putApiCache({ method: "GET", url: "u", variantHash: "", etag: null, responseBody: null });
+    db.tombstoneApiCacheIfBody({ method: "GET", url: "u", variantHash: "", expectedBody: "malformed" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBeNull(); // still a tombstone, no error
+    db.close();
+  });
+
+  test("an absent row is a no-op (nothing to re-serve, nothing to insert)", () => {
+    const db = mem();
+    db.tombstoneApiCacheIfBody({ method: "GET", url: "missing", variantHash: "", expectedBody: "x" });
+    expect(db.getApiCache("GET", "missing", "")).toBeNull(); // unlike the old put-null, no spurious row is created
+    db.close();
+  });
+
+  test("refuses a non-GET method (mirrors putApiCache's REST-GET-only guard)", () => {
+    const db = mem();
+    expect(() => db.tombstoneApiCacheIfBody({ method: "POST", url: "u", variantHash: "", expectedBody: "x" })).toThrow(/REST-GET only/);
+    db.close();
+  });
+});
+
 describe("run lifecycle — startup rules (§3)", () => {
   test("new run persists the full config echo", () => {
     const db = mem();

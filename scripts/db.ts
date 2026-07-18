@@ -2387,6 +2387,26 @@ export class AuditDb {
       .run(entry.method, entry.url, entry.variantHash, entry.etag, entry.responseBody, nowIso());
   }
 
+  // COMPARE-AND-DELETE tombstone: null the row's body+etag ONLY when the stored body is STILL the exact
+  // bytes the caller read as malformed (`expectedBody`). restGet persists an exact-200 body BEFORE the
+  // endpoint-level validator sees it; when validation rejects it the caller tombstones so the poison is
+  // not re-served. But this cache row is the ONE the no-mutex "distinct rows" claim excepts: two fibers
+  // fetching the SAME immutable SHA (identical-content branches) share it. An UNCONDITIONAL null would
+  // let a fiber's malformed-transient tombstone clobber a SIBLING's newer VALID write of the same SHA →
+  // a needless refetch. Gating the null on `response_body = ?` makes it a no-op once a valid (or any
+  // different) body has won, while still nulling the genuinely-poisoned single-fiber row (stored body ==
+  // expectedBody). One synchronous SQLite statement → atomic on the single-threaded loop (no mutex). A
+  // NULL stored body never equals the non-null expectedBody, so an already-tombstoned row is untouched.
+  tombstoneApiCacheIfBody(entry: { method: string; url: string; variantHash: string; expectedBody: string }): void {
+    if (entry.method !== "GET") fail(`api_cache is REST-GET only; refusing to tombstone method ${entry.method}`);
+    this.db
+      .query(
+        `UPDATE api_cache SET response_body = NULL, etag = NULL, cached_at = ?
+           WHERE method = ? AND url = ? AND variant_hash = ? AND response_body = ?`,
+      )
+      .run(nowIso(), entry.method, entry.url, entry.variantHash, entry.expectedBody);
+  }
+
   // ---- package_api_surface (§5.E durable introspection) ---------------------------------------
   // The per-version COMPLETION MARKER row (export_name='', export_kind='__complete__') is the
   // durable success record; it is written LAST in the SAME transaction as the export/bin rows,
