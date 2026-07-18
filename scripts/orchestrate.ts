@@ -291,6 +291,16 @@ export async function runScan(
   // PolicyMatchError (a config defect must exclude the run from latest) — even when a lower-index
   // generic escape is the one surfaced. A run with NO PolicyMatchError stays resumable (no failRun).
   // Rethrow the FIRST rejection in owner order (deterministic surfaced error) AFTER the full drain.
+  //
+  // ACCEPTED trade-off (prompt fan-out cancellation): the predicate sees only COLLECTED failures. A
+  // generic fatal (a DB-write failure, the bucket-wiring assertion) in an earlier owner now trips the
+  // run Aborter promptly (onFatal), which can SKIP a later sibling owner's would-be PolicyMatchError —
+  // so that run stays resumable rather than failed. This is benign: a fatal run emits NO report (the
+  // throw below precedes completeRun/emitReport) and is never served as "latest" (that filters
+  // status='completed'), and the config defect is DETERMINISTIC — it recurs and fails the next run's
+  // re-scan of the same branch. Guaranteeing failRun on a masked-behind-a-generic-fatal PolicyMatchError
+  // would need estate-wide up-front policy validation, out of scope here. The masking already existed
+  // pre-fan-out (any abort stops siblings); onFatal only narrows the window.
   const failures = ownerResults.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
   if (failures.length > 0) {
     if (failures.some((reason) => reason instanceof PolicyMatchError)) db.failRun(runId);
