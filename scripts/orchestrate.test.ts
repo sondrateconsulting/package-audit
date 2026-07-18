@@ -1799,6 +1799,33 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
+
+  test("processRepo DROPS its run-Aborter callback after each pool settles — no accumulation over a large estate", async () => {
+    // Fix 5 end-to-end: each processRepo registers a branchAbort-trip on the run-level Aborter and must
+    // unsubscribe it (the .finally) once its branch pool settles, so a run over thousands of repos does
+    // not leave a callback per completed repo on the run Aborter. We drive many repos against ONE shared
+    // run Aborter and assert its callback list returns to empty after each — a broken unsubscribe would
+    // grow it unbounded. (White-box on the private `callbacks`, mirroring boundedPool.test.ts's tripwire.)
+    const root = mkdtempSync(join(tmpdir(), "fanout-unsub-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const nodes = nodesN(1); // just the default branch (main) — a clean, fatal-free scan
+    const client = makeClient(root, async (_bin, args) =>
+      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    const cfg = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 2 } };
+    const runAborter = new Aborter();
+    const internal = runAborter as unknown as { callbacks: unknown[] };
+    await captureJsonl(async () => {
+      for (let i = 0; i < 25; i++) {
+        // a DISTINCT repo each iteration (fresh scheduledRepoKeys per call), like a large estate
+        await processRepo(db, client, rt(cfg, "h"), runId, "org-a", { ...repo, name: `svc${i}` }, [], new Set(), new Set(), runAborter);
+        expect(internal.callbacks.length).toBe(0); // this repo unsubscribed once its pool settled
+      }
+    });
+    expect(runAborter.aborted).toBe(false); // no fatal occurred; the Aborter was only ever registered on and unsubscribed from
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
 });
 
 describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations > 1, §7)", () => {

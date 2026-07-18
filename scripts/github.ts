@@ -1388,9 +1388,18 @@ export class GithubClient {
         // Persist ONLY an exact-200 body (defense-in-depth over classifyRest's ok⇒200): both
         // cache-serving paths synthesize 200, so laundering any other 2xx into the cache would make
         // it a 'complete' 200 forever for SHA-pinned endpoints. Cache write provenance is a durable
-        // invariant (rows are statusless and outlive --fresh), so it must hold locally.
-        if (outcome.parsed.status === 200 && !noStore)
-          this.db?.putApiCache({ method: "GET", url: key, variantHash: accept, etag: outcome.parsed.headers["etag"] ?? null, responseBody: outcome.parsed.body });
+        // invariant (rows are statusless and outlive --fresh), so it must hold locally. IMMUTABLE
+        // (SHA-pinned) endpoints use the GUARDED put: this body is persisted BEFORE validation, so
+        // under fan-out an unconditional overwrite could clobber a sibling's already-cached VALID body
+        // of the same byte-stable SHA with a malformed transient. putApiCacheImmutable refuses to
+        // overwrite a non-null DIFFERENT body (writing only absent/NULL/identical); the compare-and-
+        // delete tombstone guards the other half. Mutable endpoints keep the unconditional put (a newer
+        // 200 legitimately supersedes the old body).
+        if (outcome.parsed.status === 200 && !noStore) {
+          const entry = { method: "GET" as const, url: key, variantHash: accept, etag: outcome.parsed.headers["etag"] ?? null, responseBody: outcome.parsed.body };
+          if (immutable) this.db?.putApiCacheImmutable(entry);
+          else this.db?.putApiCache(entry);
+        }
         return outcome.parsed;
       }
       if (outcome.kind === "fatal")

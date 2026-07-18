@@ -1734,6 +1734,35 @@ describe("tombstoneApiCacheIfBody — compare-and-delete (§4 fan-out: no clobbe
   });
 });
 
+describe("putApiCacheImmutable — guarded persist (§4 fan-out: a malformed transient never overwrites a valid immutable body)", () => {
+  test("writes an absent row, repairs a NULL tombstone, is idempotent on an identical body, and REFUSES a different body", () => {
+    const db = mem();
+    // absent → insert
+    db.putApiCacheImmutable({ method: "GET", url: "u", variantHash: "", etag: "e1", responseBody: "V" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBe("V");
+    // identical body → idempotent (etag refreshes, body unchanged)
+    db.putApiCacheImmutable({ method: "GET", url: "u", variantHash: "", etag: "e2", responseBody: "V" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBe("V");
+    expect(db.getApiCache("GET", "u", "")?.etag).toBe("e2");
+    // DIFFERENT body (a malformed transient of the same immutable SHA) → REFUSED; the valid body survives
+    db.putApiCacheImmutable({ method: "GET", url: "u", variantHash: "", etag: "eM", responseBody: "MALFORMED" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBe("V"); // not clobbered
+    expect(db.getApiCache("GET", "u", "")?.etag).toBe("e2");        // etag also untouched
+    // NULL tombstone → the next write repairs it (IS NULL branch)
+    db.tombstoneApiCacheIfBody({ method: "GET", url: "u", variantHash: "", expectedBody: "V" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBeNull();
+    db.putApiCacheImmutable({ method: "GET", url: "u", variantHash: "", etag: "e3", responseBody: "V" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBe("V"); // repaired
+    db.close();
+  });
+
+  test("refuses a non-GET method (mirrors putApiCache's REST-GET-only guard)", () => {
+    const db = mem();
+    expect(() => db.putApiCacheImmutable({ method: "POST", url: "u", variantHash: "", etag: null, responseBody: "V" })).toThrow(/REST-GET only/);
+    db.close();
+  });
+});
+
 describe("run lifecycle — startup rules (§3)", () => {
   test("new run persists the full config echo", () => {
     const db = mem();

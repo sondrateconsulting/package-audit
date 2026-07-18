@@ -780,6 +780,28 @@ describe("restGet caching + conditional requests", () => {
     db.close();
   });
 
+  test("a malformed body does NOT overwrite a sibling's already-cached VALID immutable body (guarded persist, §4 fan-out)", async () => {
+    // The PERSIST half of the clobber (distinct from the tombstone half above): restGet persists the
+    // 200 body BEFORE validation. If a sibling's VALID write of the same immutable SHA already landed,
+    // an UNCONDITIONAL put would overwrite it with this fiber's malformed transient (which the tombstone
+    // would then null). The guarded immutable put REFUSES to overwrite a non-null DIFFERENT body, so the
+    // valid body survives BOTH the persist and the (no-op) tombstone. We land the sibling's valid write
+    // immediately before this fiber's guarded put by wrapping it.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const validBody = `{"type":"file","sha":"${SHA}","size":12}`;
+    const realPut = db.putApiCacheImmutable.bind(db);
+    let injected = false;
+    (db as unknown as { putApiCacheImmutable: AuditDb["putApiCacheImmutable"] }).putApiCacheImmutable = (e) => {
+      if (!injected) { injected = true; db.putApiCache({ method: "GET", url: e.url, variantHash: e.variantHash, etag: 'W/"v"', responseBody: validBody }); } // sibling's valid write lands FIRST
+      realPut(e); // this fiber's guarded put of the MALFORMED body → refused (stored valid != malformed)
+    };
+    const { client } = makeClient([ok(http(200, {}, `{bad json`))], { db }); // this fiber: malformed 200
+    await expect(client.fetchFileMeta("o", "r", "package.json", SHA)).rejects.toThrow(/invalid JSON/);
+    const row = db.read("SELECT response_body AS body FROM api_cache").get() as { body: string | null };
+    expect(row.body).toBe(validBody); // survived the malformed persist AND the malformed tombstone
+    db.close();
+  });
+
   test("restGet: noStore OVERRIDES immutable — a SHA-pinned pre-seeded row is neither served, revalidated, nor overwritten", async () => {
     // `immutable` alone would serve the seeded row with ZERO network; noStore must win — a plain
     // uncached fetch that touches the row in no way (no read, no If-None-Match, no persist). Pins the

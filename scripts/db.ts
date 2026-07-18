@@ -2387,6 +2387,30 @@ export class AuditDb {
       .run(entry.method, entry.url, entry.variantHash, entry.etag, entry.responseBody, nowIso());
   }
 
+  // GUARDED persist for IMMUTABLE (SHA-pinned, byte-stable) content: write only when it will NOT clobber
+  // a sibling's body — an absent row, a NULL tombstone (a repair after a poisoned row), or a row already
+  // holding the IDENTICAL body (idempotent). It REFUSES to overwrite a non-null DIFFERENT body: for
+  // immutable content two different bodies mean at least one is a malformed transient, and restGet
+  // persists BEFORE validation, so under fan-out an unconditional put would let a fiber's malformed body
+  // overwrite a sibling's already-cached VALID body (which the compare-and-delete tombstone would then
+  // null). This guard closes the persist half of that race; tombstoneApiCacheIfBody closes the tombstone
+  // half. Malformed-first is still self-healing: the malformed row is tombstoned to NULL and the next
+  // fetch repairs it via the IS NULL branch. Mutable endpoints keep using putApiCache (a newer 200 body
+  // legitimately supersedes the old one). One synchronous UPDATE — atomic on the single-threaded loop.
+  putApiCacheImmutable(entry: { method: string; url: string; variantHash: string; etag: string | null; responseBody: string }): void {
+    if (entry.method !== "GET") fail(`api_cache is REST-GET only; refusing to cache method ${entry.method}`);
+    this.db
+      .query(
+        `INSERT INTO api_cache (method, url, variant_hash, etag, response_body, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(method, url, variant_hash)
+         DO UPDATE SET etag = excluded.etag, response_body = excluded.response_body,
+           cached_at = excluded.cached_at
+         WHERE api_cache.response_body IS NULL OR api_cache.response_body = excluded.response_body`,
+      )
+      .run(entry.method, entry.url, entry.variantHash, entry.etag, entry.responseBody, nowIso());
+  }
+
   // COMPARE-AND-DELETE tombstone: null the row's body+etag ONLY when the stored body is STILL the exact
   // bytes the caller read as malformed (`expectedBody`). restGet persists an exact-200 body BEFORE the
   // endpoint-level validator sees it; when validation rejects it the caller tombstones so the poison is
