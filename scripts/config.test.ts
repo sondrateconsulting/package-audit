@@ -381,6 +381,36 @@ describe("loadConfig — file I/O", () => {
     expect(loaded.branchPolicy.include).toBeNull();
     expect(loaded.branchPolicy.exclude).toEqual([]);
   });
+  test("loadConfig compiles the repository denylist onto LoadedConfig (ASCII-folded, canonical order)", async () => {
+    const p = join(dir, "repopolicy.json");
+    writeFileSync(p, JSON.stringify({ ...baseRaw(), excludeRepositories: ["ACME/*", "acme/*", "b/legacy-*"] }));
+    const loaded = await loadConfig(["--config", p], {});
+    // folded ("ACME/*"→"acme/*") THEN sortedDedup collapses the case-only duplicate; canonical order.
+    expect(loaded.repositoryPolicy.map((c) => c.pattern)).toEqual(["acme/*", "b/legacy-*"]);
+  });
+  test("loadConfig leaves repositoryPolicy empty when excludeRepositories is omitted", async () => {
+    const p = join(dir, "norepopolicy.json");
+    writeFileSync(p, JSON.stringify(baseRaw()));
+    const loaded = await loadConfig(["--config", p], {});
+    expect(loaded.repositoryPolicy).toEqual([]);
+  });
+  test("a repository-glob CONSTRUCTION throw surfaces as ConfigError at load (never mid-run)", async () => {
+    // No real pattern throws at construction on the exercised Bun, so force it: swap Bun.Glob for a
+    // throwing constructor. The config configures NO branch policy (branches:null, excludeBranches:[]),
+    // so compileBranchPolicy constructs no glob — the throw is isolated to the repository compile, whose
+    // RepositoryPolicyError loadConfig must re-wrap as ConfigError.
+    const p = join(dir, "badrepoglob.json");
+    writeFileSync(p, JSON.stringify({ ...baseRaw(), excludeRepositories: ["acme/legacy-*"] }));
+    const OriginalGlob = Bun.Glob;
+    try {
+      (Bun as { Glob: unknown }).Glob = class {
+        constructor() { throw new Error("forced construction failure"); }
+      };
+      await expect(loadConfig(["--config", p], {})).rejects.toThrow(ConfigError);
+    } finally {
+      (Bun as { Glob: typeof OriginalGlob }).Glob = OriginalGlob;
+    }
+  });
   test("missing file throws ConfigError", async () => {
     await expect(loadConfig(["--config", join(dir, "nope.json")], {})).rejects.toThrow(ConfigError);
   });

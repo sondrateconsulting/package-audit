@@ -10,6 +10,7 @@ import { assertContained } from "./readOnlyGuard.ts";
 import { isValidPackageName } from "./packageName.ts";
 import { sortedDedup, toAsciiLower } from "./patternCanonical.ts";
 import { compileBranchPolicy, BranchPolicyError, type CompiledBranchPolicy } from "./branchPolicy.ts";
+import { compileRepositoryPolicy, RepositoryPolicyError, type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -65,6 +66,9 @@ export interface LoadedConfig {
   // The compiled branch policy, built once here at load and threaded as the SINGLE instance
   // through plan + scan (do not recompile downstream). A resumed run in another process recompiles.
   branchPolicy: CompiledBranchPolicy;
+  // The compiled repository denylist, built once here at load (same single-instance discipline). Empty
+  // when excludeRepositories is []/omitted, in which case classifyRepository is a constant false.
+  repositoryPolicy: CompiledRepositoryPolicy;
 }
 
 const DEFAULT_GITHUB_HOST = "github.com";
@@ -527,5 +531,15 @@ export async function loadConfig(
     if (e instanceof BranchPolicyError) return fail(e.message);
     throw e;
   }
-  return { config, configHash: computeConfigHash(config), configPath, branchPolicy };
+  // Same eager-at-load boundary for the repository denylist: a glob REJECTED AT CONSTRUCTION surfaces as
+  // a ConfigError before any run is created/resumed, never mid-run. Best-effort (Bun.Glob accepts some
+  // malformed patterns at construction); classifyRepository fails closed on a match-time throw.
+  let repositoryPolicy: CompiledRepositoryPolicy;
+  try {
+    repositoryPolicy = compileRepositoryPolicy(config.excludeRepositories);
+  } catch (e) {
+    if (e instanceof RepositoryPolicyError) return fail(e.message);
+    throw e;
+  }
+  return { config, configHash: computeConfigHash(config), configPath, branchPolicy, repositoryPolicy };
 }

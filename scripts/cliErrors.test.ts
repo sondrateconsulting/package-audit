@@ -14,6 +14,7 @@ import { GithubApiError, ThrottleExhausted } from "./github.ts";
 import { IntrospectionError } from "./apiSurface.ts";
 import { ArtifactWriteError } from "./artifactWrite.ts";
 import { PolicyMatchError } from "./branchPolicy.ts";
+import { RepoPolicyMatchError } from "./repositoryPolicy.ts";
 
 const OPTS = { command: "orchestrate", usage: ORCHESTRATE_USAGE };
 
@@ -44,6 +45,7 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       new GithubApiError("x"), new ThrottleExhausted("graphql"),
       new IntrospectionError("x"), new ReadOnlyViolation("READ-ONLY VIOLATION: x"),
       new ArtifactWriteError("x"), new PolicyMatchError("excludeBranches", "dep*", "main", new Error("z")),
+      new RepoPolicyMatchError("acme/*", "acme/repo", new Error("z")),
     ];
     expect(new Set(instances.map((e) => e.name))).toEqual(new Set(KNOWN_OPERATOR_ERRORS));
     for (const e of instances) expect(isKnownOperatorError(e)).toBe(true);
@@ -60,6 +62,11 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       // ConfigError before it can reach a CLI entrypoint, so it is never operator-facing directly.
       // If it ever surfaced unwrapped that would be a bug, and the full stack is the right diagnostic.
       "BranchPolicyError",
+      // repositoryPolicy.ts is the same shape of dependency leaf: it throws its own RepositoryPolicyError
+      // for a construction failure, which loadConfig() ALWAYS re-wraps as ConfigError before any CLI
+      // entrypoint sees it. (Its OTHER error, RepoPolicyMatchError, DOES surface directly and IS
+      // registered above — same split as branchPolicy's BranchPolicyError vs PolicyMatchError.)
+      "RepositoryPolicyError",
     ]);
     const declared = new Set<string>();
     for (const file of readdirSync(import.meta.dir)) {
