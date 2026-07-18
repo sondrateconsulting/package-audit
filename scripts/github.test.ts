@@ -1181,48 +1181,52 @@ describe("throttle wait clamping (§4 hardening)", () => {
     expect(sleeps.length).toBe(sleepsBefore);
   });
 
-  test("the final attempt's classification does not arm a residual pause for the next call", async () => {
-    // 6 secondary throttles exhaust the call; the LAST response must not tax the next,
-    // possibly honest, call with an inherited pause.
+  test("the final attempt's pause IS published so a concurrent/follow-up caller waits the still-live window (§4 fan-out)", async () => {
+    // Under fan-out the final attempt's observed pause is bucket-global evidence: a sibling that
+    // inherits the freed slot must NOT spawn into a still-active rate-limit window. So — unlike the
+    // old per-caller design that DISCARDED the final pause — it is now PUBLISHED. The exhausted
+    // caller itself throws without sleeping it (its loop ended); the NEXT caller inherits the pause,
+    // waits it exactly ONCE, then succeeds. The wall-clock budget charges that window a single time.
     const throttle = err(http(429, { "x-ratelimit-remaining": "50", "retry-after": "7" }, "{}"));
     const { client, sleeps } = makeClient([...Array.from({ length: 6 }, () => throttle), ok(http(200, {}, `{"ok":1}`))]);
     await expect(client.restGet("rate_limit")).rejects.toThrow(ThrottleExhausted);
     const sleepsBefore = sleeps.length;
     const res = await client.restGet("rate_limit");
     expect(res.body).toBe(`{"ok":1}`);
-    expect(sleeps.length).toBe(sleepsBefore); // no residual pause inherited
+    expect(sleeps.length).toBe(sleepsBefore + 1); // inherits the published final pause, waits it ONCE, then succeeds
   });
 
   test("Retry-After numeric seconds has the same 1s floor as the HTTP-date form", () => {
     expect(parseRetryAfterMs("0", 1_000_000_000_000)).toBe(1000);
   });
 
-  test("graphql: the final attempt's classification does not arm a residual pause either", async () => {
+  test("graphql: the final attempt's pause is published too so the next caller waits the live window (§4 fan-out)", async () => {
     const throttle = err(http(200, { "x-ratelimit-remaining": "50", "retry-after": "7" }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`), "gh: GraphQL error");
     const { client, sleeps } = makeClient([...Array.from({ length: 6 }, () => throttle), ok(http(200, {}, `{"data":{"x":1}}`))]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
     const sleepsBefore = sleeps.length;
     const data = await client.graphql("query{x}", {});
     expect(data).toEqual({ x: 1 });
-    expect(sleeps.length).toBe(sleepsBefore); // no residual pause inherited
+    expect(sleeps.length).toBe(sleepsBefore + 1); // inherits the published final pause, waits it ONCE, then succeeds
   });
 
-  test("restGet: the final attempt's PRIMARY classification does not arm a residual pause", async () => {
-    // small GENUINE resets so all 6 primary attempts complete within budget; the LAST
-    // response's far-future reset must not be armed for the follow-up call.
+  test("restGet: the final attempt's PRIMARY pause is published so the next caller waits the reset window (§4 fan-out)", async () => {
+    // small GENUINE resets so all 6 primary attempts fund within budget; the LAST reset (~11 days,
+    // CLAMPED to MAX_PAUSE_MS = 2h) is PUBLISHED for the next caller, who waits that one window then
+    // gets the ok. The wall-clock budget funds the clamped 2h window once (well under 8h total).
     const NOW_SEC = 1_000_000_000;
     const primaryAt = (sec: number) =>
       err(http(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(NOW_SEC + sec) }, `{"message":"rate limit"}`));
     const { client, sleeps } = makeClient([
       primaryAt(100), primaryAt(300), primaryAt(500), primaryAt(700), primaryAt(900),
-      primaryAt(999_999), // final attempt: would arm ~11 days if the guard regressed
+      primaryAt(999_999), // final attempt: clamps to MAX_PAUSE_MS (2h), published for the next caller
       ok(http(200, {}, `{"ok":1}`)),
     ]);
     await expect(client.restGet("rate_limit")).rejects.toThrow(ThrottleExhausted);
     const sleepsBefore = sleeps.length;
     const res = await client.restGet("rate_limit");
     expect(res.body).toBe(`{"ok":1}`);
-    expect(sleeps.length).toBe(sleepsBefore); // the poisoned final primary was not armed
+    expect(sleeps.length).toBe(sleepsBefore + 1); // the published final primary is waited exactly once
   });
 
   test("a graphql SECONDARY (remaining>0) with an absurd Retry-After sleeps exactly MAX_PAUSE_MS", async () => {
@@ -1236,6 +1240,71 @@ describe("throttle wait clamping (§4 hardening)", () => {
     expect(data).toEqual({ x: 1 });
     expect(sleeps.length).toBeGreaterThanOrEqual(1);
     expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
+  });
+});
+
+describe("concurrency: global cap + concurrent throttle coordination (§4/§5.6 fan-out)", () => {
+  test("gh, git (clone), and tar (extract) all count against the ONE global in-flight cap", async () => {
+    // Before this feature git() and tar() called spawnBounded DIRECTLY, bypassing the semaphore — so
+    // under fan-out unbounded concurrent clones/extractions could blow temp-dir/fd/memory. They now
+    // acquire the same global slot gh does. A gate holds every spawn in-flight so peak concurrency is
+    // observable: with cap=2 and 6 launches (2 gh + 2 git + 2 tar), at most 2 ever run at once.
+    let inFlight = 0;
+    let peak = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const spawn: SpawnFn = async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await gate;
+      inFlight--;
+      return ok("v1\n");
+    };
+    const { client } = makeClient([], { spawnImpl: spawn, concurrency: 2, spawnTimeoutMs: 60_000 });
+    const running = [
+      client.gh(["--version"]), client.gh(["--version"]),
+      client.git(["--version"]), client.git(["--version"]),
+      client.tar(["--version"]), client.tar(["--version"]),
+    ];
+    await new Promise((r) => setTimeout(r, 20)); // let the 6 launches settle onto the 2 slots
+    expect(peak).toBe(2); // git/tar are NOT unbounded — they share gh's cap; exactly 2 run at once
+    release();
+    await Promise.all(running);
+    expect(peak).toBe(2); // never exceeded across the whole run
+  });
+
+  test("N concurrent callers sharing ONE rate-limit window resolve correctly — coordinated single sleep, all succeed", async () => {
+    // The redesign exists for the CONCURRENT caller. A barrier makes N callers hit the SAME primary
+    // window simultaneously; arm-before-release (ghBucketedAttempt) plus acquireRespectingPause's
+    // pause re-check mean the window is slept ONCE across all N (the fake sleepImpl advances the clock
+    // synchronously, so the first sleeper's advance makes the rest observe wait<=0), and every caller
+    // then succeeds on retry. (That synchronous advance is also why the fake clock CANNOT reproduce a
+    // real-wall-clock N× budget over-count; the wall-clock union-tail budget that prevents it is
+    // verified by construction — armBucketPause — and by the single-caller budget tests above.)
+    const N = 4;
+    const FIXED_RESET = String(1_000_000_000 + 3600); // ~1h out, within MAX_PAUSE_MS: a fixed absolute window
+    const primary = http(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FIXED_RESET }, `{"message":"rl"}`);
+    let spawns = 0;
+    let arrived = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((r) => { release = r; });
+    let throttleRound = 0;
+    const spawn: SpawnFn = async () => {
+      spawns++;
+      if (throttleRound < N) {
+        throttleRound++;
+        arrived++;
+        if (arrived === N) release(); // all N throttle-spawns are in-flight → resolve them together
+        await barrier;
+        return err(primary);
+      }
+      return ok(http(200, {}, `{"ok":1}`));
+    };
+    const { client, sleeps } = makeClient([], { spawnImpl: spawn, concurrency: N, spawnTimeoutMs: 60_000 });
+    const results = await Promise.all(Array.from({ length: N }, () => client.restGet("rate_limit")));
+    expect(results.every((r) => r.body === `{"ok":1}`)).toBe(true); // every concurrent caller succeeded
+    expect(spawns).toBe(2 * N); // N throttles + N oks — no caller double-spawned or spun
+    expect(sleeps.length).toBe(1); // the shared window was slept ONCE across all N, not N times
   });
 });
 
@@ -2613,8 +2682,10 @@ describe("single chokepoint (grep-enforced)", () => {
   });
   test("every spawn in github.ts flows through a guard-calling wrapper", () => {
     const src = readFileSync("./scripts/github.ts", "utf8");
-    // each of gh()/git()/tar() must call assertSpawnAllowed + its read-only guard
-    expect(src.match(/assertSpawnAllowed\(/g)?.length).toBe(3);
+    // each guarded spawn path must call assertSpawnAllowed + its read-only guard. FOUR paths now:
+    // gh() (bare, e.g. preflight), ghBucketedAttempt() (the pause-aware gh path restGet/graphql use —
+    // a DISTINCT gh spawn that re-runs the guards), git(), and tar().
+    expect(src.match(/assertSpawnAllowed\(/g)?.length).toBe(4);
     for (const guard of ["assertReadOnlyGh", "assertReadOnlyGit", "assertReadOnlyTar"])
       expect(src.includes(`${guard}(args)`)).toBe(true);
   });
