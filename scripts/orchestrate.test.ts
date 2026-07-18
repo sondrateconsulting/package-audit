@@ -686,7 +686,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       if (h.status === "scanned") throw injected; // processUnit's scanned write; delegate every other row
       return realUpsert(h);
     };
-    const client = scanClient(root, [{ name: "main", oid: "o-main", date: "2025-06-01T00:00:00Z" }], "main");
+    const client = scanClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main");
     let thrown: unknown;
     await captureJsonl(async () => {
       try {
