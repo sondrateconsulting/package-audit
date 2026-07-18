@@ -1489,8 +1489,9 @@ Acceptance checklist — the run is NOT complete until all are true:
     an unresolved/private subpath) and CLI usage correctly carry export_name=''.
 [ ] Eligible branches are SELECTED and admitted to the scan pool in committed-date-descending
     order (the cap walks newest-first); no non-default branch before cutoffDate inspected.
-    Completion and DB-write order are unconstrained (branch/owner fan-out, §5) — determinism is
-    guaranteed by content-sorted output, not processing order.
+    Completion and DB-write order are unconstrained (branch/owner fan-out, §5) — same-DB-same-run
+    determinism is guaranteed by sorting every emitted array on a TOTAL stable key (findings by
+    content; errors by the spec-mandated (occurred_at, id)), not by processing order.
 [ ] SQLite is the source of truth. A second run still performs the cheap discovery
     calls needed to detect change (paginated-REST repo discovery, per-repo branch-head
     GraphQL), but performs

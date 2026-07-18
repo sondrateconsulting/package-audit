@@ -91,12 +91,19 @@ describe("buildReport (§7)", () => {
     db.close();
   });
 
-  test("is byte-reproducible across builds", () => {
+  test("is byte-reproducible across builds (errors[] included — frozen occurred_at,id re-render identically)", () => {
     const db = mem();
     const run = seed(db);
+    // Seed a few errors so the re-render exercises errors[] too. errors[] is ordered by the
+    // spec-mandated (occurred_at, id) rather than a content key (PROMPT.md §7), so it is NOT
+    // insertion-order-INDEPENDENT across separate runs — but for ONE frozen DB those keys are fixed,
+    // so re-rendering the same DB is byte-identical, which is the actual determinism contract.
+    db.insertError({ runId: run.runId, scope: "scan", organization: "org-a", repository: "svc", branch: "dev", message: "scan boom" });
+    db.insertError({ runId: run.runId, scope: "introspection", packageName: "expo", version: "50.0.7", message: "introspect boom" });
     const a = JSON.stringify(buildReport(db, run));
     const b = JSON.stringify(buildReport(db, run));
     expect(a).toBe(b);
+    expect((buildReport(db, run) as { errors: unknown[] }).errors.length).toBe(2);
     db.close();
   });
 

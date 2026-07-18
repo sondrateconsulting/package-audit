@@ -8,8 +8,11 @@
 // Owners and (per repo) branch-units are fanned out through bounded pools (§5, concurrency.*), but
 // no mutex is needed: bun:sqlite statements are synchronous and every DB read-modify-write below is
 // an await-free block, so concurrent fibers never interleave mid-write and each unit's rows are
-// distinct. Emitted output is deterministic (report/export re-sort every array by a total key), so
-// the nondeterministic write order under fan-out never changes the bytes.
+// distinct. Determinism is preserved (§6): a given run's DB re-renders byte-identically because
+// report/export sort every emitted array by a TOTAL, stable key — findings by CONTENT, and errors by
+// the spec-mandated (occurred_at, id) (total via the unique id) — so which fiber wrote a row first
+// never changes the emitted bytes. (Chronological error order is inherently per-run: occurred_at is
+// wall-clock, so errors[] was never byte-identical ACROSS separate runs, fan-out or not.)
 
 import { readdirSync, lstatSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
