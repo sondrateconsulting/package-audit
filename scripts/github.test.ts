@@ -484,6 +484,21 @@ describe("restGet caching + conditional requests", () => {
     db.close();
   });
 
+  test("an immutable cache HIT synthesizes an exact status 200 (the whole envelope is pinned, not just the body)", async () => {
+    // restGet's zero-network immutable hit returns { status: 200, ... } literally; without this the
+    // synthesized status is only proven INDIRECTLY (fetchTreeRecursive's own !=200 reject). Pin it
+    // here so a mutation of the synthesized status (e.g. → 206) fails a direct assertion.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const ep = `repos/o/r/contents/package.json?ref=${SHA}`; // SHA-pinned → immutable eligible
+    const { client, calls } = makeClient([ok(http(200, {}, "imm-body"))], { db });
+    await client.restGet(ep, { immutable: true }); // primes the immutable row
+    const hit = await client.restGet(ep, { immutable: true }); // served from cache, zero network
+    expect(hit.status).toBe(200); // the SYNTHESIZED status, asserted directly
+    expect(hit.body).toBe("imm-body");
+    expect(calls.length).toBe(1); // second read hit SQLite, not the network
+    db.close();
+  });
+
   test("a NON-sha ref never earns the immutable zero-network path", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const { client, calls } = makeClient(
