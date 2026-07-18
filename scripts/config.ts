@@ -99,8 +99,10 @@ const isPosInt = (v: unknown): v is number => typeof v === "number" && Number.is
 
 // A LIST of non-empty names under `concurrency.<k>` can only have been meant as the root-level
 // allowlist: a count is never a list. Unambiguous, so name the one key it must be.
-// A '!'-prefixed entry is rejected by the root allowlist too (glob negation is unsupported), so
-// pointing there would just trade one error for another — stay silent instead.
+// A '!'-prefixed entry gets no hint either (the predicate below filters it out): the branch
+// allowlists reject a leading "!" outright (validateBranchPattern — glob negation is unsupported),
+// while the organizations allowlist accepts "!acme" but then matches no real org. Either way,
+// pointing at the root allowlist just trades one problem for another — stay silent instead.
 function concurrencyListHint(key: string, v: unknown): string {
   if (key !== "organizations" && key !== "branches") return "";
   if (!Array.isArray(v) || !v.every((x) => isString(x) && x.length > 0 && !x.startsWith("!"))) return "";
