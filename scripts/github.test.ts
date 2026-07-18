@@ -314,6 +314,15 @@ describe("path encoding + repo shaping", () => {
       [{ ...OK, owner: { login: "" } }, /owner\.login/],
       [{ ...OK, owner: { login: 42 } }, /owner\.login/],   // non-string, non-null (was coerced to "42")
       [{ ...OK, owner: { login: "other" } }, /not the requested owner/], // well-formed but FOREIGN owner → scan redirect
+      // non-canonical identity segments — a "." / ".." / separator / control / whitespace value in
+      // `name` steers the clone URL + fs join + endpoint; real GitHub repo names carry none of these
+      [{ ...OK, name: "." }, /name is not a canonical identity/],
+      [{ ...OK, name: ".." }, /name is not a canonical identity/],
+      [{ ...OK, name: "a/b" }, /name is not a canonical identity/],   // path separator
+      [{ ...OK, name: "a\\b" }, /name is not a canonical identity/],  // backslash
+      [{ ...OK, name: "a b" }, /name is not a canonical identity/],   // whitespace
+      [{ ...OK, name: "a" + String.fromCharCode(0) + "b" }, /name is not a canonical identity/], // control char (NUL)
+      [{ ...OK, name: "a" + String.fromCharCode(0x7f) + "b" }, /name is not a canonical identity/], // control char (DEL)
       // scope-steering fields (silent under-report via sort/cap/filter if coerced)
       [{ ...OK, pushed_at: undefined }, /pushed_at/],       // missing (was coerced to null)
       [{ ...OK, pushed_at: 1700000000 }, /pushed_at/],      // number (was coerced to null → sinks in the cap)
@@ -333,6 +342,23 @@ describe("path encoding + repo shaping", () => {
       expect((caught as GithubApiError).message).toMatch(re);
       expect((caught as GithubApiError).endpoint).toBe("orgs/o/repos");
     }
+  });
+  test("mapRestRepo rejects a non-canonical owner.login even when it equals the expected owner", () => {
+    // expectedOwner=".." makes the case-insensitive cross-owner equality PASS, so this exercises the
+    // identity-segment guard ITSELF — not the foreign-owner check. With expectedOwner="o" the foreign
+    // check would throw first and silently mask a missing guard (the TDD trap).
+    let caught: unknown;
+    try {
+      mapRestRepo({ name: "r", owner: { login: ".." }, pushed_at: null, archived: false, fork: false, private: false }, "orgs/x/repos", 0, "..");
+    } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).message).toMatch(/owner\.login is not a canonical identity/);
+  });
+  test("mapRestRepo accepts legitimate dotted identities (a .github repo under an a.b owner)", () => {
+    // Only the EXACT dot segments "." / ".." are structurally special; interior dots are ordinary.
+    const repo = mapRestRepo({ name: ".github", owner: { login: "a.b" }, pushed_at: null, archived: false, fork: false, private: false }, "orgs/a.b/repos", 0, "a.b");
+    expect(repo.name).toBe(".github");
+    expect(repo.organization).toBe("a.b");
   });
   test("mapRestRepo accepts pushed_at: null (a repo with no pushes) and maps it to pushedAt: null", () => {
     const repo = mapRestRepo({ name: "r", owner: { login: "o" }, pushed_at: null, archived: false, fork: false, private: false }, "orgs/o/repos", 0, "o");
@@ -1777,6 +1803,19 @@ describe("listOrgMemberships (§5.A fail-closed)", () => {
     try { await client.listOrgMemberships(); } catch (e) { caught = e; }
     expect(caught).toBeInstanceOf(GithubApiError);
     expect((caught as GithubApiError).message).toMatch(/index 1/); // the SECOND entry, not a partial success
+  });
+  test("a non-canonical login (dot segment / separator / control char) fails LOUD — a fabricated org can't steer discovery", async () => {
+    // listOrgMemberships has NO cross-owner check (it PRODUCES the discovered org set), so a "." / ".."
+    // / path-separator / control-char login must be rejected HERE or it becomes a fabricated owner fed
+    // verbatim into every subsequent repo/branch scan.
+    const bad = ["..", ".", "a/b", "a\\b", "a b", "a" + String.fromCharCode(0) + "b"];
+    for (const login of bad) {
+      const { client } = makeClient([ok(http(200, {}, JSON.stringify([{ login }])))]);
+      let caught: unknown;
+      try { await client.listOrgMemberships(); } catch (e) { caught = e; }
+      expect(caught).toBeInstanceOf(GithubApiError);
+      expect((caught as GithubApiError).message).toMatch(/malformed org membership at index 0/);
+    }
   });
   test("a malformed entry on a LATER page is indexed GLOBALLY across the flattened pagination", async () => {
     // restGetPagedArray flattens all pages, so the index must be global (page-2 entry 0 → index 2),

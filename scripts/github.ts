@@ -714,6 +714,21 @@ function isCanonicalTreePath(p: string): boolean {
   if (p.length === 0 || p.includes("\u0000")) return false;
   return p.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
 }
+// A GitHub org/repo identity is a single path segment consumed verbatim by API endpoints, the clone
+// URL, and the local clone-dir join. Reject the dot segments "." / ".." (traversal), path separators,
+// and any control/whitespace character — a real GitHub login or repo name contains none of these,
+// while legitimate names like ".github" and "a.b" pass. This does NOT enforce the full GitHub name
+// grammar (GHES/legacy differ); it only closes the structural scope-steering vectors — the same
+// fail-closed posture isCanonicalTreePath applies to tree paths.
+function isCanonicalIdentity(s: string): boolean {
+  if (s.length === 0 || s === "." || s === "..") return false;
+  for (const ch of s) {
+    const c = ch.codePointAt(0)!;
+    if (c <= 0x20 || c === 0x7f) return false; // C0 controls, space, and DEL
+    if (ch === "/" || ch === "\\" || /\s/.test(ch)) return false; // separators + any (incl. Unicode) whitespace
+  }
+  return true;
+}
 
 // ---- §5.C path encoding (pure) --------------------------------------------------------------
 // encodeURIComponent per PATH SEGMENT, preserving '/' — matches the permalink builder's rule.
@@ -761,10 +776,15 @@ export function mapRestRepo(raw: unknown, endpoint: string, index: number, expec
   if (!isObject(raw)) throw fail("not an object");
   const name = raw["name"];
   if (typeof name !== "string" || name.length === 0) throw fail("missing, empty, or non-string name");
+  if (!isCanonicalIdentity(name)) throw fail("name is not a canonical identity segment");
   const owner = raw["owner"];
   if (!isObject(owner)) throw fail("missing or non-object owner");
   const login = owner["login"];
   if (typeof login !== "string" || login.length === 0) throw fail("missing, empty, or non-string owner.login");
+  // Validate the segment BEFORE the cross-owner equality: a hostile "." / ".." / separator login must
+  // fail loud even in the (degenerate) case where it equals expectedOwner, not slip past because the
+  // equality happened to hold.
+  if (!isCanonicalIdentity(login)) throw fail("owner.login is not a canonical identity segment");
   // Both listings pass their EXPECTED owner: an org listing passes the org; a user listing passes the
   // authenticated personal login (known at its orchestrate.ts call site). The row's owner MUST equal
   // it — case-insensitively (GitHub logins are), keeping the returned casing — or a foreign-owner row
@@ -1427,6 +1447,10 @@ export class GithubClient {
       const login = o["login"];
       if (typeof login !== "string" || login.length === 0)
         throw new GithubApiError(`malformed org membership at index ${i}: missing, empty, or non-string login`, { endpoint: "user/orgs" });
+      // No cross-owner check guards this listing (it PRODUCES the org set), so a "." / ".." / separator
+      // / control-char login must be rejected here or it becomes a fabricated owner steering every scan.
+      if (!isCanonicalIdentity(login))
+        throw new GithubApiError(`malformed org membership at index ${i}: login is not a canonical identity segment`, { endpoint: "user/orgs" });
       return login;
     });
   }
