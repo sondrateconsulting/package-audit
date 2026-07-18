@@ -723,18 +723,13 @@ function isCanonicalTreePath(p: string): boolean {
 }
 // A GitHub org/repo identity is a single path segment consumed verbatim by API endpoints, the clone
 // URL, and the local clone-dir join. Reject the dot segments "." / ".." (traversal), path separators,
-// and any control/whitespace character — a real GitHub login or repo name contains none of these,
-// while legitimate names like ".github" and "a.b" pass. This does NOT enforce the full GitHub name
-// grammar (GHES/legacy differ); it only closes the structural scope-steering vectors — the same
-// fail-closed posture isCanonicalTreePath applies to tree paths.
+// and any Unicode control (\p{Cc} — C0, C1, and DEL) or whitespace character — a real GitHub login or
+// repo name contains none of these, while legitimate names like ".github" and "a.b" pass. This does
+// NOT enforce the full GitHub name grammar (GHES/legacy differ); it only closes the structural
+// scope-steering vectors — the same fail-closed posture isCanonicalTreePath applies to tree paths.
+const IDENTITY_REJECT_RE = /[\p{Cc}\s/\\]/u;
 function isCanonicalIdentity(s: string): boolean {
-  if (s.length === 0 || s === "." || s === "..") return false;
-  for (const ch of s) {
-    const c = ch.codePointAt(0)!;
-    if (c <= 0x20 || c === 0x7f) return false; // C0 controls, space, and DEL
-    if (ch === "/" || ch === "\\" || /\s/.test(ch)) return false; // separators + any (incl. Unicode) whitespace
-  }
-  return true;
+  return s.length > 0 && s !== "." && s !== ".." && !IDENTITY_REJECT_RE.test(s);
 }
 
 // ---- §5.C path encoding (pure) --------------------------------------------------------------

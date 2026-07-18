@@ -321,8 +321,10 @@ describe("path encoding + repo shaping", () => {
       [{ ...OK, name: "a/b" }, /name is not a canonical identity/],   // path separator
       [{ ...OK, name: "a\\b" }, /name is not a canonical identity/],  // backslash
       [{ ...OK, name: "a b" }, /name is not a canonical identity/],   // whitespace
-      [{ ...OK, name: "a" + String.fromCharCode(0) + "b" }, /name is not a canonical identity/], // control char (NUL)
-      [{ ...OK, name: "a" + String.fromCharCode(0x7f) + "b" }, /name is not a canonical identity/], // control char (DEL)
+      [{ ...OK, name: "a" + String.fromCharCode(0) + "b" }, /name is not a canonical identity/], // C0 control (NUL)
+      [{ ...OK, name: "a" + String.fromCharCode(0x7f) + "b" }, /name is not a canonical identity/], // DEL
+      [{ ...OK, name: "a" + String.fromCharCode(0x85) + "b" }, /name is not a canonical identity/], // C1 control (NEL)
+      [{ ...OK, name: "a" + String.fromCharCode(0x9b) + "b" }, /name is not a canonical identity/], // C1 control (CSI)
       // scope-steering fields (silent under-report via sort/cap/filter if coerced)
       [{ ...OK, pushed_at: undefined }, /pushed_at/],       // missing (was coerced to null)
       [{ ...OK, pushed_at: 1700000000 }, /pushed_at/],      // number (was coerced to null → sinks in the cap)
@@ -1847,7 +1849,7 @@ describe("listOrgMemberships (§5.A fail-closed)", () => {
     // listOrgMemberships has NO cross-owner check (it PRODUCES the discovered org set), so a "." / ".."
     // / path-separator / control-char login must be rejected HERE or it becomes a fabricated owner fed
     // verbatim into every subsequent repo/branch scan.
-    const bad = ["..", ".", "a/b", "a\\b", "a b", "a" + String.fromCharCode(0) + "b"];
+    const bad = ["..", ".", "a/b", "a\\b", "a b", "a" + String.fromCharCode(0) + "b", "a" + String.fromCharCode(0x85) + "b"];
     for (const login of bad) {
       const { client } = makeClient([ok(http(200, {}, JSON.stringify([{ login }])))]);
       let caught: unknown;
