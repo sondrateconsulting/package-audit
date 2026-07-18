@@ -730,7 +730,7 @@ describe("runReport zero-write on a missing database", () => {
     cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
     includeArchived: false, includeForks: false, includePersonalNamespace: false,
     maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],
-    branches: null, excludeBranches: [],
+    branches: null, excludeBranches: [], excludeRepositories: [],
     packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
     // both under root, which starts empty — any create/mkdir would leave a trace
     paths: { sqlitePath: join(root, "data", "audit.db"), outputDir: join(root, "output") },
@@ -822,7 +822,7 @@ describe("report --html wiring (emitDossiers + runReport integration)", () => {
     cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
     includeArchived: false, includeForks: false, includePersonalNamespace: false,
     maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],
-    branches: null, excludeBranches: [],
+    branches: null, excludeBranches: [], excludeRepositories: [],
     packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
     paths: { sqlitePath: join(root, "data", "audit.db"), outputDir: join(root, "output") },
   });

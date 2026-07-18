@@ -8,7 +8,7 @@ import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { isValidPackageName } from "./packageName.ts";
-import { sortedDedup } from "./patternCanonical.ts";
+import { sortedDedup, toAsciiLower } from "./patternCanonical.ts";
 import { compileBranchPolicy, BranchPolicyError, type CompiledBranchPolicy } from "./branchPolicy.ts";
 
 export class ConfigError extends Error {
@@ -47,6 +47,10 @@ export interface Config {
   // a denylist that wins over `branches`; the default branch is NEVER excluded by policy.
   branches: string[] | null;
   excludeBranches: string[];
+  // Repository-name denylist (Bun glob or exact name) over `owner/repo` full names, CASE-INSENSITIVE
+  // (ASCII fold). Deny-only; default []. A leading "!" or empty entry is rejected at validation. Unlike
+  // excludeBranches (case-SENSITIVE), repo matching is case-insensitive because GitHub repo identity is.
+  excludeRepositories: string[];
   cutoffDate: string; // YYYY-MM-DD
   concurrency: Concurrency;
   packages: PackageConfig[];
@@ -143,9 +147,9 @@ function optBool(o: Record<string, unknown>, key: string, dflt: boolean): boolea
 // helper backs (excludeOrganizations, excludeDirGlobs), and an empty org name or glob is always
 // operator error — "" as a glob matches nothing and as an org name is unresolvable.
 // ONE definition of the per-item rule every string-array config key shares (schema: items
-// minLength 1). Three different array validators consume it (optStringArray,
-// normalizeOrganizations, validateBranchPattern) and the schema-sync test pins every
-// constrained key against it, so the predicate and message cannot drift apart per key.
+// minLength 1). Four different array validators consume it (optStringArray,
+// normalizeOrganizations, validateBranchPattern, validateRepoPattern) and the schema-sync test pins
+// every constrained key against it, so the predicate and message cannot drift apart per key.
 function assertNonEmptyStringItem(v: unknown, label: string, i: number): string {
   if (!isString(v) || v.length === 0) fail(`${label}[${i}] must be a non-empty string`);
   return v;
@@ -167,7 +171,7 @@ function optStringArray(o: Record<string, unknown>, key: string, dflt: string[])
 export const CONFIG_ROOT_KEYS = [
   "$schema", "githubHost", "organizations", "excludeOrganizations", "includePersonalNamespace",
   "includeForks", "includeArchived", "maxReposPerOrg", "maxBranchesPerRepo", "branches",
-  "excludeBranches", "cutoffDate", "concurrency", "packages", "excludeDirGlobs", "paths",
+  "excludeBranches", "excludeRepositories", "cutoffDate", "concurrency", "packages", "excludeDirGlobs", "paths",
 ] as const;
 export const CONFIG_CONCURRENCY_KEYS = ["organizations", "repositories", "branches"] as const;
 export const CONFIG_PATHS_KEYS = ["sqlitePath", "outputDir"] as const;
@@ -251,6 +255,32 @@ function normalizeExcludeBranches(o: Record<string, unknown>): string[] {
   if (v === undefined || v === null) return [];
   if (!Array.isArray(v)) fail(`excludeBranches must be an array of strings`);
   return (v as unknown[]).map((el, i) => validateBranchPattern(el, "excludeBranches", i));
+}
+
+// A repository-denylist pattern (exact `owner/repo` name or Bun glob) at index i. Same structural
+// restriction as validateBranchPattern — rejects a non-string, an empty string, and any leading "!"
+// (Bun.Glob negation, unsupported as a policy-language choice so "!acme/x" can never read as "not
+// acme/x") — but the remediation names excludeRepositories, not branches: a deny-only denylist has no
+// sibling include list to redirect to. The value is JSON.stringify'd so a control character cannot
+// corrupt the diagnostic. Glob VALIDITY is not checked here (Bun.Glob accepts malformed patterns at
+// construction); compileRepositoryPolicy rejects a construction throw, and the matcher fails closed on
+// a match-time throw (see repositoryPolicy.ts). Matching is case-insensitive, but the STORED pattern
+// keeps its original case (the ASCII fold is applied only in the hash projection and at compile time).
+function validateRepoPattern(v: unknown, i: number): string {
+  const s = assertNonEmptyStringItem(v, "excludeRepositories", i);
+  if (s.startsWith("!"))
+    fail(`excludeRepositories[${i}] must not start with "!" — glob negation is not supported; list the repositories to EXCLUDE by their "owner/repo" name (exact or glob): ${JSON.stringify(s)}`);
+  return s;
+}
+
+// excludeRepositories: null/omitted = none ([]); [..] = denylist. null collapses to [] (an absent and
+// an explicit-empty denylist mean the same thing), mirroring excludeBranches/excludeOrganizations. The
+// order is preserved as-written; the ASCII fold + sortedDedup are applied downstream (hash + compile).
+function normalizeExcludeRepositories(o: Record<string, unknown>): string[] {
+  const v = o["excludeRepositories"];
+  if (v === undefined || v === null) return [];
+  if (!Array.isArray(v)) fail(`excludeRepositories must be an array of strings`);
+  return (v as unknown[]).map((el, i) => validateRepoPattern(el, i));
 }
 
 function validateRegistryUrl(url: string, pkgName: string): string {
@@ -367,6 +397,7 @@ export function validateAndNormalize(raw: unknown, env: Record<string, string | 
     maxBranchesPerRepo,
     branches: normalizeBranches(o),
     excludeBranches: normalizeExcludeBranches(o),
+    excludeRepositories: normalizeExcludeRepositories(o),
     cutoffDate,
     concurrency: normalizeConcurrency(o),
     packages: normalizePackages(o, env),
@@ -400,6 +431,14 @@ export function computeConfigHash(config: Config): string {
   // actually configured — which also preserves null (unrestricted) hashing distinctly from [] (only the
   // default branch), since [] itself makes the policy configured.
   const hasBranchPolicy = config.branches !== null || config.excludeBranches.length > 0;
+  // Repository denylist is scan-defining too, but gated INDEPENDENTLY of hasBranchPolicy and folded as
+  // its OWN top-level spread — never merged into the branch-policy spread. A repo-only policy must
+  // still change the hash when no branch policy is set, and (critically) an empty excludeRepositories
+  // must NOT leak `excludeRepositories: []` into an existing branch-policy projection, which would
+  // churn every branch-policy user's config_hash on upgrade and orphan their work_queue. The projected
+  // form is the ASCII-folded sortedDedup — NOT byte-identical to the raw config value — so two configs
+  // differing only in case (which scan identically) hash identically (Premise 5/7).
+  const hasRepoPolicy = config.excludeRepositories.length > 0;
   const projection = {
     githubHost: config.githubHost,
     organizations: config.organizations === null ? null : sortedDedup(config.organizations),
@@ -416,6 +455,9 @@ export function computeConfigHash(config: Config): string {
           excludeBranches: sortedDedup(config.excludeBranches),
         }
       : {}),
+    // Own spread, own gate — see hasRepoPolicy above. Case-folded (ASCII) so a cosmetic case edit is
+    // hash-stable; sortedDedup so reordering/duplicating is hash-stable.
+    ...(hasRepoPolicy ? { excludeRepositories: sortedDedup(config.excludeRepositories.map(toAsciiLower)) } : {}),
     cutoffDate: config.cutoffDate,
     excludeDirGlobs: sortedDedup(config.excludeDirGlobs),
     // packages sorted by name (order does not change what is scanned; names are unique)

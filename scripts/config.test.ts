@@ -48,6 +48,16 @@ describe("validateAndNormalize — happy path + defaults", () => {
     expect(norm({ ...baseRaw(), excludeBranches: null }).excludeBranches).toEqual([]);
     expect(norm({ ...baseRaw(), excludeBranches: ["dependabot/*"] }).excludeBranches).toEqual(["dependabot/*"]);
   });
+  test("excludeRepositories null (default) / [] / [..] normalize; default is [], order preserved as-written", () => {
+    expect(norm(baseRaw()).excludeRepositories).toEqual([]);
+    // null and omitted both collapse to [] (an absent and an explicit-empty denylist mean the same).
+    expect(norm({ ...baseRaw(), excludeRepositories: null }).excludeRepositories).toEqual([]);
+    expect(norm({ ...baseRaw(), excludeRepositories: [] }).excludeRepositories).toEqual([]);
+    // the normalized value is the raw validated strings in file order (NOT folded/sorted — the ASCII
+    // fold + sortedDedup happen only in the hash projection and the compiled policy, not here).
+    expect(norm({ ...baseRaw(), excludeRepositories: ["acme/legacy-*", "*/sandbox"] }).excludeRepositories)
+      .toEqual(["acme/legacy-*", "*/sandbox"]);
+  });
   test("registryUrl trailing slash canonicalized in hash", () => {
     const a = hashOf({ ...baseRaw(), packages: [{ name: "x", registryUrl: "https://r.example.com/" }] });
     const b = hashOf({ ...baseRaw(), packages: [{ name: "x", registryUrl: "https://r.example.com" }] });
@@ -81,6 +91,10 @@ describe("validateAndNormalize — validation failures", () => {
     ["leading-! excludeBranch pattern", { ...baseRaw(), excludeBranches: ["!release/*"] }],
     ["branches not null and not array", { ...baseRaw(), branches: "main" }],
     ["excludeBranches not an array", { ...baseRaw(), excludeBranches: "dependabot/*" }],
+    ["empty-string excludeRepositories pattern", { ...baseRaw(), excludeRepositories: [""] }],
+    ["leading-! excludeRepositories pattern", { ...baseRaw(), excludeRepositories: ["!acme/legacy"] }],
+    ["excludeRepositories not an array", { ...baseRaw(), excludeRepositories: "acme/*" }],
+    ["non-string excludeRepositories element", { ...baseRaw(), excludeRepositories: [42] }],
     ["non-string branch element", { ...baseRaw(), branches: [123] }],
     ["empty-string organization", { ...baseRaw(), organizations: ["acme", ""] }],
     ["non-string organization element", { ...baseRaw(), organizations: [42] }],
@@ -98,6 +112,15 @@ describe("validateAndNormalize — validation failures", () => {
       .toThrow(/excludeOrganizations\[0\] must be a non-empty string/);
     expect(() => norm({ ...baseRaw(), excludeDirGlobs: ["**/dist/**", ""] }))
       .toThrow(/excludeDirGlobs\[1\] must be a non-empty string/);
+    expect(() => norm({ ...baseRaw(), excludeRepositories: ["acme/api", ""] }))
+      .toThrow(/excludeRepositories\[1\] must be a non-empty string/);
+  });
+
+  test("excludeRepositories leading-! rejected with a repo-specific remediation (NOT the branch text)", () => {
+    // Mirrors validateBranchPattern's leading-! rejection but the remediation names excludeRepositories,
+    // not branches — a leading '!' is Bun.Glob negation, unsupported as a policy-language restriction.
+    expect(() => norm({ ...baseRaw(), excludeRepositories: ["!acme/legacy"] }))
+      .toThrow(/excludeRepositories\[0\] must not start with "!"/);
   });
 
   // `organizations` and `branches` each name a root-level allowlist AND a key under `concurrency`.
@@ -189,6 +212,45 @@ describe("computeConfigHash — determinism + scope", () => {
     expect(hashOf({ ...baseRaw(), branches: null, excludeBranches: [] })).toBe(hashOf(baseRaw()));
   });
 
+  // excludeRepositories hash projection: ASCII-folded (sortedDedup), folded into the hash ONLY when
+  // non-empty via a hasRepoPolicy gate INDEPENDENT of the branch-policy gate (mirrors hasBranchPolicy).
+  test("a repo-policy-free config keeps its PRE-FEATURE hash; the repo feature never perturbs existing BRANCH hashes", () => {
+    // policy-free baseline — same literal the branch-policy legacy pin verified byte-equal at 81d79a1
+    // (the excludeRepositories spread must stay OUT of the projection when empty):
+    expect(hashOf(baseRaw())).toBe("86b8d1c1c68298fbe85dbe5012e9a7110ae3ed260ccf3c468ab920d62d8efe8b");
+    // CONFIGURED branch-policy hashes must be byte-identical to their pre-repo-feature values — a
+    // stray excludeRepositories:[] leaking into a branch-policy projection would silently churn these
+    // and orphan every branch-policy user's work_queue on upgrade (verified at d18240b, pre-feature):
+    expect(hashOf({ ...baseRaw(), branches: ["main"] })).toBe("caba45c375db20c05bbd8affeb04bc189c750becbc7dfb047c2ffd96c910ff0e");
+    expect(hashOf({ ...baseRaw(), excludeBranches: ["dev"] })).toBe("f399b30d59fff91259501202dae039b0e9456a5bbd990a4467197b9641c0093f");
+    // an explicit empty / null excludeRepositories is the SAME policy as omitted → same hash
+    expect(hashOf({ ...baseRaw(), excludeRepositories: [] })).toBe(hashOf(baseRaw()));
+    expect(hashOf({ ...baseRaw(), excludeRepositories: null })).toBe(hashOf(baseRaw()));
+  });
+  test("a non-empty excludeRepositories changes the hash and composes distinctly with branch policy", () => {
+    const free = hashOf(baseRaw());
+    const repoOnly = hashOf({ ...baseRaw(), excludeRepositories: ["acme/legacy-*"] });
+    const branchOnly = hashOf({ ...baseRaw(), excludeBranches: ["dev"] });
+    const both = hashOf({ ...baseRaw(), excludeRepositories: ["acme/legacy-*"], excludeBranches: ["dev"] });
+    expect(repoOnly).not.toBe(free);
+    expect(new Set([free, repoOnly, branchOnly, both]).size).toBe(4); // four distinct scopes
+  });
+  test("excludeRepositories reorder/dupe does not change the hash (sortedDedup)", () => {
+    const a = hashOf({ ...baseRaw(), excludeRepositories: ["a/x", "b/y"] });
+    const b = hashOf({ ...baseRaw(), excludeRepositories: ["b/y", "a/x", "a/x"] });
+    expect(a).toBe(b);
+  });
+  test("excludeRepositories hash is CASE-INSENSITIVE via the ASCII fold: case-only edits hash identically", () => {
+    expect(hashOf({ ...baseRaw(), excludeRepositories: ["ACME/Legacy-API"] }))
+      .toBe(hashOf({ ...baseRaw(), excludeRepositories: ["acme/legacy-api"] }));
+  });
+  test("the fold is ASCII-ONLY (NOT Unicode): non-ASCII case variants stay DISTINCT — guards against a toLowerCase() swap", () => {
+    // Ä (U+00C4) vs ä (U+00E4): an ASCII-only fold (A-Z only) leaves BOTH untouched, so they stay
+    // distinct code-unit sequences → distinct hashes. String.prototype.toLowerCase would collapse Ä→ä
+    // and make these collide, so this test fails the moment someone substitutes a Unicode fold.
+    expect(hashOf({ ...baseRaw(), excludeRepositories: ["Äcme/repo"] }))
+      .not.toBe(hashOf({ ...baseRaw(), excludeRepositories: ["äcme/repo"] }));
+  });
   test("any CONFIGURED branch policy changes the hash, and null (unrestricted) stays distinct from [] (default-only)", () => {
     const free = hashOf(baseRaw());
     const emptyAllowlist = hashOf({ ...baseRaw(), branches: [] });
@@ -504,14 +566,14 @@ describe("config.schema.json ↔ runtime sync", () => {
     // Derived FROM the schema, then pinned: a new string-array key gaining items.minLength must be
     // added to the expected list (loud), and every listed key must actually reject an empty item
     // AND a non-string item at runtime (the schema declares items.type "string" for all of them,
-    // and the keys route through THREE different validators — optStringArray,
-    // normalizeOrganizations, validateBranchPattern — so per-key coverage is what keeps them in
-    // lockstep). Schema/code drift on array items fails here instead of shipping.
+    // and the keys route through FOUR different validators — optStringArray,
+    // normalizeOrganizations, validateBranchPattern, validateRepoPattern — so per-key coverage is what
+    // keeps them in lockstep). Schema/code drift on array items fails here instead of shipping.
     const constrained = Object.entries<Record<string, any>>(schema["properties"])
       .filter(([, prop]) => prop["items"]?.["type"] === "string" && prop["items"]?.["minLength"] >= 1)
       .map(([key]) => key)
       .sort();
-    expect(constrained).toEqual(["branches", "excludeBranches", "excludeDirGlobs", "excludeOrganizations", "organizations"]);
+    expect(constrained).toEqual(["branches", "excludeBranches", "excludeDirGlobs", "excludeOrganizations", "excludeRepositories", "organizations"]);
     for (const key of constrained) {
       expect(() => norm({ ...baseRaw(), [key]: [""] })).toThrow(ConfigError);
       expect(() => norm({ ...baseRaw(), [key]: [42] })).toThrow(ConfigError);
@@ -536,6 +598,7 @@ describe("config.schema.json ↔ runtime sync", () => {
       includeForks: config.includeForks, includeArchived: config.includeArchived,
       maxReposPerOrg: config.maxReposPerOrg, branches: config.branches,
       excludeBranches: config.excludeBranches, excludeDirGlobs: config.excludeDirGlobs,
+      excludeRepositories: config.excludeRepositories,
     };
     const pkgRuntimeDefaults: Record<string, unknown> = {
       registryUrl: pkg.registryUrl, registryAuthEnvVar: pkg.registryAuthEnvVar,

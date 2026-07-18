@@ -161,6 +161,25 @@ Every non-default branch stays eligible except `release/…` at any depth — bu
 
 Configuring a policy changes `config_hash`, so the next audit starts a fresh run rather than resuming; the old hash's queue rows survive and are reused if you change back. Not every edit counts: the lists are canonicalized, so reordering or duplicating entries changes nothing, and a policy-free spelling hashes the same either way (`excludeBranches: []` and `null` are identical; `branches: []` is a configured policy and does differ from `null`). Preview with `bun run audit --plan`. It also prints advisory warnings: two for a rule that is doing nothing (a pattern that matched no discovered branch; a deny pattern whose only matches were default branches), and one for `branches: []`, which is the opposite — a rule doing a great deal, since it drops every non-default branch.
 
+### Repository policy
+
+`excludeRepositories` is a **deny-only** list that drops whole repositories by their `owner/repo` full name — exact strings or Bun globs, never regex. `acme/*` drops one org, `*/legacy-*` drops a family across every org, and `acme/legacy-api` drops one repo. As with branch globs, `*` does not cross `/` but `**` does: `["*"]` matches nothing (every full name has a `/`), while `["**"]` matches everything. A leading `!` or empty entry is rejected at startup. There is no repository allowlist — the counterpart to `organizations` at the repo grain is deferred.
+
+Two deliberate differences from `excludeBranches`, both because GitHub repository identity is not git branch identity:
+
+- **Matching is case-INSENSITIVE** (an ASCII fold: `A`–`Z` only). `acme/Legacy-API` and `acme/legacy-api` are the same repo, unlike the case-sensitive `excludeBranches`. The fold is intentionally ASCII-only, so a non-ASCII name is compared byte-for-byte rather than through Unicode case rules a self-hosted host might not share.
+- **There is no dead-pattern warning.** `excludeBranches` warns when a pattern matches nothing; `excludeRepositories` does not (the warning's original purpose — catching case typos — is already handled by case-insensitivity). Confirm a pattern caught the repos you meant with `bun run audit --plan`, which lists every excluded `owner/repo` and a `repositoriesExcluded` count.
+
+Denial is applied to the **raw** discovered list, **before** archived/fork filtering and the `maxReposPerOrg` cap — so a denied repository never consumes a cap slot an eligible one could have used (the repo-grain analog of branch policy running before the cap).
+
+```json
+{
+  "excludeRepositories": ["*/legacy-*", "acme/generated-monorepo"]
+}
+```
+
+Like branch policy, a non-empty `excludeRepositories` changes `config_hash` (a policy-free config keeps its pre-feature hash and resumes cleanly); the list is canonicalized, so reordering, duplicating, or case-only edits change nothing.
+
 ### Concurrency
 
 The optional `concurrency` block sets three fan-out widths (all default when omitted; each capped at 64):

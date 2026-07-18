@@ -30,7 +30,7 @@ const NO_ARGS: OrchestrateArgs = { configPath: null, plan: false, fresh: false, 
 // A full Config, policy fields overridable per scenario. packages default []: no registry fetch.
 const mkConfig = (root: string, over: Partial<Config> = {}): Config => ({
   githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [],
-  branches: null, excludeBranches: [], includePersonalNamespace: false, includeForks: false, includeArchived: false,
+  branches: null, excludeBranches: [], excludeRepositories: [], includePersonalNamespace: false, includeForks: false, includeArchived: false,
   maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
   concurrency: { organizations: 1, repositories: 1, branches: 1 },
   packages: [], excludeDirGlobs: [],

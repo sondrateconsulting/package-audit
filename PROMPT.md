@@ -109,6 +109,14 @@ below).
                                        //   (always scanned); it records the counterfactual instead — a
                                        //   policy_status on a SCANNED row is the default-branch
                                        //   override, NOT an exclusion (§3).
+  "excludeRepositories": [],           // DENY-ONLY denylist over `owner/repo` full names (exact or Bun
+                                       //   glob). CASE-INSENSITIVE (ASCII fold), UNLIKE case-sensitive
+                                       //   `excludeBranches` — GitHub repo identity is case-insensitive.
+                                       //   `*` does not cross '/' (`["*"]` matches nothing); `**` does.
+                                       //   Applied to the RAW list BEFORE archived/fork + `maxReposPerOrg`
+                                       //   (a denied repo never consumes a cap slot). Leading '!'/empty
+                                       //   rejected. No dead-pattern warning — confirm via `--plan`. Like
+                                       //   the branch keys, folded into config_hash ONLY when non-empty.
   "cutoffDate": "2024-01-01",          // ISO date; ignore non-default branches with no commits since this
   "maxBranchesPerRepo": 25,
   "maxReposPerOrg": null,              // null = unlimited
