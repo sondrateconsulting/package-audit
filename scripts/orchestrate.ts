@@ -265,10 +265,17 @@ export async function runScan(
   // escapes, so sibling owners stop dispatching NEW repos/units at once (boundary-only cancellation:
   // in-flight discovery/scans drain naturally, bounded by the per-spawn deadline; nothing throws an
   // AbortError, so no discovery fail-soft catch is ever mis-fired into a false error row).
+  //
+  // onFatal is threaded DOWN into each processRepo's branch pool so a fatal caught deep in a branch
+  // worker trips this run Aborter PROMPTLY — not only when the owner worker's catch below runs (which
+  // waits for that owner's whole branch pool to drain first). The owner catch is still needed for
+  // fatals OUTSIDE the branch-worker path (discovery, duplicate scheduling, reconciliation). abort() is
+  // idempotent, so the two paths compose without double-firing.
   const aborter = new Aborter();
+  const onFatal = (): void => aborter.abort();
   const ownerResults = await boundedPool(owners, config.concurrency.organizations, async (owner) => {
     try {
-      return await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, aborter);
+      return await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, aborter, onFatal);
     } catch (e) {
       aborter.abort(); // trip so sibling owners stop dispatching new work immediately
       throw e; // captured by the pool; the run lifecycle is decided AFTER every owner has drained
@@ -351,7 +358,7 @@ export async function resolveOwnersWithDiscovery(
 export async function processOwner(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, personalLogin: string | null, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-  scheduledRepoKeys: Set<string> = new Set(), signal?: AbortLike,
+  scheduledRepoKeys: Set<string> = new Set(), signal?: AbortLike, onFatal?: () => void,
 ): Promise<RepoPolicyCoverage[]> {
   // Personal-vs-org routing is CASE-INSENSITIVE to match ownerResolve's owner fold: a configured
   // "Alice" that collapsed onto personal login "alice" must still route through listUserRepos, not
@@ -366,7 +373,7 @@ export async function processOwner(
   const coverages: RepoPolicyCoverage[] = [];
   for (const repo of outcome.items) {
     if (signal?.aborted) break;
-    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, signal);
+    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, signal, onFatal);
     if (cov !== null) coverages.push(cov);
   }
   return coverages;
@@ -434,7 +441,7 @@ export async function discoverBranchHeads(
 export async function processRepo(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-  scheduledRepoKeys: Set<string> = new Set(), signal?: AbortLike,
+  scheduledRepoKeys: Set<string> = new Set(), signal?: AbortLike, onFatal?: () => void,
 ): Promise<RepoPolicyCoverage | null> {
   const { config, configHash, branchPolicy } = runtime;
   const outcome = await discoverBranchHeads(db, client, runId, repo);
@@ -557,10 +564,16 @@ export async function processRepo(
       }
     } catch (e) {
       // A fatal escaped this unit (PolicyMatchError, or the internal bucket-wiring assertion — the
-      // handled throttle/scan-error cases above never reach here). Trip branchAbort so the pool
-      // dispatches NO further units at once (fail-fast), then rethrow so boundedPool captures it and
-      // processRepo surfaces the first rejection after the in-flight drain.
+      // handled throttle/scan-error cases above never reach here). Trip branchAbort so THIS pool
+      // dispatches NO further units at once (fail-fast). Also trip the RUN-level Aborter PROMPTLY via
+      // onFatal: without it the run Aborter is only tripped in runScan's owner-worker catch, which runs
+      // AFTER this whole branch pool drains and processRepo rethrows — so during that drain sibling
+      // OWNERS keep dispatching new repos. onFatal (= aborter.abort) stops sibling owners at their next
+      // repo check and trips sibling repos' branchAborts at once. Settle-all is preserved: abort only
+      // stops NEW dispatch; in-flight units still drain, so db.close() never races a live writer. Then
+      // rethrow so boundedPool captures it and processRepo surfaces the first rejection after the drain.
       branchAbort.abort();
+      onFatal?.();
       throw e;
     }
   }, { signal: branchAbort });

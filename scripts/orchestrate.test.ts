@@ -8,6 +8,7 @@ import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type RepoInfo, type SpawnFn } from "./github.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
+import { Aborter } from "./boundedPool.ts";
 import type { Config } from "./config.ts";
 import type { OrchestrateArgs } from "./args.ts";
 
@@ -1757,6 +1758,44 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
       (br) => db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: br }) !== null);
     expect(dispatched.length).toBe(3); // exactly the 2 scanned + the fatal b3; the other 3 were skipped (no row)
     expect(dispatched).toContain("b3"); // the fatal unit WAS dispatched (enqueued, then threw mid-scan)
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a branch fatal trips the RUN-level Aborter via onFatal PROMPTLY — the instant it is caught, before the drain (§7)", async () => {
+    // The fix for the deferred "branch-abort promptness" finding: a fatal caught deep in a branch worker
+    // must trip the RUN-level Aborter at once (not only when the owner worker's catch runs, AFTER this
+    // repo's whole branch pool drains and processRepo rethrows). onFatal is invoked synchronously in the
+    // branch-worker fatal catch, so a tripped run Aborter promptly stops SIBLING owners at their next
+    // repo check and sibling repos' branch pools at their next pull (boundedPool.test.ts "abort STOPS
+    // dispatch" + processOwner's `if (signal?.aborted) break` prove the tripped Aborter halts dispatch).
+    const root = mkdtempSync(join(tmpdir(), "fanout-onfatal-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const nodes = nodesN(3); // main, b1, b2 (branches:1 → strictly sequential dispatch)
+    const injected = new PolicyMatchError("excludeBranches", "x*", "b1", new Error("write-time incoherence"));
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+      if (h.status === "scanned" && h.branch === "b1") throw injected; // fatal from b1's scanned upsert
+      return realUpsert(h);
+    };
+    const client = makeClient(root, async (_bin, args) =>
+      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    const seqConfig = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 1 } };
+    const runAborter = new Aborter();
+    // Record whether the run Aborter was ALREADY tripped when onFatal fired vs the branch-abort discipline.
+    let onFatalCalls = 0;
+    const onFatal = (): void => { onFatalCalls++; runAborter.abort(); };
+    let thrown: unknown;
+    await captureJsonl(async () => {
+      try { await processRepo(db, client, rt(seqConfig, "h"), runId, "org-a", repo, [], new Set(), new Set(), runAborter, onFatal); }
+      catch (e) { thrown = e; }
+    });
+    expect(thrown).toBe(injected);                  // the fatal is still rethrown (deterministic surfacing unchanged)
+    expect(onFatalCalls).toBeGreaterThanOrEqual(1); // onFatal fired ON the branch fatal — NOT swallowed
+    expect(runAborter.aborted).toBe(true);          // → the run-level Aborter is tripped, so siblings stop dispatching
+    // b2 (after the fatal b1) was never dispatched — the local branchAbort still fail-fasts this pool.
+    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: "b2" })).toBeNull();
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
