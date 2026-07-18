@@ -820,6 +820,32 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("a walkClone failure on a TRUNCATED tree fails the unit LOUD and still reclaims the clone temp dir (no leak)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-leak-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    // truncated tree → clone fallback; the clone "succeeds" but the dest dir is never materialized, so
+    // walkClone's readdirSync throws (a deterministic stand-in for an EACCES/EIO walk failure on a real
+    // large clone). Since walkClone now throws, the clone temp dir must be reclaimed by processUnit's
+    // cleanup, not leaked until the next startup sweep.
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      if (args[0] === "clone") return { exitCode: 0, stderr: "", stdout: "" }; // exits 0 but creates no dest
+      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: "o-moved\n" };
+      if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
+      return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // truncated → clone fallback
+    });
+    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(db.getUnit(key("main"))?.status).toBe("error"); // failed loud, never silently marked scanned
+    expect((db.read(`SELECT COUNT(*) AS n FROM errors WHERE run_id = ? AND scope = 'scan'`).get(runId) as { n: number }).n).toBeGreaterThan(0);
+    // the CLONE run temp dir (makeRunTempDir: pkg-audit-*) must be reclaimed; the pkg-audit-gitcfg-*
+    // dir is a client-lifetime git-config resource, not a per-unit leak, so exclude it.
+    const cloneLeftovers = readdirSync(root).filter((n) => n.startsWith("pkg-audit-") && !n.startsWith("pkg-audit-gitcfg-"));
+    expect(cloneLeftovers).toEqual([]); // clone temp dir reclaimed — no leak
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("runPlan uses the SAME shared planner — a denied branch counts as excludedByPolicy, not eligible", async () => {
     const root = mkdtempSync(join(tmpdir(), "plan-policy-"));
     const config = { ...testConfig(root, 25), organizations: ["org-a"], excludeBranches: ["dev"], packages: [] };

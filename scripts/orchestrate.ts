@@ -523,8 +523,6 @@ async function processUnit(
 ): Promise<{ commitSha: string; committedDate: string }> {
   const h = decision.head;
   const tree = await client.fetchTreeRecursive(repo.organization, repo.name, h.treeOid);
-  let entries: TreeEntry[];
-  let readFile: (path: string, entry: TreeEntry) => Promise<string | null>;
   let cloneDir: string | null = null;
   // The ACTUAL scanned commit + its date: the discovery head (h.oid / h.committedDate) for the API
   // path, or the clone's real HEAD for the fallback (the branch may have moved between GraphQL
@@ -532,20 +530,25 @@ async function processUnit(
   // scanned_commit_date must pin to what was truly scanned, §5.C/§4).
   let commitSha = h.oid;
   let committedDate = h.committedDate;
-  if (tree.truncated) {
-    const cloned = await client.cloneShallow(repo.organization, repo.name, h.name);
-    cloneDir = cloned.dir;
-    commitSha = cloned.headSha;
-    committedDate = cloned.headCommittedDate;
-    entries = walkClone(cloned.dir);
-    readFile = cloneReader(cloned.dir);
-  } else {
-    entries = tree.paths.map((p) => ({ path: p.path, type: p.type, sha: p.sha, size: p.size }));
-    readFile = apiReader(client, repo.organization, repo.name, h.oid);
-  }
-  const loc: UnitLocation = { githubHost: config.githubHost, organization: repo.organization, repository: repo.name, branch: h.name, commitSha };
-
+  // The clone-fallback setup (cloneShallow → walkClone → cloneReader) runs INSIDE this try so a
+  // walkClone/reader throw AFTER cloneShallow succeeds still reaches the finally's clone-dir reclaim —
+  // otherwise a completed (multi-GB) clone would leak until the next startup sweep. cloneShallow's own
+  // failure path cleans up before it sets cloneDir, so the finally correctly no-ops there.
   try {
+    let entries: TreeEntry[];
+    let readFile: (path: string, entry: TreeEntry) => Promise<string | null>;
+    if (tree.truncated) {
+      const cloned = await client.cloneShallow(repo.organization, repo.name, h.name);
+      cloneDir = cloned.dir;
+      commitSha = cloned.headSha;
+      committedDate = cloned.headCommittedDate;
+      entries = walkClone(cloned.dir);
+      readFile = cloneReader(cloned.dir);
+    } else {
+      entries = tree.paths.map((p) => ({ path: p.path, type: p.type, sha: p.sha, size: p.size }));
+      readFile = apiReader(client, repo.organization, repo.name, h.oid);
+    }
+    const loc: UnitLocation = { githubHost: config.githubHost, organization: repo.organization, repository: repo.name, branch: h.name, commitSha };
     const result = await scanUnit(loc, { trackedPackages: config.packages.map((p) => p.name), excludeDirGlobs: config.excludeDirGlobs }, entries, readFile, cliTermSets);
     const now = nowIso();
     for (const d of result.dependencyFindings) {
