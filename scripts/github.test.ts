@@ -1500,10 +1500,11 @@ describe("cloneShallow temp-dir cleanup on failure", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("a cleanup failure never masks the original clone error", async () => {
+  test("a cleanup failure never masks the original clone error, but IS surfaced as a warning", async () => {
     // rmSync's force only suppresses ENOENT — an EACCES/EBUSY from the cleanup walk must not
-    // replace the actionable git error (which carries git's stderr). The stuck tree is the
-    // next run's startup sweep's problem; the ORIGINAL error is the operator's diagnostic.
+    // replace the actionable git error (which carries git's stderr): the ORIGINAL error is the
+    // operator's diagnostic. But the failed reclaim is not swallowed silently — it emits a
+    // clone-cleanup-failed warning, consistent with processUnit's success-path reclaim.
     const root = mkdtempSync(join(tmpdir(), "clone-mask-"));
     let cloneDest = "";
     const spawnImpl: SpawnFn = async (_bin, args) => {
@@ -1517,11 +1518,22 @@ describe("cloneShallow temp-dir cleanup on failure", () => {
       githubHost: "github.com", spawnImpl,
       env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: root,
     });
+    const isRoot = typeof process.getuid === "function" && process.getuid() === 0; // root ignores chmod
+    const lines: string[] = [];
+    const realWrite = process.stdout.write.bind(process.stdout);
+    (process.stdout as unknown as { write: (s: string) => boolean }).write = (s: string) => { lines.push(s); return true; };
+    let thrown: unknown;
     try {
-      await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/ORIGINAL_GIT_FAILURE/);
-    } finally {
+      await client.cloneShallow("o", "r", "main");
+    } catch (e) { thrown = e; } finally {
+      (process.stdout as unknown as { write: typeof realWrite }).write = realWrite;
       if (cloneDest !== "") chmodSync(cloneDest, 0o755);
       rmSync(root, { recursive: true, force: true });
+    }
+    expect(String((thrown as Error | undefined)?.message)).toMatch(/ORIGINAL_GIT_FAILURE/); // never masked
+    if (!isRoot) {
+      const events = lines.join("").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(events.filter((e) => e.event === "warning" && e.reason === "clone-cleanup-failed").length).toBe(1); // reclaim failure surfaced
     }
   });
 });

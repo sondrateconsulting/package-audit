@@ -1762,8 +1762,11 @@ export class GithubClient {
       // not replace the actionable git error (a stuck tree is the next sweep's problem).
       try {
         rmSync(runDir, { recursive: true, force: true });
-      } catch {
-        // the original error propagates below
+      } catch (cleanupErr) {
+        // best-effort — the ORIGINAL clone/rev-parse/show error (thrown below) is the operator's
+        // diagnostic and must NOT be masked, but the failed reclaim is still surfaced (a stuck tree the
+        // next startup sweep must handle), consistent with processUnit's clone-cleanup-failed warning.
+        logLine({ event: "warning", reason: "clone-cleanup-failed", target: runDir, message: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) });
       }
       throw e;
     }
