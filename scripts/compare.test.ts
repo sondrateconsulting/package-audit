@@ -462,29 +462,40 @@ describe("buildCompare — policy churn", () => {
     forge.close();
     const db2 = AuditDb.open({ sqlitePath: path });
     const rB = db2.getRun(runBId)!;
-
-    // (1) report surfaces the incoherent attribution verbatim — no re-match, no throw
-    const legacyInReport = buildReport(db2, rB).scanScope.policyBranches.find((b) => b.branch === "legacy");
-    expect(legacyInReport).toEqual({
-      organization: "org-a", repository: "svc", branch: "legacy",
-      disposition: "excluded", policyStatus: "excluded-by-deny", matchedPattern: "release/*",
-    });
-
-    // (2) the default export writes it byte-faithful
     const out = mkdtempSync(join(tmpdir(), "readgate-export-"));
-    exportRun(db2, rB, out, { raw: false });
-    const legacyLine = readFileSync(join(out, "xray", "run_unit_head.jsonl"), "utf8")
-      .split("\n").filter((l) => l.length > 0)
-      .map((l) => JSON.parse(l) as { branch: string; policy_matched_pattern: string })
-      .find((r) => r.branch === "legacy");
-    expect(legacyLine?.policy_matched_pattern).toBe("release/*");
-    rmSync(out, { recursive: true, force: true });
-
-    // (3) compare files it under enteredExclusion carrying the incoherent pattern verbatim — no re-validation, no throw
-    const churn = buildCompare(db2, db2.getRun(runAId)!, rB).compare.policyChurn;
-    if (churn.available !== true) throw new Error("expected churn available");
-    expect(churn.enteredExclusion.find((e) => e.branch === "legacy")?.runB.policyMatchedPattern).toBe("release/*");
-    db2.close();
+    // Prove the read surfaces are GLOB-FREE, not merely non-throwing: install a Bun.Glob that throws on
+    // construction, so a read surface that tried to re-evaluate the stored pattern (constructing a glob
+    // but ignoring its false result) fails HERE instead of passing. report.ts / export.ts / compare.ts
+    // construct no Bun.Glob for any other reason, so this cannot fire spuriously.
+    const originalGlob = Bun.Glob;
+    (Bun as { Glob: unknown }).Glob = class {
+      constructor() {
+        throw new Error("read gate constructed a Bun.Glob — report/export/compare must stay glob-free (write-time-only attestation)");
+      }
+    };
+    try {
+      // (1) report surfaces the incoherent attribution verbatim — no re-match, no glob constructed
+      const legacyInReport = buildReport(db2, rB).scanScope.policyBranches.find((b) => b.branch === "legacy");
+      expect(legacyInReport).toEqual({
+        organization: "org-a", repository: "svc", branch: "legacy",
+        disposition: "excluded", policyStatus: "excluded-by-deny", matchedPattern: "release/*",
+      });
+      // (2) the default export writes it byte-faithful
+      exportRun(db2, rB, out, { raw: false });
+      const legacyLine = readFileSync(join(out, "xray", "run_unit_head.jsonl"), "utf8")
+        .split("\n").filter((l) => l.length > 0)
+        .map((l) => JSON.parse(l) as { branch: string; policy_matched_pattern: string })
+        .find((r) => r.branch === "legacy");
+      expect(legacyLine?.policy_matched_pattern).toBe("release/*");
+      // (3) compare files it under enteredExclusion carrying the incoherent pattern verbatim — no re-validation, no glob
+      const churn = buildCompare(db2, db2.getRun(runAId)!, rB).compare.policyChurn;
+      if (churn.available !== true) throw new Error("expected churn available");
+      expect(churn.enteredExclusion.find((e) => e.branch === "legacy")?.runB.policyMatchedPattern).toBe("release/*");
+    } finally {
+      (Bun as { Glob: typeof Bun.Glob }).Glob = originalGlob;
+      rmSync(out, { recursive: true, force: true });
+      db2.close();
+    }
   });
 
   test("churn is unavailable when EITHER run carries a pre-v4 NULL scanned_commit_date (unknown provenance)", () => {

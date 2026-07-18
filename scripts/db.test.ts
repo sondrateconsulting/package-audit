@@ -3809,18 +3809,27 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     expect(v4runs.checks).toContain(normalizeCheck("status IN ('running','completed','failed')"));
   });
 
-  test("tableShapesAt hands out a COPY, never the memoized ownership oracle — a caller's mutation cannot corrupt it", () => {
+  test("tableShapesAt hands out a COPY on BOTH the cold and cached paths — a caller's mutation cannot corrupt the memoized ownership oracle", () => {
     // tableShapesAt is exported for tests but referenceShapesByVersion is the same cache production
-    // hasOwnedTableSet reads; returning the live Map would let any caller poison ownership for the rest
-    // of the process. RED before the copy: both calls returned the identical cached instance.
-    const a = tableShapesAt(4);
-    const b = tableShapesAt(4);
-    expect(a).not.toBe(b); // distinct objects…
-    expect([...a.entries()].sort()).toEqual([...b.entries()].sort()); // …with identical contents
-    // The not.toBe gate above throws on the RED path, so the tamper below only ever runs once copies are
-    // in place — mutating the returned map must not survive into a later call (the oracle stays intact).
-    (a as Map<string, string>).set("run_unit_head", "TAMPERED");
-    expect(tableShapesAt(4).get("run_unit_head")).not.toBe("TAMPERED");
+    // hasOwnedTableSet reads; returning the live Map on EITHER path would let a caller poison ownership
+    // for the rest of the process. hasOwnedTableSet only warms MIN_OWNED_VERSION..SCHEMA_VERSION, so a
+    // higher key is guaranteed COLD here — this test owns its whole cache lifecycle and pins the cold
+    // build (first call) AND the cached return (later calls) deterministically, independent of test
+    // order (a cache warmed by an earlier test would otherwise hide a cold-path-only regression).
+    const coldKey = SCHEMA_VERSION + 100;
+    const cold = tableShapesAt(coldKey); // COLD path — the first build for this key
+    const warm = tableShapesAt(coldKey); // CACHED path — served from the memoized entry
+    expect(cold).not.toBe(warm); // both are fresh copies → distinct instances (RED if EITHER path hands back the memoized Map)
+    const realRuns = cold.get("runs");
+    expect(realRuns).toBeDefined();
+    expect([...cold.entries()].sort()).toEqual([...warm.entries()].sort()); // …with identical contents
+    // Tamper the COLD-path result: the memoized oracle a later call reads must be BYTE-IDENTICAL to the
+    // real value (not merely "not TAMPERED" — that would also pass on an undefined regression).
+    (cold as Map<string, string>).set("runs", "TAMPERED-COLD");
+    expect(tableShapesAt(coldKey).get("runs")).toBe(realRuns);
+    // Tamper a CACHED-path result too: same guarantee (this arm is what catches a cached-path-only regression).
+    (tableShapesAt(coldKey) as Map<string, string>).set("runs", "TAMPERED-CACHED");
+    expect(tableShapesAt(coldKey).get("runs")).toBe(realRuns);
   });
 
   test("inbound FK from a NON-audit table: the ownership preflight refuses the file before --fresh/migration", () => {
