@@ -6,7 +6,7 @@ import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, planSumma
 import type { TreeEntry } from "./unitPipeline.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
-import { compileRepositoryPolicy } from "./repositoryPolicy.ts";
+import { compileRepositoryPolicy, RepoPolicyMatchError } from "./repositoryPolicy.ts";
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type RepoInfo, type SpawnFn } from "./github.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { Aborter } from "./boundedPool.ts";
@@ -680,6 +680,10 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
   const throwingGlob = (thrown: unknown): Bun.Glob => ({ match() { throw thrown; } }) as unknown as Bun.Glob;
   const badGlobError = new Error("bad glob"); // the exact injected cause — used to prove identity on rethrow
   const throwingPolicy = { include: null, exclude: [{ pattern: "boom*", glob: throwingGlob(badGlobError) }] };
+  // The repository-denylist analog: a compiled repo glob that throws at .match() time. The repo "org-a/svc"
+  // never equals "boom*", so the exact-first pass misses and classifyRepository reaches the throwing glob.
+  const badRepoGlobError = new Error("bad repo glob");
+  const throwingRepoPolicy = [{ pattern: "boom*", glob: throwingGlob(badRepoGlobError) }];
 
   test("a denied NON-default branch persists as policy-excluded + policy attribution, and is never scanned", async () => {
     const root = mkdtempSync(join(tmpdir(), "policy-deny-"));
@@ -811,6 +815,49 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     // and it aborted MID-plan — a completed plan would have logged a plan-summary; a fail-open swallow
     // would have too (with the denied repo silently skipped). Its absence proves the fatal abort.
     expect(events.some((e) => e["event"] === "plan-summary")).toBe(false);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("runScan marks the run FAILED on a RepoPolicyMatchError from the denylist and rethrows the original", async () => {
+    const root = mkdtempSync(join(tmpdir(), "repo-policy-failrun-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // packages:[] so discoverCliTerms is a no-op; the denylist glob throws during OWNER discovery (before
+    // any branch planning), so NO branch policy is configured — the fatal is purely repository-grained.
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
+    const client = makeClient(root, async () =>
+      ({ exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` }));
+    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [] }, repositoryPolicy: throwingRepoPolicy };
+    let thrown: unknown = null;
+    await captureJsonl(async () => {
+      thrown = await runScan(db, client, runtime, noArgs, null).then(() => null, (e: unknown) => e);
+    });
+    // the ORIGINAL error is rethrown UNCHANGED — a RepoPolicyMatchError carrying the exact injected cause.
+    expect(thrown).toBeInstanceOf(RepoPolicyMatchError);
+    expect((thrown as { cause?: unknown }).cause).toBe(badRepoGlobError);
+    // a repository-policy config defect must exclude the run from latest, exactly like a branch PolicyMatchError.
+    const run = db.read("SELECT status FROM runs ORDER BY started_at DESC LIMIT 1").get() as { status: string };
+    expect(run.status).toBe("failed");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("runPlan propagates a RepoPolicyMatchError from the denylist and writes NOTHING (the --plan zero-write twin)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "repo-plan-throw-"));
+    // The denylist glob throws in filterSortCapRepos — AFTER repo discovery, BEFORE listBranchHeads —
+    // so it must abort the whole plan (never degrade into a per-repo continue) with NO DB/output write.
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
+    const client = makeClient(root, async () =>
+      ({ exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` }));
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [] }, repositoryPolicy: throwingRepoPolicy };
+    let thrown: unknown = null;
+    const events = await captureJsonl(async () => {
+      thrown = await runPlan(client, runtime, "rvo").then(() => null, (e: unknown) => e);
+    });
+    expect(thrown).toBeInstanceOf(RepoPolicyMatchError);
+    expect((thrown as { cause?: unknown }).cause).toBe(badRepoGlobError);
+    expect(events.some((e) => e["event"] === "plan-summary")).toBe(false); // aborted mid-plan
+    expect(readdirSync(root)).toEqual([]); // zero-write invariant: no db, no output, nothing at all
     rmSync(root, { recursive: true, force: true });
   });
 

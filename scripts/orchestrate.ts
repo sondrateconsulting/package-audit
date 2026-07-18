@@ -30,7 +30,7 @@ import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchSnapshot, type BranchDiscoveryOutcome } from "./github.ts";
 import { planRepoBranches, planPolicyDiagnostics, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
 import { PolicyMatchError, type CompiledBranchPolicy, type RepoPolicyCoverage } from "./branchPolicy.ts";
-import { type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
+import { RepoPolicyMatchError, type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
 import { discovered, discoveryFailed, type DiscoveryOutcome } from "./discovery.ts";
 import { computePolicyWarnings, isEmptyAllowlist, policyWarningLines, type PolicyWarning } from "./policyWarnings.ts";
 import { assertContained } from "./readOnlyGuard.ts";
@@ -264,10 +264,11 @@ export async function runScan(
   logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
 
   // §5.A/§5.B discover + process, fanned out across owners bounded by concurrency.organizations (§5).
-  // A PolicyMatchError (a compiled branch matcher THREW at match time — fail-closed) is a GLOBAL
-  // config defect — never a per-repo soft error — so it ABORTS the whole run: mark it failed (excluded
-  // from latest selection) and rethrow the ORIGINAL operator-facing error unchanged (registered in
-  // KNOWN_OPERATOR_ERRORS).
+  // A policy-match fatal — a PolicyMatchError (a compiled BRANCH matcher threw at match time) or a
+  // RepoPolicyMatchError (a compiled REPOSITORY denylist glob threw during owner discovery) — is a
+  // GLOBAL config defect, never a per-repo soft error, so it ABORTS the whole run: mark it failed
+  // (excluded from latest selection) and rethrow the ORIGINAL operator-facing error unchanged (both are
+  // registered in KNOWN_OPERATOR_ERRORS).
   //
   // boundedPool SETTLES ALL: an owner that throws never tears its siblings down, and every owner fiber
   // (with its nested per-repo branch pools) DRAINS before this returns — so main()'s finally
@@ -298,23 +299,24 @@ export async function runScan(
 
   // Fatal lifecycle over the collected REAL failures (rejections). Under boundary-only cancellation
   // nothing throws an AbortError, so every rejection is a genuine fatal. failRun iff ANY is a
-  // PolicyMatchError (a config defect must exclude the run from latest) — even when a lower-index
-  // generic escape is the one surfaced. A run with NO PolicyMatchError stays resumable (no failRun).
-  // Rethrow the FIRST rejection in owner order (deterministic surfaced error) AFTER the full drain.
+  // policy-match fatal — a PolicyMatchError (branch) OR a RepoPolicyMatchError (repository denylist) —
+  // since a config defect must exclude the run from latest, even when a lower-index generic escape is
+  // the one surfaced. A run with NO policy-match fatal stays resumable (no failRun). Rethrow the FIRST
+  // rejection in owner order (deterministic surfaced error) AFTER the full drain.
   //
   // ACCEPTED trade-off (prompt fan-out cancellation): the predicate sees only COLLECTED failures. A
   // generic fatal (a DB-write failure, the bucket-wiring assertion) in an earlier owner now trips the
-  // run Aborter promptly (onFatal), which can SKIP a later sibling owner's would-be PolicyMatchError —
+  // run Aborter promptly (onFatal), which can SKIP a later sibling owner's would-be policy-match fatal —
   // so that run stays resumable rather than failed. This is benign: a fatal run emits NO report (the
   // throw below precedes completeRun/emitReport) and is never served as "latest" (that filters
   // status='completed'), and the config defect is DETERMINISTIC — it recurs and fails the next run
-  // THAT re-scans that branch (a run that never reaches it cannot surface it, but also emits no report
-  // implicating that branch). Guaranteeing failRun on a masked-behind-a-generic-fatal PolicyMatchError
+  // THAT re-scans that owner/branch (a run that never reaches it cannot surface it, but also emits no
+  // report implicating it). Guaranteeing failRun on a masked-behind-a-generic-fatal policy-match error
   // would need estate-wide up-front policy validation, out of scope here. The masking already existed
   // pre-fan-out (any abort stops siblings); onFatal only narrows the window.
   const failures = ownerResults.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
   if (failures.length > 0) {
-    if (failures.some((reason) => reason instanceof PolicyMatchError)) db.failRun(runId);
+    if (failures.some((reason) => reason instanceof PolicyMatchError || reason instanceof RepoPolicyMatchError)) db.failRun(runId);
     throw failures[0];
   }
 
