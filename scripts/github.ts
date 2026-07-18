@@ -703,6 +703,11 @@ export function parseTreeResponse(json: unknown, endpoint: string, expectedSha: 
       // the downstream size gates instead of failing loud here.
       if (typeof s !== "number" || !Number.isSafeInteger(s) || s < 0) throw fail(`tree[${i}] size is not a non-negative safe integer`);
       size = s;
+    } else if (type === "blob") {
+      // The scan cap (unitPipeline) skips only entries whose size EXCEEDS the limit; a null-size blob
+      // sails through it and gets fetched + scanned regardless. Real GitHub always emits size on blobs,
+      // so a missing one is a malformed/hostile response — fail closed (tree/commit entries carry none).
+      throw fail(`tree[${i}] blob entry is missing size`);
     }
     return { path, type, sha, size };
   });

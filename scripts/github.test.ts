@@ -876,6 +876,13 @@ describe("parseGraphqlEnvelope / parseTreeResponse (pure)", () => {
     if (res.truncated) throw new Error("expected a non-truncated tree");
     expect(res.paths.map((p) => p.size)).toEqual([0, null]);
   });
+  test("a blob entry MISSING size fails closed — a null size would bypass the 2 MiB scan cap", () => {
+    // unitPipeline skips only entries whose size EXCEEDS the cap; a null size sails through and the
+    // (possibly huge) blob is fetched + scanned. Real GitHub always emits size for blobs, so require it.
+    expect(() =>
+      parseTreeResponse({ sha: SHA, truncated: false, tree: [{ path: "a", type: "blob", sha: "b".repeat(40) }] }, "ep", SHA),
+    ).toThrow(/tree\[0\] blob entry is missing size/);
+  });
 });
 
 // ---- fetchTreeRecursive envelope validation (§5.C fail-closed) --------------------------------
