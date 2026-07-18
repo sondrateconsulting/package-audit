@@ -75,12 +75,12 @@ describe("RepositoryPolicyError — construction-time guard", () => {
 });
 
 describe("RepoPolicyMatchError — fail-closed match-time error", () => {
-  test("is an Error subclass carrying the pattern + ownerRepo, stable name", () => {
+  test("is an Error subclass carrying the pattern + ownerRepoLower, stable name", () => {
     const e = new RepoPolicyMatchError("acme/*", "acme/repo", new Error("boom"));
     expect(e).toBeInstanceOf(Error);
     expect(e.name).toBe("RepoPolicyMatchError");
     expect(e.pattern).toBe("acme/*");
-    expect(e.ownerRepo).toBe("acme/repo");
+    expect(e.ownerRepoLower).toBe("acme/repo");
     expect(e.message).toContain("acme/*");
     expect(e.message).toContain("acme/repo");
     expect(e.message).toContain("boom");
@@ -97,10 +97,20 @@ describe("classifyRepository — exact-first, glob, case-insensitive, fail-close
     expect(classifyRepository(p, "acme/service-a")).toBe(false);
   });
   test("matching is case-insensitive: a folded pattern excludes the caller's folded owner/repo", () => {
-    // The pattern folds at compile; the CALLER folds the owner/repo with toAsciiLower before calling.
+    // The pattern folds at compile; classifyRepository folds the owner/repo internally, so pre-folding
+    // here is idempotent (belt-and-suspenders).
     const p = compileRepositoryPolicy(["ACME/Legacy-API"]);
     expect(classifyRepository(p, toAsciiLower("acme/legacy-api"))).toBe(true);
     expect(classifyRepository(p, toAsciiLower("AcMe/LEGACY-api"))).toBe(true);
+  });
+  test("folds its OWN input: an UN-folded mixed-case owner/repo is matched (a caller cannot fail OPEN by forgetting to fold)", () => {
+    // The fold lives INSIDE classifyRepository, not in a caller contract — so passing the raw,
+    // original-case name (NO toAsciiLower) still matches. This is the fail-closed guarantee the
+    // type system can't express; a future caller that forgets to pre-fold is safe.
+    const p = compileRepositoryPolicy(["acme/legacy-api"]);
+    expect(classifyRepository(p, "AcMe/Legacy-API")).toBe(true);
+    expect(classifyRepository(p, "ACME/LEGACY-API")).toBe(true);
+    expect(classifyRepository(p, "acme/service-a")).toBe(false); // still a real non-match, not a blanket true
   });
   test("'acme/*' excludes one org's direct repos but not nested paths or other orgs", () => {
     const p = compileRepositoryPolicy(["acme/*"]);
@@ -144,7 +154,7 @@ describe("classifyRepository — exact-first, glob, case-insensitive, fail-close
     try { classifyRepository(p, "acme/repo"); } catch (e) { caught = e; }
     expect(caught).toBeInstanceOf(RepoPolicyMatchError);
     expect((caught as RepoPolicyMatchError).pattern).toBe("acme/*");
-    expect((caught as RepoPolicyMatchError).ownerRepo).toBe("acme/repo");
+    expect((caught as RepoPolicyMatchError).ownerRepoLower).toBe("acme/repo");
   });
   test("SINGLE-pass fail-closed: an EARLIER throwing glob aborts even though a LATER exact would match", () => {
     // Locked semantic (design decision tree): classify checks each pattern's exact-equality then its

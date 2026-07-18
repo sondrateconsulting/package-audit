@@ -16,7 +16,6 @@ import type { DiscoveryFailure } from "./discovery.ts";
 import { isIsoInstant } from "./isoDate.ts";
 import { logLine } from "./log.ts";
 import { classifyRepository, type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
-import { toAsciiLower } from "./patternCanonical.ts";
 
 // ---- errors -----------------------------------------------------------------------------
 // Non-retryable API failure (404, permission, SSO enforcement, poisoned redirect, …) — the
@@ -825,18 +824,19 @@ export function mapRestRepo(raw: unknown, endpoint: string, index: number, expec
 // a denylisted repo never consumes a maxReposPerOrg slot an eligible repo could use (the repo-grain
 // analog of branch policy running before the cap). A SEPARATE first pass keeps `excluded` denylist-ONLY
 // — archived/fork/past-cap drops are NOT policy exclusions and never appear in it. classifyRepository
-// receives the ASCII-folded `owner/repo` (case-insensitive match); the reported name keeps original case.
+// folds the `owner/repo` INTERNALLY (case-insensitive match), so this passes the ORIGINAL-case name
+// straight through; the reported name in `excluded` keeps that original case.
 export function filterSortCapRepos(
   repos: RepoInfo[],
   opts: { policy: CompiledRepositoryPolicy; includeArchived: boolean; includeForks: boolean; maxReposPerOrg: number | null },
-): { kept: RepoInfo[]; excluded: string[] } {
+): { readonly kept: readonly RepoInfo[]; readonly excluded: readonly string[] } {
   const excluded: string[] = [];
   const surviving: RepoInfo[] = [];
   for (const r of repos) {
     const ownerRepo = `${r.organization}/${r.name}`;
     // classifyRepository may throw a fatal RepoPolicyMatchError (a compiled glob threw at match time) —
     // fail-closed by contract, propagated to the run driver which fails the run and rethrows unchanged.
-    if (classifyRepository(opts.policy, toAsciiLower(ownerRepo))) excluded.push(ownerRepo);
+    if (classifyRepository(opts.policy, ownerRepo)) excluded.push(ownerRepo);
     else surviving.push(r);
   }
   const filtered = surviving.filter(

@@ -463,7 +463,7 @@ describe("path encoding + repo shaping", () => {
       expect(excluded).toEqual(["o/denied"]); // ONLY the denylist drop — not arch/frk/keep2
     });
 
-    test("caller-fold contract: a mixed-case repo name is excluded by a lowercase pattern (filterSortCapRepos folds internally)", () => {
+    test("case-insensitive: a mixed-case repo name is excluded by a lowercase pattern (classifyRepository folds internally)", () => {
       const repos = [mk("Legacy-API", "2025-01-01T00:00:00Z", { organization: "AcmeCorp" })];
       const policy = compileRepositoryPolicy(["acmecorp/legacy-api"]);
       const { kept, excluded } = filterSortCapRepos(repos, { policy, includeArchived: false, includeForks: false, maxReposPerOrg: null });

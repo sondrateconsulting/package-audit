@@ -42,18 +42,18 @@ export class RepositoryPolicyError extends Error {
 // denylist would be fail-OPEN: a denied repo silently scanned). Unlike RepositoryPolicyError (always
 // converted to ConfigError at load), this surfaces DIRECTLY: the run driver (orchestrate.ts) calls
 // db.failRun() and rethrows it unchanged, so it is registered in KNOWN_OPERATOR_ERRORS (cliErrors.ts)
-// and rendered message-only. `ownerRepo` is the ASCII-folded `owner/repo` the classifier was matching.
+// and rendered message-only. `ownerRepoLower` is the ASCII-folded `owner/repo` the classifier was matching.
 export class RepoPolicyMatchError extends Error {
   readonly pattern: string;
-  readonly ownerRepo: string;
-  constructor(pattern: string, ownerRepo: string, cause: unknown) {
+  readonly ownerRepoLower: string;
+  constructor(pattern: string, ownerRepoLower: string, cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
     super(
-      `excludeRepositories pattern ${JSON.stringify(pattern)} failed to match repository ${JSON.stringify(ownerRepo)}: ${detail}`,
+      `excludeRepositories pattern ${JSON.stringify(pattern)} failed to match repository ${JSON.stringify(ownerRepoLower)}: ${detail}`,
     );
     this.name = "RepoPolicyMatchError";
     this.pattern = pattern;
-    this.ownerRepo = ownerRepo;
+    this.ownerRepoLower = ownerRepoLower;
     if (cause !== undefined) (this as { cause?: unknown }).cause = cause;
   }
 }
@@ -101,8 +101,10 @@ function safeMatch(p: CompiledRepositoryPattern, ownerRepoLower: string): boolea
   }
 }
 
-// Is this repository denylisted? `ownerRepoLower` is the ASCII-folded `owner/repo` full name — the
-// CALLER folds it (with toAsciiLower) before calling, matching the compiled patterns' folded form.
+// Is this repository denylisted? `ownerRepo` is the `owner/repo` full name in ORIGINAL case; this
+// function folds it INTERNALLY (ASCII, via toAsciiLower) to the compiled patterns' folded form, so a
+// caller can never fail OPEN by forgetting to pre-fold. The fold is idempotent (an already-folded
+// argument is unchanged), so the single production caller passes the raw name straight through.
 //
 // SINGLE pass in canonical order: for each pattern, check EXACT equality FIRST, then its glob. Returns
 // true on the first pattern that matches either way; false if none match. Two properties matter:
@@ -118,7 +120,8 @@ function safeMatch(p: CompiledRepositoryPattern, ownerRepoLower: string): boolea
 //     whole classification FATAL (safeMatch rethrows) rather than reaching that later exact match. That
 //     is an availability difference from branchPolicy, and it is the correct fail-closed behavior — the
 //     repo is never silently scanned.
-export function classifyRepository(policy: CompiledRepositoryPolicy, ownerRepoLower: string): boolean {
+export function classifyRepository(policy: CompiledRepositoryPolicy, ownerRepo: string): boolean {
+  const ownerRepoLower = toAsciiLower(ownerRepo); // fold HERE (idempotent) — the fail-closed guarantee a caller can't drop
   for (const p of policy) {
     if (p.pattern === ownerRepoLower) return true; // exact-equality first (fail-closed for metachar names)
     if (safeMatch(p, ownerRepoLower)) return true; // then the fail-closed glob
