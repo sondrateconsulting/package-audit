@@ -1527,7 +1527,9 @@ describe("cloneShallow temp-dir cleanup on failure", () => {
       await client.cloneShallow("o", "r", "main");
     } catch (e) { thrown = e; } finally {
       (process.stdout as unknown as { write: typeof realWrite }).write = realWrite;
-      if (cloneDest !== "") chmodSync(cloneDest, 0o755);
+      // As root the chmod 0o555 is ignored, so rmSync(runDir) already deleted cloneDest — guard the
+      // restore so it doesn't throw ENOENT on an already-removed path.
+      if (cloneDest !== "" && existsSync(cloneDest)) chmodSync(cloneDest, 0o755);
       rmSync(root, { recursive: true, force: true });
     }
     expect(String((thrown as Error | undefined)?.message)).toMatch(/ORIGINAL_GIT_FAILURE/); // never masked
