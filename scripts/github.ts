@@ -1772,7 +1772,7 @@ export class GithubClient {
     const warnFailure = (operation: string, target: string, e: unknown, suppressENOENT: boolean): void => {
       // A PER-ENTRY dir vanishing mid-sweep (ENOENT) is a benign concurrent-cleanup race; a missing or
       // unreadable temp ROOT is not — it means the sweep could not run at all — so the root always warns.
-      if (suppressENOENT && (e as { code?: unknown }).code === "ENOENT") return;
+      if (suppressENOENT && typeof e === "object" && e !== null && (e as { code?: unknown }).code === "ENOENT") return;
       logLine({ event: "warning", reason: "temp-sweep-failed", operation, target, message: e instanceof Error ? e.message : String(e) });
     };
     let entries: string[];

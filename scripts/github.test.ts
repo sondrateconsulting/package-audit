@@ -315,7 +315,7 @@ describe("path encoding + repo shaping", () => {
       [{ ...OK, owner: { login: 42 } }, /owner\.login/],   // non-string, non-null (was coerced to "42")
       [{ ...OK, owner: { login: "other" } }, /not the requested owner/], // well-formed but FOREIGN owner → scan redirect
       // non-canonical identity segments — a "." / ".." / separator / control / whitespace value in
-      // `name` steers the clone URL + fs join + endpoint; real GitHub repo names carry none of these
+      // `name` steers the clone URL and the encoded endpoint path; real GitHub repo names carry none of these
       [{ ...OK, name: "." }, /name is not a canonical identity/],
       [{ ...OK, name: ".." }, /name is not a canonical identity/],
       [{ ...OK, name: "a/b" }, /name is not a canonical identity/],   // path separator
@@ -2642,5 +2642,24 @@ describe("sweepStaleTempDirs observability (§0)", () => {
     expect(removed).toEqual([]);
     const warnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed" && e.operation === "readdir");
     expect(warnings.length).toBe(1); // ENOENT on the ROOT still warns (suppression is per-entry only)
+  });
+  test("a PER-ENTRY removal failure warns (operation:remove) — discriminates the per-entry branch", () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root ignores modes
+    const root = mkdtempSync(join(tmpdir(), "sweep-entry-"));
+    mkdirSync(join(root, "pkg-audit-stuck"));
+    writeFileSync(join(root, "pkg-audit-stuck", "f"), "x");
+    const { client } = makeClient([], { tempRoot: root });
+    chmodSync(root, 0o555); // list+traverse OK, but unlinking the child dir needs write → rmSync EACCES
+    let removed: string[] = ["sentinel"];
+    let events: Record<string, unknown>[] = [];
+    try {
+      events = captureStdout(() => { removed = client.sweepStaleTempDirs(); });
+    } finally {
+      chmodSync(root, 0o755); // restore so the outer rmSync can recurse
+      rmSync(root, { recursive: true, force: true });
+    }
+    expect(removed).toEqual([]); // nothing was successfully removed
+    const removeWarnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed" && e.operation === "remove" && String(e.target).endsWith("pkg-audit-stuck"));
+    expect(removeWarnings.length).toBe(1); // the non-ENOENT removal failure is surfaced (not the suppressed root path)
   });
 });
