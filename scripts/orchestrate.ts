@@ -768,7 +768,10 @@ export async function discoverCliTerms(db: AuditDb, client: GithubClient, config
             version: latest, versionSource: "range-resolved", packument,
           });
         }
-        const bins = db.read(`SELECT DISTINCT export_name FROM package_api_surface WHERE package_name = ? AND export_kind='cli-bin' AND version = ?`).all(pkg.name, latest) as Array<{ export_name: string }>;
+        // ORDER BY so the emitted cli-terms event's binNames are byte-stable: the JSONL vocabulary
+        // is set-based (order-independent by contract), but a total, content-derived order keeps the
+        // line reproducible run-to-run and never depends on SQLite's implementation-defined row order.
+        const bins = db.read(`SELECT DISTINCT export_name FROM package_api_surface WHERE package_name = ? AND export_kind='cli-bin' AND version = ? ORDER BY export_name`).all(pkg.name, latest) as Array<{ export_name: string }>;
         binNames = bins.map((b) => b.export_name).filter((b) => b !== "");
       }
     } catch (e) {
