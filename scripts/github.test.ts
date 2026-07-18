@@ -499,6 +499,24 @@ describe("restGet caching + conditional requests", () => {
     db.close();
   });
 
+  test("a 304 re-serve does NOT re-write the cache row — the RMW stays await-free (no concurrent clobber of a newer 200)", async () => {
+    // The cached row already holds this exact body+etag (our If-None-Match was read FROM it), so the
+    // 304's former re-persist was pure redundancy — and the ONE api_cache write that spanned the
+    // network await. Dropping it keeps the read-modify-write await-free, so under fan-out a delayed 304
+    // can never clobber a NEWER 200 a concurrent fiber wrote to the same key.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client } = makeClient(
+      [ok(http(200, { etag: 'W/"e1"' }, `{"a":1}`)), err(`HTTP/2.0 304 Not Modified\r\nEtag: W/"e1"`, "gh: HTTP 304")],
+      { db },
+    );
+    await client.restGet("user/orgs?per_page=100&page=1"); // 200 seeds the cache (one write)
+    const spy = countCacheAccess(db); // count AFTER the seed
+    const second = await client.restGet("user/orgs?per_page=100&page=1"); // 304 → serves the cached body
+    expect(second.body).toBe(`{"a":1}`); // still served correctly
+    expect(spy.writes).toBe(0); // the redundant 304 rewrite is gone (old code called putApiCache here)
+    db.close();
+  });
+
   const SHA = "0123456789abcdef0123456789abcdef01234567"; // immutable caching requires a real object id
 
   test("immutable (SHA-pinned) URLs are served from cache with ZERO spawns", async () => {
@@ -736,6 +754,51 @@ describe("restGet caching + conditional requests", () => {
     const again = await client.fetchFileMeta("o", "r", "package.json", SHA);
     expect((again as { sha: string }).sha).toBe(SHA);
     expect(calls.length).toBe(2); // …and the REPAIRED exact-200 row now earns the immutable zero-network hit
+    db.close();
+  });
+
+  test("a malformed-body tombstone does NOT clobber a concurrently-written VALID immutable row (compare-and-delete, §4 fan-out)", async () => {
+    // Under branch fan-out two fibers fetch the SAME immutable SHA (identical-content branches). Fiber A
+    // reads a malformed-TRANSIENT body and heads for the tombstone; fiber B reads the VALID body and
+    // persists it in the window between A's persist and A's tombstone. An UNCONDITIONAL tombstone would
+    // null B's newer valid row → a needless refetch, and churn on the ONE shared immutable-content cache
+    // row the no-mutex "distinct rows" claim excepts. Compare-and-delete tombstones ONLY when the stored
+    // body is still A's malformed bytes, so B's valid write survives. We land B's write DETERMINISTICALLY
+    // by wrapping the tombstone db call to inject the sibling's valid write immediately before it runs.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const validBody = `{"type":"file","sha":"${SHA}","size":12}`;
+    const realTomb = db.tombstoneApiCacheIfBody.bind(db);
+    (db as unknown as { tombstoneApiCacheIfBody: AuditDb["tombstoneApiCacheIfBody"] }).tombstoneApiCacheIfBody = (e) => {
+      // fiber B's concurrent VALID write lands on the same immutable key/variant, just before A tombstones
+      db.putApiCache({ method: "GET", url: e.url, variantHash: e.variantHash, etag: 'W/"v"', responseBody: validBody });
+      realTomb(e); // A's compare-and-delete: expectedBody is the MALFORMED body → must NOT clobber validBody
+    };
+    const { client } = makeClient([ok(http(200, {}, `{bad json`))], { db }); // fiber A: malformed 200
+    await expect(client.fetchFileMeta("o", "r", "package.json", SHA)).rejects.toThrow(/invalid JSON/);
+    const row = db.read("SELECT response_body AS body FROM api_cache").get() as { body: string | null };
+    expect(row.body).toBe(validBody); // the concurrent valid write SURVIVED the malformed tombstone
+    db.close();
+  });
+
+  test("a malformed body does NOT overwrite a sibling's already-cached VALID immutable body (guarded persist, §4 fan-out)", async () => {
+    // The PERSIST half of the clobber (distinct from the tombstone half above): restGet persists the
+    // 200 body BEFORE validation. If a sibling's VALID write of the same immutable SHA already landed,
+    // an UNCONDITIONAL put would overwrite it with this fiber's malformed transient (which the tombstone
+    // would then null). The guarded immutable put REFUSES to overwrite a non-null DIFFERENT body, so the
+    // valid body survives BOTH the persist and the (no-op) tombstone. We land the sibling's valid write
+    // immediately before this fiber's guarded put by wrapping it.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const validBody = `{"type":"file","sha":"${SHA}","size":12}`;
+    const realPut = db.putApiCacheImmutable.bind(db);
+    let injected = false;
+    (db as unknown as { putApiCacheImmutable: AuditDb["putApiCacheImmutable"] }).putApiCacheImmutable = (e) => {
+      if (!injected) { injected = true; db.putApiCache({ method: "GET", url: e.url, variantHash: e.variantHash, etag: 'W/"v"', responseBody: validBody }); } // sibling's valid write lands FIRST
+      realPut(e); // this fiber's guarded put of the MALFORMED body → refused (stored valid != malformed)
+    };
+    const { client } = makeClient([ok(http(200, {}, `{bad json`))], { db }); // this fiber: malformed 200
+    await expect(client.fetchFileMeta("o", "r", "package.json", SHA)).rejects.toThrow(/invalid JSON/);
+    const row = db.read("SELECT response_body AS body FROM api_cache").get() as { body: string | null };
+    expect(row.body).toBe(validBody); // survived the malformed persist AND the malformed tombstone
     db.close();
   });
 
@@ -1181,48 +1244,82 @@ describe("throttle wait clamping (§4 hardening)", () => {
     expect(sleeps.length).toBe(sleepsBefore);
   });
 
-  test("the final attempt's classification does not arm a residual pause for the next call", async () => {
-    // 6 secondary throttles exhaust the call; the LAST response must not tax the next,
-    // possibly honest, call with an inherited pause.
+  test("the final attempt's pause IS published so a concurrent/follow-up caller waits the still-live window (§4 fan-out)", async () => {
+    // Under fan-out the final attempt's observed pause is bucket-global evidence: a sibling that
+    // inherits the freed slot must NOT spawn into a still-active rate-limit window. So — unlike the
+    // old per-caller design that DISCARDED the final pause — it is now PUBLISHED. The exhausted
+    // caller itself throws without sleeping it (its loop ended); the NEXT caller inherits the pause,
+    // waits it exactly ONCE, then succeeds. The wall-clock budget charges that window a single time.
     const throttle = err(http(429, { "x-ratelimit-remaining": "50", "retry-after": "7" }, "{}"));
     const { client, sleeps } = makeClient([...Array.from({ length: 6 }, () => throttle), ok(http(200, {}, `{"ok":1}`))]);
     await expect(client.restGet("rate_limit")).rejects.toThrow(ThrottleExhausted);
     const sleepsBefore = sleeps.length;
     const res = await client.restGet("rate_limit");
     expect(res.body).toBe(`{"ok":1}`);
-    expect(sleeps.length).toBe(sleepsBefore); // no residual pause inherited
+    expect(sleeps.length).toBe(sleepsBefore + 1); // inherits the published final pause, waits it ONCE, then succeeds
   });
 
   test("Retry-After numeric seconds has the same 1s floor as the HTTP-date form", () => {
     expect(parseRetryAfterMs("0", 1_000_000_000_000)).toBe(1000);
   });
 
-  test("graphql: the final attempt's classification does not arm a residual pause either", async () => {
+  test("graphql: the final attempt's pause is published too so the next caller waits the live window (§4 fan-out)", async () => {
     const throttle = err(http(200, { "x-ratelimit-remaining": "50", "retry-after": "7" }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`), "gh: GraphQL error");
     const { client, sleeps } = makeClient([...Array.from({ length: 6 }, () => throttle), ok(http(200, {}, `{"data":{"x":1}}`))]);
     await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
     const sleepsBefore = sleeps.length;
     const data = await client.graphql("query{x}", {});
     expect(data).toEqual({ x: 1 });
-    expect(sleeps.length).toBe(sleepsBefore); // no residual pause inherited
+    expect(sleeps.length).toBe(sleepsBefore + 1); // inherits the published final pause, waits it ONCE, then succeeds
   });
 
-  test("restGet: the final attempt's PRIMARY classification does not arm a residual pause", async () => {
-    // small GENUINE resets so all 6 primary attempts complete within budget; the LAST
-    // response's far-future reset must not be armed for the follow-up call.
+  test("restGet: the final attempt's PRIMARY pause is published so the next caller waits the reset window (§4 fan-out)", async () => {
+    // small GENUINE resets so all 6 primary attempts fund within budget; the LAST reset (~11 days,
+    // CLAMPED to MAX_PAUSE_MS = 2h) is PUBLISHED for the next caller, who waits that one window then
+    // gets the ok. The wall-clock budget funds the clamped 2h window once (well under 8h total).
     const NOW_SEC = 1_000_000_000;
     const primaryAt = (sec: number) =>
       err(http(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(NOW_SEC + sec) }, `{"message":"rate limit"}`));
     const { client, sleeps } = makeClient([
       primaryAt(100), primaryAt(300), primaryAt(500), primaryAt(700), primaryAt(900),
-      primaryAt(999_999), // final attempt: would arm ~11 days if the guard regressed
+      primaryAt(999_999), // final attempt: clamps to MAX_PAUSE_MS (2h), published for the next caller
       ok(http(200, {}, `{"ok":1}`)),
     ]);
     await expect(client.restGet("rate_limit")).rejects.toThrow(ThrottleExhausted);
     const sleepsBefore = sleeps.length;
     const res = await client.restGet("rate_limit");
     expect(res.body).toBe(`{"ok":1}`);
-    expect(sleeps.length).toBe(sleepsBefore); // the poisoned final primary was not armed
+    expect(sleeps.length).toBe(sleepsBefore + 1); // the published final primary is waited exactly once
+  });
+
+  test("armBucketPause funds the PUBLISHED horizon, not a shorter pause under an unfunded tail (§4 — no phantom budget charge)", () => {
+    // Regression for the fan-out shadow window: once a LONGER pause is published but left UNFUNDED
+    // (budget overflow), every caller sleeps to that horizon or throws — so a SHORTER pause arriving
+    // afterward must NOT spend budget on coverage nobody ever waits. The old raw-untilMs charge did;
+    // the horizon-targeted charge does not. Driven white-box because the fake clock sequentializes
+    // sleeps and cannot reproduce two concurrently-in-flight callers arming the shared bucket out of
+    // order (the real fan-out shape).
+    const H = 3_600_000;
+    let now = 100 * H;
+    const client = new GithubClient({
+      githubHost: "github.com", binPaths: { gh: "/bin/true", git: "/bin/true", tar: "/bin/true" },
+      tempRoot: TEST_TMP, nowImpl: () => now, sleepImpl: async () => {},
+    });
+    const c = client as unknown as {
+      core: { pausedUntilMs: number; accountedUntilMs: number; budgetSpentMs: number };
+      armBucketPause(b: { pausedUntilMs: number; accountedUntilMs: number; budgetSpentMs: number }, untilMs: number, now: number): void;
+    };
+    const b = c.core;
+    b.accountedUntilMs = now;                       // funded up to 'now', nothing pending
+    b.budgetSpentMs = MAX_TOTAL_PAUSE_MS - 2.5 * H; // only 2.5h of budget remains
+    c.armBucketPause(b, now + 5 * H, now);          // LONG pause needs 5h > 2.5h left → published UNFUNDED
+    expect(b.pausedUntilMs).toBe(now + 5 * H);
+    expect(b.budgetSpentMs).toBe(MAX_TOTAL_PAUSE_MS - 2.5 * H); // funded nothing (overflow)
+    expect(b.accountedUntilMs).toBe(now);           // horizon still unfunded
+    c.armBucketPause(b, now + 2 * H, now);          // SHORTER pause under the still-live 5h unfunded tail
+    expect(b.budgetSpentMs).toBe(MAX_TOTAL_PAUSE_MS - 2.5 * H); // NO phantom charge (targets the 5h horizon → re-overflows)
+    expect(b.pausedUntilMs).toBe(now + 5 * H);      // horizon unchanged
+    expect(b.accountedUntilMs).toBe(now);           // still nothing funded past 'now'
   });
 
   test("a graphql SECONDARY (remaining>0) with an absurd Retry-After sleeps exactly MAX_PAUSE_MS", async () => {
@@ -1236,6 +1333,137 @@ describe("throttle wait clamping (§4 hardening)", () => {
     expect(data).toEqual({ x: 1 });
     expect(sleeps.length).toBeGreaterThanOrEqual(1);
     expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
+  });
+});
+
+describe("concurrency: global cap + concurrent throttle coordination (§4/§5.6 fan-out)", () => {
+  test("gh, git (clone), and tar (extract) all count against the ONE global in-flight cap", async () => {
+    // Before this feature git() and tar() called spawnBounded DIRECTLY, bypassing the semaphore — so
+    // under fan-out unbounded concurrent clones/extractions could blow temp-dir/fd/memory. They now
+    // acquire the same global slot gh does. A gate holds every spawn in-flight so peak concurrency is
+    // observable: with cap=2 and 6 launches (2 gh + 2 git + 2 tar), at most 2 ever run at once.
+    let inFlight = 0;
+    let peak = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const spawn: SpawnFn = async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await gate;
+      inFlight--;
+      return ok("v1\n");
+    };
+    const { client } = makeClient([], { spawnImpl: spawn, concurrency: 2, spawnTimeoutMs: 60_000 });
+    const running = [
+      client.gh(["--version"]), client.gh(["--version"]),
+      client.git(["--version"]), client.git(["--version"]),
+      client.tar(["--version"]), client.tar(["--version"]),
+    ];
+    await new Promise((r) => setTimeout(r, 20)); // let the 6 launches settle onto the 2 slots
+    expect(peak).toBe(2); // git/tar are NOT unbounded — they share gh's cap; exactly 2 run at once
+    release();
+    await Promise.all(running);
+    expect(peak).toBe(2); // never exceeded across the whole run
+  });
+
+  test("N concurrent callers sharing ONE rate-limit window resolve correctly — coordinated single sleep, all succeed", async () => {
+    // The redesign exists for the CONCURRENT caller. A barrier makes N callers hit the SAME primary
+    // window simultaneously; arm-before-release (ghBucketedAttempt) plus acquireRespectingPause's
+    // pause re-check mean the window is slept ONCE across all N (the fake sleepImpl advances the clock
+    // synchronously, so the first sleeper's advance makes the rest observe wait<=0), and every caller
+    // then succeeds on retry. (That synchronous advance is also why the fake clock CANNOT reproduce a
+    // real-wall-clock N× budget over-count; the wall-clock union-tail budget that prevents it is
+    // verified by construction — armBucketPause — and by the single-caller budget tests above.)
+    const N = 4;
+    const FIXED_RESET = String(1_000_000_000 + 3600); // ~1h out, within MAX_PAUSE_MS: a fixed absolute window
+    const primary = http(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FIXED_RESET }, `{"message":"rl"}`);
+    let spawns = 0;
+    let arrived = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((r) => { release = r; });
+    let throttleRound = 0;
+    const spawn: SpawnFn = async () => {
+      spawns++;
+      if (throttleRound < N) {
+        throttleRound++;
+        arrived++;
+        if (arrived === N) release(); // all N throttle-spawns are in-flight → resolve them together
+        await barrier;
+        return err(primary);
+      }
+      return ok(http(200, {}, `{"ok":1}`));
+    };
+    const { client, sleeps } = makeClient([], { spawnImpl: spawn, concurrency: N, spawnTimeoutMs: 60_000 });
+    const results = await Promise.all(Array.from({ length: N }, () => client.restGet("rate_limit")));
+    expect(results.every((r) => r.body === `{"ok":1}`)).toBe(true); // every concurrent caller succeeded
+    expect(spawns).toBe(2 * N); // N throttles + N oks — no caller double-spawned or spun
+    expect(sleeps.length).toBe(1); // the shared window was slept ONCE across all N, not N times
+  });
+
+  test("concurrent restGet of the SAME immutable SHA-pinned key converges — no lost/torn cache row (P4)", async () => {
+    // Under branch fan-out two units can request the same SHA-pinned tree/blob concurrently. Both miss
+    // the (empty) cache, both fetch, both putApiCache. Safe because putApiCache is a single atomic
+    // upsert and immutable keys carry byte-identical bodies — the writeback is idempotent, so the row
+    // converges on the body with no torn/lost write. (The double-fetch is benign wasted quota.)
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const sha = "a".repeat(40);
+    const endpoint = `repos/o/r/git/trees/${sha}?recursive=1`;
+    const body = `{"sha":"${sha}","truncated":false,"tree":[]}`;
+    const { client, calls } = makeClient(
+      [ok(http(200, { etag: '"e1"' }, body)), ok(http(200, { etag: '"e1"' }, body))],
+      { db, concurrency: 4 },
+    );
+    const [a, b] = await Promise.all([
+      client.restGet(endpoint, { immutable: true }),
+      client.restGet(endpoint, { immutable: true }),
+    ]);
+    expect(a.body).toBe(body);
+    expect(b.body).toBe(body);
+    expect(calls.length).toBe(2); // both missed the empty cache and fetched — benign concurrent double-fetch
+    // the cache row converged on the body — a later read is a zero-network immutable HIT
+    expect(db.getApiCache("GET", `gh3:github.com:${endpoint}`, "")?.responseBody).toBe(body);
+    db.close();
+  });
+
+  test("admission seam: a pause armed in the acquire→spawn gap is NOT spawned into (§4 fan-out)", async () => {
+    // The race the synchronous re-check closes: acquireRespectingPause does its final pause check and
+    // then RETURNS across a microtask boundary, so a SIBLING fiber on a different slot can armBucketPause
+    // between that check and ghBucketedAttempt's spawn — the arm-inside-lease discipline only closes the
+    // SAME-slot inheritance, not this different-slot post-check window. We reproduce the gap
+    // DETERMINISTICALLY by wrapping acquireRespectingPause so a pause is armed EXACTLY ONCE right as it
+    // returns the slot — i.e. in the acquire→spawn window a sibling would arm in. The fix's synchronous
+    // re-check (in the SAME tick as the spawn, which spawnBounded issues before its first await) must
+    // catch it: the fiber releases, sleeps the pause, re-acquires, and only THEN spawns — never into a
+    // live rate-limit window. Without the fix the spawn fires while pausedUntilMs > now.
+    const H = 3_600_000;
+    let now = 1_000_000_000_000;
+    let coreRef: { pausedUntilMs: number } | null = null;
+    let spawnedIntoPause = false;
+    const spawn: SpawnFn = async () => {
+      if (coreRef !== null && coreRef.pausedUntilMs > now) spawnedIntoPause = true; // observed at the instant of spawn
+      return ok(http(200, {}, `{"ok":1}`));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl: spawn, nowImpl: () => now,
+      sleepImpl: async (ms) => { now += ms; }, // advancing clock so the injected pause elapses on the re-loop
+      binPaths: BINS, tempRoot: TEST_TMP, concurrency: 2,
+    });
+    const c = client as unknown as {
+      core: { pausedUntilMs: number; accountedUntilMs: number; budgetSpentMs: number };
+      acquireRespectingPause(b: unknown): Promise<() => void>;
+      armBucketPause(b: unknown, until: number, now: number): void;
+    };
+    coreRef = c.core;
+    const realAcquire = c.acquireRespectingPause.bind(c);
+    let armed = false;
+    c.acquireRespectingPause = async (b) => {
+      const release = await realAcquire(b);
+      if (!armed) { armed = true; c.armBucketPause(b, now + H, now); } // a sibling arms in the acquire→spawn gap
+      return release;
+    };
+    const res = await client.restGet("rate_limit");
+    expect(res.body).toBe(`{"ok":1}`);
+    expect(spawnedIntoPause).toBe(false); // the synchronous admission re-check kept the spawn out of the window
   });
 });
 
@@ -2613,8 +2841,10 @@ describe("single chokepoint (grep-enforced)", () => {
   });
   test("every spawn in github.ts flows through a guard-calling wrapper", () => {
     const src = readFileSync("./scripts/github.ts", "utf8");
-    // each of gh()/git()/tar() must call assertSpawnAllowed + its read-only guard
-    expect(src.match(/assertSpawnAllowed\(/g)?.length).toBe(3);
+    // each guarded spawn path must call assertSpawnAllowed + its read-only guard. FOUR paths now:
+    // gh() (bare, e.g. preflight), ghBucketedAttempt() (the pause-aware gh path restGet/graphql use —
+    // a DISTINCT gh spawn that re-runs the guards), git(), and tar().
+    expect(src.match(/assertSpawnAllowed\(/g)?.length).toBe(4);
     for (const guard of ["assertReadOnlyGh", "assertReadOnlyGit", "assertReadOnlyTar"])
       expect(src.includes(`${guard}(args)`)).toBe(true);
   });

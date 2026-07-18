@@ -1694,6 +1694,75 @@ describe("--fresh / --purge-cache", () => {
   });
 });
 
+describe("tombstoneApiCacheIfBody — compare-and-delete (§4 fan-out: no clobber of a concurrent valid write)", () => {
+  test("nulls the row ONLY when the stored body still equals the expected (malformed) bytes", () => {
+    const db = mem();
+    // A sibling's VALID write has already replaced the malformed body this fiber read: the stored body
+    // no longer matches expectedBody, so the tombstone must be a NO-OP (the valid row survives).
+    db.putApiCache({ method: "GET", url: "u", variantHash: "", etag: "v", responseBody: "valid" });
+    db.tombstoneApiCacheIfBody({ method: "GET", url: "u", variantHash: "", expectedBody: "malformed" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBe("valid"); // survived — not clobbered
+    expect(db.getApiCache("GET", "u", "")?.etag).toBe("v");
+    // The poison-defense case: the stored body IS the malformed bytes → tombstoned (body AND etag null).
+    db.putApiCache({ method: "GET", url: "u", variantHash: "", etag: "e", responseBody: "malformed" });
+    db.tombstoneApiCacheIfBody({ method: "GET", url: "u", variantHash: "", expectedBody: "malformed" });
+    const row = db.getApiCache("GET", "u", "");
+    expect(row?.responseBody).toBeNull(); // nulled body disables both cache-serving paths
+    expect(row?.etag).toBeNull();         // and etag suppresses If-None-Match
+    db.close();
+  });
+
+  test("an already-tombstoned (NULL body) row is untouched — NULL never equals the non-null expectedBody", () => {
+    const db = mem();
+    db.putApiCache({ method: "GET", url: "u", variantHash: "", etag: null, responseBody: null });
+    db.tombstoneApiCacheIfBody({ method: "GET", url: "u", variantHash: "", expectedBody: "malformed" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBeNull(); // still a tombstone, no error
+    db.close();
+  });
+
+  test("an absent row is a no-op (nothing to re-serve, nothing to insert)", () => {
+    const db = mem();
+    db.tombstoneApiCacheIfBody({ method: "GET", url: "missing", variantHash: "", expectedBody: "x" });
+    expect(db.getApiCache("GET", "missing", "")).toBeNull(); // unlike the old put-null, no spurious row is created
+    db.close();
+  });
+
+  test("refuses a non-GET method (mirrors putApiCache's REST-GET-only guard)", () => {
+    const db = mem();
+    expect(() => db.tombstoneApiCacheIfBody({ method: "POST", url: "u", variantHash: "", expectedBody: "x" })).toThrow(/REST-GET only/);
+    db.close();
+  });
+});
+
+describe("putApiCacheImmutable — guarded persist (§4 fan-out: a malformed transient never overwrites a valid immutable body)", () => {
+  test("writes an absent row, repairs a NULL tombstone, is idempotent on an identical body, and REFUSES a different body", () => {
+    const db = mem();
+    // absent → insert
+    db.putApiCacheImmutable({ method: "GET", url: "u", variantHash: "", etag: "e1", responseBody: "V" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBe("V");
+    // identical body → idempotent (etag refreshes, body unchanged)
+    db.putApiCacheImmutable({ method: "GET", url: "u", variantHash: "", etag: "e2", responseBody: "V" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBe("V");
+    expect(db.getApiCache("GET", "u", "")?.etag).toBe("e2");
+    // DIFFERENT body (a malformed transient of the same immutable SHA) → REFUSED; the valid body survives
+    db.putApiCacheImmutable({ method: "GET", url: "u", variantHash: "", etag: "eM", responseBody: "MALFORMED" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBe("V"); // not clobbered
+    expect(db.getApiCache("GET", "u", "")?.etag).toBe("e2");        // etag also untouched
+    // NULL tombstone → the next write repairs it (IS NULL branch)
+    db.tombstoneApiCacheIfBody({ method: "GET", url: "u", variantHash: "", expectedBody: "V" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBeNull();
+    db.putApiCacheImmutable({ method: "GET", url: "u", variantHash: "", etag: "e3", responseBody: "V" });
+    expect(db.getApiCache("GET", "u", "")?.responseBody).toBe("V"); // repaired
+    db.close();
+  });
+
+  test("refuses a non-GET method (mirrors putApiCache's REST-GET-only guard)", () => {
+    const db = mem();
+    expect(() => db.putApiCacheImmutable({ method: "POST", url: "u", variantHash: "", etag: null, responseBody: "V" })).toThrow(/REST-GET only/);
+    db.close();
+  });
+});
+
 describe("run lifecycle — startup rules (§3)", () => {
   test("new run persists the full config echo", () => {
     const db = mem();
@@ -2058,6 +2127,49 @@ describe("reconcileRunUnitHead (stale-row prune)", () => {
     scanned(db, "r1", "o", "repo", "stale");
     expect(db.reconcileRunUnitHead("r1", "o", "repo", weird)).toBe(1); // ONLY "stale" pruned — every weird name is kept
     expect(branchesOf(db, "r1", "o", "repo").sort()).toEqual([...weird].sort());
+    db.close();
+  });
+});
+
+describe("pruneExcludedOwnerRows (§1 case-insensitive exclusion on resume)", () => {
+  const scanned = (db: AuditDb, runId: string, org: string, repo: string): void =>
+    db.upsertRunUnitHead({ runId, organization: org, repository: repo, branch: "main", commitSha: `sha-${org}-${repo}`, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+  const scanError = (db: AuditDb, runId: string, org: string, repo: string): void =>
+    db.insertError({ runId, scope: "scan", organization: org, repository: repo, branch: "main", message: "boom" });
+  const orgsOf = (db: AuditDb, runId: string): string[] =>
+    (db.read("SELECT DISTINCT organization FROM run_unit_head WHERE run_id=? ORDER BY organization").all(runId) as Array<{ organization: string }>).map((r) => r.organization);
+  const errRows = (db: AuditDb, runId: string): Array<{ organization: string | null }> =>
+    db.read("SELECT organization FROM errors WHERE run_id=?").all(runId) as Array<{ organization: string | null }>;
+  const hasErrorOrg = (db: AuditDb, runId: string, org: string): boolean =>
+    errRows(db, runId).some((e) => (e.organization ?? "").toLowerCase() === org.toLowerCase());
+
+  test("drops HEADS AND ERRORS for an owner a CASE-VARIANT exclude now matches; keeps other owners, null-org errors, and other runs", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    rawRun(db, "r2", "running");
+    scanned(db, "r1", "acme", "a"); scanned(db, "r1", "acme", "b"); scanError(db, "r1", "acme", "a"); // canonical owner scanned+errored before the old case-sensitive exclude was fixed
+    scanned(db, "r1", "bigco", "c"); scanError(db, "r1", "bigco", "c"); // a different, non-excluded owner — must be kept
+    db.insertError({ runId: "r1", scope: "introspection", packageName: "expo", message: "packument" }); // org=NULL — never owner-matched, must survive
+    scanned(db, "r2", "acme", "a"); scanError(db, "r2", "acme", "a"); // same owner, DIFFERENT run — must survive (run-scoped)
+    // exclude "Acme" (config spelling) must match the canonical "acme" CASE-INSENSITIVELY
+    expect(db.pruneExcludedOwnerRows("r1", ["Acme"])).toEqual({ heads: 2, errors: 1 });
+    expect(orgsOf(db, "r1")).toEqual(["bigco"]);          // acme heads gone, bigco kept
+    expect(hasErrorOrg(db, "r1", "acme")).toBe(false);    // acme error gone (would otherwise inflate branchesErrored once its head is pruned)
+    expect(hasErrorOrg(db, "r1", "bigco")).toBe(true);    // bigco error kept
+    expect(errRows(db, "r1").some((e) => e.organization === null)).toBe(true); // null-org introspection error kept
+    expect(orgsOf(db, "r2")).toEqual(["acme"]);           // the other run is untouched
+    expect(hasErrorOrg(db, "r2", "acme")).toBe(true);
+    db.close();
+  });
+
+  test("no-op when the denylist is empty or matches no owner in the run (never over-prunes)", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    scanned(db, "r1", "acme", "a"); scanError(db, "r1", "acme", "a");
+    expect(db.pruneExcludedOwnerRows("r1", [])).toEqual({ heads: 0, errors: 0 }); // empty denylist → no-op (the common case)
+    expect(db.pruneExcludedOwnerRows("r1", ["other-org"])).toEqual({ heads: 0, errors: 0 }); // no case-insensitive match → no-op
+    expect(orgsOf(db, "r1")).toEqual(["acme"]); // a transiently-undiscovered-but-not-excluded owner keeps its rows
+    expect(hasErrorOrg(db, "r1", "acme")).toBe(true);
     db.close();
   });
 });

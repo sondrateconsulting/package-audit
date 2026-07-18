@@ -8,7 +8,9 @@
 // form — and runs.cutoff_date holds the operator-CONFIGURED bare YYYY-MM-DD cutoff (validated at
 // config load; legacy-migrated rows carry ''). None of these participate in the nowIso MAX/ordering
 // invariant (see assertCanonicalTimestamp).
-// Single-writer: orchestrate.ts owns all writes; report.ts reads via the exposed handle.
+// Single writer CONNECTION: orchestrate.ts owns all writes through ONE bun:sqlite handle (§5 fan-out
+// runs many fibers, but they share that single connection and its synchronous statements serialize
+// them — no second writer, no mutex); report.ts reads via the exposed handle.
 
 import { Database, type Statement } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
@@ -2321,6 +2323,40 @@ export class AuditDb {
     return res.changes;
   }
 
+  // §1 exclusion enforcement for a RESUMED run: drop this run's rows for any owner named in
+  // excludeOrganizations, matched CASE-INSENSITIVELY (as ownerResolve folds owners). config_hash
+  // hashes excludeOrganizations exact-case ON PURPOSE (folding it would rehash every case-variant
+  // legacy config and orphan its resumable work; canonically-cased configs would hash the same), so a
+  // run that STRADDLES the upgrade to case-insensitive exclusion can still hold
+  // rows for an owner a case-variant exclude now removes (e.g. exclude "Acme", earlier-scanned "acme").
+  // Pruning them here keeps a resumed run's report from ever surfacing an owner its own
+  // excludeOrganizations excludes. BOTH tables that carry an owner into the report are cleaned, in ONE
+  // transaction:
+  //   • run_unit_head — the report joins findings THROUGH it, so removing the head rows removes that
+  //     owner's dispositions AND findings together.
+  //   • errors — errors[] is selected by run_id (NOT joined to run_unit_head), and branchesErrored
+  //     counts scan errors that hold NO head row, so leaving the owner's errors would both keep it in
+  //     errors[] AND (once its heads are pruned) newly inflate branchesErrored. Owner-scoped errors
+  //     carry an organization (discovery/scan); package-scoped introspection errors carry NULL and are
+  //     never owner-matched. errors[] is append-only in NORMAL operation; this is its ONE reconciliation
+  //     — scoped to an owner that should never have been scanned at all.
+  // TARGETED and SAFE: it keys off the STABLE configured denylist, never the per-invocation
+  // effective/discovered set, so a transiently-undiscovered (but not excluded) owner never loses rows.
+  // No-op on a fresh run (no prior rows) and whenever excludeOrganizations is empty.
+  pruneExcludedOwnerRows(runId: string, excludeOrganizations: readonly string[]): { heads: number; errors: number } {
+    if (excludeOrganizations.length === 0) return { heads: 0, errors: 0 };
+    const list = JSON.stringify(excludeOrganizations);
+    return this.db.transaction((): { heads: number; errors: number } => {
+      const heads = this.db
+        .query(`DELETE FROM run_unit_head WHERE run_id = ? AND lower(organization) IN (SELECT lower(value) FROM json_each(?))`)
+        .run(runId, list).changes;
+      const errors = this.db
+        .query(`DELETE FROM errors WHERE run_id = ? AND lower(organization) IN (SELECT lower(value) FROM json_each(?))`)
+        .run(runId, list).changes;
+      return { heads, errors };
+    })();
+  }
+
   // ---- api_cache (§3 caching rules; REST-GET only — GraphQL is never cached) -----------------
   getApiCache(method: string, url: string, variantHash: string): ApiCacheEntry | null {
     const row = this.db
@@ -2350,6 +2386,52 @@ export class AuditDb {
            cached_at = excluded.cached_at`,
       )
       .run(entry.method, entry.url, entry.variantHash, entry.etag, entry.responseBody, nowIso());
+  }
+
+  // GUARDED persist for IMMUTABLE (SHA-pinned, byte-stable) content: write only when it will NOT clobber
+  // a sibling's body — an absent row, a NULL tombstone (a repair after a poisoned row), or a row already
+  // holding the IDENTICAL body (a body-preserving no-op; etag/cached_at still refresh). It REFUSES to
+  // overwrite a non-null DIFFERENT body: for
+  // immutable content two different bodies mean at least one is a malformed transient, and restGet
+  // persists BEFORE validation, so under fan-out an unconditional put would let a fiber's malformed body
+  // overwrite a sibling's already-cached VALID body (which the compare-and-delete tombstone would then
+  // null). This guard closes the persist half of that race; tombstoneApiCacheIfBody closes the tombstone
+  // half. Malformed-first is still self-healing: the malformed row is tombstoned to NULL and the next
+  // fetch repairs it via the IS NULL branch. Mutable endpoints keep using putApiCache (a newer 200 body
+  // legitimately supersedes the old one). One synchronous upsert (INSERT … ON CONFLICT DO UPDATE; an
+  // absent row takes the insert path) — atomic on the single-threaded loop.
+  putApiCacheImmutable(entry: { method: string; url: string; variantHash: string; etag: string | null; responseBody: string }): void {
+    if (entry.method !== "GET") fail(`api_cache is REST-GET only; refusing to cache method ${entry.method}`);
+    this.db
+      .query(
+        `INSERT INTO api_cache (method, url, variant_hash, etag, response_body, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(method, url, variant_hash)
+         DO UPDATE SET etag = excluded.etag, response_body = excluded.response_body,
+           cached_at = excluded.cached_at
+         WHERE api_cache.response_body IS NULL OR api_cache.response_body = excluded.response_body`,
+      )
+      .run(entry.method, entry.url, entry.variantHash, entry.etag, entry.responseBody, nowIso());
+  }
+
+  // COMPARE-AND-DELETE tombstone: null the row's body+etag ONLY when the stored body is STILL the exact
+  // bytes the caller read as malformed (`expectedBody`). restGet persists an exact-200 body BEFORE the
+  // endpoint-level validator sees it; when validation rejects it the caller tombstones so the poison is
+  // not re-served. But this cache row is the ONE the no-mutex "distinct rows" claim excepts: two fibers
+  // fetching the SAME immutable SHA (identical-content branches) share it. An UNCONDITIONAL null would
+  // let a fiber's malformed-transient tombstone clobber a SIBLING's newer VALID write of the same SHA →
+  // a needless refetch. Gating the null on `response_body = ?` makes it a no-op once a valid (or any
+  // different) body has won, while still nulling the genuinely-poisoned single-fiber row (stored body ==
+  // expectedBody). One synchronous SQLite statement → atomic on the single-threaded loop (no mutex). A
+  // NULL stored body never equals the non-null expectedBody, so an already-tombstoned row is untouched.
+  tombstoneApiCacheIfBody(entry: { method: string; url: string; variantHash: string; expectedBody: string }): void {
+    if (entry.method !== "GET") fail(`api_cache is REST-GET only; refusing to tombstone method ${entry.method}`);
+    this.db
+      .query(
+        `UPDATE api_cache SET response_body = NULL, etag = NULL, cached_at = ?
+           WHERE method = ? AND url = ? AND variant_hash = ? AND response_body = ?`,
+      )
+      .run(nowIso(), entry.method, entry.url, entry.variantHash, entry.expectedBody);
   }
 
   // ---- package_api_surface (§5.E durable introspection) ---------------------------------------

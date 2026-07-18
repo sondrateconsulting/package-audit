@@ -29,20 +29,47 @@ export interface OwnerResolveResult {
 
 // §1 steps 1-4: base set (allowlist OR discovery) → append personal login in BOTH modes →
 // subtract excludes in BOTH modes → dedupe + sort → empty-fail-fast with remediation.
+//
+// Dedup + exclusion + personal matching are all CASE-INSENSITIVE. GitHub logins are
+// case-insensitive-unique, so a case-variant owner pair ("Acme" and "acme") is the SAME account —
+// collapsing it to ONE effective owner is what makes branch-exclusivity provable under owner
+// fan-out: two owner iterations for the same account would discover the SAME canonical repos and
+// two fibers would then race the SAME work_queue/run_unit_head rows. This fold stays OUT of
+// computeConfigHash (config.ts hashes owners exact-case via sortedDedup) ON PURPOSE — folding the
+// hash would change every non-canonically-cased legacy config's hash and orphan its resumable work.
+// Keeping the fold out of the hash means a run STRADDLING the upgrade that ADDED case-insensitive
+// exclusion could hold prior-invocation run_unit_head rows for an owner a case-variant exclude now
+// removes (e.g. exclude "Acme", earlier-scanned "acme") — its config_hash is unchanged, so it resumes
+// rather than starting fresh. db.pruneExcludedOwnerRows (called at resume in runScan) cleans exactly
+// those rows (both run_unit_head AND errors), so a resumed run's report never surfaces an owner its own
+// excludeOrganizations excludes — in its findings, dispositions, or errors[].
+// That prune keys off the STABLE configured denylist, NOT the per-invocation effective/discovered set,
+// so a transiently-undiscovered (but not excluded) owner never loses its rows. Folding the hash instead
+// would orphan every case-variant legacy config's resumable work — a strictly worse trade — which is
+// why it stays out.
 export function resolveEffectiveOwners(input: OwnerResolveInput): OwnerResolveResult {
   const configured = input.organizations !== null;
   const base = configured ? input.organizations! : input.discoveredOrgs;
   const source: OwnersSource = configured ? "configured" : "discovered";
 
-  const set = new Set(base);
+  // lowercased login -> representative spelling (first occurrence wins; the personal login prefers
+  // its OWN spelling below). The final list is sorted, so the representative choice only affects the
+  // reported/logged casing, never determinism or which endpoint an owner routes to (that comparison
+  // is also case-insensitive — see orchestrate.ts isPersonal).
+  const byKey = new Map<string, string>();
+  for (const login of base) {
+    const k = login.toLowerCase();
+    if (!byKey.has(k)) byKey.set(k, login);
+  }
   if (input.includePersonalNamespace) {
     if (input.personalLogin === null || input.personalLogin === "")
       throw new EmptyOwnersError("includePersonalNamespace is true but the personal login could not be resolved (gh api user)");
-    set.add(input.personalLogin);
+    byKey.set(input.personalLogin.toLowerCase(), input.personalLogin);
   }
-  for (const ex of input.excludeOrganizations) set.delete(ex);
+  // Exclusions win, matched case-insensitively (mirrors the fold) so `Acme` removes a discovered `acme`.
+  for (const ex of input.excludeOrganizations) byKey.delete(ex.toLowerCase());
 
-  const owners = [...set].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const owners = [...byKey.values()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   if (owners.length === 0) throw new EmptyOwnersError(emptyRemediation(input, source));
   return { owners, source };
 }

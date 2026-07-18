@@ -8,6 +8,7 @@ import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type RepoInfo, type SpawnFn } from "./github.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
+import { Aborter } from "./boundedPool.ts";
 import type { Config } from "./config.ts";
 import type { OrchestrateArgs } from "./args.ts";
 
@@ -592,6 +593,40 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
       { branch: "dev", commit_sha: hexOid("o-dev"), status: "scanned", is_default_branch: 0 },
       { branch: "main", commit_sha: hexOid("o-main"), status: "scanned", is_default_branch: 1 },
     ]);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("P0 exclusivity backstop: a repo scheduled twice in one run fails LOUD (shared scheduledRepoKeys, case-insensitive)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "excl-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    // pre-seed main done@head so the first pass is skip-current (no tree fetch), keeping the test
+    // focused on the exclusivity claim rather than the scan pipeline.
+    const key: WorkUnitKey = { configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: "main" };
+    db.enqueueUnit(key, runId);
+    db.setUnitStatus(key, { status: "done", runId, lastCommitSha: hexOid("o-main"), lastCommitDate: "2025-06-01T00:00:00Z" });
+    const client = makeClient(root, async () => ({ exitCode: 0, stderr: "", stdout: graphqlHeads([
+      { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+    ], "main") }));
+    const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+    const shared = new Set<string>();
+
+    // first scheduling of org-a/svc succeeds and claims the canonical key
+    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set(), shared));
+    // a SECOND scheduling of the same canonical (org, repo) with the SHARED set throws BEFORE any write
+    await expect(
+      processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set(), shared),
+    ).rejects.toThrow(/scheduled twice/);
+    // a case-variant owner spelling is caught too (the key is lowercased) — proves the fold cannot be evaded
+    await expect(
+      processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "ORG-A", { ...repo, organization: "ORG-A" }, [], new Set(), shared),
+    ).rejects.toThrow(/scheduled twice/);
+    // a DISTINCT repo in the SAME shared set is unaffected (no false positive — different canonical key)
+    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", { ...repo, name: "other" }, [], new Set(), shared));
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -1319,6 +1354,7 @@ const config = Object.freeze({
   cutoffDate: "2000-01-01", maxBranchesPerRepo: 10, maxReposPerOrg: 10,
   includeArchived: true, includeForks: true, includePersonalNamespace: false,
   organizations: null, excludeOrganizations: [],
+  concurrency: { organizations: 1, repositories: 1, branches: 1 }, // sequential in tests (derived stubs inherit)
 }) as unknown as Config;
 const KEY: WorkUnitKey = { configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "main" };
 
@@ -1656,5 +1692,308 @@ describe("clone-fallback readers fail closed (§5.C)", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
+  const heads = (nodes: Array<{ name: string; oid: string; date: string }>): string =>
+    `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: {
+      defaultBranchRef: { name: "main" },
+      refs: { pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: hexOid(`t-${n.name}`) } } })) },
+    } } })}`;
+  const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+  const startRun = (db: AuditDb): string =>
+    db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" }).runId;
+  const fanoutConfig = (root: string) => ({ ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 4 } });
+  const nodesN = (n: number) => Array.from({ length: n }, (_, i) => ({ name: i === 0 ? "main" : `b${i}`, oid: hexOid(`o${i}`), date: "2025-06-01T00:00:00Z" }));
+
+  test("N branches scan concurrently (branches:4) — every unit lands exactly once, no lost/corrupted rows", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fanout-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const nodes = nodesN(8); // 1 default + 7 non-default, all within the cap of 25
+    const client = makeClient(root, async (_bin, args) =>
+      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    await captureJsonl(() => processRepo(db, client, rt(fanoutConfig(root), "h"), runId, "org-a", repo, [], new Set()));
+    const rows = db.read(`SELECT branch, status FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<{ branch: string; status: string }>;
+    expect(rows.length).toBe(8); // exactly one row per branch — no dupes, none lost
+    expect(rows.every((r) => r.status === "scanned")).toBe(true);
+    for (const n of nodes) // work queue: each unit reached 'done' exactly once
+      expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: n.name })?.status).toBe("done");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a fatal from ONE unit fails the repo and STOPS dispatching further units (fail-fast, branches:1)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fanout-fatal-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const nodes = nodesN(6); // plan.toScan order: main, b1, b2, b3, b4, b5
+    // inject a write-time PolicyMatchError from exactly ONE unit's scanned upsert (b3)
+    const injected = new PolicyMatchError("excludeBranches", "x*", "b3", new Error("simulated write-time attribution incoherence"));
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+      if (h.status === "scanned" && h.branch === "b3") throw injected;
+      return realUpsert(h);
+    };
+    const client = makeClient(root, async (_bin, args) =>
+      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    // branches:1 makes dispatch strictly sequential, so the fail-fast is deterministic: units BEFORE b3
+    // drain, b3 throws the fatal → trips the local Aborter → no unit AFTER b3 is ever dispatched.
+    const seqConfig = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 1 } };
+    let thrown: unknown;
+    await captureJsonl(async () => {
+      try { await processRepo(db, client, rt(seqConfig, "h"), runId, "org-a", repo, [], new Set()); }
+      catch (e) { thrown = e; }
+    });
+    expect(thrown).toBe(injected); // the fatal is rethrown (deterministic: first rejection in plan.toScan order)
+    // At width 1 dispatch is strictly ordered, so the fatal at b3 (index 2 of plan.toScan) means exactly
+    // the 2 units BEFORE it scanned and the fatal branch was dispatched — 3 work-queue units total. Every
+    // unit AFTER b3 was never dispatched (the local Aborter stopped the pool), so it has NO work-queue row.
+    // This is the fail-fast the old sequential loop had — NOT the settle-all-continue that scanned all 5.
+    const scannedCount = (db.read(`SELECT COUNT(*) AS n FROM run_unit_head WHERE run_id = ? AND status = 'scanned'`).get(runId) as { n: number }).n;
+    expect(scannedCount).toBe(2); // only the units before b3 drained — NOT all 5 siblings
+    const dispatched = ["main", "b1", "b2", "b3", "b4", "b5"].filter(
+      (br) => db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: br }) !== null);
+    expect(dispatched.length).toBe(3); // exactly the 2 scanned + the fatal b3; the other 3 were skipped (no row)
+    expect(dispatched).toContain("b3"); // the fatal unit WAS dispatched (enqueued, then threw mid-scan)
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a branch fatal trips the RUN-level Aborter via onFatal PROMPTLY — WHILE a sibling branch is still in flight, before the pool drains (§7)", async () => {
+    // The fix for the deferred "branch-abort promptness" finding. A post-drain onFatal (calling it only
+    // AFTER the whole branch pool drained) would reproduce the exact defect yet still leave the run
+    // Aborter tripped by the end — so an end-of-run assertion is too weak. We prove it fires MID-DRAIN:
+    // branches:2 dispatches the fatal branch AND a sibling that BLOCKS on a gate, so the pool cannot
+    // drain. onFatal signals only AFTER it trips the run Aborter, so when `fatalHandled` resolves the
+    // sibling is STILL blocked (pool not drained) and yet the run Aborter is ALREADY tripped — impossible
+    // for a post-drain onFatal. Then we release the gate and confirm settle-all (the blocked sibling
+    // still drains) plus the fatal rethrow.
+    const root = mkdtempSync(join(tmpdir(), "fanout-onfatal-prompt-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const nodes = [
+      { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }, // the fatal branch
+      { name: "slow", oid: hexOid("o-slow"), date: "2025-06-01T00:00:00Z" }, // a gated sibling — holds the drain open
+    ];
+    const injected = new PolicyMatchError("excludeBranches", "x*", "main", new Error("write-time incoherence"));
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+      if (h.status === "scanned" && h.branch === "main") throw injected; // fatal from main's scanned upsert
+      return realUpsert(h);
+    };
+    let releaseSlow!: () => void;
+    const gateSlow = new Promise<void>((r) => { releaseSlow = r; });
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads(nodes) };
+      if (args.join(" ").includes(hexOid("t-slow"))) await gateSlow; // the 'slow' branch scan blocks until released
+      return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+    });
+    const cfg = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 2 } };
+    const runAborter = new Aborter();
+    let onFatalCalls = 0;
+    let signalHandled!: () => void;
+    const fatalHandled = new Promise<void>((r) => { signalHandled = r; });
+    const onFatal = (): void => { onFatalCalls++; runAborter.abort(); signalHandled(); }; // trip BEFORE signalling
+    let thrown: unknown = "unset";
+    const p = captureJsonl(async () => {
+      try { await processRepo(db, client, rt(cfg, "h"), runId, "org-a", repo, [], new Set(), new Set(), runAborter, onFatal); thrown = null; }
+      catch (e) { thrown = e; }
+    });
+    await fatalHandled; // onFatal has run (main's fatal was caught); the 'slow' sibling is STILL blocked on gateSlow
+    expect(onFatalCalls).toBe(1);
+    expect(runAborter.aborted).toBe(true); // tripped WHILE the pool is blocked mid-drain — a post-drain onFatal cannot do this
+    releaseSlow();  // release the in-flight sibling so the pool can drain (settle-all)
+    await p;
+    expect(thrown).toBe(injected); // the fatal is rethrown after the FULL drain
+    // settle-all: the blocked sibling drained to a terminal state despite the abort
+    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: "slow" })?.status).toBe("done");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("processRepo DROPS its run-Aborter callback after each pool settles — no accumulation over a large estate", async () => {
+    // Fix 5 end-to-end: each processRepo registers a branchAbort-trip on the run-level Aborter and must
+    // unsubscribe it (the .finally) once its branch pool settles, so a run over thousands of repos does
+    // not leave a callback per completed repo on the run Aborter. We drive many repos against ONE shared
+    // run Aborter and assert its callback list returns to empty after each — a broken unsubscribe would
+    // grow it unbounded. (White-box on the private `callbacks`, mirroring boundedPool.test.ts's tripwire.)
+    const root = mkdtempSync(join(tmpdir(), "fanout-unsub-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const nodes = nodesN(1); // just the default branch (main) — a clean, fatal-free scan
+    const client = makeClient(root, async (_bin, args) =>
+      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    const cfg = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 2 } };
+    const runAborter = new Aborter();
+    const internal = runAborter as unknown as { callbacks: unknown[] };
+    await captureJsonl(async () => {
+      for (let i = 0; i < 25; i++) {
+        // a DISTINCT repo each iteration (fresh scheduledRepoKeys per call), like a large estate
+        await processRepo(db, client, rt(cfg, "h"), runId, "org-a", { ...repo, name: `svc${i}` }, [], new Set(), new Set(), runAborter);
+        expect(internal.callbacks.length).toBe(0); // this repo unsubscribed once its pool settled
+      }
+    });
+    expect(runAborter.aborted).toBe(false); // no fatal occurred; the Aborter was only ever registered on and unsubscribed from
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations > 1, §7)", () => {
+  const heads = `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: {
+    defaultBranchRef: { name: "main" },
+    refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ name: "main", target: { oid: hexOid("o-main"), committedDate: "2025-06-01T00:00:00Z", tree: { oid: hexOid("t-main") } } }] },
+  } } })}`;
+  // A repo listing OWNED BY the requested org (mapRestRepo enforces owner-scope), one branch (main),
+  // an empty tree. Lets two owners fan out and both scan to zero findings.
+  const multiOwnerClient = (root: string): GithubClient =>
+    makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads };
+      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+      const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const twoOwnerConfig = (root: string) => ({ ...testConfig(root, 25), organizations: ["org-a", "org-b"], concurrency: { organizations: 2, repositories: 2, branches: 1 } });
+  const runStatus = (db: AuditDb): string | undefined => (db.read(`SELECT status FROM runs`).get() as { status: string } | null)?.status ?? undefined;
+  const scannedOrgs = (db: AuditDb): string[] =>
+    (db.read(`SELECT DISTINCT organization FROM run_unit_head WHERE status='scanned' ORDER BY organization`).all() as Array<{ organization: string }>).map((r) => r.organization);
+  // Inject a fatal thrown from a specific owner's reconcileRunUnitHead — an escape point AFTER that
+  // owner's branch already scanned, so both owners are provably DRAINED (their scanned rows written)
+  // before the fatal is surfaced. Errors thrown there escape processRepo → processOwner → the owner
+  // worker (which trips the run Aborter and rethrows) → the pool, exactly the fatal path §7 governs.
+  const injectReconcile = (db: AuditDb, byOrg: Record<string, Error>): void => {
+    const real = db.reconcileRunUnitHead.bind(db);
+    (db as unknown as { reconcileRunUnitHead: AuditDb["reconcileRunUnitHead"] }).reconcileRunUnitHead = (runId, org, repo, branches) => {
+      const e = byOrg[org];
+      if (e !== undefined) throw e;
+      return real(runId, org, repo, branches);
+    };
+  };
+  const runToError = async (db: AuditDb, root: string): Promise<unknown> => {
+    let thrown: unknown = null;
+    await captureJsonl(async () => { thrown = await runScan(db, multiOwnerClient(root), rt(twoOwnerConfig(root), "h"), noArgs, null).then(() => null, (e: unknown) => e); });
+    return thrown;
+  };
+
+  test("two owners fan out and BOTH scan (concurrency.organizations:2), run completes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owner-fanout-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await captureJsonl(() => runScan(db, multiOwnerClient(root), rt(twoOwnerConfig(root), "h"), noArgs, null));
+    expect(scannedOrgs(db)).toEqual(["org-a", "org-b"]);
+    expect(runStatus(db)).toBe("completed");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a PolicyMatchError escaping ONE owner FAILS the run — sibling owner fully DRAINED first (§7)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owner-policy-fatal-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const injected = new PolicyMatchError("excludeBranches", "x*", "main", new Error("org-b incoherence"));
+    injectReconcile(db, { "org-b": injected });
+    const thrown = await runToError(db, root);
+    expect(thrown).toBe(injected); // the ORIGINAL policy error, surfaced unchanged
+    expect(runStatus(db)).toBe("failed"); // failRun ran — a config defect excludes the run from latest
+    expect(scannedOrgs(db)).toEqual(["org-a", "org-b"]); // BOTH drained (org-b scanned before its reconcile threw)
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a GENERIC escape leaves the run RESUMABLE (no failRun) — sibling owner still drains", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owner-generic-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const generic = new Error("org-b reconcile boom (transient/infra)");
+    injectReconcile(db, { "org-b": generic });
+    const thrown = await runToError(db, root);
+    expect(thrown).toBe(generic);
+    expect(runStatus(db)).toBe("running"); // NO failRun — a non-policy escape stays resumable (§7)
+    expect(scannedOrgs(db)).toEqual(["org-a", "org-b"]); // both drained
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("Trap 2: failRun is keyed on ANY collected PolicyMatchError even when a lower-index GENERIC error is surfaced", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owner-trap2-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const generic = new Error("org-a generic (lower owner index)");
+    const policy = new PolicyMatchError("excludeBranches", "x*", "main", new Error("org-b policy"));
+    injectReconcile(db, { "org-a": generic, "org-b": policy });
+    const thrown = await runToError(db, root);
+    expect(thrown).toBe(generic); // surfaced = FIRST rejection in owner order (org-a), deterministic
+    expect(runStatus(db)).toBe("failed"); // but failRun STILL ran, because org-b's PolicyMatchError was collected
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("onFatal is WIRED through runScan → processOwner: a BRANCH fatal in one owner stops a sibling owner's dispatch while the fatal repo is still draining (§7)", async () => {
+    // The end-to-end regression for the deferred "branch-abort promptness" finding through the PRODUCTION
+    // path (not a direct processRepo call): a branch-worker fatal in org-a must trip the RUN Aborter
+    // PROMPTLY via the onFatal runScan threads down, so a CONCURRENT sibling owner (org-b) skips its
+    // SECOND repo instead of scanning it during org-a's drain. Deterministic via gates: org-a's fatal
+    // branch (main) is fast while a sibling branch (slow) holds org-a's pool open (gateSlow, released
+    // only AFTER we assert); org-b's first repo (r1) is gated so org-b reaches the r2 decision only after
+    // org-a's fatal has already tripped the run Aborter. If runScan/processOwner did NOT forward onFatal,
+    // the run Aborter would trip only in org-a's owner-catch — which cannot run until gateSlow releases —
+    // so org-b would dispatch r2. We assert r2 has NO run_unit_head row.
+    const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+    const root = mkdtempSync(join(tmpdir(), "owner-onfatal-wire-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const branchHeads = (branches: Array<{ name: string; tree: string }>): string =>
+      `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: {
+        defaultBranchRef: { name: "main" },
+        refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: branches.map((b) => ({
+          name: b.name, target: { oid: hexOid(`o-${b.name}`), committedDate: "2025-06-01T00:00:00Z", tree: { oid: hexOid(b.tree) } } })) },
+      } } })}`;
+    const repoList = (owner: string, names: string[]): string =>
+      `HTTP/2.0 200 X\r\n\r\n${JSON.stringify(names.map((n) => ({ name: n, owner: { login: owner }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false })))}`;
+    const injected = new PolicyMatchError("excludeBranches", "x*", "main", new Error("org-a write-time incoherence"));
+    let signalFatal!: () => void;
+    const fatalThrown = new Promise<void>((r) => { signalFatal = r; });
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+      if (h.status === "scanned" && h.organization === "org-a" && h.branch === "main") { signalFatal(); throw injected; }
+      return realUpsert(h);
+    };
+    let releaseSlow!: () => void; const gateSlow = new Promise<void>((r) => { releaseSlow = r; });
+    let releaseR1!: () => void;   const gateR1 = new Promise<void>((r) => { releaseR1 = r; });
+    const client = makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (j.includes("orgs/org-a/repos")) return { exitCode: 0, stderr: "", stdout: repoList("org-a", ["svc"]) };
+      if (j.includes("orgs/org-b/repos")) return { exitCode: 0, stderr: "", stdout: repoList("org-b", ["r1", "r2"]) };
+      if (args.some((a) => a === "graphql")) {
+        if (j.includes("owner=org-a")) return { exitCode: 0, stderr: "", stdout: branchHeads([{ name: "main", tree: "t-a-main" }, { name: "slow", tree: "t-a-slow" }]) };
+        if (j.includes("name=r1")) return { exitCode: 0, stderr: "", stdout: branchHeads([{ name: "main", tree: "t-b-r1" }]) };
+        return { exitCode: 0, stderr: "", stdout: branchHeads([{ name: "main", tree: "t-b-r2" }]) }; // name=r2
+      }
+      if (j.includes(hexOid("t-a-slow"))) await gateSlow; // org-a's 'slow' branch holds org-a's pool open
+      if (j.includes(hexOid("t-b-r1"))) await gateR1;     // org-b's r1 scan blocks until released
+      return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+    });
+    const cfg = { ...testConfig(root, 25), organizations: ["org-a", "org-b"], concurrency: { organizations: 2, repositories: 2, branches: 2 } };
+    let thrown: unknown = "unset";
+    const p = captureJsonl(async () => {
+      try { await runScan(db, client, rt(cfg, "h"), noArgs, null); thrown = null; }
+      catch (e) { thrown = e; }
+    });
+    await fatalThrown;   // org-a's main fatal is imminent; org-a's 'slow' and org-b's r1 are both blocked
+    releaseR1();         // let org-b's r1 finish; by the time it does, onFatal has already tripped the run Aborter
+    // wait for org-b to finish r1 and reach the r2 decision, WITHOUT releasing org-a's drain (gateSlow held)
+    for (let i = 0; i < 1000 && db.getUnit({ configHash: "h", scope: "branch", organization: "org-b", repository: "r1", branch: "main" })?.status !== "done"; i++) await tick();
+    for (let i = 0; i < 20; i++) await tick(); // let org-b's post-r1 aborted-check settle (a non-forwarded onFatal would dispatch r2 here)
+    releaseSlow();       // now let org-a's 'slow' drain so the run can finish (org-a's owner-catch abort is far too late)
+    await p;
+    expect(thrown).toBe(injected); // the run failed with org-a's fatal, surfaced unchanged
+    expect(runStatus(db)).toBe("failed");
+    // r1 (org-b's first repo) DID scan (settle-all: it was in flight when the abort fired) …
+    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-b", repository: "r1", branch: "main" })?.status).toBe("done");
+    // … but r2 (org-b's SECOND repo) was SKIPPED — never dispatched, so no work-queue row exists for it.
+    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-b", repository: "r2", branch: "main" })).toBeNull();
+    expect(db.read(`SELECT COUNT(*) AS n FROM run_unit_head WHERE organization='org-b' AND repository='r2'`).get()).toEqual({ n: 0 });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
   });
 });

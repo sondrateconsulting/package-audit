@@ -68,6 +68,14 @@ const DEFAULT_REGISTRY_URL = "https://registry.npmjs.org";
 const DEFAULT_EXCLUDE_DIR_GLOBS = ["**/node_modules/**", "**/dist/**", "**/build/**", "**/vendor/**"];
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+// §5 concurrency: all three keys are OPTIONAL and default when absent. `repositories` is the global
+// in-flight cap on gh/git/tar subprocesses; `organizations` and `branches` size the owner and
+// per-repo branch-unit fan-out pools. A documented ceiling caps a pathological value (e.g. a huge
+// `branches` would otherwise try to dispatch that many fibers). concurrency is EXCLUDED from
+// config_hash, so defaulting/tuning it never changes the hash or orphans resumable work.
+const DEFAULT_CONCURRENCY = { organizations: 3, repositories: 8, branches: 4 } as const;
+const MAX_CONCURRENCY = 64;
+
 // ---- input helpers (validate at the boundary; never trust external JSON) -----------------
 const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
@@ -83,11 +91,11 @@ const isPosInt = (v: unknown): v is number => typeof v === "number" && Number.is
 // Both hints fire ONLY when the value's shape actually fits the sibling: a wrong hint — telling
 // someone they meant the other key when they simply mistyped this one — is worse than no hint.
 // `concurrency.repositories` has no root-level twin and never hints.
-// The hints name a DESTINATION and deliberately do not describe what the concurrency keys DO: only
-// `concurrency.repositories` is read at runtime (github.ts's global in-flight cap); `organizations`
-// and `branches` are validated, required, and then never consumed — owners/repos/branches are all
-// iterated sequentially. Calling them parallelism controls here would be a fresh false claim on top
-// of the schema's existing one.
+// The hints name a DESTINATION, not behavior. All three concurrency keys ARE consumed now (§5 fan-out):
+// `repositories` is the global in-flight cap on gh/git/tar subprocesses (github.ts), `organizations`
+// sizes the owner fan-out pool, and `branches` the per-repo branch-unit pool. They are DISTINCT from
+// the root-level `organizations`/`branches` allow-lists (which define WHAT is scanned) — same word,
+// unrelated setting — which is exactly the collision these hints disambiguate.
 
 // A LIST of non-empty names under `concurrency.<k>` can only have been meant as the root-level
 // allowlist: a count is never a list. Unambiguous, so name the one key it must be.
@@ -102,8 +110,8 @@ function concurrencyListHint(key: string, v: unknown): string {
 
 // A positive integer under a root-level allowlist key is the mirror-image mix-up. `organizations` has
 // exactly one numeric twin; `branches` has TWO plausible ones and guessing between them would be a coin
-// flip, so name both and let the operator pick. Only `maxBranchesPerRepo` is described, because it is
-// the only one of the three whose behavior can be stated truthfully (see the note above).
+// flip, so name both and let the operator pick (`maxBranchesPerRepo`, the per-repo branch cap, vs
+// `concurrency.branches`, the per-repo branch fan-out width — both real, so both are offered).
 // Any other numeric shape (0, negative, float) fits no sibling and gets no hint.
 function allowlistNumberHint(key: "organizations" | "branches", v: unknown): string {
   if (!isPosInt(v)) return "";
@@ -290,12 +298,15 @@ function normalizePackages(o: Record<string, unknown>, env: Record<string, strin
 
 function normalizeConcurrency(o: Record<string, unknown>): Concurrency {
   const c = o["concurrency"];
+  if (c === undefined || c === null) return { ...DEFAULT_CONCURRENCY }; // whole block optional → all defaults
   if (!isObject(c)) fail(`concurrency must be an object`);
   rejectUnknownKeys(c, CONFIG_CONCURRENCY_KEYS, "$.concurrency");
   const read = (k: keyof Concurrency): number => {
     const v = (c as Record<string, unknown>)[k];
+    if (v === undefined || v === null) return DEFAULT_CONCURRENCY[k]; // per-key optional → its default
     if (!isPosInt(v)) fail(`concurrency.${k} must be a positive integer${concurrencyListHint(k, v)}`);
-    return v as number;
+    if (v > MAX_CONCURRENCY) fail(`concurrency.${k} must be <= ${MAX_CONCURRENCY} (got ${v}) — past this ceiling a larger value yields no throughput gain (organizations/branches only queue more fibers; repositories only raises the subprocess cap) and just risks exhausting memory/handles`);
+    return v;
   };
   return { organizations: read("organizations"), repositories: read("repositories"), branches: read("branches") };
 }

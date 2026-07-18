@@ -62,9 +62,11 @@ export interface SpawnResult {
   stdout: string;
   stderr: string;
 }
-// Minimal lib.dom-free abort plumbing (the tsconfig lib is ESNext-only, so the platform
-// AbortSignal instance type is memberless here): the client flips it on deadline expiry and
-// the spawn impl registers the child-kill. onAbort fires immediately if already aborted.
+// Minimal, purpose-built abort plumbing: a bespoke { aborted, onAbort } read side fit for the
+// spawn-deadline use — the client flips it on deadline expiry and the spawn impl registers the
+// child-kill — rather than the platform AbortSignal's EventTarget (add/removeEventListener) API.
+// (The platform AbortController/AbortSignal ARE available under `types: ["bun"]`; this is a
+// fit-for-purpose shape, not a missing type.) onAbort fires immediately if already aborted.
 export interface SpawnAbortSignal {
   readonly aborted: boolean;
   onAbort(cb: () => void): void;
@@ -447,10 +449,12 @@ const CLOCK_SKEW_MS = 5_000;
 export const MAX_PAUSE_MS = 2 * 60 * 60 * 1000;
 const clampPauseMs = (ms: number | null): number | null =>
   ms === null ? null : Math.min(ms, MAX_PAUSE_MS);
-// MAX_PAUSE_MS bounds ONE sleep; this bounds the TOTAL a bucket may sleep per client
-// lifetime — otherwise poison-then-succeed responses keep every call "succeeding" at
-// 5 clamped naps per page, ~417 days across one MAX_PAGES listing. Once spent, further
-// pending pauses fail as ThrottleExhausted instead of sleeping.
+// MAX_PAUSE_MS bounds ONE sleep; this bounds the total WALL-CLOCK a bucket's pause windows may
+// cover per client lifetime — their UNION, so concurrent callers waiting out the SAME window are
+// charged once, not once per caller (the summed per-caller sleep time can exceed this; the funded
+// wall-clock coverage cannot). Otherwise poison-then-succeed responses keep every call "succeeding"
+// at 5 clamped naps per page, ~417 days across one MAX_PAGES listing. Once spent, further pending
+// pauses fail as ThrottleExhausted instead of sleeping.
 export const MAX_TOTAL_PAUSE_MS = 8 * 60 * 60 * 1000;
 
 export function parseRetryAfterMs(value: string | undefined, nowMs: number): number | null {
@@ -900,7 +904,7 @@ export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
 export interface GithubClientOptions {
   githubHost: string;
   db?: AuditDb | null; // api_cache home; null disables caching
-  concurrency?: number; // GLOBAL in-flight gh cap (§4)
+  concurrency?: number; // GLOBAL in-flight cap on gh/git/tar subprocesses (§4/§5.6)
   spawnImpl?: SpawnFn;
   sleepImpl?: (ms: number) => Promise<void>;
   nowImpl?: () => number;
@@ -912,8 +916,18 @@ export interface GithubClientOptions {
 
 interface Bucket {
   label: string;
+  // The published pause window end — every caller in this bucket sleeps until here (or, if the tail
+  // is unfunded, throws). Published even on budget overflow so a queued caller can never inherit a
+  // freed slot and spawn INTO an active rate-limit window (§4 admission).
   pausedUntilMs: number;
-  totalPausedMs: number; // cumulative slept-for-throttle ms, capped by MAX_TOTAL_PAUSE_MS
+  // WALL-CLOCK budget accounting (not per-caller-slept): accountedUntilMs is how far the cumulative
+  // pause budget has FUNDED, and budgetSpentMs is the total wall-clock ms charged (<= MAX_TOTAL_PAUSE_MS).
+  // N concurrent callers waiting out ONE window charge it ONCE (the union tail), where the old
+  // per-caller `totalPausedMs += wait` ledgered it N times and tripped the budget N× too early — wrong
+  // for the fan-out caller this whole feature adds. A pause published beyond accountedUntilMs is the
+  // UNFUNDED tail: waitBucket throws ThrottleExhausted for it rather than sleeping past the budget.
+  accountedUntilMs: number;
+  budgetSpentMs: number;
 }
 
 export class GithubClient {
@@ -928,8 +942,8 @@ export class GithubClient {
   private readonly ghEnv: Record<string, string>;
   private readonly baseEnv: Env;
   private readonly sem: Semaphore;
-  private readonly core: Bucket = { label: "core", pausedUntilMs: 0, totalPausedMs: 0 };
-  private readonly graphqlBucket: Bucket = { label: "graphql", pausedUntilMs: 0, totalPausedMs: 0 };
+  private readonly core: Bucket = { label: "core", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
+  private readonly graphqlBucket: Bucket = { label: "graphql", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
   private gitConfigPath: string | null = null;
 
   // Observable cache-role: --plan's zero-write contract requires a cache-less client (db: null),
@@ -1037,18 +1051,64 @@ export class GithubClient {
   }
 
   // ---- guarded low-level spawns (the §6 chokepoint) ----
-  // EVERY gh spawn — including direct preflight calls (`gh auth status`, `gh --version`) —
-  // acquires the GLOBAL semaphore so §4's "cap TOTAL in-flight gh processes" holds for all
-  // call paths, not just restGet/graphql. A `bucket` (core/graphql) makes acquisition
-  // pause-aware; a bare call (no rate-limit bucket) still counts against the cap.
-  async gh(args: string[], bucket?: Bucket): Promise<SpawnResult> {
+  // EVERY guarded subprocess — gh (incl. direct preflight `gh auth status`/`gh --version`), git
+  // (clone), and tar (extract) — acquires the GLOBAL semaphore so §4's "cap TOTAL in-flight
+  // subprocesses" holds for every path. `gh()` is the BARE form (no rate-limit bucket): it counts
+  // against the cap but is not pause-aware. The pause-aware, bucketed path is ghBucketedAttempt
+  // below (restGet/graphql), which arms any throttle pause INSIDE the lease so the slot is never
+  // released into an about-to-open pause window.
+  async gh(args: string[]): Promise<SpawnResult> {
     assertSpawnAllowed(this.bins.gh, args);
     assertReadOnlyGh(args);
-    const release = bucket !== undefined ? await this.acquireRespectingPause(bucket) : await this.sem.acquire();
+    const release = await this.sem.acquire();
     try {
       return await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
     } finally {
       release();
+    }
+  }
+
+  // ONE guarded, pause-aware gh attempt against a rate-limit bucket (the core of restGet/graphql's
+  // retry loops). Acquire the slot waiting out any live pause → spawn → run the caller's PURE
+  // `analyze` → ARM any throttle pause it reports, ALL before releasing the slot. Arm-before-release
+  // is load-bearing under fan-out: with the old release-then-classify-then-arm order a queued caller
+  // could inherit the freed slot and spawn straight into the window the first caller was about to
+  // publish (§4 admission race). `analyze` is synchronous, so nothing yields between spawn, arm, and
+  // release; `now` is read ONCE and shared by analyze's classification and the arm so both agree on
+  // the clock. Returns analyze's control-flow outcome for the caller's loop to act on OUTSIDE the
+  // lease (DB writes, transient backoff sleeps, return/throw).
+  //
+  // ATOMIC ADMISSION: acquireRespectingPause re-checks the pause AFTER acquiring the slot, but it
+  // returns the release across an `await` — i.e. a MICROTASK boundary — so a SIBLING fiber holding a
+  // DIFFERENT slot (concurrency ≥ 2) can armBucketPause in the gap between that check and the spawn
+  // below, and this fiber would spawn straight INTO a just-armed rate-limit window (the arm-inside-
+  // lease discipline only closes SAME-slot inheritance, not this different-slot post-check window).
+  // The final re-check here is therefore SYNCHRONOUS and in the SAME tick as the spawn: spawnBounded
+  // invokes this.spawn() synchronously before its first await, so with NO await between the re-check
+  // and spawnBounded nothing can interleave to arm a pause. A pause seen live releases the slot and
+  // re-loops (waitBucket sleeps it out, or ThrottleExhausted terminates the loop for an unfunded
+  // budget-overflow tail — so the loop always makes progress).
+  private async ghBucketedAttempt<T>(
+    args: string[], bucket: Bucket,
+    analyze: (res: SpawnResult, now: number) => { outcome: T; pauseUntilMs: number | null },
+  ): Promise<T> {
+    assertSpawnAllowed(this.bins.gh, args);
+    assertReadOnlyGh(args);
+    for (;;) {
+      const release = await this.acquireRespectingPause(bucket);
+      if (bucket.pausedUntilMs > this.now()) {
+        release(); // a pause armed in the acquire→spawn gap — wait it out without holding the slot
+        continue;  // re-loop: acquireRespectingPause sleeps the window, re-acquires, re-checks
+      }
+      try {
+        const res = await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
+        const now = this.now();
+        const { outcome, pauseUntilMs } = analyze(res, now);
+        if (pauseUntilMs !== null) this.armBucketPause(bucket, pauseUntilMs, now);
+        return outcome;
+      } finally {
+        release();
+      }
     }
   }
 
@@ -1078,7 +1138,17 @@ export class GithubClient {
     // gitconfig, so plan mode truly writes nothing and leaks no pkg-audit-gitcfg-* dir.
     const isVersionProbe = args.length === 1 && args[0] === "--version";
     const env = buildGitEnv(this.baseEnv, isVersionProbe ? devNull : this.ensureGitConfig());
-    return this.spawnBounded(this.bins.git, args, { env, cwd });
+    // Count the clone against the GLOBAL in-flight cap (§4/§5.6): under fan-out a clone per branch-unit
+    // would otherwise reach the composed organizations×branches degree and blow temp-dir/fd/memory.
+    // Acquire HERE (not inside spawnBounded, which gh already wraps — a second acquire there would
+    // deadlock gh at concurrency 1). Bare slot (no bucket): a clone is network work but consumes no
+    // REST/GraphQL quota, so it sits OUTSIDE the rate-limit buckets — only the subprocess cap bounds it.
+    const release = await this.sem.acquire();
+    try {
+      return await this.spawnBounded(this.bins.git, args, { env, cwd });
+    } finally {
+      release();
+    }
   }
 
   async tar(args: string[]): Promise<SpawnResult> {
@@ -1135,7 +1205,14 @@ export class GithubClient {
       if (!args.includes("--no-same-owner") || !args.includes("--no-same-permissions"))
         throw new GithubApiError("tar extract requires --no-same-owner and --no-same-permissions", {});
     }
-    return this.spawnBounded(this.bins.tar, args, { env: buildTarEnv(this.baseEnv) });
+    // Count the extraction against the GLOBAL in-flight cap (§4/§5.6), same as git — acquire once at
+    // this level, never inside spawnBounded (gh already wraps it → double-acquire deadlock at 1).
+    const release = await this.sem.acquire();
+    try {
+      return await this.spawnBounded(this.bins.tar, args, { env: buildTarEnv(this.baseEnv) });
+    } finally {
+      release();
+    }
   }
 
   // ---- REST GET with cache + throttle handling ----
@@ -1158,14 +1235,16 @@ export class GithubClient {
 
   private async waitBucket(bucket: Bucket): Promise<void> {
     const wait = bucket.pausedUntilMs - this.now();
-    if (wait <= 0) return;
-    // the single chokepoint every throttle pause sleeps through — enforce the budget here.
-    // totalPausedMs is PER-CALLER-slept ms, not wall-clock: N concurrent callers sleeping one
-    // window ledger N×W. That over-count is deliberate (fails EARLY, never late), as is the
-    // accrue-BEFORE-sleep ordering — a concurrent caller must see the budget already committed.
-    if (bucket.totalPausedMs + wait > MAX_TOTAL_PAUSE_MS)
+    if (wait <= 0) return; // no active pause
+    // WALL-CLOCK budget (the single chokepoint every throttle pause sleeps through): sleep only
+    // within the FUNDED horizon. A pause published BEYOND accountedUntilMs is the budget-overflow
+    // tail that armBucketPause could not fund — fail EARLY here rather than sleep past
+    // MAX_TOTAL_PAUSE_MS. Crucially, N concurrent callers all sleeping this ONE window is correct:
+    // the window's wall-clock cost was charged ONCE when it was armed (the union tail), not once per
+    // sleeper — fixing the old per-caller ledger that tripped the budget N× too early for the
+    // concurrent caller this feature adds.
+    if (bucket.pausedUntilMs > bucket.accountedUntilMs)
       throw new ThrottleExhausted(`${bucket.label} bucket (cumulative pause budget ${MAX_TOTAL_PAUSE_MS}ms exceeded)`);
-    bucket.totalPausedMs += wait;
     await this.sleep(wait); // semaphore NOT held while sleeping
   }
 
@@ -1180,18 +1259,46 @@ export class GithubClient {
     }
   }
 
-  // §4: the FINAL attempt's classification must not arm the bucket — the call is about to
-  // throw, and a residual pause would tax the next (possibly honest) call for free. ONE site
-  // for the guard so restGet and graphql can never drift apart. Callers compute untilMs
-  // eagerly; on the final attempt that spends one extra this.now() read and one discarded
-  // backoffWait computation (both pure — the injected test clocks only advance on sleep).
-  private armBucketPause(bucket: Bucket, attempt: number, untilMs: number): void {
-    if (attempt < MAX_ATTEMPTS - 1) bucket.pausedUntilMs = Math.max(bucket.pausedUntilMs, untilMs);
+  // Arm a throttle pause on the bucket, WALL-CLOCK-budgeted for concurrent callers. Two things run
+  // here, both under the caller's semaphore lease (ghBucketedAttempt), so a queued caller cannot
+  // spawn between them:
+  //   1. PUBLISH the window (pausedUntilMs = max) UNCONDITIONALLY — even the final attempt's pause
+  //      (which the caller is about to ThrottleExhausted on) and even a budget-overflow pause. Under
+  //      fan-out the final/overflow pause is bucket-global evidence every OTHER concurrent caller
+  //      must see; the exhausted caller simply throws without sleeping it (its loop ends / waitBucket
+  //      trips), but siblings must not spawn into a live rate-limit window.
+  //   2. FUND only the uncovered UNION TAIL: delta = max(0, published horizon (pausedUntilMs) −
+  //      max(now, accountedUntilMs)) — the horizon, NOT this candidate's raw untilMs (see the funding
+  //      comment below for why). Two callers arming the SAME window charge it once WHEN it was funded
+  //      (the second sees delta 0); if the first publication overflowed the budget the horizon is left
+  //      unfunded, and a later arm re-computes the tail against the CURRENT now: while that tail still
+  //      exceeds the remaining budget it re-overflows and funds nothing, but as now advances toward the
+  //      horizon the tail shrinks, so once it fits a later arm DOES fund it (and waitBucket then sleeps
+  //      it). If funding the tail
+  //      would exceed MAX_TOTAL_PAUSE_MS, publish the pause but do NOT advance accountedUntilMs — the
+  //      tail stays unfunded and waitBucket throws ThrottleExhausted for it instead of over-sleeping.
+  private armBucketPause(bucket: Bucket, untilMs: number, now: number): void {
+    bucket.pausedUntilMs = Math.max(bucket.pausedUntilMs, untilMs);
+    // Fund toward the PUBLISHED horizon (pausedUntilMs), not this candidate's raw untilMs. Every
+    // caller sleeps to pausedUntilMs — or throws — so that horizon is the only wall-clock a charge can
+    // buy. Charging raw untilMs let a SHORTER pause arriving under an already-published-but-UNFUNDED
+    // longer tail spend budget on coverage no caller ever sleeps (waitBucket throws for the WHOLE
+    // window while the tail is unfunded): a phantom charge that, under fan-out where sibling callers
+    // arm the shared bucket out of order, could drain the budget for time never actually paused.
+    // Targeting the horizon also keeps the two invariants intact: N callers arming the SAME window
+    // charge it once (the second sees delta 0), and an already-unfundable horizon stays unfunded WHILE
+    // its tail exceeds the remaining budget (the delta re-overflows) — until enough wall-clock elapses
+    // that the shrunken (horizon − now) tail fits, when a later arm funds it.
+    const horizon = bucket.pausedUntilMs;
+    const delta = Math.max(0, horizon - Math.max(now, bucket.accountedUntilMs));
+    if (delta === 0) return; // horizon already funded or entirely in the past — nothing new to charge
+    if (bucket.budgetSpentMs + delta > MAX_TOTAL_PAUSE_MS) return; // overflow: published, unfunded tail
+    bucket.budgetSpentMs += delta;
+    bucket.accountedUntilMs = horizon;
   }
 
-  // MUST stay PURE (no state, no jitter, no counters): armBucketPause callers evaluate it
-  // even on the final attempt and discard the result — a side effect here would silently
-  // start taxing that discarded call.
+  // MUST stay PURE (no state, no jitter, no counters): it is evaluated inside analyze closures whose
+  // result may be discarded, and a side effect here would silently perturb the budget.
   private backoffWait(kind: "secondary" | "transient", attempt: number, waitMs: number | null): number {
     if (waitMs !== null) return waitMs;
     const base = kind === "secondary" ? SECONDARY_BASE_WAIT_MS : TRANSIENT_BASE_WAIT_MS;
@@ -1234,63 +1341,82 @@ export class GithubClient {
     if (accept !== "") args.push("-H", `Accept: ${accept}`);
     if (cached?.etag != null && cached.responseBody !== null) args.push("-H", `If-None-Match: ${cached.etag}`);
 
+    // Each attempt spawns under the core bucket's lease and classifies + arms any throttle pause
+    // INSIDE that lease (ghBucketedAttempt), so a queued fan-out caller can never inherit the freed
+    // slot and spawn into the window this attempt just discovered. The caller acts on the returned
+    // outcome OUTSIDE the lease (DB writes, transient backoff sleeps, return/throw). A `retry`
+    // outcome means a pause was already armed — the NEXT attempt's acquire waits it out (or throws
+    // ThrottleExhausted if it is an unfunded budget-overflow tail; the final attempt likewise falls
+    // through to the throw below without sleeping the pause it published for its siblings).
+    type RestOutcome =
+      | { kind: "ok"; parsed: HttpResponse }
+      | { kind: "not-modified"; headers: Record<string, string>; body: string }
+      | { kind: "fatal"; status: number; ssoRequired: boolean; message: string }
+      | { kind: "no-response"; stderr: string }
+      | { kind: "truncated"; exitCode: number; stderr: string }
+      | { kind: "retry" };
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      // gh() acquires the (pause-aware) semaphore for the core bucket and releases it.
-      const res = await this.gh(args, this.core);
-      const parsed = parseGhApiOutput(res.stdout);
-      if (parsed.status === 0) {
+      const outcome = await this.ghBucketedAttempt<RestOutcome>(args, this.core, (res, now) => {
+        const parsed = parseGhApiOutput(res.stdout);
         // no HTTP response at all (network/auth plumbing failure; diagnostics on stderr)
-        if (attempt < MAX_ATTEMPTS - 1) {
-          await this.sleep(this.backoffWait("transient", attempt, null));
-          continue;
+        if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
+        if (parsed.status === 304 && cached !== null && cached.responseBody !== null)
+          return { outcome: { kind: "not-modified", headers: parsed.headers, body: cached.responseBody }, pauseUntilMs: null };
+        // A parsed SUCCESS from a FAILED gh process is untrustworthy: gh api -i streams the body
+        // AFTER the header block, so a mid-body transport cut leaves a well-formed 200 head + a
+        // TRUNCATED body + a nonzero exit — invisible to every status gate. HTTP-error statuses also
+        // arrive nonzero BY DESIGN (gh exits 1 on 4xx/5xx and on the 304 hit above) and classify
+        // normally below; only a 200-with-nonzero-exit is the truncation shape. Same transient class
+        // as no-response: retry, then surface stderr.
+        if (parsed.status === 200 && res.exitCode !== 0)
+          return { outcome: { kind: "truncated", exitCode: res.exitCode, stderr: res.stderr }, pauseUntilMs: null };
+        const cls = classifyRest(parsed.status, parsed.headers, parsed.body, now);
+        if (cls.kind === "ok") return { outcome: { kind: "ok", parsed }, pauseUntilMs: null };
+        if (cls.kind === "fatal") return { outcome: { kind: "fatal", status: cls.status, ssoRequired: cls.ssoRequired, message: cls.message }, pauseUntilMs: null };
+        // primary → pause until the reset epoch; secondary/transient → now + backoff. Arming from
+        // this pauseUntilMs happens inside the lease (ghBucketedAttempt), before the slot is released.
+        const pauseUntilMs = cls.kind === "primary" ? cls.untilMs : now + this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
+        return { outcome: { kind: "retry" }, pauseUntilMs };
+      });
+      if (outcome.kind === "no-response") {
+        if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
+        throw new GithubApiError(`gh api produced no HTTP response: ${outcome.stderr.trim().slice(0, 300)}`, { endpoint });
+      }
+      if (outcome.kind === "not-modified") {
+        // A 304 means the cached row is still valid — it ALREADY holds this exact body+etag (the
+        // If-None-Match we sent was read FROM it), so re-persisting it is pure redundancy. Skipping it
+        // also removes the one shared-row cache write that would span the network await: a delayed 304
+        // (old body/etag) rewriting the row could clobber a NEWER 200 a concurrent fiber wrote to the
+        // same key. Today every fan-out cache key is SHA-pinned immutable (a clobber would be
+        // byte-identical anyway), but keeping the cache RMW await-free holds even if a future
+        // mutable+cached endpoint is ever fetched under fan-out. The served body is unchanged.
+        return { status: 200, headers: outcome.headers, body: outcome.body };
+      }
+      if (outcome.kind === "truncated") {
+        if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
+        throw new GithubApiError(`gh exited ${outcome.exitCode} with an HTTP 200 response — the body may be truncated: ${outcome.stderr.trim().slice(0, 300)}`, { endpoint });
+      }
+      if (outcome.kind === "ok") {
+        // Persist ONLY an exact-200 body (defense-in-depth over classifyRest's ok⇒200): both
+        // cache-serving paths synthesize 200, so laundering any other 2xx into the cache would make
+        // it a 'complete' 200 forever for SHA-pinned endpoints. Cache write provenance is a durable
+        // invariant (rows are statusless and outlive --fresh), so it must hold locally. IMMUTABLE
+        // (SHA-pinned) endpoints use the GUARDED put: this body is persisted BEFORE validation, so
+        // under fan-out an unconditional overwrite could clobber a sibling's already-cached VALID body
+        // of the same byte-stable SHA with a malformed transient. putApiCacheImmutable refuses to
+        // overwrite a non-null DIFFERENT body (writing only absent/NULL/identical); the compare-and-
+        // delete tombstone guards the other half. Mutable endpoints keep the unconditional put (a newer
+        // 200 legitimately supersedes the old body).
+        if (outcome.parsed.status === 200 && !noStore) {
+          const entry = { method: "GET" as const, url: key, variantHash: accept, etag: outcome.parsed.headers["etag"] ?? null, responseBody: outcome.parsed.body };
+          if (immutable) this.db?.putApiCacheImmutable(entry);
+          else this.db?.putApiCache(entry);
         }
-        throw new GithubApiError(`gh api produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`, { endpoint });
+        return outcome.parsed;
       }
-      if (parsed.status === 304 && cached !== null && cached.responseBody !== null) {
-        this.db?.putApiCache({ method: "GET", url: key, variantHash: accept, etag: cached.etag, responseBody: cached.responseBody });
-        return { status: 200, headers: parsed.headers, body: cached.responseBody };
-      }
-      // A parsed SUCCESS from a FAILED gh process is untrustworthy: gh api -i streams the body
-      // AFTER printing the header block, so a mid-body transport failure leaves a well-formed
-      // 200 head with a TRUNCATED body on stdout and a nonzero exit — invisible to every status
-      // gate, and the exact-200 persist gate would freeze it into the cache. Only the exact-200
-      // path consumes/persists bodies; HTTP-error statuses arrive with a nonzero exit BY DESIGN
-      // (gh exits 1 on 4xx/5xx and on the 304 the cache hit above depends on) and classify
-      // normally below. Same transient class as no-response: retry, then surface stderr.
-      if (parsed.status === 200 && res.exitCode !== 0) {
-        if (attempt < MAX_ATTEMPTS - 1) {
-          await this.sleep(this.backoffWait("transient", attempt, null));
-          continue;
-        }
-        throw new GithubApiError(
-          `gh exited ${res.exitCode} with an HTTP 200 response — the body may be truncated: ${res.stderr.trim().slice(0, 300)}`,
-          { endpoint },
-        );
-      }
-      const cls = classifyRest(parsed.status, parsed.headers, parsed.body, this.now());
-      if (cls.kind === "ok") {
-        // Persist ONLY an exact-200 body. Both cache-serving paths above synthesize status 200,
-        // so caching any other 2xx (e.g. a 206 Partial Content) would launder it into a
-        // 'complete' 200 on every later call — permanently, for SHA-pinned endpoints.
-        // classifyRest now makes ok imply exactly 200, so this check looks redundant — it is
-        // DELIBERATE defense-in-depth: cache write provenance is a durable invariant (rows are
-        // statusless and outlive --fresh) and must hold locally, never by depending on a distant
-        // classifier's range staying narrow. Expected to survive mutation testing.
-        if (parsed.status === 200 && !noStore)
-          this.db?.putApiCache({
-            method: "GET", url: key, variantHash: accept,
-            etag: parsed.headers["etag"] ?? null, responseBody: parsed.body,
-          });
-        return parsed;
-      }
-      if (cls.kind === "fatal")
-        throw new GithubApiError(`${cls.message} (${endpoint})`, { status: cls.status, endpoint, ssoRequired: cls.ssoRequired });
-      if (cls.kind === "primary") {
-        this.armBucketPause(this.core, attempt, cls.untilMs);
-        continue;
-      }
-      const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-      this.armBucketPause(this.core, attempt, this.now() + waitMs);
+      if (outcome.kind === "fatal")
+        throw new GithubApiError(`${outcome.message} (${endpoint})`, { status: outcome.status, endpoint, ssoRequired: outcome.ssoRequired });
+      // outcome.kind === "retry": pause already armed inside the lease; loop again (next acquire waits it out).
     }
     throw new ThrottleExhausted(endpoint);
   }
@@ -1300,19 +1426,22 @@ export class GithubClient {
     try {
       return JSON.parse(res.body);
     } catch {
-      this.tombstoneApiCache(endpoint, ""); // the unparseable body was cached before we could see it
+      this.tombstoneApiCache(endpoint, "", res.body); // the unparseable body was cached before we could see it
       throw new GithubApiError(`invalid JSON from ${endpoint}`, { status: res.status, endpoint });
     }
   }
 
   // A 200 body is cached by restGet before endpoint-level validation runs. When validation then
-  // rejects it, overwrite the row with a NULL body: both cache-serving paths (the immutable hit
-  // and the 304 If-None-Match revalidation) require a non-null cached body, so the next call goes
-  // back to the network instead of re-serving the poisoned bytes until --purge-cache. The accept
-  // variant must match the fetch that cached the row — a mismatched variant would tombstone the
-  // wrong row and leave the poisoned one live.
-  private tombstoneApiCache(endpoint: string, accept: string): void {
-    this.db?.putApiCache({ method: "GET", url: this.cacheKey(endpoint), variantHash: accept, etag: null, responseBody: null });
+  // rejects it, null the row's body: both cache-serving paths (the immutable hit and the 304
+  // If-None-Match revalidation) require a non-null cached body, so the next call goes back to the
+  // network instead of re-serving the poisoned bytes until --purge-cache. The accept variant must
+  // match the fetch that cached the row — a mismatched variant would tombstone the wrong row and
+  // leave the poisoned one live. COMPARE-AND-DELETE: pass the exact bytes this fiber read as
+  // malformed (`expectedBody`) so the null lands ONLY if that body is still stored — under fan-out
+  // two fibers share the SAME immutable-SHA row, and a malformed-transient tombstone must not clobber
+  // a sibling's newer VALID write of the same SHA (see db.tombstoneApiCacheIfBody).
+  private tombstoneApiCache(endpoint: string, accept: string, expectedBody: string): void {
+    this.db?.tombstoneApiCacheIfBody({ method: "GET", url: this.cacheKey(endpoint), variantHash: accept, expectedBody });
   }
 
   // TS pagination (§5.A): per-page `gh api -i`, follow Link rel="next" (host-verified,
@@ -1355,70 +1484,61 @@ export class GithubClient {
     const args = ["api", "-i", "graphql", "-f", `query=${query}`];
     for (const [k, v] of Object.entries(fields)) args.push("-f", `${k}=${v}`); // -f raw strings, never -F
 
+    // Same lease discipline as restGet: spawn + classify + arm inside ghBucketedAttempt so a queued
+    // caller never spawns into an about-to-open pause. GraphQL classification reads the HTTP-200 BODY
+    // (RATE_LIMITED lives there, not just in headers), so parseGraphqlEnvelope + classifyGraphql run
+    // INSIDE the lease; the ok-branch post-checks (exact-200, malformed-envelope) run in the caller.
+    type GqlOutcome =
+      | { kind: "ok"; data: unknown; malformed: string | null; status: number; exitCode: number; stderr: string }
+      | { kind: "fatal"; status: number; ssoRequired: boolean; message: string }
+      | { kind: "no-response"; stderr: string }
+      | { kind: "retry" };
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      const res = await this.gh(args, this.graphqlBucket);
-      const parsed = parseGhApiOutput(res.stdout);
-      if (parsed.status === 0) {
-        if (attempt < MAX_ATTEMPTS - 1) {
-          await this.sleep(this.backoffWait("transient", attempt, null));
-          continue;
-        }
-        throw new GithubApiError(`gh api graphql produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`, { endpoint: "graphql" });
+      const outcome = await this.ghBucketedAttempt<GqlOutcome>(args, this.graphqlBucket, (res, now) => {
+        const parsed = parseGhApiOutput(res.stdout);
+        if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
+        // DELIBERATELY no broad restGet-style nonzero-exit truncation guard: gh exits 1 BY DESIGN after
+        // a COMPLETE HTTP-200 envelope whose body carries `errors` (incl. genuine RATE_LIMITED), so a
+        // nonzero exit under a parsed 200 is the NORMAL semantic-error shape, not truncation (a broad
+        // guard would blind-retry real throttles). classifyGraphql runs FIRST on whatever error
+        // evidence WAS readable: status/header semantics (5xx, throttle, SSO-fatal) are never
+        // downgraded by a malformed body — malformation (and a 2xx-non-200 status) only preempts the
+        // SUCCESS path, which the caller handles. Coercing a malformed envelope to "no errors" would be
+        // fail-OPEN (an ok branch-discovery feeds the reconcile PRUNE), so it is surfaced, never eaten.
+        const env = parseGraphqlEnvelope(parsed.body);
+        const cls = classifyGraphql(parsed.status, parsed.headers, env.errors, now);
+        if (cls.kind === "ok")
+          return { outcome: { kind: "ok", data: env.data, malformed: env.malformed, status: parsed.status, exitCode: res.exitCode, stderr: res.stderr }, pauseUntilMs: null };
+        if (cls.kind === "fatal") return { outcome: { kind: "fatal", status: cls.status, ssoRequired: cls.ssoRequired, message: cls.message }, pauseUntilMs: null };
+        const pauseUntilMs = cls.kind === "primary" ? cls.untilMs : now + this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
+        return { outcome: { kind: "retry" }, pauseUntilMs };
+      });
+      if (outcome.kind === "no-response") {
+        if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
+        throw new GithubApiError(`gh api graphql produced no HTTP response: ${outcome.stderr.trim().slice(0, 300)}`, { endpoint: "graphql" });
       }
-      // There is DELIBERATELY no BROAD restGet-style nonzero-exit truncation guard here: gh exits 1
-      // BY DESIGN after printing a complete HTTP-200 envelope whose body carries `errors` —
-      // including genuine RATE_LIMITED throttles — so a nonzero exit under a parsed 200 is by itself
-      // the NORMAL semantic-error shape, not a truncation signal (a broad guard would blind-retry
-      // real throttles past their reset window and misreport them as truncated). The ok-branch below
-      // does add a NARROW transient retry for the ONE shape that IS transport truncation — a nonzero
-      // exit whose body is ALSO unparseable — which a complete errors envelope (RATE_LIMITED parses
-      // fine → malformed===null) can never match. Truncation stays fail-closed even without it: the
-      // envelope is object-rooted JSON, and no proper prefix of a valid top-level-object JSON text is
-      // itself valid JSON except one that only sheds trailing whitespace (which still carries the
-      // complete object) — so a mid-stream cut either loses nothing or fails JSON.parse → flagged
-      // malformed → retried-then-rejected below.
-      // Spec-shape validation lives in parseGraphqlEnvelope (pure). A malformed envelope means the
-      // failure signal we were meant to read is unreadable — coercing it to "no errors" would be
-      // fail-OPEN: an ok:true branch discovery feeds the reconcile PRUNE (reconcileRunUnitHead), so a
-      // swallowed error signal could turn a partial result into row deletion. classifyGraphql still runs
-      // FIRST on whatever error evidence WAS readable: status/header semantics (5xx retry,
-      // throttle, SSO-fatal) are never downgraded by a malformed body — malformation (and a
-      // 2xx-non-200 status) only preempts the SUCCESS path below.
-      const env = parseGraphqlEnvelope(parsed.body);
-      // §4: GraphQL throttles can arrive as HTTP 200 with body errors — check BOTH.
-      const cls = classifyGraphql(parsed.status, parsed.headers, env.errors, this.now());
-      if (cls.kind === "ok") {
-        if (parsed.status !== 200)
-          throw new GithubApiError(
-            `graphql envelope: HTTP ${parsed.status} — only exactly 200 is success`,
-            { status: parsed.status, endpoint: "graphql" },
-          );
-        if (env.malformed !== null) {
-          // A truncated transport (gh buffers the graphql JSON, then aborts printing on a mid-stream
-          // read failure) leaves a well-formed HTTP-200 head + an unparseable body + a NONZERO exit —
-          // a transient read failure, retried under the same bounded transient budget restGet's
-          // truncation guard uses. Scoped to exactly that shape so a COMPLETE errors envelope (which
-          // parses fine → malformed===null) is never blind-retried; every other malformed reason
-          // (non-object root, missing data/errors, bad error entries) is a real spec violation → fatal.
-          if (env.malformed === "unparseable JSON body" && res.exitCode !== 0 && attempt < MAX_ATTEMPTS - 1) {
+      if (outcome.kind === "fatal")
+        throw new GithubApiError(`graphql: ${outcome.message}`, { status: outcome.status, endpoint: "graphql", ssoRequired: outcome.ssoRequired });
+      if (outcome.kind === "ok") {
+        if (outcome.status !== 200)
+          throw new GithubApiError(`graphql envelope: HTTP ${outcome.status} — only exactly 200 is success`, { status: outcome.status, endpoint: "graphql" });
+        if (outcome.malformed !== null) {
+          // A truncated transport leaves a well-formed HTTP-200 head + an unparseable body + a NONZERO
+          // exit — a transient read failure, retried under the bounded transient budget. Scoped to
+          // exactly that shape so a COMPLETE errors envelope (parses fine → malformed===null) is never
+          // blind-retried; every other malformed reason is a real spec violation → fatal.
+          if (outcome.malformed === "unparseable JSON body" && outcome.exitCode !== 0 && attempt < MAX_ATTEMPTS - 1) {
             await this.sleep(this.backoffWait("transient", attempt, null));
             continue;
           }
           throw new GithubApiError(
-            `graphql envelope: ${env.malformed}${res.exitCode !== 0 ? ` (gh exit ${res.exitCode}: ${res.stderr.trim().slice(0, 300)})` : ""} — refusing to treat the response as success`,
-            { status: parsed.status, endpoint: "graphql" },
+            `graphql envelope: ${outcome.malformed}${outcome.exitCode !== 0 ? ` (gh exit ${outcome.exitCode}: ${outcome.stderr.trim().slice(0, 300)})` : ""} — refusing to treat the response as success`,
+            { status: outcome.status, endpoint: "graphql" },
           );
         }
-        return env.data;
+        return outcome.data;
       }
-      if (cls.kind === "fatal")
-        throw new GithubApiError(`graphql: ${cls.message}`, { status: cls.status, endpoint: "graphql", ssoRequired: cls.ssoRequired });
-      if (cls.kind === "primary") {
-        this.armBucketPause(this.graphqlBucket, attempt, cls.untilMs);
-        continue;
-      }
-      const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-      this.armBucketPause(this.graphqlBucket, attempt, this.now() + waitMs);
+      // outcome.kind === "retry": pause already armed inside the lease; loop again (next acquire waits it out).
     }
     throw new ThrottleExhausted("graphql");
   }
@@ -1661,8 +1781,10 @@ export class GithubClient {
     } catch (e) {
       // restGet cached this body BEFORE validation could see it; for a SHA-pinned tree the
       // immutable path would re-serve the poisoned bytes forever (--purge-cache was the only
-      // remedy). Tombstone the row so the next call goes back to the network.
-      this.tombstoneApiCache(endpoint, "");
+      // remedy). Tombstone the row so the next call goes back to the network — compare-and-delete on
+      // the exact bytes read (res.body) so a sibling's concurrent VALID write of the same SHA is not
+      // clobbered.
+      this.tombstoneApiCache(endpoint, "", res.body);
       throw e;
     }
   }

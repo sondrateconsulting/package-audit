@@ -71,7 +71,8 @@ describe("validateAndNormalize — validation failures", () => {
     ["impossible cutoffDate", { ...baseRaw(), cutoffDate: "2024-13-40" }],
     ["zero maxBranchesPerRepo", { ...baseRaw(), maxBranchesPerRepo: 0 }],
     ["negative maxReposPerOrg", { ...baseRaw(), maxReposPerOrg: -1 }],
-    ["missing concurrency field", { ...baseRaw(), concurrency: { organizations: 3, repositories: 6 } }],
+    ["non-object concurrency", { ...baseRaw(), concurrency: 5 }],
+    ["over-max concurrency value", { ...baseRaw(), concurrency: { organizations: 3, repositories: 6, branches: 65 } }],
     ["missing paths", { ...baseRaw(), paths: undefined }],
     ["githubHost with scheme", { ...baseRaw(), githubHost: "https://gh.com" }],
     ["empty-string branch pattern", { ...baseRaw(), branches: ["main", ""] }],
@@ -112,8 +113,8 @@ describe("validateAndNormalize — validation failures", () => {
         .toThrow(/concurrency\.organizations must be a positive integer — for a list of organization names you likely meant the root-level "organizations" allowlist/);
     });
 
-    // Only maxBranchesPerRepo is DESCRIBED: concurrency.branches is validated but never consumed at
-    // runtime, so calling it a parallelism control would be a fresh false claim (see config.ts).
+    // Both numeric twins are real now: maxBranchesPerRepo (the per-repo cap) and concurrency.branches
+    // (the per-repo branch fan-out width, §5). The hint offers both and lets the operator pick.
     test("a NUMBER under root branches names BOTH numeric twins — guessing between them would be a coin flip", () => {
       expect(() => norm({ ...baseRaw(), branches: 4 }))
         .toThrow(/branches must be null or an array of strings — for a number you likely meant "maxBranchesPerRepo" \(the per-repo branch cap\) or "concurrency\.branches"/);
@@ -139,6 +140,36 @@ describe("validateAndNormalize — validation failures", () => {
     test("concurrency.repositories has no root-level twin and never hints", () => {
       expect(() => norm(conc({ repositories: ["a"] }))).toThrow(/^concurrency\.repositories must be a positive integer$/);
     });
+  });
+});
+
+describe("concurrency defaults + ceiling (§5 fan-out)", () => {
+  test("an omitted concurrency block falls back to ALL defaults (org 3, repos 8, branches 4)", () => {
+    const raw = baseRaw();
+    delete raw["concurrency"];
+    expect(norm(raw).concurrency).toEqual({ organizations: 3, repositories: 8, branches: 4 });
+  });
+  test("a partial concurrency block defaults ONLY the absent keys", () => {
+    expect(norm({ ...baseRaw(), concurrency: { repositories: 12 } }).concurrency)
+      .toEqual({ organizations: 3, repositories: 12, branches: 4 });
+  });
+  test("a null block and null keys fall back to defaults (parity with the schema's ['type','null'] convention)", () => {
+    // The runtime treats null like omitted (config.ts normalizeConcurrency), and config.schema.json
+    // now types the block and every key ["…","null"] to match — so an explicit null validates the same
+    // in both. Pins that parity so the two can never drift.
+    expect(norm({ ...baseRaw(), concurrency: null }).concurrency).toEqual({ organizations: 3, repositories: 8, branches: 4 });
+    expect(norm({ ...baseRaw(), concurrency: { organizations: null, repositories: 12, branches: null } }).concurrency)
+      .toEqual({ organizations: 3, repositories: 12, branches: 4 });
+  });
+  test("the documented ceiling (64) is inclusive; 65 is rejected on every key", () => {
+    expect(norm({ ...baseRaw(), concurrency: { organizations: 64, repositories: 64, branches: 64 } }).concurrency)
+      .toEqual({ organizations: 64, repositories: 64, branches: 64 });
+    for (const k of ["organizations", "repositories", "branches"] as const)
+      expect(() => norm({ ...baseRaw(), concurrency: { [k]: 65 } })).toThrow(/must be <= 64/);
+  });
+  test("still rejects non-positive / non-integer values (defaults never mask a real mistake)", () => {
+    expect(() => norm({ ...baseRaw(), concurrency: { organizations: 0 } })).toThrow(/must be a positive integer/);
+    expect(() => norm({ ...baseRaw(), concurrency: { branches: 1.5 } })).toThrow(/must be a positive integer/);
   });
 });
 
@@ -381,7 +412,7 @@ describe("config.schema.json ↔ runtime sync", () => {
 
   // The ONE keyword allowlist both the value-checker and the schema-only walk trust — a new
   // schema keyword must be added here (and taught to the checker) exactly once.
-  const KNOWN_SCHEMA_KEYWORDS = new Set(["$schema", "$id", "title", "description", "type", "properties", "required", "additionalProperties", "items", "minItems", "minimum", "minLength", "maxLength", "pattern", "format", "default"]);
+  const KNOWN_SCHEMA_KEYWORDS = new Set(["$schema", "$id", "title", "description", "type", "properties", "required", "additionalProperties", "items", "minItems", "minimum", "maximum", "minLength", "maxLength", "pattern", "format", "default"]);
 
   // Minimal JSON-Schema-subset checker covering exactly the features config.schema.json uses:
   // type (string | union incl. "null"), properties/required/additionalProperties:false, items,
@@ -400,6 +431,7 @@ describe("config.schema.json ↔ runtime sync", () => {
       if (node["pattern"] !== undefined && !new RegExp(node["pattern"]).test(value)) violations.push(`${path}: does not match ${node["pattern"]}`);
     }
     if (typeof value === "number" && node["minimum"] !== undefined && value < node["minimum"]) violations.push(`${path}: below minimum`);
+    if (typeof value === "number" && node["maximum"] !== undefined && value > node["maximum"]) violations.push(`${path}: above maximum`);
     if (Array.isArray(value)) {
       if (node["minItems"] !== undefined && value.length < node["minItems"]) violations.push(`${path}: fewer than minItems`);
       if (node["items"] !== undefined) value.forEach((v, i) => check(v, node["items"], `${path}[${i}]`, violations));
@@ -455,7 +487,7 @@ describe("config.schema.json ↔ runtime sync", () => {
     expect(schema["properties"]["packages"]["items"]["additionalProperties"]).toBe(false);
   });
   test("schema required matches the runtime's required fields (each omission throws; optionals don't)", () => {
-    expect((schema["required"] as string[]).sort()).toEqual(["concurrency", "cutoffDate", "maxBranchesPerRepo", "packages", "paths"]);
+    expect((schema["required"] as string[]).sort()).toEqual(["cutoffDate", "maxBranchesPerRepo", "packages", "paths"]);
     for (const req of schema["required"] as string[]) {
       const raw = baseRaw();
       delete raw[req];
@@ -520,5 +552,16 @@ describe("config.schema.json ↔ runtime sync", () => {
       expect({ key, value: pkgRuntimeDefaults[key] }).toEqual({ key, value: prop["default"] });
     }
     expect(defaultsChecked).toBeGreaterThanOrEqual(9); // the walk actually found the annotations
+  });
+  test("schema concurrency NESTED defaults match the runtime defaults", () => {
+    // The default walk above only sweeps ROOT + packages.items, so pin the nested concurrency
+    // defaults separately against what the runtime supplies for an omitted block.
+    const raw = baseRaw();
+    delete raw["concurrency"];
+    const rt = norm(raw).concurrency;
+    const props = schema["properties"]["concurrency"]["properties"] as Record<string, { default: number }>;
+    expect(props["organizations"]!.default).toBe(rt.organizations);
+    expect(props["repositories"]!.default).toBe(rt.repositories);
+    expect(props["branches"]!.default).toBe(rt.branches);
   });
 });

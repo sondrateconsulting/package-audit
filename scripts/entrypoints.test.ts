@@ -142,8 +142,8 @@ describe("orchestrate main() --plan (offline shims — the zero-write early retu
 
       // stdout is PURE JSONL, and the dispatch stopped at the plan summary — nothing after it
       const events = out.split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
-      expect(events.map((e) => e["event"])).toEqual(["config", "preflight", "owners", "plan-summary"]);
-      const summary = events[3]!;
+      expect(events.map((e) => e["event"])).toEqual(["config", "concurrency", "preflight", "owners", "plan-summary"]);
+      const summary = events[4]!;
       expect(summary["owners"]).toEqual(["pkg-audit-test-org-that-cannot-exist"]);
       expect(summary["reposDiscovered"]).toBe(0);
       expect(summary["discoveryErrors"]).toBe(0);
@@ -151,7 +151,10 @@ describe("orchestrate main() --plan (offline shims — the zero-write early retu
       expect(summary["excludedByDeny"]).toBe(0);
       expect(summary["excludedByAllow"]).toBe(0);
       expect(summary["defaultBranchPolicyOverrides"]).toBe(0);
-      expect(events[1]!["login"]).toBe("tester"); // preflight really ran against the shims
+      expect(events[2]!["login"]).toBe("tester"); // preflight really ran against the shims
+      // the concurrency event reports the effective fan-out widths (all three keys present)
+      expect(events[1]).toMatchObject({ event: "concurrency" });
+      for (const k of ["organizations", "branches", "repositories"]) expect(typeof events[1]![k]).toBe("number");
       expect(err).toContain("PLAN — preview only");
 
       // §0 zero-write, at the process level: the cwd tree is EXACTLY the two empty roots it

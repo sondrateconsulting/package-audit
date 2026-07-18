@@ -91,13 +91,66 @@ describe("buildReport (§7)", () => {
     db.close();
   });
 
-  test("is byte-reproducible across builds", () => {
+  test("is byte-reproducible across builds (errors[] included — frozen occurred_at,id re-render identically)", () => {
     const db = mem();
     const run = seed(db);
+    // Seed a few errors so the re-render exercises errors[] too. errors[] is ordered by the
+    // spec-mandated (occurred_at, id) rather than a content key (PROMPT.md §7), so it is NOT
+    // insertion-order-INDEPENDENT across separate runs — but for ONE frozen DB those keys are fixed,
+    // so re-rendering the same DB is byte-identical, which is the actual determinism contract.
+    db.insertError({ runId: run.runId, scope: "scan", organization: "org-a", repository: "svc", branch: "dev", message: "scan boom" });
+    db.insertError({ runId: run.runId, scope: "introspection", packageName: "expo", version: "50.0.7", message: "introspect boom" });
     const a = JSON.stringify(buildReport(db, run));
     const b = JSON.stringify(buildReport(db, run));
     expect(a).toBe(b);
+    expect((buildReport(db, run) as { errors: unknown[] }).errors.length).toBe(2);
     db.close();
+  });
+
+  // Concurrency fan-out (P1) determinism guard: under fan-out, run_unit_head rows and findings are
+  // WRITTEN in nondeterministic order across fibers. The report must be byte-identical regardless,
+  // which holds ONLY if every emitted array sorts by a TOTAL, content-derived key (nothing ties and
+  // falls back to insert/rowid order). Seed two DBs with identical logical content in FORWARD vs
+  // REVERSED insertion order and assert the report BODY (all sorted arrays) matches byte-for-byte —
+  // normalising the two genuinely run-identity fields (runId, generatedAt=completed_at timestamp).
+  // A future array sorted by a non-total key would reverse with the rowid order and fail here.
+  test("report body is independent of finding/unit INSERTION ORDER (fan-out determinism)", () => {
+    const seedMulti = (db: AuditDb, reversed: boolean) => {
+      const { runId } = db.startRun({
+        configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+        trackedPackages: ["expo", "react"], cutoffDate: "2024-01-01", githubHost: "github.com",
+      });
+      const now = "2026-01-01T00:00:00.000Z";
+      const ops: Array<() => void> = [];
+      for (const u of [{ branch: "main", sha: "aaa111", def: true }, { branch: "dev", sha: "bbb222", def: false }]) {
+        ops.push(() => db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: u.branch, commitSha: u.sha, status: "scanned", isDefaultBranch: u.def, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" }));
+        for (const pkg of ["expo", "react"]) {
+          ops.push(() => db.upsertDependencyFinding({
+            runId, organization: "org-a", repository: "svc", branch: u.branch, commitSha: u.sha, dateFetched: now,
+            packageName: pkg, dependencyKey: pkg, dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 5,
+            manifestPermalink: `https://github.com/org-a/svc/blob/${u.sha}/package.json#L5`, declaredVersion: "^1.0.0",
+            resolvedVersion: "1.0.0", resolvedVersionSource: "lockfile",
+          }));
+          ops.push(() => db.upsertUsageFinding({
+            runId, organization: "org-a", repository: "svc", branch: u.branch, commitSha: u.sha, packageName: pkg,
+            dependencyKey: pkg, usageType: "named-import", exportName: "x", context: "", filePath: "src/index.ts", lineNumber: 1,
+            permalink: `https://github.com/org-a/svc/blob/${u.sha}/src/index.ts#L1`, snippet: "import", foundAt: now,
+          }));
+        }
+      }
+      ops.push(() => db.writeApiSurface({ packageName: "expo", version: "1.0.0", versionSource: "lockfile", rows: [{ exportName: "x", exportKind: "named", source: "d.ts" }] }));
+      ops.push(() => db.writeApiSurface({ packageName: "react", version: "1.0.0", versionSource: "lockfile", rows: [{ exportName: "x", exportKind: "named", source: "d.ts" }] }));
+      for (const op of reversed ? [...ops].reverse() : ops) op();
+      db.completeRun(runId);
+      return db.getRun(runId)!;
+    };
+    const norm = (db: AuditDb, run: ReturnType<typeof seedMulti>): string =>
+      JSON.stringify({ ...(buildReport(db, run) as unknown as Record<string, unknown>), runId: "R", generatedAt: "G" });
+    const dbA = mem();
+    const dbB = mem();
+    expect(norm(dbA, seedMulti(dbA, false))).toBe(norm(dbB, seedMulti(dbB, true)));
+    dbA.close();
+    dbB.close();
   });
 
   test("units carry the tri-state isDefaultBranch from run_unit_head (true/false/null)", () => {

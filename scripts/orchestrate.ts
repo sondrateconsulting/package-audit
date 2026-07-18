@@ -1,11 +1,27 @@
-// orchestrate.ts — the single-writer coordinator (§5, §8). Entry point:
+// orchestrate.ts — the scan coordinator (§5, §8). Entry point:
 //   bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
 //                                  [--rescan-branch <org>/<repo>@<branch>]... [--help]
 // Flow (§8): restate config → preflight (§2) → resolve effective owners (§1) → start/resume run
 // (§3) → discover repos+branches and process each branch unit (§5.A-H) → reconcile introspection
-// (§5.E) → BIN-term CLI pass (§5.G) → mark run completed. ALL SQLite writes happen HERE (single
-// writer); per-unit reads fan out through the guarded github wrapper. Deterministic iteration
-// order (owners/repos/branches sorted) so runs are reproducible.
+// (§5.E) → BIN-term CLI pass (§5.G) → mark run completed. ALL SQLite writes happen through the ONE
+// AuditDb connection opened here; per-unit reads fan out through the guarded github wrapper.
+// Owners and (per repo) branch-units are fanned out through bounded pools (§5, concurrency.*), but
+// no mutex is needed: bun:sqlite statements are synchronous and every DB read-modify-write below is
+// an await-free block, so concurrent fibers never interleave mid-write and each unit's queue/head/
+// finding rows are distinct. The ONE row two units can share — `api_cache` for identical-content
+// branches (same SHA-pinned key) — is guarded separately (compare-and-delete tombstone + a
+// refuse-to-clobber immutable put, github.ts), not by row distinctness. Determinism (§6) is the
+// SAME-DB-SAME-RUN guarantee the spec makes (PROMPT.md: "Completion
+// and DB-write order are unconstrained... determinism is guaranteed by sorting every emitted array on a
+// TOTAL stable key"): report/export sort every emitted array by a total key, so RE-RENDERING a given
+// completed run's DB is byte-identical no matter which fiber wrote each row first. Findings sort by
+// CONTENT, so their ORDER is stable ACROSS runs that scanned the same commits (byte-identity is
+// same-DB-same-run only — a report/export finding still carries per-run wall-clock fields like
+// date_fetched/found_at that differ run-to-run). errors[] does NOT reproduce byte-for-byte across runs
+// and is not claimed to: it sorts by the spec-mandated (occurred_at, id) — a chronological event log
+// whose order and wall-clock timestamps are inherently per-run (occurred_at is wall-clock, so errors[]
+// was never byte-identical across separate runs, fan-out or not; fan-out only changes WHICH order two
+// same-instant errors take, exactly as their occurred_at already varied run-to-run).
 
 import { readdirSync, lstatSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -27,6 +43,7 @@ import { parseAlias, type DependencyType } from "./manifest.ts";
 import { introspectVersion, fetchPackument, resolveRangeToVersion, type Packument } from "./apiSurface.ts";
 import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
+import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
 import { logLine } from "./log.ts";
 
 // The three values that TOGETHER define one coherent scan/plan: the config, its hash, and the
@@ -109,6 +126,12 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const trackedNames = config.packages.map((p) => p.name);
 
   logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
+  // §5 configured fan-out widths. Emitted for both audit and --plan; in --plan runPlan traverses
+  // owners/repos SEQUENTIALLY, so organizations/branches are reported but not fanned out there (only
+  // repositories, the gh/git/tar subprocess cap, applies in plan mode). `repositories` is the GLOBAL
+  // in-flight subprocess cap, NOT a repo-loop degree — so at most `repositories` gh/git/tar run at
+  // once no matter how organizations×branches compose. Set-vocabulary event (documented in README).
+  logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
 
   // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
   // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls).
@@ -206,6 +229,15 @@ export async function runScan(
   const resume = db.resumeInfo(configHash);
   logLine({ event: "run", runId, resumed, counts: resume.counts });
 
+  // §1 exclusion enforcement on RESUME: excludeOrganizations is matched case-insensitively (ownerResolve),
+  // but config_hash hashes it exact-case (folding the hash would orphan legacy resumable work). So a run
+  // that straddles the upgrade to case-insensitive exclusion could hold run_unit_head + errors rows for an
+  // owner a case-variant exclude now removes — prune both so a resumed run's report never surfaces an owner
+  // its own excludeOrganizations excludes. No-op on a fresh run and when excludeOrganizations is empty.
+  const excludedPruned = db.pruneExcludedOwnerRows(runId, config.excludeOrganizations);
+  if (excludedPruned.heads > 0 || excludedPruned.errors > 0)
+    logLine({ event: "reconciliation", target: "excluded-owner", runId, action: "prune-excluded-owner", prunedHeads: excludedPruned.heads, prunedErrors: excludedPruned.errors });
+
   // §3 --rescan-branch: reset matching branch units to pending BEFORE discovery.
   for (const t of args.rescanBranches) {
     const reset = db.rescanBranch(configHash, t.organization, t.repository, t.branch);
@@ -213,6 +245,13 @@ export async function runScan(
   }
 
   const nonRegistrySkipSeen = new Set<string>();
+  // §5.A exclusivity backstop (P0): the canonical `org\0repo` key of every repo scheduled this run.
+  // Owner case-folding (ownerResolve.ts) plus mapRestRepo's owner-scope enforcement (github.ts)
+  // already make a repo reachable under exactly ONE effective owner, so this Set NEVER trips in
+  // correct operation — it is the honest tripwire that makes "each branch-unit scheduled at most
+  // once" provable rather than assumed, so a future regression that double-schedules a repo (and
+  // would race two fibers on the same rows under fan-out) fails LOUD instead of corrupting silently.
+  const scheduledRepoKeys = new Set<string>();
 
   // §5.G bin discovery: introspect each tracked package's LATEST published version ONCE up
   // front to learn its bin names, so the per-unit CLI scan runs specifier + bin terms in a
@@ -221,18 +260,59 @@ export async function runScan(
   const cliTermSets = await discoverCliTerms(db, client, config, runId);
   logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
 
-  // §5.A/§5.B discover + process, deterministically. A PolicyMatchError (a compiled branch matcher
-  // THREW at match time — fail-closed) is a GLOBAL config defect — never a per-repo soft error — so
-  // it ABORTS the whole run: mark the run failed (excluded from latest selection) and rethrow the
-  // ORIGINAL operator-facing error unchanged (it is registered in KNOWN_OPERATOR_ERRORS).
-  const coverages: RepoPolicyCoverage[] = [];
-  try {
-    for (const owner of owners) {
-      coverages.push(...(await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen)));
+  // §5.A/§5.B discover + process, fanned out across owners bounded by concurrency.organizations (§5).
+  // A PolicyMatchError (a compiled branch matcher THREW at match time — fail-closed) is a GLOBAL
+  // config defect — never a per-repo soft error — so it ABORTS the whole run: mark it failed (excluded
+  // from latest selection) and rethrow the ORIGINAL operator-facing error unchanged (registered in
+  // KNOWN_OPERATOR_ERRORS).
+  //
+  // boundedPool SETTLES ALL: an owner that throws never tears its siblings down, and every owner fiber
+  // (with its nested per-repo branch pools) DRAINS before this returns — so main()'s finally
+  // db.close() can never race a live writer. The per-run Aborter is tripped the instant ANY owner
+  // escapes, so sibling owners stop dispatching NEW repos/units at once (boundary-only cancellation:
+  // in-flight discovery/scans drain naturally, bounded by the per-spawn deadline; nothing throws an
+  // AbortError, so no discovery fail-soft catch is ever mis-fired into a false error row).
+  //
+  // onFatal is threaded DOWN into each processRepo's branch pool so a fatal caught deep in a branch
+  // worker trips this run Aborter PROMPTLY — not only when the owner worker's catch below runs (which
+  // waits for that owner's whole branch pool to drain first). The owner catch is still needed for
+  // fatals OUTSIDE the branch-worker path (discovery, duplicate scheduling, reconciliation). abort() is
+  // idempotent, so the two paths compose without double-firing.
+  const aborter = new Aborter();
+  const onFatal = (): void => aborter.abort();
+  const ownerResults = await boundedPool(owners, config.concurrency.organizations, async (owner) => {
+    try {
+      return await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, aborter, onFatal);
+    } catch (e) {
+      aborter.abort(); // trip so sibling owners stop dispatching new work immediately
+      throw e; // captured by the pool; the run lifecycle is decided AFTER every owner has drained
     }
-  } catch (e) {
-    if (e instanceof PolicyMatchError) db.failRun(runId);
-    throw e;
+  }, { signal: aborter });
+
+  // Coverage from the SUCCESSFUL owners, in deterministic owner order (positional pool results).
+  const coverages: RepoPolicyCoverage[] = [];
+  for (const r of ownerResults) if (r.status === "fulfilled") coverages.push(...r.value);
+
+  // Fatal lifecycle over the collected REAL failures (rejections). Under boundary-only cancellation
+  // nothing throws an AbortError, so every rejection is a genuine fatal. failRun iff ANY is a
+  // PolicyMatchError (a config defect must exclude the run from latest) — even when a lower-index
+  // generic escape is the one surfaced. A run with NO PolicyMatchError stays resumable (no failRun).
+  // Rethrow the FIRST rejection in owner order (deterministic surfaced error) AFTER the full drain.
+  //
+  // ACCEPTED trade-off (prompt fan-out cancellation): the predicate sees only COLLECTED failures. A
+  // generic fatal (a DB-write failure, the bucket-wiring assertion) in an earlier owner now trips the
+  // run Aborter promptly (onFatal), which can SKIP a later sibling owner's would-be PolicyMatchError —
+  // so that run stays resumable rather than failed. This is benign: a fatal run emits NO report (the
+  // throw below precedes completeRun/emitReport) and is never served as "latest" (that filters
+  // status='completed'), and the config defect is DETERMINISTIC — it recurs and fails the next run
+  // THAT re-scans that branch (a run that never reaches it cannot surface it, but also emits no report
+  // implicating that branch). Guaranteeing failRun on a masked-behind-a-generic-fatal PolicyMatchError
+  // would need estate-wide up-front policy validation, out of scope here. The masking already existed
+  // pre-fan-out (any abort stops siblings); onFatal only narrows the window.
+  const failures = ownerResults.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
+  if (failures.length > 0) {
+    if (failures.some((reason) => reason instanceof PolicyMatchError)) db.failRun(runId);
+    throw failures[0];
   }
 
   // Emit the unmatched-pattern warnings (before completeRun/done) and build the summary array.
@@ -296,15 +376,23 @@ export async function resolveOwnersWithDiscovery(
 export async function processOwner(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, personalLogin: string | null, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+  scheduledRepoKeys: Set<string> = new Set(), signal?: AbortLike, onFatal?: () => void,
 ): Promise<RepoPolicyCoverage[]> {
-  const isPersonal = runtime.config.includePersonalNamespace && owner === personalLogin;
+  // Personal-vs-org routing is CASE-INSENSITIVE to match ownerResolve's owner fold: a configured
+  // "Alice" that collapsed onto personal login "alice" must still route through listUserRepos, not
+  // the org endpoint. (personalLogin here is the resolved preflight login; includePersonalNamespace
+  // gates whether personal routing applies — the `personalLogin !== null` check is just defensive.)
+  const isPersonal = runtime.config.includePersonalNamespace && personalLogin !== null && owner.toLowerCase() === personalLogin.toLowerCase();
   const outcome = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
   if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
-  // Collect each successfully-discovered repo's coverage (null = its branch discovery failed) so the
-  // run-level warning finalizer sees exactly the patterns exercised against real branches.
+  // Repos stay SEQUENTIAL within an owner (§4): each repo's discover→plan→scan→reconcile must be
+  // atomic (branches fan out INSIDE processRepo). Check the run-level abort before each repo so a
+  // fatal in a SIBLING owner stops this owner from dispatching more work promptly (boundary-only
+  // cancellation — no throw, so partial coverage is fine; the run is failing anyway).
   const coverages: RepoPolicyCoverage[] = [];
   for (const repo of outcome.items) {
-    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen);
+    if (signal?.aborted) break;
+    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, signal, onFatal);
     if (cov !== null) coverages.push(cov);
   }
   return coverages;
@@ -372,10 +460,22 @@ export async function discoverBranchHeads(
 export async function processRepo(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+  scheduledRepoKeys: Set<string> = new Set(), signal?: AbortLike, onFatal?: () => void,
 ): Promise<RepoPolicyCoverage | null> {
   const { config, configHash, branchPolicy } = runtime;
   const outcome = await discoverBranchHeads(db, client, runId, repo);
   if (!outcome.ok) return null; // failed/throttled — this repo isn't "discovered"; contributes no coverage
+  // §5.A exclusivity backstop (P0): claim this repo's canonical (org, repo) BEFORE any per-branch
+  // write, so a double-scheduled repo fails LOUD rather than racing two fibers on the same rows
+  // under fan-out. The check-then-add is synchronous (no await between .has and .add), so it stays
+  // correct even when sibling processRepo calls run concurrently. Keyed on repo.organization (the
+  // API-canonical owner.login, validated == the requested owner by mapRestRepo) so a case-variant
+  // owner cannot evade it. This never trips in correct operation (owner fold + owner-scope
+  // enforcement guarantee it); it is the honest proof, not a routine branch.
+  const repoKey = `${repo.organization.toLowerCase()}\0${repo.name.toLowerCase()}`;
+  if (scheduledRepoKeys.has(repoKey))
+    throw new Error(`internal: repo ${repo.organization}/${repo.name} scheduled twice in one run — the owner-dedup/branch-exclusivity invariant was violated`);
+  scheduledRepoKeys.add(repoKey);
   const heads = outcome.snapshot.heads;
   // Classify the WHOLE repo up-front (policy → cutoff/cap) via the ONE shared planner. This runs
   // OUTSIDE the discovery catch and BEFORE any per-branch write, so a match-time PolicyMatchError
@@ -420,47 +520,100 @@ export async function processRepo(
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "past-cap" });
   }
 
-  // To-scan (default + within-cap after-cutoff). Only the DEFAULT may carry a policy counterfactual
-  // (the override); a non-default to-scan branch is necessarily no-exclusion (asserted, fail-closed).
-  for (const d of plan.toScan) {
-    const h = d.head;
-    if (!d.isDefaultBranch && d.rawPolicyResult.kind !== "no-exclusion")
-      throw new Error(`internal: non-default scanned branch ${repo.organization}/${repo.name}@${h.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
-    const key = keyFor(h.name);
-    const attr = policyAttribution(d.rawPolicyResult); // (null, null) unless the default-branch override
-    db.enqueueUnit(key, runId);
-    const unit = db.getUnit(key);
-    // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is reused
-    // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate.
-    if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
-      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
-      db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
-      logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
-      continue;
-    }
-
-    db.setUnitStatus(key, { status: "in_progress", runId });
+  // To-scan (default + within-cap after-cutoff). Fan out through a per-repo pool bounded by
+  // concurrency.branches (§5). Safe WITHOUT a mutex because each unit is a DISTINCT (org, repo,
+  // branch) — so distinct work_queue / run_unit_head rows — and every DB write below is an await-free
+  // synchronous block; bun:sqlite is fully synchronous, so no sibling fiber can interleave mid-block
+  // and the units never race each other's rows. Repos stay SEQUENTIAL within an owner (§4): each
+  // repo's discover→plan→scan→reconcile must be atomic, and this pool drains fully before the
+  // reconcile below. Only the DEFAULT may carry a policy counterfactual (the override); a non-default
+  // to-scan branch is necessarily no-exclusion (asserted, fail-closed).
+  //
+  // Fatal fail-fast: a LOCAL Aborter stops NEW unit dispatch the instant any unit throws a fatal
+  // (PolicyMatchError or the internal bucket-wiring assertion), matching the run-level owner Aborter's
+  // discipline one level down — so branches:1 reproduces the old sequential loop's fail-fast, and a
+  // broken policy does not re-throw against every remaining branch. It is composed with the incoming
+  // run-level signal (a sibling owner's fatal trips this pool too). Settle-all is preserved: units
+  // already IN FLIGHT still drain (the drain-safety §7 depends on for db.close()); only undispatched
+  // units are skipped.
+  const branchAbort = new Aborter();
+  // Register this repo's branchAbort-trip on the run-level Aborter, and DROP it (the .finally below)
+  // once this branch pool settles. Without the unsubscribe every COMPLETED repo's callback would stay
+  // on the run-level Aborter until the run ends — unbounded accumulation over a large estate. The
+  // .finally runs whether the pool resolves or the fatal-rethrow path is taken, and unsubscribe is a
+  // no-op if the callback already fired (a run-level abort).
+  const unsubscribe = signal?.onAbort(() => branchAbort.abort()); // run-level fatal → stop this pool too (fires immediately if already aborted)
+  const unitResults = await boundedPool(plan.toScan, config.concurrency.branches, async (d) => {
+    if (branchAbort.aborted) return; // a fatal (this repo's own or a sibling owner's) tripped the run — dispatch no new units
     try {
-      const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
-      db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
-    } catch (e) {
-      // A PolicyMatchError is FATAL by contract (the run driver fails the whole run on it) — it
-      // must never be downgraded to an ordinary per-unit scan error here. Today it can arise from
-      // the write chokepoint's attribution-coherence verification inside processUnit's upserts.
-      if (e instanceof PolicyMatchError) throw e;
-      if (e instanceof ThrottleExhausted) {
-        // §4: throttle exhaustion is NOT a permanent unit failure — put the unit back to
-        // pending so a LATER run retries it. No same-run spin: this loop visits each unit
-        // exactly once and nothing later in the run re-reads pending units.
-        db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
-        logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
-      } else {
-        db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
-        db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
-        logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
+      const h = d.head;
+      if (!d.isDefaultBranch && d.rawPolicyResult.kind !== "no-exclusion")
+        throw new Error(`internal: non-default scanned branch ${repo.organization}/${repo.name}@${h.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
+      const key = keyFor(h.name);
+      const attr = policyAttribution(d.rawPolicyResult); // (null, null) unless the default-branch override
+      db.enqueueUnit(key, runId);
+      const unit = db.getUnit(key);
+      // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is reused
+      // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate. This
+      // enqueue→get→upsert→setStatus RMW is await-free, so it runs to completion atomically vs siblings.
+      if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
+        db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
+        db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
+        logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
+        return;
       }
+
+      db.setUnitStatus(key, { status: "in_progress", runId });
+      try {
+        const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
+        db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
+      } catch (e) {
+        // A PolicyMatchError is FATAL by contract — never downgraded to a per-unit scan error. It
+        // escapes to the outer catch, which trips branchAbort; boundedPool captures it and processRepo
+        // rethrows it below AFTER draining every in-flight sibling. Today it can arise from the write
+        // chokepoint's attribution-coherence verification inside processUnit's upserts.
+        if (e instanceof PolicyMatchError) throw e;
+        if (e instanceof ThrottleExhausted) {
+          // §4: throttle exhaustion is NOT a permanent unit failure — reset to pending so a LATER run
+          // retries it. No same-run spin: the pool dispatches each fixed plan.toScan unit exactly once
+          // and nothing re-reads pending units within the run. Handled here (not a fatal), so it never
+          // trips branchAbort — one throttled branch must not cancel its siblings.
+          db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
+          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
+        } else {
+          db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
+          db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
+          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
+        }
+      }
+    } catch (e) {
+      // A fatal escaped this unit (PolicyMatchError, or the internal bucket-wiring assertion — the
+      // handled throttle/scan-error cases above never reach here). Trip branchAbort so THIS pool
+      // dispatches NO further units at once (fail-fast). Also trip the RUN-level Aborter PROMPTLY via
+      // onFatal: without it the run Aborter is only tripped in runScan's owner-worker catch, which runs
+      // AFTER this whole branch pool drains and processRepo rethrows — so during that drain sibling
+      // OWNERS keep dispatching new repos. onFatal (= aborter.abort) stops sibling owners at their next
+      // repo check and trips sibling repos' branchAborts at once. Settle-all is preserved: abort only
+      // stops NEW dispatch; in-flight units still drain, so db.close() never races a live writer. Then
+      // rethrow so boundedPool captures it and processRepo surfaces the first rejection after the drain.
+      branchAbort.abort();
+      onFatal?.();
+      throw e;
     }
-  }
+  }, { signal: branchAbort }).finally(() => unsubscribe?.()); // drop this repo's run-Aborter callback once the pool settles
+  // A PolicyMatchError (or any other escaping fatal — the internal bucket-wiring assertion, a DB
+  // write failure) from ANY unit is FATAL: branchAbort has already stopped new dispatch and every
+  // IN-FLIGHT sibling has drained (settle-all), so surface a rejection here. runScan fails the run IFF
+  // any collected escape is a PolicyMatchError, so we PREFER to surface a PolicyMatchError (the first,
+  // for determinism) over a generic rejection — mirroring runScan's own failRun predicate one level
+  // down, so a config-defect PolicyMatchError can never be masked behind an earlier generic escape.
+  // (Belt-and-braces: a generic escape here is synchronous and trips branchAbort before any sibling
+  // reaches its POST-await PolicyMatchError, so a co-occurring policy fatal is already lower-index
+  // today — but preferring it keeps the failRun invariant robust to any future change in that timing.)
+  // Absent a PolicyMatchError, surface the first rejection in plan.toScan order (deterministic). This
+  // runs BEFORE reconciliation, exactly as the old sequential rethrow skipped it.
+  const rejections = unitResults.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
+  if (rejections.length > 0) throw rejections.find((reason) => reason instanceof PolicyMatchError) ?? rejections[0];
   // Stale-row reconciliation: this repo was discovered COMPLETELY (ok:true, reached only past the early
   // `!outcome.ok` return; listBranchHeads fails closed on any structural incompleteness, so `heads` is
   // the exact live branch set for THIS discovery snapshot). Prune this run's stale run_unit_head rows —
@@ -516,7 +669,9 @@ export async function processRepo(
 }
 
 // Scan ONE branch unit: fetch the tree (clone fallback on truncation), run the §5.C-H pipeline,
-// and WRITE every finding + the run_unit_head snapshot (single-writer).
+// and WRITE every finding + the run_unit_head snapshot. All writes here are an await-free synchronous
+// block AFTER the last await (scanUnit), and target THIS unit's distinct rows — so under branch
+// fan-out they never race a sibling unit's writes.
 async function processUnit(
   db: AuditDb, client: GithubClient, config: Config, runId: string,
   repo: RepoInfo, decision: BranchDecision, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
@@ -745,7 +900,10 @@ export async function discoverCliTerms(db: AuditDb, client: GithubClient, config
             version: latest, versionSource: "range-resolved", packument,
           });
         }
-        const bins = db.read(`SELECT DISTINCT export_name FROM package_api_surface WHERE package_name = ? AND export_kind='cli-bin' AND version = ?`).all(pkg.name, latest) as Array<{ export_name: string }>;
+        // ORDER BY so the emitted cli-terms event's `bins` array is byte-stable: the JSONL vocabulary
+        // is set-based (order-independent by contract), but a total, content-derived order keeps the
+        // line reproducible run-to-run and never depends on SQLite's implementation-defined row order.
+        const bins = db.read(`SELECT DISTINCT export_name FROM package_api_surface WHERE package_name = ? AND export_kind='cli-bin' AND version = ? ORDER BY export_name`).all(pkg.name, latest) as Array<{ export_name: string }>;
         binNames = bins.map((b) => b.export_name).filter((b) => b !== "");
       }
     } catch (e) {
