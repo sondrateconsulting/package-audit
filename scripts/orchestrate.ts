@@ -784,9 +784,13 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   // Warning parity: the empty-allowlist warning is emitted at mode entry, unconditionally, exactly as in
   // runScan — so --plan and the real run produce identical policy-warning events for the same config.
   if (isEmptyAllowlist(branchPolicy)) logLine({ event: "policy-warning", kind: "empty-allowlist" });
-  // The zero-write contract is enforced, not assumed: a caching client would write api_cache rows
-  // into the DB during discovery. This is an internal contract violation (a bug, not an operator
-  // error), so a plain Error with a stack is the right rendering.
+  // The zero-write contract is enforced STRUCTURALLY, not assumed. Plan discovery today writes no
+  // api_cache rows anyway — its listings are paginated (noStore: cache fully bypassed) and branch
+  // discovery is GraphQL (never cached) — but the contract must NOT depend on that staying true: a
+  // db-backed client plus any future discovery call that caches would silently write into the DB in
+  // plan mode. Rejecting a db-backed client up front keeps "--plan writes nothing" a durable
+  // invariant. An internal contract violation (a bug, not an operator error), so a plain Error with
+  // a stack is the right rendering.
   if (client.cachesToDb) throw new Error("runPlan requires a cache-less client (db: null) — plan mode must not write api_cache");
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 

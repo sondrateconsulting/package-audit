@@ -234,7 +234,8 @@ describe("runPlan cache-less client guard (--plan zero-write)", () => {
     const root = mkdtempSync(join(tmpdir(), "plan-guard-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     let spawns = 0;
-    // WRONG client for plan mode: it would cache into the DB
+    // WRONG client for plan mode: it is db-backed, so the structural zero-DB guard must reject it up
+    // front (independent of whether current discovery calls happen to write — they no longer do)
     const client = makeClient(root, async () => { spawns++; return { exitCode: 1, stderr: "never reached", stdout: "" }; }, { db });
     await expect(runPlan(client, rt(testConfig(root)), "rvo")).rejects.toThrow(/cache-less/);
     expect(spawns).toBe(0); // the guard fires before owner resolution / any gh call

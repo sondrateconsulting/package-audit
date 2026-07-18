@@ -640,8 +640,9 @@ describe("restGet caching + conditional requests", () => {
       { db },
     );
     await expect(client.fetchFileMeta("o", "r", "package.json", SHA)).rejects.toThrow(/invalid JSON/);
-    // the row is TOMBSTONED (NULL body AND NULL etag) — not merely deleted/absent: both cache-serving
-    // paths require a non-null body/etag, so a NULL-NULL row forces the refetch below.
+    // the row is TOMBSTONED (NULL body AND NULL etag) — not merely deleted/absent. The NULL BODY is
+    // what disables both cache-serving paths (the immutable hit and the 304 re-serve each require a
+    // non-null body), forcing the refetch below; the NULL etag additionally suppresses If-None-Match.
     const tomb = db.read("SELECT COUNT(*) AS n FROM api_cache WHERE response_body IS NULL AND etag IS NULL").get() as { n: number };
     expect(tomb.n).toBe(1); // exactly one tombstone row
     const live = db.read("SELECT COUNT(*) AS n FROM api_cache WHERE response_body IS NOT NULL").get() as { n: number };
@@ -899,12 +900,19 @@ describe("fetchTreeRecursive envelope validation (§5.C fail-closed)", () => {
       ],
     });
   });
-  test("truncated:true returns NO paths — the partial entry list is unusable and the caller must clone", async () => {
+  test("truncated:true returns NO paths — the partial list is unusable, and `paths` is a COMPILE error on it", async () => {
     // per-entry validation is deliberately skipped here: junk inside a partial list must not block
     // the clone fallback, and nothing downstream may read these entries anyway.
     const b = JSON.stringify({ sha: TREE_SHA, truncated: true, tree: [{ path: 42 }] });
     const { client } = makeClient([tree(b)]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).resolves.toEqual({ truncated: true });
+    const res = await client.fetchTreeRecursive("o", "r", TREE_SHA);
+    expect(res).toEqual({ truncated: true });
+    expect(Object.hasOwn(res, "paths")).toBe(false); // no `paths` key at runtime, not just at the type level
+    if (res.truncated) {
+      // @ts-expect-error — the discriminated union makes `paths` inaccessible on the truncated variant;
+      // this line stops compiling (unused @ts-expect-error) if `paths` is ever added back, guarding the union.
+      void res.paths;
+    }
   });
   test("a malformed 200 body does NOT permanently poison the immutable cache — the next call refetches", async () => {
     // restGet caches the 200 body BEFORE validation sees it; without the tombstone the SHA-pinned
@@ -1606,10 +1614,11 @@ describe("pagination", () => {
     expect(calls.length).toBe(MAX_PAGES); // cap checked BEFORE the fetch: exactly MAX_PAGES spawns
   });
 
-  test("paginated pages are NEVER written to the cache — no ETag row is ever created to drop a Link on a later 304", async () => {
-    // The cache stores body+ETag but NOT the Link header. A cached paginated page whose 304
-    // revalidation omits Link would make the listing stop early and silently under-report. Closing
-    // that seam means paginated pages must not go through the conditional cache at all.
+  test("restGetPagedArray writes NO cache row (noStore) — no ETag row is ever created to drop a Link on a later 304", async () => {
+    // Scope: this is about the restGetPagedArray (noStore) path ONLY — non-paginated restGet still
+    // caches + revalidates normally (see the immutable/304 tests above). The cache stores body+ETag
+    // but NOT the Link header, so a cached paginated page whose 304 omits Link would make the listing
+    // stop early and silently under-report; closing that seam means paginated pages bypass the cache.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const { client } = makeClient([
       ok(http(200, { etag: 'W/"p1"', link: `<https://api.github.com/orgs/x/repos?per_page=100&page=2&type=all>; rel="next"` }, `[{"name":"a"}]`)),
@@ -1618,7 +1627,7 @@ describe("pagination", () => {
     const rows = await client.restGetPagedArray("orgs/x/repos?per_page=100&page=1&type=all");
     expect(rows.length).toBe(2);
     const n = db.read("SELECT COUNT(*) AS n FROM api_cache").get() as { n: number };
-    expect(n.n).toBe(0); // no row was written — a paginated page can never be re-served from cache
+    expect(n.n).toBe(0); // the noStore paginated fetch wrote no row — a paginated page can never be re-served from cache
     db.close();
   });
 
@@ -1671,7 +1680,9 @@ describe("pagination", () => {
     const { client } = makeClient([ok(http(200, {}, page))]);
     const rows = await client.restGetPagedArray("orgs/x/repos?per_page=100&page=1&type=all");
     expect(rows.length).toBe(n); // every entry kept — a spread accumulator would have thrown at this size
-    // verify order/identity across the whole page, not just the tail (a corrupted/duplicated middle must fail)
+    // sample start, midpoint, and end for order/identity — enough to catch length changes and any
+    // corruption that shifts these positions; NOT an exhaustive per-element check (an isolated
+    // equal-length swap at an unsampled index would pass, which is acceptable for this accumulator guard)
     expect(rows[0]).toBe(0);
     expect(rows[Math.floor(n / 2)]).toBe(Math.floor(n / 2));
     expect(rows[n - 1]).toBe(n - 1);

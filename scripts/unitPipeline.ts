@@ -18,8 +18,8 @@ import type { DependencyType } from "./manifest.ts";
 import type { TreeEntryType } from "./github.ts"; // type-only: the git object types, one source of truth
 
 // A tree entry (from the git/trees API or a walked clone). `type` is the git object type — the
-// same closed set github.ts validates git/trees against, so `e.type === "blob"` typos and fixture
-// drift are compile errors.
+// same closed set github.ts validates git/trees against, so `e.type === "blob"` typos and any
+// TreeEntry-typed fixture drift are compile errors (a stub cast with `as` still bypasses the type).
 export interface TreeEntry {
   path: string;
   type: TreeEntryType;
