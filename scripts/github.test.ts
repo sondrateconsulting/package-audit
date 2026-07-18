@@ -2569,3 +2569,30 @@ describe("single chokepoint (grep-enforced)", () => {
       expect(src.includes(`${guard}(args)`)).toBe(true);
   });
 });
+
+describe("sweepStaleTempDirs observability (§0)", () => {
+  // Capture stdout JSONL for the duration of fn(), restoring the real writer afterward.
+  const captureStdout = (fn: () => void): Record<string, unknown>[] => {
+    const lines: string[] = [];
+    const real = process.stdout.write.bind(process.stdout);
+    (process.stdout as unknown as { write: (s: string) => boolean }).write = (s: string) => { lines.push(s); return true; };
+    try { fn(); } finally { (process.stdout as unknown as { write: typeof real }).write = real; }
+    return lines.join("").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+  };
+
+  test("a temp root that can't be listed emits a structured warning, not a silent empty sweep", () => {
+    // A regular file as tempRoot makes readdirSync throw ENOTDIR — a real listing failure. Without the
+    // warning, stale multi-GB clones would accumulate with zero operator signal (the caller discards
+    // the return value).
+    const file = join(TEST_TMP, "sweep-not-a-dir");
+    writeFileSync(file, "x");
+    const { client } = makeClient([], { tempRoot: file });
+    let removed: string[] = ["sentinel"];
+    const events = captureStdout(() => { removed = client.sweepStaleTempDirs(); });
+    rmSync(file, { force: true });
+    expect(removed).toEqual([]);
+    const warnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed");
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]!.operation).toBe("readdir");
+  });
+});

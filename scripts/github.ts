@@ -14,6 +14,7 @@ import {
 import type { AuditDb } from "./db.ts";
 import type { DiscoveryFailure } from "./discovery.ts";
 import { isIsoInstant } from "./isoDate.ts";
+import { logLine } from "./log.ts";
 
 // ---- errors -----------------------------------------------------------------------------
 // Non-retryable API failure (404, permission, SSO enforcement, poisoned redirect, …) — the
@@ -1756,10 +1757,18 @@ export class GithubClient {
   // ---- startup sweep (§0): stale pkg-audit-* DIRECT children of the temp root only ----
   sweepStaleTempDirs(): string[] {
     const removed: string[] = [];
+    // ENOENT here is benign (a dir vanished mid-sweep under concurrent cleanup); anything else
+    // (EACCES/EBUSY/ENOTDIR/…) is a real failure that would otherwise leave stale multi-GB clones
+    // accumulating with no signal — the sole caller discards the return value, so warn on stdout.
+    const warnFailure = (operation: string, target: string, e: unknown): void => {
+      if ((e as { code?: unknown }).code === "ENOENT") return;
+      logLine({ event: "warning", reason: "temp-sweep-failed", operation, target, message: (e as Error).message });
+    };
     let entries: string[];
     try {
       entries = readdirSync(this.tempRoot);
-    } catch {
+    } catch (e) {
+      warnFailure("readdir", this.tempRoot, e);
       return removed;
     }
     for (const name of entries) {
@@ -1768,7 +1777,8 @@ export class GithubClient {
       let st;
       try {
         st = lstatSync(full); // lstat: NEVER follow a symlink
-      } catch {
+      } catch (e) {
+        warnFailure("lstat", full, e);
         continue;
       }
       try {
@@ -1780,8 +1790,8 @@ export class GithubClient {
           unlinkSync(full);
         }
         removed.push(name);
-      } catch {
-        // a dir vanishing mid-sweep (concurrent cleanup) is not an error
+      } catch (e) {
+        warnFailure("remove", full, e); // a dir vanishing mid-sweep (ENOENT) stays silent
       }
     }
     return removed;
