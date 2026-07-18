@@ -178,7 +178,7 @@ Denial is applied to the **raw** discovered list, **before** archived/fork filte
 }
 ```
 
-Like branch policy, a non-empty `excludeRepositories` changes `config_hash` (a policy-free config keeps its pre-feature hash and resumes cleanly); the list is canonicalized, so reordering, duplicating, or case-only edits change nothing.
+Like branch policy, a non-empty `excludeRepositories` changes `config_hash` (a policy-free config keeps its pre-feature hash and resumes cleanly, gated independently of the branch-policy keys); the list is canonicalized, so reordering, duplicating, or **ASCII** case-only edits (`ACME/x` = `acme/x`) change nothing — a non-ASCII letter's case is preserved (not folded), so it is not treated as the same repo.
 
 ### Concurrency
 
