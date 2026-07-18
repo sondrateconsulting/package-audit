@@ -1750,3 +1750,91 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 });
+
+describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations > 1, §7)", () => {
+  const heads = `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: {
+    defaultBranchRef: { name: "main" },
+    refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ name: "main", target: { oid: hexOid("o-main"), committedDate: "2025-06-01T00:00:00Z", tree: { oid: hexOid("t-main") } } }] },
+  } } })}`;
+  // A repo listing OWNED BY the requested org (mapRestRepo enforces owner-scope), one branch (main),
+  // an empty tree. Lets two owners fan out and both scan to zero findings.
+  const multiOwnerClient = (root: string): GithubClient =>
+    makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads };
+      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+      const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const twoOwnerConfig = (root: string) => ({ ...testConfig(root, 25), organizations: ["org-a", "org-b"], concurrency: { organizations: 2, repositories: 2, branches: 1 } });
+  const runStatus = (db: AuditDb): string | undefined => (db.read(`SELECT status FROM runs`).get() as { status: string } | null)?.status ?? undefined;
+  const scannedOrgs = (db: AuditDb): string[] =>
+    (db.read(`SELECT DISTINCT organization FROM run_unit_head WHERE status='scanned' ORDER BY organization`).all() as Array<{ organization: string }>).map((r) => r.organization);
+  // Inject a fatal thrown from a specific owner's reconcileRunUnitHead — an escape point AFTER that
+  // owner's branch already scanned, so both owners are provably DRAINED (their scanned rows written)
+  // before the fatal is surfaced. Errors thrown there escape processRepo → processOwner → the owner
+  // worker (which trips the run Aborter and rethrows) → the pool, exactly the fatal path §7 governs.
+  const injectReconcile = (db: AuditDb, byOrg: Record<string, Error>): void => {
+    const real = db.reconcileRunUnitHead.bind(db);
+    (db as unknown as { reconcileRunUnitHead: AuditDb["reconcileRunUnitHead"] }).reconcileRunUnitHead = (runId, org, repo, branches) => {
+      const e = byOrg[org];
+      if (e !== undefined) throw e;
+      return real(runId, org, repo, branches);
+    };
+  };
+  const runToError = async (db: AuditDb, root: string): Promise<unknown> => {
+    let thrown: unknown = null;
+    await captureJsonl(async () => { thrown = await runScan(db, multiOwnerClient(root), rt(twoOwnerConfig(root), "h"), noArgs, null).then(() => null, (e: unknown) => e); });
+    return thrown;
+  };
+
+  test("two owners fan out and BOTH scan (concurrency.organizations:2), run completes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owner-fanout-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    await captureJsonl(() => runScan(db, multiOwnerClient(root), rt(twoOwnerConfig(root), "h"), noArgs, null));
+    expect(scannedOrgs(db)).toEqual(["org-a", "org-b"]);
+    expect(runStatus(db)).toBe("completed");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a PolicyMatchError escaping ONE owner FAILS the run — sibling owner fully DRAINED first (§7)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owner-policy-fatal-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const injected = new PolicyMatchError("excludeBranches", "x*", "main", new Error("org-b incoherence"));
+    injectReconcile(db, { "org-b": injected });
+    const thrown = await runToError(db, root);
+    expect(thrown).toBe(injected); // the ORIGINAL policy error, surfaced unchanged
+    expect(runStatus(db)).toBe("failed"); // failRun ran — a config defect excludes the run from latest
+    expect(scannedOrgs(db)).toEqual(["org-a", "org-b"]); // BOTH drained (org-b scanned before its reconcile threw)
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a GENERIC escape leaves the run RESUMABLE (no failRun) — sibling owner still drains", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owner-generic-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const generic = new Error("org-b reconcile boom (transient/infra)");
+    injectReconcile(db, { "org-b": generic });
+    const thrown = await runToError(db, root);
+    expect(thrown).toBe(generic);
+    expect(runStatus(db)).toBe("running"); // NO failRun — a non-policy escape stays resumable (§7)
+    expect(scannedOrgs(db)).toEqual(["org-a", "org-b"]); // both drained
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("Trap 2: failRun is keyed on ANY collected PolicyMatchError even when a lower-index GENERIC error is surfaced", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owner-trap2-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const generic = new Error("org-a generic (lower owner index)");
+    const policy = new PolicyMatchError("excludeBranches", "x*", "main", new Error("org-b policy"));
+    injectReconcile(db, { "org-a": generic, "org-b": policy });
+    const thrown = await runToError(db, root);
+    expect(thrown).toBe(generic); // surfaced = FIRST rejection in owner order (org-a), deterministic
+    expect(runStatus(db)).toBe("failed"); // but failRun STILL ran, because org-b's PolicyMatchError was collected
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+});

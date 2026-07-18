@@ -27,7 +27,7 @@ import { parseAlias, type DependencyType } from "./manifest.ts";
 import { introspectVersion, fetchPackument, resolveRangeToVersion, type Packument } from "./apiSurface.ts";
 import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
-import { boundedPool } from "./boundedPool.ts";
+import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
 import { logLine } from "./log.ts";
 
 // The three values that TOGETHER define one coherent scan/plan: the config, its hash, and the
@@ -229,18 +229,41 @@ export async function runScan(
   const cliTermSets = await discoverCliTerms(db, client, config, runId);
   logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
 
-  // §5.A/§5.B discover + process, deterministically. A PolicyMatchError (a compiled branch matcher
-  // THREW at match time — fail-closed) is a GLOBAL config defect — never a per-repo soft error — so
-  // it ABORTS the whole run: mark the run failed (excluded from latest selection) and rethrow the
-  // ORIGINAL operator-facing error unchanged (it is registered in KNOWN_OPERATOR_ERRORS).
-  const coverages: RepoPolicyCoverage[] = [];
-  try {
-    for (const owner of owners) {
-      coverages.push(...(await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys)));
+  // §5.A/§5.B discover + process, fanned out across owners bounded by concurrency.organizations (§5).
+  // A PolicyMatchError (a compiled branch matcher THREW at match time — fail-closed) is a GLOBAL
+  // config defect — never a per-repo soft error — so it ABORTS the whole run: mark it failed (excluded
+  // from latest selection) and rethrow the ORIGINAL operator-facing error unchanged (registered in
+  // KNOWN_OPERATOR_ERRORS).
+  //
+  // boundedPool SETTLES ALL: an owner that throws never tears its siblings down, and every owner fiber
+  // (with its nested per-repo branch pools) DRAINS before this returns — so main()'s finally
+  // db.close() can never race a live writer. The per-run Aborter is tripped the instant ANY owner
+  // escapes, so sibling owners stop dispatching NEW repos/units at once (boundary-only cancellation:
+  // in-flight discovery/scans drain naturally, bounded by the per-spawn deadline; nothing throws an
+  // AbortError, so no discovery fail-soft catch is ever mis-fired into a false error row).
+  const aborter = new Aborter();
+  const ownerResults = await boundedPool(owners, config.concurrency.organizations, async (owner) => {
+    try {
+      return await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, aborter);
+    } catch (e) {
+      aborter.abort(); // trip so sibling owners stop dispatching new work immediately
+      throw e; // captured by the pool; the run lifecycle is decided AFTER every owner has drained
     }
-  } catch (e) {
-    if (e instanceof PolicyMatchError) db.failRun(runId);
-    throw e;
+  }, { signal: aborter });
+
+  // Coverage from the SUCCESSFUL owners, in deterministic owner order (positional pool results).
+  const coverages: RepoPolicyCoverage[] = [];
+  for (const r of ownerResults) if (r.status === "fulfilled") coverages.push(...r.value);
+
+  // Fatal lifecycle over the collected REAL failures (rejections). Under boundary-only cancellation
+  // nothing throws an AbortError, so every rejection is a genuine fatal. failRun iff ANY is a
+  // PolicyMatchError (a config defect must exclude the run from latest) — even when a lower-index
+  // generic escape is the one surfaced. A run with NO PolicyMatchError stays resumable (no failRun).
+  // Rethrow the FIRST rejection in owner order (deterministic surfaced error) AFTER the full drain.
+  const failures = ownerResults.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
+  if (failures.length > 0) {
+    if (failures.some((reason) => reason instanceof PolicyMatchError)) db.failRun(runId);
+    throw failures[0];
   }
 
   // Emit the unmatched-pattern warnings (before completeRun/done) and build the summary array.
@@ -304,7 +327,7 @@ export async function resolveOwnersWithDiscovery(
 export async function processOwner(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, personalLogin: string | null, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-  scheduledRepoKeys: Set<string> = new Set(),
+  scheduledRepoKeys: Set<string> = new Set(), signal?: AbortLike,
 ): Promise<RepoPolicyCoverage[]> {
   // Personal-vs-org routing is CASE-INSENSITIVE to match ownerResolve's owner fold: a configured
   // "Alice" that collapsed onto personal login "alice" must still route through listUserRepos, not
@@ -312,11 +335,14 @@ export async function processOwner(
   const isPersonal = runtime.config.includePersonalNamespace && personalLogin !== null && owner.toLowerCase() === personalLogin.toLowerCase();
   const outcome = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
   if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
-  // Collect each successfully-discovered repo's coverage (null = its branch discovery failed) so the
-  // run-level warning finalizer sees exactly the patterns exercised against real branches.
+  // Repos stay SEQUENTIAL within an owner (§2.3): each repo's discover→plan→scan→reconcile must be
+  // atomic (branches fan out INSIDE processRepo). Check the run-level abort before each repo so a
+  // fatal in a SIBLING owner stops this owner from dispatching more work promptly (boundary-only
+  // cancellation — no throw, so partial coverage is fine; the run is failing anyway).
   const coverages: RepoPolicyCoverage[] = [];
   for (const repo of outcome.items) {
-    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys);
+    if (signal?.aborted) break;
+    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, signal);
     if (cov !== null) coverages.push(cov);
   }
   return coverages;
@@ -384,7 +410,7 @@ export async function discoverBranchHeads(
 export async function processRepo(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
-  scheduledRepoKeys: Set<string> = new Set(),
+  scheduledRepoKeys: Set<string> = new Set(), signal?: AbortLike,
 ): Promise<RepoPolicyCoverage | null> {
   const { config, configHash, branchPolicy } = runtime;
   const outcome = await discoverBranchHeads(db, client, runId, repo);
@@ -453,6 +479,7 @@ export async function processRepo(
   // reconcile below. Only the DEFAULT may carry a policy counterfactual (the override); a non-default
   // to-scan branch is necessarily no-exclusion (asserted, fail-closed).
   const unitResults = await boundedPool(plan.toScan, config.concurrency.branches, async (d) => {
+    if (signal?.aborted) return; // a fatal in a sibling owner/repo tripped the run — dispatch no new units
     const h = d.head;
     if (!d.isDefaultBranch && d.rawPolicyResult.kind !== "no-exclusion")
       throw new Error(`internal: non-default scanned branch ${repo.organization}/${repo.name}@${h.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
@@ -492,7 +519,7 @@ export async function processRepo(
         logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
       }
     }
-  });
+  }, { signal });
   // A PolicyMatchError (or any other escaping fatal — the internal bucket-wiring assertion, a DB
   // write failure) from ANY unit is FATAL: every sibling has already drained (settle-all), so rethrow
   // the FIRST rejection in plan.toScan order (deterministic precedence). runScan's catch then fails
