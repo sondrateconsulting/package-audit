@@ -531,9 +531,10 @@ async function processUnit(
   let commitSha = h.oid;
   let committedDate = h.committedDate;
   // The clone-fallback setup (cloneShallow → walkClone → cloneReader) runs INSIDE this try so a
-  // walkClone/reader throw AFTER cloneShallow succeeds still reaches the finally's clone-dir reclaim —
-  // otherwise a completed (multi-GB) clone would leak until the next startup sweep. cloneShallow's own
-  // failure path cleans up before it sets cloneDir, so the finally correctly no-ops there.
+  // walkClone/reader throw AFTER cloneShallow succeeds still reaches the finally's (best-effort,
+  // warns-on-failure) clone-dir reclaim — otherwise a completed (multi-GB) clone would be left for the
+  // next startup sweep instead. cloneShallow's own failure path cleans up before it sets cloneDir, so
+  // the finally correctly no-ops there.
   try {
     let entries: TreeEntry[];
     let readFile: (path: string, entry: TreeEntry) => Promise<string | null>;

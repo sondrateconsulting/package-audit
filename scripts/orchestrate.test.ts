@@ -804,18 +804,36 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
       if (args[0] === "clone") { const dest = args[args.length - 1]!; mkdirSync(dest, { recursive: true }); writeFileSync(join(dest, "package.json"), "{}"); return { exitCode: 0, stderr: "", stdout: "" }; }
-      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: "o-moved\n" };
+      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: hexOid("o-moved") + "\n" };
       if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
       return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // REST tree → truncated
     });
     await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
     // the durable row pins the SCANNED (clone) commit + its OWN date — never the stale discovered date
     expect(headRowsOf(db, runId)).toEqual([
-      { branch: "main", status: "scanned", sha: "o-moved", d: 1, ps: null, pat: null, scd: "2025-06-15T09:00:00+00:00" },
+      { branch: "main", status: "scanned", sha: hexOid("o-moved"), d: 1, ps: null, pat: null, scd: "2025-06-15T09:00:00+00:00" },
     ]);
     const unit = db.getUnit(key("main")); // the work-queue pair matches (the stale-date fix)
-    expect(unit?.lastCommitSha).toBe("o-moved");
+    expect(unit?.lastCommitSha).toBe(hexOid("o-moved"));
     expect(unit?.lastCommitDate).toBe("2025-06-15T09:00:00+00:00");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a clone HEAD that is NOT a hex object id fails the unit LOUD (never persisted as the scanned commit)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-badsha-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      if (args[0] === "clone") { const dest = args[args.length - 1]!; mkdirSync(dest, { recursive: true }); writeFileSync(join(dest, "package.json"), "{}"); return { exitCode: 0, stderr: "", stdout: "" }; }
+      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: "not-a-hex-sha\n" }; // hostile/garbled clone HEAD
+      if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
+      return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // truncated → clone fallback
+    });
+    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(db.getUnit(key("main"))?.status).toBe("error"); // rejected loud — never persisted as the scanned commit
+    expect((db.read(`SELECT COUNT(*) AS n FROM errors WHERE run_id = ? AND scope = 'scan'`).get(runId) as { n: number }).n).toBeGreaterThan(0);
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -831,7 +849,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
       if (args[0] === "clone") return { exitCode: 0, stderr: "", stdout: "" }; // exits 0 but creates no dest
-      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: "o-moved\n" };
+      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: hexOid("o-moved") + "\n" };
       if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
       return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // truncated → clone fallback
     });
@@ -862,7 +880,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
         chmodSync(runDir, 0o555); // read+exec but NOT writable → the finally's rmSync can't unlink → EACCES
         return { exitCode: 0, stderr: "", stdout: "" };
       }
-      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: "o-moved\n" };
+      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: hexOid("o-moved") + "\n" };
       if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
       return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // truncated → clone fallback
     });

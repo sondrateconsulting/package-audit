@@ -22,7 +22,9 @@ every run as "continue the job," not "start over," unless the user passes `--fre
   ever spawned with cwd inside a cloned repo or extracted tarball except `git`/`tar`
   themselves. Only STATICALLY read files; static scanners MUST NOT follow symlinks
   out of the clone/tarball root. This is the single biggest read-only risk — sacred.
-- Any `git clone` must be shallow, into an ephemeral temp dir, and removed on exit.
+- Any `git clone` must be shallow, into an ephemeral temp dir, and reclaimed on exit
+  (best-effort — a reclaim that fails emits a `clone-cleanup-failed` warning; containment
+  holds regardless, so a stranded dir is disk to reclaim on a later run, never an escape).
   Full hardened invocation (the §5.C clone fallback uses exactly this):
   `GIT_TERMINAL_PROMPT=0 git clone --depth 1
   --single-branch --branch <branch> --no-tags --no-recurse-submodules --template=
@@ -44,7 +46,8 @@ every run as "continue the job," not "start over," unless the user passes `--fre
   prefix-containment in an allowed root (realpath defeats symlink escape); it also
   validates the configured `sqlitePath`/`outputDir` are so contained. A startup
   sweep removes stale `pkg-audit-*` dirs (direct children of the temp root only,
-  never following symlinks) left by crashed prior runs.
+  never following symlinks) left by crashed prior runs — best-effort, warning
+  (`temp-sweep-failed`) on any dir it cannot list or remove.
 - If unsure whether an action is read-only, DO NOT do it — log and skip.
 
 ================================================================================

@@ -1731,6 +1731,12 @@ export class GithubClient {
       const rev = await this.git(["rev-parse", "HEAD"], dest);
       if (rev.exitCode !== 0)
         throw new GithubApiError(`git rev-parse HEAD failed in ${dest}: ${rev.stderr.trim().slice(0, 300)}`, { endpoint: url });
+      const headSha = rev.stdout.trim();
+      // §5.C fail-closed: this clone HEAD is persisted as the scanned commit and built into every
+      // permalink, so it must be a real object id — validate it exactly like the API path's oids (and
+      // like the committer date below), never trust rev-parse's stdout verbatim.
+      if (!HEX_OBJECT_ID_RE.test(headSha))
+        throw new GithubApiError(`git rev-parse HEAD returned a non-hex object id in ${dest}: ${JSON.stringify(headSha.slice(0, 80))}`, { endpoint: url });
       // §4 (branch allow/deny): the ACTUAL scanned commit's date. The clone HEAD may be AHEAD of the
       // GraphQL-discovered head (the branch moved between discovery and clone), so its date must be
       // read from the clone — not reused from discovery. This exact argv is the ONLY `show` form
@@ -1748,7 +1754,7 @@ export class GithubClient {
       // value — so the poison risk here is the run's durable scan-scope ledger, not selection.
       if (!isIsoInstant(headCommittedDate))
         throw new GithubApiError(`git show HEAD returned a non-ISO committer date in ${dest}: ${JSON.stringify(headCommittedDate.slice(0, 80))}`, { endpoint: url });
-      return { dir: dest, headSha: rev.stdout.trim(), headCommittedDate };
+      return { dir: dest, headSha, headCommittedDate };
     } catch (e) {
       // a failed/timed-out clone can leave a multi-GB partial tree — reclaim it NOW rather
       // than at the next run's startup sweep (the caller only cleans up on success). The

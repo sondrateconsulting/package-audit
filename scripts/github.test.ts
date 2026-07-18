@@ -1487,14 +1487,14 @@ describe("cloneShallow temp-dir cleanup on failure", () => {
   });
   test("a clone whose date-capture (show) fails also cleans up", async () => {
     const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
-    const { client } = makeClient([ok(""), ok("abc123def\n"), err("", "fatal: bad object", 128)], { tempRoot: root });
+    const { client } = makeClient([ok(""), ok("a".repeat(40) + "\n"), err("", "fatal: bad object", 128)], { tempRoot: root });
     await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/committer date failed/);
     expect(cloneRunDirs(root)).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
   test("a non-ISO committer date is rejected and cleans up (a garbled read must not poison provenance)", async () => {
     const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
-    const { client } = makeClient([ok(""), ok("abc123def\n"), ok("not-a-date\n")], { tempRoot: root });
+    const { client } = makeClient([ok(""), ok("a".repeat(40) + "\n"), ok("not-a-date\n")], { tempRoot: root });
     await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/non-ISO committer date/);
     expect(cloneRunDirs(root)).toEqual([]);
     rmSync(root, { recursive: true, force: true });
@@ -2358,11 +2358,11 @@ describe("hardened clone (§0/§5.C)", () => {
   test("emits exactly the hardened argv, pins git config, and records the fetched SHA + committer date", async () => {
     const { client, calls } = makeClient([
       ok(""), // clone
-      ok("abc123def\n"), // rev-parse HEAD
+      ok("a".repeat(40) + "\n"), // rev-parse HEAD
       ok("2025-06-01T12:34:56+00:00\n"), // show --format=%cI HEAD (the scanned commit's date)
     ]);
     const { dir, headSha, headCommittedDate } = await client.cloneShallow("org-a", "repo-b", "release/1.x");
-    expect(headSha).toBe("abc123def");
+    expect(headSha).toBe("a".repeat(40));
     expect(headCommittedDate).toBe("2025-06-01T12:34:56+00:00"); // strict-ISO, offset preserved verbatim
     expect(dir.startsWith(TEST_TMP)).toBe(true);
     // a SUCCESSFUL clone must keep its run dir (the failure-only cleanup must not be a finally):
