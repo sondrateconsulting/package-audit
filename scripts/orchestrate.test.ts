@@ -1762,40 +1762,54 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("a branch fatal trips the RUN-level Aborter via onFatal PROMPTLY — the instant it is caught, before the drain (§7)", async () => {
-    // The fix for the deferred "branch-abort promptness" finding: a fatal caught deep in a branch worker
-    // must trip the RUN-level Aborter at once (not only when the owner worker's catch runs, AFTER this
-    // repo's whole branch pool drains and processRepo rethrows). onFatal is invoked synchronously in the
-    // branch-worker fatal catch, so a tripped run Aborter promptly stops SIBLING owners at their next
-    // repo check and sibling repos' branch pools at their next pull (boundedPool.test.ts "abort STOPS
-    // dispatch" + processOwner's `if (signal?.aborted) break` prove the tripped Aborter halts dispatch).
-    const root = mkdtempSync(join(tmpdir(), "fanout-onfatal-"));
+  test("a branch fatal trips the RUN-level Aborter via onFatal PROMPTLY — WHILE a sibling branch is still in flight, before the pool drains (§7)", async () => {
+    // The fix for the deferred "branch-abort promptness" finding. A post-drain onFatal (calling it only
+    // AFTER the whole branch pool drained) would reproduce the exact defect yet still leave the run
+    // Aborter tripped by the end — so an end-of-run assertion is too weak. We prove it fires MID-DRAIN:
+    // branches:2 dispatches the fatal branch AND a sibling that BLOCKS on a gate, so the pool cannot
+    // drain. onFatal signals only AFTER it trips the run Aborter, so when `fatalHandled` resolves the
+    // sibling is STILL blocked (pool not drained) and yet the run Aborter is ALREADY tripped — impossible
+    // for a post-drain onFatal. Then we release the gate and confirm settle-all (the blocked sibling
+    // still drains) plus the fatal rethrow.
+    const root = mkdtempSync(join(tmpdir(), "fanout-onfatal-prompt-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startRun(db);
-    const nodes = nodesN(3); // main, b1, b2 (branches:1 → strictly sequential dispatch)
-    const injected = new PolicyMatchError("excludeBranches", "x*", "b1", new Error("write-time incoherence"));
+    const nodes = [
+      { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }, // the fatal branch
+      { name: "slow", oid: hexOid("o-slow"), date: "2025-06-01T00:00:00Z" }, // a gated sibling — holds the drain open
+    ];
+    const injected = new PolicyMatchError("excludeBranches", "x*", "main", new Error("write-time incoherence"));
     const realUpsert = db.upsertRunUnitHead.bind(db);
     (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
-      if (h.status === "scanned" && h.branch === "b1") throw injected; // fatal from b1's scanned upsert
+      if (h.status === "scanned" && h.branch === "main") throw injected; // fatal from main's scanned upsert
       return realUpsert(h);
     };
-    const client = makeClient(root, async (_bin, args) =>
-      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
-    const seqConfig = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 1 } };
+    let releaseSlow!: () => void;
+    const gateSlow = new Promise<void>((r) => { releaseSlow = r; });
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads(nodes) };
+      if (args.join(" ").includes(hexOid("t-slow"))) await gateSlow; // the 'slow' branch scan blocks until released
+      return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+    });
+    const cfg = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 2 } };
     const runAborter = new Aborter();
-    // Record whether the run Aborter was ALREADY tripped when onFatal fired vs the branch-abort discipline.
     let onFatalCalls = 0;
-    const onFatal = (): void => { onFatalCalls++; runAborter.abort(); };
-    let thrown: unknown;
-    await captureJsonl(async () => {
-      try { await processRepo(db, client, rt(seqConfig, "h"), runId, "org-a", repo, [], new Set(), new Set(), runAborter, onFatal); }
+    let signalHandled!: () => void;
+    const fatalHandled = new Promise<void>((r) => { signalHandled = r; });
+    const onFatal = (): void => { onFatalCalls++; runAborter.abort(); signalHandled(); }; // trip BEFORE signalling
+    let thrown: unknown = "unset";
+    const p = captureJsonl(async () => {
+      try { await processRepo(db, client, rt(cfg, "h"), runId, "org-a", repo, [], new Set(), new Set(), runAborter, onFatal); thrown = null; }
       catch (e) { thrown = e; }
     });
-    expect(thrown).toBe(injected);                  // the fatal is still rethrown (deterministic surfacing unchanged)
-    expect(onFatalCalls).toBeGreaterThanOrEqual(1); // onFatal fired ON the branch fatal — NOT swallowed
-    expect(runAborter.aborted).toBe(true);          // → the run-level Aborter is tripped, so siblings stop dispatching
-    // b2 (after the fatal b1) was never dispatched — the local branchAbort still fail-fasts this pool.
-    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: "b2" })).toBeNull();
+    await fatalHandled; // onFatal has run (main's fatal was caught); the 'slow' sibling is STILL blocked on gateSlow
+    expect(onFatalCalls).toBe(1);
+    expect(runAborter.aborted).toBe(true); // tripped WHILE the pool is blocked mid-drain — a post-drain onFatal cannot do this
+    releaseSlow();  // release the in-flight sibling so the pool can drain (settle-all)
+    await p;
+    expect(thrown).toBe(injected); // the fatal is rethrown after the FULL drain
+    // settle-all: the blocked sibling drained to a terminal state despite the abort
+    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: "slow" })?.status).toBe("done");
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -1911,6 +1925,74 @@ describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations
     const thrown = await runToError(db, root);
     expect(thrown).toBe(generic); // surfaced = FIRST rejection in owner order (org-a), deterministic
     expect(runStatus(db)).toBe("failed"); // but failRun STILL ran, because org-b's PolicyMatchError was collected
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("onFatal is WIRED through runScan → processOwner: a BRANCH fatal in one owner stops a sibling owner's dispatch while the fatal repo is still draining (§7)", async () => {
+    // The end-to-end regression for the deferred "branch-abort promptness" finding through the PRODUCTION
+    // path (not a direct processRepo call): a branch-worker fatal in org-a must trip the RUN Aborter
+    // PROMPTLY via the onFatal runScan threads down, so a CONCURRENT sibling owner (org-b) skips its
+    // SECOND repo instead of scanning it during org-a's drain. Deterministic via gates: org-a's fatal
+    // branch (main) is fast while a sibling branch (slow) holds org-a's pool open (gateSlow, released
+    // only AFTER we assert); org-b's first repo (r1) is gated so org-b reaches the r2 decision only after
+    // org-a's fatal has already tripped the run Aborter. If runScan/processOwner did NOT forward onFatal,
+    // the run Aborter would trip only in org-a's owner-catch — which cannot run until gateSlow releases —
+    // so org-b would dispatch r2. We assert r2 has NO run_unit_head row.
+    const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+    const root = mkdtempSync(join(tmpdir(), "owner-onfatal-wire-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const branchHeads = (branches: Array<{ name: string; tree: string }>): string =>
+      `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: {
+        defaultBranchRef: { name: "main" },
+        refs: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: branches.map((b) => ({
+          name: b.name, target: { oid: hexOid(`o-${b.name}`), committedDate: "2025-06-01T00:00:00Z", tree: { oid: hexOid(b.tree) } } })) },
+      } } })}`;
+    const repoList = (owner: string, names: string[]): string =>
+      `HTTP/2.0 200 X\r\n\r\n${JSON.stringify(names.map((n) => ({ name: n, owner: { login: owner }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false })))}`;
+    const injected = new PolicyMatchError("excludeBranches", "x*", "main", new Error("org-a write-time incoherence"));
+    let signalFatal!: () => void;
+    const fatalThrown = new Promise<void>((r) => { signalFatal = r; });
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+      if (h.status === "scanned" && h.organization === "org-a" && h.branch === "main") { signalFatal(); throw injected; }
+      return realUpsert(h);
+    };
+    let releaseSlow!: () => void; const gateSlow = new Promise<void>((r) => { releaseSlow = r; });
+    let releaseR1!: () => void;   const gateR1 = new Promise<void>((r) => { releaseR1 = r; });
+    const client = makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (j.includes("orgs/org-a/repos")) return { exitCode: 0, stderr: "", stdout: repoList("org-a", ["svc"]) };
+      if (j.includes("orgs/org-b/repos")) return { exitCode: 0, stderr: "", stdout: repoList("org-b", ["r1", "r2"]) };
+      if (args.some((a) => a === "graphql")) {
+        if (j.includes("owner=org-a")) return { exitCode: 0, stderr: "", stdout: branchHeads([{ name: "main", tree: "t-a-main" }, { name: "slow", tree: "t-a-slow" }]) };
+        if (j.includes("name=r1")) return { exitCode: 0, stderr: "", stdout: branchHeads([{ name: "main", tree: "t-b-r1" }]) };
+        return { exitCode: 0, stderr: "", stdout: branchHeads([{ name: "main", tree: "t-b-r2" }]) }; // name=r2
+      }
+      if (j.includes(hexOid("t-a-slow"))) await gateSlow; // org-a's 'slow' branch holds org-a's pool open
+      if (j.includes(hexOid("t-b-r1"))) await gateR1;     // org-b's r1 scan blocks until released
+      return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+    });
+    const cfg = { ...testConfig(root, 25), organizations: ["org-a", "org-b"], concurrency: { organizations: 2, repositories: 2, branches: 2 } };
+    let thrown: unknown = "unset";
+    const p = captureJsonl(async () => {
+      try { await runScan(db, client, rt(cfg, "h"), noArgs, null); thrown = null; }
+      catch (e) { thrown = e; }
+    });
+    await fatalThrown;   // org-a's main fatal is imminent; org-a's 'slow' and org-b's r1 are both blocked
+    releaseR1();         // let org-b's r1 finish; by the time it does, onFatal has already tripped the run Aborter
+    // wait for org-b to finish r1 and reach the r2 decision, WITHOUT releasing org-a's drain (gateSlow held)
+    for (let i = 0; i < 1000 && db.getUnit({ configHash: "h", scope: "branch", organization: "org-b", repository: "r1", branch: "main" })?.status !== "done"; i++) await tick();
+    for (let i = 0; i < 20; i++) await tick(); // let org-b's post-r1 aborted-check settle (a non-forwarded onFatal would dispatch r2 here)
+    releaseSlow();       // now let org-a's 'slow' drain so the run can finish (org-a's owner-catch abort is far too late)
+    await p;
+    expect(thrown).toBe(injected); // the run failed with org-a's fatal, surfaced unchanged
+    expect(runStatus(db)).toBe("failed");
+    // r1 (org-b's first repo) DID scan (settle-all: it was in flight when the abort fired) …
+    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-b", repository: "r1", branch: "main" })?.status).toBe("done");
+    // … but r2 (org-b's SECOND repo) was SKIPPED — never dispatched, so no work-queue row exists for it.
+    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-b", repository: "r2", branch: "main" })).toBeNull();
+    expect(db.read(`SELECT COUNT(*) AS n FROM run_unit_head WHERE organization='org-b' AND repository='r2'`).get()).toEqual({ n: 0 });
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
