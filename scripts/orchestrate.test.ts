@@ -1,8 +1,9 @@
 import { expect, test, describe, spyOn } from "bun:test";
-import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
+import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
+import type { TreeEntry } from "./unitPipeline.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type RepoInfo, type SpawnFn } from "./github.ts";
@@ -1520,5 +1521,64 @@ describe("runScan owner-discovery throttle (§4, site a — consumer wiring)", (
     const runs = db.read("SELECT COUNT(*) AS n FROM runs").get() as { n: number };
     expect(runs.n).toBe(0); // startRun was never reached — no run, no report
     db.close();
+  });
+});
+
+describe("clone-fallback readers fail closed (§5.C)", () => {
+  const dummyEntry: TreeEntry = { path: "x", type: "blob", sha: "", size: 0 };
+
+  test("cloneReader PROPAGATES a read failure (a dir at the blob path → EISDIR) instead of degrading to null", async () => {
+    // A file the walk just enumerated from a completed clone is never a benign 404; a read failure
+    // means the snapshot was not fully read. The old blanket catch returned null → under-report.
+    const dir = mkdtempSync(join(tmpdir(), "clonereader-"));
+    mkdirSync(join(dir, "notafile"));
+    try {
+      await expect(cloneReader(dir)("notafile", dummyEntry)).rejects.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("cloneReader returns a real file's contents", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "clonereader-"));
+    writeFileSync(join(dir, "f.txt"), "hello");
+    try {
+      expect(await cloneReader(dir)("f.txt", dummyEntry)).toBe("hello");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("cloneReader fails loud on a containment violation (never reads outside the clone dir)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "clonereader-"));
+    try {
+      await expect(cloneReader(dir)("../escape", dummyEntry)).rejects.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("walkClone PROPAGATES a readdir failure on an unreadable subdir instead of silently skipping it", () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root ignores modes
+    const root = mkdtempSync(join(tmpdir(), "walkclone-"));
+    mkdirSync(join(root, "sub"));
+    writeFileSync(join(root, "sub", "deep.txt"), "x");
+    chmodSync(join(root, "sub"), 0o111); // execute-only: readdir(sub) throws EACCES
+    try {
+      expect(() => walkClone(root)).toThrow();
+    } finally {
+      chmodSync(join(root, "sub"), 0o755); // restore so rmSync can recurse
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  test("walkClone enumerates a normal tree (blobs only; skips .git)", () => {
+    const root = mkdtempSync(join(tmpdir(), "walkclone-"));
+    mkdirSync(join(root, "src"));
+    writeFileSync(join(root, "a.txt"), "a");
+    writeFileSync(join(root, "src", "b.txt"), "bb");
+    mkdirSync(join(root, ".git"));
+    writeFileSync(join(root, ".git", "config"), "ignored");
+    try {
+      expect(walkClone(root).map((e) => e.path).sort()).toEqual(["a.txt", "src/b.txt"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

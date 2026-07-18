@@ -7,7 +7,7 @@
 // writer); per-unit reads fan out through the guarded github wrapper. Deterministic iteration
 // order (owners/repos/branches sorted) so runs are reproducible.
 
-import { readdirSync, lstatSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { readdirSync, lstatSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
@@ -59,42 +59,34 @@ function apiReader(client: GithubClient, org: string, repo: string, commitSha: s
   };
 }
 
-// Clone-fallback reader: read a file from the walked clone dir, contained to that dir.
-function cloneReader(cloneDir: string) {
+// Clone-fallback reader: read a file from the walked clone dir, contained to that dir. Every failure
+// PROPAGATES — unlike apiReader (whose 404→null models a benign force-push race), a file the walk
+// just enumerated from a COMPLETED local clone is never legitimately absent, so any read error
+// (ENOENT/EACCES/EISDIR/EIO/…) or containment violation means the snapshot was not fully read and
+// must surface as a scan error, not degrade to null and mark a partially-read head `done`.
+export function cloneReader(cloneDir: string) {
   return async (path: string, _entry: TreeEntry): Promise<string | null> => {
-    try {
-      const abs = join(cloneDir, path);
-      assertContained(abs, [cloneDir]);
-      return existsSync(abs) ? readFileSync(abs, "utf8") : null;
-    } catch {
-      return null;
-    }
+    const abs = join(cloneDir, path);
+    assertContained(abs, [cloneDir]);
+    return readFileSync(abs, "utf8");
   };
 }
 
 // Walk a cloned working tree into TreeEntry rows (blobs only; size from lstat). Skips .git and
-// symlinks (never followed). Paths are repo-relative POSIX.
-function walkClone(root: string): TreeEntry[] {
+// symlinks (never followed). Paths are repo-relative POSIX. A readdir/lstat failure PROPAGATES: on a
+// completed clone it means the tree was not fully enumerated, and a silent skip would under-report
+// the unit's files as `done` (the same fail-open hazard cloneReader closes on the read side).
+export function walkClone(root: string): TreeEntry[] {
   const out: TreeEntry[] = [];
   const stack: string[] = [""];
   while (stack.length > 0) {
     const rel = stack.pop()!;
     const abs = rel === "" ? root : join(root, rel);
-    let names: string[];
-    try {
-      names = readdirSync(abs);
-    } catch {
-      continue;
-    }
+    const names = readdirSync(abs);
     for (const name of names) {
       if (rel === "" && name === ".git") continue;
       const childRel = rel === "" ? name : `${rel}/${name}`;
-      let st;
-      try {
-        st = lstatSync(join(root, childRel));
-      } catch {
-        continue;
-      }
+      const st = lstatSync(join(root, childRel));
       if (st.isSymbolicLink()) continue;
       if (st.isDirectory()) stack.push(childRel);
       else if (st.isFile()) out.push({ path: childRel, type: "blob", sha: "", size: st.size });
