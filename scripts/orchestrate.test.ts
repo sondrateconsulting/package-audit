@@ -698,7 +698,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     // untested (the bug class this feature's whole design exists to prevent).
     const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
     const client = makeClient(root, async (_bin, args) => {
-      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: "o-dev", date: "2025-05-01T00:00:00Z" }], "dev") };
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], "dev") };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
     const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy };
