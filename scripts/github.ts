@@ -1370,15 +1370,18 @@ export class GithubClient {
         }
         throw new GithubApiError(`gh api graphql produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`, { endpoint: "graphql" });
       }
-      // There is DELIBERATELY no restGet-style nonzero-exit truncation guard here: gh exits 1
+      // There is DELIBERATELY no BROAD restGet-style nonzero-exit truncation guard here: gh exits 1
       // BY DESIGN after printing a complete HTTP-200 envelope whose body carries `errors` —
-      // including genuine RATE_LIMITED throttles — so a nonzero exit under a parsed 200 is the
-      // NORMAL semantic-error shape, not a truncation signal (such a guard would blind-retry
-      // real throttles past their reset window and misreport them as truncated). Truncation is
-      // still fail-closed without it: the envelope is object-rooted JSON, and no proper prefix
-      // of a valid top-level-object JSON text is itself valid JSON except one that only sheds
-      // trailing whitespace (which still carries the complete object) — so a mid-stream cut
-      // either loses nothing or fails JSON.parse → flagged malformed → rejected below.
+      // including genuine RATE_LIMITED throttles — so a nonzero exit under a parsed 200 is by itself
+      // the NORMAL semantic-error shape, not a truncation signal (a broad guard would blind-retry
+      // real throttles past their reset window and misreport them as truncated). The ok-branch below
+      // does add a NARROW transient retry for the ONE shape that IS transport truncation — a nonzero
+      // exit whose body is ALSO unparseable — which a complete errors envelope (RATE_LIMITED parses
+      // fine → malformed===null) can never match. Truncation stays fail-closed even without it: the
+      // envelope is object-rooted JSON, and no proper prefix of a valid top-level-object JSON text is
+      // itself valid JSON except one that only sheds trailing whitespace (which still carries the
+      // complete object) — so a mid-stream cut either loses nothing or fails JSON.parse → flagged
+      // malformed → retried-then-rejected below.
       // Spec-shape validation lives in parseGraphqlEnvelope (pure). A malformed envelope means the
       // failure signal we were meant to read is unreadable — coercing it to "no errors" would be
       // fail-OPEN: an ok:true branch discovery feeds the reconcile PRUNE (reconcileRunUnitHead), so a
@@ -1395,11 +1398,22 @@ export class GithubClient {
             `graphql envelope: HTTP ${parsed.status} — only exactly 200 is success`,
             { status: parsed.status, endpoint: "graphql" },
           );
-        if (env.malformed !== null)
+        if (env.malformed !== null) {
+          // A truncated transport (gh buffers the graphql JSON, then aborts printing on a mid-stream
+          // read failure) leaves a well-formed HTTP-200 head + an unparseable body + a NONZERO exit —
+          // a transient read failure, retried under the same bounded transient budget restGet's
+          // truncation guard uses. Scoped to exactly that shape so a COMPLETE errors envelope (which
+          // parses fine → malformed===null) is never blind-retried; every other malformed reason
+          // (non-object root, missing data/errors, bad error entries) is a real spec violation → fatal.
+          if (env.malformed === "unparseable JSON body" && res.exitCode !== 0 && attempt < MAX_ATTEMPTS - 1) {
+            await this.sleep(this.backoffWait("transient", attempt, null));
+            continue;
+          }
           throw new GithubApiError(
-            `graphql envelope: ${env.malformed} — refusing to treat the response as success`,
+            `graphql envelope: ${env.malformed}${res.exitCode !== 0 ? ` (gh exit ${res.exitCode}: ${res.stderr.trim().slice(0, 300)})` : ""} — refusing to treat the response as success`,
             { status: parsed.status, endpoint: "graphql" },
           );
+        }
         return env.data;
       }
       if (cls.kind === "fatal")

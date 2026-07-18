@@ -1104,6 +1104,38 @@ describe("throttle wait clamping (§4 hardening)", () => {
     expect(sleeps.length).toBeGreaterThanOrEqual(1); // it actually took the transient retry path
   });
 
+  test("a truncated graphql envelope (headers-only 200 + nonzero exit + unparseable body) is TRANSIENT, retried", async () => {
+    // gh buffers the graphql JSON and aborts printing on a mid-stream read failure → a well-formed
+    // HTTP-200 head + truncated (here empty) body + nonzero exit. That is transport truncation, not a
+    // semantic malformation, so it retries under the transient budget — unlike a COMPLETE errors
+    // envelope (RATE_LIMITED etc.), which parses fine and must never be blind-retried.
+    const { client, calls, sleeps } = makeClient([
+      err(http(200, {}, ""), "curl: (56) Recv failure: Connection reset by peer"), // truncated transport
+      ok(http(200, {}, `{"data":{"x":1}}`)), // succeeds on retry
+    ]);
+    const data = await client.graphql("query{x}", {});
+    expect(data).toEqual({ x: 1 });
+    expect(calls.length).toBe(2); // exactly one retry
+    expect(sleeps.length).toBe(1); // one transient backoff
+  });
+  test("an unparseable graphql body at EXIT 0 stays FATAL (gh succeeded but printed garbage — not truncation)", async () => {
+    // Only a NONZERO exit marks transport truncation; an unparseable body at exit 0 is a genuine
+    // malformation and must NOT be retried — proves the retry is scoped, not a blanket exit guard.
+    const { client, calls } = makeClient([ok(http(200, {}, "<html>bad</html>"))]);
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/graphql envelope/);
+    expect(calls.length).toBe(1); // no retry
+  });
+  test("a PERSISTENT graphql transport truncation exhausts the retry budget and throws WITH gh stderr", async () => {
+    const truncated = err(http(200, {}, ""), "curl: (56) Recv failure: Connection reset by peer");
+    const { client, calls } = makeClient(Array.from({ length: 6 }, () => truncated)); // MAX_ATTEMPTS = 6
+    let caught: unknown;
+    try { await client.graphql("query{x}", {}); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as Error).message).toMatch(/unparseable JSON body/);
+    expect((caught as Error).message).toMatch(/Connection reset by peer/); // final throw retains gh stderr
+    expect(calls.length).toBe(6); // every attempt consumed
+  });
+
   test("a malformed errors field does NOT preempt SSO evidence: 403+x-github-sso stays fatal WITH ssoRequired", async () => {
     const { client } = makeClient([
       err(http(403, { "x-ratelimit-remaining": "5", "x-github-sso": "required" }, `{"errors":"garbage"}`), "gh: HTTP 403"), // gh exits 1 on any HTTP error status
@@ -2074,14 +2106,16 @@ describe("graphql envelope validation (§4 spec hardening)", () => {
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/NOT_FOUND.*gone/);
     expect(calls.length).toBe(1);
   });
-  test("a TRUNCATED graphql body fails closed without any exit-code guard — a JSON-object prefix is never valid JSON", async () => {
-    // DELIBERATELY SYNTHETIC stdout shape: gh buffers graphql JSON before printing, so a real
-    // read failure yields headers-only stdout + exit 1. The partial body pins the JSON-prefix
-    // fail-closed property itself against a hostile/changed transport that streams instead.
-    const { client } = makeClient([
-      err(http(200, {}, `{"data":{"x":1}`), "read: connection reset"), // mid-stream cut: brace never closes
-    ]);
+  test("a TRUNCATED graphql body (a mid-stream JSON-object prefix) is retried, then fails closed once the budget is spent", async () => {
+    // DELIBERATELY SYNTHETIC stdout shape: gh buffers graphql JSON before printing, so a real read
+    // failure yields headers-only stdout + exit 1; a mid-stream cut leaves an unclosed object that
+    // never parses. That unparseable-body + nonzero-exit shape is transport truncation → retried
+    // (transient), then fails closed after MAX_ATTEMPTS. The JSON-prefix property still holds: no
+    // proper prefix of a top-level object is itself valid JSON, so it can never sanitize into success.
+    const partial = err(http(200, {}, `{"data":{"x":1}`), "read: connection reset"); // brace never closes
+    const { client, calls } = makeClient(Array.from({ length: 6 }, () => partial)); // MAX_ATTEMPTS = 6
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/unparseable JSON/);
+    expect(calls.length).toBe(6); // retried to exhaustion, then fail-closed
   });
   test("junk errors entries do NOT preempt SSO evidence: 403+x-github-sso stays fatal WITH ssoRequired", async () => {
     const { client } = makeClient([
