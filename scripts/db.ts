@@ -2390,7 +2390,8 @@ export class AuditDb {
 
   // GUARDED persist for IMMUTABLE (SHA-pinned, byte-stable) content: write only when it will NOT clobber
   // a sibling's body — an absent row, a NULL tombstone (a repair after a poisoned row), or a row already
-  // holding the IDENTICAL body (idempotent). It REFUSES to overwrite a non-null DIFFERENT body: for
+  // holding the IDENTICAL body (a body-preserving no-op; etag/cached_at still refresh). It REFUSES to
+  // overwrite a non-null DIFFERENT body: for
   // immutable content two different bodies mean at least one is a malformed transient, and restGet
   // persists BEFORE validation, so under fan-out an unconditional put would let a fiber's malformed body
   // overwrite a sibling's already-cached VALID body (which the compare-and-delete tombstone would then

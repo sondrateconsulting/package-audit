@@ -686,9 +686,10 @@ each branch-unit's queue/head/finding rows are distinct. The ONE row two fibers 
 `api_cache` for identical-content branches (same SHA-pinned key) — is guarded separately (a
 compare-and-delete tombstone + a refuse-to-clobber immutable put, §3 caching), not by row
 distinctness.
-CRITICAL: workers (subagents in this strategy; AS SHIPPED, in-process fibers per the fan-out
-above) COMPUTE and return structured data; ALL SQLite writes go through the ONE
-AuditDb connection (its synchronous statements serialize concurrent fibers without a mutex).
+CRITICAL: in the SUBAGENT strategy, subagents COMPUTE and return structured JSON to a coordinator
+that performs the writes; AS SHIPPED, the in-process fibers instead WRITE DIRECTLY — ALL SQLite
+writes go through the ONE AuditDb connection (its synchronous statements serialize concurrent fibers
+without a mutex).
 Do not bet on multi-process WAL writer safety. Additionally, this strategy could delegate genuinely
 NON-DETERMINISTIC comprehension to a subagent — e.g., disambiguating heavily aliased/namespaced
 imports, barrel-file re-exports, or unusual export patterns — passing only the scoped file context

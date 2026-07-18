@@ -1270,9 +1270,11 @@ export class GithubClient {
   //   2. FUND only the uncovered UNION TAIL: delta = max(0, published horizon (pausedUntilMs) −
   //      max(now, accountedUntilMs)) — the horizon, NOT this candidate's raw untilMs (see the funding
   //      comment below for why). Two callers arming the SAME window charge it once WHEN it was funded
-  //      (the second sees delta 0); if the first publication overflowed the budget the horizon stays
-  //      unfunded, so a later arm re-computes a nonzero delta that re-overflows and funds nothing. If
-  //      funding the tail
+  //      (the second sees delta 0); if the first publication overflowed the budget the horizon is left
+  //      unfunded, and a later arm re-computes the tail against the CURRENT now: while that tail still
+  //      exceeds the remaining budget it re-overflows and funds nothing, but as now advances toward the
+  //      horizon the tail shrinks, so once it fits a later arm DOES fund it (and waitBucket then sleeps
+  //      it). If funding the tail
   //      would exceed MAX_TOTAL_PAUSE_MS, publish the pause but do NOT advance accountedUntilMs — the
   //      tail stays unfunded and waitBucket throws ThrottleExhausted for it instead of over-sleeping.
   private armBucketPause(bucket: Bucket, untilMs: number, now: number): void {
@@ -1284,8 +1286,9 @@ export class GithubClient {
     // window while the tail is unfunded): a phantom charge that, under fan-out where sibling callers
     // arm the shared bucket out of order, could drain the budget for time never actually paused.
     // Targeting the horizon also keeps the two invariants intact: N callers arming the SAME window
-    // charge it once (the second sees delta 0), and an already-unfundable horizon stays unfunded (the
-    // delta re-overflows and funds nothing).
+    // charge it once (the second sees delta 0), and an already-unfundable horizon stays unfunded WHILE
+    // its tail exceeds the remaining budget (the delta re-overflows) — until enough wall-clock elapses
+    // that the shrunken (horizon − now) tail fits, when a later arm funds it.
     const horizon = bucket.pausedUntilMs;
     const delta = Math.max(0, horizon - Math.max(now, bucket.accountedUntilMs));
     if (delta === 0) return; // horizon already funded or entirely in the past — nothing new to charge

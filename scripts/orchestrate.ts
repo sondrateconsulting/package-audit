@@ -380,11 +380,12 @@ export async function processOwner(
 ): Promise<RepoPolicyCoverage[]> {
   // Personal-vs-org routing is CASE-INSENSITIVE to match ownerResolve's owner fold: a configured
   // "Alice" that collapsed onto personal login "alice" must still route through listUserRepos, not
-  // the org endpoint. (personalLogin is null when personal-namespace scanning is off.)
+  // the org endpoint. (personalLogin here is the resolved preflight login; includePersonalNamespace
+  // gates whether personal routing applies — the `personalLogin !== null` check is just defensive.)
   const isPersonal = runtime.config.includePersonalNamespace && personalLogin !== null && owner.toLowerCase() === personalLogin.toLowerCase();
   const outcome = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
   if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
-  // Repos stay SEQUENTIAL within an owner (§2.3): each repo's discover→plan→scan→reconcile must be
+  // Repos stay SEQUENTIAL within an owner (§4): each repo's discover→plan→scan→reconcile must be
   // atomic (branches fan out INSIDE processRepo). Check the run-level abort before each repo so a
   // fatal in a SIBLING owner stops this owner from dispatching more work promptly (boundary-only
   // cancellation — no throw, so partial coverage is fine; the run is failing anyway).
@@ -523,7 +524,7 @@ export async function processRepo(
   // concurrency.branches (§5). Safe WITHOUT a mutex because each unit is a DISTINCT (org, repo,
   // branch) — so distinct work_queue / run_unit_head rows — and every DB write below is an await-free
   // synchronous block; bun:sqlite is fully synchronous, so no sibling fiber can interleave mid-block
-  // and the units never race each other's rows. Repos stay SEQUENTIAL within an owner (§2.3): each
+  // and the units never race each other's rows. Repos stay SEQUENTIAL within an owner (§4): each
   // repo's discover→plan→scan→reconcile must be atomic, and this pool drains fully before the
   // reconcile below. Only the DEFAULT may carry a policy counterfactual (the override); a non-default
   // to-scan branch is necessarily no-exclusion (asserted, fail-closed).
@@ -899,7 +900,7 @@ export async function discoverCliTerms(db: AuditDb, client: GithubClient, config
             version: latest, versionSource: "range-resolved", packument,
           });
         }
-        // ORDER BY so the emitted cli-terms event's binNames are byte-stable: the JSONL vocabulary
+        // ORDER BY so the emitted cli-terms event's `bins` array is byte-stable: the JSONL vocabulary
         // is set-based (order-independent by contract), but a total, content-derived order keeps the
         // line reproducible run-to-run and never depends on SQLite's implementation-defined row order.
         const bins = db.read(`SELECT DISTINCT export_name FROM package_api_surface WHERE package_name = ? AND export_kind='cli-bin' AND version = ? ORDER BY export_name`).all(pkg.name, latest) as Array<{ export_name: string }>;
