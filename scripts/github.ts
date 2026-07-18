@@ -673,7 +673,8 @@ export function parseTreeResponse(json: unknown, endpoint: string, expectedSha: 
   const obj = json;
   const truncated = obj["truncated"];
   if (typeof truncated !== "boolean") throw fail("truncated flag missing or non-boolean");
-  if (!Array.isArray(obj["tree"])) throw fail("tree member missing or non-array");
+  const tree = obj["tree"];
+  if (!Array.isArray(tree)) throw fail("tree member missing or non-array");
   if (expectedSha !== null) {
     const sha = obj["sha"];
     if (typeof sha !== "string" || sha.toLowerCase() !== expectedSha.toLowerCase())
@@ -684,7 +685,7 @@ export function parseTreeResponse(json: unknown, endpoint: string, expectedSha: 
   // fallback. Return the flag alone.
   if (truncated) return { truncated: true };
   const seen = new Set<string>();
-  const paths = (obj["tree"] as unknown[]).map((entry, i) => {
+  const paths = tree.map((entry: unknown, i) => {
     if (!isObject(entry)) throw fail(`tree[${i}] is not an object`);
     const e = entry;
     const path = e["path"];
