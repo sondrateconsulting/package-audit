@@ -262,6 +262,69 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     expect(readdirSync(root)).toEqual([]); // zero-write preserved
     rmSync(root, { recursive: true, force: true });
   });
+
+  test("MULTI-OWNER: repositoriesExcluded/reposKept AGGREGATE across owners (+=, not =); each denying owner emits its own plan-excluded; a zero-denial owner emits none", async () => {
+    // Three configured owners exercise the per-owner ACCUMULATION the single-owner tests can't reach:
+    //   org-a denies 2 (keeps 1) · org-b denies 1 (keeps 1) · org-c denies 0 (keeps 1).
+    // "*/legacy-*" is cross-org + case-insensitive. This pins two otherwise-surviving mutations:
+    //   (A) `repositoriesExcluded = excluded.length` (instead of `+=`) → reports the LAST owner's count (0), not 3.
+    //   (B) dropping the `excluded.length > 0` guard → org-c emits a spurious empty plan-excluded.
+    const root = mkdtempSync(join(tmpdir(), "plan-deny-multi-"));
+    const reposByOwner: Record<string, Array<{ name: string; pushed: string }>> = {
+      "org-a": [
+        { name: "svc-a", pushed: "2025-01-01T00:00:00Z" }, // kept
+        { name: "Legacy-API", pushed: "2025-02-01T00:00:00Z" }, // denied (case-insensitively)
+        { name: "legacy-portal", pushed: "2025-03-01T00:00:00Z" }, // denied
+      ],
+      "org-b": [
+        { name: "svc-b", pushed: "2025-01-01T00:00:00Z" }, // kept
+        { name: "legacy-worker", pushed: "2025-02-01T00:00:00Z" }, // denied
+      ],
+      "org-c": [{ name: "svc-c", pushed: "2025-01-01T00:00:00Z" }], // kept, nothing denied
+    };
+    const OWNERS = ["org-a", "org-b", "org-c"] as const;
+    const listing = (owner: string): string =>
+      http(200, {}, JSON.stringify(reposByOwner[owner]!.map((r) => ({
+        name: r.name, owner: { login: owner }, default_branch: "main", pushed_at: r.pushed, archived: false, fork: false, private: false,
+      }))));
+    const heads = http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{ name: "main", target: { oid: hexOid("o-main"), committedDate: "2025-06-01T00:00:00Z", tree: { oid: hexOid("t1") } } }],
+    } } } }));
+    const client = makeClient(root, async (bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads };
+      const owner = OWNERS.find((o) => args.some((a) => a.includes(`orgs/${o}/repos`)));
+      if (owner === undefined) throw new Error(`unexpected spawn: ${bin} ${args.join(" ")}`);
+      return { exitCode: 0, stderr: "", stdout: listing(owner) };
+    });
+    const config: Config = {
+      githubHost: "github.com", organizations: [...OWNERS], excludeOrganizations: [], branches: null, excludeBranches: [],
+      excludeRepositories: ["*/legacy-*"], // cross-org, case-insensitive
+      includePersonalNamespace: false, includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
+      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
+    };
+    let totals: PlanTotals | undefined;
+    const events = await captureJsonl(async () => { totals = await runPlan(client, rt(config), "rvo"); });
+    // Discovered = 3+2+1 = 6; kept = 1+1+1 = 3; excluded = 2+1+0 = 3. `=`-instead-of-`+=` would yield the
+    // last owner's counts (kept 1, excluded 0), so these three aggregates kill mutation (A).
+    expect(totals!.reposDiscovered).toBe(6);
+    expect(totals!.reposKept).toBe(3);
+    expect(totals!.repositoriesExcluded).toBe(3);
+    // Compare plan-excluded events BY OWNER (not by emission order): exactly org-a + org-b emit; org-c does not.
+    const excludedByOrg = new Map(
+      events.filter((e) => e["event"] === "plan-excluded").map((e) => [e["org"] as string, e["repositories"] as string[]]),
+    );
+    expect(excludedByOrg.size).toBe(2); // org-c emitted NONE → kills mutation (B); the empty-guard drop would make this 3
+    expect(excludedByOrg.get("org-a")).toEqual(["org-a/Legacy-API", "org-a/legacy-portal"]); // original case, raw discovery order
+    expect(excludedByOrg.get("org-b")).toEqual(["org-b/legacy-worker"]);
+    expect(excludedByOrg.has("org-c")).toBe(false);
+    // plan-summary carries the AGGREGATE count (not a per-owner snapshot)
+    expect(events.find((e) => e["event"] === "plan-summary")!["repositoriesExcluded"]).toBe(3);
+    expect(readdirSync(root)).toEqual([]); // zero-write preserved
+    rmSync(root, { recursive: true, force: true });
+  });
 });
 
 // Shared minimal Config for the guard/wiring tests below (single configured org, cap via arg).
