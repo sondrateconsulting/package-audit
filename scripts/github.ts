@@ -14,6 +14,7 @@ import {
 import type { AuditDb } from "./db.ts";
 import type { DiscoveryFailure } from "./discovery.ts";
 import { isIsoInstant } from "./isoDate.ts";
+import { logLine } from "./log.ts";
 
 // ---- errors -----------------------------------------------------------------------------
 // Non-retryable API failure (404, permission, SSO enforcement, poisoned redirect, …) — the
@@ -486,7 +487,21 @@ export function classifyRest(
   body: string,
   nowMs: number,
 ): Classification {
-  if (status >= 200 && status < 300) return { kind: "ok" };
+  if (status === 200) return { kind: "ok" };
+  // §5.C: only EXACTLY 200 is success. A non-200 2xx (206 Partial Content from a middlebox,
+  // 203 proxy-transformed content, …) carries a body that cannot be trusted as complete. The
+  // raw consumers (fetchFileRaw/fetchBlobRaw) scan those bodies as file content with no
+  // structural validation at all, and the structured consumers' validation cannot establish
+  // transport completeness anyway — so ONE fatal here covers every consumer, current and
+  // future. Non-retryable on purpose: a transforming middlebox would re-transform on retry,
+  // and the transient path would
+  // end in a misleading ThrottleExhausted that loses the status. Every REST endpoint this tool
+  // calls returns exactly 200 on success; an endpoint with genuine 202/204 semantics would need
+  // its own explicit handler, never a re-widening of this range. Bounds are exact (201-299) so
+  // status 0 (no HTTP response — handled before classification) and a terminal 1xx (the -i
+  // parser can surface one when no final block follows) keep their existing paths.
+  if (status >= 201 && status < 300)
+    return { kind: "fatal", status, ssoRequired: false, message: `HTTP ${status} — only exactly 200 is success (a non-200 2xx body cannot be trusted as complete)` };
   if (status === 403 || status === 429) {
     // PRIMARY is keyed on remaining==0, NOT the status code (§4). Checking it BEFORE the SSO
     // header is safe: a genuine SSO/permission 403 is not consuming the last request of the
@@ -550,6 +565,173 @@ export function classifyGraphql(
   return { kind: "fatal", status, ssoRequired: false, message: `HTTP ${status}` };
 }
 
+// ---- §4/§5.C response-envelope validation (pure) ---------------------------------------------
+// sha1 (40) or sha256 (64) hex object ids — the only forms that may address SHA-pinned fetches.
+const HEX_OBJECT_ID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
+
+// Non-null, non-array object guard (mirrors config.ts's isObject) — the same shape recurred across
+// every envelope/tree/branch-head validator below; the type predicate also drops their `as Record` casts.
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+// GraphQL spec (§7 Response): the body is a MAP carrying `data` and/or a NON-EMPTY `errors` list
+// of maps. parseGraphqlEnvelope never throws: it reports the FIRST spec violation via `malformed`
+// and returns whatever error evidence it could read, so graphql() can classify status/header/
+// throttle semantics BEFORE deciding what a violation means for its path.
+export interface GraphqlEnvelope {
+  data: unknown; // the data member verbatim (undefined when absent)
+  // Sanitized projections — only string-valued type/message survive, so downstream string
+  // coercion (classifyGraphql's join / template literals) is total even on hostile entries.
+  // CONTRACT: `errors` and `malformed` are INDEPENDENT — a non-null `malformed` (from one bad
+  // sibling entry) can coexist with readable `errors` (e.g. a genuine RATE_LIMITED beside it).
+  // A consumer must classify off `errors` FIRST and treat `malformed` only as "do not accept as
+  // success", never as "the errors are worthless".
+  errors: GraphqlErrorEntry[];
+  malformed: string | null; // first spec violation, null when the envelope is well-formed
+}
+export function parseGraphqlEnvelope(bodyText: string): GraphqlEnvelope {
+  let malformed: string | null = null;
+  const note = (reason: string): void => {
+    if (malformed === null) malformed = reason;
+  };
+  let root: unknown;
+  try {
+    root = JSON.parse(bodyText);
+  } catch {
+    return { data: undefined, errors: [], malformed: "unparseable JSON body" };
+  }
+  if (!isObject(root))
+    return { data: undefined, errors: [], malformed: "non-object response root" };
+  const obj = root;
+  const hasData = Object.hasOwn(obj, "data");
+  const hasErrors = Object.hasOwn(obj, "errors");
+  if (!hasData && !hasErrors) note("response carries neither data nor errors");
+  const errors: GraphqlErrorEntry[] = [];
+  if (hasErrors) {
+    const raw = obj["errors"];
+    if (!Array.isArray(raw)) note("present errors member is not an array");
+    else if (raw.length === 0) note("present errors member is an empty array (spec: non-empty)");
+    else {
+      for (const entry of raw) {
+        if (!isObject(entry)) {
+          note("errors[] contains a non-object entry");
+          continue;
+        }
+        const e = entry;
+        const proj: GraphqlErrorEntry = {};
+        if (Object.hasOwn(e, "type")) {
+          if (typeof e["type"] === "string") proj.type = e["type"];
+          else note("errors[].type is not a string");
+        }
+        if (Object.hasOwn(e, "message")) {
+          if (typeof e["message"] === "string") proj.message = e["message"];
+          else note("errors[].message is not a string");
+        }
+        // An entry with NOTHING readable carries no classifiable signal. Keeping it would
+        // fabricate "ERROR: " fatal text; dropping it SILENTLY would fail open — {"errors":[{}]}
+        // would sanitize to no-errors and classify as success. Flag it, then drop it.
+        if (proj.type === undefined && proj.message === undefined) {
+          note("errors[] entry carries no readable type/message");
+          continue;
+        }
+        errors.push(proj);
+      }
+    }
+  }
+  if (hasData) {
+    const d = obj["data"];
+    if (d === null) {
+      // spec: data:null is the total-execution-failure shape and requires errors beside it —
+      // alone it is indistinguishable from a swallowed failure signal.
+      if (!hasErrors) note("data is null but no errors member is present");
+    } else if (!isObject(d)) {
+      note("data member is not an object");
+    }
+  }
+  return { data: hasData ? obj["data"] : undefined, errors, malformed };
+}
+
+// GitHub git/trees (§5.C): the listing we act on must be PROVABLY complete and well-addressed,
+// so every violation throws (→ a scan-scope errors row at the unit boundary). Before this guard,
+// a missing `tree` member read as an EMPTY repo (zero findings, silently) and a missing
+// `truncated` flag read as `false` — silently disabling the caller's clone fallback, its only
+// escape hatch for over-limit repos.
+// The git object types git/trees returns — the SINGLE source of truth for both the runtime check
+// and the static TreeEntryType, so the two cannot drift. A future/unknown type must fail LOUD, not
+// vanish through the downstream blob filter.
+const TREE_ENTRY_TYPES = ["blob", "tree", "commit"] as const;
+export type TreeEntryType = (typeof TREE_ENTRY_TYPES)[number];
+const isTreeEntryType = (v: unknown): v is TreeEntryType => (TREE_ENTRY_TYPES as readonly unknown[]).includes(v);
+// truncated:true carries NO paths (partial data is unusable — the caller clones); the discriminated
+// union makes reading `paths` on a truncated tree a COMPILE error, not a silent empty-repo read.
+export type TreeResponse =
+  | { truncated: true }
+  | { truncated: false; paths: Array<{ path: string; type: TreeEntryType; sha: string; size: number | null }> };
+export function parseTreeResponse(json: unknown, endpoint: string, expectedSha: string | null): TreeResponse {
+  const fail = (reason: string): GithubApiError =>
+    new GithubApiError(`malformed git-tree response from ${endpoint}: ${reason}`, { status: 200, endpoint });
+  if (!isObject(json)) throw fail("non-object response root");
+  const obj = json;
+  const truncated = obj["truncated"];
+  if (typeof truncated !== "boolean") throw fail("truncated flag missing or non-boolean");
+  const tree = obj["tree"];
+  if (!Array.isArray(tree)) throw fail("tree member missing or non-array");
+  if (expectedSha !== null) {
+    const sha = obj["sha"];
+    if (typeof sha !== "string" || sha.toLowerCase() !== expectedSha.toLowerCase())
+      throw fail("response sha does not match the requested tree oid");
+  }
+  // A truncated listing is unusable partial data: the caller MUST fall back to a clone (§5.C)
+  // and nothing may read these entries — validating junk we won't consume would only block that
+  // fallback. Return the flag alone.
+  if (truncated) return { truncated: true };
+  const seen = new Set<string>();
+  const paths = tree.map((entry: unknown, i) => {
+    if (!isObject(entry)) throw fail(`tree[${i}] is not an object`);
+    const e = entry;
+    const path = e["path"];
+    const type = e["type"];
+    const sha = e["sha"];
+    if (typeof path !== "string" || !isCanonicalTreePath(path)) throw fail(`tree[${i}] path missing or non-canonical`);
+    if (!isTreeEntryType(type)) throw fail(`tree[${i}] has an unknown entry type`);
+    if (typeof sha !== "string" || !HEX_OBJECT_ID_RE.test(sha)) throw fail(`tree[${i}] sha missing or non-hex`);
+    if (seen.has(path)) throw fail(`duplicate path ${JSON.stringify(path)}`);
+    seen.add(path);
+    let size: number | null = null;
+    if (Object.hasOwn(e, "size")) {
+      const s = e["size"];
+      // typeof-number alone admits Infinity (JSON "1e400") and fractions — either would corrupt
+      // the downstream size gates instead of failing loud here.
+      if (typeof s !== "number" || !Number.isSafeInteger(s) || s < 0) throw fail(`tree[${i}] size is not a non-negative safe integer`);
+      size = s;
+    } else if (type === "blob") {
+      // The scan cap (unitPipeline) skips only entries whose size EXCEEDS the limit; a null-size blob
+      // sails through it and gets fetched + scanned regardless. Real GitHub always emits size on blobs,
+      // so a missing one is a malformed/hostile response — fail closed (tree/commit entries carry none).
+      throw fail(`tree[${i}] blob entry is missing size`);
+    }
+    return { path, type, sha, size };
+  });
+  return { truncated: false, paths };
+}
+// git tree paths are repo-relative and canonical: no empty / "." / ".." segments (which also
+// covers leading, trailing and doubled slashes) and no NUL — anything else misaddresses the
+// contents fetch and the permalink.
+function isCanonicalTreePath(p: string): boolean {
+  if (p.length === 0 || p.includes("\u0000")) return false;
+  return p.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
+}
+// A GitHub org/repo identity is a single path segment consumed verbatim by API endpoint paths and the
+// clone URL. Reject the dot segments "." / ".." (traversal), path separators,
+// and any Unicode control (\p{Cc} — C0, C1, and DEL) or whitespace character — a real GitHub login or
+// repo name contains none of these, while legitimate names like ".github" and "a.b" pass. This does
+// NOT enforce the full GitHub name grammar (GHES/legacy differ); it only closes the structural
+// scope-steering vectors — the same fail-closed posture isCanonicalTreePath applies to tree paths.
+const IDENTITY_REJECT_RE = /[\p{Cc}\s/\\]/u;
+export function isCanonicalIdentity(s: string): boolean {
+  return s.length > 0 && s !== "." && s !== ".." && !IDENTITY_REJECT_RE.test(s);
+}
+
 // ---- §5.C path encoding (pure) --------------------------------------------------------------
 // encodeURIComponent per PATH SEGMENT, preserving '/' — matches the permalink builder's rule.
 export function encodeContentsPath(path: string): string {
@@ -576,16 +758,56 @@ export interface RepoInfo {
   fork: boolean;
   isPrivate: boolean;
 }
-export function mapRestRepo(raw: Record<string, unknown>): RepoInfo {
-  const owner = raw["owner"] as Record<string, unknown> | undefined;
-  return {
-    name: String(raw["name"] ?? ""),
-    organization: String(owner?.["login"] ?? ""),
-    pushedAt: typeof raw["pushed_at"] === "string" ? raw["pushed_at"] : null,
-    archived: raw["archived"] === true,
-    fork: raw["fork"] === true,
-    isPrivate: raw["private"] === true,
-  };
+// Fail LOUD on a malformed repo listing entry (§5.A). EVERY RepoInfo field is now strictly validated,
+// replacing the old String(raw.name ?? "")/String(owner?.login ?? "") coercion and the
+// `?? "" / === true / typeof` defaults — the SCOPE-STEERING fields (name, owner.login, pushed_at,
+// archived, fork) each silently mis-scoped the audit when coerced, and `private` is validated too for
+// report integrity even though it does not steer selection:
+//   • name / owner.login → a missing/empty/null/non-string value became "" or a coerced string
+//     (e.g. 42 → "42"), a FABRICATED repo/owner id.
+//   • pushed_at drives the DESC sort + `maxReposPerOrg` cap: a coerced-to-null (or garbage-string)
+//     value sinks a repo to last, and the cap can then drop a genuinely-recent repo — a silent
+//     UNDER-report. It must be explicitly `null` (never pushed) or a valid ISO instant.
+//   • archived / fork drive the policy filter: a coerced-to-false value both scans an excluded repo
+//     AND lets it displace an eligible one out of a finite cap (also an under-report). Must be bool.
+// Anything malformed throws an indexed GithubApiError — same fail-closed posture as
+// listOrgMemberships and listBranchHeads' committedDate.
+export function mapRestRepo(raw: unknown, endpoint: string, index: number, expectedOwner: string): RepoInfo {
+  const fail = (reason: string): GithubApiError =>
+    new GithubApiError(`malformed repo listing at index ${index}: ${reason}`, { endpoint });
+  if (!isObject(raw)) throw fail("not an object");
+  const name = raw["name"];
+  if (typeof name !== "string" || name.length === 0) throw fail("missing, empty, or non-string name");
+  if (!isCanonicalIdentity(name)) throw fail("name is not a canonical identity segment");
+  const owner = raw["owner"];
+  if (!isObject(owner)) throw fail("missing or non-object owner");
+  const login = owner["login"];
+  if (typeof login !== "string" || login.length === 0) throw fail("missing, empty, or non-string owner.login");
+  // Validate the segment BEFORE the cross-owner equality: a hostile "." / ".." / separator login must
+  // fail loud even in the (degenerate) case where it equals expectedOwner, not slip past because the
+  // equality happened to hold.
+  if (!isCanonicalIdentity(login)) throw fail("owner.login is not a canonical identity segment");
+  // Both listings pass their EXPECTED owner: an org listing passes the org; a user listing passes the
+  // authenticated personal login (known at its orchestrate.ts call site). The row's owner MUST equal
+  // it — case-insensitively (GitHub logins are), keeping the returned casing — or a foreign-owner row
+  // would redirect the scan to a different account and mis-attribute every finding/permalink to it.
+  if (login.toLowerCase() !== expectedOwner.toLowerCase())
+    throw fail(`owner.login ${JSON.stringify(login)} is not the requested owner ${JSON.stringify(expectedOwner)}`);
+  const pushed = raw["pushed_at"];
+  let pushedAt: string | null;
+  // pushed_at drives the DESC sort + maxReposPerOrg cap, and filterSortCapRepos compares the strings
+  // LEXICALLY — which equals chronological order ONLY for the canonical UTC (Z) form GitHub's REST API
+  // actually emits. isIsoInstant also accepts OFFSET forms (it is shared with git's %cI committedDate),
+  // and an offset instant sorts lexically wrong (e.g. `…-10:00` is newer than a `…Z` value it sorts
+  // before), so it could sink a genuinely-recent repo below the cap — a silent under-report. Require Z.
+  if (pushed === null) pushedAt = null;
+  else if (typeof pushed === "string" && pushed.endsWith("Z") && isIsoInstant(pushed)) pushedAt = pushed;
+  else throw fail("pushed_at is not null or a canonical UTC (Z) ISO instant");
+  const archived = raw["archived"], fork = raw["fork"], isPrivate = raw["private"];
+  if (typeof archived !== "boolean") throw fail("archived is not a boolean");
+  if (typeof fork !== "boolean") throw fail("fork is not a boolean");
+  if (typeof isPrivate !== "boolean") throw fail("private is not a boolean");
+  return { name, organization: login, pushedAt, archived, fork, isPrivate };
 }
 // Client-side policy (§5.A): archived/fork filtering never trusts a server-side filter, then
 // sort pushed_at DESC (nulls last, name ASC tie-break) and cap at maxReposPerOrg.
@@ -918,7 +1140,20 @@ export class GithubClient {
 
   // ---- REST GET with cache + throttle handling ----
   private cacheKey(endpoint: string): string {
-    return `gh:${this.githubHost}:${endpoint}`; // host-scoped; never a hand-built API hostname
+    // KEY EPOCH `gh3`: rows are statusless and survive --fresh, so every strengthening of cache
+    // WRITE provenance quarantines all older rows by making their keys unreachable (--purge-cache
+    // reclaims the dead rows; the cost is a one-time refetch). gh:→gh2: closed rows written
+    // before the exact-200 persist gate (any ok-classified 2xx body, e.g. a 206, could ride the
+    // immutable/304 hits' synthesized 200 into the unvalidated raw consumers). gh2:→gh3: closed
+    // rows written before the truncated-transfer exit gate (a parsed 200 from a FAILED gh
+    // process could persist a mid-stream-cut body — same laundering, worse provenance). The
+    // epoch lives in the PREFIX itself (next bump gh4:) because githubHost accepts host:port
+    // and numeric hosts — an epoch spelled INSIDE the old `gh:` namespace could collide with a
+    // legacy key across a host transition (`gh:200.1:443:` = legacy host "200.1:443" = current
+    // host "443"). Every legacy key starts with the literal `gh:` or `gh2:`, and no string can
+    // inhabit two of these grammars (they disagree at index 2: ':', '2', '3'). Bump whenever
+    // cache WRITE-provenance guarantees change in a way reads rely on.
+    return `gh3:${this.githubHost}:${endpoint}`; // host-scoped; never a hand-built API hostname
   }
 
   private async waitBucket(bucket: Bucket): Promise<void> {
@@ -965,7 +1200,13 @@ export class GithubClient {
 
   // One REST GET. `immutable: true` (commit/tree/blob-SHA-pinned URLs) serves a cached body
   // with ZERO network request (§3); otherwise a cached ETag rides as If-None-Match and gh's
-  // non-zero-exit 304 is a cache HIT.
+  // non-zero-exit 304 is a cache HIT. `noStore: true` OVERRIDES both — it disables the cache read
+  // (so neither the immutable hit nor the If-None-Match/304 path can fire) and the persist, so a
+  // `{ immutable, noStore }` combination resolves to a plain uncached fetch (noStore wins).
+  // CONTRACT: a resolved response always has status EXACTLY 200 — direct (classifyRest fails
+  // every non-200 2xx closed) or cache-synthesized (both cache-serving paths fabricate 200).
+  // Consumers (fetchFileRaw/fetchBlobRaw/restGetJson/restGetPagedArray) rely on this and do
+  // not re-check status; an endpoint with genuine 202/204 semantics must get its own handler.
   // An endpoint is only genuinely IMMUTABLE if it pins a git object id — a blob/tree SHA in
   // the path or a sha-shaped `?ref=`. This is defense-in-depth over the callers' own isSha
   // gate: a caller can never zero-network-freeze a mutable branch/tag URL by passing immutable.
@@ -973,14 +1214,19 @@ export class GithubClient {
     const [path, query = ""] = endpoint.split("?");
     if (/\/git\/(blobs|trees)\/[0-9a-f]{40}([0-9a-f]{24})?(\/|$)/i.test(path ?? "")) return true;
     const ref = new URLSearchParams(query).get("ref") ?? "";
-    return /^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(ref);
+    return HEX_OBJECT_ID_RE.test(ref); // same as isSha — a sha-shaped ?ref= pins an immutable object
   }
 
-  async restGet(endpoint: string, opts: { accept?: string; immutable?: boolean } = {}): Promise<HttpResponse> {
+  async restGet(endpoint: string, opts: { accept?: string; immutable?: boolean; noStore?: boolean } = {}): Promise<HttpResponse> {
     const accept = opts.accept ?? "";
     const immutable = opts.immutable === true && GithubClient.endpointIsShaPinned(endpoint);
     const key = this.cacheKey(endpoint);
-    const cached = this.db?.getApiCache("GET", key, accept) ?? null;
+    // `noStore` fully opts OUT of the conditional cache: no read, no If-None-Match, no persist. The
+    // cache stores body+ETag but NOT the Link header, so a paginated page served from a 304 that
+    // omits Link would make restGetPagedArray stop early and silently under-report the listing — a
+    // cache the caller cannot use correctly must not be used at all (§5.A completeness).
+    const noStore = opts.noStore === true;
+    const cached = noStore ? null : (this.db?.getApiCache("GET", key, accept) ?? null);
     if (immutable && cached !== null && cached.responseBody !== null)
       return { status: 200, headers: {}, body: cached.responseBody };
 
@@ -1004,12 +1250,37 @@ export class GithubClient {
         this.db?.putApiCache({ method: "GET", url: key, variantHash: accept, etag: cached.etag, responseBody: cached.responseBody });
         return { status: 200, headers: parsed.headers, body: cached.responseBody };
       }
+      // A parsed SUCCESS from a FAILED gh process is untrustworthy: gh api -i streams the body
+      // AFTER printing the header block, so a mid-body transport failure leaves a well-formed
+      // 200 head with a TRUNCATED body on stdout and a nonzero exit — invisible to every status
+      // gate, and the exact-200 persist gate would freeze it into the cache. Only the exact-200
+      // path consumes/persists bodies; HTTP-error statuses arrive with a nonzero exit BY DESIGN
+      // (gh exits 1 on 4xx/5xx and on the 304 the cache hit above depends on) and classify
+      // normally below. Same transient class as no-response: retry, then surface stderr.
+      if (parsed.status === 200 && res.exitCode !== 0) {
+        if (attempt < MAX_ATTEMPTS - 1) {
+          await this.sleep(this.backoffWait("transient", attempt, null));
+          continue;
+        }
+        throw new GithubApiError(
+          `gh exited ${res.exitCode} with an HTTP 200 response — the body may be truncated: ${res.stderr.trim().slice(0, 300)}`,
+          { endpoint },
+        );
+      }
       const cls = classifyRest(parsed.status, parsed.headers, parsed.body, this.now());
       if (cls.kind === "ok") {
-        this.db?.putApiCache({
-          method: "GET", url: key, variantHash: accept,
-          etag: parsed.headers["etag"] ?? null, responseBody: parsed.body,
-        });
+        // Persist ONLY an exact-200 body. Both cache-serving paths above synthesize status 200,
+        // so caching any other 2xx (e.g. a 206 Partial Content) would launder it into a
+        // 'complete' 200 on every later call — permanently, for SHA-pinned endpoints.
+        // classifyRest now makes ok imply exactly 200, so this check looks redundant — it is
+        // DELIBERATE defense-in-depth: cache write provenance is a durable invariant (rows are
+        // statusless and outlive --fresh) and must hold locally, never by depending on a distant
+        // classifier's range staying narrow. Expected to survive mutation testing.
+        if (parsed.status === 200 && !noStore)
+          this.db?.putApiCache({
+            method: "GET", url: key, variantHash: accept,
+            etag: parsed.headers["etag"] ?? null, responseBody: parsed.body,
+          });
         return parsed;
       }
       if (cls.kind === "fatal")
@@ -1029,12 +1300,27 @@ export class GithubClient {
     try {
       return JSON.parse(res.body);
     } catch {
+      this.tombstoneApiCache(endpoint, ""); // the unparseable body was cached before we could see it
       throw new GithubApiError(`invalid JSON from ${endpoint}`, { status: res.status, endpoint });
     }
   }
 
+  // A 200 body is cached by restGet before endpoint-level validation runs. When validation then
+  // rejects it, overwrite the row with a NULL body: both cache-serving paths (the immutable hit
+  // and the 304 If-None-Match revalidation) require a non-null cached body, so the next call goes
+  // back to the network instead of re-serving the poisoned bytes until --purge-cache. The accept
+  // variant must match the fetch that cached the row — a mismatched variant would tombstone the
+  // wrong row and leave the poisoned one live.
+  private tombstoneApiCache(endpoint: string, accept: string): void {
+    this.db?.putApiCache({ method: "GET", url: this.cacheKey(endpoint), variantHash: accept, etag: null, responseBody: null });
+  }
+
   // TS pagination (§5.A): per-page `gh api -i`, follow Link rel="next" (host-verified,
-  // recomposed relative) until absent, accumulating array pages.
+  // recomposed relative) until absent, accumulating array pages. Pages are fetched with
+  // `noStore` — the conditional cache preserves body+ETag but NOT the Link header, so a cached
+  // page whose 304 revalidation omits Link would silently truncate the listing. With noStore a
+  // paginated fetch never creates, overwrites, OR consumes a cache row (a pre-existing row from an
+  // earlier version simply stays, unread), so it can neither be poisoned by nor poison the cache.
   async restGetPagedArray(endpoint: string): Promise<unknown[]> {
     const acc: unknown[] = [];
     // A compromised/misbehaving API controls the Link chain: a repeated endpoint (cycle) or
@@ -1047,7 +1333,7 @@ export class GithubClient {
       if (seen.size >= MAX_PAGES)
         throw new GithubApiError(`pagination exceeded ${MAX_PAGES} pages following Link next`, { endpoint: ep });
       seen.add(ep);
-      const res = await this.restGet(ep);
+      const res = await this.restGet(ep, { noStore: true });
       let page: unknown;
       try {
         page = JSON.parse(res.body);
@@ -1055,7 +1341,7 @@ export class GithubClient {
         throw new GithubApiError(`invalid JSON page from ${ep}`, { status: res.status, endpoint: ep });
       }
       if (!Array.isArray(page)) throw new GithubApiError(`expected a JSON array page from ${ep}`, { endpoint: ep });
-      acc.push(...page);
+      for (const item of page) acc.push(item); // iterative, not acc.push(...page): a huge page would blow the arg limit
       const nextUrl = parseLinkNext(res.headers["link"]);
       ep = nextUrl === null ? null : nextEndpointFromLink(nextUrl, this.githubHost);
     }
@@ -1079,34 +1365,51 @@ export class GithubClient {
         }
         throw new GithubApiError(`gh api graphql produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`, { endpoint: "graphql" });
       }
-      let body: { data?: unknown; errors?: GraphqlErrorEntry[] } = {};
-      try {
-        // A non-object root (null / array / primitive — JSON.parse("null") SUCCEEDS) carries neither
-        // data nor a readable errors member; normalize it to {} exactly like unparseable JSON, so the
-        // property reads below cannot TypeError and a missing `data` is rejected structurally
-        // downstream.
-        const parsedBody: unknown = JSON.parse(parsed.body);
-        body = parsedBody !== null && typeof parsedBody === "object" && !Array.isArray(parsedBody) ? (parsedBody as typeof body) : {};
-      } catch {
-        body = {};
-      }
-      // GraphQL spec: a PRESENT `errors` member is an ARRAY. A present-but-non-array errors field
-      // means the failure signal we were meant to read is unreadable — coercing it to "no errors"
-      // would be fail-OPEN: an ok:true branch discovery feeds the reconcile PRUNE (reconcileRunUnitHead), so a
-      // swallowed error signal could turn a partial result into row deletion. classifyGraphql still
-      // runs FIRST with errors=[]: status/header evidence (5xx retry, throttle, SSO-fatal) keeps its
-      // semantics, and the malformed envelope only preempts the OK path below.
-      const errorsMalformed = body.errors !== undefined && !Array.isArray(body.errors);
-      const errors = Array.isArray(body.errors) ? body.errors : [];
+      // There is DELIBERATELY no BROAD restGet-style nonzero-exit truncation guard here: gh exits 1
+      // BY DESIGN after printing a complete HTTP-200 envelope whose body carries `errors` —
+      // including genuine RATE_LIMITED throttles — so a nonzero exit under a parsed 200 is by itself
+      // the NORMAL semantic-error shape, not a truncation signal (a broad guard would blind-retry
+      // real throttles past their reset window and misreport them as truncated). The ok-branch below
+      // does add a NARROW transient retry for the ONE shape that IS transport truncation — a nonzero
+      // exit whose body is ALSO unparseable — which a complete errors envelope (RATE_LIMITED parses
+      // fine → malformed===null) can never match. Truncation stays fail-closed even without it: the
+      // envelope is object-rooted JSON, and no proper prefix of a valid top-level-object JSON text is
+      // itself valid JSON except one that only sheds trailing whitespace (which still carries the
+      // complete object) — so a mid-stream cut either loses nothing or fails JSON.parse → flagged
+      // malformed → retried-then-rejected below.
+      // Spec-shape validation lives in parseGraphqlEnvelope (pure). A malformed envelope means the
+      // failure signal we were meant to read is unreadable — coercing it to "no errors" would be
+      // fail-OPEN: an ok:true branch discovery feeds the reconcile PRUNE (reconcileRunUnitHead), so a
+      // swallowed error signal could turn a partial result into row deletion. classifyGraphql still runs
+      // FIRST on whatever error evidence WAS readable: status/header semantics (5xx retry,
+      // throttle, SSO-fatal) are never downgraded by a malformed body — malformation (and a
+      // 2xx-non-200 status) only preempts the SUCCESS path below.
+      const env = parseGraphqlEnvelope(parsed.body);
       // §4: GraphQL throttles can arrive as HTTP 200 with body errors — check BOTH.
-      const cls = classifyGraphql(parsed.status, parsed.headers, errors, this.now());
+      const cls = classifyGraphql(parsed.status, parsed.headers, env.errors, this.now());
       if (cls.kind === "ok") {
-        if (errorsMalformed)
+        if (parsed.status !== 200)
           throw new GithubApiError(
-            "graphql: response carries a malformed (non-array) errors field — refusing to treat it as success",
+            `graphql envelope: HTTP ${parsed.status} — only exactly 200 is success`,
             { status: parsed.status, endpoint: "graphql" },
           );
-        return body.data;
+        if (env.malformed !== null) {
+          // A truncated transport (gh buffers the graphql JSON, then aborts printing on a mid-stream
+          // read failure) leaves a well-formed HTTP-200 head + an unparseable body + a NONZERO exit —
+          // a transient read failure, retried under the same bounded transient budget restGet's
+          // truncation guard uses. Scoped to exactly that shape so a COMPLETE errors envelope (which
+          // parses fine → malformed===null) is never blind-retried; every other malformed reason
+          // (non-object root, missing data/errors, bad error entries) is a real spec violation → fatal.
+          if (env.malformed === "unparseable JSON body" && res.exitCode !== 0 && attempt < MAX_ATTEMPTS - 1) {
+            await this.sleep(this.backoffWait("transient", attempt, null));
+            continue;
+          }
+          throw new GithubApiError(
+            `graphql envelope: ${env.malformed}${res.exitCode !== 0 ? ` (gh exit ${res.exitCode}: ${res.stderr.trim().slice(0, 300)})` : ""} — refusing to treat the response as success`,
+            { status: parsed.status, endpoint: "graphql" },
+          );
+        }
+        return env.data;
       }
       if (cls.kind === "fatal")
         throw new GithubApiError(`graphql: ${cls.message}`, { status: cls.status, endpoint: "graphql", ssoRequired: cls.ssoRequired });
@@ -1121,19 +1424,51 @@ export class GithubClient {
   }
 
   // ---- discovery (§5.A / §5.B) ----
-  async listOrgRepos(org: string): Promise<RepoInfo[]> {
-    const raw = await this.restGetPagedArray(`orgs/${encodeURIComponent(org)}/repos?per_page=100&page=1&type=all`);
-    return raw.map((r) => mapRestRepo(r as Record<string, unknown>));
+  // Map a flattened repo listing to validated RepoInfo, rejecting DUPLICATE (owner, name) identities:
+  // a repeated repo (a pagination artifact when the listing shifts between pages, or a hostile row)
+  // would take a maxReposPerOrg cap slot and silently drop a DISTINCT repo — a silent under-report,
+  // the same hazard parseTreeResponse guards against for duplicate tree paths.
+  private mapRepoPage(raw: unknown[], endpoint: string, expectedOwner: string): RepoInfo[] {
+    const seen = new Set<string>();
+    return raw.map((r, i) => {
+      const repo = mapRestRepo(r, endpoint, i, expectedOwner);
+      const key = JSON.stringify([repo.organization.toLowerCase(), repo.name.toLowerCase()]); // collision-proof tuple key (no separator ambiguity)
+      if (seen.has(key)) throw new GithubApiError(`duplicate repo ${repo.organization}/${repo.name} in listing at index ${i}`, { endpoint });
+      seen.add(key);
+      return repo;
+    });
   }
 
-  async listUserRepos(): Promise<RepoInfo[]> {
+  async listOrgRepos(org: string): Promise<RepoInfo[]> {
+    const raw = await this.restGetPagedArray(`orgs/${encodeURIComponent(org)}/repos?per_page=100&page=1&type=all`);
+    return this.mapRepoPage(raw, `orgs/${org}/repos`, org);
+  }
+
+  // `user/repos?affiliation=owner` returns repos owned by the AUTHENTICATED user, so the caller's
+  // known personal login is the expected owner — validate it too (a foreign-owner row would redirect
+  // the personal scan / take a cap slot, exactly as for an org listing).
+  async listUserRepos(expectedOwner: string): Promise<RepoInfo[]> {
     const raw = await this.restGetPagedArray(`user/repos?affiliation=owner&per_page=100&page=1`);
-    return raw.map((r) => mapRestRepo(r as Record<string, unknown>));
+    return this.mapRepoPage(raw, "user/repos", expectedOwner);
   }
 
   async listOrgMemberships(): Promise<string[]> {
     const raw = await this.restGetPagedArray(`user/orgs?per_page=100&page=1`);
-    return raw.map((o) => String((o as Record<string, unknown>)["login"] ?? "")).filter((s) => s !== "");
+    // Fail LOUD on any malformed entry — the old `String(o.login ?? "")` + `.filter(s => s !== "")`
+    // silently dropped a missing/empty/null login and string-COERCED a non-string one into a
+    // fabricated org, either way understating or corrupting the discovered org set (§5.A). Same
+    // fail-closed posture as listBranchHeads' malformed-node throw.
+    return raw.map((o, i) => {
+      if (!isObject(o)) throw new GithubApiError(`malformed org membership at index ${i}: not an object`, { endpoint: "user/orgs" });
+      const login = o["login"];
+      if (typeof login !== "string" || login.length === 0)
+        throw new GithubApiError(`malformed org membership at index ${i}: missing, empty, or non-string login`, { endpoint: "user/orgs" });
+      // No cross-owner check guards this listing (it PRODUCES the org set), so a "." / ".." / separator
+      // / control-char login must be rejected here or it becomes a fabricated owner steering every scan.
+      if (!isCanonicalIdentity(login))
+        throw new GithubApiError(`malformed org membership at index ${i}: login is not a canonical identity segment`, { endpoint: "user/orgs" });
+      return login;
+    });
   }
 
   // §5.B: enumerate ALL ref pages (RefOrderField cannot order heads by commit date), then sort
@@ -1213,16 +1548,21 @@ export class GithubClient {
       if (!Array.isArray(refs.nodes))
         throw new GithubApiError(`refs page missing a nodes array for ${org}/${repo}`, { endpoint: "graphql" });
       for (const node of refs.nodes) {
+        // a null/non-object node must fail here, not as a raw TypeError on the property reads below
+        if (!isObject(node))
+          throw new GithubApiError(`malformed branch-head node for ${org}/${repo}`, { endpoint: "graphql" });
         const n = node as { name?: string; target?: { oid?: string; committedDate?: string; tree?: { oid?: string } } };
         // Every refs/heads/* head is a complete Commit; a malformed/non-Commit node is anomalous and
-        // must not be silently skipped (see the completeness note above). Every field must be a
-        // NON-EMPTY string — an empty oid/date/tree.oid is malformed (an empty committedDate would
-        // otherwise classify as cutoff-skipped and then trip upsertRunUnitHead's non-empty-date
-        // invariant OUTSIDE the fail-soft discovery path, aborting the whole run).
+        // must not be silently skipped (see the completeness note above). name must be a NON-EMPTY
+        // string; both oids must be HEX OBJECT IDS — they flow into SHA-pinned fetches where a
+        // ref-looking value ("main") would freeze a MUTABLE response into the immutable cache and
+        // into skip-current persistence. An empty committedDate would otherwise classify as
+        // cutoff-skipped and then trip upsertRunUnitHead's non-empty-date invariant OUTSIDE the
+        // fail-soft discovery path, aborting the whole run.
         if (typeof n.name !== "string" || n.name.length === 0 ||
-            typeof n.target?.oid !== "string" || n.target.oid.length === 0 ||
+            typeof n.target?.oid !== "string" || !HEX_OBJECT_ID_RE.test(n.target.oid) ||
             typeof n.target.committedDate !== "string" || n.target.committedDate.length === 0 ||
-            typeof n.target.tree?.oid !== "string" || n.target.tree.oid.length === 0)
+            typeof n.target.tree?.oid !== "string" || !HEX_OBJECT_ID_RE.test(n.target.tree.oid))
           throw new GithubApiError(`malformed branch-head node for ${org}/${repo}`, { endpoint: "graphql" });
         // Non-empty is NOT enough for the DATE: it steers cutoff/cap selection lexically and is then
         // persisted, so an impossible value would silently change WHAT GETS SCANNED rather than fail
@@ -1297,24 +1637,34 @@ export class GithubClient {
   // Only a full hex object id earns the immutable zero-network path — a branch/tag name
   // passed by mistake must never freeze a MUTABLE response into the cache forever.
   private static isSha(ref: string): boolean {
-    return /^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(ref); // sha1 (40) or sha256 (64) object ids
+    return HEX_OBJECT_ID_RE.test(ref); // sha1 (40) or sha256 (64) object ids
   }
 
-  async fetchTreeRecursive(org: string, repo: string, treeOid: string): Promise<{ truncated: boolean; paths: Array<{ path: string; type: string; sha: string; size: number | null }> }> {
+  async fetchTreeRecursive(org: string, repo: string, treeOid: string): Promise<TreeResponse> {
     const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(treeOid)}?recursive=1`;
-    const json = (await this.restGetJson(endpoint, { immutable: GithubClient.isSha(treeOid) })) as {
-      truncated?: boolean;
-      tree?: Array<{ path?: string; type?: string; sha?: string; size?: number }>;
-    };
-    return {
-      truncated: json.truncated === true,
-      paths: (json.tree ?? []).map((e) => ({
-        path: e.path ?? "",
-        type: e.type ?? "",
-        sha: e.sha ?? "",
-        size: typeof e.size === "number" ? e.size : null,
-      })),
-    };
+    const immutable = GithubClient.isSha(treeOid);
+    const res = await this.restGet(endpoint, { immutable });
+    try {
+      // Unreachable through restGet (its contract is exact-200), so this is DELIBERATE
+      // defense-in-depth: a partial 206 body parsed here would read as a complete tree, and
+      // tree completeness must not silently depend on a distant classifier's range staying
+      // narrow. Exercised by a stubbed-restGet test; expected to survive mutation testing.
+      if (res.status !== 200)
+        throw new GithubApiError(`malformed git-tree response from ${endpoint}: HTTP ${res.status} — only exactly 200 is success`, { status: res.status, endpoint });
+      let json: unknown;
+      try {
+        json = JSON.parse(res.body);
+      } catch {
+        throw new GithubApiError(`invalid JSON from ${endpoint}`, { status: res.status, endpoint });
+      }
+      return parseTreeResponse(json, endpoint, immutable ? treeOid : null);
+    } catch (e) {
+      // restGet cached this body BEFORE validation could see it; for a SHA-pinned tree the
+      // immutable path would re-serve the poisoned bytes forever (--purge-cache was the only
+      // remedy). Tombstone the row so the next call goes back to the network.
+      this.tombstoneApiCache(endpoint, "");
+      throw e;
+    }
   }
 
   async fetchFileRaw(org: string, repo: string, path: string, refSha: string): Promise<string> {
@@ -1381,6 +1731,12 @@ export class GithubClient {
       const rev = await this.git(["rev-parse", "HEAD"], dest);
       if (rev.exitCode !== 0)
         throw new GithubApiError(`git rev-parse HEAD failed in ${dest}: ${rev.stderr.trim().slice(0, 300)}`, { endpoint: url });
+      const headSha = rev.stdout.trim();
+      // §5.C fail-closed: this clone HEAD is persisted as the scanned commit and built into every
+      // permalink, so it must be a real object id — validate it exactly like the API path's oids (and
+      // like the committer date below), never trust rev-parse's stdout verbatim.
+      if (!HEX_OBJECT_ID_RE.test(headSha))
+        throw new GithubApiError(`git rev-parse HEAD returned a non-hex object id in ${dest}: ${JSON.stringify(headSha.slice(0, 80))}`, { endpoint: url });
       // §4 (branch allow/deny): the ACTUAL scanned commit's date. The clone HEAD may be AHEAD of the
       // GraphQL-discovered head (the branch moved between discovery and clone), so its date must be
       // read from the clone — not reused from discovery. This exact argv is the ONLY `show` form
@@ -1398,7 +1754,7 @@ export class GithubClient {
       // value — so the poison risk here is the run's durable scan-scope ledger, not selection.
       if (!isIsoInstant(headCommittedDate))
         throw new GithubApiError(`git show HEAD returned a non-ISO committer date in ${dest}: ${JSON.stringify(headCommittedDate.slice(0, 80))}`, { endpoint: url });
-      return { dir: dest, headSha: rev.stdout.trim(), headCommittedDate };
+      return { dir: dest, headSha, headCommittedDate };
     } catch (e) {
       // a failed/timed-out clone can leave a multi-GB partial tree — reclaim it NOW rather
       // than at the next run's startup sweep (the caller only cleans up on success). The
@@ -1406,8 +1762,11 @@ export class GithubClient {
       // not replace the actionable git error (a stuck tree is the next sweep's problem).
       try {
         rmSync(runDir, { recursive: true, force: true });
-      } catch {
-        // the original error propagates below
+      } catch (cleanupErr) {
+        // best-effort — the ORIGINAL clone/rev-parse/show error (thrown below) is the operator's
+        // diagnostic and must NOT be masked, but the failed reclaim is still surfaced (a stuck tree the
+        // next startup sweep must handle), consistent with processUnit's clone-cleanup-failed warning.
+        logLine({ event: "warning", reason: "clone-cleanup-failed", target: runDir, message: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) });
       }
       throw e;
     }
@@ -1416,10 +1775,20 @@ export class GithubClient {
   // ---- startup sweep (§0): stale pkg-audit-* DIRECT children of the temp root only ----
   sweepStaleTempDirs(): string[] {
     const removed: string[] = [];
+    // ENOENT here is benign (a dir vanished mid-sweep under concurrent cleanup); anything else
+    // (EACCES/EBUSY/ENOTDIR/…) is a real failure that would otherwise leave stale multi-GB clones
+    // accumulating with no signal — the sole caller discards the return value, so warn on stdout.
+    const warnFailure = (operation: string, target: string, e: unknown, suppressENOENT: boolean): void => {
+      // A PER-ENTRY dir vanishing mid-sweep (ENOENT) is a benign concurrent-cleanup race; a missing or
+      // unreadable temp ROOT is not — it means the sweep could not run at all — so the root always warns.
+      if (suppressENOENT && typeof e === "object" && e !== null && (e as { code?: unknown }).code === "ENOENT") return;
+      logLine({ event: "warning", reason: "temp-sweep-failed", operation, target, message: e instanceof Error ? e.message : String(e) });
+    };
     let entries: string[];
     try {
       entries = readdirSync(this.tempRoot);
-    } catch {
+    } catch (e) {
+      warnFailure("readdir", this.tempRoot, e, false); // root failure ALWAYS warns, incl. a missing root (ENOENT)
       return removed;
     }
     for (const name of entries) {
@@ -1428,7 +1797,8 @@ export class GithubClient {
       let st;
       try {
         st = lstatSync(full); // lstat: NEVER follow a symlink
-      } catch {
+      } catch (e) {
+        warnFailure("lstat", full, e, true); // per-entry: a benign mid-sweep vanish (ENOENT) stays silent
         continue;
       }
       try {
@@ -1440,8 +1810,8 @@ export class GithubClient {
           unlinkSync(full);
         }
         removed.push(name);
-      } catch {
-        // a dir vanishing mid-sweep (concurrent cleanup) is not an error
+      } catch (e) {
+        warnFailure("remove", full, e, true); // per-entry: a dir vanishing mid-sweep (ENOENT) stays silent
       }
     }
     return removed;

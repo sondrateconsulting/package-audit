@@ -22,7 +22,9 @@ every run as "continue the job," not "start over," unless the user passes `--fre
   ever spawned with cwd inside a cloned repo or extracted tarball except `git`/`tar`
   themselves. Only STATICALLY read files; static scanners MUST NOT follow symlinks
   out of the clone/tarball root. This is the single biggest read-only risk — sacred.
-- Any `git clone` must be shallow, into an ephemeral temp dir, and removed on exit.
+- Any `git clone` must be shallow, into an ephemeral temp dir, and reclaimed on exit
+  (best-effort — a reclaim that fails emits a `clone-cleanup-failed` warning; containment
+  holds regardless, so a stranded dir is disk to reclaim on a later run, never an escape).
   Full hardened invocation (the §5.C clone fallback uses exactly this):
   `GIT_TERMINAL_PROMPT=0 git clone --depth 1
   --single-branch --branch <branch> --no-tags --no-recurse-submodules --template=
@@ -44,7 +46,8 @@ every run as "continue the job," not "start over," unless the user passes `--fre
   prefix-containment in an allowed root (realpath defeats symlink escape); it also
   validates the configured `sqlitePath`/`outputDir` are so contained. A startup
   sweep removes stale `pkg-audit-*` dirs (direct children of the temp root only,
-  never following symlinks) left by crashed prior runs.
+  never following symlinks) left by crashed prior runs — best-effort, warning
+  (`temp-sweep-failed`) on any dir it cannot list or remove.
 - If unsure whether an action is read-only, DO NOT do it — log and skip.
 
 ================================================================================
@@ -614,15 +617,21 @@ Resumability rules:
 - Caching (see api_cache): commit-SHA-pinned contents URLs are IMMUTABLE — serve them
   from cache with ZERO network request. For other REST GETs use ETag/If-None-Match
   conditional requests (treat gh's non-zero exit on HTTP 304 as a cache HIT, capture the
-  ETag via `gh api -i`). Branch-discovery GraphQL is NEVER cached — it BYPASSES
+  ETag via `gh api -i`) — EXCEPT PAGINATED listing requests (repo/org enumeration followed
+  via `Link rel=next`), which BYPASS api_cache entirely: no read, no If-None-Match, no
+  write. api_cache stores an ETag+body but NOT the response's `Link` header, so a cached
+  page served from a 304 that omitted `Link` would drop the pagination chain and SILENTLY
+  TRUNCATE the listing (repos/orgs silently out of scope). A cache that cannot preserve the
+  pagination linkage must not be used for paginated requests; each page is fetched fresh.
+  Branch-discovery GraphQL is NEVER cached — it BYPASSES
   api_cache entirely and always hits the network. Two reasons: (a) the skip predicate
   depends on seeing the LIVE head every invocation, and a resumed run's persisted
   `started_at` predates a crash, so ANY time-based cache check would risk serving a
   pre-crash (stale) head; (b) each repo's branch query is unique, so it never repeats
   within a run and caching would buy nothing. The branch-discovery call also passes NO
   `gh --cache` flag, so gh's OWN on-disk response cache cannot serve a stale head either.
-  api_cache is therefore effectively REST-GET only; the `method` column stays for
-  defensiveness but GraphQL rows are not written.
+  api_cache is therefore effectively single-page REST-GET only; the `method` column stays for
+  defensiveness but GraphQL and paginated-listing rows are not written.
 - CLI flags:
   - `--fresh` DROPs and recreates the run-scoped tables but PRESERVES `api_cache` and
     `package_api_surface` (content-addressed and expensive to rebuild) unless

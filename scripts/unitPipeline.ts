@@ -15,11 +15,14 @@ import { resolveFromLockfile, type LockResolution } from "./lockfile.ts";
 import { scanUsage, type TrackedPackage, type UsageRow } from "./usageScanner.ts";
 import { scanCli, classifyFile, type CliTermSet, type CliRow } from "./cliScanner.ts";
 import type { DependencyType } from "./manifest.ts";
+import type { TreeEntryType } from "./github.ts"; // type-only: the git object types, one source of truth
 
-// A tree entry (from the git/trees API or a walked clone). `type` is the git object type.
+// A tree entry (from the git/trees API or a walked clone). `type` is the git object type — the
+// same closed set github.ts validates git/trees against, so `e.type === "blob"` typos and any
+// TreeEntry-typed fixture drift are compile errors (a stub cast with `as` still bypasses the type).
 export interface TreeEntry {
   path: string;
-  type: string; // 'blob' | 'tree' | 'commit' (submodule) | …
+  type: TreeEntryType;
   sha: string; // blob SHA (for the raw/blob size split)
   size: number | null;
 }

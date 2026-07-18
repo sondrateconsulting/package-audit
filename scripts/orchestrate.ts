@@ -7,7 +7,7 @@
 // writer); per-unit reads fan out through the guarded github wrapper. Deterministic iteration
 // order (owners/repos/branches sorted) so runs are reproducible.
 
-import { readdirSync, lstatSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { readdirSync, lstatSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
@@ -59,42 +59,34 @@ function apiReader(client: GithubClient, org: string, repo: string, commitSha: s
   };
 }
 
-// Clone-fallback reader: read a file from the walked clone dir, contained to that dir.
-function cloneReader(cloneDir: string) {
+// Clone-fallback reader: read a file from the walked clone dir, contained to that dir. Every failure
+// PROPAGATES — unlike apiReader (whose 404→null models a benign force-push race), a file the walk
+// just enumerated from a COMPLETED local clone is never legitimately absent, so any read error
+// (ENOENT/EACCES/EISDIR/EIO/…) or containment violation means the snapshot was not fully read and
+// must surface as a scan error, not degrade to null and mark a partially-read head `done`.
+export function cloneReader(cloneDir: string) {
   return async (path: string, _entry: TreeEntry): Promise<string | null> => {
-    try {
-      const abs = join(cloneDir, path);
-      assertContained(abs, [cloneDir]);
-      return existsSync(abs) ? readFileSync(abs, "utf8") : null;
-    } catch {
-      return null;
-    }
+    const abs = join(cloneDir, path);
+    assertContained(abs, [cloneDir]);
+    return readFileSync(abs, "utf8");
   };
 }
 
 // Walk a cloned working tree into TreeEntry rows (blobs only; size from lstat). Skips .git and
-// symlinks (never followed). Paths are repo-relative POSIX.
-function walkClone(root: string): TreeEntry[] {
+// symlinks (never followed). Paths are repo-relative POSIX. A readdir/lstat failure PROPAGATES: on a
+// completed clone it means the tree was not fully enumerated, and a silent skip would under-report
+// the unit's files as `done` (the same fail-open hazard cloneReader closes on the read side).
+export function walkClone(root: string): TreeEntry[] {
   const out: TreeEntry[] = [];
   const stack: string[] = [""];
   while (stack.length > 0) {
     const rel = stack.pop()!;
     const abs = rel === "" ? root : join(root, rel);
-    let names: string[];
-    try {
-      names = readdirSync(abs);
-    } catch {
-      continue;
-    }
+    const names = readdirSync(abs);
     for (const name of names) {
       if (rel === "" && name === ".git") continue;
       const childRel = rel === "" ? name : `${rel}/${name}`;
-      let st;
-      try {
-        st = lstatSync(join(root, childRel));
-      } catch {
-        continue;
-      }
+      const st = lstatSync(join(root, childRel));
       if (st.isSymbolicLink()) continue;
       if (st.isDirectory()) stack.push(childRel);
       else if (st.isFile()) out.push({ path: childRel, type: "blob", sha: "", size: st.size });
@@ -330,7 +322,7 @@ export async function discoverOwnerRepos(
 ): Promise<DiscoveryOutcome<RepoInfo>> {
   let repos: RepoInfo[];
   try {
-    repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
+    repos = isPersonal ? await client.listUserRepos(owner) : await client.listOrgRepos(owner);
   } catch (e) {
     // §4: a throttle during repo discovery is TRANSIENT — no permanent errors row (discovery
     // re-runs next invocation). Any other error is a permanent discovery failure. Either way the
@@ -531,8 +523,6 @@ async function processUnit(
 ): Promise<{ commitSha: string; committedDate: string }> {
   const h = decision.head;
   const tree = await client.fetchTreeRecursive(repo.organization, repo.name, h.treeOid);
-  let entries: TreeEntry[];
-  let readFile: (path: string, entry: TreeEntry) => Promise<string | null>;
   let cloneDir: string | null = null;
   // The ACTUAL scanned commit + its date: the discovery head (h.oid / h.committedDate) for the API
   // path, or the clone's real HEAD for the fallback (the branch may have moved between GraphQL
@@ -540,20 +530,26 @@ async function processUnit(
   // scanned_commit_date must pin to what was truly scanned, §5.C/§4).
   let commitSha = h.oid;
   let committedDate = h.committedDate;
-  if (tree.truncated) {
-    const cloned = await client.cloneShallow(repo.organization, repo.name, h.name);
-    cloneDir = cloned.dir;
-    commitSha = cloned.headSha;
-    committedDate = cloned.headCommittedDate;
-    entries = walkClone(cloned.dir);
-    readFile = cloneReader(cloned.dir);
-  } else {
-    entries = tree.paths.map((p) => ({ path: p.path, type: p.type, sha: p.sha, size: p.size }));
-    readFile = apiReader(client, repo.organization, repo.name, h.oid);
-  }
-  const loc: UnitLocation = { githubHost: config.githubHost, organization: repo.organization, repository: repo.name, branch: h.name, commitSha };
-
+  // The clone-fallback setup (cloneShallow → walkClone → cloneReader) runs INSIDE this try so a
+  // walkClone/reader throw AFTER cloneShallow succeeds still reaches the finally's (best-effort,
+  // warns-on-failure) clone-dir reclaim — otherwise a completed (multi-GB) clone would be left for the
+  // next startup sweep instead. cloneShallow's own failure path cleans up before it sets cloneDir, so
+  // the finally correctly no-ops there.
   try {
+    let entries: TreeEntry[];
+    let readFile: (path: string, entry: TreeEntry) => Promise<string | null>;
+    if (tree.truncated) {
+      const cloned = await client.cloneShallow(repo.organization, repo.name, h.name);
+      cloneDir = cloned.dir;
+      commitSha = cloned.headSha;
+      committedDate = cloned.headCommittedDate;
+      entries = walkClone(cloned.dir);
+      readFile = cloneReader(cloned.dir);
+    } else {
+      entries = tree.paths.map((p) => ({ path: p.path, type: p.type, sha: p.sha, size: p.size }));
+      readFile = apiReader(client, repo.organization, repo.name, h.oid);
+    }
+    const loc: UnitLocation = { githubHost: config.githubHost, organization: repo.organization, repository: repo.name, branch: h.name, commitSha };
     const result = await scanUnit(loc, { trackedPackages: config.packages.map((p) => p.name), excludeDirGlobs: config.excludeDirGlobs }, entries, readFile, cliTermSets);
     const now = nowIso();
     for (const d of result.dependencyFindings) {
@@ -611,8 +607,11 @@ async function processUnit(
         const runTempDir = dirname(cloneDir);
         assertContained(runTempDir, [client.tempRoot]);
         rmSync(runTempDir, { recursive: true, force: true });
-      } catch {
-        // best-effort
+      } catch (e) {
+        // Best-effort reclaim, but NOT silent: a failed cleanup leaves a (multi-GB) clone until the
+        // next startup sweep, so surface it — without masking any primary scan error already
+        // propagating out of the try (the throw continues; this only adds an observability line).
+        logLine({ event: "warning", reason: "clone-cleanup-failed", target: cloneDir, message: e instanceof Error ? e.message : String(e) });
       }
     }
   }
@@ -788,9 +787,13 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   // Warning parity: the empty-allowlist warning is emitted at mode entry, unconditionally, exactly as in
   // runScan — so --plan and the real run produce identical policy-warning events for the same config.
   if (isEmptyAllowlist(branchPolicy)) logLine({ event: "policy-warning", kind: "empty-allowlist" });
-  // The zero-write contract is enforced, not assumed: a caching client would write api_cache rows
-  // into the DB during discovery. This is an internal contract violation (a bug, not an operator
-  // error), so a plain Error with a stack is the right rendering.
+  // The zero-write contract is enforced STRUCTURALLY, not assumed. Plan discovery today writes no
+  // api_cache rows anyway — its listings are paginated (noStore: cache fully bypassed) and branch
+  // discovery is GraphQL (never cached) — but the contract must NOT depend on that staying true: a
+  // db-backed client plus any future discovery call that caches would silently write into the DB in
+  // plan mode. Rejecting a db-backed client up front keeps "--plan writes nothing" a durable
+  // invariant. An internal contract violation (a bug, not an operator error), so a plain Error with
+  // a stack is the right rendering.
   if (client.cachesToDb) throw new Error("runPlan requires a cache-less client (db: null) — plan mode must not write api_cache");
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 
@@ -801,7 +804,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
     const isPersonal = config.includePersonalNamespace && owner === personalLogin;
     let repos: RepoInfo[];
     try {
-      repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
+      repos = isPersonal ? await client.listUserRepos(owner) : await client.listOrgRepos(owner);
     } catch (e) {
       discoveryErrors++;
       logLine({ event: "plan", org: owner, error: `repo discovery failed: ${(e as Error).message}` });

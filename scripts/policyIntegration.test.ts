@@ -52,7 +52,8 @@ const graphqlHeads = (nodes: Head[], defaultBranch: string | null): string =>
     defaultBranchRef: defaultBranch === null ? null : { name: defaultBranch },
     refs: {
       pageInfo: { hasNextPage: false, endCursor: null },
-      nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: `tree-${n.oid}` } } })),
+      // tree oid = the commit oid reversed: still 40-hex (§5.B requires hex ids), distinct from the commit
+      nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: [...n.oid].reverse().join("") } } })),
     },
   } } })}`;
 // NOTE the REST listing still carries default_branch — the shape is real, the auditor just ignores it.
@@ -62,7 +63,12 @@ function scanClient(root: string, heads: Head[], defaultBranch: string | null): 
   const spawn: SpawnFn = async (bin, args) => {
     if (bin.endsWith("/git")) throw new Error(`unexpected git spawn (${args.join(" ")}) — non-truncated trees must never clone`);
     if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads(heads, defaultBranch) };
-    if (args.some((a) => a.includes("git/trees"))) return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ truncated: false, tree: [] })}` };
+    if (args.some((a) => a.includes("git/trees"))) {
+      // §5.C envelope: echo the requested oid as the root sha (fetchTreeRecursive verifies it)
+      const ep = args.find((a) => a.includes("/git/trees/")) ?? "";
+      const sha = decodeURIComponent(ep.split("/git/trees/")[1]?.split("?")[0] ?? "");
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ sha, truncated: false, tree: [] })}` };
+    }
     return { exitCode: 0, stderr: "", stdout: repoList };
   };
   return new GithubClient({
@@ -91,12 +97,12 @@ describe("branch allow/deny — end-to-end policy classification seam", () => {
   // Six heads, newest-first (as listBranchHeads supplies). allow-list keep/scan {feature/x, overflow,
   // ancient} + default main; cap=1 non-default. feature/x newer than overflow → wins the cap in run A.
   const HEADS: Head[] = [
-    { name: "main", oid: "o-main-00000000000000000000000000000001", date: "2025-06-01T00:00:00Z" },
-    { name: "feature/x", oid: "o-fx-000000000000000000000000000000002", date: "2025-05-01T00:00:00Z" },
-    { name: "overflow", oid: "o-of-000000000000000000000000000000003", date: "2025-04-01T00:00:00Z" },
-    { name: "deny-me", oid: "o-dm-000000000000000000000000000000004", date: "2025-03-01T00:00:00Z" },
-    { name: "other", oid: "o-ot-000000000000000000000000000000005", date: "2025-02-01T00:00:00Z" },
-    { name: "ancient", oid: "o-an-000000000000000000000000000000006", date: "2023-01-01T00:00:00Z" }, // < cutoff
+    { name: "main", oid: "aaaa000000000000000000000000000000000001", date: "2025-06-01T00:00:00Z" },
+    { name: "feature/x", oid: "aaaa000000000000000000000000000000000002", date: "2025-05-01T00:00:00Z" },
+    { name: "overflow", oid: "aaaa000000000000000000000000000000000003", date: "2025-04-01T00:00:00Z" },
+    { name: "deny-me", oid: "aaaa000000000000000000000000000000000004", date: "2025-03-01T00:00:00Z" },
+    { name: "other", oid: "aaaa000000000000000000000000000000000005", date: "2025-02-01T00:00:00Z" },
+    { name: "ancient", oid: "aaaa000000000000000000000000000000000006", date: "2023-01-01T00:00:00Z" }, // < cutoff
   ];
   const ALLOW = ["feature/x", "overflow", "ancient"];
 
