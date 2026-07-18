@@ -181,7 +181,7 @@ export const policyBranchSchema = z.strictObject({
   branch: z.string(),
   disposition: z.enum(["excluded", "scanned-default-override"]),
   policyStatus: z.enum(["excluded-by-deny", "excluded-by-allow"]),
-  matchedPattern: z.string().nullable().describe("The causing deny pattern; null for an allow-miss / default-override-by-allow"),
+  matchedPattern: z.string().nullable().describe("The stored deny-attribution pattern; null for an allow-miss / default-override-by-allow. Writes verify it matches the branch; report/export/compare preserve it verbatim on otherwise-sound pre-verifier or externally-edited rows (malformed rows still fail the read gate on shape) without re-running version-sensitive glob matching, so it is not read-time attested"),
 });
 export const scanScopeSchema = z
   .strictObject({
