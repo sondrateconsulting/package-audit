@@ -900,7 +900,7 @@ export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
 export interface GithubClientOptions {
   githubHost: string;
   db?: AuditDb | null; // api_cache home; null disables caching
-  concurrency?: number; // GLOBAL in-flight gh cap (§4)
+  concurrency?: number; // GLOBAL in-flight cap on gh/git/tar subprocesses (§4/§5.6)
   spawnImpl?: SpawnFn;
   sleepImpl?: (ms: number) => Promise<void>;
   nowImpl?: () => number;

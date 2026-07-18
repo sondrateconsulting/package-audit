@@ -2062,6 +2062,38 @@ describe("reconcileRunUnitHead (stale-row prune)", () => {
   });
 });
 
+describe("pruneExcludedOwnerHeads (§1 case-insensitive exclusion on resume)", () => {
+  const scanned = (db: AuditDb, runId: string, org: string, repo: string): void =>
+    db.upsertRunUnitHead({ runId, organization: org, repository: repo, branch: "main", commitSha: `sha-${org}-${repo}`, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+  const orgsOf = (db: AuditDb, runId: string): string[] =>
+    (db.read("SELECT DISTINCT organization FROM run_unit_head WHERE run_id=? ORDER BY organization").all(runId) as Array<{ organization: string }>).map((r) => r.organization);
+
+  test("drops rows for an owner a CASE-VARIANT exclude now matches; keeps other owners and other runs", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    rawRun(db, "r2", "running");
+    scanned(db, "r1", "acme", "a");  // API-canonical owner scanned before the old case-sensitive exclude was fixed
+    scanned(db, "r1", "acme", "b");
+    scanned(db, "r1", "bigco", "c"); // a different, non-excluded owner — must be kept
+    scanned(db, "r2", "acme", "a");  // same owner, DIFFERENT run — must survive (the prune is run-scoped)
+    // exclude "Acme" (config spelling) must match the canonical "acme" CASE-INSENSITIVELY
+    expect(db.pruneExcludedOwnerHeads("r1", ["Acme"])).toBe(2);
+    expect(orgsOf(db, "r1")).toEqual(["bigco"]); // acme rows gone, bigco kept
+    expect(orgsOf(db, "r2")).toEqual(["acme"]); // the other run is untouched
+    db.close();
+  });
+
+  test("no-op when the denylist is empty or matches no owner in the run (never over-prunes)", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    scanned(db, "r1", "acme", "a");
+    expect(db.pruneExcludedOwnerHeads("r1", [])).toBe(0); // empty denylist → no-op (the common case)
+    expect(db.pruneExcludedOwnerHeads("r1", ["other-org"])).toBe(0); // no case-insensitive match → no-op
+    expect(orgsOf(db, "r1")).toEqual(["acme"]); // a transiently-undiscovered-but-not-excluded owner keeps its rows
+    db.close();
+  });
+});
+
 describe("api_cache", () => {
   test("variant_hash separates JSON-vs-raw reads of one URL", () => {
     const db = mem();

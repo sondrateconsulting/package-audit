@@ -8,7 +8,9 @@
 // form — and runs.cutoff_date holds the operator-CONFIGURED bare YYYY-MM-DD cutoff (validated at
 // config load; legacy-migrated rows carry ''). None of these participate in the nowIso MAX/ordering
 // invariant (see assertCanonicalTimestamp).
-// Single-writer: orchestrate.ts owns all writes; report.ts reads via the exposed handle.
+// Single writer CONNECTION: orchestrate.ts owns all writes through ONE bun:sqlite handle (§5 fan-out
+// runs many fibers, but they share that single connection and its synchronous statements serialize
+// them — no second writer, no mutex); report.ts reads via the exposed handle.
 
 import { Database, type Statement } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
@@ -2318,6 +2320,29 @@ export class AuditDb {
            AND branch NOT IN (SELECT value FROM json_each(?))`,
       )
       .run(runId, organization, repository, JSON.stringify(discoveredBranches));
+    return res.changes;
+  }
+
+  // §1 exclusion enforcement for a RESUMED run: drop this run's run_unit_head rows for any owner named
+  // in excludeOrganizations, matched CASE-INSENSITIVELY (as ownerResolve folds owners). config_hash
+  // hashes excludeOrganizations exact-case ON PURPOSE (folding it would orphan every legacy config's
+  // resumable work), so a run that STRADDLES the upgrade to case-insensitive exclusion can still hold
+  // rows for an owner a case-variant exclude now removes (e.g. exclude "Acme", earlier-scanned "acme").
+  // Pruning them here keeps a resumed run's report from ever surfacing an owner its own
+  // excludeOrganizations excludes — the report joins findings THROUGH run_unit_head, so removing the
+  // head rows removes that owner's dispositions AND findings together. TARGETED and SAFE: it keys off
+  // the STABLE configured denylist, never the per-invocation effective/discovered set, so a
+  // transiently-undiscovered (but not excluded) owner never loses its rows. No-op on a fresh run (no
+  // prior rows) and whenever excludeOrganizations is empty. Returns the number of rows pruned.
+  pruneExcludedOwnerHeads(runId: string, excludeOrganizations: readonly string[]): number {
+    if (excludeOrganizations.length === 0) return 0;
+    const res = this.db
+      .query(
+        `DELETE FROM run_unit_head
+         WHERE run_id = ?
+           AND lower(organization) IN (SELECT lower(value) FROM json_each(?))`,
+      )
+      .run(runId, JSON.stringify(excludeOrganizations));
     return res.changes;
   }
 

@@ -218,6 +218,15 @@ export async function runScan(
   const resume = db.resumeInfo(configHash);
   logLine({ event: "run", runId, resumed, counts: resume.counts });
 
+  // §1 exclusion enforcement on RESUME: excludeOrganizations is matched case-insensitively (ownerResolve),
+  // but config_hash hashes it exact-case (folding the hash would orphan legacy resumable work). So a run
+  // that straddles the upgrade to case-insensitive exclusion could hold run_unit_head rows for an owner a
+  // case-variant exclude now removes — prune them so a resumed run's report never surfaces an owner its
+  // own excludeOrganizations excludes. No-op on a fresh run and when excludeOrganizations is empty.
+  const excludedPruned = db.pruneExcludedOwnerHeads(runId, config.excludeOrganizations);
+  if (excludedPruned > 0)
+    logLine({ event: "reconciliation", target: "run_unit_head", runId, action: "prune-excluded-owner", pruned: excludedPruned });
+
   // §3 --rescan-branch: reset matching branch units to pending BEFORE discovery.
   for (const t of args.rescanBranches) {
     const reset = db.rescanBranch(configHash, t.organization, t.repository, t.branch);
@@ -553,10 +562,17 @@ export async function processRepo(
   }, { signal: branchAbort });
   // A PolicyMatchError (or any other escaping fatal — the internal bucket-wiring assertion, a DB
   // write failure) from ANY unit is FATAL: branchAbort has already stopped new dispatch and every
-  // IN-FLIGHT sibling has drained (settle-all), so rethrow the FIRST rejection in plan.toScan order
-  // (deterministic precedence). runScan's catch then fails the run. This runs BEFORE reconciliation,
-  // exactly as the old sequential rethrow skipped it.
-  for (const r of unitResults) if (r.status === "rejected") throw r.reason;
+  // IN-FLIGHT sibling has drained (settle-all), so surface a rejection here. runScan fails the run IFF
+  // any collected escape is a PolicyMatchError, so we PREFER to surface a PolicyMatchError (the first,
+  // for determinism) over a generic rejection — mirroring runScan's own failRun predicate one level
+  // down, so a config-defect PolicyMatchError can never be masked behind an earlier generic escape.
+  // (Belt-and-braces: a generic escape here is synchronous and trips branchAbort before any sibling
+  // reaches its POST-await PolicyMatchError, so a co-occurring policy fatal is already lower-index
+  // today — but preferring it keeps the failRun invariant robust to any future change in that timing.)
+  // Absent a PolicyMatchError, surface the first rejection in plan.toScan order (deterministic). This
+  // runs BEFORE reconciliation, exactly as the old sequential rethrow skipped it.
+  const rejections = unitResults.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
+  if (rejections.length > 0) throw rejections.find((reason) => reason instanceof PolicyMatchError) ?? rejections[0];
   // Stale-row reconciliation: this repo was discovered COMPLETELY (ok:true, reached only past the early
   // `!outcome.ok` return; listBranchHeads fails closed on any structural incompleteness, so `heads` is
   // the exact live branch set for THIS discovery snapshot). Prune this run's stale run_unit_head rows —

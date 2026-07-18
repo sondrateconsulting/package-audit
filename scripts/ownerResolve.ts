@@ -37,15 +37,14 @@ export interface OwnerResolveResult {
 // two fibers would then race the SAME work_queue/run_unit_head rows. This fold stays OUT of
 // computeConfigHash (config.ts hashes owners exact-case via sortedDedup) ON PURPOSE — folding the
 // hash would change every non-canonically-cased legacy config's hash and orphan its resumable work.
-// The documented cost of keeping it out of the hash is a one-run transitional artifact when a run
-// straddles the upgrade that ADDED case-insensitive exclusion: a config whose excludeOrganizations
-// only case-differs from a discovered owner (e.g. exclude "Acme", discover "acme") stops scanning
-// that owner without a hash change, so a resumed run keeps and reports the prior invocation's
-// run_unit_head rows for it (reconciliation only prunes within STILL-discovered repos, never a
-// now-excluded owner). Accepted: case-insensitive exclusion is the CORRECT semantics (they are one
-// account), the staleness is bounded to the single upgrade-straddling run, and it self-heals — the
-// next run's fresh run_id never scans the excluded owner. Folding the hash to avoid it would orphan
-// ALL legacy resumable work, a strictly worse trade.
+// Keeping the fold out of the hash means a run STRADDLING the upgrade that ADDED case-insensitive
+// exclusion could hold prior-invocation run_unit_head rows for an owner a case-variant exclude now
+// removes (e.g. exclude "Acme", earlier-scanned "acme") — its config_hash is unchanged, so it resumes
+// rather than starting fresh. db.pruneExcludedOwnerHeads (called at resume in runScan) cleans exactly
+// those rows, so a resumed run's report never surfaces an owner its own excludeOrganizations excludes.
+// That prune keys off the STABLE configured denylist, NOT the per-invocation effective/discovered set,
+// so a transiently-undiscovered (but not excluded) owner never loses its rows. Folding the hash instead
+// would orphan ALL legacy resumable work — a strictly worse trade — which is why it stays out.
 export function resolveEffectiveOwners(input: OwnerResolveInput): OwnerResolveResult {
   const configured = input.organizations !== null;
   const base = configured ? input.organizations! : input.discoveredOrgs;
