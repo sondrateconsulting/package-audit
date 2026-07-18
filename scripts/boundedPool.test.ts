@@ -112,4 +112,42 @@ describe("Aborter", () => {
     a.onAbort(() => { late++; });
     expect(late).toBe(1);
   });
+
+  test("onAbort returns an unsubscribe: an unsubscribed callback does NOT fire on abort", () => {
+    const a = new Aborter();
+    const fired: number[] = [];
+    const unsubs = [0, 1, 2, 3].map((i) => a.onAbort(() => fired.push(i)));
+    unsubs[1]!(); // drop callback 1
+    unsubs[3]!(); // drop callback 3
+    a.abort();
+    expect(fired).toEqual([0, 2]); // only the still-subscribed callbacks fired, in registration order
+  });
+
+  test("unsubscribe is idempotent — a second call (and a call after abort) is a harmless no-op", () => {
+    const a = new Aborter();
+    let fired = 0;
+    const unsub = a.onAbort(() => { fired++; });
+    unsub();
+    unsub(); // second unsubscribe: no throw, no effect
+    a.abort();
+    expect(fired).toBe(0); // stayed unsubscribed
+    // an unsubscribe called AFTER the callback already fired is also a no-op
+    let fired2 = 0;
+    const unsub2 = a.onAbort(() => { fired2++; }); // fires immediately (already aborted)
+    expect(fired2).toBe(1);
+    expect(() => unsub2()).not.toThrow();
+    expect(fired2).toBe(1);
+  });
+
+  test("the callback list does not grow across many onAbort()+unsubscribe cycles (no accumulation)", () => {
+    const a = new Aborter();
+    const internal = a as unknown as { callbacks: unknown[] };
+    for (let i = 0; i < 10_000; i++) a.onAbort(() => {})(); // register then immediately unsubscribe
+    expect(internal.callbacks.length).toBe(0); // every callback was removed — nothing accumulated
+    // and a still-subscribed callback registered afterward still fires
+    let fired = 0;
+    a.onAbort(() => { fired++; });
+    a.abort();
+    expect(fired).toBe(1);
+  });
 });

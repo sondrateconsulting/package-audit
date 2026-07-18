@@ -11,7 +11,11 @@
 // into workers and the pool so cancellation is observable without dragging in lib.dom.
 export interface AbortLike {
   readonly aborted: boolean;
-  onAbort(cb: () => void): void; // fires immediately if already aborted
+  // Register a callback; fires immediately if already aborted. Returns an UNSUBSCRIBE function so a
+  // registrant whose lifetime is shorter than the run — one processRepo among thousands — can DROP its
+  // callback when it finishes, instead of leaving it on the run-level Aborter to accumulate until the
+  // run ends. The unsubscribe is idempotent and is a harmless no-op when the callback already fired.
+  onAbort(cb: () => void): () => void;
 }
 
 export class Aborter implements AbortLike {
@@ -20,9 +24,25 @@ export class Aborter implements AbortLike {
   get aborted(): boolean {
     return this.isAborted;
   }
-  onAbort(cb: () => void): void {
-    if (this.isAborted) cb();
-    else this.callbacks.push(cb);
+  // Register a callback and return its unsubscribe. Already aborted: fire synchronously and return a
+  // no-op (there is nothing to remove). Otherwise push it and return an idempotent remover. abort()
+  // drains `callbacks` into a local and clears the field, so an unsubscribe called AFTER abort finds
+  // its callback absent and no-ops; one called BEFORE abort removes it so abort never fires it. Both
+  // are correct in this single-threaded model. Each registrant passes a distinct closure, so indexOf
+  // identifies exactly the right callback.
+  onAbort(cb: () => void): () => void {
+    if (this.isAborted) {
+      cb();
+      return () => {};
+    }
+    this.callbacks.push(cb);
+    let active = true;
+    return () => {
+      if (!active) return; // idempotent — a second unsubscribe (or one after abort) does nothing
+      active = false;
+      const i = this.callbacks.indexOf(cb);
+      if (i !== -1) this.callbacks.splice(i, 1);
+    };
   }
   // Idempotent: the first call latches `aborted` and fires every registered callback ONCE; later
   // calls are no-ops. Callbacks are drained (not re-run) so a re-abort cannot double-fire them.

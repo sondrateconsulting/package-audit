@@ -518,7 +518,12 @@ export async function processRepo(
   // already IN FLIGHT still drain (the drain-safety §7 depends on for db.close()); only undispatched
   // units are skipped.
   const branchAbort = new Aborter();
-  if (signal !== undefined) signal.onAbort(() => branchAbort.abort()); // run-level fatal → stop this pool too (fires immediately if already aborted)
+  // Register this repo's branchAbort-trip on the run-level Aborter, and DROP it (the .finally below)
+  // once this branch pool settles. Without the unsubscribe every COMPLETED repo's callback would stay
+  // on the run-level Aborter until the run ends — unbounded accumulation over a large estate. The
+  // .finally runs whether the pool resolves or the fatal-rethrow path is taken, and unsubscribe is a
+  // no-op if the callback already fired (a run-level abort).
+  const unsubscribe = signal?.onAbort(() => branchAbort.abort()); // run-level fatal → stop this pool too (fires immediately if already aborted)
   const unitResults = await boundedPool(plan.toScan, config.concurrency.branches, async (d) => {
     if (branchAbort.aborted) return; // a fatal (this repo's own or a sibling owner's) tripped the run — dispatch no new units
     try {
@@ -576,7 +581,7 @@ export async function processRepo(
       onFatal?.();
       throw e;
     }
-  }, { signal: branchAbort });
+  }, { signal: branchAbort }).finally(() => unsubscribe?.()); // drop this repo's run-Aborter callback once the pool settles
   // A PolicyMatchError (or any other escaping fatal — the internal bucket-wiring assertion, a DB
   // write failure) from ANY unit is FATAL: branchAbort has already stopped new dispatch and every
   // IN-FLIGHT sibling has drained (settle-all), so surface a rejection here. runScan fails the run IFF
