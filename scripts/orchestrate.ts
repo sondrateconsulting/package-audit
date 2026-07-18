@@ -30,6 +30,7 @@ import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchSnapshot, type BranchDiscoveryOutcome } from "./github.ts";
 import { planRepoBranches, planPolicyDiagnostics, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
 import { PolicyMatchError, type CompiledBranchPolicy, type RepoPolicyCoverage } from "./branchPolicy.ts";
+import { type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
 import { discovered, discoveryFailed, type DiscoveryOutcome } from "./discovery.ts";
 import { computePolicyWarnings, isEmptyAllowlist, policyWarningLines, type PolicyWarning } from "./policyWarnings.ts";
 import { assertContained } from "./readOnlyGuard.ts";
@@ -46,13 +47,15 @@ import type { CliTermSet } from "./cliScanner.ts";
 import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
 import { logLine } from "./log.ts";
 
-// The three values that TOGETHER define one coherent scan/plan: the config, its hash, and the
-// compiled branch policy. Threaded as ONE object through runScan/processOwner/processRepo/runPlan so
-// the policy can never be dropped or mismatched against its config.
+// The values that TOGETHER define one coherent scan/plan: the config, its hash, and the compiled
+// branch + repository policies. Threaded as ONE object through runScan/processOwner/processRepo/runPlan
+// so a policy can never be dropped or mismatched against its config. Both policies are the SINGLE
+// load-time instances from loadConfig (never recompiled downstream).
 export interface AuditRuntime {
   readonly config: Config;
   readonly configHash: string;
   readonly branchPolicy: CompiledBranchPolicy;
+  readonly repositoryPolicy: CompiledRepositoryPolicy;
 }
 
 // ---- per-unit read helpers ------------------------------------------------------------------
@@ -121,8 +124,8 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     process.stdout.write(ORCHESTRATE_HELP + "\n");
     return;
   }
-  const { config, configHash, branchPolicy } = await loadConfig(argv);
-  const runtime: AuditRuntime = { config, configHash, branchPolicy };
+  const { config, configHash, branchPolicy, repositoryPolicy } = await loadConfig(argv);
+  const runtime: AuditRuntime = { config, configHash, branchPolicy, repositoryPolicy };
   const trackedNames = config.packages.map((p) => p.name);
 
   logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
@@ -383,7 +386,7 @@ export async function processOwner(
   // the org endpoint. (personalLogin here is the resolved preflight login; includePersonalNamespace
   // gates whether personal routing applies — the `personalLogin !== null` check is just defensive.)
   const isPersonal = runtime.config.includePersonalNamespace && personalLogin !== null && owner.toLowerCase() === personalLogin.toLowerCase();
-  const outcome = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
+  const outcome = await discoverOwnerRepos(db, client, runtime.config, runtime.repositoryPolicy, runId, owner, isPersonal);
   if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
   // Repos stay SEQUENTIAL within an owner (§4): each repo's discover→plan→scan→reconcile must be
   // atomic (branches fan out INSIDE processRepo). Check the run-level abort before each repo so a
@@ -406,7 +409,8 @@ export async function processOwner(
 // only runtime caller. The --plan twin lives in runPlan, deliberately separate — plan mode has no DB
 // and counts failures into its totals instead.
 export async function discoverOwnerRepos(
-  db: AuditDb, client: GithubClient, config: Config, runId: string, owner: string, isPersonal: boolean,
+  db: AuditDb, client: GithubClient, config: Config, repositoryPolicy: CompiledRepositoryPolicy,
+  runId: string, owner: string, isPersonal: boolean,
 ): Promise<DiscoveryOutcome<RepoInfo>> {
   let repos: RepoInfo[];
   try {
@@ -424,9 +428,13 @@ export async function discoverOwnerRepos(
     logLine({ event: "discovery", org: owner, error: message });
     return discoveryFailed("failed");
   }
+  // The real scan consumes only `kept`; the denylist `excluded` list is surfaced by --plan (runPlan),
+  // not persisted here. A fatal RepoPolicyMatchError (match-time glob throw) propagates OUT of here to
+  // the run driver, which fails the run and rethrows it — never a silent scan of a denylisted repo.
   return discovered(filterSortCapRepos(repos, {
+    policy: repositoryPolicy,
     includeArchived: config.includeArchived, includeForks: config.includeForks, maxReposPerOrg: config.maxReposPerOrg,
-  }));
+  }).kept);
 }
 
 // Branch-head discovery for ONE repo as a typed outcome — extracted so both the run (here) and
@@ -941,7 +949,7 @@ export interface PlanTotals {
   readonly discoveryErrors: number;
 }
 export async function runPlan(client: GithubClient, runtime: AuditRuntime, personalLogin: string): Promise<PlanTotals> {
-  const { config, branchPolicy } = runtime;
+  const { config, branchPolicy, repositoryPolicy } = runtime;
   // Warning parity: the empty-allowlist warning is emitted at mode entry, unconditionally, exactly as in
   // runScan — so --plan and the real run produce identical policy-warning events for the same config.
   if (isEmptyAllowlist(branchPolicy)) logLine({ event: "policy-warning", kind: "empty-allowlist" });
@@ -969,7 +977,12 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
       continue;
     }
     reposDiscovered += repos.length;
-    const kept = filterSortCapRepos(repos, {
+    // --plan applies the SAME denylist the real scan does (deny before archived/fork + cap). The
+    // `excluded` list + a repositoriesExcluded count are surfaced by --plan in T6; here we consume
+    // `kept` so reposKept already reflects denial. A fatal RepoPolicyMatchError propagates with NO DB
+    // write (plan mode has no DB — the zero-write invariant holds).
+    const { kept } = filterSortCapRepos(repos, {
+      policy: repositoryPolicy,
       includeArchived: config.includeArchived, includeForks: config.includeForks, maxReposPerOrg: config.maxReposPerOrg,
     });
     reposKept += kept.length;

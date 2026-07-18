@@ -6,6 +6,7 @@ import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, planSumma
 import type { TreeEntry } from "./unitPipeline.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
+import { compileRepositoryPolicy } from "./repositoryPolicy.ts";
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type RepoInfo, type SpawnFn } from "./github.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { Aborter } from "./boundedPool.ts";
@@ -31,7 +32,11 @@ const rt = (config: Config, configHash = "hash"): AuditRuntime => ({
   config,
   configHash,
   branchPolicy: compileBranchPolicy(config.branches, config.excludeBranches),
+  repositoryPolicy: compileRepositoryPolicy(config.excludeRepositories),
 });
+
+// An empty repository denylist for the discoverOwnerRepos call sites that don't exercise repo policy.
+const NO_DENY = compileRepositoryPolicy([]);
 
 // Scripted client factory — every test client shares this boilerplate (offline binPaths, noop
 // sleep, tempRoot under the test dir) and differs ONLY in its spawn script and cache role.
@@ -292,7 +297,7 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
 
     let kept: unknown;
     const events = await captureJsonl(async () => {
-      kept = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-a", false);
+      kept = await discoverOwnerRepos(db, client, testConfig(root), NO_DENY, runId, "org-a", false);
     });
 
     expect(kept).toEqual({ ok: false, reason: "failed" }); // fail-soft: a permanent-failure outcome, no partial items
@@ -325,12 +330,28 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
       });
 
     const events = await captureJsonl(async () => {
-      const keptA = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-a", false);
-      const keptB = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-b", false);
+      const keptA = await discoverOwnerRepos(db, client, testConfig(root), NO_DENY, runId, "org-a", false);
+      const keptB = await discoverOwnerRepos(db, client, testConfig(root), NO_DENY, runId, "org-b", false);
       expect(keptA).toEqual({ ok: false, reason: "failed" }); // permanent discovery failure
       expect(keptB.ok && keptB.items.map((r) => r.name)).toEqual(["svc"]); // archived repo filtered by config
     });
     expect(events.filter((e) => e["event"] === "discovery")).toHaveLength(1); // only org-a's failure
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("threads the repository denylist: a matching repo is dropped from the returned kept set", async () => {
+    const root = mkdtempSync(join(tmpdir(), "own-disc-deny-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const client = makeClient(root, async () => ({ exitCode: 0, stderr: "", stdout: http(200, JSON.stringify([
+      { name: "keep", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
+      { name: "legacy-api", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-02-01T00:00:00Z", archived: false, fork: false, private: false },
+    ])) }));
+    // deny "org-a/legacy-*" (case-insensitive) — the newer repo, which would otherwise sort first.
+    const policy = compileRepositoryPolicy(["ORG-A/legacy-*"]);
+    const kept = await discoverOwnerRepos(db, client, testConfig(root), policy, runId, "org-a", false);
+    expect(kept.ok && kept.items.map((r) => r.name)).toEqual(["keep"]); // legacy-api excluded by the denylist
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -349,7 +370,7 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
         ])) };
       });
 
-    const kept = await discoverOwnerRepos(db, client, testConfig(root), runId, "rvo", true);
+    const kept = await discoverOwnerRepos(db, client, testConfig(root), NO_DENY, runId, "rvo", true);
     expect(kept.ok && kept.items.map((r) => r.name)).toEqual(["dotfiles"]); // discovered via user/repos, owner "rvo" validated
     expect(calls).toHaveLength(1);
     expect(calls[0]!.join(" ")).toContain("user/repos?affiliation=owner");
@@ -698,7 +719,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
     const client = scanClient(root, [{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], "dev");
-    const runtime: AuditRuntime = { config: testConfig(root, 25), configHash: "h", branchPolicy: throwingPolicy };
+    const runtime: AuditRuntime = { config: testConfig(root, 25), configHash: "h", branchPolicy: throwingPolicy, repositoryPolicy: compileRepositoryPolicy([]) };
     await expect(processRepo(db, client, runtime, runId, "org-a", repo, [], new Set())).rejects.toThrow(PolicyMatchError);
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -750,7 +771,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
     const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
-    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy };
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy, repositoryPolicy: compileRepositoryPolicy([]) };
     let thrown: unknown = null;
     await captureJsonl(async () => {
       thrown = await runScan(db, client, runtime, noArgs, null).then(() => null, (e: unknown) => e);
@@ -779,7 +800,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], "dev") };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy };
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy, repositoryPolicy: compileRepositoryPolicy([]) };
     let thrown: unknown = null;
     const events = await captureJsonl(async () => {
       thrown = await runPlan(client, runtime, "rvo").then(() => null, (e: unknown) => e);
@@ -1073,7 +1094,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const badError = new Error("shadowed");
     // deny ['main' exact winner, 'z*' throwing]: classification wins on the exact 'main', but the
     // coverage sweep invokes z*.match('main') and throws — the run must fail with no branch rows.
-    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [{ pattern: "main", glob: new Bun.Glob("main") }, { pattern: "z*", glob: throwingGlob(badError) }] } };
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [{ pattern: "main", glob: new Bun.Glob("main") }, { pattern: "z*", glob: throwingGlob(badError) }] }, repositoryPolicy: compileRepositoryPolicy([]) };
     let thrown: unknown = null;
     await captureJsonl(async () => { thrown = await runScan(db, fullClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main"), runtime, noArgsT7, null).then(() => null, (e: unknown) => e); });
     expect(thrown).toBeInstanceOf(PolicyMatchError);
@@ -1354,7 +1375,7 @@ const liveSnapshot: BranchSnapshot = { heads: [liveHead], defaultBranch: "main" 
 const config = Object.freeze({
   cutoffDate: "2000-01-01", maxBranchesPerRepo: 10, maxReposPerOrg: 10,
   includeArchived: true, includeForks: true, includePersonalNamespace: false,
-  organizations: null, excludeOrganizations: [],
+  organizations: null, excludeOrganizations: [], excludeRepositories: [],
   concurrency: { organizations: 1, repositories: 1, branches: 1 }, // sequential in tests (derived stubs inherit)
 }) as unknown as Config;
 const KEY: WorkUnitKey = { configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "main" };

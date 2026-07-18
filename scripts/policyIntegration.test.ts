@@ -19,6 +19,7 @@ import { AuditDb, nowIso, type RunRecord } from "./db.ts";
 import { GithubClient, type SpawnFn } from "./github.ts";
 import { runScan, type AuditRuntime } from "./orchestrate.ts";
 import { compileBranchPolicy } from "./branchPolicy.ts";
+import { compileRepositoryPolicy } from "./repositoryPolicy.ts";
 import { buildReport } from "./report.ts";
 import { exportRun } from "./export.ts";
 import { buildCompare } from "./compare.ts";
@@ -39,7 +40,7 @@ const mkConfig = (root: string, over: Partial<Config> = {}): Config => ({
 });
 
 const rt = (config: Config, configHash: string): AuditRuntime =>
-  ({ config, configHash, branchPolicy: compileBranchPolicy(config.branches, config.excludeBranches) });
+  ({ config, configHash, branchPolicy: compileBranchPolicy(config.branches, config.excludeBranches), repositoryPolicy: compileRepositoryPolicy(config.excludeRepositories) });
 
 // One org repo `svc` (default main) + GraphQL heads + EMPTY trees; any git spawn is a failure (pins the
 // no-clone assumption — a non-truncated tree never triggers cloneShallow).
