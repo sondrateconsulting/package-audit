@@ -27,6 +27,7 @@ import { parseAlias, type DependencyType } from "./manifest.ts";
 import { introspectVersion, fetchPackument, resolveRangeToVersion, type Packument } from "./apiSurface.ts";
 import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
+import { boundedPool } from "./boundedPool.ts";
 import { logLine } from "./log.ts";
 
 // The three values that TOGETHER define one coherent scan/plan: the config, its hash, and the
@@ -443,9 +444,15 @@ export async function processRepo(
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "past-cap" });
   }
 
-  // To-scan (default + within-cap after-cutoff). Only the DEFAULT may carry a policy counterfactual
-  // (the override); a non-default to-scan branch is necessarily no-exclusion (asserted, fail-closed).
-  for (const d of plan.toScan) {
+  // To-scan (default + within-cap after-cutoff). Fan out through a per-repo pool bounded by
+  // concurrency.branches (§5). Safe WITHOUT a mutex because each unit is a DISTINCT (org, repo,
+  // branch) — so distinct work_queue / run_unit_head rows — and every DB write below is an await-free
+  // synchronous block; bun:sqlite is fully synchronous, so no sibling fiber can interleave mid-block
+  // and the units never race each other's rows. Repos stay SEQUENTIAL within an owner (§2.3): each
+  // repo's discover→plan→scan→reconcile must be atomic, and this pool drains fully before the
+  // reconcile below. Only the DEFAULT may carry a policy counterfactual (the override); a non-default
+  // to-scan branch is necessarily no-exclusion (asserted, fail-closed).
+  const unitResults = await boundedPool(plan.toScan, config.concurrency.branches, async (d) => {
     const h = d.head;
     if (!d.isDefaultBranch && d.rawPolicyResult.kind !== "no-exclusion")
       throw new Error(`internal: non-default scanned branch ${repo.organization}/${repo.name}@${h.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
@@ -454,12 +461,13 @@ export async function processRepo(
     db.enqueueUnit(key, runId);
     const unit = db.getUnit(key);
     // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is reused
-    // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate.
+    // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate. This
+    // enqueue→get→upsert→setStatus RMW is await-free, so it runs to completion atomically vs siblings.
     if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
       db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
       db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
       logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
-      continue;
+      return;
     }
 
     db.setUnitStatus(key, { status: "in_progress", runId });
@@ -467,14 +475,15 @@ export async function processRepo(
       const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
       db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
     } catch (e) {
-      // A PolicyMatchError is FATAL by contract (the run driver fails the whole run on it) — it
-      // must never be downgraded to an ordinary per-unit scan error here. Today it can arise from
-      // the write chokepoint's attribution-coherence verification inside processUnit's upserts.
+      // A PolicyMatchError is FATAL by contract — never downgraded to a per-unit scan error. It
+      // escapes this worker; boundedPool captures it and processRepo rethrows it below AFTER draining
+      // every sibling unit. Today it can arise from the write chokepoint's attribution-coherence
+      // verification inside processUnit's upserts.
       if (e instanceof PolicyMatchError) throw e;
       if (e instanceof ThrottleExhausted) {
-        // §4: throttle exhaustion is NOT a permanent unit failure — put the unit back to
-        // pending so a LATER run retries it. No same-run spin: this loop visits each unit
-        // exactly once and nothing later in the run re-reads pending units.
+        // §4: throttle exhaustion is NOT a permanent unit failure — reset to pending so a LATER run
+        // retries it. No same-run spin: the pool dispatches each fixed plan.toScan unit exactly once
+        // and nothing re-reads pending units within the run.
         db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
         logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
       } else {
@@ -483,7 +492,12 @@ export async function processRepo(
         logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
       }
     }
-  }
+  });
+  // A PolicyMatchError (or any other escaping fatal — the internal bucket-wiring assertion, a DB
+  // write failure) from ANY unit is FATAL: every sibling has already drained (settle-all), so rethrow
+  // the FIRST rejection in plan.toScan order (deterministic precedence). runScan's catch then fails
+  // the run. This runs BEFORE reconciliation, exactly as the old sequential rethrow skipped it.
+  for (const r of unitResults) if (r.status === "rejected") throw r.reason;
   // Stale-row reconciliation: this repo was discovered COMPLETELY (ok:true, reached only past the early
   // `!outcome.ok` return; listBranchHeads fails closed on any structural incompleteness, so `heads` is
   // the exact live branch set for THIS discovery snapshot). Prune this run's stale run_unit_head rows —

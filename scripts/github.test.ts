@@ -1306,6 +1306,31 @@ describe("concurrency: global cap + concurrent throttle coordination (§4/§5.6 
     expect(spawns).toBe(2 * N); // N throttles + N oks — no caller double-spawned or spun
     expect(sleeps.length).toBe(1); // the shared window was slept ONCE across all N, not N times
   });
+
+  test("concurrent restGet of the SAME immutable SHA-pinned key converges — no lost/torn cache row (P4)", async () => {
+    // Under branch fan-out two units can request the same SHA-pinned tree/blob concurrently. Both miss
+    // the (empty) cache, both fetch, both putApiCache. Safe because putApiCache is a single atomic
+    // upsert and immutable keys carry byte-identical bodies — the writeback is idempotent, so the row
+    // converges on the body with no torn/lost write. (The double-fetch is benign wasted quota.)
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const sha = "a".repeat(40);
+    const endpoint = `repos/o/r/git/trees/${sha}?recursive=1`;
+    const body = `{"sha":"${sha}","truncated":false,"tree":[]}`;
+    const { client, calls } = makeClient(
+      [ok(http(200, { etag: '"e1"' }, body)), ok(http(200, { etag: '"e1"' }, body))],
+      { db, concurrency: 4 },
+    );
+    const [a, b] = await Promise.all([
+      client.restGet(endpoint, { immutable: true }),
+      client.restGet(endpoint, { immutable: true }),
+    ]);
+    expect(a.body).toBe(body);
+    expect(b.body).toBe(body);
+    expect(calls.length).toBe(2); // both missed the empty cache and fetched — benign concurrent double-fetch
+    // the cache row converged on the body — a later read is a zero-network immutable HIT
+    expect(db.getApiCache("GET", `gh3:github.com:${endpoint}`, "")?.responseBody).toBe(body);
+    db.close();
+  });
 });
 
 describe("constructor knob validation (fail-fast at the boundary)", () => {

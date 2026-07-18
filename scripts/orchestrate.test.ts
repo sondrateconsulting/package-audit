@@ -1353,6 +1353,7 @@ const config = Object.freeze({
   cutoffDate: "2000-01-01", maxBranchesPerRepo: 10, maxReposPerOrg: 10,
   includeArchived: true, includeForks: true, includePersonalNamespace: false,
   organizations: null, excludeOrganizations: [],
+  concurrency: { organizations: 1, repositories: 1, branches: 1 }, // sequential in tests (derived stubs inherit)
 }) as unknown as Config;
 const KEY: WorkUnitKey = { configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "main" };
 
@@ -1690,5 +1691,62 @@ describe("clone-fallback readers fail closed (§5.C)", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
+  const heads = (nodes: Array<{ name: string; oid: string; date: string }>): string =>
+    `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: {
+      defaultBranchRef: { name: "main" },
+      refs: { pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: hexOid(`t-${n.name}`) } } })) },
+    } } })}`;
+  const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+  const startRun = (db: AuditDb): string =>
+    db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" }).runId;
+  const fanoutConfig = (root: string) => ({ ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 4 } });
+  const nodesN = (n: number) => Array.from({ length: n }, (_, i) => ({ name: i === 0 ? "main" : `b${i}`, oid: hexOid(`o${i}`), date: "2025-06-01T00:00:00Z" }));
+
+  test("N branches scan concurrently (branches:4) — every unit lands exactly once, no lost/corrupted rows", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fanout-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const nodes = nodesN(8); // 1 default + 7 non-default, all within the cap of 25
+    const client = makeClient(root, async (_bin, args) =>
+      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    await captureJsonl(() => processRepo(db, client, rt(fanoutConfig(root), "h"), runId, "org-a", repo, [], new Set()));
+    const rows = db.read(`SELECT branch, status FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<{ branch: string; status: string }>;
+    expect(rows.length).toBe(8); // exactly one row per branch — no dupes, none lost
+    expect(rows.every((r) => r.status === "scanned")).toBe(true);
+    for (const n of nodes) // work queue: each unit reached 'done' exactly once
+      expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: n.name })?.status).toBe("done");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a PolicyMatchError from ONE unit fails the repo AFTER draining every sibling (settle-all, branches:4)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fanout-fatal-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const nodes = nodesN(6);
+    // inject a write-time PolicyMatchError from exactly ONE unit's scanned upsert (b3)
+    const injected = new PolicyMatchError("excludeBranches", "x*", "b3", new Error("simulated write-time attribution incoherence"));
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+      if (h.status === "scanned" && h.branch === "b3") throw injected;
+      return realUpsert(h);
+    };
+    const client = makeClient(root, async (_bin, args) =>
+      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    let thrown: unknown;
+    await captureJsonl(async () => {
+      try { await processRepo(db, client, rt(fanoutConfig(root), "h"), runId, "org-a", repo, [], new Set()); }
+      catch (e) { thrown = e; }
+    });
+    expect(thrown).toBe(injected); // the fatal is rethrown (deterministic: first rejection in plan.toScan order)
+    // settle-all, NOT fail-fast: the other 5 branches were fully drained and their scanned rows written
+    expect((db.read(`SELECT COUNT(*) AS n FROM run_unit_head WHERE run_id = ? AND status = 'scanned'`).get(runId) as { n: number }).n).toBe(5);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
   });
 });
