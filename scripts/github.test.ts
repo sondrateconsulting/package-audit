@@ -791,6 +791,7 @@ describe("parseGraphqlEnvelope / parseTreeResponse (pure)", () => {
       { sha: SHA, truncated: false, tree: [{ path: "a", type: "blob", sha: "b".repeat(40), size: 0 }, { path: "b", type: "commit", sha: "c".repeat(40) }] },
       "ep", SHA,
     );
+    if (res.truncated) throw new Error("expected a non-truncated tree");
     expect(res.paths.map((p) => p.size)).toEqual([0, null]);
   });
 });
@@ -903,7 +904,7 @@ describe("fetchTreeRecursive envelope validation (§5.C fail-closed)", () => {
     // the clone fallback, and nothing downstream may read these entries anyway.
     const b = JSON.stringify({ sha: TREE_SHA, truncated: true, tree: [{ path: 42 }] });
     const { client } = makeClient([tree(b)]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).resolves.toEqual({ truncated: true, paths: [] });
+    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).resolves.toEqual({ truncated: true });
   });
   test("a malformed 200 body does NOT permanently poison the immutable cache — the next call refetches", async () => {
     // restGet caches the 200 body BEFORE validation sees it; without the tombstone the SHA-pinned
@@ -915,6 +916,7 @@ describe("fetchTreeRecursive envelope validation (§5.C fail-closed)", () => {
     );
     await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/tree member/);
     const second = await client.fetchTreeRecursive("o", "r", TREE_SHA);
+    if (second.truncated) throw new Error("expected a non-truncated tree");
     expect(second.paths.map((p) => p.path)).toEqual(["package.json"]);
     expect(calls.length).toBe(2); // call 2 went back to the network, not the poisoned cache row
     const third = await client.fetchTreeRecursive("o", "r", TREE_SHA);
@@ -1673,6 +1675,55 @@ describe("pagination", () => {
     expect(rows[0]).toBe(0);
     expect(rows[Math.floor(n / 2)]).toBe(Math.floor(n / 2));
     expect(rows[n - 1]).toBe(n - 1);
+  });
+});
+
+describe("listOrgMemberships (§5.A fail-closed)", () => {
+  test("maps well-formed membership entries to their logins", async () => {
+    const { client } = makeClient([ok(http(200, {}, `[{"login":"acme"},{"login":"globex"}]`))]);
+    await expect(client.listOrgMemberships()).resolves.toEqual(["acme", "globex"]);
+  });
+  test("a malformed membership entry fails LOUD with an indexed diagnostic — never silently dropped or coerced", async () => {
+    // Under the old String(o.login ?? "") + .filter code, most of these silently became "" (dropped)
+    // or a coerced string (a fabricated org); the null ITEM instead threw a raw TypeError. None
+    // surfaced as a proper GithubApiError — so the discovered org set was silently shrunk/corrupted.
+    // Each bad entry sits at index 0 here, so the diagnostic must name index 0 and the user/orgs endpoint.
+    const bad = [
+      `[{"login":""}]`,       // empty login → was dropped
+      `[{"login":null}]`,     // null login → was coerced to "" and dropped
+      `[{"login":42}]`,       // non-string login → was string-coerced to "42" (a fabricated org!)
+      `[{}]`,                 // missing login → was dropped
+      `[null]`,               // null item → threw a raw TypeError, not a GithubApiError
+      `["not-an-object"]`,    // non-object item → login undefined → dropped
+    ];
+    for (const body of bad) {
+      const { client } = makeClient([ok(http(200, {}, body))]);
+      let caught: unknown;
+      try { await client.listOrgMemberships(); } catch (e) { caught = e; }
+      expect(caught).toBeInstanceOf(GithubApiError);
+      expect((caught as GithubApiError).message).toMatch(/malformed org membership at index 0/);
+      expect((caught as GithubApiError).endpoint).toBe("user/orgs");
+    }
+  });
+  test("a good entry BESIDE a malformed one fails the whole listing at the RIGHT index (no partial membership)", async () => {
+    const { client } = makeClient([ok(http(200, {}, `[{"login":"acme"},{"login":""}]`))]);
+    let caught: unknown;
+    try { await client.listOrgMemberships(); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).message).toMatch(/index 1/); // the SECOND entry, not a partial success
+  });
+  test("a malformed entry on a LATER page is indexed GLOBALLY across the flattened pagination", async () => {
+    // restGetPagedArray flattens all pages, so the index must be global (page-2 entry 0 → index 2),
+    // not a per-page index — a per-page index would misreport WHICH org membership is broken.
+    const link2 = `<https://api.github.com/user/orgs?per_page=100&page=2>; rel="next"`;
+    const { client } = makeClient([
+      ok(http(200, { link: link2 }, `[{"login":"acme"},{"login":"globex"}]`)),
+      ok(http(200, {}, `[{"login":""}]`)), // the first entry of page 2 — global index 2
+    ]);
+    let caught: unknown;
+    try { await client.listOrgMemberships(); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).message).toMatch(/index 2/);
   });
 });
 

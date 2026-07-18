@@ -568,6 +568,11 @@ export function classifyGraphql(
 // sha1 (40) or sha256 (64) hex object ids — the only forms that may address SHA-pinned fetches.
 const HEX_OBJECT_ID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 
+// Non-null, non-array object guard (mirrors config.ts's isObject) — the same shape recurred across
+// every envelope/tree/branch-head validator below; the type predicate also drops their `as Record` casts.
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
 // GraphQL spec (§7 Response): the body is a MAP carrying `data` and/or a NON-EMPTY `errors` list
 // of maps. parseGraphqlEnvelope never throws: it reports the FIRST spec violation via `malformed`
 // and returns whatever error evidence it could read, so graphql() can classify status/header/
@@ -576,6 +581,10 @@ export interface GraphqlEnvelope {
   data: unknown; // the data member verbatim (undefined when absent)
   // Sanitized projections — only string-valued type/message survive, so downstream string
   // coercion (classifyGraphql's join / template literals) is total even on hostile entries.
+  // CONTRACT: `errors` and `malformed` are INDEPENDENT — a non-null `malformed` (from one bad
+  // sibling entry) can coexist with readable `errors` (e.g. a genuine RATE_LIMITED beside it).
+  // A consumer must classify off `errors` FIRST and treat `malformed` only as "do not accept as
+  // success", never as "the errors are worthless".
   errors: GraphqlErrorEntry[];
   malformed: string | null; // first spec violation, null when the envelope is well-formed
 }
@@ -590,9 +599,9 @@ export function parseGraphqlEnvelope(bodyText: string): GraphqlEnvelope {
   } catch {
     return { data: undefined, errors: [], malformed: "unparseable JSON body" };
   }
-  if (root === null || typeof root !== "object" || Array.isArray(root))
+  if (!isObject(root))
     return { data: undefined, errors: [], malformed: "non-object response root" };
-  const obj = root as Record<string, unknown>;
+  const obj = root;
   const hasData = Object.hasOwn(obj, "data");
   const hasErrors = Object.hasOwn(obj, "errors");
   if (!hasData && !hasErrors) note("response carries neither data nor errors");
@@ -603,11 +612,11 @@ export function parseGraphqlEnvelope(bodyText: string): GraphqlEnvelope {
     else if (raw.length === 0) note("present errors member is an empty array (spec: non-empty)");
     else {
       for (const entry of raw) {
-        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        if (!isObject(entry)) {
           note("errors[] contains a non-object entry");
           continue;
         }
-        const e = entry as Record<string, unknown>;
+        const e = entry;
         const proj: GraphqlErrorEntry = {};
         if (Object.hasOwn(e, "type")) {
           if (typeof e["type"] === "string") proj.type = e["type"];
@@ -634,7 +643,7 @@ export function parseGraphqlEnvelope(bodyText: string): GraphqlEnvelope {
       // spec: data:null is the total-execution-failure shape and requires errors beside it —
       // alone it is indistinguishable from a swallowed failure signal.
       if (!hasErrors) note("data is null but no errors member is present");
-    } else if (typeof d !== "object" || Array.isArray(d)) {
+    } else if (!isObject(d)) {
       note("data member is not an object");
     }
   }
@@ -646,16 +655,22 @@ export function parseGraphqlEnvelope(bodyText: string): GraphqlEnvelope {
 // a missing `tree` member read as an EMPTY repo (zero findings, silently) and a missing
 // `truncated` flag read as `false` — silently disabling the caller's clone fallback, its only
 // escape hatch for over-limit repos.
-const TREE_ENTRY_TYPES = new Set(["blob", "tree", "commit"]); // a future git object type must fail LOUD, not vanish through the blob filter
-export interface TreeResponse {
-  truncated: boolean;
-  paths: Array<{ path: string; type: string; sha: string; size: number | null }>;
-}
+// The git object types git/trees returns — the SINGLE source of truth for both the runtime check
+// and the static TreeEntryType, so the two cannot drift. A future/unknown type must fail LOUD, not
+// vanish through the downstream blob filter.
+const TREE_ENTRY_TYPES = ["blob", "tree", "commit"] as const;
+export type TreeEntryType = (typeof TREE_ENTRY_TYPES)[number];
+const isTreeEntryType = (v: unknown): v is TreeEntryType => (TREE_ENTRY_TYPES as readonly unknown[]).includes(v);
+// truncated:true carries NO paths (partial data is unusable — the caller clones); the discriminated
+// union makes reading `paths` on a truncated tree a COMPILE error, not a silent empty-repo read.
+export type TreeResponse =
+  | { truncated: true }
+  | { truncated: false; paths: Array<{ path: string; type: TreeEntryType; sha: string; size: number | null }> };
 export function parseTreeResponse(json: unknown, endpoint: string, expectedSha: string | null): TreeResponse {
   const fail = (reason: string): GithubApiError =>
     new GithubApiError(`malformed git-tree response from ${endpoint}: ${reason}`, { status: 200, endpoint });
-  if (json === null || typeof json !== "object" || Array.isArray(json)) throw fail("non-object response root");
-  const obj = json as Record<string, unknown>;
+  if (!isObject(json)) throw fail("non-object response root");
+  const obj = json;
   const truncated = obj["truncated"];
   if (typeof truncated !== "boolean") throw fail("truncated flag missing or non-boolean");
   if (!Array.isArray(obj["tree"])) throw fail("tree member missing or non-array");
@@ -667,16 +682,16 @@ export function parseTreeResponse(json: unknown, endpoint: string, expectedSha: 
   // A truncated listing is unusable partial data: the caller MUST fall back to a clone (§5.C)
   // and nothing may read these entries — validating junk we won't consume would only block that
   // fallback. Return the flag alone.
-  if (truncated) return { truncated: true, paths: [] };
+  if (truncated) return { truncated: true };
   const seen = new Set<string>();
   const paths = (obj["tree"] as unknown[]).map((entry, i) => {
-    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) throw fail(`tree[${i}] is not an object`);
-    const e = entry as Record<string, unknown>;
+    if (!isObject(entry)) throw fail(`tree[${i}] is not an object`);
+    const e = entry;
     const path = e["path"];
     const type = e["type"];
     const sha = e["sha"];
     if (typeof path !== "string" || !isCanonicalTreePath(path)) throw fail(`tree[${i}] path missing or non-canonical`);
-    if (typeof type !== "string" || !TREE_ENTRY_TYPES.has(type)) throw fail(`tree[${i}] has an unknown entry type`);
+    if (!isTreeEntryType(type)) throw fail(`tree[${i}] has an unknown entry type`);
     if (typeof sha !== "string" || !HEX_OBJECT_ID_RE.test(sha)) throw fail(`tree[${i}] sha missing or non-hex`);
     if (seen.has(path)) throw fail(`duplicate path ${JSON.stringify(path)}`);
     seen.add(path);
@@ -1142,7 +1157,7 @@ export class GithubClient {
     const [path, query = ""] = endpoint.split("?");
     if (/\/git\/(blobs|trees)\/[0-9a-f]{40}([0-9a-f]{24})?(\/|$)/i.test(path ?? "")) return true;
     const ref = new URLSearchParams(query).get("ref") ?? "";
-    return /^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(ref);
+    return HEX_OBJECT_ID_RE.test(ref); // same as isSha — a sha-shaped ?ref= pins an immutable object
   }
 
   async restGet(endpoint: string, opts: { accept?: string; immutable?: boolean; noStore?: boolean } = {}): Promise<HttpResponse> {
@@ -1350,7 +1365,17 @@ export class GithubClient {
 
   async listOrgMemberships(): Promise<string[]> {
     const raw = await this.restGetPagedArray(`user/orgs?per_page=100&page=1`);
-    return raw.map((o) => String((o as Record<string, unknown>)["login"] ?? "")).filter((s) => s !== "");
+    // Fail LOUD on any malformed entry — the old `String(o.login ?? "")` + `.filter(s => s !== "")`
+    // silently dropped a missing/empty/null login and string-COERCED a non-string one into a
+    // fabricated org, either way understating or corrupting the discovered org set (§5.A). Same
+    // fail-closed posture as listBranchHeads' malformed-node throw.
+    return raw.map((o, i) => {
+      if (!isObject(o)) throw new GithubApiError(`malformed org membership at index ${i}: not an object`, { endpoint: "user/orgs" });
+      const login = o["login"];
+      if (typeof login !== "string" || login.length === 0)
+        throw new GithubApiError(`malformed org membership at index ${i}: missing, empty, or non-string login`, { endpoint: "user/orgs" });
+      return login;
+    });
   }
 
   // §5.B: enumerate ALL ref pages (RefOrderField cannot order heads by commit date), then sort
@@ -1431,7 +1456,7 @@ export class GithubClient {
         throw new GithubApiError(`refs page missing a nodes array for ${org}/${repo}`, { endpoint: "graphql" });
       for (const node of refs.nodes) {
         // a null/non-object node must fail here, not as a raw TypeError on the property reads below
-        if (node === null || typeof node !== "object" || Array.isArray(node))
+        if (!isObject(node))
           throw new GithubApiError(`malformed branch-head node for ${org}/${repo}`, { endpoint: "graphql" });
         const n = node as { name?: string; target?: { oid?: string; committedDate?: string; tree?: { oid?: string } } };
         // Every refs/heads/* head is a complete Commit; a malformed/non-Commit node is anomalous and
