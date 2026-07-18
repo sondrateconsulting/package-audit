@@ -463,10 +463,12 @@ describe("buildCompare — policy churn", () => {
     const db2 = AuditDb.open({ sqlitePath: path });
     const rB = db2.getRun(runBId)!;
     const out = mkdtempSync(join(tmpdir(), "readgate-export-"));
-    // Prove the read surfaces are GLOB-FREE, not merely non-throwing: install a Bun.Glob that throws on
-    // construction, so a read surface that tried to re-evaluate the stored pattern (constructing a glob
-    // but ignoring its false result) fails HERE instead of passing. report.ts / export.ts / compare.ts
-    // construct no Bun.Glob for any other reason, so this cannot fire spuriously.
+    // Prove the BUILDER read path is GLOB-FREE, not merely non-throwing: install a Bun.Glob that throws
+    // on construction, so a read surface that tried to re-evaluate the stored pattern (constructing a
+    // glob but ignoring its false result) fails HERE instead of passing. buildReport / exportRun /
+    // buildCompare and the shared read gate construct no Bun.Glob for any reason, so this cannot fire
+    // spuriously — this pins the builders, not the CLI entrypoints (which legitimately compile configured
+    // globs while LOADING config).
     const originalGlob = Bun.Glob;
     (Bun as { Glob: unknown }).Glob = class {
       constructor() {

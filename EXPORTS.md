@@ -214,9 +214,10 @@ override** — the counterfactual verdict on a branch policy would have dropped 
 scanned anyway. That override is the reason `policy_status` is its own column and not folded into
 `status`: the branch really was scanned, so it belongs in `scanned`, and its verdict is advisory.
 `policy_matched_pattern` is the stored deny-attribution pattern (null otherwise). Writes verify it
-matches `branch`; report, export, and compare intentionally preserve it verbatim on otherwise-sound
-pre-verifier or externally edited rows (a malformed row still fails the read gate on shape), without
-re-running version-sensitive glob matching — so the value is not read-time attested.
+matches `branch`; the read gate does not re-match it — report, compare, and JSONL export surface the
+stored value on otherwise-sound pre-verifier or externally edited rows (a malformed row still fails the
+read gate on shape; the default CSV export still applies its documented formula-injection defense),
+without re-running version-sensitive glob matching — so the value is not read-time attested.
 `scanned_commit_date` is the
 scanned commit's date on a scanned row, the discovered-head date otherwise (null only for pre-v4
 migrated rows). `is_default_branch` is `1`/`0`/null: null means UNKNOWN (pre-v3 migrated rows) —
