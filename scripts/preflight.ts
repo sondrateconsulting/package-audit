@@ -114,13 +114,22 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
 
   // 5. discovery scope evidence (only in discovery mode) + capture login
   const userRes = await client.restGet("user");
-  let login = "";
+  let parsedUser: unknown;
   try {
-    login = String((JSON.parse(userRes.body) as { login?: unknown }).login ?? "");
+    parsedUser = JSON.parse(userRes.body);
   } catch {
     throw new PreflightError("could not parse `gh api user` response");
   }
-  if (login === "") throw new PreflightError("`gh api user` returned no login");
+  // Validate, don't String()-coerce: a non-string login (e.g. {login:42}) previously became the
+  // fabricated login "42", and this PR feeds this value to listUserRepos(owner) as the personal-scan
+  // owner authority. Require a non-array object carrying a non-empty string login; fail loud otherwise.
+  const rawLogin =
+    typeof parsedUser === "object" && parsedUser !== null && !Array.isArray(parsedUser)
+      ? (parsedUser as Record<string, unknown>)["login"]
+      : undefined;
+  if (typeof rawLogin !== "string" || rawLogin === "")
+    throw new PreflightError("`gh api user` returned no valid login (expected a non-empty string)");
+  const login = rawLogin;
   const discoveryMode = config.organizations === null;
   let scopeEvidence: PreflightReport["discoveryScopeEvidence"] = "not-needed";
   if (discoveryMode) {

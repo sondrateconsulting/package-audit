@@ -77,6 +77,36 @@ describe("runPreflight — unsupported tar implementation (§5.E)", () => {
   });
 });
 
+describe("runPreflight — malformed `gh api user` login (fail-closed identity)", () => {
+  const config = {
+    githubHost: "github.com", organizations: ["org-a"],
+    packages: [{ name: "expo", registryUrl: "https://registry.example.com", registryAuthEnvVar: null }],
+  } as unknown as Config;
+  const clientWithUserBody = (userBody: string): GithubClient => ({
+    gh: async () => ({ exitCode: 0, stdout: "gh version 2.95.0", stderr: "" }),
+    git: async () => ({ exitCode: 0, stdout: "git version 2.45.1", stderr: "" }),
+    tar: async () => ({ exitCode: 0, stdout: "bsdtar 3.5.3 - libarchive 3.7.4", stderr: "" }),
+    restGet: async () => ({ body: userBody, headers: {} }),
+    rateLimit: async () => ({ resources: { core: { remaining: 100 }, graphql: { remaining: 100 } } }),
+  } as unknown as GithubClient);
+  const deps = { fetchImpl: async () => ({ ok: true, status: 200 }) };
+
+  test("a non-string / missing / non-object login is rejected LOUD, never String()-coerced", async () => {
+    // 42/true previously String()-coerced to "42"/"true" — a FABRICATED login that this PR now feeds
+    // to listUserRepos(owner) as the personal-scan owner authority. null/{}/array/primitive already
+    // threw, but under a weaker "no login" message; all must fail loud BEFORE rate-limit/registry.
+    for (const body of [
+      JSON.stringify({ login: 42 }), JSON.stringify({ login: true }), JSON.stringify({ login: null }),
+      JSON.stringify({}), JSON.stringify(["alice"]), JSON.stringify("alice"),
+    ]) {
+      await expect(runPreflight(clientWithUserBody(body), config, deps)).rejects.toThrow(/no valid login/);
+    }
+  });
+  test("invalid JSON is distinguished from a malformed-shape login", async () => {
+    await expect(runPreflight(clientWithUserBody("{not json"), config, deps)).rejects.toThrow(/could not parse/);
+  });
+});
+
 describe("runPreflight registry probe deadline (§5.E hardening)", () => {
   // every prior test injects deps.fetchImpl, which bypasses the DEFAULT fetch closure — the
   // one carrying the AbortSignal.timeout deadline. This exercises the real closure against a
