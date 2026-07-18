@@ -67,6 +67,18 @@ function makeClient(
   return { client, calls, sleeps };
 }
 
+// Instrument an AuditDb to COUNT api_cache reads/writes — proves a noStore path touches the DB
+// zero times (not merely that its observable effects are absent). Wrap AFTER any test seeding so
+// the seed's own putApiCache is not counted.
+function countCacheAccess(db: AuditDb): { reads: number; writes: number } {
+  const counters = { reads: 0, writes: 0 };
+  const realGet = db.getApiCache.bind(db);
+  const realPut = db.putApiCache.bind(db);
+  db.getApiCache = (m: string, u: string, v: string) => { counters.reads++; return realGet(m, u, v); };
+  db.putApiCache = (e: Parameters<typeof realPut>[0]) => { counters.writes++; realPut(e); };
+  return counters;
+}
+
 // ---- pure parsers -----------------------------------------------------------------------
 describe("parseGhApiOutput", () => {
   test("parses status, lowercases headers, joins duplicates (CRLF and LF)", () => {
@@ -614,6 +626,70 @@ describe("restGet caching + conditional requests", () => {
     const body = await client.fetchFileRaw("o", "r", "package.json", SHA2);
     expect(body).toBe("full-body");
     expect(calls.length).toBe(1);
+    db.close();
+  });
+
+  test("restGetJson: an invalid-JSON 200 body does NOT poison the immutable cache — fetchFileMeta refetches, then the repaired row serves zero-network", async () => {
+    // restGet persists the exact-200 body BEFORE restGetJson's JSON.parse validates it. Without the
+    // tombstone, fetchFileMeta's SHA-pinned immutable row would re-serve the unparseable body forever
+    // with ZERO network (JSON.parse failing on every later call). This pins restGetJson's invalid-JSON
+    // tombstone (the twin of fetchTreeRecursive's) via a structured-JSON consumer — previously uncovered.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client, calls } = makeClient(
+      [ok(http(200, {}, `{bad json`)), ok(http(200, {}, `{"type":"file","sha":"${SHA}","size":12}`))],
+      { db },
+    );
+    await expect(client.fetchFileMeta("o", "r", "package.json", SHA)).rejects.toThrow(/invalid JSON/);
+    // the row is TOMBSTONED (NULL body AND NULL etag) — not merely deleted/absent: both cache-serving
+    // paths require a non-null body/etag, so a NULL-NULL row forces the refetch below.
+    const tomb = db.read("SELECT COUNT(*) AS n FROM api_cache WHERE response_body IS NULL AND etag IS NULL").get() as { n: number };
+    expect(tomb.n).toBe(1); // exactly one tombstone row
+    const live = db.read("SELECT COUNT(*) AS n FROM api_cache WHERE response_body IS NOT NULL").get() as { n: number };
+    expect(live.n).toBe(0); // and no live poisoned row
+    const meta = await client.fetchFileMeta("o", "r", "package.json", SHA);
+    expect((meta as { sha: string }).sha).toBe(SHA);
+    expect(calls.length).toBe(2); // the immutable path did NOT serve the poison with zero network — it refetched
+    const again = await client.fetchFileMeta("o", "r", "package.json", SHA);
+    expect((again as { sha: string }).sha).toBe(SHA);
+    expect(calls.length).toBe(2); // …and the REPAIRED exact-200 row now earns the immutable zero-network hit
+    db.close();
+  });
+
+  test("restGet: noStore OVERRIDES immutable — a SHA-pinned pre-seeded row is neither served, revalidated, nor overwritten", async () => {
+    // `immutable` alone would serve the seeded row with ZERO network; noStore must win — a plain
+    // uncached fetch that touches the row in no way (no read, no If-None-Match, no persist). Pins the
+    // documented precedence independently of pagination (the only in-tree noStore caller today).
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const ep = `repos/o/r/contents/package.json?ref=${SHA}`; // SHA-pinned → endpointIsShaPinned true
+    db.putApiCache({ method: "GET", url: `gh3:github.com:${ep}`, variantHash: "", etag: 'W/"imm"', responseBody: "cached-immutable-body" });
+    const spy = countCacheAccess(db); // prove noStore touches the DB zero times, not merely that its effects are absent
+    const { client, calls } = makeClient([ok(http(200, { etag: 'W/"fresh"' }, "fresh-network-body"))], { db });
+    const res = await client.restGet(ep, { immutable: true, noStore: true });
+    expect(res.body).toBe("fresh-network-body"); // fetched fresh, NOT the seed — noStore beat immutable
+    expect(calls.length).toBe(1); // network was hit; the immutable zero-network shortcut did not fire
+    expect(calls[0]!.args.some((a) => a.toLowerCase().startsWith("if-none-match:"))).toBe(false); // no validator sent
+    expect(spy.reads).toBe(0); // getApiCache was never CALLED — a read-then-discard mutant fails here
+    expect(spy.writes).toBe(0); // putApiCache was never called — no persist over the seed
+    const row = db.read(`SELECT response_body AS body, etag FROM api_cache WHERE url = 'gh3:github.com:${ep}'`).get() as { body: string; etag: string };
+    expect(row.body).toBe("cached-immutable-body"); // seed unchanged — noStore did not persist over it
+    expect(row.etag).toBe('W/"imm"');
+    db.close();
+  });
+
+  test("restGet under noStore: an unsolicited 304 is fatal, never laundered through a bypassed cache row", async () => {
+    // noStore never reads the cache, so a 304 (impossible without our If-None-Match) cannot be served
+    // as a cached body — it falls through to classifyRest and fails loud.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const ep = `repos/o/r/contents/package.json?ref=${SHA}`;
+    db.putApiCache({ method: "GET", url: `gh3:github.com:${ep}`, variantHash: "", etag: 'W/"imm"', responseBody: "seed" });
+    const spy = countCacheAccess(db);
+    const { client } = makeClient([err(`HTTP/2.0 304 Not Modified\r\nEtag: W/"imm"`, "gh: HTTP 304")], { db });
+    await expect(client.restGet(ep, { noStore: true })).rejects.toThrow(/304/);
+    expect(spy.reads).toBe(0); // even on the 304 branch, noStore read nothing…
+    expect(spy.writes).toBe(0); // …and wrote nothing
+    const row = db.read(`SELECT response_body AS body, etag FROM api_cache WHERE url = 'gh3:github.com:${ep}'`).get() as { body: string; etag: string };
+    expect(row.body).toBe("seed"); // the seed row was neither consumed nor mutated
+    expect(row.etag).toBe('W/"imm"');
     db.close();
   });
 
@@ -1526,6 +1602,77 @@ describe("pagination", () => {
     await expect(rejection).rejects.toThrow(GithubApiError);
     await expect(rejection).rejects.toThrow(/exceeded/);
     expect(calls.length).toBe(MAX_PAGES); // cap checked BEFORE the fetch: exactly MAX_PAGES spawns
+  });
+
+  test("paginated pages are NEVER written to the cache — no ETag row is ever created to drop a Link on a later 304", async () => {
+    // The cache stores body+ETag but NOT the Link header. A cached paginated page whose 304
+    // revalidation omits Link would make the listing stop early and silently under-report. Closing
+    // that seam means paginated pages must not go through the conditional cache at all.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client } = makeClient([
+      ok(http(200, { etag: 'W/"p1"', link: `<https://api.github.com/orgs/x/repos?per_page=100&page=2&type=all>; rel="next"` }, `[{"name":"a"}]`)),
+      ok(http(200, { etag: 'W/"p2"' }, `[{"name":"b"}]`)),
+    ], { db });
+    const rows = await client.restGetPagedArray("orgs/x/repos?per_page=100&page=1&type=all");
+    expect(rows.length).toBe(2);
+    const n = db.read("SELECT COUNT(*) AS n FROM api_cache").get() as { n: number };
+    expect(n.n).toBe(0); // no row was written — a paginated page can never be re-served from cache
+    db.close();
+  });
+
+  test("a PRE-SEEDED cache row can NEVER silently truncate a listing — pagination ignores it and sends no If-None-Match", async () => {
+    // The realistic hazard is a page row left by the OLD caching code (or any future partial noStore
+    // that skips writes but still READS): body+ETag with no stored Link. If pagination revalidated it
+    // and got a 304 without Link, it would stop at page 1 and silently under-report. Seed exactly such
+    // a current-epoch (gh3) row and prove pagination never reads it, never revalidates, and refetches.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const P1 = "orgs/x/repos?per_page=100&page=1&type=all";
+    const P2 = "orgs/x/repos?per_page=100&page=2&type=all";
+    const link2 = `<https://api.github.com/${P2}>; rel="next"`;
+    db.putApiCache({ method: "GET", url: `gh3:github.com:${P1}`, variantHash: "", etag: 'W/"seed"', responseBody: `[{"name":"stale-seed"}]` });
+    const spy = countCacheAccess(db); // prove pagination touches the DB zero times — no read-then-discard, no write
+    const dispatch = (call: Call): SpawnResult => {
+      const ep = call.args[2]; // ["api", "-i", <endpoint>, ...]
+      // A client that read the seed would send If-None-Match; the server then 304s WITHOUT a Link —
+      // the exact trap. A correct noStore client never sends the validator, so this arm is dead here.
+      if (call.args.some((a) => a.startsWith("If-None-Match:"))) return err(`HTTP/2.0 304 Not Modified\r\nEtag: W/"seed"`, "gh: HTTP 304");
+      if (ep === P1) return ok(http(200, { etag: 'W/"p1"', link: link2 }, `[{"name":"a"}]`));
+      return ok(http(200, { etag: 'W/"p2"' }, `[{"name":"b"}]`)); // page 2, last page, no Link
+    };
+    const { client, calls } = makeClient(Array.from({ length: 8 }, () => dispatch), { db });
+    const rows = await client.restGetPagedArray(P1);
+    expect(rows).toEqual([{ name: "a" }, { name: "b" }]); // FRESH page 1 (not the stale seed), then page 2
+    expect(calls.length).toBe(2); // both pages fetched fresh — page 2 was followed
+    expect(calls.map((c) => c.args[2])).toEqual([P1, P2]); // exact endpoints, in order
+    expect(calls.every((c) => !c.args.some((a) => a.toLowerCase().startsWith("if-none-match:")))).toBe(true); // never revalidated the seed
+    expect(spy.reads).toBe(0); // getApiCache never CALLED — a read-then-discard noStore mutant fails here
+    expect(spy.writes).toBe(0); // …and putApiCache never called, so no page row was created either
+    const seed = db.read(`SELECT response_body AS body, etag FROM api_cache WHERE url = 'gh3:github.com:${P1}'`).get() as { body: string; etag: string };
+    expect(seed.body).toBe(`[{"name":"stale-seed"}]`); // the seed row remains — bypassed, not read, revalidated, or overwritten
+    expect(seed.etag).toBe('W/"seed"');
+    db.close();
+  });
+
+  test("restGetPagedArray accumulates a page too large for acc.push(...page) without truncating", async () => {
+    // acc.push(...page) throws once a page exceeds the engine's spread/stack argument limit — the exact
+    // hard failure the iterative `for (const item of page) acc.push(item)` avoids. That limit is engine-
+    // and stack-dependent (well above 65k on Bun/JSC), so DERIVE a size that genuinely overflows the
+    // spread in THIS runtime, assert it does, then prove the paginator still accumulates every entry.
+    const spreadOverflows = (len: number): boolean => {
+      // require the SPECIFIC RangeError (arg/stack overflow) — a different error would be a bad probe
+      try { const a: number[] = []; a.push(...new Array(len).fill(0)); return false; } catch (e) { return e instanceof RangeError; }
+    };
+    let n = 500_000;
+    while (n < 8_000_000 && !spreadOverflows(n)) n *= 2;
+    expect(spreadOverflows(n)).toBe(true); // guard against a false green: n is a size where acc.push(...page) RangeErrors
+    const page = JSON.stringify(Array.from({ length: n }, (_, i) => i));
+    const { client } = makeClient([ok(http(200, {}, page))]);
+    const rows = await client.restGetPagedArray("orgs/x/repos?per_page=100&page=1&type=all");
+    expect(rows.length).toBe(n); // every entry kept — a spread accumulator would have thrown at this size
+    // verify order/identity across the whole page, not just the tail (a corrupted/duplicated middle must fail)
+    expect(rows[0]).toBe(0);
+    expect(rows[Math.floor(n / 2)]).toBe(Math.floor(n / 2));
+    expect(rows[n - 1]).toBe(n - 1);
   });
 });
 

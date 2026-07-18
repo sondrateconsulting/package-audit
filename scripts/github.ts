@@ -1128,7 +1128,9 @@ export class GithubClient {
 
   // One REST GET. `immutable: true` (commit/tree/blob-SHA-pinned URLs) serves a cached body
   // with ZERO network request (§3); otherwise a cached ETag rides as If-None-Match and gh's
-  // non-zero-exit 304 is a cache HIT.
+  // non-zero-exit 304 is a cache HIT. `noStore: true` OVERRIDES both — it disables the cache read
+  // (so neither the immutable hit nor the If-None-Match/304 path can fire) and the persist, so a
+  // `{ immutable, noStore }` combination resolves to a plain uncached fetch (noStore wins).
   // CONTRACT: a resolved response always has status EXACTLY 200 — direct (classifyRest fails
   // every non-200 2xx closed) or cache-synthesized (both cache-serving paths fabricate 200).
   // Consumers (fetchFileRaw/fetchBlobRaw/restGetJson/restGetPagedArray) rely on this and do
@@ -1143,11 +1145,16 @@ export class GithubClient {
     return /^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(ref);
   }
 
-  async restGet(endpoint: string, opts: { accept?: string; immutable?: boolean } = {}): Promise<HttpResponse> {
+  async restGet(endpoint: string, opts: { accept?: string; immutable?: boolean; noStore?: boolean } = {}): Promise<HttpResponse> {
     const accept = opts.accept ?? "";
     const immutable = opts.immutable === true && GithubClient.endpointIsShaPinned(endpoint);
     const key = this.cacheKey(endpoint);
-    const cached = this.db?.getApiCache("GET", key, accept) ?? null;
+    // `noStore` fully opts OUT of the conditional cache: no read, no If-None-Match, no persist. The
+    // cache stores body+ETag but NOT the Link header, so a paginated page served from a 304 that
+    // omits Link would make restGetPagedArray stop early and silently under-report the listing — a
+    // cache the caller cannot use correctly must not be used at all (§5.A completeness).
+    const noStore = opts.noStore === true;
+    const cached = noStore ? null : (this.db?.getApiCache("GET", key, accept) ?? null);
     if (immutable && cached !== null && cached.responseBody !== null)
       return { status: 200, headers: {}, body: cached.responseBody };
 
@@ -1197,7 +1204,7 @@ export class GithubClient {
         // DELIBERATE defense-in-depth: cache write provenance is a durable invariant (rows are
         // statusless and outlive --fresh) and must hold locally, never by depending on a distant
         // classifier's range staying narrow. Expected to survive mutation testing.
-        if (parsed.status === 200)
+        if (parsed.status === 200 && !noStore)
           this.db?.putApiCache({
             method: "GET", url: key, variantHash: accept,
             etag: parsed.headers["etag"] ?? null, responseBody: parsed.body,
@@ -1237,7 +1244,11 @@ export class GithubClient {
   }
 
   // TS pagination (§5.A): per-page `gh api -i`, follow Link rel="next" (host-verified,
-  // recomposed relative) until absent, accumulating array pages.
+  // recomposed relative) until absent, accumulating array pages. Pages are fetched with
+  // `noStore` — the conditional cache preserves body+ETag but NOT the Link header, so a cached
+  // page whose 304 revalidation omits Link would silently truncate the listing. With noStore a
+  // paginated fetch never creates, overwrites, OR consumes a cache row (a pre-existing row from an
+  // earlier version simply stays, unread), so it can neither be poisoned by nor poison the cache.
   async restGetPagedArray(endpoint: string): Promise<unknown[]> {
     const acc: unknown[] = [];
     // A compromised/misbehaving API controls the Link chain: a repeated endpoint (cycle) or
@@ -1250,7 +1261,7 @@ export class GithubClient {
       if (seen.size >= MAX_PAGES)
         throw new GithubApiError(`pagination exceeded ${MAX_PAGES} pages following Link next`, { endpoint: ep });
       seen.add(ep);
-      const res = await this.restGet(ep);
+      const res = await this.restGet(ep, { noStore: true });
       let page: unknown;
       try {
         page = JSON.parse(res.body);
@@ -1258,7 +1269,7 @@ export class GithubClient {
         throw new GithubApiError(`invalid JSON page from ${ep}`, { status: res.status, endpoint: ep });
       }
       if (!Array.isArray(page)) throw new GithubApiError(`expected a JSON array page from ${ep}`, { endpoint: ep });
-      acc.push(...page);
+      for (const item of page) acc.push(item); // iterative, not acc.push(...page): a huge page would blow the arg limit
       const nextUrl = parseLinkNext(res.headers["link"]);
       ep = nextUrl === null ? null : nextEndpointFromLink(nextUrl, this.githubHost);
     }
