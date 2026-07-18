@@ -721,8 +721,8 @@ function isCanonicalTreePath(p: string): boolean {
   if (p.length === 0 || p.includes("\u0000")) return false;
   return p.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
 }
-// A GitHub org/repo identity is a single path segment consumed verbatim by API endpoints, the clone
-// URL, and the local clone-dir join. Reject the dot segments "." / ".." (traversal), path separators,
+// A GitHub org/repo identity is a single path segment consumed verbatim by API endpoint paths and the
+// clone URL. Reject the dot segments "." / ".." (traversal), path separators,
 // and any Unicode control (\p{Cc} — C0, C1, and DEL) or whitespace character — a real GitHub login or
 // repo name contains none of these, while legitimate names like ".github" and "a.b" pass. This does
 // NOT enforce the full GitHub name grammar (GHES/legacy differ); it only closes the structural
@@ -1769,15 +1769,17 @@ export class GithubClient {
     // ENOENT here is benign (a dir vanished mid-sweep under concurrent cleanup); anything else
     // (EACCES/EBUSY/ENOTDIR/…) is a real failure that would otherwise leave stale multi-GB clones
     // accumulating with no signal — the sole caller discards the return value, so warn on stdout.
-    const warnFailure = (operation: string, target: string, e: unknown): void => {
-      if ((e as { code?: unknown }).code === "ENOENT") return;
-      logLine({ event: "warning", reason: "temp-sweep-failed", operation, target, message: (e as Error).message });
+    const warnFailure = (operation: string, target: string, e: unknown, suppressENOENT: boolean): void => {
+      // A PER-ENTRY dir vanishing mid-sweep (ENOENT) is a benign concurrent-cleanup race; a missing or
+      // unreadable temp ROOT is not — it means the sweep could not run at all — so the root always warns.
+      if (suppressENOENT && (e as { code?: unknown }).code === "ENOENT") return;
+      logLine({ event: "warning", reason: "temp-sweep-failed", operation, target, message: e instanceof Error ? e.message : String(e) });
     };
     let entries: string[];
     try {
       entries = readdirSync(this.tempRoot);
     } catch (e) {
-      warnFailure("readdir", this.tempRoot, e);
+      warnFailure("readdir", this.tempRoot, e, false); // root failure ALWAYS warns, incl. a missing root (ENOENT)
       return removed;
     }
     for (const name of entries) {
@@ -1787,7 +1789,7 @@ export class GithubClient {
       try {
         st = lstatSync(full); // lstat: NEVER follow a symlink
       } catch (e) {
-        warnFailure("lstat", full, e);
+        warnFailure("lstat", full, e, true); // per-entry: a benign mid-sweep vanish (ENOENT) stays silent
         continue;
       }
       try {
@@ -1800,7 +1802,7 @@ export class GithubClient {
         }
         removed.push(name);
       } catch (e) {
-        warnFailure("remove", full, e); // a dir vanishing mid-sweep (ENOENT) stays silent
+        warnFailure("remove", full, e, true); // per-entry: a dir vanishing mid-sweep (ENOENT) stays silent
       }
     }
     return removed;

@@ -1,7 +1,7 @@
 import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
 import type { TreeEntry } from "./unitPipeline.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
@@ -844,6 +844,38 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     expect(cloneLeftovers).toEqual([]); // clone temp dir reclaimed — no leak
     db.close();
     rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a clone-cleanup FAILURE after a successful scan is surfaced as a warning, not swallowed", async () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root ignores modes
+    const root = mkdtempSync(join(tmpdir(), "clone-cleanup-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    let runDir = "";
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      if (args[0] === "clone") {
+        const dest = args[args.length - 1]!;
+        mkdirSync(dest, { recursive: true });
+        writeFileSync(join(dest, "package.json"), "{}");
+        runDir = dirname(dest);
+        chmodSync(runDir, 0o555); // read+exec but NOT writable → the finally's rmSync can't unlink → EACCES
+        return { exitCode: 0, stderr: "", stdout: "" };
+      }
+      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: "o-moved\n" };
+      if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
+      return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // truncated → clone fallback
+    });
+    try {
+      const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+      expect(db.getUnit(key("main"))?.status).toBe("done"); // the scan itself SUCCEEDED (files readable), unit marked done
+      const warnings = events.filter((e) => e.event === "warning" && e.reason === "clone-cleanup-failed");
+      expect(warnings.length).toBe(1); // the failed reclaim is surfaced, not swallowed
+    } finally {
+      if (runDir !== "") chmodSync(runDir, 0o755); // restore so the outer rmSync can recurse
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("runPlan uses the SAME shared planner — a denied branch counts as excludedByPolicy, not eligible", async () => {

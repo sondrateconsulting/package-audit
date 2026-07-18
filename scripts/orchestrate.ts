@@ -606,8 +606,11 @@ async function processUnit(
         const runTempDir = dirname(cloneDir);
         assertContained(runTempDir, [client.tempRoot]);
         rmSync(runTempDir, { recursive: true, force: true });
-      } catch {
-        // best-effort
+      } catch (e) {
+        // Best-effort reclaim, but NOT silent: a failed cleanup leaves a (multi-GB) clone until the
+        // next startup sweep, so surface it — without masking any primary scan error already
+        // propagating out of the try (the throw continues; this only adds an observability line).
+        logLine({ event: "warning", reason: "clone-cleanup-failed", target: cloneDir, message: e instanceof Error ? e.message : String(e) });
       }
     }
   }

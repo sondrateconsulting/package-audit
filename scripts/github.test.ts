@@ -2630,5 +2630,17 @@ describe("sweepStaleTempDirs observability (§0)", () => {
     const warnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed");
     expect(warnings.length).toBe(1);
     expect(warnings[0]!.operation).toBe("readdir");
+    expect(warnings[0]!.target).toBe(file); // the failing target is named
+    expect(typeof warnings[0]!.message).toBe("string"); // an errno message is carried
+  });
+  test("a MISSING temp root still warns — a root-readdir ENOENT is not a benign per-entry race", () => {
+    const root = mkdtempSync(join(tmpdir(), "sweep-missing-"));
+    const { client } = makeClient([], { tempRoot: root });
+    rmSync(root, { recursive: true, force: true }); // remove the root AFTER construction → readdir ENOENT
+    let removed: string[] = ["sentinel"];
+    const events = captureStdout(() => { removed = client.sweepStaleTempDirs(); });
+    expect(removed).toEqual([]);
+    const warnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed" && e.operation === "readdir");
+    expect(warnings.length).toBe(1); // ENOENT on the ROOT still warns (suppression is per-entry only)
   });
 });
