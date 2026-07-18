@@ -938,6 +938,9 @@ export interface PlanTotals {
   readonly ownersSource: OwnersSource;
   readonly reposDiscovered: number;
   readonly reposKept: number;
+  // Repos dropped SPECIFICALLY by the excludeRepositories denylist (distinct from archived/fork/cap
+  // drops). Denylist-only; the per-owner excluded names are emitted as `plan-excluded` events.
+  readonly repositoriesExcluded: number;
   readonly branchesEligible: number;
   readonly branchesSkippedByCutoff: number;
   readonly branchesPastCap: number;
@@ -965,7 +968,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   if (client.cachesToDb) throw new Error("runPlan requires a cache-less client (db: null) — plan mode must not write api_cache");
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 
-  let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, branchesExcludedByPolicy = 0, discoveryErrors = 0;
+  let reposDiscovered = 0, reposKept = 0, repositoriesExcluded = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, branchesExcludedByPolicy = 0, discoveryErrors = 0;
   let excludedByDeny = 0, excludedByAllow = 0, defaultBranchPolicyOverrides = 0; // policy diagnostics (overlays)
   const coverages: RepoPolicyCoverage[] = []; // per successfully-discovered repo, for the warning finalizer
   for (const owner of owners) {
@@ -979,15 +982,20 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
       continue;
     }
     reposDiscovered += repos.length;
-    // --plan applies the SAME denylist the real scan does (deny before archived/fork + cap). The
-    // `excluded` list + a repositoriesExcluded count are surfaced by --plan in T6; here we consume
-    // `kept` so reposKept already reflects denial. A fatal RepoPolicyMatchError propagates with NO DB
-    // write (plan mode has no DB — the zero-write invariant holds).
-    const { kept } = filterSortCapRepos(repos, {
+    // --plan applies the SAME denylist the real scan does (deny before archived/fork + cap), so
+    // reposKept already reflects denial. A fatal RepoPolicyMatchError propagates with NO DB write
+    // (plan mode has no DB — the zero-write invariant holds).
+    const { kept, excluded } = filterSortCapRepos(repos, {
       policy: repositoryPolicy,
       includeArchived: config.includeArchived, includeForks: config.includeForks, maxReposPerOrg: config.maxReposPerOrg,
     });
     reposKept += kept.length;
+    repositoriesExcluded += excluded.length;
+    // DX: surface the denied owner/repo names (original case, raw order) at PREVIEW time — a developer
+    // confirms each pattern caught the repos they meant BEFORE a repo silently goes missing from a real
+    // audit. Emitted per owner (only when it denied something), BEFORE that owner's per-repo plan events.
+    // This is the confirm-a-pattern-is-live path that replaces the (deliberately absent) dead-pattern warning.
+    if (excluded.length > 0) logLine({ event: "plan-excluded", org: owner, repositories: excluded });
     for (const repo of kept) {
       // --plan has no DB, so it consumes the client directly rather than via discoverBranchHeads. It
       // must still take the default branch from the SAME snapshot as the heads (§5.B) — a --plan that
@@ -1026,7 +1034,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   // Emit the unmatched-pattern warnings (before plan-summary) — identical to runScan's set.
   const warnings = emitPolicyWarnings(branchPolicy, coverages);
 
-  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, excludedByDeny, excludedByAllow, defaultBranchPolicyOverrides, discoveryErrors };
+  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, repositoriesExcluded, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, excludedByDeny, excludedByAllow, defaultBranchPolicyOverrides, discoveryErrors };
   logLine({ event: "plan-summary", ...totals });
   process.stderr.write(planSummaryText(config, totals, warnings));
   return totals;
@@ -1042,7 +1050,7 @@ export function planSummaryText(
     "",
     "PLAN — preview only: no database opened, nothing scanned, nothing written",
     `  Owners (${t.ownersSource}):  ${t.owners.join(", ")}`,
-    `  Repos:                ${t.reposDiscovered} discovered, ${t.reposKept} kept after archive/fork filters and caps`,
+    `  Repos:                ${t.reposDiscovered} discovered, ${t.reposKept} kept after archive/fork filters and caps${t.repositoriesExcluded > 0 ? ` (${t.repositoriesExcluded} excluded first by the repository denylist)` : ""}`,
     `  Branches:             ${t.branchesEligible} eligible to scan (a real run may skip already-current ones)`,
     `                        ${t.branchesSkippedByCutoff} skipped by cutoff (< ${config.cutoffDate}) · ${t.branchesPastCap} past the per-repo cap (${config.maxBranchesPerRepo}) · ${t.branchesExcludedByPolicy} excluded by branch policy`,
     // Policy breakdown, shown only when policy actually removed or overrode branches. Wording avoids

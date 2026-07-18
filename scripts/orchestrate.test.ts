@@ -172,7 +172,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     const totals = await runPlan(client, rt(config), "rvo");
     expect(totals).toEqual({
       owners: ["org-a"], ownersSource: "configured",
-      reposDiscovered: 1, reposKept: 1,
+      reposDiscovered: 1, reposKept: 1, repositoriesExcluded: 0,
       branchesEligible: 1, branchesSkippedByCutoff: 1, branchesPastCap: 0, branchesExcludedByPolicy: 0,
       excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, discoveryErrors: 0,
     });
@@ -209,6 +209,57 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     expect(totals.discoveryErrors).toBe(1);
     expect(totals.branchesEligible).toBe(0);
     expect(readdirSync(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("emits a plan-excluded event (original-case names, before that owner's plan events) + a repositoriesExcluded count", async () => {
+    const root = mkdtempSync(join(tmpdir(), "plan-deny-"));
+    const responses = [
+      // 1) listOrgRepos("org-a") — two repos; the denylist drops the (case-insensitively) matching one
+      { exitCode: 0, stderr: "", stdout: http(200, {}, JSON.stringify([
+        { name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
+        { name: "Legacy-API", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-02-01T00:00:00Z", archived: false, fork: false, private: false },
+      ])) },
+      // 2) listBranchHeads("org-a","svc") — ONLY the kept repo is planned (legacy-api was denied)
+      { exitCode: 0, stderr: "", stdout: http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [{ name: "main", target: { oid: hexOid("o-main"), committedDate: "2025-06-01T00:00:00Z", tree: { oid: hexOid("t1") } } }],
+      } } } })) },
+    ];
+    const calls: Array<{ bin: string; args: string[] }> = [];
+    const client = makeClient(root, async (bin, args) => {
+      calls.push({ bin, args });
+      const r = responses[calls.length - 1];
+      if (r === undefined) throw new Error(`unexpected spawn #${calls.length}: ${bin} ${args.join(" ")}`);
+      return r;
+    });
+    const config: Config = {
+      githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [],
+      excludeRepositories: ["org-a/legacy-*"], // case-insensitive → matches "org-a/Legacy-API"
+      includePersonalNamespace: false, includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
+      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
+    };
+    let totals: PlanTotals | undefined;
+    const events = await captureJsonl(async () => { totals = await runPlan(client, rt(config), "rvo"); });
+    expect(totals!.reposDiscovered).toBe(2);
+    expect(totals!.reposKept).toBe(1);
+    expect(totals!.repositoriesExcluded).toBe(1); // denylist-only count
+    // the plan-excluded event lists the denied repo in ORIGINAL case, raw discovery order
+    const excludedEvents = events.filter((e) => e["event"] === "plan-excluded");
+    expect(excludedEvents).toHaveLength(1);
+    expect(excludedEvents[0]!["org"]).toBe("org-a");
+    expect(excludedEvents[0]!["repositories"]).toEqual(["org-a/Legacy-API"]);
+    // placement: the owner's plan-excluded event precedes its per-repo plan events (verify at preview time)
+    const idxExcluded = events.findIndex((e) => e["event"] === "plan-excluded");
+    const idxPlan = events.findIndex((e) => e["event"] === "plan");
+    expect(idxExcluded).toBeGreaterThanOrEqual(0);
+    expect(idxPlan).toBeGreaterThan(idxExcluded);
+    // the plan-summary carries the aggregate count
+    const summary = events.find((e) => e["event"] === "plan-summary");
+    expect(summary!["repositoriesExcluded"]).toBe(1);
+    expect(readdirSync(root)).toEqual([]); // zero-write preserved
     rmSync(root, { recursive: true, force: true });
   });
 });
@@ -1368,7 +1419,7 @@ describe("planSummaryText", () => {
   // a full PlanTotals with all-zero policy diagnostics; spread + override per test
   const totals: PlanTotals = {
     owners: ["org-a", "org-b"], ownersSource: "discovered",
-    reposDiscovered: 42, reposKept: 37,
+    reposDiscovered: 42, reposKept: 37, repositoriesExcluded: 0,
     branchesEligible: 210, branchesSkippedByCutoff: 58, branchesPastCap: 12, branchesExcludedByPolicy: 0,
     excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, discoveryErrors: 0,
   };
@@ -1379,12 +1430,18 @@ describe("planSummaryText", () => {
     expect(text).toContain("no database opened");
     expect(text).toContain("org-a, org-b");
     expect(text).toContain("42 discovered, 37 kept");
+    expect(text).not.toContain("repository denylist"); // repositoriesExcluded: 0 → the denylist segment is suppressed
     expect(text).toContain("210 eligible");
     expect(text).toContain("58 skipped by cutoff (< 2024-01-01)");
     expect(text).toContain("12 past the per-repo cap (25)");
     expect(text).toContain("3 excluded by branch policy");
     expect(text).toContain("expo");
     expect(text).toMatch(/Discovery errors:\s+0\b/);
+  });
+
+  test("Repos line appends the repository-denylist count ONLY when it excluded something", () => {
+    const text = planSummaryText(config, { ...totals, repositoriesExcluded: 5 });
+    expect(text).toContain("42 discovered, 37 kept after archive/fork filters and caps (5 excluded first by the repository denylist)");
   });
 
   test("policy detail line: shown with the deny/allow split + override count when policy removed branches", () => {
