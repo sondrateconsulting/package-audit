@@ -595,6 +595,40 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
+
+  test("P0 exclusivity backstop: a repo scheduled twice in one run fails LOUD (shared scheduledRepoKeys, case-insensitive)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "excl-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    // pre-seed main done@head so the first pass is skip-current (no tree fetch), keeping the test
+    // focused on the exclusivity claim rather than the scan pipeline.
+    const key: WorkUnitKey = { configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: "main" };
+    db.enqueueUnit(key, runId);
+    db.setUnitStatus(key, { status: "done", runId, lastCommitSha: hexOid("o-main"), lastCommitDate: "2025-06-01T00:00:00Z" });
+    const client = makeClient(root, async () => ({ exitCode: 0, stderr: "", stdout: graphqlHeads([
+      { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+    ], "main") }));
+    const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+    const shared = new Set<string>();
+
+    // first scheduling of org-a/svc succeeds and claims the canonical key
+    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set(), shared));
+    // a SECOND scheduling of the same canonical (org, repo) with the SHARED set throws BEFORE any write
+    await expect(
+      processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set(), shared),
+    ).rejects.toThrow(/scheduled twice/);
+    // a case-variant owner spelling is caught too (the key is lowercased) — proves the fold cannot be evaded
+    await expect(
+      processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "ORG-A", { ...repo, organization: "ORG-A" }, [], new Set(), shared),
+    ).rejects.toThrow(/scheduled twice/);
+    // a DISTINCT repo in the SAME shared set is unaffected (no false positive — different canonical key)
+    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", { ...repo, name: "other" }, [], new Set(), shared));
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
 });
 
 describe("processRepo / runScan — branch allow/deny wiring", () => {

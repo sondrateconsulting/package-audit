@@ -32,6 +32,24 @@ describe("resolveEffectiveOwners", () => {
     expect(resolveEffectiveOwners({ ...base, discoveredOrgs: ["a", "b"], excludeOrganizations: ["b"] }).owners).toEqual(["a"]);
     expect(resolveEffectiveOwners({ ...base, organizations: ["a", "b"], excludeOrganizations: ["a"] }).owners).toEqual(["b"]);
   });
+  test("case-variant owners collapse to ONE (first spelling wins) — branch-exclusivity prerequisite", () => {
+    // GitHub logins are case-insensitive-unique, so Acme/acme/ACME are the SAME account: keeping all
+    // three would make owner fan-out discover the same canonical repos 3× and race the same rows.
+    expect(resolveEffectiveOwners({ ...base, discoveredOrgs: ["Acme", "acme", "ACME"] }).owners).toEqual(["Acme"]);
+    expect(resolveEffectiveOwners({ ...base, organizations: ["MyOrg", "myorg"] }).owners).toEqual(["MyOrg"]);
+    // genuinely-distinct owners are untouched
+    expect(resolveEffectiveOwners({ ...base, discoveredOrgs: ["Globex", "Acme"] }).owners).toEqual(["Acme", "Globex"]);
+  });
+  test("excludeOrganizations matches case-insensitively (mirrors the owner fold)", () => {
+    expect(() => resolveEffectiveOwners({ ...base, organizations: ["acme"], excludeOrganizations: ["ACME"] })).toThrow(EmptyOwnersError);
+    expect(resolveEffectiveOwners({ ...base, organizations: ["keep", "Drop"], excludeOrganizations: ["DROP"] }).owners).toEqual(["keep"]);
+  });
+  test("personal login folds with a case-variant configured owner and prefers its own spelling", () => {
+    // configured "Alice" + personal login "alice" are ONE account — collapse to one owner spelled as
+    // the personal login, so it routes through the personal endpoint (orchestrate isPersonal folds too).
+    const r = resolveEffectiveOwners({ ...base, organizations: ["Alice"], includePersonalNamespace: true, personalLogin: "alice" });
+    expect(r.owners).toEqual(["alice"]);
+  });
   test("empty discovery fails fast with read:org / personal-namespace hints", () => {
     expect(() => resolveEffectiveOwners({ ...base })).toThrow(EmptyOwnersError);
     try {

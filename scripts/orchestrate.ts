@@ -213,6 +213,13 @@ export async function runScan(
   }
 
   const nonRegistrySkipSeen = new Set<string>();
+  // §5.A exclusivity backstop (P0): the canonical `org\0repo` key of every repo scheduled this run.
+  // Owner case-folding (ownerResolve.ts) plus mapRestRepo's owner-scope enforcement (github.ts)
+  // already make a repo reachable under exactly ONE effective owner, so this Set NEVER trips in
+  // correct operation — it is the honest tripwire that makes "each branch-unit scheduled at most
+  // once" provable rather than assumed, so a future regression that double-schedules a repo (and
+  // would race two fibers on the same rows under fan-out) fails LOUD instead of corrupting silently.
+  const scheduledRepoKeys = new Set<string>();
 
   // §5.G bin discovery: introspect each tracked package's LATEST published version ONCE up
   // front to learn its bin names, so the per-unit CLI scan runs specifier + bin terms in a
@@ -228,7 +235,7 @@ export async function runScan(
   const coverages: RepoPolicyCoverage[] = [];
   try {
     for (const owner of owners) {
-      coverages.push(...(await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen)));
+      coverages.push(...(await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys)));
     }
   } catch (e) {
     if (e instanceof PolicyMatchError) db.failRun(runId);
@@ -296,15 +303,19 @@ export async function resolveOwnersWithDiscovery(
 export async function processOwner(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, personalLogin: string | null, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+  scheduledRepoKeys: Set<string> = new Set(),
 ): Promise<RepoPolicyCoverage[]> {
-  const isPersonal = runtime.config.includePersonalNamespace && owner === personalLogin;
+  // Personal-vs-org routing is CASE-INSENSITIVE to match ownerResolve's owner fold: a configured
+  // "Alice" that collapsed onto personal login "alice" must still route through listUserRepos, not
+  // the org endpoint. (personalLogin is null when personal-namespace scanning is off.)
+  const isPersonal = runtime.config.includePersonalNamespace && personalLogin !== null && owner.toLowerCase() === personalLogin.toLowerCase();
   const outcome = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
   if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
   // Collect each successfully-discovered repo's coverage (null = its branch discovery failed) so the
   // run-level warning finalizer sees exactly the patterns exercised against real branches.
   const coverages: RepoPolicyCoverage[] = [];
   for (const repo of outcome.items) {
-    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen);
+    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys);
     if (cov !== null) coverages.push(cov);
   }
   return coverages;
@@ -372,10 +383,22 @@ export async function discoverBranchHeads(
 export async function processRepo(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+  scheduledRepoKeys: Set<string> = new Set(),
 ): Promise<RepoPolicyCoverage | null> {
   const { config, configHash, branchPolicy } = runtime;
   const outcome = await discoverBranchHeads(db, client, runId, repo);
   if (!outcome.ok) return null; // failed/throttled — this repo isn't "discovered"; contributes no coverage
+  // §5.A exclusivity backstop (P0): claim this repo's canonical (org, repo) BEFORE any per-branch
+  // write, so a double-scheduled repo fails LOUD rather than racing two fibers on the same rows
+  // under fan-out. The check-then-add is synchronous (no await between .has and .add), so it stays
+  // correct even when sibling processRepo calls run concurrently. Keyed on repo.organization (the
+  // API-canonical owner.login, validated == the requested owner by mapRestRepo) so a case-variant
+  // owner cannot evade it. This never trips in correct operation (owner fold + owner-scope
+  // enforcement guarantee it); it is the honest proof, not a routine branch.
+  const repoKey = `${repo.organization.toLowerCase()}\0${repo.name.toLowerCase()}`;
+  if (scheduledRepoKeys.has(repoKey))
+    throw new Error(`internal: repo ${repo.organization}/${repo.name} scheduled twice in one run — the owner-dedup/branch-exclusivity invariant was violated`);
+  scheduledRepoKeys.add(repoKey);
   const heads = outcome.snapshot.heads;
   // Classify the WHOLE repo up-front (policy → cutoff/cap) via the ONE shared planner. This runs
   // OUTSIDE the discovery catch and BEFORE any per-branch write, so a match-time PolicyMatchError
