@@ -3574,6 +3574,88 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     dbx.close();
   });
 
+  // ── Independent classifier coverage (PR #17 follow-up) ──────────────────────────────────────────
+  // Since the whole-DB fingerprint work, isOwnedOrEmpty/tableShape refuse a COLLATE / ON CONFLICT /
+  // DEFERRABLE / MATCH / duplicate-CHECK deviation as "did not create" BEFORE classifyRunUnitHead runs,
+  // so the AuditDb.open pins for those reasons now accept EITHER layer's message (the widened
+  // /did not create|…/ alternations further down). These tests keep classifyRunUnitHead's OWN per-reason
+  // detection independently pinned by driving the exported migrateV3toV4 seam directly on a stamp-3
+  // connection — the migration classifies the on-disk shape with no ownership preflight ahead of it — so
+  // a regression in the classifier alone (ownership still correct) can no longer pass unnoticed. Mirrors
+  // the "unexpected-dependents guard" test above. STRICT is deliberately absent: tableShape already
+  // fingerprinted pragma_table_list.strict, so this PR did not newly shadow it (the classifier's STRICT
+  // branch was never solely responsible for the AuditDb.open pin).
+  //
+  // Rebuild run_unit_head in-place from a mutated CREATE (rows copied, FK off), recreating the exact
+  // ix_ruh_loc if the base had one, then re-stamp — so the ONLY difference from ours is `mutate`.
+  function forgeRuhInPlace(path: string, mutate: (sql: string) => string, stamp: number): void {
+    const f = new Database(path, { strict: true });
+    const sql = (f.query("SELECT sql FROM sqlite_schema WHERE type='table' AND name='run_unit_head'").get() as { sql: string }).sql;
+    const mutated = mutate(sql);
+    if (mutated === sql) throw new Error("forgeRuhInPlace: mutation was a no-op");
+    const idxSql = (f.query("SELECT sql FROM sqlite_schema WHERE type='index' AND name='ix_ruh_loc'").get() as { sql: string } | null)?.sql ?? null;
+    f.exec("PRAGMA foreign_keys=OFF");
+    f.exec(mutated.replace("CREATE TABLE run_unit_head", "CREATE TABLE run_unit_head__forge"));
+    const cs = (f.query("SELECT name FROM pragma_table_info('run_unit_head')").all() as Array<{ name: string }>).map((c) => c.name).join(",");
+    f.exec(`INSERT INTO run_unit_head__forge (${cs}) SELECT ${cs} FROM run_unit_head`);
+    f.exec("DROP TABLE run_unit_head");
+    f.exec("ALTER TABLE run_unit_head__forge RENAME TO run_unit_head");
+    if (idxSql !== null) f.exec(idxSql);
+    f.exec(`PRAGMA user_version = ${stamp}`);
+    f.close();
+  }
+
+  // Each case: a single-token/CHECK deviation the ownership preflight now shadows, the SPECIFIC reason
+  // classifyRunUnitHead must still name through migrateV3toV4, and the base builder — a v3 twin for the
+  // token / v3-CHECK arms; a physically-v4 table left at stamp 3 for the v4-CHECK arm (classifyRunUnitHead's
+  // "not the exact v4 CHECK set" at the v4-columns branch, which the v3 duplicate cannot reach).
+  const CLASSIFIER_SEAM_CASES: ReadonlyArray<{
+    name: string; base: (p: string) => void; mutate: (sql: string) => string; reason: RegExp;
+  }> = [
+    { name: "COLLATE on a non-PK column", base: buildV3TwinDb,
+      mutate: (s) => s.replace("status TEXT NOT NULL DEFAULT 'scanned'", "status TEXT COLLATE NOCASE NOT NULL DEFAULT 'scanned'"),
+      reason: /declares a COLLATE clause/ },
+    { name: "ON CONFLICT on the primary key", base: buildV3TwinDb,
+      mutate: (s) => s.replace("PRIMARY KEY (run_id, organization, repository, branch)", "PRIMARY KEY (run_id, organization, repository, branch) ON CONFLICT REPLACE"),
+      reason: /declares an ON CONFLICT clause/ },
+    { name: "DEFERRABLE foreign key", base: buildV3TwinDb,
+      mutate: (s) => s.replace("REFERENCES runs(run_id)", "REFERENCES runs(run_id) DEFERRABLE INITIALLY DEFERRED"),
+      reason: /declares a DEFERRABLE foreign key/ },
+    { name: "MATCH foreign key", base: buildV3TwinDb,
+      mutate: (s) => s.replace("REFERENCES runs(run_id)", "REFERENCES runs(run_id) MATCH FULL"),
+      reason: /declares a MATCH clause/ },
+    { name: "duplicated v3 CHECK (v3-columns arm)", base: buildV3TwinDb,
+      mutate: (s) => s.replace("CHECK (status IN ('scanned','skipped-cutoff'))", "CHECK (status IN ('scanned','skipped-cutoff')) CHECK (status IN ('scanned','skipped-cutoff'))"),
+      reason: /not the exact v3 CHECK set/ },
+    { name: "duplicated v4 CHECK (v4-columns arm, physically-v4 under stamp 3)", base: (p) => buildNativeV4(p),
+      mutate: (s) => s.replace(
+        "CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap'))",
+        "CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap')) CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap'))"),
+      reason: /not the exact v4 CHECK set/ },
+  ];
+  for (const c of CLASSIFIER_SEAM_CASES) {
+    test(`classifier names its OWN reason via migrateV3toV4 (ownership preflight shadows it at AuditDb.open): ${c.name}`, () => {
+      const path = nextFile();
+      c.base(path);
+      forgeRuhInPlace(path, c.mutate, 3); // leave it stamp-3 so migrateV3toV4 classifies (never a no-op rebuild)
+      const dbx = new Database(path, { strict: true });
+      dbx.exec("PRAGMA foreign_keys = ON;");
+      const before = (dbx.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n;
+      let msg = "";
+      try {
+        migrateV3toV4(dbx);
+        throw new Error("unreachable: migrateV3toV4 accepted a shadowed deviation");
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(c.reason); // the classifier's OWN reason…
+      expect(msg).not.toMatch(/did not create/); // …never delegated to the ownership layer's message
+      expect(uv(dbx)).toBe(3); // classify-and-refuse: never stamped v4
+      expect((dbx.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n).toBe(before); // rows intact
+      dbx.close();
+    });
+  }
+
   // Replace run_unit_head with a FOREIGN shape at stamp 4 (same audit tables otherwise) to probe the
   // fingerprint's fail-closed properties.
   function forgeRuh(path: string, ruhCreate: string): void {
