@@ -128,6 +128,12 @@ describe("classifyRepository — exact-first, glob, case-insensitive, fail-close
     expect(classifyRepository(p, "acme/repo[x]")).toBe(true); // exact-equality catches it (fail-closed)
     expect(classifyRepository(p, "acme/repox")).toBe(true); // and the glob still matches "acme/repox"
   });
+  test("exact-equality short-circuits BEFORE the SAME entry's glob: a throwing glob on an exact-named entry is never invoked", () => {
+    // Pins exact-BEFORE-glob per pattern: if the exact check ran after (or instead of before) the glob,
+    // this entry's throwing glob would fire and raise RepoPolicyMatchError instead of returning true.
+    const p = [cp("acme/repo", throwingGlob(new Error("glob must not run for an exact-named entry")))];
+    expect(classifyRepository(p, "acme/repo")).toBe(true);
+  });
   test("a deny match at a LATER pattern still excludes (iterates the whole list)", () => {
     const p = compileRepositoryPolicy(["a/keep", "z/*"]);
     expect(classifyRepository(p, "z/dropme")).toBe(true);

@@ -418,14 +418,35 @@ describe("path encoding + repo shaping", () => {
       expect(excluded).toEqual(["o/newest"]); // denylist-only, original case
     });
 
-    test("deny wins over archived: a denied+archived repo is dropped by the denylist FIRST (even when includeArchived would keep it)", () => {
+    test("deny runs BEFORE the archived filter: a denied+archived repo is ATTRIBUTED to the denylist, not archived-dropped (includeArchived:false)", () => {
       const repos = [mk("keep", "2025-01-01T00:00:00Z"), mk("legacy", "2025-02-01T00:00:00Z", { archived: true })];
       const policy = compileRepositoryPolicy(["o/legacy"]);
-      // includeArchived:true means the archived filter would KEEP "legacy" — so if it is dropped, ONLY the
-      // denylist can have dropped it, proving deny runs first.
-      const { kept, excluded } = filterSortCapRepos(repos, { policy, includeArchived: true, includeForks: false, maxReposPerOrg: null });
+      // includeArchived:FALSE means the archived filter WOULD drop "legacy" — so its appearance in
+      // `excluded` proves denial ran FIRST. (With includeArchived:true both orderings agree, so this
+      // MUST use false to actually pin the ordering — a deny-after-archived mutation would leave
+      // `excluded` empty here.)
+      const { kept, excluded } = filterSortCapRepos(repos, { policy, includeArchived: false, includeForks: false, maxReposPerOrg: null });
       expect(kept.map((r) => r.name)).toEqual(["keep"]);
-      expect(excluded).toEqual(["o/legacy"]);
+      expect(excluded).toEqual(["o/legacy"]); // denylist-attributed, NOT silently archived-dropped
+    });
+
+    test("deny runs BEFORE the fork filter: a denied+forked repo is ATTRIBUTED to the denylist (includeForks:false)", () => {
+      const repos = [mk("keep", "2025-01-01T00:00:00Z"), mk("legacy", "2025-02-01T00:00:00Z", { fork: true })];
+      const policy = compileRepositoryPolicy(["o/legacy"]);
+      const { kept, excluded } = filterSortCapRepos(repos, { policy, includeArchived: false, includeForks: false, maxReposPerOrg: null });
+      expect(kept.map((r) => r.name)).toEqual(["keep"]);
+      expect(excluded).toEqual(["o/legacy"]); // deny-after-fork mutation would leave this empty
+    });
+
+    test("the fold is ASCII-only at the filter too: a non-ASCII name is NOT over-folded (a toLowerCase swap would wrongly exclude it)", () => {
+      // Ä (U+00C4) vs ä (U+00E4): an ASCII-only fold leaves both untouched, so the lowercase pattern
+      // "o/ä" neither exact-matches nor glob-matches the repo "o/Ä" → NOT excluded. String.toLowerCase
+      // would fold Ä→ä and wrongly deny it, failing this test.
+      const repos = [mk("Ä", "2025-01-01T00:00:00Z")];
+      const policy = compileRepositoryPolicy(["o/ä"]);
+      const { kept, excluded } = filterSortCapRepos(repos, { policy, includeArchived: false, includeForks: false, maxReposPerOrg: null });
+      expect(excluded).toEqual([]);
+      expect(kept.map((r) => r.name)).toEqual(["Ä"]);
     });
 
     test("excluded is denylist-ONLY: archived/fork/past-cap drops never appear in it", () => {
