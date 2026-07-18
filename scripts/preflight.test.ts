@@ -105,6 +105,14 @@ describe("runPreflight — malformed `gh api user` login (fail-closed identity)"
   test("invalid JSON is distinguished from a malformed-shape login", async () => {
     await expect(runPreflight(clientWithUserBody("{not json"), config, deps)).rejects.toThrow(/could not parse/);
   });
+  test("a non-CANONICAL login (dot segment / separator / control) is rejected — a fabricated owner can't become the scan authority", async () => {
+    // The login becomes an effective owner (ownerResolve). A "." / ".." / separator / control login
+    // would flow in as an authority; if user/repos is then empty, no row reaches mapRestRepo and the
+    // malformed authority yields a SILENT zero-repo run. Reject it loud at the source.
+    for (const login of ["..", ".", "a/b", "a b", "a" + String.fromCharCode(0x85) + "b"]) {
+      await expect(runPreflight(clientWithUserBody(JSON.stringify({ login })), config, deps)).rejects.toThrow(/non-canonical login/);
+    }
+  });
 });
 
 describe("runPreflight registry probe deadline (§5.E hardening)", () => {

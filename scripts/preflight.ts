@@ -4,7 +4,7 @@
 // actionable remediation. It verifies ACCESS + SCOPE EVIDENCE only — it does NOT resolve or
 // persist the effective owner list (that is §8 step 3, after preflight).
 
-import type { GithubClient } from "./github.ts";
+import { isCanonicalIdentity, type GithubClient } from "./github.ts";
 import type { Config } from "./config.ts";
 import { FETCH_TIMEOUT_MS } from "./apiSurface.ts";
 
@@ -129,6 +129,12 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
       : undefined;
   if (typeof rawLogin !== "string" || rawLogin === "")
     throw new PreflightError("`gh api user` returned no valid login (expected a non-empty string)");
+  // The login becomes an effective scan owner (ownerResolve). Reject a non-canonical value (dot
+  // segment / separator / control / whitespace) at the source: it would otherwise flow in as a
+  // fabricated authority, and an empty user/repos listing would then produce a SILENT zero-repo run
+  // rather than a loud failure. Same isCanonicalIdentity guard mapRestRepo/listOrgMemberships apply.
+  if (!isCanonicalIdentity(rawLogin))
+    throw new PreflightError("`gh api user` returned a non-canonical login — refusing to use it as a scan owner");
   const login = rawLogin;
   const discoveryMode = config.organizations === null;
   let scopeEvidence: PreflightReport["discoveryScopeEvidence"] = "not-needed";

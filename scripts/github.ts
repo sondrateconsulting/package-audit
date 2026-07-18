@@ -728,7 +728,7 @@ function isCanonicalTreePath(p: string): boolean {
 // NOT enforce the full GitHub name grammar (GHES/legacy differ); it only closes the structural
 // scope-steering vectors — the same fail-closed posture isCanonicalTreePath applies to tree paths.
 const IDENTITY_REJECT_RE = /[\p{Cc}\s/\\]/u;
-function isCanonicalIdentity(s: string): boolean {
+export function isCanonicalIdentity(s: string): boolean {
   return s.length > 0 && s !== "." && s !== ".." && !IDENTITY_REJECT_RE.test(s);
 }
 
