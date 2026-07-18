@@ -1,6 +1,6 @@
 import { expect, test, describe, afterAll, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso, type RunRecord, type UnitHeadStatus, type UsageType } from "./db.ts";
@@ -9,6 +9,8 @@ import {
   main, parseCompareArgs, runCompare, type CompareEnvelope,
 } from "./compare.ts";
 import { ArgsError } from "./args.ts";
+import { buildReport } from "./report.ts";
+import { exportRun } from "./export.ts";
 import type { Config } from "./config.ts";
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
@@ -200,15 +202,15 @@ describe("buildCompare — policy churn", () => {
     phead(db, runB.runId, "main", { isDefaultBranch: true });
     // entering: clean-scanned in A → deny-excluded in B
     phead(db, runA.runId, "entering", { isDefaultBranch: false });
-    phead(db, runB.runId, "entering", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
+    phead(db, runB.runId, "entering", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "enter*" });
     // leaving: deny-excluded in A → clean-scanned in B
-    phead(db, runA.runId, "leaving", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
+    phead(db, runA.runId, "leaving", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "leav*" });
     phead(db, runB.runId, "leaving", { isDefaultBranch: false });
     // reclass: excluded both sides but the causing pattern changed
-    phead(db, runA.runId, "reclass", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feature/*" });
-    phead(db, runB.runId, "reclass", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "feat/*" });
+    phead(db, runA.runId, "reclass", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "rec*" });
+    phead(db, runB.runId, "reclass", { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", pattern: "reclass" });
     // override-change: default-override carrying a counterfactual in A → plain clean default in B (neither APPLIED)
-    phead(db, runA.runId, "trunk", { isDefaultBranch: true, policyStatus: "excluded-by-deny", pattern: "release/*" });
+    phead(db, runA.runId, "trunk", { isDefaultBranch: true, policyStatus: "excluded-by-deny", pattern: "tr*" });
     phead(db, runB.runId, "trunk", { isDefaultBranch: true });
     // only-in-A and only-in-B branches are NOT classified (absence has many causes)
     phead(db, runA.runId, "gone", { isDefaultBranch: false });
@@ -228,11 +230,11 @@ describe("buildCompare — policy churn", () => {
     expect(churn.enteredExclusion[0]).toEqual({
       organization: "org-a", repository: "svc", branch: "entering",
       runA: { status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, policyApplied: false, defaultOverride: false },
-      runB: { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*", policyApplied: true, defaultOverride: false },
+      runB: { status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "enter*", policyApplied: true, defaultOverride: false },
     });
     // reclassified carries the pattern change explicitly
-    expect(churn.reclassifiedExclusion[0]!.runA.policyMatchedPattern).toBe("feature/*");
-    expect(churn.reclassifiedExclusion[0]!.runB.policyMatchedPattern).toBe("feat/*");
+    expect(churn.reclassifiedExclusion[0]!.runA.policyMatchedPattern).toBe("rec*");
+    expect(churn.reclassifiedExclusion[0]!.runB.policyMatchedPattern).toBe("reclass");
     db.close();
   });
 
@@ -429,6 +431,74 @@ describe("buildCompare — policy churn", () => {
       /outside the known domain/,
     );
     db2.close();
+  });
+
+  test("read gate stays glob-free: a legacy deny row whose pattern does NOT match its branch is read VERBATIM by report, export, AND compare (never re-validated)", () => {
+    // The write chokepoint (assertRunUnitHeadInvariants → denyPatternMatchesBranch) rejects an
+    // excluded-by-deny row whose stored pattern does not match its branch. The read surfaces
+    // DELIBERATELY do not re-run that glob check — Bun.Glob semantics are version-sensitive, so
+    // re-evaluating history under a newer engine could refuse rows that were true when written
+    // (policyDisposition.ts's "ONE deliberate exception"; the write-time-only trust boundary). So a
+    // pre-verifier / raw-SQL / foreign row with an incoherent attribution must stay READABLE and be
+    // surfaced verbatim, never throw. This pins that contract on all three read surfaces at once
+    // (previously exercised only incidentally). Raw-inserted to bypass the chokepoint; the row is
+    // otherwise fully valid — every SQLite CHECK holds. "release/*" does NOT match "legacy".
+    const path = nextFile();
+    const db = AuditDb.open({ sqlitePath: path });
+    const runA = startCompleted(db, ["expo"]);
+    const runB = startCompleted(db, ["expo"]);
+    phead(db, runA.runId, "main", { isDefaultBranch: true });
+    phead(db, runB.runId, "main", { isDefaultBranch: true });
+    phead(db, runA.runId, "legacy", { isDefaultBranch: false }); // clean-scanned in A → ENTERS exclusion in B
+    const [runAId, runBId] = [runA.runId, runB.runId];
+    db.close();
+    const forge = new Database(path, { strict: true }); // raw INSERT bypasses the write chokepoint (every SQLite CHECK still holds)
+    forge
+      .query(
+        `INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date)
+         VALUES (?, 'org-a', 'svc', 'legacy', '', 'policy-excluded', 0, 'excluded-by-deny', 'release/*', '2025-06-01T00:00:00Z')`,
+      )
+      .run(runBId);
+    forge.close();
+    const db2 = AuditDb.open({ sqlitePath: path });
+    const rB = db2.getRun(runBId)!;
+    const out = mkdtempSync(join(tmpdir(), "readgate-export-"));
+    // Prove the BUILDER read path is GLOB-FREE, not merely non-throwing: install a Bun.Glob that throws
+    // on construction, so a read surface that tried to re-evaluate the stored pattern (constructing a
+    // glob but ignoring its false result) fails HERE instead of passing. buildReport / exportRun /
+    // buildCompare and the shared read gate construct no Bun.Glob for any reason, so this cannot fire
+    // spuriously — this pins the builders, not the CLI entrypoints (which legitimately compile configured
+    // globs while LOADING config).
+    const originalGlob = Bun.Glob;
+    (Bun as { Glob: unknown }).Glob = class {
+      constructor() {
+        throw new Error("read gate constructed a Bun.Glob — report/export/compare must stay glob-free (write-time-only attestation)");
+      }
+    };
+    try {
+      // (1) report surfaces the incoherent attribution verbatim — no re-match, no glob constructed
+      const legacyInReport = buildReport(db2, rB).scanScope.policyBranches.find((b) => b.branch === "legacy");
+      expect(legacyInReport).toEqual({
+        organization: "org-a", repository: "svc", branch: "legacy",
+        disposition: "excluded", policyStatus: "excluded-by-deny", matchedPattern: "release/*",
+      });
+      // (2) the JSONL export writes it byte-faithful (release/* is non-formula, so the default CSV's
+      //     apostrophe formula-defense would not trigger here either)
+      exportRun(db2, rB, out, { raw: false });
+      const legacyLine = readFileSync(join(out, "xray", "run_unit_head.jsonl"), "utf8")
+        .split("\n").filter((l) => l.length > 0)
+        .map((l) => JSON.parse(l) as { branch: string; policy_matched_pattern: string })
+        .find((r) => r.branch === "legacy");
+      expect(legacyLine?.policy_matched_pattern).toBe("release/*");
+      // (3) compare files it under enteredExclusion carrying the incoherent pattern verbatim — no re-validation, no glob
+      const churn = buildCompare(db2, db2.getRun(runAId)!, rB).compare.policyChurn;
+      if (churn.available !== true) throw new Error("expected churn available");
+      expect(churn.enteredExclusion.find((e) => e.branch === "legacy")?.runB.policyMatchedPattern).toBe("release/*");
+    } finally {
+      (Bun as { Glob: typeof Bun.Glob }).Glob = originalGlob;
+      rmSync(out, { recursive: true, force: true });
+      db2.close();
+    }
   });
 
   test("churn is unavailable when EITHER run carries a pre-v4 NULL scanned_commit_date (unknown provenance)", () => {

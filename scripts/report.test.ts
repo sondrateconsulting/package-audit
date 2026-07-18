@@ -145,7 +145,8 @@ describe("buildReport (§7)", () => {
     head("main", "scanned", { isDefaultBranch: true });
     head("develop", "scanned", { isDefaultBranch: false });
     const hostilePattern = "release/<img src=x onerror=alert(1)>*"; // carried verbatim in the JSON model
-    head("release/9.0", "scanned", { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: hostilePattern });
+    const hostileBranch = "release/<img src=x onerror=alert(1)>9.0"; // matches the pattern (write-time verification) AND probes branch-cell escaping
+    head(hostileBranch, "scanned", { isDefaultBranch: true, policyStatus: "excluded-by-deny", policyMatchedPattern: hostilePattern });
     head("stale", "skipped-cutoff"); // genuine cutoff (no policy) — is_default_branch may stay null
     // policy-excluded + past-cap rows are known non-defaults → is_default_branch MUST be false
     head("feature/x", "policy-excluded", { isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*" });
@@ -168,10 +169,10 @@ describe("buildReport (§7)", () => {
     expect(report.scanScope).toEqual({
       excludedByDeny: 1, // feature/x — the default-override deny does NOT count as an exclusion
       excludedByAllow: 1, // wip/y
-      defaultBranchPolicyOverrides: 1, // release/9.0
+      defaultBranchPolicyOverrides: 1, // the hostile-named default
       policyBranches: [
         { organization: "org-a", repository: "svc", branch: "feature/x", disposition: "excluded", policyStatus: "excluded-by-deny", matchedPattern: "feature/*" },
-        { organization: "org-a", repository: "svc", branch: "release/9.0", disposition: "scanned-default-override", policyStatus: "excluded-by-deny", matchedPattern: hostilePattern },
+        { organization: "org-a", repository: "svc", branch: hostileBranch, disposition: "scanned-default-override", policyStatus: "excluded-by-deny", matchedPattern: hostilePattern },
         { organization: "org-a", repository: "svc", branch: "wip/y", disposition: "excluded", policyStatus: "excluded-by-allow", matchedPattern: null },
       ],
       provenance: "complete", // every head carries a non-null scanned_commit_date

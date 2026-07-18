@@ -25,10 +25,13 @@ export const KNOWN_OPERATOR_ERRORS: ReadonlySet<string> = new Set([
   //                       config-triggerable when two tracked packages sanitize/alias to one
   //                       dossier filename — and a non-real xray/ dir (symlink or non-directory); lifecycle bugs there
   //                       are plain Errors and keep their stacks)
-  "PolicyMatchError", // branchPolicy.ts — a configured branch glob's compiled matcher threw at
-  //                     .match() time (a pattern Bun.Glob accepted at construction; none is
-  //                     currently known to do this — the class is fail-closed insurance).
-  //                     Operator-actionable (fix the pattern); the run driver fails the run and
+  "PolicyMatchError", // branchPolicy.ts — a branch policy glob failed to evaluate, in one of two
+  //                     fail-closed ways: (a) a compiled matcher threw at .match() (or construction)
+  //                     time — a pattern Bun.Glob accepted but cannot evaluate; none is currently
+  //                     known to do this, so the class is insurance; (b) the write chokepoint
+  //                     (db.ts) found a stored excluded-by-deny row whose policy_matched_pattern does
+  //                     NOT match the branch it claims to have excluded (write-time attribution
+  //                     coherence). Both are operator-actionable; the run driver fails the run and
   //                     rethrows it UNCHANGED (unlike BranchPolicyError, which loadConfig always
   //                     converts to ConfigError).
 ]);
