@@ -153,6 +153,14 @@ describe("concurrency defaults + ceiling (§5 fan-out)", () => {
     expect(norm({ ...baseRaw(), concurrency: { repositories: 12 } }).concurrency)
       .toEqual({ organizations: 3, repositories: 12, branches: 4 });
   });
+  test("a null block and null keys fall back to defaults (parity with the schema's ['type','null'] convention)", () => {
+    // The runtime treats null like omitted (config.ts normalizeConcurrency), and config.schema.json
+    // now types the block and every key ["…","null"] to match — so an explicit null validates the same
+    // in both. Pins that parity so the two can never drift.
+    expect(norm({ ...baseRaw(), concurrency: null }).concurrency).toEqual({ organizations: 3, repositories: 8, branches: 4 });
+    expect(norm({ ...baseRaw(), concurrency: { organizations: null, repositories: 12, branches: null } }).concurrency)
+      .toEqual({ organizations: 3, repositories: 12, branches: 4 });
+  });
   test("the documented ceiling (64) is inclusive; 65 is rejected on every key", () => {
     expect(norm({ ...baseRaw(), concurrency: { organizations: 64, repositories: 64, branches: 64 } }).concurrency)
       .toEqual({ organizations: 64, repositories: 64, branches: 64 });

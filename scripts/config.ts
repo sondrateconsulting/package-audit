@@ -305,7 +305,7 @@ function normalizeConcurrency(o: Record<string, unknown>): Concurrency {
     const v = (c as Record<string, unknown>)[k];
     if (v === undefined || v === null) return DEFAULT_CONCURRENCY[k]; // per-key optional → its default
     if (!isPosInt(v)) fail(`concurrency.${k} must be a positive integer${concurrencyListHint(k, v)}`);
-    if (v > MAX_CONCURRENCY) fail(`concurrency.${k} must be <= ${MAX_CONCURRENCY} (got ${v}) — a larger value would dispatch an unbounded number of fibers with no throughput gain (the gh cap still bounds real network work)`);
+    if (v > MAX_CONCURRENCY) fail(`concurrency.${k} must be <= ${MAX_CONCURRENCY} (got ${v}) — past this ceiling a larger value yields no throughput gain (organizations/branches only queue more fibers; repositories only raises the subprocess cap) and just risks exhausting memory/handles`);
     return v;
   };
   return { organizations: read("organizations"), repositories: read("repositories"), branches: read("branches") };

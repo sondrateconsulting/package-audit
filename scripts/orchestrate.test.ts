@@ -1724,11 +1724,11 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("a PolicyMatchError from ONE unit fails the repo AFTER draining every sibling (settle-all, branches:4)", async () => {
+  test("a fatal from ONE unit fails the repo and STOPS dispatching further units (fail-fast, branches:1)", async () => {
     const root = mkdtempSync(join(tmpdir(), "fanout-fatal-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startRun(db);
-    const nodes = nodesN(6);
+    const nodes = nodesN(6); // plan.toScan order: main, b1, b2, b3, b4, b5
     // inject a write-time PolicyMatchError from exactly ONE unit's scanned upsert (b3)
     const injected = new PolicyMatchError("excludeBranches", "x*", "b3", new Error("simulated write-time attribution incoherence"));
     const realUpsert = db.upsertRunUnitHead.bind(db);
@@ -1738,14 +1738,25 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
     };
     const client = makeClient(root, async (_bin, args) =>
       args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    // branches:1 makes dispatch strictly sequential, so the fail-fast is deterministic: units BEFORE b3
+    // drain, b3 throws the fatal → trips the local Aborter → no unit AFTER b3 is ever dispatched.
+    const seqConfig = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 1 } };
     let thrown: unknown;
     await captureJsonl(async () => {
-      try { await processRepo(db, client, rt(fanoutConfig(root), "h"), runId, "org-a", repo, [], new Set()); }
+      try { await processRepo(db, client, rt(seqConfig, "h"), runId, "org-a", repo, [], new Set()); }
       catch (e) { thrown = e; }
     });
     expect(thrown).toBe(injected); // the fatal is rethrown (deterministic: first rejection in plan.toScan order)
-    // settle-all, NOT fail-fast: the other 5 branches were fully drained and their scanned rows written
-    expect((db.read(`SELECT COUNT(*) AS n FROM run_unit_head WHERE run_id = ? AND status = 'scanned'`).get(runId) as { n: number }).n).toBe(5);
+    // At width 1 dispatch is strictly ordered, so the fatal at b3 (index 2 of plan.toScan) means exactly
+    // the 2 units BEFORE it scanned and the fatal branch was dispatched — 3 work-queue units total. Every
+    // unit AFTER b3 was never dispatched (the local Aborter stopped the pool), so it has NO work-queue row.
+    // This is the fail-fast the old sequential loop had — NOT the settle-all-continue that scanned all 5.
+    const scannedCount = (db.read(`SELECT COUNT(*) AS n FROM run_unit_head WHERE run_id = ? AND status = 'scanned'`).get(runId) as { n: number }).n;
+    expect(scannedCount).toBe(2); // only the units before b3 drained — NOT all 5 siblings
+    const dispatched = ["main", "b1", "b2", "b3", "b4", "b5"].filter(
+      (br) => db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: br }) !== null);
+    expect(dispatched.length).toBe(3); // exactly the 2 scanned + the fatal b3; the other 3 were skipped (no row)
+    expect(dispatched).toContain("b3"); // the fatal unit WAS dispatched (enqueued, then threw mid-scan)
     db.close();
     rmSync(root, { recursive: true, force: true });
   });

@@ -171,7 +171,7 @@ The optional `concurrency` block sets three fan-out widths (all default when omi
 | `branches` | 4 | Branch-units scanned concurrently **per repo** (repos within an owner stay sequential). |
 | `repositories` | 8 | **Global** in-flight cap on `gh`/`git`/`tar` subprocesses. |
 
-`repositories` is the network-politeness governor, **not** a repo-loop parallelism degree despite its name: no matter how `organizations × branches` compose, at most `repositories` subprocesses ever run at once. So the two fan-out knobs govern how much work is *dispatched*, while `repositories` bounds the actual *network* concurrency (a cache hit consumes no slot). Higher values speed up large estates; `organizations: 1, branches: 1` reproduces a fully sequential run.
+`repositories` is the network-politeness governor, **not** a repo-loop parallelism degree despite its name: no matter how `organizations × branches` compose, at most `repositories` subprocesses ever run at once. So the two fan-out knobs govern how much work is *dispatched*, while `repositories` bounds the actual *network* concurrency (an immutable, SHA-pinned cache hit is served with no subprocess, so it consumes no slot; a conditional revalidation still spends one on its `304` round-trip). Higher values speed up large estates; `organizations: 1, branches: 1` reproduces a fully sequential run — one owner, one branch-unit at a time, and a fatal stops dispatching further units at once.
 
 Tuning `concurrency` never changes `config_hash` — it is excluded from the hash, so raising or lowering these knobs between runs never orphans resumable work. (`concurrency.branches` is unrelated to the root-level `branches` allow/deny list above; they merely share the word.)
 

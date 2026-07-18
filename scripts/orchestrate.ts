@@ -489,52 +489,73 @@ export async function processRepo(
   // repo's discover→plan→scan→reconcile must be atomic, and this pool drains fully before the
   // reconcile below. Only the DEFAULT may carry a policy counterfactual (the override); a non-default
   // to-scan branch is necessarily no-exclusion (asserted, fail-closed).
+  //
+  // Fatal fail-fast: a LOCAL Aborter stops NEW unit dispatch the instant any unit throws a fatal
+  // (PolicyMatchError or the internal bucket-wiring assertion), matching the run-level owner Aborter's
+  // discipline one level down — so branches:1 reproduces the old sequential loop's fail-fast, and a
+  // broken policy does not re-throw against every remaining branch. It is composed with the incoming
+  // run-level signal (a sibling owner's fatal trips this pool too). Settle-all is preserved: units
+  // already IN FLIGHT still drain (the drain-safety §7 depends on for db.close()); only undispatched
+  // units are skipped.
+  const branchAbort = new Aborter();
+  if (signal !== undefined) signal.onAbort(() => branchAbort.abort()); // run-level fatal → stop this pool too (fires immediately if already aborted)
   const unitResults = await boundedPool(plan.toScan, config.concurrency.branches, async (d) => {
-    if (signal?.aborted) return; // a fatal in a sibling owner/repo tripped the run — dispatch no new units
-    const h = d.head;
-    if (!d.isDefaultBranch && d.rawPolicyResult.kind !== "no-exclusion")
-      throw new Error(`internal: non-default scanned branch ${repo.organization}/${repo.name}@${h.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
-    const key = keyFor(h.name);
-    const attr = policyAttribution(d.rawPolicyResult); // (null, null) unless the default-branch override
-    db.enqueueUnit(key, runId);
-    const unit = db.getUnit(key);
-    // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is reused
-    // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate. This
-    // enqueue→get→upsert→setStatus RMW is await-free, so it runs to completion atomically vs siblings.
-    if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
-      db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
-      db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
-      logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
-      return;
-    }
-
-    db.setUnitStatus(key, { status: "in_progress", runId });
+    if (branchAbort.aborted) return; // a fatal (this repo's own or a sibling owner's) tripped the run — dispatch no new units
     try {
-      const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
-      db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
-    } catch (e) {
-      // A PolicyMatchError is FATAL by contract — never downgraded to a per-unit scan error. It
-      // escapes this worker; boundedPool captures it and processRepo rethrows it below AFTER draining
-      // every sibling unit. Today it can arise from the write chokepoint's attribution-coherence
-      // verification inside processUnit's upserts.
-      if (e instanceof PolicyMatchError) throw e;
-      if (e instanceof ThrottleExhausted) {
-        // §4: throttle exhaustion is NOT a permanent unit failure — reset to pending so a LATER run
-        // retries it. No same-run spin: the pool dispatches each fixed plan.toScan unit exactly once
-        // and nothing re-reads pending units within the run.
-        db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
-        logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
-      } else {
-        db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
-        db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
-        logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
+      const h = d.head;
+      if (!d.isDefaultBranch && d.rawPolicyResult.kind !== "no-exclusion")
+        throw new Error(`internal: non-default scanned branch ${repo.organization}/${repo.name}@${h.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
+      const key = keyFor(h.name);
+      const attr = policyAttribution(d.rawPolicyResult); // (null, null) unless the default-branch override
+      db.enqueueUnit(key, runId);
+      const unit = db.getUnit(key);
+      // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is reused
+      // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate. This
+      // enqueue→get→upsert→setStatus RMW is await-free, so it runs to completion atomically vs siblings.
+      if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
+        db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
+        db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
+        logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
+        return;
       }
+
+      db.setUnitStatus(key, { status: "in_progress", runId });
+      try {
+        const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
+        db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
+      } catch (e) {
+        // A PolicyMatchError is FATAL by contract — never downgraded to a per-unit scan error. It
+        // escapes to the outer catch, which trips branchAbort; boundedPool captures it and processRepo
+        // rethrows it below AFTER draining every in-flight sibling. Today it can arise from the write
+        // chokepoint's attribution-coherence verification inside processUnit's upserts.
+        if (e instanceof PolicyMatchError) throw e;
+        if (e instanceof ThrottleExhausted) {
+          // §4: throttle exhaustion is NOT a permanent unit failure — reset to pending so a LATER run
+          // retries it. No same-run spin: the pool dispatches each fixed plan.toScan unit exactly once
+          // and nothing re-reads pending units within the run. Handled here (not a fatal), so it never
+          // trips branchAbort — one throttled branch must not cancel its siblings.
+          db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
+          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
+        } else {
+          db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
+          db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
+          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
+        }
+      }
+    } catch (e) {
+      // A fatal escaped this unit (PolicyMatchError, or the internal bucket-wiring assertion — the
+      // handled throttle/scan-error cases above never reach here). Trip branchAbort so the pool
+      // dispatches NO further units at once (fail-fast), then rethrow so boundedPool captures it and
+      // processRepo surfaces the first rejection after the in-flight drain.
+      branchAbort.abort();
+      throw e;
     }
-  }, { signal });
+  }, { signal: branchAbort });
   // A PolicyMatchError (or any other escaping fatal — the internal bucket-wiring assertion, a DB
-  // write failure) from ANY unit is FATAL: every sibling has already drained (settle-all), so rethrow
-  // the FIRST rejection in plan.toScan order (deterministic precedence). runScan's catch then fails
-  // the run. This runs BEFORE reconciliation, exactly as the old sequential rethrow skipped it.
+  // write failure) from ANY unit is FATAL: branchAbort has already stopped new dispatch and every
+  // IN-FLIGHT sibling has drained (settle-all), so rethrow the FIRST rejection in plan.toScan order
+  // (deterministic precedence). runScan's catch then fails the run. This runs BEFORE reconciliation,
+  // exactly as the old sequential rethrow skipped it.
   for (const r of unitResults) if (r.status === "rejected") throw r.reason;
   // Stale-row reconciliation: this repo was discovered COMPLETELY (ok:true, reached only past the early
   // `!outcome.ok` return; listBranchHeads fails closed on any structural incompleteness, so `heads` is

@@ -1251,11 +1251,21 @@ export class GithubClient {
   //      tail stays unfunded and waitBucket throws ThrottleExhausted for it instead of over-sleeping.
   private armBucketPause(bucket: Bucket, untilMs: number, now: number): void {
     bucket.pausedUntilMs = Math.max(bucket.pausedUntilMs, untilMs);
-    const delta = Math.max(0, untilMs - Math.max(now, bucket.accountedUntilMs));
-    if (delta === 0) return; // window already funded or entirely in the past — nothing new to charge
+    // Fund toward the PUBLISHED horizon (pausedUntilMs), not this candidate's raw untilMs. Every
+    // caller sleeps to pausedUntilMs — or throws — so that horizon is the only wall-clock a charge can
+    // buy. Charging raw untilMs let a SHORTER pause arriving under an already-published-but-UNFUNDED
+    // longer tail spend budget on coverage no caller ever sleeps (waitBucket throws for the WHOLE
+    // window while the tail is unfunded): a phantom charge that, under fan-out where sibling callers
+    // arm the shared bucket out of order, could drain the budget for time never actually paused.
+    // Targeting the horizon also keeps the two invariants intact: N callers arming the SAME window
+    // charge it once (the second sees delta 0), and an already-unfundable horizon stays unfunded (the
+    // delta re-overflows and funds nothing).
+    const horizon = bucket.pausedUntilMs;
+    const delta = Math.max(0, horizon - Math.max(now, bucket.accountedUntilMs));
+    if (delta === 0) return; // horizon already funded or entirely in the past — nothing new to charge
     if (bucket.budgetSpentMs + delta > MAX_TOTAL_PAUSE_MS) return; // overflow: published, unfunded tail
     bucket.budgetSpentMs += delta;
-    bucket.accountedUntilMs = Math.max(bucket.accountedUntilMs, untilMs);
+    bucket.accountedUntilMs = horizon;
   }
 
   // MUST stay PURE (no state, no jitter, no counters): it is evaluated inside analyze closures whose
@@ -1311,7 +1321,7 @@ export class GithubClient {
     // through to the throw below without sleeping the pause it published for its siblings).
     type RestOutcome =
       | { kind: "ok"; parsed: HttpResponse }
-      | { kind: "not-modified"; headers: Record<string, string>; etag: string | null; body: string }
+      | { kind: "not-modified"; headers: Record<string, string>; body: string }
       | { kind: "fatal"; status: number; ssoRequired: boolean; message: string }
       | { kind: "no-response"; stderr: string }
       | { kind: "truncated"; exitCode: number; stderr: string }
@@ -1322,7 +1332,7 @@ export class GithubClient {
         // no HTTP response at all (network/auth plumbing failure; diagnostics on stderr)
         if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
         if (parsed.status === 304 && cached !== null && cached.responseBody !== null)
-          return { outcome: { kind: "not-modified", headers: parsed.headers, etag: cached.etag, body: cached.responseBody }, pauseUntilMs: null };
+          return { outcome: { kind: "not-modified", headers: parsed.headers, body: cached.responseBody }, pauseUntilMs: null };
         // A parsed SUCCESS from a FAILED gh process is untrustworthy: gh api -i streams the body
         // AFTER the header block, so a mid-body transport cut leaves a well-formed 200 head + a
         // TRUNCATED body + a nonzero exit — invisible to every status gate. HTTP-error statuses also
@@ -1344,7 +1354,13 @@ export class GithubClient {
         throw new GithubApiError(`gh api produced no HTTP response: ${outcome.stderr.trim().slice(0, 300)}`, { endpoint });
       }
       if (outcome.kind === "not-modified") {
-        if (!noStore) this.db?.putApiCache({ method: "GET", url: key, variantHash: accept, etag: outcome.etag, responseBody: outcome.body });
+        // A 304 means the cached row is still valid — it ALREADY holds this exact body+etag (the
+        // If-None-Match we sent was read FROM it), so re-persisting it is pure redundancy. Skipping it
+        // also removes the one shared-row cache write that would span the network await: a delayed 304
+        // (old body/etag) rewriting the row could clobber a NEWER 200 a concurrent fiber wrote to the
+        // same key. Today every fan-out cache key is SHA-pinned immutable (a clobber would be
+        // byte-identical anyway), but keeping the cache RMW await-free holds even if a future
+        // mutable+cached endpoint is ever fetched under fan-out. The served body is unchanged.
         return { status: 200, headers: outcome.headers, body: outcome.body };
       }
       if (outcome.kind === "truncated") {

@@ -499,6 +499,24 @@ describe("restGet caching + conditional requests", () => {
     db.close();
   });
 
+  test("a 304 re-serve does NOT re-write the cache row — the RMW stays await-free (no concurrent clobber of a newer 200)", async () => {
+    // The cached row already holds this exact body+etag (our If-None-Match was read FROM it), so the
+    // 304's former re-persist was pure redundancy — and the ONE api_cache write that spanned the
+    // network await. Dropping it keeps the read-modify-write await-free, so under fan-out a delayed 304
+    // can never clobber a NEWER 200 a concurrent fiber wrote to the same key.
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { client } = makeClient(
+      [ok(http(200, { etag: 'W/"e1"' }, `{"a":1}`)), err(`HTTP/2.0 304 Not Modified\r\nEtag: W/"e1"`, "gh: HTTP 304")],
+      { db },
+    );
+    await client.restGet("user/orgs?per_page=100&page=1"); // 200 seeds the cache (one write)
+    const spy = countCacheAccess(db); // count AFTER the seed
+    const second = await client.restGet("user/orgs?per_page=100&page=1"); // 304 → serves the cached body
+    expect(second.body).toBe(`{"a":1}`); // still served correctly
+    expect(spy.writes).toBe(0); // the redundant 304 rewrite is gone (old code called putApiCache here)
+    db.close();
+  });
+
   const SHA = "0123456789abcdef0123456789abcdef01234567"; // immutable caching requires a real object id
 
   test("immutable (SHA-pinned) URLs are served from cache with ZERO spawns", async () => {
@@ -1227,6 +1245,36 @@ describe("throttle wait clamping (§4 hardening)", () => {
     const res = await client.restGet("rate_limit");
     expect(res.body).toBe(`{"ok":1}`);
     expect(sleeps.length).toBe(sleepsBefore + 1); // the published final primary is waited exactly once
+  });
+
+  test("armBucketPause funds the PUBLISHED horizon, not a shorter pause under an unfunded tail (§4 — no phantom budget charge)", () => {
+    // Regression for the fan-out shadow window: once a LONGER pause is published but left UNFUNDED
+    // (budget overflow), every caller sleeps to that horizon or throws — so a SHORTER pause arriving
+    // afterward must NOT spend budget on coverage nobody ever waits. The old raw-untilMs charge did;
+    // the horizon-targeted charge does not. Driven white-box because the fake clock sequentializes
+    // sleeps and cannot reproduce two concurrently-in-flight callers arming the shared bucket out of
+    // order (the real fan-out shape).
+    const H = 3_600_000;
+    let now = 100 * H;
+    const client = new GithubClient({
+      githubHost: "github.com", binPaths: { gh: "/bin/true", git: "/bin/true", tar: "/bin/true" },
+      tempRoot: TEST_TMP, nowImpl: () => now, sleepImpl: async () => {},
+    });
+    const c = client as unknown as {
+      core: { pausedUntilMs: number; accountedUntilMs: number; budgetSpentMs: number };
+      armBucketPause(b: { pausedUntilMs: number; accountedUntilMs: number; budgetSpentMs: number }, untilMs: number, now: number): void;
+    };
+    const b = c.core;
+    b.accountedUntilMs = now;                       // funded up to 'now', nothing pending
+    b.budgetSpentMs = MAX_TOTAL_PAUSE_MS - 2.5 * H; // only 2.5h of budget remains
+    c.armBucketPause(b, now + 5 * H, now);          // LONG pause needs 5h > 2.5h left → published UNFUNDED
+    expect(b.pausedUntilMs).toBe(now + 5 * H);
+    expect(b.budgetSpentMs).toBe(MAX_TOTAL_PAUSE_MS - 2.5 * H); // funded nothing (overflow)
+    expect(b.accountedUntilMs).toBe(now);           // horizon still unfunded
+    c.armBucketPause(b, now + 2 * H, now);          // SHORTER pause under the still-live 5h unfunded tail
+    expect(b.budgetSpentMs).toBe(MAX_TOTAL_PAUSE_MS - 2.5 * H); // NO phantom charge (targets the 5h horizon → re-overflows)
+    expect(b.pausedUntilMs).toBe(now + 5 * H);      // horizon unchanged
+    expect(b.accountedUntilMs).toBe(now);           // still nothing funded past 'now'
   });
 
   test("a graphql SECONDARY (remaining>0) with an absurd Retry-After sleeps exactly MAX_PAUSE_MS", async () => {

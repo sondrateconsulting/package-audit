@@ -113,7 +113,7 @@ below).
   "maxBranchesPerRepo": 25,
   "maxReposPerOrg": null,              // null = unlimited
   "includeArchived": false,
-  "concurrency": { "organizations": 3, "repositories": 6, "branches": 4 },
+  "concurrency": { "organizations": 3, "repositories": 8, "branches": 4 },
   "paths": { "sqlitePath": "./data/audit.db", "outputDir": "./output" },
   "excludeDirGlobs": ["**/node_modules/**", "**/dist/**", "**/build/**", "**/vendor/**"]
 }
