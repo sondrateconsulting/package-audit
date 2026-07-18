@@ -741,16 +741,51 @@ export interface RepoInfo {
   fork: boolean;
   isPrivate: boolean;
 }
-export function mapRestRepo(raw: Record<string, unknown>): RepoInfo {
-  const owner = raw["owner"] as Record<string, unknown> | undefined;
-  return {
-    name: String(raw["name"] ?? ""),
-    organization: String(owner?.["login"] ?? ""),
-    pushedAt: typeof raw["pushed_at"] === "string" ? raw["pushed_at"] : null,
-    archived: raw["archived"] === true,
-    fork: raw["fork"] === true,
-    isPrivate: raw["private"] === true,
-  };
+// Fail LOUD on a malformed repo listing entry (§5.A). EVERY RepoInfo field is now strictly validated,
+// replacing the old String(raw.name ?? "")/String(owner?.login ?? "") coercion and the
+// `?? "" / === true / typeof` defaults — the SCOPE-STEERING fields (name, owner.login, pushed_at,
+// archived, fork) each silently mis-scoped the audit when coerced, and `private` is validated too for
+// report integrity even though it does not steer selection:
+//   • name / owner.login → a missing/empty/null/non-string value became "" or a coerced string
+//     (e.g. 42 → "42"), a FABRICATED repo/owner id.
+//   • pushed_at drives the DESC sort + `maxReposPerOrg` cap: a coerced-to-null (or garbage-string)
+//     value sinks a repo to last, and the cap can then drop a genuinely-recent repo — a silent
+//     UNDER-report. It must be explicitly `null` (never pushed) or a valid ISO instant.
+//   • archived / fork drive the policy filter: a coerced-to-false value both scans an excluded repo
+//     AND lets it displace an eligible one out of a finite cap (also an under-report). Must be bool.
+// Anything malformed throws an indexed GithubApiError — same fail-closed posture as
+// listOrgMemberships and listBranchHeads' committedDate.
+export function mapRestRepo(raw: unknown, endpoint: string, index: number, expectedOwner: string): RepoInfo {
+  const fail = (reason: string): GithubApiError =>
+    new GithubApiError(`malformed repo listing at index ${index}: ${reason}`, { endpoint });
+  if (!isObject(raw)) throw fail("not an object");
+  const name = raw["name"];
+  if (typeof name !== "string" || name.length === 0) throw fail("missing, empty, or non-string name");
+  const owner = raw["owner"];
+  if (!isObject(owner)) throw fail("missing or non-object owner");
+  const login = owner["login"];
+  if (typeof login !== "string" || login.length === 0) throw fail("missing, empty, or non-string owner.login");
+  // Both listings pass their EXPECTED owner: an org listing passes the org; a user listing passes the
+  // authenticated personal login (known at its orchestrate.ts call site). The row's owner MUST equal
+  // it — case-insensitively (GitHub logins are), keeping the returned casing — or a foreign-owner row
+  // would redirect the scan to a different account and mis-attribute every finding/permalink to it.
+  if (login.toLowerCase() !== expectedOwner.toLowerCase())
+    throw fail(`owner.login ${JSON.stringify(login)} is not the requested owner ${JSON.stringify(expectedOwner)}`);
+  const pushed = raw["pushed_at"];
+  let pushedAt: string | null;
+  // pushed_at drives the DESC sort + maxReposPerOrg cap, and filterSortCapRepos compares the strings
+  // LEXICALLY — which equals chronological order ONLY for the canonical UTC (Z) form GitHub's REST API
+  // actually emits. isIsoInstant also accepts OFFSET forms (it is shared with git's %cI committedDate),
+  // and an offset instant sorts lexically wrong (e.g. `…-10:00` is newer than a `…Z` value it sorts
+  // before), so it could sink a genuinely-recent repo below the cap — a silent under-report. Require Z.
+  if (pushed === null) pushedAt = null;
+  else if (typeof pushed === "string" && pushed.endsWith("Z") && isIsoInstant(pushed)) pushedAt = pushed;
+  else throw fail("pushed_at is not null or a canonical UTC (Z) ISO instant");
+  const archived = raw["archived"], fork = raw["fork"], isPrivate = raw["private"];
+  if (typeof archived !== "boolean") throw fail("archived is not a boolean");
+  if (typeof fork !== "boolean") throw fail("fork is not a boolean");
+  if (typeof isPrivate !== "boolean") throw fail("private is not a boolean");
+  return { name, organization: login, pushedAt, archived, fork, isPrivate };
 }
 // Client-side policy (§5.A): archived/fork filtering never trusts a server-side filter, then
 // sort pushed_at DESC (nulls last, name ASC tie-break) and cap at maxReposPerOrg.
@@ -1353,14 +1388,32 @@ export class GithubClient {
   }
 
   // ---- discovery (§5.A / §5.B) ----
-  async listOrgRepos(org: string): Promise<RepoInfo[]> {
-    const raw = await this.restGetPagedArray(`orgs/${encodeURIComponent(org)}/repos?per_page=100&page=1&type=all`);
-    return raw.map((r) => mapRestRepo(r as Record<string, unknown>));
+  // Map a flattened repo listing to validated RepoInfo, rejecting DUPLICATE (owner, name) identities:
+  // a repeated repo (a pagination artifact when the listing shifts between pages, or a hostile row)
+  // would take a maxReposPerOrg cap slot and silently drop a DISTINCT repo — a silent under-report,
+  // the same hazard parseTreeResponse guards against for duplicate tree paths.
+  private mapRepoPage(raw: unknown[], endpoint: string, expectedOwner: string): RepoInfo[] {
+    const seen = new Set<string>();
+    return raw.map((r, i) => {
+      const repo = mapRestRepo(r, endpoint, i, expectedOwner);
+      const key = JSON.stringify([repo.organization.toLowerCase(), repo.name.toLowerCase()]); // collision-proof tuple key (no separator ambiguity)
+      if (seen.has(key)) throw new GithubApiError(`duplicate repo ${repo.organization}/${repo.name} in listing at index ${i}`, { endpoint });
+      seen.add(key);
+      return repo;
+    });
   }
 
-  async listUserRepos(): Promise<RepoInfo[]> {
+  async listOrgRepos(org: string): Promise<RepoInfo[]> {
+    const raw = await this.restGetPagedArray(`orgs/${encodeURIComponent(org)}/repos?per_page=100&page=1&type=all`);
+    return this.mapRepoPage(raw, `orgs/${org}/repos`, org);
+  }
+
+  // `user/repos?affiliation=owner` returns repos owned by the AUTHENTICATED user, so the caller's
+  // known personal login is the expected owner — validate it too (a foreign-owner row would redirect
+  // the personal scan / take a cap slot, exactly as for an org listing).
+  async listUserRepos(expectedOwner: string): Promise<RepoInfo[]> {
     const raw = await this.restGetPagedArray(`user/repos?affiliation=owner&per_page=100&page=1`);
-    return raw.map((r) => mapRestRepo(r as Record<string, unknown>));
+    return this.mapRepoPage(raw, "user/repos", expectedOwner);
   }
 
   async listOrgMemberships(): Promise<string[]> {

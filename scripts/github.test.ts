@@ -298,11 +298,51 @@ describe("path encoding + repo shaping", () => {
   test("encodeContentsPath encodes per segment, preserving '/'", () => {
     expect(encodeContentsPath("src dir/ü#?.ts")).toBe("src%20dir/%C3%BC%23%3F.ts");
   });
+  test("mapRestRepo rejects a malformed identity OR a scope-steering field with an indexed, endpoint-scoped error", () => {
+    const OK = { name: "r", owner: { login: "o" }, pushed_at: null, archived: false, fork: false, private: false };
+    const bad: Array<[unknown, RegExp]> = [
+      [null, /not an object/],
+      ["str", /not an object/],
+      // identity fields
+      [{ ...OK, name: undefined }, /non-string name/],
+      [{ ...OK, name: "" }, /non-string name/],
+      [{ ...OK, name: 42 }, /non-string name/],
+      [{ ...OK, owner: undefined }, /non-object owner/],
+      [{ ...OK, owner: null }, /non-object owner/],
+      [{ ...OK, owner: "x" }, /non-object owner/],
+      [{ ...OK, owner: {} }, /owner\.login/],
+      [{ ...OK, owner: { login: "" } }, /owner\.login/],
+      [{ ...OK, owner: { login: 42 } }, /owner\.login/],   // non-string, non-null (was coerced to "42")
+      [{ ...OK, owner: { login: "other" } }, /not the requested owner/], // well-formed but FOREIGN owner → scan redirect
+      // scope-steering fields (silent under-report via sort/cap/filter if coerced)
+      [{ ...OK, pushed_at: undefined }, /pushed_at/],       // missing (was coerced to null)
+      [{ ...OK, pushed_at: 1700000000 }, /pushed_at/],      // number (was coerced to null → sinks in the cap)
+      [{ ...OK, pushed_at: "not-a-date" }, /pushed_at/],    // garbage string (arbitrary lexical sort position)
+      [{ ...OK, pushed_at: "2025-02-30T00:00:00Z" }, /pushed_at/], // impossible calendar date (Date.parse rolls it over)
+      [{ ...OK, pushed_at: "2024-06-01T00:00:00-10:00" }, /canonical UTC/], // OFFSET form: valid instant, but sorts lexically WRONG vs Z-form → cap-sink
+      [{ ...OK, pushed_at: "2024-06-01T00:00:00+00:00" }, /canonical UTC/], // even +00:00 (== Z) is rejected: only the literal Z form sorts correctly
+      [{ ...OK, archived: "true" }, /archived is not a boolean/], // string (=== true was false → scanned + displaces)
+      [{ ...OK, fork: 1 }, /fork is not a boolean/],
+      [{ ...OK, private: null }, /private is not a boolean/],
+    ];
+    for (const [raw, re] of bad) {
+      let caught: unknown;
+      try { mapRestRepo(raw, "orgs/o/repos", 3, "o"); } catch (e) { caught = e; }
+      expect(caught).toBeInstanceOf(GithubApiError);
+      expect((caught as GithubApiError).message).toMatch(/index 3/);
+      expect((caught as GithubApiError).message).toMatch(re);
+      expect((caught as GithubApiError).endpoint).toBe("orgs/o/repos");
+    }
+  });
+  test("mapRestRepo accepts pushed_at: null (a repo with no pushes) and maps it to pushedAt: null", () => {
+    const repo = mapRestRepo({ name: "r", owner: { login: "o" }, pushed_at: null, archived: false, fork: false, private: false }, "orgs/o/repos", 0, "o");
+    expect(repo).toEqual({ name: "r", organization: "o", pushedAt: null, archived: false, fork: false, isPrivate: false });
+  });
   test("mapRestRepo maps the snake_case REST shape and IGNORES default_branch (a stale epoch)", () => {
     const repo = mapRestRepo({
       name: "r", owner: { login: "o" }, default_branch: "main",
       pushed_at: "2024-06-01T00:00:00Z", archived: false, fork: true, private: true,
-    });
+    }, "orgs/o/repos", 0, "o");
     // toEqual is exact, so this pins the ABSENCE of any default-branch field: the REST listing is a
     // different (older) epoch than §5.B branch discovery, and letting its default_branch reach the
     // planner is what allowed a renamed default to be policy-excluded. The default comes from
@@ -1733,6 +1773,113 @@ describe("listOrgMemberships (§5.A fail-closed)", () => {
     ]);
     let caught: unknown;
     try { await client.listOrgMemberships(); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).message).toMatch(/index 2/);
+  });
+});
+
+describe("listOrgRepos / listUserRepos (§5.A fail-closed)", () => {
+  const good = `{"name":"r","owner":{"login":"o"},"pushed_at":"2024-06-01T00:00:00Z","archived":false,"fork":false,"private":false}`;
+  test("maps a well-formed repo listing", async () => {
+    const { client } = makeClient([ok(http(200, {}, `[${good}]`))]);
+    const repos = await client.listOrgRepos("o");
+    expect(repos).toEqual([{ name: "r", organization: "o", pushedAt: "2024-06-01T00:00:00Z", archived: false, fork: false, isPrivate: false }]);
+  });
+  test("a malformed identity OR scope-steering field fails LOUD — never silently coerced or mis-scoped", async () => {
+    // Under the old code, a non-string/missing value became "" or a coerced string (a fabricated
+    // repo/owner), a malformed pushed_at coerced to null (sinking the repo in the sort+cap), and a
+    // malformed archived/fork coerced to false (scanning an excluded repo AND displacing an eligible
+    // one out of the cap). Each is now an indexed GithubApiError at index 0. Endpoint carries too.
+    const bad = [
+      `[{"name":"","owner":{"login":"o"},"pushed_at":null,"archived":false,"fork":false,"private":false}]`,   // empty name
+      `[{"name":42,"owner":{"login":"o"},"pushed_at":null,"archived":false,"fork":false,"private":false}]`,   // non-string name → "42"
+      `[{"owner":{"login":"o"},"pushed_at":null,"archived":false,"fork":false,"private":false}]`,             // missing name
+      `[{"name":"r","pushed_at":null,"archived":false,"fork":false,"private":false}]`,                        // missing owner
+      `[{"name":"r","owner":{"login":""},"pushed_at":null,"archived":false,"fork":false,"private":false}]`,   // empty owner.login
+      `[{"name":"r","owner":{"login":42},"pushed_at":null,"archived":false,"fork":false,"private":false}]`,   // non-string owner.login → "42"
+      `[{"name":"r","owner":"nope","pushed_at":null,"archived":false,"fork":false,"private":false}]`,         // non-object owner
+      `[{"name":"r","owner":{"login":"o"},"pushed_at":1700000000,"archived":false,"fork":false,"private":false}]`, // number pushed_at → null → cap sink
+      `[{"name":"r","owner":{"login":"o"},"pushed_at":"not-a-date","archived":false,"fork":false,"private":false}]`, // garbage-string pushed_at
+      `[{"name":"r","owner":{"login":"o"},"pushed_at":"2024-06-01T00:00:00-10:00","archived":false,"fork":false,"private":false}]`, // OFFSET pushed_at → lexical sort wrong vs Z
+      `[{"name":"r","owner":{"login":"o"},"pushed_at":null,"archived":"true","fork":false,"private":false}]`, // string archived → false → scanned+displaces
+      `[{"name":"r","owner":{"login":"o"},"pushed_at":null,"archived":false,"fork":1,"private":false}]`,      // non-bool fork
+      `[null]`,                                                                                               // null item → was a raw TypeError
+      `["not-an-object"]`,                                                                                    // non-object item → coerced to ""
+    ];
+    for (const body of bad) {
+      const { client } = makeClient([ok(http(200, {}, body))]);
+      let caught: unknown;
+      try { await client.listOrgRepos("o"); } catch (e) { caught = e; }
+      expect(caught).toBeInstanceOf(GithubApiError);
+      expect((caught as GithubApiError).message).toMatch(/malformed repo listing at index 0/);
+      expect((caught as GithubApiError).endpoint).toBe("orgs/o/repos");
+    }
+  });
+  test("listUserRepos runs the FULL validation chain (a malformed scope field, past the identity checks, fails loud)", async () => {
+    // a fully-formed repo except a non-boolean `archived` — proves listUserRepos exercises the whole
+    // validator (not just the first identity guard) and carries the user/repos endpoint.
+    const { client } = makeClient([ok(http(200, {}, `[{"name":"r","owner":{"login":"u"},"pushed_at":null,"archived":"true","fork":false,"private":false}]`))]);
+    let caught: unknown;
+    try { await client.listUserRepos("u"); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).message).toMatch(/archived is not a boolean/);
+    expect((caught as GithubApiError).endpoint).toBe("user/repos");
+  });
+  test("listUserRepos rejects a FOREIGN owner too (the authenticated login is known) and matches case-insensitively", async () => {
+    const foreign = `[{"name":"r","owner":{"login":"someone-else"},"pushed_at":null,"archived":false,"fork":false,"private":false}]`;
+    const { client } = makeClient([ok(http(200, {}, foreign))]);
+    let caught: unknown;
+    try { await client.listUserRepos("u"); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).message).toMatch(/not the requested owner/);
+    // case-insensitive accept, canonical casing preserved
+    const { client: c2 } = makeClient([ok(http(200, {}, `[{"name":"r","owner":{"login":"MyUser"},"pushed_at":null,"archived":false,"fork":false,"private":false}]`))]);
+    const repos = await c2.listUserRepos("myuser");
+    expect(repos[0]!.organization).toBe("MyUser");
+  });
+  test("a DUPLICATE (owner, name) repo fails loud — a cap slot must never silently drop a distinct repo", async () => {
+    // pagination can legitimately return a repo twice when the listing shifts between pages; with a
+    // maxReposPerOrg cap a duplicate would displace a distinct repo (silent under-report), so reject it.
+    const { client } = makeClient([ok(http(200, {}, `[${good},${good}]`))]);
+    let caught: unknown;
+    try { await client.listOrgRepos("o"); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).message).toMatch(/duplicate repo o\/r .*index 1/);
+  });
+  test("a CASE-VARIED duplicate ACROSS PAGES is caught (the dedup key is case-normalized and global)", async () => {
+    // page 1 has repo o/R; page 2 (global index 1) has o/r — same repo by GitHub's case-insensitive
+    // identity, so it must be rejected at global index 1, not silently kept.
+    const p1 = `{"name":"R","owner":{"login":"O"},"pushed_at":null,"archived":false,"fork":false,"private":false}`;
+    const p2 = `{"name":"r","owner":{"login":"o"},"pushed_at":null,"archived":false,"fork":false,"private":false}`;
+    const link2 = `<https://api.github.com/orgs/o/repos?per_page=100&page=2&type=all>; rel="next"`;
+    const { client } = makeClient([ok(http(200, { link: link2 }, `[${p1}]`)), ok(http(200, {}, `[${p2}]`))]);
+    let caught: unknown;
+    try { await client.listOrgRepos("o"); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).message).toMatch(/duplicate repo o\/r in listing at index 1/);
+  });
+  test("listOrgRepos rejects a FOREIGN-owner repo — a /orgs/o/repos row owned by someone else would redirect the scan", async () => {
+    const foreign = `{"name":"r","owner":{"login":"someone-else"},"pushed_at":null,"archived":false,"fork":false,"private":false}`;
+    const { client } = makeClient([ok(http(200, {}, `[${foreign}]`))]);
+    let caught: unknown;
+    try { await client.listOrgRepos("o"); } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(GithubApiError);
+    expect((caught as GithubApiError).message).toMatch(/not the requested owner/);
+  });
+  test("listOrgRepos owner match is case-insensitive (GitHub logins are), keeping the returned casing", async () => {
+    const { client } = makeClient([ok(http(200, {}, `[{"name":"r","owner":{"login":"MyOrg"},"pushed_at":null,"archived":false,"fork":false,"private":false}]`))]);
+    const repos = await client.listOrgRepos("myorg");
+    expect(repos[0]!.organization).toBe("MyOrg"); // canonical casing preserved
+  });
+  test("a good repo BESIDE a malformed one fails the whole listing at the RIGHT global index (across pages)", async () => {
+    const good2 = `{"name":"r2","owner":{"login":"o"},"pushed_at":"2024-05-01T00:00:00Z","archived":false,"fork":false,"private":false}`;
+    const link2 = `<https://api.github.com/orgs/o/repos?per_page=100&page=2&type=all>; rel="next"`;
+    const { client } = makeClient([
+      ok(http(200, { link: link2 }, `[${good},${good2}]`)), // two DISTINCT repos (not duplicates)
+      ok(http(200, {}, `[{"name":"","owner":{"login":"o"},"pushed_at":null,"archived":false,"fork":false,"private":false}]`)), // page-2 entry 0 → global index 2
+    ]);
+    let caught: unknown;
+    try { await client.listOrgRepos("o"); } catch (e) { caught = e; }
     expect(caught).toBeInstanceOf(GithubApiError);
     expect((caught as GithubApiError).message).toMatch(/index 2/);
   });

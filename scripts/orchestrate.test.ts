@@ -339,11 +339,15 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
     const calls: string[][] = [];
     const client = makeClient(root, async (_bin, args) => {
         calls.push(args);
-        return { exitCode: 0, stderr: "", stdout: http(200, "[]") };
+        // a real repo OWNED BY the expected personal login — exercises listUserRepos' cross-owner
+        // validation through the orchestrate wiring (a wrong/absent owner threaded from here would throw)
+        return { exitCode: 0, stderr: "", stdout: http(200, JSON.stringify([
+          { name: "dotfiles", owner: { login: "rvo" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
+        ])) };
       });
 
     const kept = await discoverOwnerRepos(db, client, testConfig(root), runId, "rvo", true);
-    expect(kept).toEqual({ ok: true, items: [] }); // discovered, genuinely empty
+    expect(kept.ok && kept.items.map((r) => r.name)).toEqual(["dotfiles"]); // discovered via user/repos, owner "rvo" validated
     expect(calls).toHaveLength(1);
     expect(calls[0]!.join(" ")).toContain("user/repos?affiliation=owner");
     db.close();

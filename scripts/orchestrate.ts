@@ -330,7 +330,7 @@ export async function discoverOwnerRepos(
 ): Promise<DiscoveryOutcome<RepoInfo>> {
   let repos: RepoInfo[];
   try {
-    repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
+    repos = isPersonal ? await client.listUserRepos(owner) : await client.listOrgRepos(owner);
   } catch (e) {
     // §4: a throttle during repo discovery is TRANSIENT — no permanent errors row (discovery
     // re-runs next invocation). Any other error is a permanent discovery failure. Either way the
@@ -801,7 +801,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
     const isPersonal = config.includePersonalNamespace && owner === personalLogin;
     let repos: RepoInfo[];
     try {
-      repos = isPersonal ? await client.listUserRepos() : await client.listOrgRepos(owner);
+      repos = isPersonal ? await client.listUserRepos(owner) : await client.listOrgRepos(owner);
     } catch (e) {
       discoveryErrors++;
       logLine({ event: "plan", org: owner, error: `repo discovery failed: ${(e as Error).message}` });
