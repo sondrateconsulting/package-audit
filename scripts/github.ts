@@ -62,9 +62,11 @@ export interface SpawnResult {
   stdout: string;
   stderr: string;
 }
-// Minimal lib.dom-free abort plumbing (the tsconfig lib is ESNext-only, so the platform
-// AbortSignal instance type is memberless here): the client flips it on deadline expiry and
-// the spawn impl registers the child-kill. onAbort fires immediately if already aborted.
+// Minimal, purpose-built abort plumbing: a bespoke { aborted, onAbort } read side fit for the
+// spawn-deadline use — the client flips it on deadline expiry and the spawn impl registers the
+// child-kill — rather than the platform AbortSignal's EventTarget (add/removeEventListener) API.
+// (The platform AbortController/AbortSignal ARE available under `types: ["bun"]`; this is a
+// fit-for-purpose shape, not a missing type.) onAbort fires immediately if already aborted.
 export interface SpawnAbortSignal {
   readonly aborted: boolean;
   onAbort(cb: () => void): void;
