@@ -2062,34 +2062,45 @@ describe("reconcileRunUnitHead (stale-row prune)", () => {
   });
 });
 
-describe("pruneExcludedOwnerHeads (§1 case-insensitive exclusion on resume)", () => {
+describe("pruneExcludedOwnerRows (§1 case-insensitive exclusion on resume)", () => {
   const scanned = (db: AuditDb, runId: string, org: string, repo: string): void =>
     db.upsertRunUnitHead({ runId, organization: org, repository: repo, branch: "main", commitSha: `sha-${org}-${repo}`, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+  const scanError = (db: AuditDb, runId: string, org: string, repo: string): void =>
+    db.insertError({ runId, scope: "scan", organization: org, repository: repo, branch: "main", message: "boom" });
   const orgsOf = (db: AuditDb, runId: string): string[] =>
     (db.read("SELECT DISTINCT organization FROM run_unit_head WHERE run_id=? ORDER BY organization").all(runId) as Array<{ organization: string }>).map((r) => r.organization);
+  const errRows = (db: AuditDb, runId: string): Array<{ organization: string | null }> =>
+    db.read("SELECT organization FROM errors WHERE run_id=?").all(runId) as Array<{ organization: string | null }>;
+  const hasErrorOrg = (db: AuditDb, runId: string, org: string): boolean =>
+    errRows(db, runId).some((e) => (e.organization ?? "").toLowerCase() === org.toLowerCase());
 
-  test("drops rows for an owner a CASE-VARIANT exclude now matches; keeps other owners and other runs", () => {
+  test("drops HEADS AND ERRORS for an owner a CASE-VARIANT exclude now matches; keeps other owners, null-org errors, and other runs", () => {
     const db = mem();
     rawRun(db, "r1", "running");
     rawRun(db, "r2", "running");
-    scanned(db, "r1", "acme", "a");  // API-canonical owner scanned before the old case-sensitive exclude was fixed
-    scanned(db, "r1", "acme", "b");
-    scanned(db, "r1", "bigco", "c"); // a different, non-excluded owner — must be kept
-    scanned(db, "r2", "acme", "a");  // same owner, DIFFERENT run — must survive (the prune is run-scoped)
+    scanned(db, "r1", "acme", "a"); scanned(db, "r1", "acme", "b"); scanError(db, "r1", "acme", "a"); // canonical owner scanned+errored before the old case-sensitive exclude was fixed
+    scanned(db, "r1", "bigco", "c"); scanError(db, "r1", "bigco", "c"); // a different, non-excluded owner — must be kept
+    db.insertError({ runId: "r1", scope: "introspection", packageName: "expo", message: "packument" }); // org=NULL — never owner-matched, must survive
+    scanned(db, "r2", "acme", "a"); scanError(db, "r2", "acme", "a"); // same owner, DIFFERENT run — must survive (run-scoped)
     // exclude "Acme" (config spelling) must match the canonical "acme" CASE-INSENSITIVELY
-    expect(db.pruneExcludedOwnerHeads("r1", ["Acme"])).toBe(2);
-    expect(orgsOf(db, "r1")).toEqual(["bigco"]); // acme rows gone, bigco kept
-    expect(orgsOf(db, "r2")).toEqual(["acme"]); // the other run is untouched
+    expect(db.pruneExcludedOwnerRows("r1", ["Acme"])).toEqual({ heads: 2, errors: 1 });
+    expect(orgsOf(db, "r1")).toEqual(["bigco"]);          // acme heads gone, bigco kept
+    expect(hasErrorOrg(db, "r1", "acme")).toBe(false);    // acme error gone (would otherwise inflate branchesErrored once its head is pruned)
+    expect(hasErrorOrg(db, "r1", "bigco")).toBe(true);    // bigco error kept
+    expect(errRows(db, "r1").some((e) => e.organization === null)).toBe(true); // null-org introspection error kept
+    expect(orgsOf(db, "r2")).toEqual(["acme"]);           // the other run is untouched
+    expect(hasErrorOrg(db, "r2", "acme")).toBe(true);
     db.close();
   });
 
   test("no-op when the denylist is empty or matches no owner in the run (never over-prunes)", () => {
     const db = mem();
     rawRun(db, "r1", "running");
-    scanned(db, "r1", "acme", "a");
-    expect(db.pruneExcludedOwnerHeads("r1", [])).toBe(0); // empty denylist → no-op (the common case)
-    expect(db.pruneExcludedOwnerHeads("r1", ["other-org"])).toBe(0); // no case-insensitive match → no-op
+    scanned(db, "r1", "acme", "a"); scanError(db, "r1", "acme", "a");
+    expect(db.pruneExcludedOwnerRows("r1", [])).toEqual({ heads: 0, errors: 0 }); // empty denylist → no-op (the common case)
+    expect(db.pruneExcludedOwnerRows("r1", ["other-org"])).toEqual({ heads: 0, errors: 0 }); // no case-insensitive match → no-op
     expect(orgsOf(db, "r1")).toEqual(["acme"]); // a transiently-undiscovered-but-not-excluded owner keeps its rows
+    expect(hasErrorOrg(db, "r1", "acme")).toBe(true);
     db.close();
   });
 });

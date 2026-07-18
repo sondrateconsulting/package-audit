@@ -2323,27 +2323,37 @@ export class AuditDb {
     return res.changes;
   }
 
-  // §1 exclusion enforcement for a RESUMED run: drop this run's run_unit_head rows for any owner named
-  // in excludeOrganizations, matched CASE-INSENSITIVELY (as ownerResolve folds owners). config_hash
+  // §1 exclusion enforcement for a RESUMED run: drop this run's rows for any owner named in
+  // excludeOrganizations, matched CASE-INSENSITIVELY (as ownerResolve folds owners). config_hash
   // hashes excludeOrganizations exact-case ON PURPOSE (folding it would orphan every legacy config's
   // resumable work), so a run that STRADDLES the upgrade to case-insensitive exclusion can still hold
   // rows for an owner a case-variant exclude now removes (e.g. exclude "Acme", earlier-scanned "acme").
   // Pruning them here keeps a resumed run's report from ever surfacing an owner its own
-  // excludeOrganizations excludes — the report joins findings THROUGH run_unit_head, so removing the
-  // head rows removes that owner's dispositions AND findings together. TARGETED and SAFE: it keys off
-  // the STABLE configured denylist, never the per-invocation effective/discovered set, so a
-  // transiently-undiscovered (but not excluded) owner never loses its rows. No-op on a fresh run (no
-  // prior rows) and whenever excludeOrganizations is empty. Returns the number of rows pruned.
-  pruneExcludedOwnerHeads(runId: string, excludeOrganizations: readonly string[]): number {
-    if (excludeOrganizations.length === 0) return 0;
-    const res = this.db
-      .query(
-        `DELETE FROM run_unit_head
-         WHERE run_id = ?
-           AND lower(organization) IN (SELECT lower(value) FROM json_each(?))`,
-      )
-      .run(runId, JSON.stringify(excludeOrganizations));
-    return res.changes;
+  // excludeOrganizations excludes. BOTH tables that carry an owner into the report are cleaned, in ONE
+  // transaction:
+  //   • run_unit_head — the report joins findings THROUGH it, so removing the head rows removes that
+  //     owner's dispositions AND findings together.
+  //   • errors — errors[] is selected by run_id (NOT joined to run_unit_head), and branchesErrored
+  //     counts scan errors that hold NO head row, so leaving the owner's errors would both keep it in
+  //     errors[] AND (once its heads are pruned) newly inflate branchesErrored. Owner-scoped errors
+  //     carry an organization (discovery/scan); package-scoped introspection errors carry NULL and are
+  //     never owner-matched. errors[] is append-only in NORMAL operation; this is its ONE reconciliation
+  //     — scoped to an owner that should never have been scanned at all.
+  // TARGETED and SAFE: it keys off the STABLE configured denylist, never the per-invocation
+  // effective/discovered set, so a transiently-undiscovered (but not excluded) owner never loses rows.
+  // No-op on a fresh run (no prior rows) and whenever excludeOrganizations is empty.
+  pruneExcludedOwnerRows(runId: string, excludeOrganizations: readonly string[]): { heads: number; errors: number } {
+    if (excludeOrganizations.length === 0) return { heads: 0, errors: 0 };
+    const list = JSON.stringify(excludeOrganizations);
+    return this.db.transaction((): { heads: number; errors: number } => {
+      const heads = this.db
+        .query(`DELETE FROM run_unit_head WHERE run_id = ? AND lower(organization) IN (SELECT lower(value) FROM json_each(?))`)
+        .run(runId, list).changes;
+      const errors = this.db
+        .query(`DELETE FROM errors WHERE run_id = ? AND lower(organization) IN (SELECT lower(value) FROM json_each(?))`)
+        .run(runId, list).changes;
+      return { heads, errors };
+    })();
   }
 
   // ---- api_cache (§3 caching rules; REST-GET only — GraphQL is never cached) -----------------

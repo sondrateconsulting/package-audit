@@ -8,11 +8,15 @@
 // Owners and (per repo) branch-units are fanned out through bounded pools (§5, concurrency.*), but
 // no mutex is needed: bun:sqlite statements are synchronous and every DB read-modify-write below is
 // an await-free block, so concurrent fibers never interleave mid-write and each unit's rows are
-// distinct. Determinism is preserved (§6): a given run's DB re-renders byte-identically because
-// report/export sort every emitted array by a TOTAL, stable key — findings by CONTENT, and errors by
-// the spec-mandated (occurred_at, id) (total via the unique id) — so which fiber wrote a row first
-// never changes the emitted bytes. (Chronological error order is inherently per-run: occurred_at is
-// wall-clock, so errors[] was never byte-identical ACROSS separate runs, fan-out or not.)
+// distinct. Determinism (§6) is the SAME-DB-SAME-RUN guarantee the spec makes (PROMPT.md: "Completion
+// and DB-write order are unconstrained... determinism is guaranteed by sorting every emitted array on a
+// TOTAL stable key"): report/export sort every emitted array by a total key, so RE-RENDERING a given
+// completed run's DB is byte-identical no matter which fiber wrote each row first. Findings sort by
+// CONTENT, so they additionally reproduce ACROSS runs that scanned the same commits. errors[] does NOT
+// and is not claimed to: it sorts by the spec-mandated (occurred_at, id) — a chronological event log
+// whose order and wall-clock timestamps are inherently per-run (occurred_at is wall-clock, so errors[]
+// was never byte-identical across separate runs, fan-out or not; fan-out only changes WHICH order two
+// same-instant errors take, exactly as their occurred_at already varied run-to-run).
 
 import { readdirSync, lstatSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -220,12 +224,12 @@ export async function runScan(
 
   // §1 exclusion enforcement on RESUME: excludeOrganizations is matched case-insensitively (ownerResolve),
   // but config_hash hashes it exact-case (folding the hash would orphan legacy resumable work). So a run
-  // that straddles the upgrade to case-insensitive exclusion could hold run_unit_head rows for an owner a
-  // case-variant exclude now removes — prune them so a resumed run's report never surfaces an owner its
-  // own excludeOrganizations excludes. No-op on a fresh run and when excludeOrganizations is empty.
-  const excludedPruned = db.pruneExcludedOwnerHeads(runId, config.excludeOrganizations);
-  if (excludedPruned > 0)
-    logLine({ event: "reconciliation", target: "run_unit_head", runId, action: "prune-excluded-owner", pruned: excludedPruned });
+  // that straddles the upgrade to case-insensitive exclusion could hold run_unit_head + errors rows for an
+  // owner a case-variant exclude now removes — prune both so a resumed run's report never surfaces an owner
+  // its own excludeOrganizations excludes. No-op on a fresh run and when excludeOrganizations is empty.
+  const excludedPruned = db.pruneExcludedOwnerRows(runId, config.excludeOrganizations);
+  if (excludedPruned.heads > 0 || excludedPruned.errors > 0)
+    logLine({ event: "reconciliation", target: "excluded-owner", runId, action: "prune-excluded-owner", prunedHeads: excludedPruned.heads, prunedErrors: excludedPruned.errors });
 
   // §3 --rescan-branch: reset matching branch units to pending BEFORE discovery.
   for (const t of args.rescanBranches) {

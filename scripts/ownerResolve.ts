@@ -40,8 +40,9 @@ export interface OwnerResolveResult {
 // Keeping the fold out of the hash means a run STRADDLING the upgrade that ADDED case-insensitive
 // exclusion could hold prior-invocation run_unit_head rows for an owner a case-variant exclude now
 // removes (e.g. exclude "Acme", earlier-scanned "acme") — its config_hash is unchanged, so it resumes
-// rather than starting fresh. db.pruneExcludedOwnerHeads (called at resume in runScan) cleans exactly
-// those rows, so a resumed run's report never surfaces an owner its own excludeOrganizations excludes.
+// rather than starting fresh. db.pruneExcludedOwnerRows (called at resume in runScan) cleans exactly
+// those rows (both run_unit_head AND errors), so a resumed run's report never surfaces an owner its own
+// excludeOrganizations excludes — in its findings, dispositions, or errors[].
 // That prune keys off the STABLE configured denylist, NOT the per-invocation effective/discovered set,
 // so a transiently-undiscovered (but not excluded) owner never loses its rows. Folding the hash instead
 // would orphan ALL legacy resumable work — a strictly worse trade — which is why it stays out.
