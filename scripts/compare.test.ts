@@ -482,7 +482,8 @@ describe("buildCompare — policy churn", () => {
         organization: "org-a", repository: "svc", branch: "legacy",
         disposition: "excluded", policyStatus: "excluded-by-deny", matchedPattern: "release/*",
       });
-      // (2) the default export writes it byte-faithful
+      // (2) the JSONL export writes it byte-faithful (release/* is non-formula, so the default CSV's
+      //     apostrophe formula-defense would not trigger here either)
       exportRun(db2, rB, out, { raw: false });
       const legacyLine = readFileSync(join(out, "xray", "run_unit_head.jsonl"), "utf8")
         .split("\n").filter((l) => l.length > 0)
