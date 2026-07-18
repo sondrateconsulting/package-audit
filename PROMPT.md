@@ -674,16 +674,18 @@ work bounded by `concurrency.*`:
 - one subagent per org (enumerate repos/branches),
 - one per repo (branch lists, cutoff filter, candidate files),
 - one per branch (fetch manifests/lockfiles, scan usage).
-AS BUILT — this is build strategy, not a description of the shipped runtime: all three
-levels are iterated SEQUENTIALLY. The only `concurrency.*` value read is `repositories`,
-and it is not a per-repo fan-out either — it is the GLOBAL in-flight cap on gh requests
-(github.ts's semaphore). `concurrency.organizations` and `concurrency.branches` are thus
-validated, required, and never consumed: they are this section's fan-out, unbuilt. Whether
-to implement it or drop the two dead keys is an OPEN decision; until it is made, nothing
-may describe them as active controls (config.schema.json marks both RESERVED).
-CRITICAL: Subagents COMPUTE and return structured JSON; a SINGLE coordinator
-performs all SQLite writes (single-writer pattern). Do not bet on multi-process WAL
-writer safety. Additionally, delegate genuinely NON-DETERMINISTIC comprehension to a
+AS BUILT (§5 fan-out): all three `concurrency.*` values are consumed. `repositories` is the
+GLOBAL in-flight cap on gh/git/tar subprocesses (github.ts's semaphore) — NOT a per-repo
+fan-out degree. `concurrency.organizations` sizes the owner fan-out pool and
+`concurrency.branches` the per-repo branch-unit pool; repos within an owner stay SEQUENTIAL
+(each repo's discover→plan→scan→reconcile is atomic per worker). All three are optional and
+default (3 / 8 / 4), capped at 64, and excluded from config_hash (tuning never orphans
+resumable work). No mutex is needed: bun:sqlite statements are synchronous and every DB
+read-modify-write is an await-free block, so concurrent fibers never interleave mid-write and
+each branch-unit's rows are distinct.
+CRITICAL: Subagents COMPUTE and return structured JSON; ALL SQLite writes go through the ONE
+AuditDb connection (its synchronous statements serialize concurrent fibers without a mutex).
+Do not bet on multi-process WAL writer safety. Additionally, delegate genuinely NON-DETERMINISTIC comprehension to a
 subagent — e.g., disambiguating heavily aliased/namespaced imports, barrel-file
 re-exports, or unusual export patterns — passing only the scoped file context and
 returning structured JSON.
@@ -691,10 +693,12 @@ If subagents are unavailable, run the SAME workflow sequentially in the same ord
 but keep code structured (pure functions) so it could parallelize later.
 
 RATE-LIMIT & THROTTLING (all gh calls go through the github.ts wrapper, so this is
-enforced in one place): a parallel `concurrency.*` fan-out (e.g. 3 orgs × 6 repos × 4
-branches — the §4 STRATEGY above, not the shipped sequential runtime) could trip GitHub's
-rate limits, so the wrapper caps TOTAL in-flight `gh` processes with one GLOBAL semaphore
-(sized by `concurrency.repositories`, the only concurrency.* key the runtime reads). The wrapper reads the relevant response headers
+enforced in one place): the shipped `concurrency.*` fan-out (up to organizations × branches
+units dispatched at once) could trip GitHub's rate limits, so the wrapper caps TOTAL in-flight
+gh/git/tar subprocesses with one GLOBAL semaphore (sized by `concurrency.repositories`).
+Throttle classification and pause-arming happen INSIDE the semaphore lease (so a queued caller
+never spawns into an about-to-open pause), and the per-bucket pause budget is WALL-CLOCK and
+shared, so N concurrent callers waiting out one window charge it once rather than N times. The wrapper reads the relevant response headers
 (`x-ratelimit-remaining`/`x-ratelimit-reset`/`Retry-After`/`x-github-sso`) via `gh api -i`
 (as §2.3/§3 already do). Two distinct retryable throttles, handled the same way (the
 wrapper WAITS through the computed window and RETRIES the request IN PLACE, up to its
@@ -1483,7 +1487,10 @@ Acceptance checklist — the run is NOT complete until all are true:
 [ ] Every in-repo usage is attributed to a specific named export where one exists;
     usage types with no single binding (side-effect-import, reexport, namespace-import,
     an unresolved/private subpath) and CLI usage correctly carry export_name=''.
-[ ] Branches processed most-recent-first; no non-default branch before cutoffDate inspected.
+[ ] Eligible branches are SELECTED and admitted to the scan pool in committed-date-descending
+    order (the cap walks newest-first); no non-default branch before cutoffDate inspected.
+    Completion and DB-write order are unconstrained (branch/owner fan-out, §5) — determinism is
+    guaranteed by content-sorted output, not processing order.
 [ ] SQLite is the source of truth. A second run still performs the cheap discovery
     calls needed to detect change (paginated-REST repo discovery, per-repo branch-head
     GraphQL), but performs

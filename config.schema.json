@@ -5,7 +5,7 @@
   "description": "Input config for the READ-ONLY npm-package-usage auditor (PROMPT.md §1). Path precedence at runtime: --config <path> > CONFIG_PATH env var > ./config.json.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["cutoffDate", "maxBranchesPerRepo", "concurrency", "packages", "paths"],
+  "required": ["cutoffDate", "maxBranchesPerRepo", "packages", "paths"],
   "properties": {
     "$schema": {
       "type": "string",
@@ -76,12 +76,11 @@
     "concurrency": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["organizations", "repositories", "branches"],
-      "description": "Request cap + reserved keys. Only 'repositories' is consumed today (a GLOBAL in-flight cap on gh requests); 'organizations' and 'branches' are RESERVED — validated and required, but never read. Excluded from config_hash (tuning speed never orphans resumable work).",
+      "description": "Fan-out widths + the global request cap (§5). All OPTIONAL: an omitted block or key falls back to its default (organizations 3, repositories 8, branches 4). 'repositories' is the GLOBAL in-flight cap on gh/git/tar subprocesses — NOT a per-repo parallelism degree; it bounds real network work no matter how organizations×branches compose. 'organizations' sizes the owner fan-out pool; 'branches' the per-repo branch-unit pool. Excluded from config_hash (tuning speed never orphans resumable work). Each is capped at 64.",
       "properties": {
-        "organizations": { "type": "integer", "minimum": 1 },
-        "repositories": { "type": "integer", "minimum": 1 },
-        "branches": { "type": "integer", "minimum": 1, "description": "RESERVED — validated and required, but NOT consumed at runtime: branches are scanned sequentially today. Unrelated to the root-level 'branches' allow/deny list, which shares only the name." }
+        "organizations": { "type": "integer", "minimum": 1, "maximum": 64, "default": 3, "description": "Max owners processed concurrently (default 3)." },
+        "repositories": { "type": "integer", "minimum": 1, "maximum": 64, "default": 8, "description": "GLOBAL cap on in-flight gh/git/tar subprocesses (default 8) — the true network-politeness governor, not a repo-loop degree." },
+        "branches": { "type": "integer", "minimum": 1, "maximum": 64, "default": 4, "description": "Max branch-units scanned concurrently PER REPO (default 4). Unrelated to the root-level 'branches' allow/deny list, which shares only the name." }
       }
     },
     "packages": {

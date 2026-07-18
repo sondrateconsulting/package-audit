@@ -1,11 +1,15 @@
-// orchestrate.ts — the single-writer coordinator (§5, §8). Entry point:
+// orchestrate.ts — the scan coordinator (§5, §8). Entry point:
 //   bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
 //                                  [--rescan-branch <org>/<repo>@<branch>]... [--help]
 // Flow (§8): restate config → preflight (§2) → resolve effective owners (§1) → start/resume run
 // (§3) → discover repos+branches and process each branch unit (§5.A-H) → reconcile introspection
-// (§5.E) → BIN-term CLI pass (§5.G) → mark run completed. ALL SQLite writes happen HERE (single
-// writer); per-unit reads fan out through the guarded github wrapper. Deterministic iteration
-// order (owners/repos/branches sorted) so runs are reproducible.
+// (§5.E) → BIN-term CLI pass (§5.G) → mark run completed. ALL SQLite writes happen through the ONE
+// AuditDb connection opened here; per-unit reads fan out through the guarded github wrapper.
+// Owners and (per repo) branch-units are fanned out through bounded pools (§5, concurrency.*), but
+// no mutex is needed: bun:sqlite statements are synchronous and every DB read-modify-write below is
+// an await-free block, so concurrent fibers never interleave mid-write and each unit's rows are
+// distinct. Emitted output is deterministic (report/export re-sort every array by a total key), so
+// the nondeterministic write order under fan-out never changes the bytes.
 
 import { readdirSync, lstatSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -110,6 +114,10 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const trackedNames = config.packages.map((p) => p.name);
 
   logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
+  // §5 effective fan-out widths (both run and --plan). `repositories` is the GLOBAL in-flight
+  // subprocess cap, NOT a repo-loop degree — so at most `repositories` gh/git/tar run at once no
+  // matter how organizations×branches compose. Set-vocabulary event (documented in README).
+  logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
 
   // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
   // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls).
@@ -580,7 +588,9 @@ export async function processRepo(
 }
 
 // Scan ONE branch unit: fetch the tree (clone fallback on truncation), run the §5.C-H pipeline,
-// and WRITE every finding + the run_unit_head snapshot (single-writer).
+// and WRITE every finding + the run_unit_head snapshot. All writes here are an await-free synchronous
+// block AFTER the last await (scanUnit), and target THIS unit's distinct rows — so under branch
+// fan-out they never race a sibling unit's writes.
 async function processUnit(
   db: AuditDb, client: GithubClient, config: Config, runId: string,
   repo: RepoInfo, decision: BranchDecision, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
