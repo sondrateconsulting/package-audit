@@ -171,7 +171,7 @@ export function assertRunUnitHeadSound(r: PolicyDispositionRow, where: string): 
   }
   // commit_sha ↔ disposition family (§3.1a: the findings-join partition). A SCAN-ATTEMPT row pins the
   // OBSERVED head commit (scanned/reused name the head they reported — current when recorded, possibly
-  // preserved-stale after a moved-head transient; deferred-*/error name the head the failed attempt saw);
+  // preserved-stale after a moved-head transient; deferred-*/error name the head the failed attempt recorded — its observed head);
   // every DISCOVERY-time disposition stores ''. Only scanned/reused JOIN findings,
   // but the whole scan-attempt family carries a real commit (the commit-aware upsert precedence relies
   // on it). r.status is a validated UnitHeadStatus here (isKnownStatus ran above).

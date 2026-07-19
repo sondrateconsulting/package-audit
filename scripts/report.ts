@@ -1,6 +1,7 @@
 // report.ts — §7 consolidated report, generated DETERMINISTICALLY from SQLite ALONE. Entry point:
 //   bun run scripts/report.ts [--config <path>] [--run-id <id>] [--html]
-// Default (no --run-id): the latest COMPLETED run with non-empty tracked_packages; also overwrites
+// Default (no --run-id): the latest run with a COMPLETE (or migrated legacy-unknown) OUTCOME and non-empty
+// tracked_packages — a partial/fatal run is NOT reportable; also overwrites
 // <outputDir>/latest.json. A --run-id writes its JSON report ONLY to <outputDir>/run-<id>.json (never latest.json).
 // Findings are joined through the per-run run_unit_head snapshot (never findings.run_id) filtered
 // to runs.tracked_packages, and EVERY emitted array has a total, stable sort key so the output is

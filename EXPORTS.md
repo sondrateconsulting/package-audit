@@ -185,7 +185,8 @@ or displaced past `maxReposPerOrg`) is never revisited and keeps its prior rows.
 So a branch that errored in an earlier invocation and reached no row-bearing disposition in the final one —
 deleted, or its repo's discovery failed — is still counted via its append-only error while correctly holding
 no row here. (A throttle-requeued retry is NOT such a case: it writes a `deferred-throttle` row, or the
-findings-preservation guard keeps a prior scan's row — either way it holds a row here.) Conversely, a branch
+findings-preservation guard keeps a prior scan's row — either way it holds a row here, barring a crash
+between the coverage-incomplete mark and the head upsert, which `coverage_complete=0` still flags.) Conversely, a branch
 that kept a row from an earlier invocation is counted by THAT row's disposition — an `error` head is itself
 counted in `branchesErrored`, a `scanned` row under `branchesScanned` — never a second time via `errors[]`.
 

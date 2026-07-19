@@ -1772,6 +1772,22 @@ describe("processRepo throttle requeue (§4)", () => {
     db.close();
   });
 
+  test("§3.1a end-to-end: a throttle-requeue over a PRIOR scan PRESERVES the scan AND still floors partial-deferred (no deferred row)", async () => {
+    const { db, runId } = openRun();
+    // A prior invocation scanned main@d (a REPORTABLE head). THIS invocation re-discovers main at the MOVED
+    // head a (liveHead) and the re-scan THROTTLE-exhausts. The findings-preservation guard must keep
+    // scanned@d (its findings survive) and write NO deferred-throttle row, yet still floor the run to
+    // partial-deferred — via markCoverageIncomplete, recorded BEFORE the (no-op) upsert for crash-safety.
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "d".repeat(40), status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-05-01T00:00:00Z" });
+    await captureJsonl(() => processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), rt(config, "hash"), runId, "o", repo, [], new Set()));
+    const head = db.read(`SELECT commit_sha, status FROM run_unit_head WHERE run_id = ? AND branch = 'main'`).get(runId) as { commit_sha: string; status: string };
+    expect(head).toEqual({ commit_sha: "d".repeat(40), status: "scanned" }); // PRESERVED — never demoted to deferred-throttle@a
+    expect(db.getUnit(KEY)?.status).toBe("pending"); // the unit is requeued for a later run
+    expect((db.read(`SELECT coverage_complete AS c FROM runs WHERE run_id = ?`).get(runId) as { c: number }).c).toBe(0); // gap recorded out of band
+    expect(db.finalizeRun(runId, "complete")).toBe("partial-deferred"); // floored despite the preserved scanned row + NO deferred-* row
+    db.close();
+  });
+
   test("a GithubApiError still lands as a permanent ERROR with an errors row", async () => {
     const { db, runId } = openRun();
     await processRepo(db, fakeClient(new GithubApiError("boom", { endpoint: "x" })), rt(config, "hash"), runId, "o", repo, [], new Set());

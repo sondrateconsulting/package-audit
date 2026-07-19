@@ -207,7 +207,7 @@ export const scanScopeSchema = z
 export const runOutcomeSchema = z
   .strictObject({
     outcome: runOutcomeEnumSchema.describe("runs.outcome — always present: an unfinalized run (outcome NULL) is served as notReportable, never as a report"),
-    coverageComplete: z.boolean().nullable().describe("Did this run cover the whole estate: true=full, false=a coverage gap (a discovery gap OR a unit-level deferral — incl. a deferral preserved over a prior scan, which writes no deferred-* row), null=unknowable (migrated pre-v4 run)"),
+    coverageComplete: z.boolean().nullable().describe("Did this run cover the whole estate: true=full, false=a coverage gap (a discovery gap OR a unit-level deferral — incl. a deferral preserved over a prior scan, which writes no deferred-* row), null=unknowable (migrated pre-v5 run — the column was added at schema v5)"),
     discoveryFailures: z.number().int().min(0).describe("Permanent owner/repo/branch discovery failures this run (each makes the denominator unknown)"),
     discoveryDeferrals: z.number().int().min(0).describe("Discovery enumerations deferred by rate-limiting this run (re-run to complete)"),
     units: z

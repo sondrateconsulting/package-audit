@@ -121,12 +121,14 @@ export type WorkStatus = "pending" | "in_progress" | "done" | "skipped" | "error
 //     the cutoff, and the durable vocabulary must name the event the live JSONL calls 'skip-policy'.
 //   • SCAN-ATTEMPT dispositions (T5, decided AT a known head): 'scanned' (fresh), 'reused'
 //     (skip-as-current — previously mislabeled 'scanned'), and the requeue/failure outcomes
-//     'deferred-throttle'/'deferred-network'/'deferred-service'/'error'. Every unit the run reaches
-//     writes exactly one row with its true disposition; the cause→disposition map (§3.1a) is the
-//     single source of truth. These carry the OBSERVED head commit_sha (NOT '') so the commit-aware
-//     upsert precedence can protect a same-head good scan from a later transient requeue.
-// The default-branch OVERRIDE is NOT a member — that branch IS scanned/reused and merely carries a
-// counterfactual policy_status (see policyDisposition.ts::isDefaultOverride).
+//     'deferred-throttle'/'deferred-network'/'deferred-service'/'error'. These carry the OBSERVED head
+//     commit_sha (NOT ''), and the cause→disposition map (§3.1a) is the single source of truth. A unit the
+//     run reaches USUALLY writes one row with its disposition — EXCEPT the findings-preservation guard: a
+//     transient error/deferred-* over a prior REPORTABLE scan (scanned/reused) writes NO row (the good scan
+//     is kept), even at a MOVED head; the coverage gap is then recorded out of band (errors[] for an error,
+//     coverage_complete=0 for a deferral).
+// The default-branch OVERRIDE is NOT a member — that branch IS scan-attempted (scanned/reused, or a
+// deferred-*/error attempt) and merely carries a counterfactual policy_status (see policyDisposition.ts::isDefaultOverride).
 export type UnitHeadStatus =
   | "scanned" | "reused" | "skipped-cutoff" | "policy-excluded" | "past-cap"
   | "deferred-throttle" | "deferred-network" | "deferred-service" | "error";
@@ -313,7 +315,8 @@ export interface RunUnitHeadInput {
   // '' for the DISCOVERY-time dispositions that name no scanned commit (skipped-cutoff / past-cap /
   // policy-excluded). The SCAN-ATTEMPT dispositions carry the OBSERVED head oid: 'scanned'/'reused'
   // name the head they reported (current when recorded, possibly preserved-stale after a moved-head
-  // transient — §3.1a), and 'deferred-*'/'error' name the head the failed attempt saw — REQUIRED (not '')
+  // transient — §3.1a), and 'deferred-*'/'error' name the head the failed attempt RECORDED (its observed
+  // head — the coherent discovery head when a clone could not fully resolve) — REQUIRED (not '')
   // so the commit-aware upsert precedence keeps a good scan when a later attempt at any head is
   // throttled/errored (§3.1a: a transient never downgrades a reportable scan, same-commit or moved).
   commitSha: string;
@@ -2583,10 +2586,11 @@ export class AuditDb {
       );
   }
 
-  // Per-run immutable snapshot row (§3 report-head invariant). Upserted for every disposition the run
-  // reaches: scanned, reused (skip-as-current, same head), skipped-cutoff/past-cap/policy-excluded
-  // (commit_sha='' — discovery-time), and deferred-*/error (the requeue/failure paths carry the
-  // observed head oid). is_default_branch maps true/false/null → 1/0/NULL (tri-state; NULL = unknown,
+  // Per-run immutable snapshot row (§3 report-head invariant). Upserted for each disposition the run
+  // reaches — though the precedence KEEPS a prior reportable scan over a transient error/deferred-*, so
+  // that transient writes no row (§3.1a). The dispositions: scanned, reused (skip-as-current, same head),
+  // skipped-cutoff/past-cap/policy-excluded (commit_sha='' — discovery-time), and deferred-*/error (the
+  // requeue/failure paths carry the observed head oid). is_default_branch maps true/false/null → 1/0/NULL (tri-state; NULL = unknown,
   // §5.B).
   //
   // §3.1a commit-aware precedence (codex r4): the PK is (run_id,org,repo,branch), so a crash-resume
@@ -2599,8 +2603,9 @@ export class AuditDb {
   // (policy-excluded > past-cap >) error > deferred-* — so a later same-commit pass never downgrades a real
   // scan; a same-commit deferred↔deferred tie takes the latest observation. scanned_commit_date rides WITH
   // commit_sha (it describes that commit), so it is gated by the SAME condition. The DISCOVERY-KNOWN attributes
-  // {is_default_branch, policy_status, policy_matched_pattern} are run-stable (deterministic per branch
-  // name under a fixed config_hash), so they always overwrite independently — clearing stale values in
+  // {is_default_branch, policy_status, policy_matched_pattern} are re-derived at each discovery (usually
+  // stable per branch name under a fixed config_hash, though a renamed default can flip is_default_branch on
+  // a resume), so they always overwrite independently — clearing stale values in
   // every direction (§6) without ever contradicting a kept status (a branch's policy verdict cannot
   // change within a run, so the agreement CHECKs hold).
   upsertRunUnitHead(h: RunUnitHeadInput): void {

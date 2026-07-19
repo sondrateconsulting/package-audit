@@ -741,9 +741,10 @@ export async function processRepo(
       progress.startUnit(repo.organization, repo.name, h.name, h.oid);
       // The ACTUAL observed head for THIS attempt: seeded to the discovery head, but processUnit
       // OVERWRITES it with the clone's real HEAD on the truncated-tree fallback (the branch may have
-      // moved between GraphQL discovery and the clone). A deferred/error disposition below must pin to
-      // what was truly attempted — NOT the possibly-stale h.oid — so the commit-aware upsert precedence
-      // and the report's head invariant stay honest under fallback. Mutated in place by processUnit.
+      // moved between GraphQL discovery and the clone). A deferred/error disposition below pins to what was
+      // truly attempted (the clone HEAD, not the possibly-stale h.oid) WHENEVER the clone fully resolves; if
+      // the clone resolves a moved HEAD but its date read fails, observed stays the COHERENT discovery head
+      // (never a clone-sha + discovery-date pair — §3.1a fail-safe). Mutated in place by processUnit.
       const observed = { commitSha: h.oid, committedDate: h.committedDate };
       try {
         const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen, observed);
@@ -768,8 +769,9 @@ export async function processRepo(
           // reportable scan over this transient deferral (findings-preservation, §3.1a), so a moved-head
           // deferral over an existing scan writes NO deferred row yet must STILL floor. It runs FIRST, BEFORE
           // the head upsert, for crash-safety (§3.1b): a crash between the two can then only leave coverage
-          // INCOMPLETE (never optimistically complete), and a crash before it leaves the unit `pending` for a
-          // clean retry. The deferred head is still upserted at the OBSERVED head (the clone's real HEAD under
+          // INCOMPLETE (never optimistically complete), and a crash BEFORE this mark leaves the unit `pending`
+          // (set just above) with the optimistic coverage default — a safe state the next run cleanly
+          // retries. The deferred head is still upserted at the OBSERVED head (the clone's real HEAD under
           // a truncated-tree fallback, else the discovery head) so the no-prior-scan case records its
           // disposition; the precedence keeps any same-/moved-head good scan intact.
           db.markCoverageIncomplete(runId);
