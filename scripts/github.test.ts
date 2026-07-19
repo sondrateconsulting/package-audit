@@ -1878,13 +1878,14 @@ describe("per-category spawn deadlines (T11)", () => {
   });
 
   // graphql() and bare gh() route through the control-API budget; only restGet was deadline-tested.
-  // Both budgets are short (11/31) so a routing mutant fires fast instead of hanging. (IMPORTANT-5b)
-  test("a graphql call times out on controlApiMs, never the clone budget", async () => {
-    const client = stall({ controlApiMs: 11, cloneMs: 31 });
+  // EVERY category gets a short DISTINCT budget, so a routing mutant to ANY of them fires in tens of ms
+  // (the assertion pins "after 11ms" = controlApiMs) instead of hanging to the runner timeout. (5b)
+  test("a graphql call times out on controlApiMs, never any other category's budget", async () => {
+    const client = stall({ controlApiMs: 11, bulkApiMs: 21, cloneMs: 31, tarMs: 41, probeMs: 51 });
     await expect(client.graphql("query{x}", {})).rejects.toThrow(/spawn timed out after 11ms/);
   });
-  test("a bare gh control call (--version) times out on controlApiMs", async () => {
-    const client = stall({ controlApiMs: 11, cloneMs: 31 });
+  test("a bare gh control call (--version) times out on controlApiMs, never any other category's budget", async () => {
+    const client = stall({ controlApiMs: 11, bulkApiMs: 21, cloneMs: 31, tarMs: 41, probeMs: 51 });
     const res = await client.gh(["--version"]);
     expect(res.stderr).toMatch(/spawn timed out after 11ms/);
   });
