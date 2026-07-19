@@ -555,6 +555,37 @@ describe("sealable stderr proxy (§U8.13a)", () => {
     expect(causes.some((c) => c.includes("stderr write threw") && c.includes("EIO"))).toBe(true);
     proxy.detach();
   });
+
+  test("compensateCursor clears its once-flag when the failure arrives through the CALLBACK — a later site retries", () => {
+    // A write can return normally and still fail: the stream reports the error via the
+    // callback. A sync-success-only flag would have recorded a compensation that never landed.
+    const real = new FakeStream();
+    const failure: { err: Error | null } = { err: new Error("EIO reported via callback") };
+    real.write = ((chunk: unknown, encodingOrCb?: unknown, maybeCb?: unknown): boolean => {
+      const cb =
+        typeof encodingOrCb === "function"
+          ? (encodingOrCb as (e?: Error | null) => void)
+          : typeof maybeCb === "function"
+            ? (maybeCb as (e?: Error | null) => void)
+            : undefined;
+      if (failure.err !== null) {
+        cb?.(failure.err); // reported through the callback, not a throw
+        return true;
+      }
+      real.writes.push(String(chunk));
+      cb?.();
+      return true;
+    }) as typeof real.write;
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    proxy.compensateCursor();
+    expect(proxy.cursorCompensated).toBe(false); // the callback said it never landed
+    expect(real.all()).toBe("");
+    failure.err = null; // the stream recovers
+    proxy.compensateCursor();
+    expect(proxy.cursorCompensated).toBe(true);
+    expect(real.all()).toBe(SHOW_CURSOR);
+    proxy.detach();
+  });
 });
 
 // ---- §U8.13 lifecycle ------------------------------------------------------------------------
@@ -1226,6 +1257,50 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     expect(r).toBe("ok");
     expect(capture.opts).toBeNull();
     expect(stderr.all()).toBe(""); // nothing landed anywhere — and nothing threw
+  });
+
+  test("a clean-looking exit whose unmount window ABSORBED a failed write still gets cursor compensation (step 5a's absorb delta)", async () => {
+    // Ink's own cursor-restore write can be eaten by a dying stderr while waitUntilExit still
+    // resolves "exited" — the absorb-channel delta across the unmount window is the tell. A
+    // redundant show would be a no-op; skipping it here would strand a hidden cursor.
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    const handle = makeFakeHandle({
+      exitMode: "manual",
+      onUnmount: () => {
+        // ink's restore attempt, refused by the stream — then the stream recovers
+        stderr.throwOnWrite = new Error("EIO at restore time");
+        (capture.opts!.out as unknown as { write: (c: string) => boolean }).write(SHOW_CURSOR);
+        stderr.throwOnWrite = null;
+      },
+    });
+    deps.mountImpl = makeFakeMount(handle, capture);
+    await runWithTui(deps, async () => {});
+    // the failed restore was absorbed (and latched); step 5a compensated after recovery
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1);
+    expect(stderr.all()).toContain("dashboard disabled — stderr write threw: EIO at restore time");
+  });
+
+  test("the late-handle unwind RETRIES a refused pre-wait compensation after its bounded wait", async () => {
+    // The unwind compensates BEFORE its bounded wait; a transiently broken stderr refuses that
+    // first attempt (the callback-aware flag stays unset) — the post-wait retry must land it.
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    const handle = makeFakeHandle({
+      exitMode: "immediate",
+      onDispose: () => {
+        stderr.throwOnWrite = null; // the stream recovers right after the pre-wait attempt
+      },
+    });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.onDegrade(); // teardown races ahead — the returning handle takes the unwind path
+        stderr.throwOnWrite = new Error("EIO during unwind");
+      },
+    });
+    const r = await runWithTui(deps, async () => 7);
+    expect(r).toBe(7);
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1); // the RETRY landed it
   });
 });
 

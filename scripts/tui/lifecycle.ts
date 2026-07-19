@@ -95,6 +95,11 @@ export interface SealableStderr {
   readonly stream: NodeJS.WriteStream; // hand THIS to Ink; delegates everything else to the real stream
   readonly sealed: boolean;
   readonly sealedDrops: number; // write attempts counted-and-dropped after seal
+  readonly absorbedFailures: number; // every failure routed through the absorb channel (write
+  //                                    throws, callback errors, 'error' events) — teardown's
+  //                                    step-5a delta check reads it: stderr trouble inside the
+  //                                    unmount window means Ink's own cursor restore may have
+  //                                    been eaten even when the exit looked clean
   readonly cursorCompensated: boolean; // the cursor-show escape was written on Ink's behalf
   seal(): void; // idempotent; writes stop reaching the real stream
   sealEarly(): void; // seal + cursor-show compensation in ONE synchronous step (§U1)
@@ -115,9 +120,11 @@ type WriteCb = (err?: Error | null) => void;
 export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (cause: string) => void): SealableStderr {
   let sealed = false;
   let sealedDrops = 0;
+  let absorbedFailures = 0;
   let cursorCompensated = false;
 
   const absorb = (cause: string): void => {
+    absorbedFailures++;
     try {
       onWriteFailure(cause);
     } catch {
@@ -220,6 +227,9 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
     get sealedDrops() {
       return sealedDrops;
     },
+    get absorbedFailures() {
+      return absorbedFailures;
+    },
     get cursorCompensated() {
       return cursorCompensated;
     },
@@ -231,17 +241,21 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
       // restore write was (or will be) dropped by the seal: sealEarly, a timed-out/failed
       // unmount, or a late-handle unwind against an already-sealed proxy. Idempotent on
       // SUCCESS; best-effort (a dead stderr cannot be compensated, and must not throw here).
-      // The once-flag is set only AFTER a non-throwing write: a transiently broken stderr
-      // must not consume the single compensation attempt — a later caller (step 5a's net)
-      // can still retry, so one cursor hide can never end with zero successful shows while
-      // any compensation site remains. A redundant show when the cursor is already visible
+      // CALLBACK-AWARE: the once-flag is set optimistically and CLEARED whenever the stream
+      // refuses the escape — synchronously (a throw) or asynchronously (a later callback
+      // error) — so a transiently broken stderr never consumes the single compensation
+      // attempt: a later site (teardown step 5a, the unwind's post-wait retry) writes it
+      // again. One cursor hide can therefore never end with zero successful shows while any
+      // compensation site remains, and a redundant show when the cursor is already visible
       // is a terminal no-op.
       if (cursorCompensated) return;
       try {
-        real.write(SHOW_CURSOR, () => {});
         cursorCompensated = true;
+        real.write(SHOW_CURSOR, (err) => {
+          if (err != null) cursorCompensated = false; // the write DID NOT land — re-open the retry window
+        });
       } catch {
-        // best-effort only — the flag stays unset so a later site may retry
+        cursorCompensated = false; // synchronous refusal — a later site may retry
       }
     },
     sealEarly(): void {
@@ -420,6 +434,7 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         // 2. unmount + bounded exit wait. A non-"exited" outcome is NOT silent success: it is a
         // teardown fact the operator must see (a wedged Ink whose frames the seal will drop).
         const sealedBeforeUnmount = proxy.sealed;
+        const absorbedBeforeUnmount = proxy.absorbedFailures; // step 5a compares: failures AFTER this are unmount-window trouble
         let exitOutcome: "exited" | "timeout" | "wait-rejected" | "wait-threw" | "timer-failed" | "no-handle" = "no-handle";
         if (h !== null) {
           try {
@@ -460,12 +475,19 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
                 : `JSONL log: ${shownPath}`;
           guarded("exit-line", () => writeReal(exitLine + "\n"));
         }
-        // 5a. cursor compensation for every path where Ink's own restore write did not land:
-        // a seal that preceded unmount without sealEarly's compensation (a defensive
-        // impossibility — every pre-unmount seal site uses sealEarly), and the REAL case a
-        // bounded-exit failure leaves behind — a wedged/failed unmount never restored the
-        // cursor, and the step-3 seal has closed the stream to any late restore attempt.
-        if (!proxy.cursorCompensated && (sealedBeforeUnmount || (state.handle !== null && exitOutcome !== "exited")))
+        // 5a. cursor compensation for every path where Ink's own restore write did not land —
+        // or an earlier compensation attempt was refused (the once-flag is callback-aware, so
+        // a failed sealEarly show re-opens this retry window): a seal that preceded unmount
+        // (sealEarly compensates, but a transiently broken stderr may have eaten the escape),
+        // the REAL case a bounded-exit failure leaves behind (a wedged/failed unmount never
+        // restored the cursor, and the step-3 seal has closed the stream to any late restore),
+        // and a CLEAN-LOOKING exit whose unmount window recorded ABSORBED stderr failures —
+        // Ink believed its restore landed; the absorb delta says the stream was eating writes.
+        // A redundant show on a healthy terminal is a no-op; a missing one strands the cursor.
+        if (
+          !proxy.cursorCompensated &&
+          (sealedBeforeUnmount || (state.handle !== null && (exitOutcome !== "exited" || proxy.absorbedFailures > absorbedBeforeUnmount)))
+        )
           guarded("cursor-show", () => proxy.compensateCursor());
         // 6. the ONE latched-failure warning (first cause + sealed-write count), if any
         const latch = tuiFailure();
@@ -540,6 +562,17 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         }
         const unwindOutcome = await boundedExitWait(h, (m) => unwindWarnings.push(m));
         if (unwindOutcome !== "exited") unwindWarnings.push(`exit-wait: ${unwindOutcome}`);
+        // The pre-wait compensation above may have been REFUSED by a transiently broken stderr
+        // (the once-flag is callback-aware) — one post-wait retry keeps the unwind's cursor
+        // discipline total: this renderer hid the cursor, so the unwind must not end with zero
+        // successful shows while the stream will still take one.
+        if (!proxy.cursorCompensated) {
+          try {
+            proxy.compensateCursor();
+          } catch {
+            // internally total; belt-and-braces
+          }
+        }
         if (unwindWarnings.length > 0) warnReal(`package-audit: dashboard unwind warnings — ${unwindWarnings.join("; ")}\n`);
       } else {
         state.handle = h;
