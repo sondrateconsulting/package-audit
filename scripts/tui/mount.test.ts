@@ -8,6 +8,7 @@ import { expect, test, describe, spyOn, afterEach } from "bun:test";
 import { EventEmitter } from "node:events";
 import { mountTui, DEFAULT_TICK_MS, type TuiHandle, type MountTuiOptions } from "./mount.tsx";
 import { createTuiStore, type TuiStore } from "./store.ts";
+import { makeSealableStderr } from "./lifecycle.ts";
 import { resetTuiFailure, reportTuiFailure } from "../progress.ts";
 
 // Ink treats a CI environment as non-interactive regardless of isTTY (is-in-ci reads these).
@@ -303,6 +304,35 @@ describe("post-render rollback + adapter cleanup (§U6 remediation)", () => {
     expect(events).toEqual(["unmount"]);
     expect(unrefs).toBe(1); // the uncancellable interval no longer holds the event loop
     (tickFn as unknown as () => void)(); // a still-firing interval callback is inert (no throw)
+  });
+
+  test("ink-facing dims pin LIVE while getRawDims reports the collapse: the App renders EMPTY without ink ever seeing falsy dims", async () => {
+    const real = new CaptureStream(); // 100x30 to start
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    const handle = mountTui(createTuiStore(() => 0), { out: proxy.stream, onDegrade: () => {}, nowMs: () => 0 });
+    try {
+      if (!IN_CI) await waitFor(() => real.all().includes("package-audit")); // content at 100x30
+      // mid-run collapse: the terminal stops reporting usable dimensions
+      (real as unknown as { columns: unknown }).columns = undefined;
+      (real as unknown as { rows: unknown }).rows = 0;
+      // LIVE, not a creation-time snapshot: the pin and the raw channel both track the mutation
+      expect((proxy.stream as unknown as { columns: number }).columns).toBe(80);
+      expect((proxy.stream as unknown as { rows: number }).rows).toBe(24);
+      const raw = (proxy.stream as unknown as { getRawDims: () => { columns: number | undefined; rows: number | undefined } }).getRawDims();
+      expect(raw).toEqual({ columns: undefined, rows: 0 });
+      const framesBefore = real.frames.length;
+      real.emit("resize"); // the adapter's wake channel (registered through the proxy's delegation)
+      if (!IN_CI) await waitFor(() => real.frames.length > framesBefore); // React committed the EMPTY frame
+      else await new Promise((r) => setTimeout(r, 50));
+      const mark = real.all().length;
+      handle.requestUnmount();
+      await Promise.race([handle.waitUntilExit(), new Promise((r) => setTimeout(r, 2000))]);
+      // everything from the post-collapse commit onward carries NO panel content: the App
+      // planned EMPTY from the RAW dims while ink itself laid out against the pinned 80x24
+      expect(real.all().slice(mark)).not.toContain("package-audit");
+    } finally {
+      handle.dispose();
+    }
   });
 
   test("dispose() without unmount detaches exactly the adapter's resize listener (wedged-unmount shape)", async () => {

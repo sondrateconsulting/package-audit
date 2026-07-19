@@ -110,4 +110,16 @@ describe("planLayout (§U5 terminal-size discipline)", () => {
     const l = planLayout(120, 12, demand());
     expect(l).toEqual({ mode: "full", workRows: 0, netRows: 0, showFindings: true, problemsCollapsed: false });
   });
+
+  test("non-renderable dimensions on EITHER axis are EMPTY: the positive-integer predicate matches the proxy pin", () => {
+    // NaN passes every `<` guard (all comparisons false) and used to select FULL with a NaN row
+    // budget; fractions/Infinity would corrupt the budget likewise. The planner and the
+    // lifecycle proxy must agree on what a valid dimension is.
+    const bad = [undefined, 0, -1, 3.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY];
+    for (const v of bad) {
+      expect({ v, axis: "columns", mode: planLayout(v, 30, demand()).mode }).toEqual({ v, axis: "columns", mode: "empty" });
+      expect({ v, axis: "rows", mode: planLayout(120, v, demand()).mode }).toEqual({ v, axis: "rows", mode: "empty" });
+    }
+    expect(planLayout(120, 30, demand()).mode).toBe("full"); // valid positive integers pass
+  });
 });

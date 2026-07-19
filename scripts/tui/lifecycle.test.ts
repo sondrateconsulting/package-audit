@@ -448,6 +448,25 @@ describe("sealable stderr proxy (§U8.13a)", () => {
     proxy.detach();
   });
 
+  test("ink-facing dimension pin: positive integers delegate; every non-renderable value pins to 80x24; getRawDims reports the truth", () => {
+    // A RECORDED DEVIATION from the §U1 delegation letter, grounded in §U0: ink's internal
+    // layout consults a helper that can shell out when `columns && rows` is falsy — the proxy
+    // never hands ink a non-renderable dimension, while getRawDims() keeps the App honest.
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    const s = proxy.stream as unknown as { columns: number; rows: number; getRawDims: () => { columns: number | undefined; rows: number | undefined } };
+    expect(s.columns).toBe(100); // real positive integers delegate untouched (live, per test above)
+    expect(s.rows).toBe(30);
+    for (const v of [undefined, 0, -1, 3.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      (real as unknown as { columns: unknown }).columns = v;
+      (real as unknown as { rows: unknown }).rows = v;
+      expect({ v, columns: s.columns, rows: s.rows }).toEqual({ v, columns: 80, rows: 24 }); // ink never sees it
+      const expectedRaw = typeof v === "number" ? v : undefined;
+      expect({ v, raw: s.getRawDims() }).toEqual({ v, raw: { columns: expectedRaw, rows: expectedRaw } });
+    }
+    proxy.detach();
+  });
+
   test("seal() then sealEarly(): the late sealEarly STILL compensates, exactly once (the contract is seal+show)", () => {
     // A teardown's plain step-3 seal can race ahead of a mount-failure path's sealEarly — the
     // late caller still owes the cursor show; compensateCursor's once-flag carries the

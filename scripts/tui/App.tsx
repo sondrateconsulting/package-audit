@@ -25,11 +25,17 @@ export function App({ store, subscribe, nowMs, mountedAtMs }: AppProps) {
   // getWindowSize fallback reaches the terminal-size package — which can shell out to
   // tput/resize helpers — exactly when the stream reports falsy dimensions. This feature's code
   // spawns nothing (§U0), and undefined dimensions must render the EMPTY frame, never consult
-  // the ambient terminal (§U5). Layout reads the RAW stream dimensions below.
+  // the ambient terminal (§U5). Layout therefore reads the RAW dimensions: the lifecycle proxy
+  // pins the ink-facing columns/rows to safe positive integers (ink's OWN internal layout calls
+  // that same spawn-capable helper on falsy values) and exposes the truth via getRawDims() —
+  // function-detected here so direct capture-stream mounts (tests, ITL) fall back to the plain
+  // props unchanged.
+  const rawDims = (stdout as unknown as { getRawDims?: () => { columns: number | undefined; rows: number | undefined } }).getRawDims;
+  const dims = rawDims !== undefined ? rawDims() : { columns: stdout.columns, rows: stdout.rows };
 
   const snap = store.snapshot();
   const now = nowMs();
-  const layout = planLayout(stdout.columns, stdout.rows, {
+  const layout = planLayout(dims.columns, dims.rows, {
     units: snap.unitWorkers.length,
     introspections: snap.introspections.length,
     net: snap.spawns.length + snap.fetches.length,

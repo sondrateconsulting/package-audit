@@ -87,8 +87,14 @@ export type Layout =
 
 // The §U1 activation floor (40x5) re-checked at RENDER time: a terminal that shrinks below it
 // mid-run degrades the frame, never the lifecycle.
+// A renderable dimension is a POSITIVE INTEGER — the same predicate the lifecycle's stderr
+// proxy pins ink-facing values with (the two layers must agree, or the App could budget more
+// rows than ink's own viewport). NaN passes every `<` guard below, and fractions/Infinity would
+// corrupt the row budget — all of them render the EMPTY frame, exactly like undefined (§U5: a
+// fixed line cannot be guaranteed one physical row in an unknowable viewport).
+const usableDim = (v: number | undefined): v is number => v !== undefined && Number.isInteger(v) && v > 0;
 export function planLayout(columns: number | undefined, rows: number | undefined, demand: LayoutDemand): Layout {
-  if (columns === undefined || rows === undefined || rows < 2 || columns < 20) return { mode: "empty" };
+  if (!usableDim(columns) || !usableDim(rows) || rows < 2 || columns < 20) return { mode: "empty" };
   if (rows < 5 || columns < 40) return { mode: "single-line" };
   if (columns < 60 || rows < 12) return { mode: "compact" };
 

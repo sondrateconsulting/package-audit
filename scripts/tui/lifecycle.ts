@@ -149,12 +149,31 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
     }
   };
 
+  // Ink-facing dimension pin (a RECORDED DEVIATION from §U1's delegation letter, grounded in
+  // §U0): ink's own layout calls its getWindowSize(stdout) helper at five internal sites, and
+  // whenever `columns && rows` is falsy that helper falls through to the terminal-size package —
+  // which can SHELL OUT (tput/resize helpers) — a spawn route outside github.ts, inside our
+  // process. The proxy therefore never hands ink a non-renderable dimension: real positive
+  // integers delegate untouched; everything else (undefined, 0, NaN, negatives, fractions,
+  // Infinity — the falsy spawn triggers plus the nonsense numerics ink would misrender) pins to
+  // ink's own documented 80x24 defaults. The App does NOT read the pinned values for layout:
+  // getRawDims() exposes the real stream's actual values (undefined included), so §U5's
+  // EMPTY-frame discipline still sees the truth.
+  const pinDim = (v: unknown, fallback: number): number => (typeof v === "number" && Number.isInteger(v) && v > 0 ? v : fallback);
+  const rawDim = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  const getRawDims = (): { columns: number | undefined; rows: number | undefined } => ({
+    columns: rawDim((real as { columns?: unknown }).columns),
+    rows: rawDim((real as { rows?: unknown }).rows),
+  });
   const overrides: Record<PropertyKey, unknown> = { write };
   const stream = new Proxy(real, {
     get(target, prop) {
+      if (prop === "columns") return pinDim((target as { columns?: unknown }).columns, 80);
+      if (prop === "rows") return pinDim((target as { rows?: unknown }).rows, 24);
+      if (prop === "getRawDims") return getRawDims;
       if (prop in overrides) return overrides[prop];
-      // receiver = target on purpose: getters (isTTY/columns/rows) must read the REAL stream's
-      // state, and returned methods are bound to it — true fallthrough delegation (§U1).
+      // receiver = target on purpose: getters (isTTY etc.) must read the REAL stream's state,
+      // and returned methods are bound to it — true fallthrough delegation (§U1).
       const value = Reflect.get(target, prop, target);
       return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
     },
