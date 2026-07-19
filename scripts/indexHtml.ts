@@ -12,6 +12,7 @@ import { mdCell } from "./markdownEscape.ts";
 import {
   computeDossierModel,
   dossierFilename,
+  renderOutcomeBanner,
   renderShell,
   type DossierPackage,
   type DossierReport,
@@ -54,17 +55,31 @@ function buildRow(pkg: DossierPackage): IndexRow {
 // deny/allow + default-override diagnostics (when any policy is active), and a sorted ledger of every
 // branch carrying a policy_status. Every identifier passes through esc() inside a bidi-isolated <code>.
 function policyDispositionLabel(r: PolicyBranchRow): string {
-  if (r.disposition === "scanned-default-override") return "scanned (default-branch override)";
-  // Exhaustive over PolicyBranchRow.policyStatus — the RENDER-LAYER union (reportHtml.ts), deliberately
-  // kept distinct from db.PolicyStatus. A `=== "excluded-by-deny" ? … : …` ternary would funnel any
-  // future member of THAT union into the allow label with no compiler signal; the switch's assertNever
-  // makes it a build error instead. (A new db.PolicyStatus member is caught UPSTREAM, where report.ts's
-  // buildScanScope assigns the wider db-union value into this narrower render union.) The two current
-  // labels are byte-identical to the previous ternary.
-  switch (r.policyStatus) {
-    case "excluded-by-deny": return "excluded (deny)";
-    case "excluded-by-allow": return "excluded (not allow-listed)";
-    default: return assertNever(r.policyStatus, "policyStatus");
+  // EXHAUSTIVE over PolicyBranchRow.disposition (the RENDER union) — a future member fails the build here
+  // via assertNever rather than silently falling through to an "excluded" label. A default-branch override
+  // is scan-ATTEMPTED, but only a REPORTABLE attempt (scanned/reused) is truly scanned — a deferred-*/error
+  // attempt is 'attempted-default-override', so we never claim it was scanned.
+  switch (r.disposition) {
+    case "scanned-default-override":
+      return "scanned (default-branch override)";
+    case "attempted-default-override":
+      return "attempted (default-branch override)";
+    case "excluded":
+      // EXHAUSTIVE over PolicyBranchRow.policyStatus — the RENDER-LAYER union (reportHtml.ts), deliberately
+      // kept distinct from db.PolicyStatus. A `=== "excluded-by-deny" ? … : …` ternary would funnel any
+      // future member of THAT union into the allow label with no compiler signal; assertNever makes it a
+      // build error instead. (A new db.PolicyStatus member is caught UPSTREAM, where report.ts's
+      // buildScanScope assigns the wider db-union value into this narrower render union.)
+      switch (r.policyStatus) {
+        case "excluded-by-deny":
+          return "excluded (deny)";
+        case "excluded-by-allow":
+          return "excluded (not allow-listed)";
+        default:
+          return assertNever(r.policyStatus, "policyStatus");
+      }
+    default:
+      return assertNever(r.disposition, "disposition");
   }
 }
 function renderScanScope(report: DossierReport): string {
@@ -147,6 +162,7 @@ export function renderIndex(report: DossierReport, opts: { formatVersion: number
   const html =
     `<header id="exec"><p class="meta">package usage x-ray</p><h1 class="exec">Package usage dossiers — ${esc(plural(rows.length, "tracked package"))}.</h1>` +
     `<p class="meta num">run ${esc(report.runId)} · generated ${esc(report.generatedAt)} · ${esc(receipts)}</p></header>` +
+    renderOutcomeBanner(report.runOutcome) + // §3.1b: flag a partial/failed run at the top of the index
     `<main>${renderScanScope(report)}<section id="packages" aria-labelledby="h-packages"><h2 id="h-packages">Tracked packages</h2>` +
     `<button class="copy" type="button" aria-live="polite" data-copy-target="packages">copy as markdown</button>` +
     `<template id="packages-md">${esc(md)}</template>${body}</section></main>` +

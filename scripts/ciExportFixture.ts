@@ -88,7 +88,7 @@ export function generateFixtureExports(outputDir: string): { runId: string } {
         ],
       });
     }
-    db.completeRun(runId);
+    db.finalizeRun(runId, "complete"); // T5: the exported v4 run must be finalized (outcome='complete') to be valid
     exportRun(db, db.getRun(runId)!, outputDir, { raw: false });
     return { runId };
   } finally {

@@ -1,6 +1,6 @@
 import { expect, test, describe } from "bun:test";
 import { createHash } from "node:crypto";
-import { AuditDb } from "./db.ts";
+import { AuditDb, type RunOutcome } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
 import { STATIC_SCRIPT, dossierFilename, type DossierReport, type DossierUnit } from "./reportHtml.ts";
@@ -31,7 +31,7 @@ function fixtureReport(): DossierReport {
     permalink: "https://github.com/org-a/app/blob/abc123def4567/src/icons.tsx#L3",
     snippet: "import { Ionicons } from '@expo/vector-icons';", foundAt: T0,
   });
-  db.completeRun(runId);
+  db.finalizeRun(runId, "complete"); // buildReport requires a finalized run (§3.1e)
   const report = buildReport(db, db.getRun(runId)!) as unknown as DossierReport;
   db.close();
   // Pin the two nondeterministic envelope fields so the index renders byte-identically
@@ -48,7 +48,9 @@ const OPTS = { formatVersion: XRAY_FORMAT_VERSION };
 // re-pass bidi-isolation rule moved these bytes. Same sanction rule as reportHtml.test.ts.
 // PRE-LAUNCH RE-PIN (M4 bidi fix): `.branchnote` gains `unicode-bidi:isolate` in the shared
 // PAGE_CSS, shifting the index bytes too. CSS-only.
-const GOLDEN_INDEX_SHA256 = "f0083ae7cee2dcfff907b64d7d3b9650e5c5556ab06de81f9e41968add38ca40";
+// PRE-LAUNCH RE-PIN (§3.1b runOutcome banner, sanctioned): the shared PAGE_CSS gains `.run-banner`
+// rules + a `--danger` variable; this fixture is a COMPLETE run so no banner renders — CSS-only.
+const GOLDEN_INDEX_SHA256 = "9236d0978dd7f8f0fe0474a94acb06be79011d42b908982bd558dd925be950bf";
 
 describe("renderIndex — copy-as-markdown neutralizes a hostile value through the real render path", () => {
   // Package names are validated and versionsSeen is the valid-semver slice, so a payload cannot
@@ -134,6 +136,7 @@ describe("renderIndex — edge states", () => {
     packages,
     summary: { repositoriesScanned: 0, branchesScanned: 0, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
     scanScope: { excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "complete" },
+    runOutcome: { outcome: "complete", coverageComplete: true }, // complete → no banner (default)
   });
 
   test("no tracked packages: a designed empty table state", () => {
@@ -192,6 +195,27 @@ describe("renderIndex — edge states", () => {
     expect(html).not.toContain("were not fully recorded");
   });
 
+  test("B2/C3: attempted-default-override renders 'attempted (default-branch override)', never falls through to 'excluded'", () => {
+    const report: DossierReport = {
+      ...baseReport([]),
+      summary: { repositoriesScanned: 2, branchesScanned: 1, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+      scanScope: {
+        excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 1, // only the SCANNED override
+        policyBranches: [
+          { organization: "org-a", repository: "r1", branch: "main", disposition: "scanned-default-override", policyStatus: "excluded-by-deny", matchedPattern: "main" },
+          { organization: "org-a", repository: "r2", branch: "main", disposition: "attempted-default-override", policyStatus: "excluded-by-deny", matchedPattern: "main" },
+        ],
+        provenance: "complete",
+      },
+    };
+    const html = renderIndex(report, OPTS);
+    expect(html).toContain("scanned (default-branch override)"); // the completed attempt
+    expect(html).toContain("attempted (default-branch override)"); // the errored/deferred attempt — NOT "scanned"
+    // Neither override may fall through the disposition guards into the excluded-policyStatus switch (the
+    // pre-fix bug: an 'attempted-default-override' row would have been mislabeled "excluded (deny)").
+    expect(html).not.toContain("excluded (deny)");
+  });
+
   test("scan-scope panel: an unverifiable-provenance run (pre-v4 OR zero-head) caveats the understated counts", () => {
     const complete = renderIndex(baseReport([]), OPTS);
     expect(complete).not.toContain("were not fully recorded"); // default fixture is v4-native
@@ -209,5 +233,23 @@ describe("renderIndex — edge states", () => {
   test("INDEX_FILENAME matches the artifact name grammar", () => {
     expect(INDEX_FILENAME).toBe("index.html");
     expect(INDEX_FILENAME).toMatch(/^[A-Za-z0-9@._~-]+$/);
+  });
+
+  // §3.1b: the index page must flag a partial/failed run so `report --run-id <partial> --html` is
+  // not mistaken for a complete audit.
+  const reportWith = (outcome: RunOutcome | null, coverageComplete: boolean | null): DossierReport =>
+    ({ ...baseReport([]), runOutcome: { outcome, coverageComplete } });
+  test("a COMPLETE run's index renders NO banner element", () => {
+    expect(renderIndex(reportWith("complete", true), OPTS)).not.toContain('<p class="run-banner');
+  });
+  test("a PARTIAL run's index renders the partial banner naming the outcome", () => {
+    const html = renderIndex(reportWith("partial-deferred", false), OPTS);
+    expect(html).toContain('<p class="run-banner partial"');
+    expect(html).toContain("Partial run (partial-deferred)");
+  });
+  test("a legacy-unknown run's index renders the muted coverage-unknown note", () => {
+    const html = renderIndex(reportWith("legacy-unknown", null), OPTS);
+    expect(html).toContain('<p class="run-banner unknown"');
+    expect(html).toContain("Coverage unknown");
   });
 });

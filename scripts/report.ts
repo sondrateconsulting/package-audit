@@ -1,6 +1,7 @@
 // report.ts — §7 consolidated report, generated DETERMINISTICALLY from SQLite ALONE. Entry point:
 //   bun run scripts/report.ts [--config <path>] [--run-id <id>] [--html]
-// Default (no --run-id): the latest COMPLETED run with non-empty tracked_packages; also overwrites
+// Default (no --run-id): the latest run with a COMPLETE (or migrated legacy-unknown) OUTCOME and non-empty
+// tracked_packages — a partial/fatal run is NOT reportable; also overwrites
 // <outputDir>/latest.json. A --run-id writes its JSON report ONLY to <outputDir>/run-<id>.json (never latest.json).
 // Findings are joined through the per-run run_unit_head snapshot (never findings.run_id) filtered
 // to runs.tracked_packages, and EVERY emitted array has a total, stable sort key so the output is
@@ -10,7 +11,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { loadConfig, type Config } from "./config.ts";
-import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
+import { AuditDb, REPORTABLE_UNIT_STATUSES, type AuditDbReader, type RunOutcome, type RunRecord, type UnitHeadStatus } from "./db.ts";
 import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
@@ -22,6 +23,11 @@ import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+// The reportable-head SQL fragment (`'scanned', 'reused'`), derived from the db.ts constant so the
+// findings JOINs can never drift from the in-memory filter. Values are fixed enum literals (never
+// input), so interpolating them into the JOIN's IN(...) is injection-safe and passes read()'s guard.
+const REPORTABLE_HEAD_SQL = REPORTABLE_UNIT_STATUSES.map((s) => `'${s}'`).join(", ");
 
 interface DepRow {
   organization: string; repository: string; branch: string; commit_sha: string;
@@ -37,7 +43,7 @@ interface UsageRowDb {
   context: string; file_path: string; line_number: number; permalink: string; snippet: string; found_at: string;
 }
 interface HeadRow {
-  organization: string; repository: string; branch: string; commit_sha: string; status: string;
+  organization: string; repository: string; branch: string; commit_sha: string; status: UnitHeadStatus;
   is_default_branch: number | null; // 1/0/NULL — NULL = unknown (pre-v3 run rows)
   policy_status: string | null; // 'excluded-by-deny' | 'excluded-by-allow' | NULL (PROMPT.md §3)
   policy_matched_pattern: string | null; // the causing deny pattern; NULL for allow-miss / no-policy
@@ -56,47 +62,46 @@ export interface ReportSummary {
   repositoriesScanned: number;
   branchesScanned: number;
   branchesSkippedByCutoff: number;
-  // Branch allow/deny (§5): the disjoint disposition partition. The four disposition counts partition the
-  // run_unit_head rows this run RECORDED, exactly once each. (That clause is unconditional and exact.)
-  // Together with branchesErrored they account for the branches that reached a TERMINAL outcome:
+  // Branch allow/deny (§5): the SUMMARY disposition counts. branchesScanned (scanned+reused) /
+  // branchesSkippedByCutoff / branchesExcludedByPolicy / branchesPastCap key on `status`; together with
+  // branchesErrored they account for the branches that reached a TERMINAL outcome. The recorded
+  // run_unit_head rows ALSO include non-terminal deferred-throttle/network/service dispositions (un-covered,
+  // surfaced via runOutcome), so these SUMMARY counts partition the TERMINAL branches, not every recorded
+  // row:
   //   discovered (terminal) = branchesScanned + branchesSkippedByCutoff + branchesExcludedByPolicy
   //                           + branchesPastCap + branchesErrored   — EXACT on a SINGLE-INVOCATION run.
-  //   discovered (terminal) <= that sum                             — on a RESUMED run; see branchesErrored
-  //                                                                   for exactly which branches inflate it.
+  //   discovered (terminal) <= that sum                             — on a RESUMED run; see branchesErrored.
   // branchesScanned INCLUDES scanned default-override rows (they WERE scanned). branchesSkippedByCutoff is
   // GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket.
   branchesExcludedByPolicy: number;
   branchesPastCap: number;
-  // Counts EXACTLY this: distinct (org, repo, branch) with a scope='scan' errors[] entry for this run
-  // that hold NO run_unit_head disposition row. Read it as that, and not as "every branch whose scan
-  // errored" — on a SINGLE-INVOCATION run the two coincide (a to-scan branch that reaches a TERMINAL
-  // outcome gets a row or an errors[] entry; the one composite case is a step failing AFTER the
-  // scanned row committed — the success-log write or the work-queue 'done' update — which can leave
-  // an errors[] entry beside the row: the persisted row counts that branch under branchesScanned,
-  // and the row-key exclusion below keeps it out of THIS count, so it still counts exactly once),
-  // but on a RESUMED run they diverge in BOTH directions.
+  // Distinct branches whose scan FAILED this run — the UNION of two DISJOINT sets: (a) error-status
+  // run_unit_head HEADS (a permanent scan failure, a terminal disposition recorded at the observed commit
+  // when no prior reportable scan protected the head), and (b) ROWLESS scan errors — a scope='scan' errors[]
+  // entry on a branch holding NO run_unit_head row (a failure before any disposition). An error head IS a
+  // row, so it is excluded from (b) — never a double-count. A branch with a SCANNED row PLUS a scope='scan'
+  // error — a post-persistence log/queue write throwing after the scanned row committed, OR a moved-head
+  // re-scan failure whose findings-preservation guard (§3.1a) KEPT the prior scan — counts under
+  // branchesScanned, not here. On a SINGLE-INVOCATION run this equals "every branch whose scan errored"; on
+  // a RESUMED run (b) diverges in BOTH directions.
   //
   // A resumed run REUSES the run_id (db.startRun), so errors[] and run_unit_head both span invocations.
-  // errors[] is append-only and is NEVER reconciled; run_unit_head rows ARE pruned (reconcileRunUnitHead).
+  // errors[] is append-only — its ONE reconciliation is the excluded-owner prune (db.pruneExcludedOwnerRows);
+  // run_unit_head rows are pruned (reconcileRunUnitHead) and superseded by the commit-aware upsert.
   //
-  //   MORE than the errored set: a branch that errored in an EARLIER invocation and reached no
-  //   row-bearing disposition in the final one is still counted — whether it is now gone (deleted),
-  //   deferred (throttle-requeued on retry), or unvisited (its repo's discovery failed). Stated as this
-  //   membership rule on purpose: "overcounts by exactly the deleted branches" would be false.
+  //   MORE than the current rowless errors: a branch that errored in an EARLIER invocation and reached no
+  //   row-bearing disposition in the final one is still counted via its append-only error — whether now
+  //   gone (deleted) or unvisited (its repo's discovery failed).
   //
-  //   LESS than the errored set: a branch holding a row from an EARLIER invocation that errors in a
-  //   LATER one is NOT counted here — the row-key exclusion below drops it. That is deliberate and
-  //   correct: its retained row already places it in that row's disposition bucket, and counting it here
-  //   too would count one discovered branch TWICE and break the partition. This is the same-name
-  //   stale-head case; see the reconciliation note in orchestrate.ts::processRepo.
+  //   LESS: a branch holding a row from an EARLIER invocation is counted by THAT row's disposition, not a
+  //   second time via errors[] — an error head is itself in (a); a scanned/reused row (incl. one PRESERVED
+  //   over a later transient failure) places it in branchesScanned and the row-key exclusion drops it from
+  //   (b). This keeps every discovered branch counted at most once, so the identity above is an UPPER BOUND.
   //
-  // So the exclusion is what keeps every discovered branch counted at most once, which is why the
-  // identity above stays an UPPER BOUND (never a double-count) rather than an equality on a resume.
-  //
-  // Throttle carve-out, precisely: a branch throttle-requeued with NO prior error has neither a row nor
-  // an error — deferred, not terminal, finished next run — so it is in no count. That holds absolutely
-  // only WITHIN a single invocation; after an earlier-invocation error the branch DOES carry an error
-  // and so IS counted here, despite being deferred rather than terminal.
+  // Deferral: a throttle/network/service-deferred branch is un-covered, not terminal — it floors the run to
+  // partial-deferred (via a deferred-* head, or coverage_complete=0 when the deferral was preserved over a
+  // prior scan). A deferral with NO prior scan is in no summary count here (only runOutcome); one PRESERVED
+  // over a prior scan is counted in branchesScanned via that retained scan. Either way, NOT in branchesErrored.
   branchesErrored: number;
   totalDependencyFindings: number;
   totalUsageFindings: number;
@@ -114,6 +119,19 @@ export interface ReportSummary {
 // call stops compiling here instead of throwing at render time. The full report shape (declarations,
 // cli, dateFetched — a superset of the renderer's view) is preserved for run-<id>.json; its JSON
 // contract is separately enforced by reportSchema.ts in tests. errors[] stays untyped (leaf only).
+// §3.1b run coverage block (key-synced to reportSchema.runOutcomeSchema by test). `units` counts
+// every run_unit_head disposition in a FIXED key order for byte-determinism.
+export interface RunOutcomeBlock {
+  outcome: RunOutcome; // never null — buildReport rejects an unfinalized run (§3.1e)
+  coverageComplete: boolean | null;
+  discoveryFailures: number;
+  discoveryDeferrals: number;
+  units: {
+    scanned: number; reused: number; skippedCutoff: number; policyExcluded: number; pastCap: number;
+    deferredThrottle: number; deferredNetwork: number; deferredService: number; error: number;
+  };
+}
+
 export interface EmittedReport {
   // PINNED to the constant, not a bare `number` (the COMPARE_FORMAT_VERSION precedent): this shape IS
   // v2, so a build that emitted some other version here would be mislabelling itself, and reportSchema
@@ -121,6 +139,7 @@ export interface EmittedReport {
   formatVersion: typeof XRAY_FORMAT_VERSION; // the report/export/HTML artifact-set version
   runId: string;
   generatedAt: string;
+  runOutcome: RunOutcomeBlock;
   config: { packages: string[]; cutoffDate: string; githubHost: string; organizations: string[]; organizationsSource: string };
   packages: ReadonlyArray<ReturnType<typeof buildPackage>>;
   errors: unknown[];
@@ -136,12 +155,24 @@ export function buildReport(db: AuditDbReader, run: RunRecord): EmittedReport {
 }
 
 function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
+  // §3.1e invariant, made TOTAL here: a report requires a FINALIZED run — runOutcome.outcome is a
+  // real coverage disposition, never null. The CLI (runReport) and orchestrator both gate on this
+  // before emitting, so a null outcome reaching here is a caller bug, not a reportable state. This
+  // guard also NARROWS run.outcome to RunOutcome for the block below (schema outcome is non-nullable).
+  if (run.outcome === null)
+    throw new Error(`cannot build a report for the unfinalized run ${run.runId} (outcome is NULL — it never finalized)`);
   const runId = run.runId;
   const tracked = JSON.stringify(run.trackedPackages);
 
-  // scanned snapshot heads for this run (skipped-cutoff carry commit_sha='' and no findings).
+  // The reportable ("scanned-slice") heads for this run: a freshly 'scanned' unit AND a 'reused'
+  // skip-as-current unit both carry a findings-bearing head (current when recorded, possibly
+  // preserved-stale after a moved-head transient — §3.1a), so both JOIN into the report;
+  // skipped-cutoff/policy-excluded/past-cap/error/deferred-* carry no reportable findings.
+  // REPORTABLE_UNIT_STATUSES (from db.ts) is the single source of truth shared by this in-memory filter
+  // and the SQL JOINs below. The full column set (incl. the policy columns) feeds the policy-disposition
+  // rendering (assertRunUnitHeadSound / isPolicyExcluded) unchanged.
   const heads = db.read(`SELECT organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date FROM run_unit_head WHERE run_id = ?`).all(runId) as HeadRow[];
-  const scannedHeads = heads.filter((h) => h.status === "scanned");
+  const scannedHeads = heads.filter((h) => (REPORTABLE_UNIT_STATUSES as readonly string[]).includes(h.status));
   const scannedKeys = new Set(scannedHeads.map((h) => unitKey(h.organization, h.repository, h.branch, h.commit_sha)));
   // Tri-state default-branch flag per scanned unit (§5.B): true/false from v3 runs, null for
   // pre-v3 rows — the renderer shows null as its own "(default branch unknown)" state.
@@ -155,14 +186,14 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   // findings joined through the immutable snapshot, filtered to tracked_packages.
   const depRows = (db.read(
     `SELECT df.* FROM dependency_findings df
-     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status='scanned'
+     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status IN (${REPORTABLE_HEAD_SQL})
        AND ruh.organization=df.organization AND ruh.repository=df.repository
        AND ruh.branch=df.branch AND ruh.commit_sha=df.commit_sha
      WHERE df.package_name IN (SELECT value FROM json_each(?))`,
   ).all(runId, tracked) as DepRow[]);
   const usageRows = (db.read(
     `SELECT uf.* FROM usage_findings uf
-     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status='scanned'
+     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status IN (${REPORTABLE_HEAD_SQL})
        AND ruh.organization=uf.organization AND ruh.repository=uf.repository
        AND ruh.branch=uf.branch AND ruh.commit_sha=uf.commit_sha
      WHERE uf.package_name IN (SELECT value FROM json_each(?))`,
@@ -181,17 +212,29 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     packageName: e["package_name"], version: e["version"], message: e["message"], occurredAt: e["occurred_at"],
   }));
 
-  // §5: branches DISCOVERED but holding no disposition row because their scan ERRORED this run — each has
-  // a scope='scan' errors[] entry. Counted so the disposition buckets + branchesErrored reconcile to the
-  // discovered heads. A branch with BOTH a scan error AND a row (e.g. scanned on an earlier resume attempt,
-  // errored on this one) is already a disposition and is excluded here — hence the row-key exclusion.
+  // §5/§3.1a: branches whose scan FAILED this run — the UNION of two disjoint sets:
+  //   (a) error-status HEADS — a permanent scan failure is now a TERMINAL disposition recorded at the
+  //       observed commit (run_unit_head status='error'), so it must count here even though it holds a row;
+  //   (b) ROWLESS scan errors — a scope='scan' errors[] entry on a branch holding NO run_unit_head row
+  //       (a failure BEFORE any disposition: discovery-time, or a resume whose earlier invocation errored
+  //       before a row). The row-key exclusion keeps these out of (a)'s domain and vice-versa.
+  // The two are disjoint by construction: an error head IS a head, so it is excluded from (b)'s rowless
+  // filter; and (b) carries no head by definition. A branch with a SCANNED row PLUS a scope='scan' error
+  // (a post-persistence log/queue write throwing after the scanned row committed) is counted under
+  // branchesScanned, never here. DEFERRED (throttle-requeue) heads are NOT failures — un-covered, surfaced
+  // via runOutcome — and are excluded. Restores the summary partition (see reportSchema branchesErrored):
+  // scanned + skippedByCutoff + excludedByPolicy + pastCap + errored == terminal branches.
   const headKeys = new Set(heads.map((h) => `${h.organization}\0${h.repository}\0${h.branch}`));
-  const branchesErrored = new Set(
+  const errorHeadKeys = new Set(
+    heads.filter((h) => h.status === "error").map((h) => `${h.organization}\0${h.repository}\0${h.branch}`),
+  );
+  const rowlessScanErrorKeys = new Set(
     errors
       .filter((e) => e.scope === "scan" && typeof e.branch === "string" && e.branch !== "")
       .map((e) => `${String(e.organization)}\0${String(e.repository)}\0${String(e.branch)}`)
       .filter((k) => !headKeys.has(k)),
-  ).size;
+  );
+  const branchesErrored = errorHeadKeys.size + rowlessScanErrorKeys.size;
 
   // Validate the WHOLE head set ONCE, then feed the SAME validated array to BOTH derivations below. This
   // replaces the old reliance on object-literal evaluation order (assertHeadsWellFormed ran INSIDE the
@@ -200,10 +243,40 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   // identical — it just makes "gate before trust" a data-flow fact instead of a source-order coincidence.
   const validatedHeads = assertHeadsWellFormed(heads);
 
+  // T5c §3.1b: disposition counts over EVERY (validated) head — not just the reportable slice — in a
+  // FIXED enum order for byte-determinism. The switch is exhaustive over the v5 UnitHeadStatus (9
+  // dispositions incl. the branch-policy policy-excluded/past-cap): a new disposition added to db.ts
+  // fails to compile here (the `never` assignment) rather than being silently dropped from the view.
+  const units = { scanned: 0, reused: 0, skippedCutoff: 0, policyExcluded: 0, pastCap: 0, deferredThrottle: 0, deferredNetwork: 0, deferredService: 0, error: 0 };
+  for (const h of validatedHeads) {
+    switch (h.status) {
+      case "scanned": units.scanned++; break;
+      case "reused": units.reused++; break;
+      case "skipped-cutoff": units.skippedCutoff++; break;
+      case "policy-excluded": units.policyExcluded++; break;
+      case "past-cap": units.pastCap++; break;
+      case "deferred-throttle": units.deferredThrottle++; break;
+      case "deferred-network": units.deferredNetwork++; break;
+      case "deferred-service": units.deferredService++; break;
+      case "error": units.error++; break;
+      default: {
+        const _exhaustive: never = h.status;
+        throw new Error(`unhandled run_unit_head status in report coverage counts: ${String(_exhaustive)}`);
+      }
+    }
+  }
+
   return {
     formatVersion: XRAY_FORMAT_VERSION,
     runId,
     generatedAt: run.completedAt ?? run.startedAt, // §7: COALESCE(completed_at, started_at)
+    runOutcome: {
+      outcome: run.outcome,
+      coverageComplete: run.coverageComplete,
+      discoveryFailures: run.discoveryFailures,
+      discoveryDeferrals: run.discoveryDeferrals,
+      units,
+    },
     config: {
       packages: run.trackedPackages, cutoffDate: run.cutoffDate, githubHost: run.githubHost,
       organizations: run.effectiveOwners, organizationsSource: run.ownersSource,
@@ -234,8 +307,9 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
     organizationsScanned: orgs.size,
     repositoriesScanned: repos.size,
     branchesScanned: scannedHeads.length,
-    // The four dispositions partition allHeads by `status` alone (§5) — each row lands in exactly one
-    // bucket, and a policy exclusion is no longer a cutoff skip wearing a disambiguator.
+    // These four summary buckets key on `status` alone (§5) — and a policy exclusion is no longer a cutoff
+    // skip wearing a disambiguator. They do NOT partition every recorded row: reused folds into
+    // branchesScanned (reportable), and error/deferred-* rows are counted via branchesErrored / runOutcome.
     branchesSkippedByCutoff: allHeads.filter((h) => h.status === "skipped-cutoff").length,
     branchesExcludedByPolicy: allHeads.filter(isPolicyExcluded).length,
     branchesPastCap: allHeads.filter((h) => h.status === "past-cap").length,
@@ -248,13 +322,20 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
 // The ledger's disposition for ONE policy-bearing row, via the shared predicates only. The fail-closed
 // case lives in policyDisposition.ts (the ONE definition) so this surface and compare's policy churn
 // cannot drift apart on what an unrecognised policy-bearing row means.
-function dispositionOf(h: HeadRow): "scanned-default-override" | "excluded" {
+function dispositionOf(h: HeadRow): "scanned-default-override" | "attempted-default-override" | "excluded" {
   // Deliberately re-runs the gate even though buildReportInner's assertHeadsWellFormed already swept
   // every head: this function LABELS a row, and the label must never outlive a refactor that changes
   // which caller reaches it first. The gate is cheap, idempotent, and this is the defense-in-depth
   // layer review chose to keep rather than trust call-order.
   assertRunUnitHeadSound(h, `${h.organization}/${h.repository}@${h.branch}`);
-  return isDefaultOverride(h) ? "scanned-default-override" : "excluded";
+  // A default-branch override is always scan-ATTEMPTED, but the attempt does not always COMPLETE. Split on
+  // reportability so the ledger never claims a branch was scanned when it wasn't: a reportable head
+  // (scanned/reused, folded into branchesScanned) → 'scanned-default-override'; a deferred-*/error attempt
+  // reached no reportable head → 'attempted-default-override'. A non-override policy row → 'excluded'.
+  if (!isDefaultOverride(h)) return "excluded";
+  return (REPORTABLE_UNIT_STATUSES as readonly string[]).includes(h.status)
+    ? "scanned-default-override"
+    : "attempted-default-override";
 }
 
 // Scan-scope diagnostics (PROMPT.md §7 scanScope). policyBranches lists every head with a policy_status (both the excluded
@@ -303,7 +384,13 @@ function buildScanScope(allHeads: HeadRow[]): ScanScope {
   return {
     excludedByDeny,
     excludedByAllow,
-    defaultBranchPolicyOverrides: allHeads.filter(isDefaultOverride).length,
+    // Restricted to REPORTABLE overrides (scanned/reused) so the count stays a true subset of
+    // branchesScanned (its documented "OVERLAPPING (within branchesScanned)" contract). A deferred-*/error
+    // default-override attempt is NOT scanned — it appears in policyBranches as 'attempted-default-override'
+    // and is counted only by its non-reportable disposition bucket, never here.
+    defaultBranchPolicyOverrides: allHeads.filter(
+      (h) => isDefaultOverride(h) && (REPORTABLE_UNIT_STATUSES as readonly string[]).includes(h.status),
+    ).length,
     policyBranches,
     // Provenance is trustworthy ONLY for a v4-native run with at least one recorded head. A migrated
     // pre-v4 run (the NULL scanned_commit_date backfilled by migrateV3toV4) never persisted past-cap
@@ -423,24 +510,36 @@ export function emitReportDetailed(
   const report = buildReport(db, run);
   const runPath = join(outputDir, `run-${run.runId}.json`);
   writeJson(runPath, outputDir, report);
-  if (opts.alsoLatest) writeJson(join(outputDir, "latest.json"), outputDir, report);
+  // latest.json is written for a run-<id> report ONLY when the caller asks AND the run is genuinely
+  // reportable (§3.1e). The orchestrator already gates alsoLatest on a complete outcome, and the
+  // CLI default path selects latestReportableRun — but this independent re-check is defense in depth:
+  // a partial/fatal run must never be served as "latest" even if a caller passes alsoLatest by mistake.
+  if (opts.alsoLatest && (run.outcome === "complete" || run.outcome === "legacy-unknown"))
+    writeJson(join(outputDir, "latest.json"), outputDir, report);
   return { path: runPath, report };
 }
 // The "nothing to report" notice (no completed reportable run, or an unknown/pre-migration
 // --run-id). Exported so tests validate the REAL emitted object against notReportableSchema,
 // not a hand-written lookalike.
-export function buildNotReportableNotice(runIdArg: string | null, missingDbPath?: string): { notReportable: true; reason: string } {
+export function buildNotReportableNotice(
+  runIdArg: string | null,
+  missingDbPath?: string,
+  unfinalized?: boolean,
+): { notReportable: true; reason: string } {
   // A missing database is the most fundamental "nothing to report" cause and gets an actionable
   // reason (run the audit first); it takes precedence over the run-id/empty cases, which only
-  // make sense once a database exists.
+  // make sense once a database exists. `unfinalized` is the §3.1e case: a --run-id run that exists
+  // but never finalized (outcome NULL) — a coherent report needs a finalized coverage outcome.
   return {
     notReportable: true,
     reason:
       missingDbPath !== undefined
         ? `no database at ${missingDbPath} — run \`bun run audit\` first`
-        : runIdArg !== null
-          ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)`
-          : "no completed reportable run yet",
+        : unfinalized === true
+          ? `run ${runIdArg} did not finalize (crashed or never completed) — no coverage outcome to report`
+          : runIdArg !== null
+            ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)`
+            : "no completed reportable run yet",
   };
 }
 
@@ -464,6 +563,7 @@ export function emitDossiers(report: EmittedReport, outputDir: string): { dossie
     generatedAt: report.generatedAt,
     config: report.config,
     summary: report.summary,
+    runOutcome: report.runOutcome, // §3.1b: the banner flags a partial/failed run's HTML
     formatVersion: report.formatVersion,
   };
   const bundle = new ArtifactBundle(outputDir, "dossier");
@@ -504,8 +604,14 @@ export function runReport(config: Config, runIdArg: string | null, opts: { html?
     const outputDir = config.paths.outputDir;
     mkdirCanonical(outputDir);
 
-    if (run === null || run.trackedPackages.length === 0) {
-      const notice = buildNotReportableNotice(runIdArg);
+    // §3.1e: a --run-id run that EXISTS and has tracked packages but never FINALIZED (outcome NULL —
+    // crashed mid-run, or a legacy running row failed on the next start) has undefined coverage and
+    // is not a coherent report. Surface it as notReportable ("did not finalize") rather than emit a
+    // report with a null outcome. (The default path selects latestReportableRun, which already
+    // requires a non-null reportable outcome, so it never reaches here.)
+    const unfinalized = runIdArg !== null && run !== null && run.trackedPackages.length > 0 && run.outcome === null;
+    if (run === null || run.trackedPackages.length === 0 || unfinalized) {
+      const notice = buildNotReportableNotice(runIdArg, undefined, unfinalized);
       const path = join(outputDir, runIdArg !== null ? `run-${runIdArg}.json` : "latest.json");
       writeJson(path, outputDir, notice);
       return { line: `${JSON.stringify(notice)}\n` };

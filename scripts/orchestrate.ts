@@ -26,7 +26,7 @@
 import { readdirSync, lstatSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
-import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
+import { AuditDb, nowIso, REPORTABLE_UNIT_STATUSES, type WorkUnitKey, type RunOutcome, type FinalizableRunOutcome } from "./db.ts";
 import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchSnapshot, type BranchDiscoveryOutcome, type SpawnDeadlines } from "./github.ts";
 import { planRepoBranches, planPolicyDiagnostics, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
 import { PolicyMatchError, type CompiledBranchPolicy, type RepoPolicyCoverage } from "./branchPolicy.ts";
@@ -48,6 +48,31 @@ import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
 import { logLine, flushLogs } from "./log.ts";
 import { startHeartbeat, type HeartbeatController } from "./heartbeat.ts";
 import { createNetworkReporter, type NetworkReporter } from "./netEvents.ts";
+
+// T5b process exit codes. 0 = complete (full estate coverage). 75 (EX_TEMPFAIL) = a PARTIAL run:
+// throttle/deferral/discovery-gap left units un-scanned — re-run to finish. 1 = fatal (an
+// unrecoverable error; today only reached by a thrown exception, not a finalize outcome).
+const EXIT_COMPLETE = 0;
+const EXIT_PARTIAL = 75;
+const EXIT_FATAL = 1;
+type ExitCode = typeof EXIT_COMPLETE | typeof EXIT_PARTIAL | typeof EXIT_FATAL;
+
+// The single outcome→exit mapping (§3.1e): a reportable run (complete / migrated legacy-unknown)
+// exits 0; a failed run (fatal, or a migrated legacy-failed) exits 1; every partial-* run exits 75
+// so a CI wrapper can tell "finished, re-run to complete" apart from "done" and "hard-failed".
+// The legacy-* arms never occur on the live path (finalizeRun returns only complete/partial-*/fatal)
+// but are mapped explicitly so a stray legacy value maps by MEANING, not the partial default. Exported
+// for the mapping test.
+export function outcomeToExit(outcome: RunOutcome): ExitCode {
+  if (outcome === "complete" || outcome === "legacy-unknown") return EXIT_COMPLETE;
+  if (outcome === "fatal" || outcome === "legacy-failed") return EXIT_FATAL;
+  return EXIT_PARTIAL; // partial-deferred / partial-degraded / partial-budget
+}
+
+// The reportable-head SQL fragment (`'scanned', 'reused'`) for the §5.E reconciliation slice — the
+// db.ts source of truth report/export/compare use, so reconciliation covers exactly the units the
+// report will. Fixed enum literals → injection-safe.
+const REPORTABLE_HEAD_SQL = REPORTABLE_UNIT_STATUSES.map((s) => `'${s}'`).join(", ");
 
 // The values that TOGETHER define one coherent scan/plan: the config, its hash, and the compiled
 // branch + repository policies. Threaded as ONE object through runScan/processOwner/processRepo/runPlan
@@ -165,11 +190,11 @@ export function githubDeadlines(config: Config): SpawnDeadlines {
 
 // argv is injectable (defaulting to the process argv) so the entrypoint tests can drive the
 // REAL dispatch — help short-circuit, --plan's stop-before-DB early return — in-process.
-export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
+export async function main(argv: string[] = Bun.argv.slice(2)): Promise<ExitCode> {
   const args: OrchestrateArgs = parseArgs(argv);
   if (args.help) {
     process.stdout.write(ORCHESTRATE_HELP + "\n");
-    return;
+    return EXIT_COMPLETE;
   }
   const { config, configHash, branchPolicy, repositoryPolicy } = await loadConfig(argv);
   const runtime: AuditRuntime = { config, configHash, branchPolicy, repositoryPolicy };
@@ -206,7 +231,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
       heartbeat.setPhase("plan");
       const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories, timeouts, events: (e) => reporter.emit(e) });
       await runPlan(planClient, runtime, preflight.githubLogin, reporter);
-      return;
+      return EXIT_COMPLETE; // --plan wrote nothing and reached its end cleanly
     }
 
     // Only AFTER preflight passes do we touch the database (open/migrate/--fresh) and build the
@@ -216,7 +241,8 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories, timeouts, events: (e) => reporter.emit(e) });
 
     try {
-      await runScan(db, client, runtime, args, preflight.githubLogin, reporter, heartbeat);
+      // T5b: propagate the run's exit code (0 complete · 75 partial · 1 fatal) to the entrypoint.
+      return await runScan(db, client, runtime, args, preflight.githubLogin, reporter, heartbeat);
     } finally {
       db.close();
     }
@@ -231,19 +257,28 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
 // §8 step 7's "concise human-readable summary": stderr only — stdout stays pure JSONL. The
 // counters are the report's own §7 summary block (the imported ReportSummary type), labels
 // matching the report field names.
+// T5b: the header + report line are OUTCOME-AWARE — a partial run says INCOMPLETE, recommends a re-run,
+// and must NOT claim latest.json was written (it wasn't).
 export function runSummaryText(
-  runId: string, s: ReportSummary, errorCount: number, reportPath: string, warnings: readonly PolicyWarning[] = [],
+  runId: string, outcome: RunOutcome, s: ReportSummary, errorCount: number, reportPath: string, warnings: readonly PolicyWarning[] = [],
 ): string {
+  const isComplete = outcome === "complete";
+  const header = isComplete
+    ? `AUDIT COMPLETE — run ${runId}`
+    : `AUDIT INCOMPLETE (${outcome}) — run ${runId} — some units were not scanned; re-run to finish`;
+  const reportLine = isComplete
+    ? `  Report:                 ${reportPath} (+ latest.json)`
+    : `  Report:                 ${reportPath} (partial — latest.json NOT updated; re-run to complete the estate)`;
   return [
     "",
-    `AUDIT COMPLETE — run ${runId}`,
+    header,
     `  Organizations scanned:  ${s.organizationsScanned}`,
     `  Repositories scanned:   ${s.repositoriesScanned}`,
     `  Branches scanned:       ${s.branchesScanned} (${s.branchesSkippedByCutoff} skipped by cutoff · ${s.branchesExcludedByPolicy} excluded by policy · ${s.branchesPastCap} past cap · ${s.branchesErrored} scan-errored)`,
     `  Dependency findings:    ${s.totalDependencyFindings}`,
     `  Usage findings:         ${s.totalUsageFindings}`,
     `  Errors recorded:        ${errorCount} (fail-soft; details in the report's errors[])`,
-    `  Report:                 ${reportPath} (+ latest.json)`,
+    reportLine,
     ...policyWarningLines(warnings),
     "",
   ].join("\n");
@@ -273,7 +308,7 @@ export async function runScan(
   // T8: the run-scoped liveness heartbeat, so phase/target/unitsDone stay current as the scan runs.
   // Optional (null in tests / --plan).
   heartbeat: HeartbeatController | null = null,
-): Promise<void> {
+): Promise<ExitCode> {
   const { config, configHash } = runtime;
   const progress = new RunProgress(heartbeat, args.verboseUnits);
   // §0 startup: sweep stale temp dirs from a prior crash.
@@ -288,8 +323,14 @@ export async function runScan(
   // crashing the whole process with no report.
   const resolved = await resolveOwnersWithDiscovery(client, config, personalLogin);
   if (resolved === null) {
+    // T5 §3.1g: a PRE-RUN deferral — the throttle hit before startRun, so there is no run row to
+    // finalize and no coverage to mutate. `owner-discovery-throttled` stays as the cause line;
+    // `run-deferred` is the TERMINAL run-outcome line (its inline counters ship via the outer finally)
+    // that carries the exit intent, mirroring `done`. The run exits 75 (partial): re-run to scan.
     logLine({ event: "owner-discovery-throttled", action: "retry-next-run" });
-    return; // clean exit; the caller closes the db. No run started, nothing to report.
+    logLine({ event: "run-deferred", reason: "owner-discovery-throttle", action: "retry-next-run", ...reporter.counters() }, { terminal: true });
+    process.stderr.write("\nRUN DEFERRED — GitHub rate-limiting blocked owner discovery before any scan started; no run was started and no report was written. Re-run once the rate-limit window resets.\n");
+    return EXIT_PARTIAL;
   }
   const { owners, source } = resolved;
 
@@ -403,23 +444,37 @@ export async function runScan(
   progress.phase("reconciliation");
   await reconcileIntrospection(db, client, config, runId);
 
-  // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at).
+  // §8 step 6 / T5 §3.1e: FINALIZE the run BEFORE the report reads (so generatedAt=completed_at and
+  // getRun sees the outcome). Must run AFTER reconcileIntrospection (its writes are in) and BEFORE
+  // getRun. T5b's only stop reason is ran-to-end, so the orchestrator REQUESTS 'complete'; finalizeRun
+  // floors it to partial-deferred if the durable state shows a coverage gap or any deferred unit.
+  // (The partial-degraded/-budget/fatal REQUESTED outcomes arrive with the T2/T12/T-BUDGET breakers.)
   progress.phase("report");
-  db.completeRun(runId);
-  // §8 step 7: produce the consolidated §7 report (run-<id>.json + latest.json) from SQLite,
-  // then the machine done-event (stdout) and the human summary (stderr) — BOTH derived from
-  // the emitted report object itself, so the three can never disagree.
+  const requested: FinalizableRunOutcome = "complete";
+  const outcome = db.finalizeRun(runId, requested);
+  // Invariant (codex): a freshly-completed, running run MUST finalize to a live outcome. A null
+  // (already-finalized/not-running — impossible here) or a backfill-only value is a coding bug, not a
+  // reportable state — fail loudly rather than emit a report from an incoherent run.
+  if (outcome === null || outcome === "legacy-unknown" || outcome === "legacy-failed")
+    throw new Error(`finalizeRun returned an unexpected outcome '${outcome}' for the just-completed run ${runId}`);
+  const isComplete = outcome === "complete";
+  // §8 step 7: produce the consolidated §7 report (run-<id>.json always; latest.json ONLY for a
+  // complete run — a partial run must never be served as "latest", T5 §3.1e) from SQLite, then the
+  // machine done-event (stdout) and the human summary (stderr) — BOTH derived from the emitted report
+  // object itself, so the three can never disagree.
   const completedRun = db.getRun(runId)!;
-  const emitted = emitReportDetailed(db, completedRun, config.paths.outputDir, { alsoLatest: true });
+  const emitted = emitReportDetailed(db, completedRun, config.paths.outputDir, { alsoLatest: isComplete });
   const summary = emitted.report.summary;
   const errorCount = emitted.report.errors.length;
   // T7: fold the run-scoped retry/throttle churn into the terminal event. `done` is a TERMINAL,
   // non-droppable line; the outer finally awaits flushLogs() so it (and its counters) ship whenever
   // the stdout channel is still alive at exit (a channel that died mid-run leaves loggerStats().closed
   // set and one stderr trace — delivery of `done` is best-effort, its capacity slot is guaranteed).
+  // T5b: `runOutcome` lets a consumer see complete vs partial-* without re-reading the DB.
   const { retryTotal, suppressed } = reporter.counters();
-  logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount, retryTotal, suppressed }, { terminal: true });
-  process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path, warnings));
+  logLine({ event: "done", runId, runOutcome: outcome, report: emitted.path, summary, errors: errorCount, retryTotal, suppressed }, { terminal: true });
+  process.stderr.write(runSummaryText(runId, outcome, summary, errorCount, emitted.path, warnings));
+  return outcomeToExit(outcome);
 }
 
 // ---- owner resolution + branch classification (shared by the run and --plan paths) -----------
@@ -505,10 +560,15 @@ export async function discoverOwnerRepos(
     // §4: a throttle during repo discovery is TRANSIENT — no permanent errors row (discovery
     // re-runs next invocation). Any other error is a permanent discovery failure. Either way the
     // outcome is a FAILURE (never a genuinely-empty owner) — the caller must not treat it as "done".
+    // The run could not enumerate this owner's repos, so the estate denominator is UNKNOWN: record the
+    // coverage gap (T5 §3.1b) FIRST — before the log/error row — so a crash can never leave
+    // coverage_complete optimistically true.
     if (e instanceof ThrottleExhausted) {
+      db.recordDiscoveryDeferral(runId);
       logLine({ event: "discovery", org: owner, action: "requeue-throttle", message: (e as Error).message });
       return discoveryFailed("throttled");
     }
+    db.recordDiscoveryFailure(runId);
     const message = `repo discovery failed: ${(e as Error).message}`;
     db.insertError({ runId, scope: "discovery", organization: owner, message });
     logLine({ event: "discovery", org: owner, error: message });
@@ -536,10 +596,14 @@ export async function discoverBranchHeads(
     // resumable-but-wrong.
     return { ok: true, snapshot: await client.listBranchHeads(repo.organization, repo.name) };
   } catch (e) {
+    // This repo's branch set is unknown either way, so record the coverage gap (T5 §3.1b) FIRST —
+    // before the log/error row — so a crash can never leave coverage_complete optimistically true.
     if (e instanceof ThrottleExhausted) {
+      db.recordDiscoveryDeferral(runId);
       logLine({ event: "discovery", org: repo.organization, repo: repo.name, action: "requeue-throttle", message: (e as Error).message });
       return discoveryFailed("throttled");
     }
+    db.recordDiscoveryFailure(runId);
     const message = `branch discovery failed: ${(e as Error).message}`;
     db.insertError({ runId, scope: "discovery", organization: repo.organization, repository: repo.name, message });
     logLine({ event: "discovery", org: repo.organization, repo: repo.name, error: message });
@@ -661,7 +725,10 @@ export async function processRepo(
       // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate. This
       // enqueue→get→upsert→setStatus RMW is await-free, so it runs to completion atomically vs siblings.
       if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
-        db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
+        // T5 §3.1a: skip-as-current is its OWN disposition ('reused', not 'scanned') — the unit was not
+        // re-scanned this run, but its stored head is CURRENT so its prior-run findings still stand and
+        // JOIN into the report via REPORTABLE_UNIT_STATUSES ('scanned','reused').
+        db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "reused", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
         db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
         if (progress.verboseUnits)
           logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
@@ -672,8 +739,15 @@ export async function processRepo(
 
       db.setUnitStatus(key, { status: "in_progress", runId });
       progress.startUnit(repo.organization, repo.name, h.name, h.oid);
+      // The ACTUAL observed head for THIS attempt: seeded to the discovery head, but processUnit
+      // OVERWRITES it with the clone's real HEAD on the truncated-tree fallback (the branch may have
+      // moved between GraphQL discovery and the clone). A deferred/error disposition below pins to what was
+      // truly attempted (the clone HEAD, not the possibly-stale h.oid) WHENEVER the clone fully resolves; if
+      // the clone resolves a moved HEAD but its date read fails, observed stays the COHERENT discovery head
+      // (never a clone-sha + discovery-date pair — §3.1a fail-safe). Mutated in place by processUnit.
+      const observed = { commitSha: h.oid, committedDate: h.committedDate };
       try {
-        const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
+        const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen, observed);
         db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
         tally.scanned++;
         progress.unitDone();
@@ -689,13 +763,34 @@ export async function processRepo(
           // and nothing re-reads pending units within the run. Handled here (not a fatal), so it never
           // trips branchAbort — one throttled branch must not cancel its siblings.
           db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
-          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
+          // T5 §3.1a/§3.1b: this run left the unit un-scanned (deferred, not covered) → floor the run to
+          // partial-deferred. markCoverageIncomplete records that gap DIRECTLY (coverage_complete=0) rather
+          // than relying on the deferred-* head row — because the commit-aware upsert PRESERVES a prior
+          // reportable scan over this transient deferral (findings-preservation, §3.1a), so a moved-head
+          // deferral over an existing scan writes NO deferred row yet must STILL floor. It runs FIRST, BEFORE
+          // the head upsert, for crash-safety (§3.1b): a crash between the two can then only leave coverage
+          // INCOMPLETE (never optimistically complete), and a crash BEFORE this mark leaves the unit `pending`
+          // (set just above) with the optimistic coverage default — a safe state the next run cleanly
+          // retries. The deferred head is still upserted at the OBSERVED head (the clone's real HEAD under
+          // a truncated-tree fallback, else the discovery head) so the no-prior-scan case records its
+          // disposition; the precedence keeps any same-/moved-head good scan intact.
+          db.markCoverageIncomplete(runId);
+          db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: observed.commitSha, status: "deferred-throttle", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: observed.committedDate });
+          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: observed.commitSha, action: "requeue-throttle", message: (e as Error).message });
           tally.deferred++;
           progress.unitDone();
         } else {
           db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
           db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
-          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
+          // T5 §3.1a: a permanent unit error is a fail-soft result — recorded in errors[] and, for a branch
+          // with NO prior reportable scan, as an 'error' head at the OBSERVED commit (observed.commitSha:
+          // the clone's real HEAD under a truncated-tree fallback, else the discovery head — never the
+          // possibly-stale h.oid). The commit-aware upsert PRESERVES a prior scanned/reused over this
+          // transient error (findings-preservation, §3.1a), so a moved-head re-scan failure keeps the good
+          // scan and its findings. An error does NOT floor the run (finalizeRun's floor ignores 'error');
+          // the failure stays visible in errors[].
+          db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: observed.commitSha, status: "error", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: observed.committedDate });
+          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: observed.commitSha, action: "error", message: (e as Error).message });
           tally.errored++;
           progress.unitDone();
         }
@@ -750,31 +845,31 @@ export async function processRepo(
   // not return — so a stale keep-set errs toward retaining, except in that third case.
   //
   // SIBLING ACCEPTED-STALENESS (same-name stale head). On a RESUME: a branch whose head ADVANCED since a
-  // prior invocation, whose re-scan then errors (the insertError arm above) or throttles (the requeue
-  // arm), writes no row this attempt — and the name-keyed prune RETAINS the prior row, WHATEVER its
-  // disposition, pinned to the OLDER evaluation. The report counts the branch under that PRIOR
-  // disposition: scanned at the old head — or still skipped-cutoff/past-cap/policy-excluded from the
-  // older evaluation, even though the head became eligible this attempt (cutoff-skip via an advanced
-  // head; past-cap via a cap-order shift; policy-excluded only when the branch also BECAME the
-  // default, the one override policy permits). Accepted, because:
+  // prior invocation, whose re-scan then errors (the insertError arm above) or throttles (the requeue arm),
+  // upserts an error/deferred head at the OBSERVED (advanced) commit — but the commit-aware upsert's
+  // FINDINGS-PRESERVATION guard (§3.1a, db.upsertRunUnitHead) KEEPS a prior REPORTABLE scan (scanned/reused)
+  // rather than demoting it to that transient disposition. So the prior scan and its findings survive,
+  // pinned to the OLDER evaluation, and the report counts the branch as scanned at the old head. (A prior
+  // NON-reportable row — skipped-cutoff/policy-excluded/past-cap — is NOT protected: the moved-head
+  // observation supersedes it via the commit-differs clause, because a genuinely-moved head now
+  // cutoff/policy/cap-ineligible is a real re-disposition, not a transient failure.) Accepted, because:
   //   - it is stale, not wrong: a scanned row and its findings describe a real scan of a real commit —
   //     commit_sha + scanned_commit_date say WHICH (PROMPT.md's report-head invariant defines commit_sha
-  //     as "the head it reported", never "the live head") — and a non-scanned row's commit_sha='' +
-  //     discovered-head date describe the older evaluation it records.
-  //   - it is NOT a regression: before reconciliation existed there was no prune at all, so the row was retained
-  //     identically. The prune is a mitigation this feature ADDED (it removes deleted-branch phantoms
-  //     that used to persist forever); it is not the cause.
+  //     as "the head it reported", never "the live head").
+  //   - the COVERAGE gap is still recorded, never by demoting the head: a deferral marks coverage_complete=0
+  //     (floors the run to partial-deferred); an error stays in errors[] (fail-soft, does not floor).
   //   - it self-heals: the unit is left error/pending, never done, so the next run re-scans and re-upserts
   //     at the live head.
   // A head-SHA-aware prune is REJECTED: it would delete the clone-fallback path's legitimate rows (whose
   // commit_sha is the clone's real HEAD, deliberately != the discovered h.oid — see processUnit) and the
   // commit_sha='' sentinels the non-scanned dispositions rely on, hiding a real branch's real findings
   // entirely rather than reporting them one commit late.
-  // Sharp edge worth knowing: the ERROR variant is loud (an errors[] row + a JSONL `action:"error"`
-  // line, visible beside the stale row), but the THROTTLE variant writes neither — only a stdout
-  // requeue line — so a completed run can present the old head with no in-report signal. Related: the
-  // retained row also masks that branch from the report's branchesErrored, which counts only errored
-  // branches holding NO row (see report.ts).
+  // Sharp edge worth knowing: the ERROR variant is loud (an errors[] row + a JSONL `action:"error"` line,
+  // visible beside the preserved scan), and the THROTTLE variant now ALSO floors the run to partial-deferred
+  // via markCoverageIncomplete — so a preserved-over-scan deferral is NOT silent; the partial outcome
+  // signals it. A preserved/retained scanned row keeps the branch in branchesScanned and out of
+  // branchesErrored (which counts error heads + rowless scan errors — see report.ts): correct, because the
+  // branch IS covered by that real scan, one commit stale.
   const pruned = db.reconcileRunUnitHead(runId, repo.organization, repo.name, heads.map((h) => h.name));
   if (pruned > 0)
     logLine({ event: "reconciliation", target: "run_unit_head", runId, org: repo.organization, repo: repo.name, action: "prune-stale", pruned });
@@ -793,6 +888,10 @@ export async function processRepo(
 async function processUnit(
   db: AuditDb, client: GithubClient, config: Config, runId: string,
   repo: RepoInfo, decision: BranchDecision, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+  // Out-param: the caller seeds it to the discovery head and reads it back in its throttle/error arms.
+  // We OVERWRITE it the instant the clone fallback resolves the real HEAD (below), so a failure AFTER
+  // that point records the truly-attempted commit, not the stale discovery oid.
+  observed: { commitSha: string; committedDate: string },
 ): Promise<{ commitSha: string; committedDate: string }> {
   const h = decision.head;
   const tree = await client.fetchTreeRecursive(repo.organization, repo.name, h.treeOid);
@@ -816,6 +915,13 @@ async function processUnit(
       cloneDir = cloned.dir;
       commitSha = cloned.headSha;
       committedDate = cloned.headCommittedDate;
+      // Surface the real scanned head to the caller's throttle/error arms BEFORE the scan pipeline runs —
+      // so a walkClone/scanUnit throw past this point records THIS commit, not the stale discovery oid.
+      // cloneShallow returns a FULLY-resolved {headSha, headCommittedDate} or throws; if it throws mid-way
+      // (e.g. rev-parse resolved the moved HEAD but `git show` could not read its date), observed is left at
+      // the COHERENT discovery head — we deliberately never pin an incoherent clone-sha + discovery-date.
+      observed.commitSha = commitSha;
+      observed.committedDate = committedDate;
       entries = walkClone(cloned.dir);
       readFile = cloneReader(cloned.dir);
     } else {
@@ -918,7 +1024,7 @@ export async function reconcileIntrospection(db: AuditDb, client: GithubClient, 
               df.dependency_key, df.dependency_type, df.manifest_path, df.declared_version,
               df.lockfile_path, df.resolved_version, df.resolved_version_source
        FROM dependency_findings df
-       JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status = 'scanned'
+       JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status IN (${REPORTABLE_HEAD_SQL})
          AND ruh.organization = df.organization AND ruh.repository = df.repository
          AND ruh.branch = df.branch AND ruh.commit_sha = df.commit_sha
        WHERE df.package_name IN (SELECT value FROM json_each(?))`,
@@ -1188,9 +1294,16 @@ export function planSummaryText(
 }
 
 // Entry point (guarded so importing this module — e.g. from tests — never launches an audit).
+// T5b: set process.exitCode (NOT process.exit) so main()'s finally has already drained the terminal
+// `done`/`run-deferred` line via flushLogs() before the process exits. 0 complete · 75 partial ·
+// 1 fatal. A thrown error (renderFatal path) is a fatal → exit 1, set the same way.
 if (import.meta.main) {
-  main().catch((e) => {
-    process.stderr.write(renderFatal(e, { command: "orchestrate", usage: ORCHESTRATE_USAGE }));
-    process.exit(1);
-  });
+  main()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((e) => {
+      process.stderr.write(renderFatal(e, { command: "orchestrate", usage: ORCHESTRATE_USAGE }));
+      process.exitCode = EXIT_FATAL;
+    });
 }

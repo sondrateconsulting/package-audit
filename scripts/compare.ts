@@ -7,8 +7,9 @@
 //
 // Semantics (default-branch headline rule):
 // - Each run's slice is usage_findings joined through the IMMUTABLE run_unit_head snapshot
-//   (run_id = that run, status='scanned', matching org/repo/branch/commit_sha — report.ts's join,
-//   NEVER findings.run_id) filtered to THAT run's tracked_packages.
+//   (run_id = that run, a reportable head status — REPORTABLE_UNIT_STATUSES, matching
+//   org/repo/branch/commit_sha — report.ts's join, NEVER findings.run_id) filtered to THAT run's
+//   tracked_packages.
 // - A usage site is keyed by (org, repo, branch, usage_type, export_name, file_path,
 //   line_number, context). commit_sha is deliberately EXCLUDED — heads advance between runs, and
 //   a site that merely moved commits is not a change. branch is deliberately INCLUDED.
@@ -23,10 +24,15 @@
 
 import { existsSync } from "node:fs";
 import { loadConfig, type Config } from "./config.ts";
-import { AuditDb, type AuditDbReader, type PolicyStatus, type RunRecord } from "./db.ts";
+import { AuditDb, REPORTABLE_UNIT_STATUSES, type AuditDbReader, type PolicyStatus, type RunRecord } from "./db.ts";
 import { isPolicyExcluded, isDefaultOverride, assertRunUnitHeadSound, policyStatusOrThrow } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
+
+// The reportable-head SQL fragment (`'scanned', 'reused'`), from the db.ts source of truth so this
+// run-to-run diff's scanned-slice stays in lockstep with report.ts/export.ts (a reused skip-as-current
+// unit carries a findings-bearing head — current when recorded, possibly preserved-stale, §3.1a). Fixed enum literals → injection-safe.
+const REPORTABLE_HEAD_SQL = REPORTABLE_UNIT_STATUSES.map((s) => `'${s}'`).join(", ");
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -195,7 +201,7 @@ export interface CompareEnvelope {
 
 // Two branch states share the same policy ATTRIBUTION iff both the policy_status
 // (excluded-by-deny / excluded-by-allow / null) and the causing pattern match. Deliberately does NOT
-// compare the row's `status` column (scanned / skipped-cutoff / policy-excluded / past-cap): the callers have already
+// compare the row's `status` column (any of the nine dispositions): the callers have already
 // established the disposition via policyApplied/defaultOverride, and this answers the narrower
 // question "did the policy verdict itself change" — e.g. a branch re-classified from allow-miss to an
 // explicit deny, or a deny whose causing pattern was renamed.
@@ -312,7 +318,7 @@ function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
         : null;
   const flags = new Map<string, boolean | null>(
     heads
-      .filter((h) => h.status === "scanned")
+      .filter((h) => (REPORTABLE_UNIT_STATUSES as readonly string[]).includes(h.status))
       .map((h) => [unitKey(h.organization, h.repository, h.branch, h.commit_sha), h.is_default_branch === null ? null : h.is_default_branch === 1]),
   );
   const policyByBranch = new Map<string, PolicyBranchState>(
@@ -350,7 +356,7 @@ function loadRunSlice(db: AuditDbReader, run: RunRecord): RunSlice {
             uf.usage_type, uf.export_name, uf.context, uf.file_path, uf.line_number,
             uf.permalink, uf.snippet
      FROM usage_findings uf
-     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status='scanned'
+     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status IN (${REPORTABLE_HEAD_SQL})
        AND ruh.organization=uf.organization AND ruh.repository=uf.repository
        AND ruh.branch=uf.branch AND ruh.commit_sha=uf.commit_sha
      WHERE uf.package_name IN (SELECT value FROM json_each(?))`,

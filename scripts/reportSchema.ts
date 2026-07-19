@@ -14,7 +14,7 @@ import { z } from "zod";
 // Type-only import — zero runtime coupling: the emit path never touches this module, and this
 // module never touches the DB: the enum literals below are pinned to db.ts's unions at compile
 // time, so a new/renamed member on either side fails `bun run typecheck` instead of drifting.
-import type { ExportKind, UsageType } from "./db.ts";
+import type { ExportKind, RunOutcome, UsageType } from "./db.ts";
 // Runtime value import — a plain numeric const, NO cycle (artifactWrite imports only node built-ins +
 // readOnlyGuard). Pins formatVersion below so the schema is a TRUE shape discriminator: a v2-shaped
 // report mislabeled formatVersion:1 must FAIL validation, and a version bump auto-updates the literal.
@@ -42,12 +42,20 @@ export const exportKindSchema = z
   .enum(["named", "default", "type"])
   .describe("§5.E export classification ('cli-bin' rows surface as cli.binNames, the '__complete__' marker is never emitted)");
 
+// The run's finalized outcome (§3.1b). Pinned to db.ts's RunOutcome union (all seven members — no
+// exclusions) so a new/renamed outcome fails typecheck here. The report carries it verbatim.
+export const runOutcomeEnumSchema = z
+  .enum(["complete", "partial-deferred", "partial-degraded", "partial-budget", "fatal", "legacy-unknown", "legacy-failed"])
+  .describe("runs.outcome — the run's coverage disposition");
+
 // Bidirectional compile-time sync with db.ts (report enums = DB unions minus the CLI members,
-// which surface via cliUsage / cli.binNames instead). Equal<> fails in BOTH drift directions.
+// which surface via cliUsage / cli.binNames instead; runOutcome is the FULL union). Equal<> fails
+// in BOTH drift directions.
 type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
 type Expect<T extends true> = T;
 export type UsageEnumSyncedWithDb = Expect<Equal<(typeof usageTypeSchema.options)[number], Exclude<UsageType, "cli">>>;
 export type ExportEnumSyncedWithDb = Expect<Equal<(typeof exportKindSchema.options)[number], Exclude<ExportKind, "cli-bin">>>;
+export type RunOutcomeEnumSyncedWithDb = Expect<Equal<(typeof runOutcomeEnumSchema.options)[number], RunOutcome>>;
 
 const lockfileRefSchema = z
   .strictObject({
@@ -165,21 +173,21 @@ export const summarySchema = z
   .strictObject({
     organizationsScanned: z.number().int().min(0).describe("DISTINCT orgs among the run's scanned branch snapshots"),
     repositoriesScanned: z.number().int().min(0).describe("DISTINCT org/repo among scanned snapshots"),
-    branchesScanned: z.number().int().min(0).describe("run_unit_head rows with status='scanned' (includes skipped-as-current + scanned default-override units)"),
+    branchesScanned: z.number().int().min(0).describe("run_unit_head rows with a REPORTABLE status (scanned + reused/skip-as-current) — the findings-bearing slice; includes scanned default-override units"),
     branchesSkippedByCutoff: z.number().int().min(0).describe("GENUINE cutoff skips: run_unit_head rows with status='skipped-cutoff' (a policy exclusion is its own status, never counted here)"),
     branchesExcludedByPolicy: z.number().int().min(0).describe("Branch allow/deny exclusions: run_unit_head rows with status='policy-excluded'"),
     branchesPastCap: z.number().int().min(0).describe("Eligible branches past the per-repo cap (not scanned this run)"),
-    branchesErrored: z.number().int().min(0).describe("DISTINCT branches carrying a scope='scan' errors[] entry this run that hold NO run_unit_head disposition row — read it as exactly that, not as 'every branch whose scan errored'. The two coincide on a single-invocation run, except that a post-persistence step (the success-log write or the work-queue 'done' update) throwing after the scanned row committed can leave both a row and an errors[] entry for one branch — the persisted scanned row counts it under branchesScanned while the row-key exclusion keeps it out of branchesErrored, so the summary counts it exactly once; on a RESUMED run they diverge BOTH ways. More: a branch that errored in an earlier invocation and reached no row-bearing disposition in the final one (deleted, throttle-requeued, or its repo's discovery failed) is still counted, because errors[] is append-only and never reconciled. Less: a branch holding a row from an earlier invocation that errors in a later one is NOT counted — its retained row already places it in that row's disposition bucket, and counting it here too would count one discovered branch twice"),
+    branchesErrored: z.number().int().min(0).describe("DISTINCT branches whose scan FAILED this run — the UNION of two DISJOINT sets: (a) error-status run_unit_head heads (a permanent scan failure recorded at the observed commit when no prior reportable scan protected the head), and (b) branches carrying a scope='scan' errors[] entry that hold NO run_unit_head row (a failure BEFORE any disposition: discovery-time, or a resume whose earlier invocation errored before a row). An error head IS a row, so it is excluded from (b) — the two never double-count. A branch with a SCANNED row PLUS a scope='scan' errors[] entry (a post-persistence write throwing after the scanned row committed, OR a moved-head re-scan failure whose findings-preservation guard kept the prior scan) counts under branchesScanned, not here. A THROTTLE/network/service DEFERRAL is NOT a failure — un-covered, surfaced via runOutcome, excluded here. On a RESUMED run, (b) diverges from 'every branch whose scan errored' in BOTH directions: an earlier invocation's rowless error persists (errors[] is append-only — its one reconciliation is the excluded-owner prune) while rows are pruned/superseded"),
     totalDependencyFindings: z.number().int().min(0),
     totalUsageFindings: z.number().int().min(0),
   })
-  .describe("Per-run disposition counts + finding totals, from the immutable run_unit_head snapshot. The four disposition counts partition the RECORDED run_unit_head rows exactly once each (exact, unconditionally); together with branchesErrored they account for the branches that reached a TERMINAL outcome (scanned + skippedByCutoff + excludedByPolicy + pastCap + errored) — as an EQUALITY on a single-invocation run, and as an UPPER BOUND on a resumed run, where a branch that errored in an earlier invocation and reached no row-bearing disposition in the final one is still counted in errored (see branchesErrored, whose relationship to 'branches whose scan errored' is looser than its name suggests on a resume, in BOTH directions). A branch whose scan was THROTTLE-REQUEUED is deferred, not terminal — it holds no row and no error, and is finished on the next run, so it appears in no count here; that carve-out is absolute only within a single invocation, since a branch that errored in an earlier one carries an error and so is counted despite being deferred");
+  .describe("Per-run disposition counts + finding totals, from the immutable run_unit_head snapshot. scanned + skippedByCutoff + excludedByPolicy + pastCap + errored account for every branch that reached a TERMINAL outcome this run (errored = error-status heads + rowless scan errors; see branchesErrored) — an EQUALITY on a single-invocation run, and an UPPER BOUND on a resumed run, where an earlier invocation's rowless error persists in errored even when the final invocation recorded NO row for it (the branch is now gone or unvisited; errors[] is append-only bar the excluded-owner prune, rows are pruned/superseded). A DEFERRED branch (deferred-throttle/network/service) is NOT terminal — un-covered, finished on a later run; it floors the run to partial-deferred (via a deferred-* row, or coverage_complete=0 when the deferral was preserved over a prior scan) and appears in no terminal count of its own — though a deferral PRESERVED over a prior scan is still counted in branchesScanned via that retained scan");
 
 export const policyBranchSchema = z.strictObject({
   organization: z.string(),
   repository: z.string(),
   branch: z.string(),
-  disposition: z.enum(["excluded", "scanned-default-override"]),
+  disposition: z.enum(["excluded", "scanned-default-override", "attempted-default-override"]),
   policyStatus: z.enum(["excluded-by-deny", "excluded-by-allow"]),
   matchedPattern: z.string().nullable().describe("The stored deny-attribution pattern; null for an allow-miss / default-override-by-allow. Writes verify it matches the branch; the read gate does NOT re-match it — report/compare and JSONL export surface the stored value on otherwise-sound pre-verifier or externally-edited rows (the default CSV export still applies its formula-injection defense; malformed rows still fail the read gate on shape), so it is not read-time attested"),
 });
@@ -193,11 +201,37 @@ export const scanScopeSchema = z
   })
   .describe("Branch allow/deny scan-scope diagnostics (§5) — SEPARATE from the disjoint summary counts (subcounts overlap)");
 
+// §3.1b run coverage — a top-level block (NOT in summary) so a consumer can see, at a glance,
+// whether the run covered the whole estate and, if not, what was deferred or failed. `units` counts
+// every run_unit_head disposition in a FIXED key order so the emitted JSON stays byte-reproducible.
+export const runOutcomeSchema = z
+  .strictObject({
+    outcome: runOutcomeEnumSchema.describe("runs.outcome — always present: an unfinalized run (outcome NULL) is served as notReportable, never as a report"),
+    coverageComplete: z.boolean().nullable().describe("Did this run cover the whole estate: true=full, false=a coverage gap (a discovery gap OR a unit-level deferral — incl. a deferral preserved over a prior scan, which writes no deferred-* row), null=unknowable (migrated pre-v5 run — the column was added at schema v5)"),
+    discoveryFailures: z.number().int().min(0).describe("Permanent owner/repo/branch discovery failures this run (each makes the denominator unknown)"),
+    discoveryDeferrals: z.number().int().min(0).describe("Discovery enumerations deferred by rate-limiting this run (re-run to complete)"),
+    units: z
+      .strictObject({
+        scanned: z.number().int().min(0).describe("Freshly scanned this run"),
+        reused: z.number().int().min(0).describe("Skip-as-current: unchanged head, findings reused from the prior scan"),
+        skippedCutoff: z.number().int().min(0).describe("Head predates cutoffDate — intentionally not scanned"),
+        policyExcluded: z.number().int().min(0).describe("Dropped by the branch allow/deny policy (§5)"),
+        pastCap: z.number().int().min(0).describe("Eligible branch past the per-repo cap — not scanned this run"),
+        deferredThrottle: z.number().int().min(0).describe("Deferred by rate-limiting — re-run to finish"),
+        deferredNetwork: z.number().int().min(0).describe("Deferred by a transport outage — re-run to finish"),
+        deferredService: z.number().int().min(0).describe("Deferred by a GitHub service failure — re-run to finish"),
+        error: z.number().int().min(0).describe("A permanent, terminal scan error (a covered, real result)"),
+      })
+      .describe("Per-run unit disposition counts from run_unit_head, in fixed enum order (byte-determinism)"),
+  })
+  .describe("§3.1 run coverage disposition — did this run cover the whole estate, and if not, what is outstanding");
+
 export const reportSchema = z
   .strictObject({
     formatVersion: z.literal(XRAY_FORMAT_VERSION).describe("XRAY_FORMAT_VERSION — the report/export/HTML artifact-set version; PINNED so this schema is a true shape discriminator"),
     runId: z.string().describe("The reported run's identifier (report --run-id <id> re-emits it)"),
     generatedAt: isoUtc.describe("completed_at of the run (started_at fallback for a --run-id report of a non-completed run)"),
+    runOutcome: runOutcomeSchema,
     config: z.strictObject({
       packages: z.array(z.string()).describe("The run's tracked package names (runs.tracked_packages)"),
       cutoffDate: z.string().describe("The run's cutoff date (YYYY-MM-DD)"),

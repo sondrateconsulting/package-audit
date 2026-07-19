@@ -88,7 +88,7 @@ function seedTwoRuns(db: AuditDb): { oldRun: RunRecord; newRun: RunRecord } {
     exportName: "oldExport", context: "", filePath: "src/old.ts", lineNumber: 9,
     permalink: perma("aaa111", "src/old.ts", 9), snippet: "old-run snippet", foundAt: T1,
   });
-  db.completeRun(r1);
+  db.finalizeRun(r1, "complete"); // T5: reportable only once finalized (full coverage → 'complete')
 
   // Surfaces for BOTH versions; 49.0.0 is resolved only via the OLD run's rows, so the NEW
   // run's default export must slice it out. writeApiSurface appends the '__complete__' marker.
@@ -131,7 +131,7 @@ function seedTwoRuns(db: AuditDb): { oldRun: RunRecord; newRun: RunRecord } {
     exportName: "", context: "", filePath: "src/b.ts", lineNumber: 7,
     permalink: perma("bbb222", "src/b.ts", 7), snippet: 'const e = require("expo"), x = 1;\nnext', foundAt: T2,
   });
-  db.completeRun(r2);
+  db.finalizeRun(r2, "complete"); // T5: reportable only once finalized (full coverage → 'complete')
   return { oldRun: db.getRun(r1)!, newRun: db.getRun(r2)! };
 }
 
@@ -695,7 +695,7 @@ describe("export — run_unit_head soundness gate (same whole-row rules as repor
     const db2 = AuditDb.open({ sqlitePath: path });
     const run = db2.getRun(runId)!;
     const out = mkdtempSync(join(tmpdir(), "export-gate-"));
-    expect(() => exportRun(db2, run, out, { raw: false })).toThrow(/the default branch is always scanned/);
+    expect(() => exportRun(db2, run, out, { raw: false })).toThrow(/the default branch is always scan-attempted/);
     expect(() => exportRun(db2, run, out, { raw: true })).not.toThrow(); // forensic dump: deliberately ungated
     db2.close();
     rmSync(out, { recursive: true, force: true });

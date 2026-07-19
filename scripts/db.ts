@@ -44,7 +44,7 @@ function assertNever(x: never, what: string): never {
 // Bump when the schema changes; older on-disk versions run the §3 VERSION-STEPPED migration
 // chain — each step is one transaction that stamps its own target version, so a crash between
 // steps leaves a valid intermediate database that the next open resumes from.
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 // Every migration step stamps its own PINNED target version — never the mutable
 // SCHEMA_VERSION. (If a step stamped SCHEMA_VERSION, bumping the constant would make a crash
 // between two steps leave an intermediate-SHAPED database stamped at the new version, and every
@@ -56,6 +56,14 @@ const V3_TARGET_VERSION = 3;
 // TABLE REBUILD, and the migration classifies the on-disk shape first to reject an incompatible v4
 // (e.g. a sibling branch that also stamped 4 with a different run_unit_head) rather than adopting it.
 const V4_TARGET_VERSION = 4;
+// migrateV4toV5's target (T5 durable coverage model, §3.1): run_unit_head.status widens AGAIN to add
+// the resilience dispositions ('reused' + the three 'deferred-*' + 'error') on top of v4's policy
+// set, and `runs` gains outcome/coverage_complete/discovery_failures/discovery_deferrals. The status
+// widen is a CHECK change → another TABLE REBUILD (the v4 body is FROZEN as RUN_UNIT_HEAD_V4_BODY
+// since a v5 table cannot be ALTERed back to it); the `runs` columns are additive. A `runs.outcome`
+// column is now OUR v5 marker (classifyRunUnitHead/assertOpenCompatible were built to REJECT it as a
+// foreign v4 — those discriminators are inverted at v5, where outcome present ⟺ v5-shaped).
+const V5_TARGET_VERSION = 5;
 
 // §0 OWNERSHIP PROOF. The OLDEST version this tool has ever stamped: db.ts shipped at
 // SCHEMA_VERSION = 2 in its first commit and has stamped >= 2 ever since. `PRAGMA user_version`
@@ -106,16 +114,70 @@ export type OwnersSource = "configured" | "discovered";
 export type RunStatus = "running" | "completed" | "failed";
 export type WorkScope = "org" | "repo" | "branch";
 export type WorkStatus = "pending" | "in_progress" | "done" | "skipped" | "error";
-// The DISJOINT disposition partition (§3). 'policy-excluded' is its OWN status rather than an
-// overloaded 'skipped-cutoff': a branch dropped by branch allow/deny was not skipped by the cutoff,
-// and the durable vocabulary must name the event the live JSONL stream already calls 'skip-policy'.
-// The default-branch OVERRIDE is deliberately NOT a member — that branch IS scanned and carries only
-// a counterfactual policy_status (see policyDisposition.ts::isDefaultOverride).
-export type UnitHeadStatus = "scanned" | "skipped-cutoff" | "policy-excluded" | "past-cap";
+// The DISJOINT disposition partition (§3 + §3.1a). Two orthogonal families union here:
+//   • DISCOVERY-time dispositions (branch policy / cutoff / cap, decided before any scan):
+//     'skipped-cutoff', 'policy-excluded', 'past-cap'. 'policy-excluded' is its OWN status rather
+//     than an overloaded 'skipped-cutoff' — a branch dropped by branch allow/deny was not skipped by
+//     the cutoff, and the durable vocabulary must name the event the live JSONL calls 'skip-policy'.
+//   • SCAN-ATTEMPT dispositions (T5, decided AT a known head): 'scanned' (fresh), 'reused'
+//     (skip-as-current — previously mislabeled 'scanned'), and the requeue/failure outcomes
+//     'deferred-throttle'/'deferred-network'/'deferred-service'/'error'. These carry the OBSERVED head
+//     commit_sha (NOT ''), and the cause→disposition map (§3.1a) is the single source of truth. A unit the
+//     run reaches USUALLY writes one row with its disposition — EXCEPT the findings-preservation guard: a
+//     transient error/deferred-* over a prior REPORTABLE scan (scanned/reused) writes NO row (the good scan
+//     is kept), even at a MOVED head; the coverage gap is then recorded out of band (errors[] for an error,
+//     coverage_complete=0 for a deferral).
+// The default-branch OVERRIDE is NOT a member — that branch IS scan-attempted (scanned/reused, or a
+// deferred-*/error attempt) and merely carries a counterfactual policy_status (see policyDisposition.ts::isDefaultOverride).
+export type UnitHeadStatus =
+  | "scanned" | "reused" | "skipped-cutoff" | "policy-excluded" | "past-cap"
+  | "deferred-throttle" | "deferred-network" | "deferred-service" | "error";
 // The ORTHOGONAL, counterfactual policy decision for a branch (branch allow/deny). Computed for
 // EVERY discovered branch, including the default (whose scan is never blocked). NULL policy_status
 // (the third state) means "no exclusion" and is represented as `null`, not a member here.
 export type PolicyStatus = "excluded-by-deny" | "excluded-by-allow";
+// T5 §3.1b: the finalized outcome of a run. NULL (unfinalized/crashed) until finalizeRun.
+// 'legacy-unknown'/'legacy-failed' backfill pre-v5 completed/failed runs (coverage unknowable).
+export type RunOutcome =
+  | "complete" | "partial-deferred" | "partial-degraded" | "partial-budget"
+  | "fatal" | "legacy-unknown" | "legacy-failed";
+// The outcomes a LIVE run may finalize to. The two legacy-* variants are backfill-only (a v4→v5
+// migration stamps them on already-terminal rows) and must NEVER reach finalizeRun — passing one
+// would let a fresh run masquerade as reportable ('legacy-unknown') or land status='completed' with
+// a failure outcome ('legacy-failed'). Narrowing the parameter makes that a compile error.
+export type FinalizableRunOutcome = Exclude<RunOutcome, "legacy-unknown" | "legacy-failed">;
+// §3.1c precedence: when finalizeRun reconciles the orchestrator's REQUESTED outcome against the
+// FLOOR the durable state forces, the higher rank wins (a coverage gap can only RAISE severity, an
+// optimistic request can never lower it below what the DB proves). legacy-* are backfill-only and
+// never flow through finalizeRun — ranked here only to keep the map exhaustive over RunOutcome.
+const OUTCOME_RANK: Record<RunOutcome, number> = {
+  complete: 0,
+  "legacy-unknown": 0,
+  "partial-deferred": 1,
+  "partial-degraded": 2,
+  "partial-budget": 3,
+  "legacy-failed": 4,
+  fatal: 4,
+};
+// The scanned-slice: unit dispositions whose findings JOIN into the report (§3.1a ripple). A
+// deferred/errored/cutoff/policy/cap unit contributes no findings, so only these two are reportable
+// heads (a 'reused' skip-as-current unit carries a findings-bearing head — current WHEN RECORDED, but
+// possibly preserved-stale after a later moved-head transient failure, §3.1a).
+export const REPORTABLE_UNIT_STATUSES = ["scanned", "reused"] as const;
+// §3.1a disposition FAMILY partition. SCAN-ATTEMPT dispositions are decided AT a known head and carry
+// the OBSERVED commit_sha (scanned/reused name the head they REPORTED — current when recorded, possibly
+// preserved-stale after a moved-head transient, §3.1a; deferred-*/error name the head the failed attempt
+// saw); DISCOVERY-time dispositions are decided before any scan and carry commit_sha=''.
+// The default branch is ALWAYS scan-attempted. Record<UnitHeadStatus,…> makes this EXHAUSTIVE: adding a
+// disposition to the union forces a family decision here (a build error until it is classified), and
+// this ONE definition is shared by the write gate (assertRunUnitHeadInvariants) and the read gate
+// (policyDisposition.ts) so they can never drift.
+const STATUS_FAMILY = {
+  scanned: "scan", reused: "scan", "deferred-throttle": "scan", "deferred-network": "scan",
+  "deferred-service": "scan", error: "scan",
+  "skipped-cutoff": "discovery", "policy-excluded": "discovery", "past-cap": "discovery",
+} as const satisfies Record<UnitHeadStatus, "scan" | "discovery">;
+export const isScanAttemptStatus = (s: UnitHeadStatus): boolean => STATUS_FAMILY[s] === "scan";
 export type DependencyType =
   | "dependencies" | "devDependencies" | "peerDependencies" | "optionalDependencies"
   | "overrides" | "resolutions";
@@ -136,6 +198,12 @@ export interface RunRecord {
   cutoffDate: string;
   githubHost: string;
   status: RunStatus;
+  // T5 durable coverage (§3.1b). outcome is NULL until finalizeRun (a crashed run stays NULL, and is
+  // never latest-reportable). coverageComplete: null=unknown, true=full, false=incomplete.
+  outcome: RunOutcome | null;
+  coverageComplete: boolean | null;
+  discoveryFailures: number;
+  discoveryDeferrals: number;
 }
 
 export interface RunInput {
@@ -244,7 +312,14 @@ export interface RunUnitHeadInput {
   organization: string;
   repository: string;
   branch: string;
-  commitSha: string; // '' for every NON-scanned disposition (skipped-cutoff / past-cap / policy-excluded)
+  // '' for the DISCOVERY-time dispositions that name no scanned commit (skipped-cutoff / past-cap /
+  // policy-excluded). The SCAN-ATTEMPT dispositions carry the OBSERVED head oid: 'scanned'/'reused'
+  // name the head they reported (current when recorded, possibly preserved-stale after a moved-head
+  // transient — §3.1a), and 'deferred-*'/'error' name the head the failed attempt RECORDED (its observed
+  // head — the coherent discovery head when a clone could not fully resolve) — REQUIRED (not '')
+  // so the commit-aware upsert precedence keeps a good scan when a later attempt at any head is
+  // throttled/errored (§3.1a: a transient never downgrades a reportable scan, same-commit or moved).
+  commitSha: string;
   status: UnitHeadStatus;
   // Tri-state, REQUIRED (not optional — `undefined` must never silently become "not default"):
   // true/false when discovery knew the repo's default branch, null = unknown. Pre-v3 rows are
@@ -257,8 +332,8 @@ export interface RunUnitHeadInput {
   policyStatus: PolicyStatus | null; // null = no exclusion (the branch is policy-eligible)
   policyMatchedPattern: string | null; // non-empty ONLY when policyStatus === 'excluded-by-deny'
   // The commit date (GitHub committedDate / git-%cI family — an ISO instant, offset preserved,
-  // stored RAW, NOT the nowIso millisecond form). scanned → the ACTUALLY-scanned commit's date (the clone HEAD's
-  // own date under the clone fallback); non-scanned → the discovered head date. REQUIRED non-null:
+  // stored RAW, NOT the nowIso millisecond form). A SCAN-ATTEMPT row → the OBSERVED commit's date (the clone
+  // HEAD's own date under the clone fallback); a DISCOVERY-time row → the discovered head date. REQUIRED non-null:
   // every fresh upsert has a real date (the DB column stays nullable only for pre-v4 migrated rows,
   // which the migration writes directly, never through this input). A runtime guard rejects ''/null.
   scannedCommitDate: string;
@@ -286,11 +361,42 @@ export interface ApiSurfaceInput {
   rows: ApiSurfaceRow[]; // export/bin rows only; db.ts appends the '__complete__' marker
 }
 
-// The run_unit_head column + constraint body (v4). Extracted so the v3→v4 REBUILD's scratch table
-// and SCHEMA_SQL share ONE definition — they cannot drift, and the post-migration fingerprint would
-// catch it if they did. Column ORDER here is load-bearing: the shape classifier compares the exact
-// ordered column set (see classifyRunUnitHead).
+// The run_unit_head column + constraint body (v5). Extracted so the REBUILD's scratch table and
+// SCHEMA_SQL share ONE definition — they cannot drift, and the post-migration fingerprint would catch
+// it if they did. Column ORDER here is load-bearing: the shape classifier compares the exact ordered
+// column set (see classifyRunUnitHead). v5 differs from v4 (RUN_UNIT_HEAD_V4_BODY) ONLY in the status
+// CHECK — same columns, so a v4↔v5 tell is the CHECK set, not the column tuple.
 const RUN_UNIT_HEAD_BODY = `
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+  commit_sha TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'scanned'
+    CHECK (status IN ('scanned','reused','skipped-cutoff','policy-excluded','past-cap','deferred-throttle','deferred-network','deferred-service','error')),
+  is_default_branch INTEGER,
+  policy_status TEXT
+    CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+  policy_matched_pattern TEXT,
+  scanned_commit_date TEXT,
+  CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+  -- The status ↔ policy_status agreement, enforced in SQL so no writer (or a future one) can store a
+  -- contradiction the read surfaces would have to guess about: a 'policy-excluded' row names WHICH
+  -- rule dropped it, and a cutoff/cap row carries no policy verdict at all (policy runs BEFORE
+  -- cutoff/cap, so those dispositions are only ever reached by policy-eligible branches). The
+  -- SCAN-ATTEMPT dispositions ('scanned'/'reused'/'deferred-*'/'error') are unconstrained here — null
+  -- for the ordinary case and non-null for the default-branch override's counterfactual (the default
+  -- is always scan-attempted, never policy-excluded), a distinction assertRunUnitHeadInvariants pins
+  -- to the known default. Only the two DISCOVERY-time non-policy dispositions are forced null.
+  CHECK (status <> 'policy-excluded' OR policy_status IS NOT NULL),
+  CHECK (status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL),
+  PRIMARY KEY (run_id, organization, repository, branch)
+`;
+// The FROZEN v4 run_unit_head body — the immediate predecessor of the current (v5) body. Needed for
+// the same reason RUN_UNIT_HEAD_V3_BODY is frozen: v5 differs from v4 by a CHECK, and SQLite cannot
+// ALTER a CHECK, so a v4 reference cannot be derived from the current build by ALTER — it must be a
+// literal. Used by the v4-era reference shape (tableShapesAt), the v3→v4 migration's rebuild target,
+// and RUH_V4_CHECKS' source of truth. A v4 body is v5 minus the resilience dispositions in the status
+// CHECK; every other column and CHECK is identical (branch policy, unchanged by T5).
+const RUN_UNIT_HEAD_V4_BODY = `
   run_id TEXT NOT NULL REFERENCES runs(run_id),
   organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
   commit_sha TEXT NOT NULL DEFAULT '',
@@ -302,12 +408,6 @@ const RUN_UNIT_HEAD_BODY = `
   policy_matched_pattern TEXT,
   scanned_commit_date TEXT,
   CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
-  -- The status ↔ policy_status agreement, enforced in SQL so no writer (or a future one) can store a
-  -- contradiction the read surfaces would have to guess about: a 'policy-excluded' row names WHICH
-  -- rule dropped it, and a cutoff/cap row carries no policy verdict at all (policy runs BEFORE
-  -- cutoff/cap, so those dispositions are only ever reached by policy-eligible branches). 'scanned'
-  -- is unconstrained here — it is null for the ordinary case and non-null for the default-branch
-  -- override's counterfactual, a distinction assertRunUnitHeadInvariants pins to the known default.
   CHECK (status <> 'policy-excluded' OR policy_status IS NOT NULL),
   CHECK (status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL),
   PRIMARY KEY (run_id, organization, repository, branch)
@@ -324,7 +424,12 @@ CREATE TABLE IF NOT EXISTS runs (
   tracked_packages TEXT NOT NULL DEFAULT '[]',
   cutoff_date TEXT NOT NULL DEFAULT '',
   github_host TEXT NOT NULL DEFAULT 'github.com',
-  status TEXT NOT NULL CHECK (status IN ('running','completed','failed'))
+  status TEXT NOT NULL CHECK (status IN ('running','completed','failed')),
+  outcome TEXT
+    CHECK (outcome IS NULL OR outcome IN ('complete','partial-deferred','partial-degraded','partial-budget','fatal','legacy-unknown','legacy-failed')),
+  coverage_complete INTEGER CHECK (coverage_complete IS NULL OR coverage_complete IN (0,1)),
+  discovery_failures INTEGER NOT NULL DEFAULT 0 CHECK (discovery_failures >= 0),
+  discovery_deferrals INTEGER NOT NULL DEFAULT 0 CHECK (discovery_deferrals >= 0)
 );
 CREATE TABLE IF NOT EXISTS work_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -508,11 +613,25 @@ export function tableShapesAt(version: number): ReadonlyMap<string, string> {
   if (cached !== undefined) return new Map(cached);
   const ref = new Database(":memory:", { strict: true });
   try {
-    ref.exec(SCHEMA_SQL); // the CURRENT (v4) schema
-    if (version < V4_TARGET_VERSION) {
+    ref.exec(SCHEMA_SQL); // the CURRENT (v5) schema
+    if (version < V5_TARGET_VERSION) {
+      // `runs`: the four T5 coverage columns arrived at v5 (additive). Drop them for an older era —
+      // DROP COLUMN succeeds despite their column-level CHECKs (they are referenced by no table-level
+      // constraint, index, or PK; verified by probe). ix_ruh_loc need not be recreated on the
+      // run_unit_head rebuilds below: it is a CREATE INDEX (pragma origin 'c'), which tableShape's
+      // idxSig deliberately excludes, so the index never enters this shape fingerprint (classify's
+      // ruhIndexState governs it separately).
+      for (const col of ["outcome", "coverage_complete", "discovery_failures", "discovery_deferrals"])
+        ref.exec(`ALTER TABLE runs DROP COLUMN ${col}`);
+      // run_unit_head: a CHECK change can't be ALTERed, so rebuild from the era body. v4 keeps the
+      // policy columns and the 4-disposition CHECK (the FROZEN v4 body); v3/v2 are the pre-policy body.
       ref.exec("DROP TABLE run_unit_head");
-      ref.exec(`CREATE TABLE run_unit_head (${RUN_UNIT_HEAD_V3_BODY});`);
-      if (version < V3_TARGET_VERSION) ref.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch");
+      if (version >= V4_TARGET_VERSION) {
+        ref.exec(`CREATE TABLE run_unit_head (${RUN_UNIT_HEAD_V4_BODY});`);
+      } else {
+        ref.exec(`CREATE TABLE run_unit_head (${RUN_UNIT_HEAD_V3_BODY});`);
+        if (version < V3_TARGET_VERSION) ref.exec("ALTER TABLE run_unit_head DROP COLUMN is_default_branch");
+      }
     }
     const shapes = new Map(AUDIT_TABLES.map((t) => [t, tableShape(ref, t)]));
     referenceShapesByVersion.set(version, shapes);
@@ -1248,6 +1367,15 @@ const RUH_V4_CHECKS: readonly string[] = [
   normalizeCheck("status <> 'policy-excluded' OR policy_status IS NOT NULL"),
   normalizeCheck("status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL"),
 ];
+// v5 = v4 with the status CHECK widened by the T5 resilience dispositions; every other CHECK (and the
+// column set — RUH_V4_COLSPEC serves both) is identical, so the CHECK MULTISET is the v4↔v5 tell.
+const RUH_V5_CHECKS: readonly string[] = [
+  normalizeCheck("status IN ('scanned','reused','skipped-cutoff','policy-excluded','past-cap','deferred-throttle','deferred-network','deferred-service','error')"),
+  normalizeCheck("policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')"),
+  normalizeCheck("policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL"),
+  normalizeCheck("status <> 'policy-excluded' OR policy_status IS NOT NULL"),
+  normalizeCheck("status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL"),
+];
 const RUH_V23_CHECKS: readonly string[] = [normalizeCheck("status IN ('scanned','skipped-cutoff')")];
 const checksEqual = (actual: readonly string[], expected: readonly string[]): boolean => {
   if (actual.length !== expected.length) return false;
@@ -1267,21 +1395,23 @@ function tableCreateSql(db: Database, table: string): string | null {
 // READ-ONLY check (no writes, no sentinel inserts — works on a read-only connection) so the open
 // preflight, openReadOnly, and the migration all agree.
 type RuhClass =
-  | { kind: "ours-v4" } //               exact v4 shape — accept
-  | { kind: "ours-v4-missing-index" } // v4 shape, ix_ruh_loc absent — repairable (recreate index)
+  | { kind: "ours-v5" } //               exact v5 shape (widened dispositions) — accept
+  | { kind: "ours-v5-missing-index" } // v5 shape, ix_ruh_loc absent — repairable (recreate index)
+  | { kind: "exact-v4" } //             exact v4 shape (policy set, pre-resilience CHECK) — migrate via rebuild
   | { kind: "exact-v3" } //             exact v3 shape — migrate via rebuild
-  | { kind: "exact-v2" } //             exact v2 shape (pre is_default_branch) — migrate via v2→v3→v4
+  | { kind: "exact-v2" } //             exact v2 shape (pre is_default_branch) — migrate via v2→v3→v4→v5
   | { kind: "absent" } //               run_unit_head does not exist (fresh, or post---fresh cache-only)
   | { kind: "incompatible"; reason: string }; // anything else — reject
 
+// Classifies the run_unit_head SHAPE ALONE (its columns + CHECK set), deliberately NOT the runs.outcome
+// sibling column. The pre-T5 code rejected a runs.outcome here as "a foreign v4"; that discriminator is
+// GONE at v5 because runs.outcome is now OUR marker, and the OLD T5-branch sibling it guarded against is
+// already refused by run_unit_head shape (that branch's run_unit_head carried T5's widened dispositions
+// on the v3 COLUMN set — no policy columns — so it matches neither the v4/v5 nor the v3 CHECK set and
+// classifies 'incompatible'). The stamp (userVersion), not classify, decides migrate-vs-self-heal for a
+// recognized shape; runs.outcome presence is repaired by addV5RunsColumns on the writable heal, and its
+// ABSENCE on a stamped-v5 read-only open is caught by openReadOnly's dedicated column guard.
 function classifyRunUnitHead(db: Database): RuhClass {
-  // Sibling discriminator FIRST: a runs.outcome column is a foreign v4 regardless of run_unit_head.
-  // Read via table_xinfo so a GENERATED outcome column cannot evade the check.
-  if (tableExists(db, "runs") && tableXinfo(db, "runs").some((c) => c.name === "outcome"))
-    return {
-      kind: "incompatible",
-      reason: "the runs table has an 'outcome' column — a different v4 schema; use the matching tool build or a new database path",
-    };
   if (!tableExists(db, "run_unit_head")) return { kind: "absent" };
   const cols = tableXinfo(db, "run_unit_head");
   const sql = tableCreateSql(db, "run_unit_head");
@@ -1324,18 +1454,28 @@ function classifyRunUnitHead(db: Database): RuhClass {
   // bare-token walk cannot be tripped by the policy_matched_pattern identifier (word-boundary guard).
   if (sql !== null && sqlHasBareToken(sql, "match"))
     return { kind: "incompatible", reason: "run_unit_head declares a MATCH clause — our shape never does (SQLite parses but ignores it, so no pragma can witness it)" };
+  const idx = ruhIndexState(db);
+  // A recognized PREDECESSOR (v2/v3/v4) with a wrong ix_ruh_loc would have that index SILENTLY dropped
+  // by the rebuild — reject it (the migration recreates only OUR ix_ruh_loc). "absent" is fine (the
+  // predecessor may legitimately lack it; the rebuild + verify's SCHEMA_SQL recreate it).
+  const predIdxWrong = idx === "wrong";
+  // v4 and v5 share the SAME column tuple (v4→v5 widened only the status CHECK), so RUH_V4_COLSPEC
+  // matches BOTH shapes — the CHECK MULTISET plus the runs.outcome marker discriminate them.
   if (colsMatch(cols, RUH_V4_COLSPEC)) {
-    if (!checksEqual(checks, RUH_V4_CHECKS))
-      return { kind: "incompatible", reason: "run_unit_head has the v4 columns but not the exact v4 CHECK set" };
-    const idx = ruhIndexState(db);
-    if (idx === "wrong")
-      return { kind: "incompatible", reason: "run_unit_head has an ix_ruh_loc index with the wrong definition (UNIQUE or wrong columns)" };
-    return idx === "ok" ? { kind: "ours-v4" } : { kind: "ours-v4-missing-index" };
+    if (checksEqual(checks, RUH_V5_CHECKS)) {
+      // v5 run_unit_head — the current era.
+      if (idx === "wrong")
+        return { kind: "incompatible", reason: "run_unit_head has an ix_ruh_loc index with the wrong definition (UNIQUE or wrong columns)" };
+      return idx === "ok" ? { kind: "ours-v5" } : { kind: "ours-v5-missing-index" };
+    }
+    if (checksEqual(checks, RUH_V4_CHECKS)) {
+      // v4 run_unit_head — a migratable predecessor (or, under a v5 stamp, a healable regression).
+      if (predIdxWrong)
+        return { kind: "incompatible", reason: "run_unit_head (v4) has an ix_ruh_loc index with the wrong definition" };
+      return { kind: "exact-v4" };
+    }
+    return { kind: "incompatible", reason: "run_unit_head has the v4/v5 columns but neither the exact v4 nor v5 CHECK set" };
   }
-  // A recognized PREDECESSOR (v2/v3) with a wrong ix_ruh_loc would have that index SILENTLY dropped
-  // by the v3→v4 rebuild — reject it (the migration recreates only OUR ix_ruh_loc). "absent" is fine
-  // (the predecessor may legitimately lack it; the rebuild recreates it).
-  const predIdxWrong = ruhIndexState(db) === "wrong";
   if (colsMatch(cols, RUH_V3_COLSPEC)) {
     if (!checksEqual(checks, RUH_V23_CHECKS))
       return { kind: "incompatible", reason: "run_unit_head has the v3 columns but not the exact v3 CHECK set" };
@@ -1366,68 +1506,99 @@ function classifyRunUnitHead(db: Database): RuhClass {
 // AuditDb.open, every state that could make this transaction fail AFTER its destructive swap is
 // now intercepted earlier (ownership preflight, live backstops, classify-first), so the
 // rollback-after-swap property is only pinnable by driving the function on a raw connection.
-// The shape-keyed run_unit_head heal, shared by migrateV3toV4 and the current-stamp self-heal
-// (AuditDb.open's else arm). Classifies the on-disk shape and brings any RECOGNIZED
-// predecessor era to the v4 body, rows riding through; the v4 forms and `absent` are no-ops
-// here (the caller's SCHEMA_SQL recreates what is missing). Runs INSIDE the caller's
-// transaction — a failure rolls the whole step back.
-function healRunUnitHeadShape(db: Database): void {
+// Fixed column-name lists (never input) each era contributes to a rebuild's EXPLICIT copy — derived
+// from the ordered colspecs so they can never drift from the shape classifier.
+const RUH_V3_COLS: readonly string[] = RUH_V3_COLSPEC.map((c) => c.name);
+const RUH_V4_COLS: readonly string[] = RUH_V4_COLSPEC.map((c) => c.name);
+
+// Rebuild run_unit_head into `targetBody`, copying the predecessor's `sourceCols` EXPLICITLY (columns
+// the target adds default NULL). Guards the destructive DROP exactly as the v3→v4 rebuild always has:
+// refuse an inbound FK (a DROP with foreign_keys=ON does an implicit child-row delete that CASCADEs to
+// external rows the later foreign_key_check cannot detect) and refuse a pre-existing scratch table (a
+// foreign table of that name would be silently clobbered). The interpolated names are fixed colspec
+// literals, never input. Runs INSIDE the caller's transaction — a throw rolls the whole step back.
+// The historical scratch-table name (kept across the v4→v5 generalization): the ownership preflight
+// and the collision guard both key on it, and reusing it keeps a foreign table of that name refused.
+const RUH_REBUILD_SCRATCH = "run_unit_head__v4_new";
+function rebuildRunUnitHead(db: Database, targetBody: string, sourceCols: readonly string[]): void {
+  if (hasInboundForeignKey(db, "run_unit_head"))
+    fail("run_unit_head has an inbound foreign key — refusing to rebuild it (a DROP would cascade to external rows)");
+  if (tableExists(db, RUH_REBUILD_SCRATCH))
+    fail(`migration scratch table ${RUH_REBUILD_SCRATCH} already exists — aborting rather than clobber it`);
+  const cols = sourceCols.join(", ");
+  db.exec(`CREATE TABLE ${RUH_REBUILD_SCRATCH} (${targetBody});`);
+  db.exec(`INSERT INTO ${RUH_REBUILD_SCRATCH} (${cols}) SELECT ${cols} FROM run_unit_head`);
+  db.exec("DROP TABLE run_unit_head");
+  db.exec(`ALTER TABLE ${RUH_REBUILD_SCRATCH} RENAME TO run_unit_head`);
+}
+
+// The shape-keyed run_unit_head heal, shared by BOTH migrations and the current-stamp self-heal
+// (AuditDb.open's else arm). Classifies the on-disk shape and brings any RECOGNIZED predecessor to
+// `target`'s body, rows riding through; the target shape itself and `absent` are no-ops (the caller's
+// SCHEMA_SQL recreates what is missing). `target` is the version the CALLER produces: the v3→v4 step
+// targets 4 (the FROZEN v4 body — NEVER the current v5 build, or a v3 db would over-migrate straight
+// to v5 while the stamp says 4); the v4→v5 step and the current-stamp self-heal target 5. Runs INSIDE
+// the caller's transaction — a failure rolls the whole step back.
+function healRunUnitHeadShape(db: Database, target: 4 | 5): void {
   const cls = classifyRunUnitHead(db);
+  const targetBody = target === 5 ? RUN_UNIT_HEAD_BODY : RUN_UNIT_HEAD_V4_BODY;
   switch (cls.kind) {
-    case "ours-v4":
-    case "ours-v4-missing-index":
-      break; // physically v4 already (shape upgraded, stamp equal or lagged): preserve every value, no rebuild
+    case "ours-v5":
+    case "ours-v5-missing-index":
+      // Physically v5 already — the CURRENT shape. At ANY target this is a no-op: a v5 shape under a
+      // pre-v5 stamp is the tool's OWN crash remnant (SCHEMA_SQL committed the v5 CREATEs together with
+      // an earlier step's stamp, then crashed before the next stamp), which the ownership span accepts
+      // as a recognized-shape-ahead-of-stamp and FAST-FORWARDS without a rebuild — preserving every
+      // value. A later step re-stamps; SQLite could not narrow the CHECK back anyway.
+      break;
+    case "exact-v4":
+      // At a v4 target this is the destination shape — no-op. At a v5 target it is the immediate
+      // predecessor: rebuild WIDENING the status CHECK, copying all 10 v4 columns (policy included).
+      // A v4 row's disposition is a strict subset of v5's and stays valid AND correct under the wider
+      // CHECK — the copy invents no resilience state, and the policy columns ride through untouched.
+      if (target === 4) break;
+      rebuildRunUnitHead(db, targetBody, RUH_V4_COLS);
+      break;
     case "exact-v2":
-      // A v2 shape reaching this step means migrateV2toV3 did not run for it — either the file
-      // is stamped >= 3 with a damaged-away column (external damage; the chain itself stamps
-      // atomically with its ALTER, so it never produces this) or the shape regressed after the
-      // v2→v3 step. Both are the healable class the ownership span admits: heal the missing
-      // column FIRST — is_default_branch backfills NULL (= unknown), never 0, exactly like the
-      // real v2→v3 migration — then rebuild like any exact-v3 table (fall through).
+      // A v2 shape reaching a heal means migrateV2toV3 did not run for it (external damage / a shape
+      // that regressed after the v2→v3 step — the chain stamps atomically with its ALTER, so it never
+      // produces this). Heal the missing column FIRST — is_default_branch backfills NULL (= unknown),
+      // never 0, exactly like the real v2→v3 migration — then rebuild like any exact-v3 table.
       addColumnIfMissing(db, "run_unit_head", "is_default_branch", "INTEGER");
     // fall through — the table is now exact-v3-shaped
     case "exact-v3":
-      // A DROP with foreign_keys=ON does an implicit child-row delete that would CASCADE to any
-      // external table referencing run_unit_head — silently mutating rows the later
-      // foreign_key_check cannot detect. Refuse to rebuild in that (unexpected) mixed shape.
-      if (hasInboundForeignKey(db, "run_unit_head"))
-        fail("run_unit_head has an inbound foreign key — refusing to rebuild it (a DROP would cascade to external rows)");
-      // Rebuild: new v4-shaped table, copy the 7 v3 columns EXPLICITLY. New columns default NULL, and a
-      // v3 row's 'scanned'/'skipped-cutoff' status stays valid AND correct under the widened v4 CHECK:
-      // v3 predates branch policy, so no migrated row can be a policy exclusion mislabelled as a
-      // cutoff skip — the null policy_status it inherits is the truth, not a lossy default.
-      if (tableExists(db, "run_unit_head__v4_new"))
-        fail("migration scratch table run_unit_head__v4_new already exists — aborting rather than clobber it");
-      db.exec(`CREATE TABLE run_unit_head__v4_new (${RUN_UNIT_HEAD_BODY});`);
-      db.exec(
-        `INSERT INTO run_unit_head__v4_new
-           (run_id, organization, repository, branch, commit_sha, status, is_default_branch)
-         SELECT run_id, organization, repository, branch, commit_sha, status, is_default_branch
-         FROM run_unit_head`,
-      );
-      db.exec("DROP TABLE run_unit_head");
-      db.exec("ALTER TABLE run_unit_head__v4_new RENAME TO run_unit_head");
+      // Rebuild to the target body, copying the 7 v3 columns EXPLICITLY. Target-added columns default
+      // NULL, and a v3 row's 'scanned'/'skipped-cutoff' status is valid under BOTH the v4 and v5 CHECK:
+      // v3 predates branch policy AND the resilience dispositions, so no migrated row can be a policy
+      // exclusion or a requeue mislabelled — the null policy_status it inherits is the truth.
+      rebuildRunUnitHead(db, targetBody, RUH_V3_COLS);
       break;
     case "absent":
-      break; // recognized post---fresh cache-only state: the caller's SCHEMA_SQL creates run_unit_head at v4
+      break; // recognized post---fresh cache-only state: the caller's SCHEMA_SQL creates run_unit_head at `target`
     case "incompatible":
       // Structurally unreachable through AuditDb.open (the preflight + live compat gates reject
       // an unrecognized shape first) — kept as the transaction-internal backstop.
       fail(`run_unit_head is incompatible with this tool build (${cls.reason})`);
     default:
-      // The heal is void-returning, so TS2366 can never police this switch: a 7th RuhClass era would
+      // The heal is void-returning, so TS2366 can never police this switch: a new RuhClass era would
       // fall straight out of it, heal NOTHING, and let the caller's SCHEMA_SQL step see rows in a shape
       // it never migrated — silently, since every arm above still "handled" its own case. `cls` narrows
-      // to never here ONLY while all six eras are handled, so adding one makes this the build error that
-      // forces the decision (heal it, or state why it needs no heal). NB the exact-v2 arm's fall-through
-      // into exact-v3 is deliberate and unaffected: this arm is reachable only past every named case.
+      // to never here ONLY while all eras are handled, so adding one makes this the build error that
+      // forces the decision. NB the exact-v2 arm's fall-through into exact-v3 is deliberate and
+      // unaffected: this arm is reachable only past every named case.
       assertNever(cls, "run_unit_head class");
   }
 }
 
+// migrateV3toV4 — run_unit_head gains policy_status/policy_matched_pattern/scanned_commit_date and a
+// WIDENED status CHECK (the branch-policy dispositions), a CHECK change → TABLE REBUILD to the FROZEN
+// v4 body. ONE transaction: atomic across crashes (a crash before commit restores the v3
+// table+rows+index+stamp; after commit exposes complete v4). Classifies first (via the shared heal) so
+// it never blindly rebuilds. foreign_keys stays ON: run_unit_head is a leaf child, safe to DROP.
+// Exported for direct unit tests (the isOwnedOrEmpty / mapReadOnlyOpenError precedent).
 export function migrateV3toV4(db: Database): void {
   db.transaction(() => {
-    healRunUnitHeadShape(db);
+    healRunUnitHeadShape(db, 4);
     // Migration-boundary rule: every pre-v4 RUNNING run is failed —
     // inside this same transaction — so it can never be resumed under v4 semantics. A pre-v4 run's
     // scope may have left NO run_unit_head rows at all (v3 never recorded past-cap rows, and a repo
@@ -1439,22 +1610,87 @@ export function migrateV3toV4(db: Database): void {
     // authoritative; the config_hash is unchanged by design, so completed work_queue units still
     // skip-as-current (estate/branch discovery reruns; content rescans do not).
     if (tableExists(db, "runs")) db.exec(`UPDATE runs SET status='failed' WHERE status='running'`);
-    verifyRunUnitHeadFingerprint(db, "v3→v4 migration");
+    verifyRunUnitHeadFingerprint(db, "v3→v4 migration", 4);
     setUserVersion(db, V4_TARGET_VERSION);
   })();
 }
 
-// The post-heal verification shared by migrateV3toV4 and the current-stamp self-heal: recreate
-// any missing object (idempotent — AFTER the table-specific step so a rebuild's fresh table gets
-// its index here), then fingerprint + FK integrity before the caller commits/stamps: the step
-// MUST have produced OUR exact v4 shape, with no orphaned rows. Runs INSIDE the caller's
-// transaction. ONE definition on purpose — the two callers' teeth must never drift apart (the
-// self-heal copy previously duplicated this block verbatim).
-function verifyRunUnitHeadFingerprint(db: Database, label: string): void {
-  db.exec(SCHEMA_SQL);
+// The T5 `runs` additive columns — shared by migrateV4toV5 and the current-version self-heal so they
+// can never drift. All are safe ADD COLUMNs (SQLite permits a CHECK referencing only the new column,
+// and a NOT NULL column with a DEFAULT). No `runs` table rebuild is required.
+function addV5RunsColumns(db: Database): void {
+  addColumnIfMissing(db, "runs", "outcome",
+    `TEXT CHECK (outcome IS NULL OR outcome IN ('complete','partial-deferred','partial-degraded','partial-budget','fatal','legacy-unknown','legacy-failed'))`);
+  addColumnIfMissing(db, "runs", "coverage_complete", `INTEGER CHECK (coverage_complete IS NULL OR coverage_complete IN (0,1))`);
+  addColumnIfMissing(db, "runs", "discovery_failures", `INTEGER NOT NULL DEFAULT 0 CHECK (discovery_failures >= 0)`);
+  addColumnIfMissing(db, "runs", "discovery_deferrals", `INTEGER NOT NULL DEFAULT 0 CHECK (discovery_deferrals >= 0)`);
+}
+
+// migrateV4toV5 — T5 durable coverage model (§3.1). run_unit_head's status CHECK widens AGAIN (the
+// resilience dispositions), a CHECK change → TABLE REBUILD that PRESERVES the v4 policy columns; `runs`
+// gains outcome/coverage_complete/discovery_* additively. ONE transaction: atomic across crashes (a
+// crash before commit restores the complete v4 table+rows+stamp; after commit exposes complete v5).
+// The shared heal classifies first, so it never blindly rebuilds a physical-v5 table or masks an
+// incompatible shape. Exported for direct unit tests (the migrateV3toV4 precedent).
+export function migrateV4toV5(db: Database): void {
+  db.transaction(() => {
+    // SCHEMA_SQL FIRST — runs MUST exist before healRunUnitHeadShape rebuilds run_unit_head: with
+    // foreign_keys=ON the rebuild's `INSERT INTO scratch SELECT FROM run_unit_head` (and the RENAME)
+    // resolve run_unit_head's FK to runs, which is ABSENT on a --fresh-dropped v3 db or a cache-only
+    // post-fresh shell. SCHEMA_SQL creates every missing table at v5 (runs WITH its coverage columns for
+    // the --fresh case); a PRE-EXISTING v4 runs is a CREATE-IF-NOT-EXISTS no-op here and gets its columns
+    // from addV5RunsColumns next. It (re)creates run_unit_head only when ABSENT — an existing v2/v3/v4
+    // table is left for the heal to rebuild. classify no longer inspects runs.outcome, so creating runs
+    // (with or without the columns) before the heal cannot make a v4 run_unit_head misclassify.
+    db.exec(SCHEMA_SQL);
+    addV5RunsColumns(db); // additive coverage columns for a pre-existing v4 runs — MUST precede backfill + verify
+    healRunUnitHeadShape(db, 5); // v2/v3/v4 → v5 body (rows ride through; runs now present for the FK)
+    // Migration-boundary rule (mirrors v3→v4): every pre-v5 RUNNING run is failed inside this same
+    // transaction so it can never resume under v5 with an unknowable coverage denominator (its
+    // coverage_complete would read NULL). Work is not lost — config_hash is unchanged, so the next
+    // invocation's completed work_queue units still skip-as-current; only the failed run's un-reportable
+    // in-progress provenance is dropped.
+    db.exec(`UPDATE runs SET status='failed' WHERE status='running'`);
+    // §3.1f legacy backfill: pre-v5 completed → legacy-unknown (reportable/latest-eligible for
+    // back-compat; old discovery deferral is unreconstructable → coverage_complete NULL); failed →
+    // legacy-failed (else a NULL outcome would newly make a previously-queryable failed run
+    // not-reportable). The boundary-failed running runs above are stamped legacy-failed here too. WHERE
+    // outcome IS NULL keeps it idempotent across a resumed migration.
+    db.exec(`UPDATE runs SET outcome='legacy-unknown' WHERE status='completed' AND outcome IS NULL`);
+    db.exec(`UPDATE runs SET outcome='legacy-failed'  WHERE status='failed'    AND outcome IS NULL`);
+    verifyRunUnitHeadFingerprint(db, "v4→v5 migration", 5);
+    setUserVersion(db, V5_TARGET_VERSION);
+  })();
+}
+
+// The post-heal verification shared by the migrations and the current-stamp self-heal: recreate any
+// missing object (idempotent — AFTER the table-specific step so a rebuild's fresh table gets its index
+// here), then fingerprint + FK integrity before the caller commits/stamps: the step MUST have produced
+// OUR exact shape for `target` (v4→exact-v4, v5→ours-v5), with no orphaned rows. Runs INSIDE the
+// caller's transaction. ONE definition on purpose — the callers' teeth must never drift apart.
+function verifyRunUnitHeadFingerprint(db: Database, label: string, target: 4 | 5): void {
+  if (target === 5) {
+    // v5 IS the current build, so SCHEMA_SQL recreates EVERY missing object at exactly the right
+    // shape (incl. a cache-only db's absent runs, with the coverage columns, and the ix_ruh_loc a
+    // rebuild dropped).
+    db.exec(SCHEMA_SQL);
+  } else {
+    // A v4 CHECKPOINT must not create v5-shaped tables (SCHEMA_SQL is v5). The ONLY object a v3→v4
+    // rebuild drops is run_unit_head's ix_ruh_loc, and the ONLY table it may need to (re)create is
+    // run_unit_head itself (the cache-only/absent heal case) — at the FROZEN v4 body. Any OTHER
+    // missing audit table (e.g. a cache-only db's absent runs) is left for the next step's v5
+    // SCHEMA_SQL to create at v5, never manufactured v5-shaped under a v4 stamp here.
+    if (!tableExists(db, "run_unit_head"))
+      db.exec(`CREATE TABLE run_unit_head (${RUN_UNIT_HEAD_V4_BODY});`);
+    db.exec(`CREATE INDEX IF NOT EXISTS ix_ruh_loc ON run_unit_head(organization, repository, branch, commit_sha)`);
+  }
   const after = classifyRunUnitHead(db);
-  if (after.kind !== "ours-v4")
-    fail(`${label} did not produce the expected run_unit_head shape (got '${after.kind}')`);
+  // A v5 target must land EXACTLY on ours-v5. A v4 CHECKPOINT accepts either exact-v4 (the healed
+  // predecessor) OR ours-v5 — a physically-v5 table fast-forwarded WITHOUT a rebuild (a recognized
+  // shape ahead of its stamp, the tool's own crash remnant); the next step re-stamps it to 5.
+  const accepted = target === 5 ? after.kind === "ours-v5" : after.kind === "exact-v4" || after.kind === "ours-v5";
+  if (!accepted)
+    fail(`${label} did not produce the expected run_unit_head shape (got '${after.kind}', wanted ${target === 5 ? "'ours-v5'" : "'exact-v4' or 'ours-v5'"})`);
   const orphans = db.query(`PRAGMA foreign_key_check(run_unit_head)`).all();
   if (orphans.length > 0)
     fail(`${label} left ${orphans.length} orphaned run_unit_head row(s) — aborting`);
@@ -1482,9 +1718,11 @@ function verifyRunUnitHeadFingerprint(db: Database, label: string): void {
 function assertOpenCompatible(db: Database, userVersion: number): void {
   const reject = (why: string): never => fail(`refusing to open an incompatible database (stamped v${userVersion}): ${why}`);
   // Cross-table invariants first (they hold at every accepted stamp):
-  // (a) a runs.outcome column is a foreign v4 (table_xinfo, so a GENERATED outcome is caught);
-  if (tableExists(db, "runs") && tableXinfo(db, "runs").some((c) => c.name === "outcome"))
-    reject("the runs table has an 'outcome' column — a different v4 schema; use the matching tool build or a new database path");
+  // (a) [INVERTED AT v5] a runs.outcome column USED to prove a foreign v4 and was rejected here; it is
+  //     now OUR v5 coverage marker, so the blanket reject is gone. Its consistency with run_unit_head's
+  //     shape (outcome present ⟺ v5-shaped) is enforced inside classifyRunUnitHead below (the present
+  //     case) and by gate (b) (the absent case: a runs.outcome beside no run_unit_head is refused as
+  //     "run_unit_head missing while runs present"). No standalone check is needed here anymore.
   const ruhPresent = tableExists(db, "run_unit_head");
   // (b) run_unit_head absent while runs is present is never a legitimate (atomic) post-fresh state.
   //     Deliberately NOT left to the self-heal/repair path: recreating an EMPTY provenance table
@@ -1701,21 +1939,26 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   // branch never reaches either. Neither disposition ever carries a policy verdict.
   if ((h.status === "skipped-cutoff" || h.status === "past-cap") && h.policyStatus !== null)
     fail(`run_unit_head ${where}: ${h.status} rows must have policy_status null (policy is applied before cutoff/cap)`);
-  // Default-branch override (the default is always scanned): the ONLY way a policy-excluded branch is still scanned is
-  // the default-branch exemption. A scanned row bearing a policy_status MUST be the KNOWN default.
-  if (h.status === "scanned" && h.policyStatus !== null && h.isDefaultBranch !== true)
-    fail(`run_unit_head ${where}: a scanned row with a policy_status must be the default branch (is_default_branch=${h.isDefaultBranch ?? "null"})`);
-  // commit_sha ↔ scanned (§3): only a scanned row pins a real commit; every non-scanned disposition
-  // stores '' (the report/export joins on status='scanned' depend on this partition).
-  if (h.status === "scanned") {
-    if (h.commitSha === "") fail(`run_unit_head ${where}: a scanned row requires a non-empty commit_sha`);
+  // Default-branch override (the default is always scan-attempted): the ONLY way a policy-excluded
+  // branch is still scan-attempted is the default-branch exemption. A scan-attempt row bearing a
+  // policy_status (the counterfactual) MUST be the KNOWN default — a non-default excluded branch is
+  // 'policy-excluded', never scanned/reused/deferred/errored with a verdict attached.
+  if (isScanAttemptStatus(h.status) && h.policyStatus !== null && h.isDefaultBranch !== true)
+    fail(`run_unit_head ${where}: a ${h.status} row with a policy_status must be the default branch (is_default_branch=${h.isDefaultBranch ?? "null"})`);
+  // commit_sha ↔ disposition family (§3.1a): a SCAN-ATTEMPT row pins the OBSERVED head commit;
+  // every DISCOVERY-time disposition stores '' (the report/export joins on status IN scanned/reused
+  // AND commit_sha depend on this partition, and the commit-aware upsert precedence relies on
+  // deferred-*/error carrying the real head so a same-head requeue never wipes a good scan).
+  if (isScanAttemptStatus(h.status)) {
+    if (h.commitSha === "") fail(`run_unit_head ${where}: a ${h.status} row requires a non-empty commit_sha (the observed head)`);
   } else if (h.commitSha !== "") {
     fail(`run_unit_head ${where}: a ${h.status} row must have commit_sha='' (got ${JSON.stringify(h.commitSha)})`);
   }
-  // Default is always scanned (PROMPT.md §3): classifyBranchPlan always keeps the default in the
-  // eligible set, so a known-default branch is never cutoff-skipped or past-cap.
-  if (h.isDefaultBranch === true && h.status !== "scanned")
-    fail(`run_unit_head ${where}: the default branch is always scanned, never ${h.status}`);
+  // Default is always scan-attempted (PROMPT.md §3): classifyBranchPlan always keeps the default in the
+  // eligible set, so a known-default branch is never cutoff-skipped, policy-excluded, or past-cap — its
+  // attempt is scanned/reused, or deferred-*/error when the attempt itself failed transiently.
+  if (h.isDefaultBranch === true && !isScanAttemptStatus(h.status))
+    fail(`run_unit_head ${where}: the default branch is always scan-attempted, never ${h.status}`);
   // Non-default certainty for cap/policy exclusions (§3): past-cap and policy-excluded rows are, by
   // construction, non-default branches that discovery KNEW about — so is_default_branch is a definite
   // false, never null. (A plain cutoff-skip may still be null for a pre-v3/unknown row.)
@@ -1872,19 +2115,24 @@ export class AuditDb {
       // MIN_OWNED_VERSION rather than adopting and rebuilding it, so userVersion is >= 2 here.
       if (readUserVersion(db) < V3_TARGET_VERSION) migrateV2toV3(db);
       if (readUserVersion(db) < V4_TARGET_VERSION) migrateV3toV4(db);
+      if (readUserVersion(db) < V5_TARGET_VERSION) migrateV4toV5(db);
     } else {
-      // Current-stamp (v4) self-heal, SHAPE-keyed: the compatibility gate already rejected every
+      // Current-stamp (v5) self-heal, SHAPE-keyed: the compatibility gate already rejected every
       // UNRECOGNIZED shape, but a recognized PREDECESSOR era under the current stamp (external
-      // damage — e.g. a partial restore that regressed run_unit_head to its v2/v3 body) is
-      // deliberately admitted as healable, per the ownership span's contract. The heal runs the
-      // same rebuild the v3→v4 migration uses (rows riding through; damaged-away values honestly
-      // read NULL); verifyRunUnitHeadFingerprint then recreates any missing table/index and runs
-      // the SAME post-heal fingerprint + FK teeth as the migration (one definition, no drift).
-      // This is a repair, NOT a version crossing — the stamp is already current, so no run is
-      // failed here (the migration-boundary rule belongs to migrateV3toV4 alone).
+      // damage — e.g. a partial restore that regressed run_unit_head to its v2/v3/v4 body) is
+      // deliberately admitted as healable, per the ownership span's contract. The heal runs the same
+      // rebuild the migrations use (rows riding through; damaged-away values honestly read NULL);
+      // addV5RunsColumns re-adds a damaged-away coverage column (NULL for existing rows — never
+      // invents outcome data); verifyRunUnitHeadFingerprint then recreates any missing table/index and
+      // runs the SAME post-heal fingerprint + FK teeth as the migration (one definition, no drift).
+      // This is a repair, NOT a version crossing — the stamp is already current, so no run is failed
+      // here (the migration-boundary rule belongs to the migrations alone). addV5RunsColumns is guarded
+      // on runs' presence for the cache-only-post-fresh state (verify's SCHEMA_SQL then creates it).
       db.transaction(() => {
-        healRunUnitHeadShape(db);
-        verifyRunUnitHeadFingerprint(db, "self-heal");
+        db.exec(SCHEMA_SQL); // runs (+ any missing table) present before the heal's rebuild resolves run_unit_head's FK
+        addV5RunsColumns(db); // repair a damaged-away coverage column on a pre-existing runs
+        healRunUnitHeadShape(db, 5);
+        verifyRunUnitHeadFingerprint(db, "self-heal", 5);
       })();
     }
     return new AuditDb(db);
@@ -1970,8 +2218,15 @@ export class AuditDb {
       // ownership span admits — the WRITER repairs it (shape-keyed self-heal), so the read path
       // advises the repair rather than declaring the file incompatible (openReadOnly itself
       // cannot migrate or heal).
-      if (tableExists(db, "run_unit_head") && (cls.kind === "exact-v3" || cls.kind === "exact-v2"))
-        fail("database run_unit_head is missing the v4 policy columns — run `bun run audit` once to repair it, then retry");
+      if (tableExists(db, "run_unit_head") && (cls.kind === "exact-v4" || cls.kind === "exact-v3" || cls.kind === "exact-v2"))
+        fail("database run_unit_head is an older shape than this tool's v5 (missing the widened dispositions and/or the v4 policy columns) — run `bun run audit` once to repair it, then retry");
+      // A stamped-v5 file whose runs table lost a v5 coverage column (a partial hand-edit — the migration
+      // adds all four together) would otherwise fail a report query MID-WAY at latestReportableRun's
+      // `outcome` reference. classify no longer inspects runs.outcome, so guard it here, representative of
+      // the four columns. The writer self-heal re-adds them (addV5RunsColumns), so "run `bun run audit`"
+      // is truthful, not a dead end.
+      if (tableExists(db, "runs") && !columnExists(db, "runs", "outcome"))
+        fail("database runs table is missing the v5 outcome column — run `bun run audit` once to repair it, then retry");
       for (const t of AUDIT_TABLES) {
         if (!tableExists(db, t))
           fail(`database is missing the ${t} table — run \`bun run audit\` once to repair it, then retry`);
@@ -2016,9 +2271,12 @@ export class AuditDb {
         const runId = randomUUID();
         this.db
           .query(
+            // T5 §3.1b: a new run starts OPTIMISTICALLY complete (coverage_complete=1); the first
+            // discovery failure/deferral or early stop flips it to 0. Migrated (legacy) rows stay
+            // NULL = unknown. A RESUMED run keeps its existing coverage (this INSERT is new-run only).
             `INSERT INTO runs (run_id, started_at, completed_at, config_hash, effective_owners,
-               owners_source, tracked_packages, cutoff_date, github_host, status)
-             VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'running')`,
+               owners_source, tracked_packages, cutoff_date, github_host, status, coverage_complete)
+             VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'running', 1)`,
           )
           .run(
             runId, now, input.configHash, JSON.stringify(input.effectiveOwners),
@@ -2054,16 +2312,92 @@ export class AuditDb {
     this.db.query(`UPDATE runs SET status='failed' WHERE run_id = ?`).run(runId);
   }
 
+  // T5 §3.1b: stamp a live run's terminal disposition ONCE at the end. The orchestrator passes the
+  // outcome it derived from the stop reason it observed — ran-to-end → 'complete', a requeue →
+  // 'partial-deferred', a tripped transport/service breaker → 'partial-degraded', the run budget →
+  // 'partial-budget', an unrecoverable error → 'fatal'. finalizeRun raises that to the FLOOR the
+  // durable state forces: a discovery gap (coverage_complete≠1 or either discovery counter > 0) or any
+  // unit left deferred means the estate was NOT fully covered, so an optimistic 'complete' is floored
+  // to 'partial-deferred'. The report head must never claim coverage the run didn't reach. Permanent
+  // 'error' unit rows alone do NOT force partial — a repo that genuinely 404s is "covered" (its absence
+  // is a real, terminal result); nor do policy-excluded/past-cap (deliberate operator exclusions, not
+  // unknown gaps). fatal ⇒ status='failed'; every other outcome ⇒ status='completed'. completed_at is
+  // stamped for EVERY finalize (incl. a handled fatal): the run's processing ended at a known time, and
+  // §7's generatedAt should reflect that. The 'fatal' vs NULL outcome — not completed_at — is what
+  // separates a handled fatal from a crash-marked failure (whose outcome stays NULL, completed_at unset).
+  // GUARD: only a still-running, not-yet-finalized run is stamped — a crash-marked 'failed' row (startRun
+  // fails stale running runs, leaving outcome NULL) stays unfinalized and unreportable.
+  finalizeRun(runId: string, requested: FinalizableRunOutcome): RunOutcome | null {
+    // Defence in depth behind the compile-time narrowing: a cast that smuggles a backfill-only value in
+    // must not corrupt a live run (legacy-unknown → falsely reportable; legacy-failed → completed). The
+    // `as string` widening is deliberate — the param type already excludes these, so the check is
+    // unreachable through normal calls; it guards only an `as never`/`as RunOutcome` bypass.
+    if ((requested as string) === "legacy-unknown" || (requested as string) === "legacy-failed")
+      fail(`finalizeRun received a backfill-only outcome '${requested}' — live runs finalize to complete/partial-*/fatal only`);
+    const tx = this.db.transaction((): RunOutcome | null => {
+      const row = this.db
+        .query(
+          `SELECT status, outcome, coverage_complete, discovery_failures, discovery_deferrals
+             FROM runs WHERE run_id = ?`,
+        )
+        .get(runId) as
+        | {
+            status: RunStatus;
+            outcome: RunOutcome | null;
+            coverage_complete: number | null;
+            discovery_failures: number;
+            discovery_deferrals: number;
+          }
+        | null;
+      if (row === null || row.status !== "running" || row.outcome !== null) return null;
+      // Discovery-level gap (unknown denominator) OR any unit left in a deferred-* disposition (known
+      // unit, un-scanned) both block a 'complete' outcome.
+      const coverageGap =
+        row.coverage_complete !== 1 || row.discovery_failures > 0 || row.discovery_deferrals > 0;
+      const hasDeferredUnit =
+        coverageGap ||
+        this.db
+          .query(`SELECT 1 FROM run_unit_head WHERE run_id = ? AND status LIKE 'deferred-%' LIMIT 1`)
+          .get(runId) !== null;
+      const floor: FinalizableRunOutcome = hasDeferredUnit ? "partial-deferred" : "complete";
+      const outcome: FinalizableRunOutcome = OUTCOME_RANK[requested] >= OUTCOME_RANK[floor] ? requested : floor;
+      const status: RunStatus = outcome === "fatal" ? "failed" : "completed";
+      this.db
+        .query(`UPDATE runs SET status = ?, completed_at = ?, outcome = ? WHERE run_id = ?`)
+        .run(status, nowIso(), outcome, runId);
+      return outcome;
+    });
+    return tx();
+  }
+
+  // T5 §3.1b: a discovery FAILURE (owner/repo/branch listing failed) or DEFERRAL (throttle requeue of
+  // discovery) makes the run's true denominator unknown → coverage_complete=0 AND increment the
+  // persisted cause-specific counter, atomically. Both counters are DB-derived (survive a resume).
+  recordDiscoveryFailure(runId: string): void {
+    this.db.query(`UPDATE runs SET coverage_complete=0, discovery_failures = discovery_failures + 1 WHERE run_id = ?`).run(runId);
+  }
+  recordDiscoveryDeferral(runId: string): void {
+    this.db.query(`UPDATE runs SET coverage_complete=0, discovery_deferrals = discovery_deferrals + 1 WHERE run_id = ?`).run(runId);
+  }
+  // Any early stop that leaves the true denominator unknown (CLI-term partial, budget, transport/
+  // service breaker) flips coverage without touching a discovery counter.
+  markCoverageIncomplete(runId: string): void {
+    this.db.query(`UPDATE runs SET coverage_complete=0 WHERE run_id = ?`).run(runId);
+  }
+
   getRun(runId: string): RunRecord | null {
     const row = this.db.query(`SELECT * FROM runs WHERE run_id = ?`).get(runId) as RunRow | null;
     return row === null ? null : mapRun(row);
   }
 
-  // The default report target (§7): latest completed run with non-empty tracked_packages.
+  // The default report target (§7 / §3.1e): latest COMPLETE (or legacy-unknown) run with non-empty
+  // tracked_packages. T5 adds the outcome filter so a partial-*/fatal run — which is status='completed'
+  // (the invocation finished) but did NOT cover the estate — is never silently served as "latest".
   latestReportableRun(): RunRecord | null {
     const row = this.db
       .query(
         `SELECT * FROM runs WHERE status='completed' AND tracked_packages <> '[]'
+           AND outcome IN ('complete','legacy-unknown')
          ORDER BY started_at DESC, run_id DESC LIMIT 1`,
       )
       .get() as RunRow | null;
@@ -2252,17 +2586,60 @@ export class AuditDb {
       );
   }
 
-  // Per-run immutable snapshot row (§3 report-head invariant). Upserted for a discovered branch in
-  // each disposition: scanned, skip-as-current (same head, scanned), cutoff-skipped, past-cap, and
-  // policy-excluded (commit_sha='' for every non-scanned disposition). NOTE: a scanned row is written
-  // only when its scan SUCCEEDS this invocation — a throttled/errored scan writes no row (so the set of
-  // rows written is NOT every discovered branch; reconcileRunUnitHead therefore keys on the live-name
-  // set, not on rows-written). is_default_branch maps true/false/null → 1/0/NULL (tri-state; NULL =
-  // unknown, §5.B). The ON CONFLICT ALWAYS overwrites all six mutable columns from `excluded` (never
-  // COALESCE) so a re-upsert in a later same-run attempt clears stale policy/date/status in every
-  // direction (§6 transition matrix).
+  // Per-run immutable snapshot row (§3 report-head invariant). Upserted for each disposition the run
+  // reaches — though the precedence KEEPS a prior reportable scan over a transient error/deferred-*, so
+  // that transient writes no row (§3.1a). The dispositions: scanned, reused (skip-as-current, same head),
+  // skipped-cutoff/past-cap/policy-excluded (commit_sha='' — discovery-time), and deferred-*/error (the
+  // requeue/failure paths carry the observed head oid). is_default_branch maps true/false/null → 1/0/NULL (tri-state; NULL = unknown,
+  // §5.B).
+  //
+  // §3.1a commit-aware precedence (codex r4): the PK is (run_id,org,repo,branch), so a crash-resume
+  // revisits the SAME row. The SCAN-OUTCOME TRIPLE {commit_sha, status, scanned_commit_date} is
+  // replaced together, gated: if the OBSERVED head DIFFERS from the stored one, the newer observation
+  // REPLACES it — EXCEPT the findings-preservation guard, which keeps a REPORTABLE scan (scanned/reused)
+  // over a later TRANSIENT error/deferred-* even at a different commit (a branch that advanced A→B then
+  // merely FAILED keeps scanned@A; only a real re-scan, or a genuine discovery-time re-disposition, at B
+  // supersedes it). WITHIN the same commit, rank precedence applies — scanned > reused > skipped-cutoff >
+  // (policy-excluded > past-cap >) error > deferred-* — so a later same-commit pass never downgrades a real
+  // scan; a same-commit deferred↔deferred tie takes the latest observation. scanned_commit_date rides WITH
+  // commit_sha (it describes that commit), so it is gated by the SAME condition. The DISCOVERY-KNOWN attributes
+  // {is_default_branch, policy_status, policy_matched_pattern} are re-derived at each discovery (usually
+  // stable per branch name under a fixed config_hash, though a renamed default can flip is_default_branch on
+  // a resume), so they always overwrite independently — clearing stale values in
+  // every direction (§6) without ever contradicting a kept status (a branch's policy verdict cannot
+  // change within a run, so the agreement CHECKs hold).
   upsertRunUnitHead(h: RunUnitHeadInput): void {
     assertRunUnitHeadInvariants(h); // fail-closed at the single write chokepoint (§3 row mapping)
+    // Fixed enum literals → injection-safe. deferred-* (and any unranked disposition) fall to the ELSE
+    // rank 1. The scan-outcome triple is REPLACED when the incoming observation supersedes the stored one:
+    //   • the observed commit DIFFERS — a newer head normally wins (an advanced head re-scanned, or
+    //     re-dispositioned to a discovery-time state, records the new commit) — EXCEPT the findings-
+    //     preservation guard below;
+    //   • the STORED row is a DISCOVERY-time disposition (commit_sha='') — it names no real scanned
+    //     head, so there is nothing to protect: the latest discovery observation always wins (a
+    //     re-discovered cutoff/policy/cap refreshes its date/verdict in every direction, §6);
+    //   • the incoming rank is >= the stored rank — a same-real-commit re-scan/upgrade REFRESHES (>=,
+    //     not >, so a same-head re-scan updates its date and a deferred↔deferred tie takes the latest).
+    // FINDINGS-PRESERVATION GUARD (§3.1a): a REPORTABLE scan (scanned/reused) is NEVER demoted by a later
+    // TRANSIENT non-reportable disposition (error / deferred-*), EVEN AT A DIFFERENT COMMIT — a flaky
+    // failure or deferral on a resume's MOVED head must not wipe a real prior scan and its findings. A
+    // scanned@A whose moved-head re-scan errors/defers KEEPS scanned@A; the coverage gap is recorded OUT OF
+    // BAND (errors[] for an error — fail-soft, does not floor; markCoverageIncomplete for a deferral —
+    // floors the run to partial-deferred), never by demoting the head. Discovery-time re-dispositions
+    // (skipped-cutoff/policy-excluded/past-cap) are NOT transient failures: a genuinely-moved head now
+    // cutoff/policy/cap-ineligible still supersedes via the commit-differs clause. The other keep case is a
+    // STRICTLY LOWER rank at the SAME REAL commit. Net: a good scan survives every transient, moved or not.
+    const rank = (col: string): string =>
+      `CASE ${col} WHEN 'scanned' THEN 7 WHEN 'reused' THEN 6 WHEN 'skipped-cutoff' THEN 5` +
+      ` WHEN 'policy-excluded' THEN 4 WHEN 'past-cap' THEN 3 WHEN 'error' THEN 2 ELSE 1 END`;
+    const reportable = (col: string): string => `${col} IN ('scanned', 'reused')`;
+    const transientFail = (col: string): string =>
+      `${col} IN ('error', 'deferred-throttle', 'deferred-network', 'deferred-service')`;
+    const replace =
+      `NOT (${reportable("run_unit_head.status")} AND ${transientFail("excluded.status")}) AND (` +
+      `excluded.commit_sha <> run_unit_head.commit_sha` +
+      ` OR run_unit_head.commit_sha = ''` +
+      ` OR ${rank("excluded.status")} >= ${rank("run_unit_head.status")})`;
     this.db
       .query(
         `INSERT INTO run_unit_head
@@ -2270,11 +2647,13 @@ export class AuditDb {
             policy_status, policy_matched_pattern, scanned_commit_date)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(run_id, organization, repository, branch)
-         DO UPDATE SET commit_sha = excluded.commit_sha, status = excluded.status,
+         DO UPDATE SET
+           commit_sha          = CASE WHEN ${replace} THEN excluded.commit_sha          ELSE run_unit_head.commit_sha          END,
+           status              = CASE WHEN ${replace} THEN excluded.status              ELSE run_unit_head.status              END,
+           scanned_commit_date = CASE WHEN ${replace} THEN excluded.scanned_commit_date ELSE run_unit_head.scanned_commit_date END,
            is_default_branch = excluded.is_default_branch,
            policy_status = excluded.policy_status,
-           policy_matched_pattern = excluded.policy_matched_pattern,
-           scanned_commit_date = excluded.scanned_commit_date`,
+           policy_matched_pattern = excluded.policy_matched_pattern`,
       )
       .run(
         h.runId, h.organization, h.repository, h.branch, h.commitSha, h.status,
@@ -2293,17 +2672,19 @@ export class AuditDb {
   // disposition) — NOT merely rows rewritten this invocation, so a live branch whose scan failed this
   // attempt keeps its prior row.
   //
-  // The prune is NAME-keyed BY DESIGN, so a same-name STALE HEAD is retained, not pruned: if a branch's
-  // head advanced since a prior invocation and this attempt's re-scan errored or throttled, no
-  // replacement row is written and the prior row — WHATEVER its disposition, pinned to the OLDER
-  // evaluation — survives. The report counts the branch under that PRIOR disposition: a prior scanned
-  // row reads "scanned at the old head" (commit_sha + scanned_commit_date name the commit actually
-  // scanned, and its findings came from that real scan); a prior NON-scanned row (say skipped-cutoff,
-  // recorded when the old head sat below the cutoff) keeps the branch in its old bucket even though the
-  // advanced head became eligible — its commit_sha='' and discovered-head date describe that older
-  // evaluation. This is STALE, not WRONG: every retained row is truthful about what its own invocation
-  // decided, and the work_queue unit is left error/pending so the next run re-scans and refreshes it.
-  // Accepted, not overlooked — see processRepo's reconciliation note for the rejected alternative.
+  // The prune is NAME-keyed BY DESIGN, so a same-name STALE HEAD is retained, not pruned. And when a
+  // branch's head advanced since a prior invocation and this attempt's re-scan errored or throttled, the
+  // error/deferred head upserted at the advanced commit does NOT overwrite a prior REPORTABLE scan
+  // (scanned/reused): the commit-aware upsert's findings-preservation guard (§3.1a) keeps it, pinned to the
+  // OLDER evaluation, so the prior scan and its findings survive. The report counts the branch as "scanned
+  // at the old head" (commit_sha + scanned_commit_date name the commit actually scanned, and its findings
+  // came from that real scan). A prior NON-reportable row (skipped-cutoff/policy-excluded/past-cap) is NOT
+  // protected — a genuinely-moved head now ineligible supersedes it via the commit-differs clause, a real
+  // re-disposition rather than a transient failure. This is STALE, not WRONG: every retained scan is
+  // truthful about what its own invocation decided, the coverage gap is recorded out of band (a deferral
+  // floors the run to partial-deferred; an error stays in errors[], fail-soft), and the work_queue unit is
+  // left error/pending so the next run re-scans and refreshes it. Accepted, not overlooked — see
+  // processRepo's reconciliation note for the rejected alternative.
   //
   // SCOPE, stated precisely because the surrounding docs used to over-claim it: the caller invokes this
   // ONCE PER RE-DISCOVERED REPO, so what it guarantees is "a re-discovered repo's rows match its live
@@ -2486,6 +2867,8 @@ interface RunRow {
   run_id: string; started_at: string; completed_at: string | null; config_hash: string;
   effective_owners: string; owners_source: OwnersSource; tracked_packages: string;
   cutoff_date: string; github_host: string; status: RunStatus;
+  outcome: RunOutcome | null; coverage_complete: number | null;
+  discovery_failures: number; discovery_deferrals: number;
 }
 interface WorkQueueRow {
   id: number; config_hash: string; created_run_id: string; last_run_id: string;
@@ -2522,6 +2905,10 @@ function mapRun(row: RunRow): RunRecord {
     cutoffDate: row.cutoff_date,
     githubHost: row.github_host,
     status: row.status,
+    outcome: row.outcome,
+    coverageComplete: row.coverage_complete === null ? null : row.coverage_complete === 1,
+    discoveryFailures: row.discovery_failures,
+    discoveryDeferrals: row.discovery_deferrals,
   };
 }
 
