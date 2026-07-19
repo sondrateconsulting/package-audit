@@ -909,8 +909,9 @@ describe("report --html wiring (emitDossiers + runReport integration)", () => {
     const dataExistedBefore = existsSync("./data");
     const dbRoot = `./data/.reporttest-bp-${process.pid}-${Math.random().toString(36).slice(2)}`;
     const root = mkdtempSync(join(tmpdir(), "report-bp-"));
-    // Accept until the first `dossier` line, then backpressure (bound 1) so the following
-    // `dossier-summary` contends for the buffer — proving flushLogs drains what runReport queued.
+    // Seed TWO packages → two `dossier` lines + a `dossier-summary`. Accept until the first dossier,
+    // then backpressure so the SECOND dossier AND the summary both buffer (bound 3, no eviction): the
+    // summary genuinely contends with an already-buffered line, and flushLogs must drain all of it.
     function pauseAtDossier() {
       const received: string[] = [];
       let paused = false;
@@ -931,20 +932,33 @@ describe("report --html wiring (emitDossiers + runReport integration)", () => {
     const s = pauseAtDossier();
     const errSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
     const droppedBefore = loggerStats().dropped;
-    setLogSink(s.sink, 1); // bound 1: only a terminal event may exceed it — a shed dossier-summary would fail below
+    setLogSink(s.sink, 3); // holds the 2nd dossier + the summary with no eviction — both must drain, none shed
     try {
       const sqlitePath = join(dbRoot, "audit.db");
       const db = AuditDb.open({ sqlitePath });
-      seed(db);
+      // two tracked packages, each with a usage finding → runReport --html emits two `dossier` lines
+      const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo", "preact"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+      const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
+      db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+      for (const pkg of ["expo", "preact"])
+        db.upsertUsageFinding({ runId, ...unit, packageName: pkg, dependencyKey: pkg, usageType: "named-import", exportName: "X", context: "", filePath: `src/${pkg}.ts`, lineNumber: 1, permalink: `https://github.com/org-a/svc/blob/abc123def/src/${pkg}.ts#L1`, snippet: `import { X } from '${pkg}';`, foundAt: nowIso() });
+      db.completeRun(runId);
       db.close();
-      const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
-      runReport(cfg, null, { html: true }); // emits `dossier` (backpressures) then `dossier-summary` (buffered behind it)
+      const cfg: Config = {
+        ...config(root),
+        packages: [
+          { name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null },
+          { name: "preact", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null },
+        ],
+        paths: { sqlitePath, outputDir: join(root, "output") },
+      };
+      runReport(cfg, null, { html: true }); // dossier1 backpressures; dossier2 + dossier-summary buffer behind it
       s.resume(); // drain the buffered tail
       await flushLogs();
       const events = s.received.map((l) => JSON.parse(l) as Record<string, unknown>);
-      expect(events.some((e) => e["event"] === "dossier")).toBe(true);
-      expect(events.some((e) => e["event"] === "dossier-summary")).toBe(true); // buffered non-droppable line survived + shipped
-      expect(loggerStats().dropped - droppedBefore).toBe(0); // nothing was shed under the bound — the summary drained, not dropped
+      expect(events.filter((e) => e["event"] === "dossier")).toHaveLength(2); // BOTH dossiers shipped
+      expect(events.some((e) => e["event"] === "dossier-summary")).toBe(true); // the summary drained alongside the buffered 2nd dossier
+      expect(loggerStats().dropped - droppedBefore).toBe(0); // nothing shed under the bound — buffered, not dropped
     } finally {
       resetLogSink();
       errSpy.mockRestore();

@@ -2021,14 +2021,19 @@ describe("network event emission (T7)", () => {
     expect(retries).toHaveLength(5); // MAX_ATTEMPTS-1 — graphql's final attempt throws without a retry line
   });
 
-  test("the reporter counts a truncated re-drive in retryTotal (no longer silently uncounted)", async () => {
-    const reporter = createNetworkReporter({ emit: () => {} }); // swallow output; assert the counter only
+  test("the reporter counts a truncated re-drive in retryTotal AND serializes reason:transport-truncated", async () => {
+    const emitted: Array<Record<string, unknown>> = [];
+    const reporter = createNetworkReporter({ emit: (e) => emitted.push(e) }); // capture the reporter's SERIALIZED output
     const { client } = makeClient(
       [err(http(200, {}, "partial"), "read: connection reset"), ok(wire(200, {}, `{"ok":1}`))],
       { events: (e) => reporter.emit(e) },
     );
     await client.restGet("rate_limit");
     expect(reporter.counters().retryTotal).toBe(1);
+    // the reporter's OUTPUT line carries the new reason end-to-end (not just the internal counter)
+    const retries = emitted.filter((e) => e["event"] === "retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ event: "retry", reason: "transport-truncated", endpoint: "rate_limit" });
   });
 
   test("graphql emits throttle{bucket:graphql, waitKind:primary} on a primary rate-limit", async () => {
