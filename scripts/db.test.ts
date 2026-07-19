@@ -2906,13 +2906,36 @@ describe("upsertRunUnitHead — commit-aware precedence (§3.1a)", () => {
     db.close();
   });
 
-  test("differing observed commit REPLACES disposition+commit regardless of rank (advanced then failed)", () => {
+  test("§3.1a findings-preservation: a TRANSIENT error/deferred at a DIFFERENT commit does NOT demote a reportable scan", () => {
     const db = seeded();
     up(db, { commitSha: "cOLD", status: "scanned", isDefaultBranch: null });
-    up(db, { commitSha: "cNEW", status: "error", isDefaultBranch: null });
+    up(db, { commitSha: "cNEW", status: "error", isDefaultBranch: null }); // moved head, re-scan FAILED
+    let h = head(db);
+    expect(h.commit_sha).toBe("cOLD"); // the good scan is PRESERVED, never demoted to error@cNEW
+    expect(h.status).toBe("scanned");
+    up(db, { commitSha: "cNEWER", status: "deferred-throttle", isDefaultBranch: null }); // moved again, DEFERRED
+    h = head(db);
+    expect(h.commit_sha).toBe("cOLD"); // still preserved over a moved-head deferral
+    expect(h.status).toBe("scanned");
+    db.close();
+  });
+
+  test("a real scan REPLACES a prior transient error at a different commit (the guard protects scans, not errors)", () => {
+    const db = seeded();
+    up(db, { commitSha: "cOLD", status: "error", isDefaultBranch: null });
+    up(db, { commitSha: "cNEW", status: "scanned", isDefaultBranch: null }); // moved head re-scanned OK
     const h = head(db);
     expect(h.commit_sha).toBe("cNEW");
-    expect(h.status).toBe("error"); // newer observed head wins even though error < scanned
+    expect(h.status).toBe("scanned"); // a real scan supersedes a prior transient failure
+    db.close();
+  });
+
+  test("a NON-transient re-disposition (skipped-cutoff) at a moved head DOES supersede a prior scan (guard is transient-only)", () => {
+    const db = seeded();
+    up(db, { commitSha: "cOLD", status: "scanned", isDefaultBranch: null });
+    up(db, { commitSha: "", status: "skipped-cutoff", isDefaultBranch: null }); // head genuinely moved below cutoff
+    const h = head(db);
+    expect(h.status).toBe("skipped-cutoff"); // a genuine re-disposition wins; only transient failures are guarded
     db.close();
   });
 
@@ -2949,6 +2972,18 @@ describe("upsertRunUnitHead — commit-aware precedence (§3.1a)", () => {
 describe("finalizeRun — floor derivation + precedence + guard (§3.1b)", () => {
   const scan = (db: AuditDb, id: string, status: string) =>
     db.upsertRunUnitHead({ runId: id, organization: "o", repository: "r", branch: "b", commitSha: "c", status: status as never, isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+
+  test("§3.1a: a preserved-scan deferral floors via coverage_complete=0 even with NO deferred-* head row", () => {
+    // When a moved-head re-scan defers over a prior reportable scan, the precedence PRESERVES the scan
+    // (no deferred-* row is written), so the throttle arm records the gap out of band via
+    // markCoverageIncomplete. finalizeRun must still floor to partial-deferred off coverage_complete=0.
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    scan(db, id, "scanned"); // the reportable scan the deferral was preserved over
+    db.markCoverageIncomplete(id); // the throttle arm's out-of-band coverage-gap signal
+    expect(db.finalizeRun(id, "complete")).toBe("partial-deferred"); // floored despite NO deferred-* row
+    db.close();
+  });
 
   test("clean run: 'complete' with full coverage and no deferred units → complete + completed_at", () => {
     const db = mem();

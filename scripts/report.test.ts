@@ -547,12 +547,13 @@ describe("buildReport (§7)", () => {
     // The resumed-run shape the single-invocation test above cannot reach. A resumed run reuses the
     // run_id, so errors[] and run_unit_head both span invocations:
     //   invocation 1 — main scanned@A, writing a row.
-    //   invocation 2 — main advanced to B; the re-scan errors. No new row, and reconciliation's name-keyed prune
-    //                  RETAINS invocation 1's row (main is still a live branch).
-    // main therefore holds BOTH a row and a scan error. It is counted ONCE — in branchesScanned, via the
-    // retained row — and NOT in branchesErrored. Deliberate: counting it in both would count one
-    // discovered branch twice and break the partition. This is exactly why branchesErrored must be read
-    // as "errored branches holding no row" and NOT as "every branch whose scan errored" (see report.ts).
+    //   invocation 2 — main advanced to B; the re-scan errors. The error head at B does NOT overwrite the
+    //                  prior scanned@A — the commit-aware upsert's findings-preservation guard (§3.1a) keeps
+    //                  it — and reconciliation's name-keyed prune RETAINS it (main is still a live branch).
+    // main therefore holds a preserved scanned@A row AND a scan error. It is counted ONCE — in
+    // branchesScanned, via the preserved row — and NOT in branchesErrored (whose (b) rowless set excludes
+    // any branch holding a row). Counting it in both would count one discovered branch twice and break the
+    // partition.
     const db = mem();
     const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
     db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "main", commitSha: "sha-A", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-05-01T00:00:00Z" });

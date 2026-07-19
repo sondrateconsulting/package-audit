@@ -2601,23 +2601,35 @@ export class AuditDb {
   upsertRunUnitHead(h: RunUnitHeadInput): void {
     assertRunUnitHeadInvariants(h); // fail-closed at the single write chokepoint (§3 row mapping)
     // Fixed enum literals → injection-safe. deferred-* (and any unranked disposition) fall to the ELSE
-    // rank 1. The scan-outcome triple is REPLACED when ANY of:
-    //   • the observed commit DIFFERS — a newer head wins unconditionally (advanced-then-failed: a
-    //     scanned@A that becomes error@B must record error@B, never keep scanned@A);
+    // rank 1. The scan-outcome triple is REPLACED when the incoming observation supersedes the stored one:
+    //   • the observed commit DIFFERS — a newer head normally wins (an advanced head re-scanned, or
+    //     re-dispositioned to a discovery-time state, records the new commit) — EXCEPT the findings-
+    //     preservation guard below;
     //   • the STORED row is a DISCOVERY-time disposition (commit_sha='') — it names no real scanned
     //     head, so there is nothing to protect: the latest discovery observation always wins (a
     //     re-discovered cutoff/policy/cap refreshes its date/verdict in every direction, §6);
     //   • the incoming rank is >= the stored rank — a same-real-commit re-scan/upgrade REFRESHES (>=,
     //     not >, so a same-head re-scan updates its date and a deferred↔deferred tie takes the latest).
-    // The ONLY case that keeps the stored triple: a STRICTLY LOWER rank at the SAME REAL commit — a
-    // later transient deferred/error at a head already scanned/reused this run never downgrades it (§3.1a).
+    // FINDINGS-PRESERVATION GUARD (§3.1a): a REPORTABLE scan (scanned/reused) is NEVER demoted by a later
+    // TRANSIENT non-reportable disposition (error / deferred-*), EVEN AT A DIFFERENT COMMIT — a flaky
+    // failure or deferral on a resume's MOVED head must not wipe a real prior scan and its findings. A
+    // scanned@A whose moved-head re-scan errors/defers KEEPS scanned@A; the coverage gap is recorded OUT OF
+    // BAND (errors[] for an error — fail-soft, does not floor; markCoverageIncomplete for a deferral —
+    // floors the run to partial-deferred), never by demoting the head. Discovery-time re-dispositions
+    // (skipped-cutoff/policy-excluded/past-cap) are NOT transient failures: a genuinely-moved head now
+    // cutoff/policy/cap-ineligible still supersedes via the commit-differs clause. The other keep case is a
+    // STRICTLY LOWER rank at the SAME REAL commit. Net: a good scan survives every transient, moved or not.
     const rank = (col: string): string =>
       `CASE ${col} WHEN 'scanned' THEN 7 WHEN 'reused' THEN 6 WHEN 'skipped-cutoff' THEN 5` +
       ` WHEN 'policy-excluded' THEN 4 WHEN 'past-cap' THEN 3 WHEN 'error' THEN 2 ELSE 1 END`;
+    const reportable = (col: string): string => `${col} IN ('scanned', 'reused')`;
+    const transientFail = (col: string): string =>
+      `${col} IN ('error', 'deferred-throttle', 'deferred-network', 'deferred-service')`;
     const replace =
+      `NOT (${reportable("run_unit_head.status")} AND ${transientFail("excluded.status")}) AND (` +
       `excluded.commit_sha <> run_unit_head.commit_sha` +
       ` OR run_unit_head.commit_sha = ''` +
-      ` OR ${rank("excluded.status")} >= ${rank("run_unit_head.status")}`;
+      ` OR ${rank("excluded.status")} >= ${rank("run_unit_head.status")})`;
     this.db
       .query(
         `INSERT INTO run_unit_head
@@ -2650,17 +2662,19 @@ export class AuditDb {
   // disposition) — NOT merely rows rewritten this invocation, so a live branch whose scan failed this
   // attempt keeps its prior row.
   //
-  // The prune is NAME-keyed BY DESIGN, so a same-name STALE HEAD is retained, not pruned: if a branch's
-  // head advanced since a prior invocation and this attempt's re-scan errored or throttled, no
-  // replacement row is written and the prior row — WHATEVER its disposition, pinned to the OLDER
-  // evaluation — survives. The report counts the branch under that PRIOR disposition: a prior scanned
-  // row reads "scanned at the old head" (commit_sha + scanned_commit_date name the commit actually
-  // scanned, and its findings came from that real scan); a prior NON-scanned row (say skipped-cutoff,
-  // recorded when the old head sat below the cutoff) keeps the branch in its old bucket even though the
-  // advanced head became eligible — its commit_sha='' and discovered-head date describe that older
-  // evaluation. This is STALE, not WRONG: every retained row is truthful about what its own invocation
-  // decided, and the work_queue unit is left error/pending so the next run re-scans and refreshes it.
-  // Accepted, not overlooked — see processRepo's reconciliation note for the rejected alternative.
+  // The prune is NAME-keyed BY DESIGN, so a same-name STALE HEAD is retained, not pruned. And when a
+  // branch's head advanced since a prior invocation and this attempt's re-scan errored or throttled, the
+  // error/deferred head upserted at the advanced commit does NOT overwrite a prior REPORTABLE scan
+  // (scanned/reused): the commit-aware upsert's findings-preservation guard (§3.1a) keeps it, pinned to the
+  // OLDER evaluation, so the prior scan and its findings survive. The report counts the branch as "scanned
+  // at the old head" (commit_sha + scanned_commit_date name the commit actually scanned, and its findings
+  // came from that real scan). A prior NON-reportable row (skipped-cutoff/policy-excluded/past-cap) is NOT
+  // protected — a genuinely-moved head now ineligible supersedes it via the commit-differs clause, a real
+  // re-disposition rather than a transient failure. This is STALE, not WRONG: every retained scan is
+  // truthful about what its own invocation decided, the coverage gap is recorded out of band (a deferral
+  // floors the run to partial-deferred; an error stays in errors[], fail-soft), and the work_queue unit is
+  // left error/pending so the next run re-scans and refreshes it. Accepted, not overlooked — see
+  // processRepo's reconciliation note for the rejected alternative.
   //
   // SCOPE, stated precisely because the surrounding docs used to over-claim it: the caller invokes this
   // ONCE PER RE-DISCOVERED REPO, so what it guarantees is "a re-discovered repo's rows match its live

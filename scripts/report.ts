@@ -61,47 +61,45 @@ export interface ReportSummary {
   repositoriesScanned: number;
   branchesScanned: number;
   branchesSkippedByCutoff: number;
-  // Branch allow/deny (§5): the disjoint disposition partition. The four disposition counts partition the
-  // run_unit_head rows this run RECORDED, exactly once each. (That clause is unconditional and exact.)
-  // Together with branchesErrored they account for the branches that reached a TERMINAL outcome:
+  // Branch allow/deny (§5): the SUMMARY disposition counts. branchesScanned (scanned+reused) /
+  // branchesSkippedByCutoff / branchesExcludedByPolicy / branchesPastCap key on `status`; together with
+  // branchesErrored they account for the branches that reached a TERMINAL outcome. The recorded
+  // run_unit_head rows ALSO include non-terminal deferred-throttle/network/service dispositions (un-covered,
+  // surfaced via runOutcome), so these SUMMARY counts partition the TERMINAL branches, not every recorded
+  // row:
   //   discovered (terminal) = branchesScanned + branchesSkippedByCutoff + branchesExcludedByPolicy
   //                           + branchesPastCap + branchesErrored   — EXACT on a SINGLE-INVOCATION run.
-  //   discovered (terminal) <= that sum                             — on a RESUMED run; see branchesErrored
-  //                                                                   for exactly which branches inflate it.
+  //   discovered (terminal) <= that sum                             — on a RESUMED run; see branchesErrored.
   // branchesScanned INCLUDES scanned default-override rows (they WERE scanned). branchesSkippedByCutoff is
   // GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket.
   branchesExcludedByPolicy: number;
   branchesPastCap: number;
-  // Counts EXACTLY this: distinct (org, repo, branch) with a scope='scan' errors[] entry for this run
-  // that hold NO run_unit_head disposition row. Read it as that, and not as "every branch whose scan
-  // errored" — on a SINGLE-INVOCATION run the two coincide (a to-scan branch that reaches a TERMINAL
-  // outcome gets a row or an errors[] entry; the one composite case is a step failing AFTER the
-  // scanned row committed — the success-log write or the work-queue 'done' update — which can leave
-  // an errors[] entry beside the row: the persisted row counts that branch under branchesScanned,
-  // and the row-key exclusion below keeps it out of THIS count, so it still counts exactly once),
-  // but on a RESUMED run they diverge in BOTH directions.
+  // Distinct branches whose scan FAILED this run — the UNION of two DISJOINT sets: (a) error-status
+  // run_unit_head HEADS (a permanent scan failure, a terminal disposition recorded at the observed commit
+  // when no prior reportable scan protected the head), and (b) ROWLESS scan errors — a scope='scan' errors[]
+  // entry on a branch holding NO run_unit_head row (a failure before any disposition). An error head IS a
+  // row, so it is excluded from (b) — never a double-count. A branch with a SCANNED row PLUS a scope='scan'
+  // error — a post-persistence log/queue write throwing after the scanned row committed, OR a moved-head
+  // re-scan failure whose findings-preservation guard (§3.1a) KEPT the prior scan — counts under
+  // branchesScanned, not here. On a SINGLE-INVOCATION run this equals "every branch whose scan errored"; on
+  // a RESUMED run (b) diverges in BOTH directions.
   //
   // A resumed run REUSES the run_id (db.startRun), so errors[] and run_unit_head both span invocations.
-  // errors[] is append-only and is NEVER reconciled; run_unit_head rows ARE pruned (reconcileRunUnitHead).
+  // errors[] is append-only — its ONE reconciliation is the excluded-owner prune (db.pruneExcludedOwnerRows);
+  // run_unit_head rows are pruned (reconcileRunUnitHead) and superseded by the commit-aware upsert.
   //
-  //   MORE than the errored set: a branch that errored in an EARLIER invocation and reached no
-  //   row-bearing disposition in the final one is still counted — whether it is now gone (deleted),
-  //   deferred (throttle-requeued on retry), or unvisited (its repo's discovery failed). Stated as this
-  //   membership rule on purpose: "overcounts by exactly the deleted branches" would be false.
+  //   MORE than the current rowless errors: a branch that errored in an EARLIER invocation and reached no
+  //   row-bearing disposition in the final one is still counted via its append-only error — whether now
+  //   gone (deleted) or unvisited (its repo's discovery failed).
   //
-  //   LESS than the errored set: a branch holding a row from an EARLIER invocation that errors in a
-  //   LATER one is NOT counted here — the row-key exclusion below drops it. That is deliberate and
-  //   correct: its retained row already places it in that row's disposition bucket, and counting it here
-  //   too would count one discovered branch TWICE and break the partition. This is the same-name
-  //   stale-head case; see the reconciliation note in orchestrate.ts::processRepo.
+  //   LESS: a branch holding a row from an EARLIER invocation is counted by THAT row's disposition, not a
+  //   second time via errors[] — an error head is itself in (a); a scanned/reused row (incl. one PRESERVED
+  //   over a later transient failure) places it in branchesScanned and the row-key exclusion drops it from
+  //   (b). This keeps every discovered branch counted at most once, so the identity above is an UPPER BOUND.
   //
-  // So the exclusion is what keeps every discovered branch counted at most once, which is why the
-  // identity above stays an UPPER BOUND (never a double-count) rather than an equality on a resume.
-  //
-  // Throttle carve-out, precisely: a branch throttle-requeued with NO prior error has neither a row nor
-  // an error — deferred, not terminal, finished next run — so it is in no count. That holds absolutely
-  // only WITHIN a single invocation; after an earlier-invocation error the branch DOES carry an error
-  // and so IS counted here, despite being deferred rather than terminal.
+  // Deferral: a throttle/network/service-deferred branch is un-covered, not terminal — it floors the run to
+  // partial-deferred (via a deferred-* head, or coverage_complete=0 when the deferral was preserved over a
+  // prior scan), but appears in NO summary count here and (via the row-key exclusion) NOT in branchesErrored.
   branchesErrored: number;
   totalDependencyFindings: number;
   totalUsageFindings: number;
@@ -306,8 +304,9 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
     organizationsScanned: orgs.size,
     repositoriesScanned: repos.size,
     branchesScanned: scannedHeads.length,
-    // The four dispositions partition allHeads by `status` alone (§5) — each row lands in exactly one
-    // bucket, and a policy exclusion is no longer a cutoff skip wearing a disambiguator.
+    // These four summary buckets key on `status` alone (§5) — and a policy exclusion is no longer a cutoff
+    // skip wearing a disambiguator. They do NOT partition every recorded row: reused folds into
+    // branchesScanned (reportable), and error/deferred-* rows are counted via branchesErrored / runOutcome.
     branchesSkippedByCutoff: allHeads.filter((h) => h.status === "skipped-cutoff").length,
     branchesExcludedByPolicy: allHeads.filter(isPolicyExcluded).length,
     branchesPastCap: allHeads.filter((h) => h.status === "past-cap").length,

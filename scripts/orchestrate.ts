@@ -762,25 +762,31 @@ export async function processRepo(
           // and nothing re-reads pending units within the run. Handled here (not a fatal), so it never
           // trips branchAbort — one throttled branch must not cancel its siblings.
           db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
-          // T5 §3.1a: record the per-run disposition so finalizeRun's floor sees this run left the unit
-          // un-scanned (deferred, not covered) → the run outcome becomes partial-deferred, not complete.
-          // The OBSERVED head (observed.commitSha + its date — the clone's real HEAD under a truncated-tree
-          // fallback, else the discovery head) is stored so the commit-aware upsert precedence keeps a
-          // same-head good scan if one exists from a prior/sibling attempt.
+          // T5 §3.1a: this run left the unit un-scanned (deferred, not covered) → the run must floor to
+          // partial-deferred. markCoverageIncomplete records that gap DIRECTLY (coverage_complete=0) rather
+          // than relying on a deferred-* head row — because the commit-aware upsert PRESERVES a prior
+          // reportable scan over this transient deferral (findings-preservation, §3.1a), so a moved-head
+          // deferral over an existing scan writes NO deferred row yet must STILL floor. The deferred head is
+          // still upserted at the OBSERVED head (the clone's real HEAD under a truncated-tree fallback, else
+          // the discovery head) so the no-prior-scan case records its disposition; the precedence keeps any
+          // same-/moved-head good scan intact.
           db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: observed.commitSha, status: "deferred-throttle", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: observed.committedDate });
-          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
+          db.markCoverageIncomplete(runId);
+          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: observed.commitSha, action: "requeue-throttle", message: (e as Error).message });
           tally.deferred++;
           progress.unitDone();
         } else {
           db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
           db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
-          // T5 §3.1a: a permanent unit error is a terminal, "covered" result (its absence is a real
-          // outcome) — record it as the run's head disposition at the OBSERVED commit (observed.commitSha:
+          // T5 §3.1a: a permanent unit error is a fail-soft result — recorded in errors[] and, for a branch
+          // with NO prior reportable scan, as an 'error' head at the OBSERVED commit (observed.commitSha:
           // the clone's real HEAD under a truncated-tree fallback, else the discovery head — never the
-          // possibly-stale h.oid); it does NOT by itself force a partial outcome (finalizeRun's floor
-          // ignores 'error').
+          // possibly-stale h.oid). The commit-aware upsert PRESERVES a prior scanned/reused over this
+          // transient error (findings-preservation, §3.1a), so a moved-head re-scan failure keeps the good
+          // scan and its findings. An error does NOT floor the run (finalizeRun's floor ignores 'error');
+          // the failure stays visible in errors[].
           db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: observed.commitSha, status: "error", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: observed.committedDate });
-          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
+          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: observed.commitSha, action: "error", message: (e as Error).message });
           tally.errored++;
           progress.unitDone();
         }
@@ -835,20 +841,19 @@ export async function processRepo(
   // not return — so a stale keep-set errs toward retaining, except in that third case.
   //
   // SIBLING ACCEPTED-STALENESS (same-name stale head). On a RESUME: a branch whose head ADVANCED since a
-  // prior invocation, whose re-scan then errors (the insertError arm above) or throttles (the requeue
-  // arm), writes no row this attempt — and the name-keyed prune RETAINS the prior row, WHATEVER its
-  // disposition, pinned to the OLDER evaluation. The report counts the branch under that PRIOR
-  // disposition: scanned at the old head — or still skipped-cutoff/past-cap/policy-excluded from the
-  // older evaluation, even though the head became eligible this attempt (cutoff-skip via an advanced
-  // head; past-cap via a cap-order shift; policy-excluded only when the branch also BECAME the
-  // default, the one override policy permits). Accepted, because:
+  // prior invocation, whose re-scan then errors (the insertError arm above) or throttles (the requeue arm),
+  // upserts an error/deferred head at the OBSERVED (advanced) commit — but the commit-aware upsert's
+  // FINDINGS-PRESERVATION guard (§3.1a, db.upsertRunUnitHead) KEEPS a prior REPORTABLE scan (scanned/reused)
+  // rather than demoting it to that transient disposition. So the prior scan and its findings survive,
+  // pinned to the OLDER evaluation, and the report counts the branch as scanned at the old head. (A prior
+  // NON-reportable row — skipped-cutoff/policy-excluded/past-cap — is NOT protected: the moved-head
+  // observation supersedes it via the commit-differs clause, because a genuinely-moved head now
+  // cutoff/policy/cap-ineligible is a real re-disposition, not a transient failure.) Accepted, because:
   //   - it is stale, not wrong: a scanned row and its findings describe a real scan of a real commit —
   //     commit_sha + scanned_commit_date say WHICH (PROMPT.md's report-head invariant defines commit_sha
-  //     as "the head it reported", never "the live head") — and a non-scanned row's commit_sha='' +
-  //     discovered-head date describe the older evaluation it records.
-  //   - it is NOT a regression: before reconciliation existed there was no prune at all, so the row was retained
-  //     identically. The prune is a mitigation this feature ADDED (it removes deleted-branch phantoms
-  //     that used to persist forever); it is not the cause.
+  //     as "the head it reported", never "the live head").
+  //   - the COVERAGE gap is still recorded, never by demoting the head: a deferral marks coverage_complete=0
+  //     (floors the run to partial-deferred); an error stays in errors[] (fail-soft, does not floor).
   //   - it self-heals: the unit is left error/pending, never done, so the next run re-scans and re-upserts
   //     at the live head.
   // A head-SHA-aware prune is REJECTED: it would delete the clone-fallback path's legitimate rows (whose
@@ -905,8 +910,11 @@ async function processUnit(
       cloneDir = cloned.dir;
       commitSha = cloned.headSha;
       committedDate = cloned.headCommittedDate;
-      // Surface the real scanned head to the caller's throttle/error arms BEFORE the scan pipeline runs
-      // — so a walkClone/scanUnit throw past this point records THIS commit, not the stale discovery oid.
+      // Surface the real scanned head to the caller's throttle/error arms BEFORE the scan pipeline runs —
+      // so a walkClone/scanUnit throw past this point records THIS commit, not the stale discovery oid.
+      // cloneShallow returns a FULLY-resolved {headSha, headCommittedDate} or throws; if it throws mid-way
+      // (e.g. rev-parse resolved the moved HEAD but `git show` could not read its date), observed is left at
+      // the COHERENT discovery head — we deliberately never pin an incoherent clone-sha + discovery-date.
       observed.commitSha = commitSha;
       observed.committedDate = committedDate;
       entries = walkClone(cloned.dir);

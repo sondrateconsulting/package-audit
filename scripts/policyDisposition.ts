@@ -39,9 +39,10 @@ export interface PolicyDispositionRow {
   // CHECKs leave `scanned` free to carry a counterfactual, so a scanned+policy row with
   // is_default_branch=0 is schema-VALID and reaches this gate.
   readonly is_default_branch: number | null;
-  // A scanned row pins a real commit; every non-scanned disposition stores ''. The report/export
-  // findings join is `status='scanned'` matched on commit_sha, so a scanned row with commit_sha=''
-  // joins findings parked at the empty SHA — a stale/poison leak. The gate is that join's only defense.
+  // A SCAN-ATTEMPT row (scanned/reused/deferred-*/error) pins a real observed commit; a DISCOVERY-time
+  // disposition (skipped-cutoff/policy-excluded/past-cap) stores ''. The report/export findings join keys on
+  // a REPORTABLE head (status IN ('scanned','reused')) matched on commit_sha, so a reportable row with
+  // commit_sha='' would join findings parked at the empty SHA — a stale/poison leak. The gate is that join's only defense.
   readonly commit_sha: string;
   // NULL ONLY on a v3→v4-migrated row (the pre-upgrade provenance sentinel). Used to scope the
   // default⇒scanned rule to NATIVE rows: the migration copies v3 rows verbatim, so a CHECK — or an
@@ -108,10 +109,12 @@ export function policyStatusOrThrow(r: PolicyDispositionRow, where: string): Pol
 //   - a policy_matched_pattern that is not a real deny pattern — the SQL deny CHECK enforces only
 //     IS NOT NULL (so '' passes) and has NO converse (so an allow-exclusion may carry a deny pattern);
 //     the ledger would otherwise report a causing pattern that caused nothing, or an empty one;
-//   - a scanned row with commit_sha='' or a non-scanned row with a commit_sha — the findings join
-//     depends on this partition, and a scanned empty-commit row leaks findings parked at '';
-//   - a NATIVE default branch that is not scanned — the default is always scanned (Premise 6). Gated on
-//     scanned_commit_date (native rows only), so a migrated pre-v4 row can never fail an upgrade here;
+//   - a SCAN-ATTEMPT row (scanned/reused/deferred-*/error) with commit_sha='' or a DISCOVERY-time row
+//     (skipped-cutoff/policy-excluded/past-cap) with a commit_sha — the findings join depends on this
+//     partition, and a reportable empty-commit row leaks findings parked at '';
+//   - a NATIVE default branch that is not scan-attempted — the default is always scan-attempted (Premise 6:
+//     scanned/reused, or a deferred-*/error attempt). Gated on scanned_commit_date (native rows only), so a
+//     migrated pre-v4 row can never fail an upgrade here;
 //   - a past-cap row that is not a definite non-default (past-cap is v4-native-only, so unconditional);
 //   - 'policy-excluded' with no verdict, or on anything but a definite non-default (the default can
 //     never be an exclusion);

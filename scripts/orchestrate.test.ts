@@ -1502,22 +1502,24 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("reconciliation: a still-live branch whose scan FAILS is NOT pruned; T5 records its failed disposition (keep-set is live NAMES)", async () => {
+  test("reconciliation: a still-live branch whose re-scan FAILS is NOT pruned; T5 §3.1a PRESERVES the prior good scan (findings survive a transient failure)", async () => {
     const root = mkdtempSync(join(tmpdir(), "recon-scanfail-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
     staleHead(db, runId, "main", { commitSha: "old-sha", status: "scanned", isDefaultBranch: true, scannedCommitDate: "2025-05-01T00:00:00Z" });
-    // re-discovers main at a NEW commit, but the tree fetch (scan) FAILS → T5 records an 'error' head.
+    // re-discovers main at a NEW commit, but the tree fetch (scan) FAILS.
     const scanFailClient = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("new-sha"), date: "2025-06-01T00:00:00Z" }], "main") };
       if (args.some((a) => a.includes("git/trees"))) return { exitCode: 1, stderr: "gh: tree boom", stdout: "" };
       return { exitCode: 0, stderr: "", stdout: "HTTP/2.0 200 X\r\n\r\n[]" };
     });
     await captureJsonl(() => processRepo(db, scanFailClient, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
-    // main is in the live keep-set → NOT pruned. T5 §3.1a: the failed re-scan RECORDS its disposition as
-    // error@<new head> — the observed head advanced old-sha→new-sha, so the newer observation replaces
-    // the stale scanned@old-sha (a moved-then-failed head must not keep claiming the old scan as current).
-    expect(headRowsOf(db, runId).find((r) => (r as { branch: string }).branch === "main")).toMatchObject({ branch: "main", status: "error", sha: hexOid("new-sha") });
+    // main is in the live keep-set → NOT pruned. T5 §3.1a (findings-preservation): a TRANSIENT re-scan
+    // failure at a MOVED head must NOT wipe the prior good scan — the commit-aware upsert PRESERVES
+    // scanned@old-sha (its findings stay reportable) rather than demoting it to error@new-sha. The failure
+    // is recorded in errors[] (fail-soft, does not floor the run); the next run re-scans and refreshes.
+    expect(headRowsOf(db, runId).find((r) => (r as { branch: string }).branch === "main")).toMatchObject({ branch: "main", status: "scanned", sha: "old-sha" });
+    expect((db.read(`SELECT COUNT(*) AS n FROM errors WHERE run_id = ? AND scope='scan' AND branch='main'`).get(runId) as { n: number }).n).toBeGreaterThan(0);
     db.close();
     rmSync(root, { recursive: true, force: true });
   });

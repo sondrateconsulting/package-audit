@@ -12,7 +12,7 @@ The default export is the **selected run's view of the world** — the same sema
 JSON report:
 
 - Finding rows (`dependency_findings`, `usage_findings`) are joined through the run's own
-  `run_unit_head` snapshot (`status='scanned'`, matching
+  `run_unit_head` snapshot (a REPORTABLE head — `status IN ('scanned','reused')` — matching
   organization/repository/branch/commit_sha) and filtered to the run's tracked packages.
   Rows are **never** selected by `findings.run_id` — that column is last-writer bookkeeping,
   not run ownership.
@@ -39,7 +39,7 @@ multiple runs and configurations — never treat a raw dump as any single run's 
 | `dependency_findings.csv` / `.jsonl` | manifest/lockfile declarations of tracked packages |
 | `usage_findings.csv` / `.jsonl` | usage sites (imports/requires/re-exports/CLI invocations) |
 | `package_api_surface.csv` / `.jsonl` | introspected exports/bins per (package, version) |
-| `run_unit_head.csv` / `.jsonl` | the run's per-branch disposition snapshot — every branch (scanned / cutoff-skipped / past-cap / policy-excluded) with its branch-policy attribution |
+| `run_unit_head.csv` / `.jsonl` | the run's per-branch disposition snapshot — one of nine dispositions per branch (scan-attempt: scanned / reused / deferred-throttle / deferred-network / deferred-service / error; discovery-time: skipped-cutoff / policy-excluded / past-cap) with its branch-policy attribution |
 | `runs.csv` / `.jsonl` | the selected run's metadata row |
 | `manifest.json` | `{formatVersion, runId, artifacts:[{path, kind, sha256, bytes}]}` — written **last**; artifacts in `xray/` not listed in a coherent manifest are swept by the next generation |
 
@@ -176,22 +176,26 @@ disjoint sets — an `error` head IS a row). Scoped to the selected run only (`-
 
 On a **resumed** run (one interrupted and re-invoked, which reuses the same `run_id`), `branchesErrored`'s
 ROWLESS component still diverges from "every branch whose scan errored" in **both** directions. `errors[]`
-is append-only and is never reconciled, while the rows in *this* table **are** pruned for branches gone
+is append-only — its one reconciliation is the excluded-owner prune (an `excludeOrganizations` owner's rows
+are dropped) — while the rows in *this* table **are** pruned for branches gone
 since an earlier invocation — though only within a repo this run re-discovered and kept: the prune runs per
 repo, so a repo that dropped out of the kept set entirely (deleted, renamed, newly archived/fork-filtered,
 or displaced past `maxReposPerOrg`) is never revisited and keeps its prior rows.
 So a branch that errored in an earlier invocation and reached no row-bearing disposition in the final one —
-deleted, throttle-requeued on retry, or its repo's discovery failed — is still counted via its append-only
-error while correctly holding no row here. Conversely, a branch that kept a row from an earlier invocation
-is counted by THAT row's disposition — an `error` head is itself counted in `branchesErrored`, a `scanned`
-row under `branchesScanned` — never a second time via `errors[]`.
+deleted, or its repo's discovery failed — is still counted via its append-only error while correctly holding
+no row here. (A throttle-requeued retry is NOT such a case: it writes a `deferred-throttle` row, or the
+findings-preservation guard keeps a prior scan's row — either way it holds a row here.) Conversely, a branch
+that kept a row from an earlier invocation is counted by THAT row's disposition — an `error` head is itself
+counted in `branchesErrored`, a `scanned` row under `branchesScanned` — never a second time via `errors[]`.
 
 This table itself stays exact either way: every row is a disposition the run genuinely recorded. Note a
 **scan-attempt** row may be pinned to an older head than the branch's current one (same-name stale head):
 its `commit_sha` and `scanned_commit_date` name the commit that was actually attempted, which on a resumed
-run may predate the live head. The same retention is disposition-agnostic — a resumed run whose re-scan of
-an advanced head failed keeps the branch's prior row whatever its `status`, so e.g. a `skipped-cutoff` row
-can describe an older evaluation of a branch whose current head has since passed the cutoff. (On a
+run may predate the live head. A resumed run whose re-scan of an advanced head hits a TRANSIENT failure
+(error / deferral) keeps the branch's prior REPORTABLE scan (findings-preservation, §3.1a) rather than
+demoting it — so a `scanned` row can describe an older evaluation of a branch whose live head has since
+moved. (A prior NON-reportable row — `skipped-cutoff` / `policy-excluded` / `past-cap` — is instead
+superseded by the moved-head observation, a genuine re-disposition.) (On a
 DISCOVERY-time row — `skipped-cutoff` / `policy-excluded` / `past-cap` — `commit_sha` is `''` and
 `scanned_commit_date` is the discovered-head date; a SCAN-ATTEMPT row carries the observed commit and its
 date — see the column notes below.)
