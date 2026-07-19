@@ -17,6 +17,8 @@ import { ORCHESTRATE_HELP, REPORT_HELP } from "./args.ts";
 import { activeHeartbeats } from "./heartbeat.ts";
 import { AuditDb, nowIso } from "./db.ts";
 import { setLogSink, resetLogSink, type LogSink } from "./log.ts";
+import { ArtifactBundle } from "./artifactWrite.ts";
+import { INDEX_FILENAME } from "./indexHtml.ts";
 
 // Seed a COMPLETED run tracking `expo` with one scanned unit + a usage finding, so report --html
 // emits a `dossier` and export emits per-table `export` events. Opened at the cwd-relative path the
@@ -335,6 +337,72 @@ describe("report/export main() await their finally-flush before the summary (T7)
       resetLogSink();
       outSpy.mockRestore();
       errSpy.mockRestore();
+      rmSync(fx.root, { recursive: true, force: true });
+    }
+  });
+
+  // The DISCRIMINATING case (santa round 2, reviewer C): the success tests above would also pass if
+  // the flush regressed to the pre-remediation `runX(); await flushLogs()` (success-only) placement.
+  // Only a real `finally` drains on a THROW. Emit artifact events, then throw AFTER them, and prove
+  // main stays pending until drain and rejects with the ORIGINAL error — a success-only flush would
+  // have skipped the flush and rejected immediately with the buffered events lost.
+  test("report --html main() drains buffered dossiers in its finally even when runReport throws (rejects with the ORIGINAL error)", async () => {
+    const fx = makeFixture();
+    const g = pausedArtifactSink("dossier");
+    const realWrite = ArtifactBundle.prototype.write;
+    const bundleSpy = spyOn(ArtifactBundle.prototype, "write").mockImplementation(function (this: ArtifactBundle, name: string, content: string) {
+      if (name === INDEX_FILENAME) throw new Error("BOOM-index-write"); // the index write, AFTER the first dossier's logLine
+      return realWrite.call(this, name, content);
+    } as typeof ArtifactBundle.prototype.write);
+    const outSpy = spyOn(process.stdout, "write").mockImplementation((() => true) as typeof process.stdout.write);
+    let rejectedWith: unknown;
+    setLogSink(g.sink);
+    try {
+      await inFixture(fx, async () => {
+        seedReportableRun();
+        g.pause();
+        const p = reportMain(["--config", fx.configPath, "--html"]).then(() => {}, (e) => { rejectedWith = e; });
+        await g.hitArtifact; // a dossier is buffered; then the index write throws → runReport throws → main's finally runs
+        await new Promise((r) => setImmediate(r));
+        expect(rejectedWith).toBeUndefined(); // TEETH: main BLOCKS on the finally-flush; a success-only flush would have rejected already
+        g.resume(); // drain the buffered dossier → flush resolves → main rethrows the ORIGINAL error
+        await p;
+      });
+      expect((rejectedWith as Error).message).toMatch(/BOOM-index-write/); // the ORIGINAL error, not a flush error
+      expect(g.received.map((l) => JSON.parse(l).event)).toContain("dossier"); // buffered event drained despite the throw
+    } finally {
+      resetLogSink();
+      bundleSpy.mockRestore();
+      outSpy.mockRestore();
+      rmSync(fx.root, { recursive: true, force: true });
+    }
+  });
+
+  test("export main() drains buffered export events in its finally even when runExport throws (rejects with the ORIGINAL error)", async () => {
+    const fx = makeFixture();
+    const g = pausedArtifactSink("export");
+    // exportRun writes its human summary to stderr AFTER emitting every `export` line — throw there
+    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => { throw new Error("BOOM-export-stderr"); }) as typeof process.stderr.write);
+    const outSpy = spyOn(process.stdout, "write").mockImplementation((() => true) as typeof process.stdout.write);
+    let rejectedWith: unknown;
+    setLogSink(g.sink);
+    try {
+      await inFixture(fx, async () => {
+        seedReportableRun();
+        g.pause();
+        const p = exportMain(["--config", fx.configPath]).then(() => {}, (e) => { rejectedWith = e; });
+        await g.hitArtifact; // export events buffered; then the stderr summary throws → runExport throws → main's finally runs
+        await new Promise((r) => setImmediate(r));
+        expect(rejectedWith).toBeUndefined(); // TEETH: main BLOCKS on the finally-flush; a success-only flush would have rejected already
+        g.resume(); // drain buffered export events → flush resolves → main rethrows the ORIGINAL error
+        await p;
+      });
+      expect((rejectedWith as Error).message).toMatch(/BOOM-export-stderr/); // the ORIGINAL error, not a flush error
+      expect(g.received.map((l) => JSON.parse(l).event).filter((e) => e === "export").length).toBeGreaterThan(0); // buffered events drained despite the throw
+    } finally {
+      resetLogSink();
+      errSpy.mockRestore();
+      outSpy.mockRestore();
       rmSync(fx.root, { recursive: true, force: true });
     }
   });

@@ -203,8 +203,8 @@ let stdoutClosed = false;
 // so the latest registration wins — no listener leak across setLogSink/resetLogSink.
 let stdoutCloseCb: (() => void) | null = null;
 
-// Both channel-death paths — a SYNCHRONOUS EPIPE throw from write() and the ASYNC 'error' event —
-// funnel through here so the degrade-to-no-op is never FULLY silent (S1). It flips closed ONCE,
+// Both channel-death paths — ANY SYNCHRONOUS throw from write() (EPIPE, ERR_STREAM_DESTROYED, …) and
+// the ASYNC 'error' event — funnel through here so the degrade-to-no-op is never FULLY silent (S1). It flips closed ONCE,
 // wakes any writer awaiting a drain that a broken pipe will never send (so flushLogs() resolves
 // instead of hanging), and leaves a single best-effort trace on stderr — otherwise a run whose
 // stdout consumer dies mid-stream discards its buffered telemetry (up to and including the terminal

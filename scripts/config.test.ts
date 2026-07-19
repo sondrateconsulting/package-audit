@@ -16,6 +16,14 @@ import {
 function _readonlyTimeoutsCompileGuard(t: Timeouts, c: Config): void {
   // @ts-expect-error — Timeouts.controlApiSeconds is readonly
   t.controlApiSeconds = 0;
+  // @ts-expect-error — Timeouts.bulkApiSeconds is readonly
+  t.bulkApiSeconds = 0;
+  // @ts-expect-error — Timeouts.cloneSeconds is readonly
+  t.cloneSeconds = 0;
+  // @ts-expect-error — Timeouts.tarSeconds is readonly
+  t.tarSeconds = 0;
+  // @ts-expect-error — Timeouts.probeSeconds is readonly
+  t.probeSeconds = 0;
   // @ts-expect-error — Timeouts.heartbeatSeconds is readonly
   t.heartbeatSeconds = 0;
   // @ts-expect-error — Config.timeouts is readonly (the whole validated object can't be swapped out)

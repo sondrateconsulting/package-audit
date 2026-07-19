@@ -527,6 +527,21 @@ describe("stdout backpressure writer (T7)", () => {
       resetLogSink();
     }
   });
+
+  // The sink's degrade-on-any-error must NOT be mistaken for "swallow every logging failure": a
+  // non-serializable value (BigInt, a circular ref) fails in JSON.stringify UPSTREAM of the sink, so
+  // it must throw LOUD (a programmer bug), never degrade the channel like a genuine I/O write error.
+  test("a serialization error (BigInt) throws from logLine and does NOT mark the channel closed", () => {
+    resetLogSink();
+    const outSpy = spyOn(process.stdout, "write").mockImplementation((() => true) as typeof process.stdout.write);
+    try {
+      expect(() => logLine({ event: "x", n: BigInt(1) } as unknown as Record<string, unknown>)).toThrow();
+      expect(loggerStats().closed).toBe(false); // NOT a channel death — the sink degrade never ran
+    } finally {
+      outSpy.mockRestore();
+      resetLogSink();
+    }
+  });
 });
 
 // S1: a dead stdout channel silently discards buffered telemetry — including the terminal `done`
