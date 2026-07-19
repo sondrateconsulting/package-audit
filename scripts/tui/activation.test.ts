@@ -1,7 +1,7 @@
 // activation.test.ts — §U8.1: decideTuiActivation table-tested over every §U1 matrix row,
 // including CI, TERM=dumb, the size floor, undefined dimensions, --ui error cells, and plan.
 import { expect, test, describe } from "bun:test";
-import { decideTuiActivation, MIN_COLUMNS, MIN_ROWS, type ActivationInput } from "./activation.ts";
+import { decideTuiActivation, isInkCiEnv, MIN_COLUMNS, MIN_ROWS, type ActivationInput } from "./activation.ts";
 
 const base: ActivationInput = {
   plan: false,
@@ -95,5 +95,23 @@ describe("decideTuiActivation — the §U1 matrix, row by row", () => {
     // structural: ActivationInput has no color field — this documents the deliberate omission
     const keys = Object.keys(base).sort();
     expect(keys).toEqual(["ci", "columns", "plan", "rows", "stderrIsTTY", "stdoutIsTTY", "term", "uiFlag"]);
+  });
+
+  test("isInkCiEnv mirrors ink's pinned is-in-ci predicate EXACTLY — the gate and the renderer share one CI definition", () => {
+    // node_modules/is-in-ci/index.js: `key in env && env[key] !== '0' && env[key] !== 'false'`
+    // over CI and CONTINUOUS_INTEGRATION. Anything narrower mounts a dashboard ink will not
+    // repaint (deferring every frame to unmount over a diverted stdout); anything wider
+    // refuses terminals ink renders fine.
+    expect(isInkCiEnv({})).toBe(false);
+    expect(isInkCiEnv({ CI: "true" })).toBe(true);
+    expect(isInkCiEnv({ CI: "1" })).toBe(true);
+    expect(isInkCiEnv({ CI: "" })).toBe(true); // set-but-empty IS CI to is-in-ci
+    expect(isInkCiEnv({ CI: "0" })).toBe(false); // the explicit opt-out spellings
+    expect(isInkCiEnv({ CI: "false" })).toBe(false);
+    expect(isInkCiEnv({ CONTINUOUS_INTEGRATION: "1" })).toBe(true); // the second variable
+    expect(isInkCiEnv({ CONTINUOUS_INTEGRATION: "" })).toBe(true);
+    expect(isInkCiEnv({ CONTINUOUS_INTEGRATION: "false" })).toBe(false);
+    expect(isInkCiEnv({ CI: "0", CONTINUOUS_INTEGRATION: "1" })).toBe(true); // either suffices
+    expect(isInkCiEnv({ GITHUB_ACTIONS: "true" })).toBe(false); // is-in-ci does NOT read this
   });
 });

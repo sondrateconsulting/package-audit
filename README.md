@@ -212,7 +212,7 @@ Activation (`--ui` forces it on and fails fast if the terminal can't host it; `-
 |--------|--------|-------------|-----------|-------------------|
 | terminal | terminal | interactive | on | **diverted to a log file** |
 | terminal | piped/redirected | interactive | on | stdout, byte-identical |
-| any | any | `CI` set, `TERM=dumb`, or under 40x5 | off (auto) / fail fast (`--ui`) | stdout, byte-identical |
+| any | any | CI (ink's is-in-ci: `CI`/`CONTINUOUS_INTEGRATION`, with `0`/`false` = unset), `TERM=dumb`, or under 40x5 | off (auto) / fail fast (`--ui`) | stdout, byte-identical |
 | piped | any | any | off (auto) / fail fast (`--ui`) | stdout, byte-identical |
 
 The divert exists for exactly one reason: with both streams on the same terminal, raw JSONL would interleave with the dashboard frame. When it fires, the identical bytes stream to `<outputDir>/logs/audit-log-<UTC-stamp>-p<pid>.jsonl` (a `-2`, `-3`… suffix if the name collides; the write rides the same `./output` containment as every other artifact), and the run ends with a `JSONL log: <path>` line naming the file actually used. If the dashboard degrades mid-run — a divert write failure reroutes the stream back to stdout without losing an event; any other dashboard failure disables the display with one warning and the audit continues bare — that exit line reads `JSONL log (partial — …)` so an incomplete file is never announced as the complete record. A hard crash (power loss, SIGKILL) can truncate the file's final line mid-write; consumers should tolerate a partial last line. `--plan` never mounts the dashboard and never diverts.

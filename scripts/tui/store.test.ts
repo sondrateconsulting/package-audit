@@ -261,11 +261,22 @@ describe("totality + version (§U4)", () => {
     expect(s.runId).toBeNull(); // a non-string runId is not adopted
   });
 
-  test("version bumps on every dispatch (render-skip signal)", () => {
+  test("version bumps PER MUTATION — no-op dispatches never wake the renderer (§U4)", () => {
     const { store } = makeClock();
     const v0 = store.version;
     store.dispatch({ type: "phase", phase: "scan" });
-    store.dispatch(jsonl({ event: "unknown" })); // even a no-op fold is a dispatch
+    expect(store.version).toBe(v0 + 1); // a fold that wrote state
+    store.dispatch(jsonl({ event: "unknown" })); // unknown tapped events fold to nothing…
+    store.dispatch(jsonl({ event: "config", packages: ["expo"] })); // …including un-projected config
+    store.dispatch(jsonl({ event: "discovery", org: "acme" })); // …and a no-error discovery line
+    store.dispatch({ type: "spawn-end", id: 999 }); // unknown span id — nothing to delete
+    store.dispatch({ type: "spawn-queue", waiting: 0 }); // the gauge already reads 0
+    expect(store.version).toBe(v0 + 1); // none of those mutated anything
+    store.dispatch({ type: "rate-limit-seed", resource: "core", remaining: 100 });
+    expect(store.version).toBe(v0 + 2); // an empty slot accepted the seed
+    store.dispatch({ type: "rate-limit-seed", resource: "core", remaining: 50 }); // occupied — fold-if-absent no-op
+    expect(store.version).toBe(v0 + 2);
+    store.dispatch({ type: "owner-end", owner: "never-started" }); // unknown member — no write
     expect(store.version).toBe(v0 + 2);
   });
 

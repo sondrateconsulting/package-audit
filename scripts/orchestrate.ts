@@ -48,7 +48,7 @@ import type { CliTermSet } from "./cliScanner.ts";
 import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
 import { logLine } from "./log.ts";
 import { emitProgress, hasProgressSink } from "./progress.ts";
-import { decideTuiActivation, TuiActivationError } from "./tui/activation.ts";
+import { decideTuiActivation, TuiActivationError, isInkCiEnv } from "./tui/activation.ts";
 import { runWithTui, makeDivertPathFor, utcLogStamp } from "./tui/lifecycle.ts";
 
 // Display-phase marker (PROMPT-TUI §U3.6): synchronous, no-throw, allocation gated on the sink.
@@ -156,7 +156,7 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     columns: process.stderr.columns,
     rows: process.stderr.rows,
     term: process.env["TERM"],
-    ci: (process.env["CI"] ?? "") !== "",
+    ci: isInkCiEnv(process.env), // ink's own CI definition — the gate and the renderer must agree
   });
   if (decision.mode === "error") throw new TuiActivationError(decision.message);
 

@@ -380,8 +380,10 @@ All emissions are hub events (§U2). None are logLine calls. None add awaits. Im
    waiter queue grows or shrinks; GithubClient passes one that emits `spawn-queue`.
    In-flight count needs no event — it is the store's live spawn-span set. With the
    preflight client now constructed at the configured concurrency (§U1), the cap gauge
-   is truthful from the first frame; both clients emit through the same hub and their
-   spans/waiters simply aggregate.
+   is truthful from the first frame; both clients emit through the same hub — SPANS
+   aggregate (id-keyed map entries), while the scalar waiter gauge is OVERWRITTEN by
+   each emission and stays truthful because the clients' lifetimes are sequential
+   (preflight completes before the scan client works).
 3. **Rate-limit snapshots — via the analyze RETURN value, derived outside.** The
    response headers exist ONLY inside `restGet`/`graphql`'s per-attempt `analyze`
    closures, which `ghBucketedAttempt` documents as PURE — do not emit from inside

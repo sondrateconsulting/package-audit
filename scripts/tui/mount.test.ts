@@ -9,16 +9,16 @@ import { EventEmitter } from "node:events";
 import { mountTui, DEFAULT_TICK_MS, type TuiHandle, type MountTuiOptions } from "./mount.tsx";
 import { createTuiStore, type TuiStore } from "./store.ts";
 import { makeSealableStderr } from "./lifecycle.ts";
+import { isInkCiEnv } from "./activation.ts";
 import { resetTuiFailure, reportTuiFailure } from "../progress.ts";
 
 // Ink treats a CI environment as non-interactive regardless of isTTY, deciding via its pinned
-// is-in-ci dependency — whose EXACT predicate this must mirror (node_modules/is-in-ci/index.js:
-// `key in env && env[key] !== '0' && env[key] !== 'false'` over CI and CONTINUOUS_INTEGRATION).
-// A partial mirror diverges precisely where it matters: with only CONTINUOUS_INTEGRATION set
-// (or CI='0' read as truthy-set), one side renders per-frame while the other defers everything
-// to unmount — and the suite waits on a pre-unmount frame that never comes.
-const inkCiEnv = (key: string): boolean => key in process.env && process.env[key] !== "0" && process.env[key] !== "false";
-const IN_CI = inkCiEnv("CI") || inkCiEnv("CONTINUOUS_INTEGRATION");
+// is-in-ci dependency — whose EXACT predicate isInkCiEnv mirrors (and the activation gate
+// shares: ONE definition of "CI" everywhere). A partial mirror diverges precisely where it
+// matters: with only CONTINUOUS_INTEGRATION set (or CI='0' read as truthy-set), one side
+// renders per-frame while the other defers everything to unmount — and the suite would wait
+// on a pre-unmount frame that never comes.
+const IN_CI = isInkCiEnv(process.env);
 
 afterEach(() => {
   resetTuiFailure();

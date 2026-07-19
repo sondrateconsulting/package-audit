@@ -20,7 +20,21 @@ export interface ActivationInput {
   columns: number | undefined; // stderr dimensions; undefined is ineligible
   rows: number | undefined;
   term: string | undefined; // TERM
-  ci: boolean; // CI set and non-empty
+  ci: boolean; // ink's is-in-ci truthiness — compute via isInkCiEnv below, never a bare CI check
+}
+
+// Ink decides "CI" through its pinned is-in-ci dependency, and the activation gate must use
+// the SAME definition or the two disagree exactly where it matters: the gate would mount a
+// renderer that defers every frame to unmount (a dead dashboard over a diverted stdout), or
+// refuse one that would render fine. Mirrors node_modules/is-in-ci/index.js verbatim: CI or
+// CONTINUOUS_INTEGRATION present (empty string included), with literal "0"/"false" treated as
+// unset. RECORDED DEVIATION (PR body): §U1's letter defines the input as "CI set and
+// non-empty", but its own stated ground — "Ink itself degrades under CI" — is DEFINED by
+// is-in-ci, so the predicate follows the ground, not the letter. The mount gate's IN_CI
+// (mount.test.ts) imports this same helper: one definition of "CI" everywhere.
+export function isInkCiEnv(env: Record<string, string | undefined>): boolean {
+  const set = (key: string): boolean => key in env && env[key] !== "0" && env[key] !== "false";
+  return set("CI") || set("CONTINUOUS_INTEGRATION");
 }
 
 export type ActivationDecision =

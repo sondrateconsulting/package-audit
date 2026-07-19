@@ -1,8 +1,10 @@
 // panels.tsx — the dashboard's panel components (§U5 of PROMPT-TUI.md). Small pure function
 // components over a TuiSnapshot + an injected now; EVERY dynamic string passes sanitizeLine
-// before render, and number slots carry only store-validated finite numbers (the folds null
-// anything else — a masquerading runtime string would otherwise render its bytes verbatim —
-// and thousands/formatReset are total besides). Row truncation is Ink's layout
+// before render, and number slots sourced from EXTERNAL data (quota seeds/snapshots, tapped
+// JSONL counters) are store-validated finite numbers — the folds null anything else, since a
+// masquerading runtime string would otherwise render its bytes verbatim, and
+// thousands/formatReset are total besides; waiter/throttle/timing numbers come from this
+// process's own typed producers. Row truncation is Ink's layout
 // (<Text wrap="truncate-end"> inside a width-constrained <Box>) — never naive string slicing
 // (org/repo/branch names can carry CJK/emoji whose cell width chars can't measure). Colors
 // via <Text color/dimColor>; NO_COLOR is honored by Ink's chalk.

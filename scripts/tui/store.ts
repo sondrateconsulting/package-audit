@@ -77,8 +77,10 @@ export interface TuiSnapshot {
 }
 
 export interface TuiStore {
-  readonly version: number; // incremented per DISPATCH, changed state or not (render-skip
-  //                             signal: cheap monotonic "anything arrived", not a diff)
+  readonly version: number; // incremented per MUTATION (§U4) — only a dispatch that WROTE
+  //                             store state advances it, so the render-skip check truly skips
+  //                             no-op dispatches (unknown tapped events, unknown span ids,
+  //                             occupied-slot seeds, unchanged gauge values)
   snapshot(): TuiSnapshot;
   dispatch(e: ProgressEvent): void;
 }
@@ -122,21 +124,22 @@ export function createTuiStore(nowMs: () => number): TuiStore {
 
   // The tapped-JSONL projection (§U4): folds counters, header identity, caps, and problems from
   // the durable stream. Total over ANY shape; plan events are deliberately NOT projected (plan
-  // mode never mounts).
-  const foldJsonl = (ev: Readonly<Record<string, unknown>>): void => {
+  // mode never mounts). Returns whether anything was WRITTEN — §U4's per-mutation version
+  // contract rides on it: an event that folds to nothing must not wake the renderer.
+  const foldJsonl = (ev: Readonly<Record<string, unknown>>): boolean => {
     const event = str(ev["event"]);
-    if (event === null) return;
+    if (event === null) return false;
     switch (event) {
       case "run": {
         runId = str(ev["runId"]);
         resumed = bool(ev["resumed"]);
-        return; // counts are whole-database row totals — deliberately unread (§U4)
+        return true; // counts are whole-database row totals — deliberately unread (§U4)
       }
       case "concurrency": {
         ownerCap = num(ev["organizations"]);
         branchCap = num(ev["branches"]);
         spawnCap = num(ev["repositories"]);
-        return;
+        return true;
       }
       case "unit": {
         const action = str(ev["action"]);
@@ -149,49 +152,75 @@ export function createTuiStore(nowMs: () => number): TuiStore {
           findings.deps += num(ev["deps"]) ?? 0;
           findings.usage += num(ev["usage"]) ?? 0;
           findings.cli += num(ev["cli"]) ?? 0;
-        } else if (action === "skip-current") counters.skipCurrent++;
-        else if (action === "skip-cutoff") counters.skipCutoff++;
-        else if (action === "skip-policy") counters.skipPolicy++;
-        else if (action === "past-cap") counters.pastCap++;
-        else if (action === "requeue-throttle") counters.requeued++;
-        else if (action === "error") {
+          return true;
+        }
+        if (action === "skip-current") {
+          counters.skipCurrent++;
+          return true;
+        }
+        if (action === "skip-cutoff") {
+          counters.skipCutoff++;
+          return true;
+        }
+        if (action === "skip-policy") {
+          counters.skipPolicy++;
+          return true;
+        }
+        if (action === "past-cap") {
+          counters.pastCap++;
+          return true;
+        }
+        if (action === "requeue-throttle") {
+          counters.requeued++;
+          return true;
+        }
+        if (action === "error") {
           counters.errored++;
           pushProblem("error", "scan", target, str(ev["message"]) ?? "scan error");
+          return true;
         }
-        return;
+        return false; // an unrecognized action wrote nothing
       }
       case "discovery": {
         const error = str(ev["error"]);
         if (error !== null) {
           const repo = str(ev["repo"]);
           pushProblem("error", "discovery", repo === null ? (str(ev["org"]) ?? "?") : `${str(ev["org"]) ?? "?"}/${repo}`, error);
+          return true;
         }
-        return;
+        return false; // a successful discovery line projects nothing
       }
       case "introspection": {
         const error = str(ev["error"]);
         if (error !== null) {
           const v = str(ev["version"]);
           pushProblem("error", "introspection", `${str(ev["packageName"]) ?? "?"}${v === null ? "" : `@${v}`}`, error);
+          return true;
         }
-        return;
+        return false; // a successful introspection line projects nothing
       }
       case "warning": {
         pushProblem("warning", str(ev["reason"]) ?? "warning", str(ev["target"]) ?? "", str(ev["message"]) ?? "");
-        return;
+        return true;
       }
       case "policy-warning": {
         const kind = str(ev["kind"]) ?? "policy-warning";
         const pattern = str(ev["pattern"]);
         pushProblem("warning", "policy", pattern === null ? kind : `${kind} ${pattern}`, "");
-        return;
+        return true;
       }
       default:
-        return; // unknown events fold to nothing by design
+        return false; // unknown events fold to nothing by design
     }
   };
 
   const dispatch = (e: ProgressEvent): void => {
+    // §U4: version advances PER MUTATION — only a dispatch that WROTE store state. The no-op
+    // shapes (an unknown tapped event, an unknown span id, a seed into an occupied slot, an
+    // unchanged gauge value) leave it untouched, so the tick's render-skip check truly skips.
+    // Writes that only refresh a timestamp (re-stamped sinceMs/asOfMs) count as mutations —
+    // the stamp IS state; the contract excludes writes that never happened, not cheap ones.
+    let changed = true;
     switch (e.type) {
       case "phase":
         phase = e.phase;
@@ -200,16 +229,17 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         spawns.set(e.id, { tool: e.tool, label: e.label, sinceMs: nowMs() });
         break;
       case "spawn-end":
-        spawns.delete(e.id);
+        changed = spawns.delete(e.id);
         break;
       case "spawn-queue":
+        changed = spawnWaiting !== e.waiting;
         spawnWaiting = e.waiting;
         break;
       case "fetch-start":
         fetches.set(e.id, { kind: e.kind, label: e.label, sinceMs: nowMs() });
         break;
       case "fetch-end":
-        fetches.delete(e.id);
+        changed = fetches.delete(e.id);
         break;
       case "rate-limit":
         // Quota number slots are VALIDATED AT THE FOLD (the same num() the tapped JSONL folds
@@ -226,6 +256,7 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         // fold-if-absent ONLY: a live snapshot always wins — the seed must not clobber it with
         // nulls. Same finite validation as the live fold above (the seed IS the external one).
         if (limits[e.resource] === null) limits[e.resource] = { remaining: num(e.remaining), limit: null, resetEpochSec: null, asOfMs: nowMs() };
+        else changed = false; // occupied slot — the seed wrote nothing
         break;
       case "throttle": {
         if (e.state === "exhausted") {
@@ -238,16 +269,20 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         break;
       }
       case "owner-start":
+        changed = !activeOwners.has(e.owner);
         activeOwners.add(e.owner);
         break;
       case "owner-end":
-        activeOwners.delete(e.owner);
+        changed = activeOwners.delete(e.owner);
         break;
-      case "repo-start":
-        activeRepos.add(`${e.owner}/${e.repo}`);
+      case "repo-start": {
+        const repoKey = `${e.owner}/${e.repo}`;
+        changed = !activeRepos.has(repoKey);
+        activeRepos.add(repoKey);
         break;
+      }
       case "repo-end":
-        activeRepos.delete(`${e.owner}/${e.repo}`);
+        changed = activeRepos.delete(`${e.owner}/${e.repo}`);
         break;
       case "unit-dispatch":
         unitWorkers.set(`${e.owner}/${e.repo}@${e.branch}`, { sinceMs: nowMs() });
@@ -257,8 +292,9 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         // scan — tapped JSONL events never clear active state (the `scanned` line fires before
         // cleanup finishes, and fatal escapes emit no terminal unit line at all).
         const key = `${e.owner}/${e.repo}@${e.branch}`;
-        unitWorkers.delete(key);
-        scanningUnits.delete(key);
+        const workerGone = unitWorkers.delete(key);
+        const scanGone = scanningUnits.delete(key);
+        changed = workerGone || scanGone;
         break;
       }
       case "unit-start":
@@ -268,18 +304,18 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         introspections.set(e.id, { packageName: e.packageName, version: e.version, sinceMs: nowMs() });
         break;
       case "introspect-end":
-        introspections.delete(e.id);
+        changed = introspections.delete(e.id);
         break;
       case "divert":
         logPath = e.path;
         break;
       case "jsonl":
-        foldJsonl(e.event);
+        changed = foldJsonl(e.event);
         break;
       default:
         assertNever(e, "ProgressEvent");
     }
-    version++;
+    if (changed) version++;
   };
 
   return {
