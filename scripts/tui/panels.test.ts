@@ -118,7 +118,7 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(text).toContain("core 4,812/5,000 resets 12:34");
     expect(text).toContain("graphql 1,998"); // the seed shows remaining without a limit
     expect(text).toContain("(+2 queued)");
-    expect(text).toContain("owners 2/3: acme, initech");
+    expect(text).toContain("owners 2 (≤3 concurrent): acme, initech"); // occupancy, not a progress fraction (H1)
     expect(text).toContain("unit workers 1 (≤4/repo)");
     expect(text).toContain("scanning 1");
     expect(text).toContain("acme/api@main");

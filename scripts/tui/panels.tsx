@@ -120,7 +120,7 @@ export function WorkPanel({ snap, nowMs, workRows, showFindings }: { snap: TuiSn
     <Box flexDirection="column">
       <Row>
         <Text dimColor>{"work".padEnd(GUTTER)}</Text>
-        {`owners ${snap.owners.length}/${ownerCap}${owners} · repos ${snap.repoCount} · unit workers ${snap.unitWorkers.length} (≤${branchCap}/repo) · scanning ${snap.scanning.length}`}
+        {`owners ${snap.owners.length} (≤${ownerCap} concurrent)${owners} · repos ${snap.repoCount} · unit workers ${snap.unitWorkers.length} (≤${branchCap}/repo) · scanning ${snap.scanning.length}`}
       </Row>
       {shownUnits.map((u) => (
         <Row key={u.key}>
