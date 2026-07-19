@@ -152,7 +152,7 @@ export function WorkPanel({ snap, nowMs, workRows, showFindings }: { snap: TuiSn
       ) : null}
       <Row>
         <Text dimColor>{"".padEnd(GUTTER)}</Text>
-        {`session: scanned ${thousands(c.scanned)} · current ${thousands(c.skipCurrent)} · skipped ${thousands(skipped)} · past-cap ${thousands(c.pastCap)} · errored ${thousands(c.errored)}${c.requeued > 0 ? ` · requeued ${thousands(c.requeued)}` : ""}${snap.retryExhaustions > 0 ? ` · retry-exhausted ${thousands(snap.retryExhaustions)}` : ""}`}
+        {`session: scanned ${thousands(c.scanned)} · errored ${thousands(c.errored)}${snap.retryExhaustions > 0 ? ` · retry-exhausted ${thousands(snap.retryExhaustions)}` : ""}${c.requeued > 0 ? ` · requeued ${thousands(c.requeued)}` : ""} · current ${thousands(c.skipCurrent)} · skipped ${thousands(skipped)} · past-cap ${thousands(c.pastCap)}`}
       </Row>
       {showFindings ? (
         <Row>

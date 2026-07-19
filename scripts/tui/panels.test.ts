@@ -129,6 +129,27 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(text).toContain("JSONL → /out/logs/audit-log-20260718T211530Z-p4242.jsonl");
   });
 
+  test("session counters front-load the danger fields so end-truncation drops the least important first (M2)", async () => {
+    const text = await frame([
+      jsonl({ event: "unit", org: "o", repo: "r", branch: "a", action: "scanned", deps: 0, usage: 0, cli: 0 }),
+      jsonl({ event: "unit", org: "o", repo: "r", branch: "b", action: "skip-current" }),
+      jsonl({ event: "unit", org: "o", repo: "r", branch: "c", action: "skip-cutoff" }),
+      jsonl({ event: "unit", org: "o", repo: "r", branch: "d", action: "past-cap" }),
+      jsonl({ event: "unit", org: "o", repo: "r", branch: "e", action: "error", message: "boom" }),
+      jsonl({ event: "unit", org: "o", repo: "r", branch: "f", action: "requeue-throttle" }),
+      { type: "throttle", bucket: "core", state: "exhausted", reason: "retries", untilMs: null, budgetSpentMs: 0 },
+    ]);
+    const session = text.slice(text.indexOf("session:"));
+    expect(session).toContain("errored 1");
+    expect(session).toContain("retry-exhausted 1");
+    expect(session).toContain("requeued 1");
+    // errored / retry-exhausted / requeued precede current / skipped / past-cap: a truncate-end row
+    // sheds the rightmost fields first, and the danger fields must not be the ones lost under pressure.
+    expect(session.indexOf("errored")).toBeLessThan(session.indexOf("current"));
+    expect(session.indexOf("retry-exhausted")).toBeLessThan(session.indexOf("skipped"));
+    expect(session.indexOf("requeued")).toBeLessThan(session.indexOf("past-cap"));
+  });
+
   test("overflow: more active rows than the budget renders '… +N more'", async () => {
     const events: ProgressEvent[] = [];
     for (let i = 0; i < 12; i++) events.push({ type: "unit-dispatch", owner: "o", repo: "r", branch: `b${i}` });
