@@ -2,7 +2,7 @@ import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, githubDeadlines, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, RunProgress, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
+import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, githubDeadlines, outcomeToExit, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, RunProgress, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
 import { parseEvents } from "./testEvents.test.ts";
 import type { HeartbeatController } from "./heartbeat.ts";
 import type { TreeEntry } from "./unitPipeline.ts";
@@ -747,9 +747,11 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     // past-cap branch is now recorded for report visibility, though its work queue stays untouched).
     const headRows = db.read(`SELECT branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
     expect(headRows).toEqual([
-      { branch: "dev", commit_sha: hexOid("o-dev"), status: "scanned", is_default_branch: 0 },
+      // T5: skip-as-current units carry the 'reused' disposition (not 'scanned') — current head,
+      // findings reused from the prior scan; only a REAL processUnit scan writes 'scanned'.
+      { branch: "dev", commit_sha: hexOid("o-dev"), status: "reused", is_default_branch: 0 },
       { branch: "feat", commit_sha: "", status: "past-cap", is_default_branch: 0 },
-      { branch: "main", commit_sha: hexOid("o-main"), status: "scanned", is_default_branch: 1 },
+      { branch: "main", commit_sha: hexOid("o-main"), status: "reused", is_default_branch: 1 },
       { branch: "stale", commit_sha: "", status: "skipped-cutoff", is_default_branch: 0 },
     ]);
     // work-queue state: stale skipped, main+dev still done (reused), feat never enqueued (past-cap
@@ -1475,20 +1477,22 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("reconciliation: a still-live branch whose scan FAILS keeps its prior row (keep-set is live NAMES, not rows written)", async () => {
+  test("reconciliation: a still-live branch whose scan FAILS is NOT pruned; T5 records its failed disposition (keep-set is live NAMES)", async () => {
     const root = mkdtempSync(join(tmpdir(), "recon-scanfail-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
     staleHead(db, runId, "main", { commitSha: "old-sha", status: "scanned", isDefaultBranch: true, scannedCommitDate: "2025-05-01T00:00:00Z" });
-    // re-discovers main at a NEW commit, but the tree fetch (scan) FAILS → no new row written this attempt
+    // re-discovers main at a NEW commit, but the tree fetch (scan) FAILS → T5 records an 'error' head.
     const scanFailClient = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("new-sha"), date: "2025-06-01T00:00:00Z" }], "main") };
       if (args.some((a) => a.includes("git/trees"))) return { exitCode: 1, stderr: "gh: tree boom", stdout: "" };
       return { exitCode: 0, stderr: "", stdout: "HTTP/2.0 200 X\r\n\r\n[]" };
     });
     await captureJsonl(() => processRepo(db, scanFailClient, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
-    // main is in the live keep-set → NOT pruned; its PRIOR row survives (the failed scan wrote no replacement)
-    expect(headRowsOf(db, runId).find((r) => (r as { branch: string }).branch === "main")).toMatchObject({ branch: "main", status: "scanned", sha: "old-sha" });
+    // main is in the live keep-set → NOT pruned. T5 §3.1a: the failed re-scan RECORDS its disposition as
+    // error@<new head> — the observed head advanced old-sha→new-sha, so the newer observation replaces
+    // the stale scanned@old-sha (a moved-then-failed head must not keep claiming the old scan as current).
+    expect(headRowsOf(db, runId).find((r) => (r as { branch: string }).branch === "main")).toMatchObject({ branch: "main", status: "error", sha: hexOid("new-sha") });
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -1587,12 +1591,13 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
 });
 
 describe("runSummaryText", () => {
-  test("prints the §7 counters with report-matching labels and the fail-soft note", () => {
-    const text = runSummaryText("run-abc", {
-      organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
-      branchesSkippedByCutoff: 13, branchesExcludedByPolicy: 5, branchesPastCap: 2, branchesErrored: 4,
-      totalDependencyFindings: 104, totalUsageFindings: 994,
-    }, 3, "output/run-run-abc.json");
+  const summary = {
+    organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
+    branchesSkippedByCutoff: 13, branchesExcludedByPolicy: 5, branchesPastCap: 2, branchesErrored: 4,
+    totalDependencyFindings: 104, totalUsageFindings: 994,
+  };
+  test("a COMPLETE run prints the §7 counters, the fail-soft note, and the latest.json claim", () => {
+    const text = runSummaryText("run-abc", "complete", summary, 3, "output/run-run-abc.json");
     // labels + values pinned; column padding is cosmetic and free to change
     expect(text).toContain("AUDIT COMPLETE — run run-abc");
     expect(text).toMatch(/Organizations scanned:\s+2\b/);
@@ -1602,6 +1607,15 @@ describe("runSummaryText", () => {
     expect(text).toMatch(/Usage findings:\s+994\b/);
     expect(text).toMatch(/Errors recorded:\s+3 \(fail-soft/);
     expect(text).toContain("output/run-run-abc.json (+ latest.json)");
+  });
+  test("a PARTIAL run says INCOMPLETE, names the outcome, recommends a re-run, and does NOT claim latest.json", () => {
+    const text = runSummaryText("run-xyz", "partial-deferred", summary, 0, "output/run-run-xyz.json");
+    expect(text).toContain("AUDIT INCOMPLETE (partial-deferred) — run run-xyz");
+    expect(text).toContain("re-run to finish");
+    expect(text).not.toContain("(+ latest.json)"); // latest.json was NOT written for a partial run
+    expect(text).toContain("latest.json NOT updated");
+    // the counters still print
+    expect(text).toMatch(/Branches scanned:\s+88 \(13 skipped by cutoff · 5 excluded by policy · 2 past cap · 4 scan-errored\)/);
   });
 });
 
@@ -1806,7 +1820,7 @@ describe("processRepo throttle requeue (§4)", () => {
 });
 
 describe("same-name stale-head retention is DISPOSITION-AGNOSTIC", () => {
-  test("a prior skipped-cutoff row survives a failed re-scan of the now-eligible advanced head", async () => {
+  test("a prior skipped-cutoff row is REPLACED by a failed re-scan of the now-eligible advanced head (T5 §3.1a: newer observed head wins)", async () => {
     // Round-4 review finding: the retention docs used to describe the retained row as "scanned at
     // the old head" — but retention is name-keyed and disposition-agnostic. Invocation 1: the
     // non-default head sits BELOW the cutoff → a skipped-cutoff row (commit_sha='',
@@ -1856,10 +1870,12 @@ describe("same-name stale-head retention is DISPOSITION-AGNOSTIC", () => {
     await processRepo(db, client, rt(cutoffConfig, "hash"), runId, "o", repo, [], new Set());
     expect(treesRequested).toContain("f".repeat(40)); // the ADVANCED head really was scan-attempted (toScan, not re-skipped)
     const row2 = db.read("SELECT status, commit_sha, scanned_commit_date, policy_status, policy_matched_pattern FROM run_unit_head WHERE branch='feat'").get() as { status: string; commit_sha: string; scanned_commit_date: string; policy_status: string | null; policy_matched_pattern: string | null };
-    expect(row2.status).toBe("skipped-cutoff"); // the PRIOR disposition survives — neither scanned nor pruned
-    expect(row2.commit_sha).toBe(""); // still the non-scanned sentinel
-    expect(row2.scanned_commit_date).toBe("2025-01-01T00:00:00Z"); // pinned to the OLDER evaluation's discovered date
-    expect(row2.policy_status).toBeNull(); // a GENUINE cutoff row (the report's cutoff bucket), not a policy exclusion
+    // T5 §3.1a: the head ADVANCED (below-cutoff → eligible) and the re-scan ERRORED, so the newer OBSERVED
+    // head REPLACES the stale skipped-cutoff@'' — a moved head must not keep its old cutoff disposition.
+    expect(row2.status).toBe("error");
+    expect(row2.commit_sha).toBe("e".repeat(40)); // the observed (advanced) head the failed scan saw
+    expect(row2.scanned_commit_date).toBe("2026-01-02T00:00:00Z"); // the advanced head's date, not the stale one
+    expect(row2.policy_status).toBeNull(); // an error row carries no policy verdict
     expect(row2.policy_matched_pattern).toBeNull();
     const featErrors = db.read("SELECT message FROM errors WHERE scope='scan' AND branch='feat'").all();
     expect(featErrors.length).toBe(1); // the failed re-scan is loud — the retained row is stale, not silent
@@ -1944,16 +1960,25 @@ describe("resolveOwnersWithDiscovery owner-membership throttle (§4, site a)", (
 describe("runScan owner-discovery throttle (§4, site a — consumer wiring)", () => {
   const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
 
-  test("a throttle during owner discovery ends cleanly WITHOUT starting a run (no phantom run row)", async () => {
+  test("a throttle during owner discovery ends cleanly WITHOUT starting a run (no phantom run row); exits 75 with a terminal run-deferred", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     // sweepStaleTempDirs runs first; owner discovery then throttles, so nothing else is reached.
     const client = {
       sweepStaleTempDirs: () => [],
       listOrgMemberships: async () => { throw new ThrottleExhausted("core bucket"); },
     } as unknown as GithubClient;
-    await runScan(db, client, rt(config, "hash"), noArgs, null); // must not throw
+    let code: number | undefined;
+    const events = await captureJsonl(async () => {
+      code = await runScan(db, client, rt(config, "hash"), noArgs, null); // must not throw
+    });
+    expect(code).toBe(75); // T5b: a PRE-RUN deferral exits 75 (EX_TEMPFAIL) — re-run to scan
     const runs = db.read("SELECT COUNT(*) AS n FROM runs").get() as { n: number };
-    expect(runs.n).toBe(0); // startRun was never reached — no run, no report
+    expect(runs.n).toBe(0); // startRun was never reached — no run, no report, no coverage row
+    // the cause line stays, and a TERMINAL run-deferred carries the run-outcome/retry intent
+    const kinds = events.map((e) => e["event"]);
+    expect(kinds).toContain("owner-discovery-throttled");
+    const deferred = events.find((e) => e["event"] === "run-deferred")!;
+    expect(deferred).toMatchObject({ reason: "owner-discovery-throttle", action: "retry-next-run" });
     db.close();
   });
 });
@@ -2373,6 +2398,158 @@ describe("runScan terminal `done` event (T7 counters + terminal delivery under b
       resetLogSink();
       errSpy.mockRestore();
       fetchSpy.mockRestore();
+    }
+  });
+});
+
+describe("T5b — run-outcome dispositions, coverage counters, exit mapping (§3.1b)", () => {
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
+  const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+  // The single live branch, at a known head (its oid is the commit_sha every disposition below records).
+  const liveHead: BranchHead = { name: "main", oid: "a".repeat(40), committedDate: "2025-06-01T00:00:00Z", treeOid: hexOid("t1") };
+  const liveSnapshot = { heads: [liveHead], defaultBranch: "main" };
+  const openRun = (root: string): { db: AuditDb; runId: string } => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "hash", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    return { db, runId };
+  };
+  const headOf = (db: AuditDb, runId: string, branch = "main") =>
+    db.read("SELECT status, commit_sha FROM run_unit_head WHERE run_id=? AND branch=?").get(runId, branch) as { status: string; commit_sha: string } | null;
+  const coverageOf = (db: AuditDb, runId: string) => db.getRun(runId)!;
+  // A client whose branch discovery SUCCEEDS (one live head) but whose per-unit tree fetch throws
+  // `err` — so processRepo reaches the unit-scan catch and records the throttle/error head.
+  const scanErrsWith = (err: Error): GithubClient =>
+    ({ sweepStaleTempDirs: () => [], listBranchHeads: async () => liveSnapshot, fetchTreeRecursive: async () => { throw err; } }) as unknown as GithubClient;
+
+  test("a unit throttle records a 'deferred-throttle' head at the observed commit (finalizeRun floor sees it)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "t5b-defthr-"));
+    const { db, runId } = openRun(root);
+    try {
+      await processRepo(db, scanErrsWith(new ThrottleExhausted("core bucket")), rt(testConfig(root), "hash"), runId, "org-a", repo, [], new Set());
+      expect(headOf(db, runId)).toEqual({ status: "deferred-throttle", commit_sha: "a".repeat(40) });
+    } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("a permanent unit error records an 'error' head at the observed commit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "t5b-err-"));
+    const { db, runId } = openRun(root);
+    try {
+      await processRepo(db, scanErrsWith(new GithubApiError("boom", { endpoint: "x" })), rt(testConfig(root), "hash"), runId, "org-a", repo, [], new Set());
+      expect(headOf(db, runId)).toEqual({ status: "error", commit_sha: "a".repeat(40) });
+    } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("a branch-discovery throttle flips coverage_complete=0 and bumps discovery_deferrals (not failures)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "t5b-bdthr-"));
+    const { db, runId } = openRun(root);
+    try {
+      const client = { sweepStaleTempDirs: () => [], listBranchHeads: async () => { throw new ThrottleExhausted("graphql bucket"); } } as unknown as GithubClient;
+      await processRepo(db, client, rt(testConfig(root), "hash"), runId, "org-a", repo, [], new Set());
+      const r = coverageOf(db, runId);
+      expect(r.coverageComplete).toBe(false);
+      expect(r.discoveryDeferrals).toBe(1);
+      expect(r.discoveryFailures).toBe(0);
+    } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("a branch-discovery permanent failure flips coverage_complete=0 and bumps discovery_failures (not deferrals)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "t5b-bdfail-"));
+    const { db, runId } = openRun(root);
+    try {
+      const client = { sweepStaleTempDirs: () => [], listBranchHeads: async () => { throw new GithubApiError("branch boom", { endpoint: "x" }); } } as unknown as GithubClient;
+      await processRepo(db, client, rt(testConfig(root), "hash"), runId, "org-a", repo, [], new Set());
+      const r = coverageOf(db, runId);
+      expect(r.coverageComplete).toBe(false);
+      expect(r.discoveryFailures).toBe(1);
+      expect(r.discoveryDeferrals).toBe(0);
+    } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("a repo-discovery throttle bumps discovery_deferrals; a permanent failure bumps discovery_failures", async () => {
+    const rootA = mkdtempSync(join(tmpdir(), "t5b-rdthr-"));
+    const t = openRun(rootA);
+    try {
+      await processOwner(t.db, { sweepStaleTempDirs: () => [], listOrgRepos: async () => { throw new ThrottleExhausted("core bucket"); } } as unknown as GithubClient, rt(testConfig(rootA), "hash"), t.runId, "org-a", null, [], new Set());
+      expect(coverageOf(t.db, t.runId).discoveryDeferrals).toBe(1);
+      expect(coverageOf(t.db, t.runId).discoveryFailures).toBe(0);
+    } finally { t.db.close(); rmSync(rootA, { recursive: true, force: true }); }
+
+    const rootB = mkdtempSync(join(tmpdir(), "t5b-rdfail-"));
+    const f = openRun(rootB);
+    try {
+      await processOwner(f.db, { sweepStaleTempDirs: () => [], listOrgRepos: async () => { throw new GithubApiError("repo boom", { endpoint: "x" }); } } as unknown as GithubClient, rt(testConfig(rootB), "hash"), f.runId, "org-a", null, [], new Set());
+      expect(coverageOf(f.db, f.runId).discoveryFailures).toBe(1);
+      expect(coverageOf(f.db, f.runId).discoveryDeferrals).toBe(0);
+    } finally { f.db.close(); rmSync(rootB, { recursive: true, force: true }); }
+  });
+
+  test("outcomeToExit: complete/legacy-unknown → 0, partial-* → 75, fatal/legacy-failed → 1", () => {
+    expect(outcomeToExit("complete")).toBe(0);
+    expect(outcomeToExit("legacy-unknown")).toBe(0);
+    expect(outcomeToExit("partial-deferred")).toBe(75);
+    expect(outcomeToExit("partial-degraded")).toBe(75);
+    expect(outcomeToExit("partial-budget")).toBe(75);
+    expect(outcomeToExit("fatal")).toBe(1);
+    expect(outcomeToExit("legacy-failed")).toBe(1); // a failure maps by MEANING, not the partial default
+  });
+
+  // ---- full runScan integration: finalize → exit code → latest.json gate → done.runOutcome ------
+  // A minimal end-to-end client for the single configured org / one repo / one eligible branch.
+  // treeThrows=true makes the unit's tree fetch throttle (→ deferred), else it scans an empty tree.
+  const scanClient = (treeThrows: boolean): GithubClient =>
+    ({
+      sweepStaleTempDirs: () => [],
+      listOrgRepos: async () => [repo],
+      listBranchHeads: async () => liveSnapshot,
+      fetchTreeRecursive: async () => {
+        if (treeThrows) throw new ThrottleExhausted("core bucket");
+        return { truncated: false, entries: [] };
+      },
+    }) as unknown as GithubClient;
+
+  test("full runScan HAPPY path: complete → exit 0, latest.json written, done.runOutcome=complete", async () => {
+    const root = mkdtempSync(join(tmpdir(), "runscan-ok-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = (async () => { throw new Error("registry down"); }) as unknown as typeof fetch; // discoverCliTerms → fail-soft
+    let code: number | undefined;
+    try {
+      const events = await captureJsonl(async () => {
+        code = await runScan(db, scanClient(false), rt(testConfig(root), "hash"), noArgs, null);
+      });
+      expect(code).toBe(0);
+      expect(events.find((e) => e["event"] === "done")!["runOutcome"]).toBe("complete");
+      expect(readdirSync(root)).toContain("latest.json"); // a COMPLETE run is served as latest
+      expect(readdirSync(root).some((f) => f.startsWith("run-") && f.endsWith(".json"))).toBe(true);
+      expect(db.latestReportableRun()).not.toBeNull();
+    } finally {
+      globalThis.fetch = prevFetch;
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("full runScan PARTIAL path: a unit throttle → partial-deferred, exit 75, latest.json NOT written, done.runOutcome=partial-deferred", async () => {
+    const root = mkdtempSync(join(tmpdir(), "runscan-partial-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = (async () => { throw new Error("registry down"); }) as unknown as typeof fetch;
+    let code: number | undefined;
+    try {
+      const events = await captureJsonl(async () => {
+        code = await runScan(db, scanClient(true), rt(testConfig(root), "hash"), noArgs, null);
+      });
+      expect(code).toBe(75); // T5b: a deferred unit floors the run to partial-deferred → exit 75
+      expect(events.find((e) => e["event"] === "done")!["runOutcome"]).toBe("partial-deferred");
+      expect(readdirSync(root)).not.toContain("latest.json"); // a PARTIAL run must NOT overwrite latest.json
+      expect(readdirSync(root).some((f) => f.startsWith("run-") && f.endsWith(".json"))).toBe(true); // …but its own run report IS written
+      expect(db.latestReportableRun()).toBeNull(); // and it is excluded from latest-selection
+      expect((db.read("SELECT outcome FROM runs").get() as { outcome: string }).outcome).toBe("partial-deferred");
+    } finally {
+      globalThis.fetch = prevFetch;
       db.close();
       rmSync(root, { recursive: true, force: true });
     }

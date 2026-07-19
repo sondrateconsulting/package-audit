@@ -16,7 +16,7 @@ import { ORCHESTRATE_HELP, REPORT_HELP } from "./args.ts";
 import { activeHeartbeats } from "./heartbeat.ts";
 
 // Capture BOTH streams while `fn` runs (help text and JSONL go to stdout; summaries to stderr).
-async function captureStreams(fn: () => Promise<void>): Promise<{ out: string; err: string }> {
+async function captureStreams(fn: () => Promise<unknown>): Promise<{ out: string; err: string }> {
   const out: string[] = [];
   const err: string[] = [];
   const so = spyOn(process.stdout, "write").mockImplementation(((c: unknown) => {
@@ -95,7 +95,7 @@ function makeFixture(): { root: string; binDir: string; cwdDir: string; configPa
 
 // Run `fn` with cwd/PATH/fetch swapped to the fixture and restored afterward — the same three
 // ambient inputs production main() reads (config containment root, bin resolution, registry probe).
-async function inFixture(fx: { binDir: string; cwdDir: string }, fn: () => Promise<void>): Promise<void> {
+async function inFixture(fx: { binDir: string; cwdDir: string }, fn: () => Promise<unknown>): Promise<void> {
   const prevCwd = process.cwd();
   const prevPath = process.env.PATH;
   const prevFetch = globalThis.fetch;
