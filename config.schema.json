@@ -89,6 +89,19 @@
         "branches": { "type": ["integer", "null"], "minimum": 1, "maximum": 64, "default": 4, "description": "Max branch-units scanned concurrently PER REPO (default 4; null = default). Unrelated to the root-level 'branches' allow/deny list, which shares only the name." }
       }
     },
+    "timeouts": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "Per-category spawn deadlines plus the heartbeat cadence, in SECONDS. Optional and per-field defaulted: override one knob (e.g. bulkApiSeconds on a slow VPN) and inherit the rest. null (or omitted) = use all defaults. Excluded from config_hash (raising a timeout never orphans resumable work).",
+      "properties": {
+        "controlApiSeconds": { "type": "integer", "minimum": 1, "default": 300, "description": "Deadline for quick control calls: gh auth/version/rate_limit/user, GraphQL, and repo/branch listings." },
+        "bulkApiSeconds": { "type": "integer", "minimum": 1, "default": 900, "description": "Deadline for raw content reads (file/blob/recursive-tree GETs) — larger than control so a big read on a slow-but-live link is not a deterministic failure." },
+        "cloneSeconds": { "type": "integer", "minimum": 1, "default": 900, "description": "Deadline for the hardened shallow git clone fallback." },
+        "tarSeconds": { "type": "integer", "minimum": 1, "default": 900, "description": "Deadline for registry tarball extraction." },
+        "probeSeconds": { "type": "integer", "minimum": 1, "default": 10, "description": "Deadline reserved for the connectivity/recovery probe (validated now; consumed by the outage-lifecycle work in a later PR)." },
+        "heartbeatSeconds": { "type": "integer", "minimum": 1, "default": 30, "description": "Cadence of the liveness heartbeat emitted when the run is otherwise quiet (not a spawn deadline)." }
+      }
+    },
     "packages": {
       "type": "array",
       "minItems": 1,

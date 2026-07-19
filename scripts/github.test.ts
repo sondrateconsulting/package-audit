@@ -5,14 +5,17 @@ import { tmpdir, devNull } from "node:os";
 import { join, dirname } from "node:path";
 import {
   GithubClient, GithubApiError, ThrottleExhausted, MAX_PAGES, MAX_PAUSE_MS, SPAWN_TIMEOUT_MS, MAX_TOTAL_PAUSE_MS, SPAWN_KILL_GRACE_MS,
+  DEFAULT_CONTROL_API_TIMEOUT_MS, DEFAULT_BULK_API_TIMEOUT_MS, DEFAULT_CLONE_TIMEOUT_MS, DEFAULT_TAR_TIMEOUT_MS, DEFAULT_PROBE_TIMEOUT_MS,
   parseGhApiOutput, parseLinkNext, nextEndpointFromLink, parseRetryAfterMs,
   classifyRest, classifyGraphql, parseGraphqlEnvelope, parseTreeResponse, encodeContentsPath, mapRestRepo, filterSortCapRepos,
   buildGhEnv, buildGitEnv, buildTarEnv, readCapped, makeRealSpawn, joinSpawnOutcome,
   type SpawnFn, type SpawnResult, type RepoInfo, type SpawnAbortSignal, type StreamReader,
 } from "./github.ts";
+import { DEFAULT_TIMEOUTS } from "./config.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import { AuditDb } from "./db.ts";
 import { compileRepositoryPolicy } from "./repositoryPolicy.ts";
+import { createNetworkReporter, type NetworkEvent } from "./netEvents.ts";
 
 const NO_DENY = compileRepositoryPolicy([]); // empty denylist: filterSortCapRepos behaves as pre-feature
 
@@ -483,9 +486,16 @@ describe("path encoding + repo shaping", () => {
 
 describe("sanitized env construction", () => {
   const base = {
-    HOME: "/home/u", PATH: "/bin", GH_TOKEN: "tok", GH_DEBUG: "api", GIT_ASKPASS: "/evil",
+    HOME: "/home/u", PATH: "/bin", GH_TOKEN: "tok", GITHUB_TOKEN: "", GH_DEBUG: "api", GIT_ASKPASS: "/evil",
     GIT_SSH_COMMAND: "evil", TAR_OPTIONS: "--evil", GH_CONFIG_DIR: "/cfg", XDG_CONFIG_HOME: "/xdg",
     EMPTY: "",
+    // §H3/H4 transport env (T10): the FULL proxy family (upper AND lower case), OpenSSL + libcurl CA
+    // pointers, keyring. GITHUB_TOKEN above is allowlisted but EMPTY — it must be dropped by the guard.
+    HTTP_PROXY: "http://up-proxy:8080", HTTPS_PROXY: "http://proxy:8080", NO_PROXY: "localhost", ALL_PROXY: "socks5://p",
+    http_proxy: "http://lc-http:8080", https_proxy: "http://lc-proxy:8080", no_proxy: "127.0.0.1", all_proxy: "socks5://lc-p",
+    SSL_CERT_FILE: "/etc/ssl/corp.pem", SSL_CERT_DIR: "/etc/ssl/certs",
+    GIT_SSL_CAINFO: "/etc/ssl/git-ca.pem", GIT_SSL_CAPATH: "/etc/ssl/gitdir", CURL_CA_BUNDLE: "/etc/ssl/curl.pem",
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus", XDG_RUNTIME_DIR: "/run/user/1000",
   };
   test("gh env: pins + auth passthrough, no debug/askpass leakage", () => {
     const env = buildGhEnv(base, "ghe.corp.com");
@@ -496,6 +506,24 @@ describe("sanitized env construction", () => {
     expect(env["GH_CONFIG_DIR"]).toBe("/cfg"); // auth state passthrough
     expect(env["GH_DEBUG"]).toBeUndefined();
     expect(env["GIT_ASKPASS"]).toBeUndefined();
+    // §H3/H4 (T10): the WHOLE proxy family (upper AND lower), OpenSSL cert pointers, keyring survive
+    expect(env["HTTP_PROXY"]).toBe("http://up-proxy:8080");
+    expect(env["HTTPS_PROXY"]).toBe("http://proxy:8080");
+    expect(env["NO_PROXY"]).toBe("localhost");
+    expect(env["ALL_PROXY"]).toBe("socks5://p");
+    expect(env["http_proxy"]).toBe("http://lc-http:8080");
+    expect(env["https_proxy"]).toBe("http://lc-proxy:8080");
+    expect(env["no_proxy"]).toBe("127.0.0.1");
+    expect(env["all_proxy"]).toBe("socks5://lc-p");
+    expect(env["GITHUB_TOKEN"]).toBeUndefined(); // allowlisted but EMPTY → dropped by the empty-value guard
+    expect(env["SSL_CERT_FILE"]).toBe("/etc/ssl/corp.pem");
+    expect(env["SSL_CERT_DIR"]).toBe("/etc/ssl/certs");
+    expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBe("unix:path=/run/user/1000/bus");
+    expect(env["XDG_RUNTIME_DIR"]).toBe("/run/user/1000");
+    // git/curl-only CA pointers are NOT copied into gh's env (the Go-based gh ignores them)
+    expect(env["GIT_SSL_CAINFO"]).toBeUndefined();
+    expect(env["GIT_SSL_CAPATH"]).toBeUndefined();
+    expect(env["CURL_CA_BUNDLE"]).toBeUndefined();
   });
   test("git env: ALL config pinned; injection vectors never copied; gh auth survives for the helper", () => {
     const env = buildGitEnv(base, "/tmp/x/gitconfig");
@@ -509,12 +537,41 @@ describe("sanitized env construction", () => {
     // config-dir auth must survive for private clones
     expect(env["GH_TOKEN"]).toBe("tok");
     expect(env["GH_CONFIG_DIR"]).toBe("/cfg");
+    // §H3/H4 (T10): git does the actual TLS clone, so it ALSO carries the transport env AND the
+    // libcurl CA pointers, plus DBus/runtime for the `gh auth git-credential` keyring child.
+    expect(env["HTTP_PROXY"]).toBe("http://up-proxy:8080");
+    expect(env["HTTPS_PROXY"]).toBe("http://proxy:8080");
+    expect(env["NO_PROXY"]).toBe("localhost");
+    expect(env["ALL_PROXY"]).toBe("socks5://p");
+    expect(env["http_proxy"]).toBe("http://lc-http:8080");
+    expect(env["https_proxy"]).toBe("http://lc-proxy:8080");
+    expect(env["no_proxy"]).toBe("127.0.0.1");
+    expect(env["all_proxy"]).toBe("socks5://lc-p");
+    expect(env["GITHUB_TOKEN"]).toBeUndefined(); // allowlisted but EMPTY → dropped by the empty-value guard
+    expect(env["SSL_CERT_FILE"]).toBe("/etc/ssl/corp.pem");
+    expect(env["SSL_CERT_DIR"]).toBe("/etc/ssl/certs");
+    expect(env["GIT_SSL_CAINFO"]).toBe("/etc/ssl/git-ca.pem");
+    expect(env["GIT_SSL_CAPATH"]).toBe("/etc/ssl/gitdir");
+    expect(env["CURL_CA_BUNDLE"]).toBe("/etc/ssl/curl.pem");
+    expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBe("unix:path=/run/user/1000/bus");
+    expect(env["XDG_RUNTIME_DIR"]).toBe("/run/user/1000");
   });
-  test("tar env: TAR_OPTIONS never copied; empty base values not copied", () => {
+  test("tar env: TAR_OPTIONS never copied; empty base values not copied; no transport env leaks", () => {
     const env = buildTarEnv(base);
     expect(env["TAR_OPTIONS"]).toBeUndefined();
     expect(env["EMPTY"]).toBeUndefined();
     expect(env["PATH"]).toBe("/bin");
+    // tar extracts a locally-fetched tarball — it does no network, so proxy/CA/keyring env never leaks in
+    expect(env["HTTP_PROXY"]).toBeUndefined();
+    expect(env["HTTPS_PROXY"]).toBeUndefined();
+    expect(env["NO_PROXY"]).toBeUndefined();
+    expect(env["ALL_PROXY"]).toBeUndefined();
+    expect(env["http_proxy"]).toBeUndefined();
+    expect(env["https_proxy"]).toBeUndefined();
+    expect(env["no_proxy"]).toBeUndefined();
+    expect(env["all_proxy"]).toBeUndefined();
+    expect(env["SSL_CERT_FILE"]).toBeUndefined();
+    expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBeUndefined();
   });
 });
 
@@ -1772,6 +1829,265 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
     const base = { githubHost: "github.com", env: { HOME: "/tmp", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP };
     expect(() => new GithubClient({ ...base, concurrency: Number.NaN })).toThrow(/concurrency must be >= 1/);
     expect(() => new GithubClient({ ...base, spawnTimeoutMs: Number.NaN })).toThrow(/spawnTimeoutMs must be >= 1/);
+  });
+});
+
+describe("per-category spawn deadlines (T11)", () => {
+  // A never-settling spawn whose kill resolves an empty nonzero result (mirrors the deadline
+  // tests above). The synthetic 124 stderr names the deadline that actually fired, so we can
+  // assert WHICH category routed the call without depending on wall-clock timing. Backoff sleeps
+  // are instant so the retry loop finishes fast.
+  const stall = (timeouts: Partial<{ controlApiMs: number; bulkApiMs: number; cloneMs: number; tarMs: number; probeMs: number }>) =>
+    new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => {
+          opts.signal?.onAbort(() => resolve({ exitCode: 137, stdout: "", stderr: "killed" }));
+        }),
+      sleepImpl: async () => {},
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      timeouts,
+    });
+
+  test("a control call (rate_limit) times out on controlApiMs, never the bulk budget", async () => {
+    const client = stall({ controlApiMs: 11, bulkApiMs: 9_000_000 });
+    await expect(client.restGet("rate_limit")).rejects.toThrow(/spawn timed out after 11ms/);
+  });
+  test("a bulk raw-blob read times out on bulkApiMs, never the control budget", async () => {
+    const client = stall({ controlApiMs: 9_000_000, bulkApiMs: 12 });
+    await expect(client.fetchBlobRaw("o", "r", "a".repeat(40))).rejects.toThrow(/spawn timed out after 12ms/);
+  });
+  test("a bulk raw-file read times out on bulkApiMs, never the control budget", async () => {
+    const client = stall({ controlApiMs: 9_000_000, bulkApiMs: 17 });
+    await expect(client.fetchFileRaw("o", "r", "src/index.ts", "a".repeat(40))).rejects.toThrow(/spawn timed out after 17ms/);
+  });
+  test("a bulk recursive-tree read times out on bulkApiMs", async () => {
+    const client = stall({ controlApiMs: 9_000_000, bulkApiMs: 13 });
+    await expect(client.fetchTreeRecursive("o", "r", "a".repeat(40))).rejects.toThrow(/spawn timed out after 13ms/);
+  });
+  test("a tar spawn times out on tarMs", async () => {
+    const client = stall({ controlApiMs: 9_000_000, tarMs: 14 });
+    const res = await client.tar(["--version"]);
+    expect(res.stderr).toMatch(/spawn timed out after 14ms/);
+  });
+  test("a clone times out on cloneMs, never the control budget", async () => {
+    const client = stall({ controlApiMs: 9_000_000, cloneMs: 15 });
+    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/spawn timed out after 15ms/);
+  });
+
+  // graphql() and bare gh() route through the control-API budget; only restGet was deadline-tested.
+  // EVERY category gets a short DISTINCT budget, so a routing mutant to ANY of them fires in tens of ms
+  // (the assertion pins "after 11ms" = controlApiMs) instead of hanging to the runner timeout. (5b)
+  test("a graphql call times out on controlApiMs, never any other category's budget", async () => {
+    const client = stall({ controlApiMs: 11, bulkApiMs: 21, cloneMs: 31, tarMs: 41, probeMs: 51 });
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/spawn timed out after 11ms/);
+  });
+  test("a bare gh control call (--version) times out on controlApiMs, never any other category's budget", async () => {
+    const client = stall({ controlApiMs: 11, bulkApiMs: 21, cloneMs: 31, tarMs: 41, probeMs: 51 });
+    const res = await client.gh(["--version"]);
+    expect(res.stderr).toMatch(/spawn timed out after 11ms/);
+  });
+  test("the uniform spawnTimeoutMs override still applies to every category (back-compat)", async () => {
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => { opts.signal?.onAbort(() => resolve({ exitCode: 137, stdout: "", stderr: "killed" })); }),
+      env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP, spawnTimeoutMs: 16,
+    });
+    const res = await client.tar(["--version"]);
+    expect(res.stderr).toMatch(/spawn timed out after 16ms/);
+  });
+  test("a per-category override < 1 (or NaN) is rejected at construction like the uniform knob", () => {
+    const base = { githubHost: "github.com", env: { HOME: "/tmp", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP };
+    expect(() => new GithubClient({ ...base, timeouts: { cloneMs: 0 } })).toThrow(/timeouts\.cloneMs must be >= 1/);
+    expect(() => new GithubClient({ ...base, timeouts: { bulkApiMs: Number.NaN } })).toThrow(/timeouts\.bulkApiMs must be >= 1/);
+  });
+  test("the client's ms defaults stay in lockstep with config's second defaults (no silent drift)", () => {
+    // Two independent default sources — config.ts seconds vs github.ts ms — must agree, since a
+    // GithubClient built without an orchestrate-supplied `timeouts` (tests, or a future direct
+    // caller) falls back to the github.ts constants while operators reason in config seconds.
+    expect(DEFAULT_TIMEOUTS.controlApiSeconds * 1000).toBe(DEFAULT_CONTROL_API_TIMEOUT_MS);
+    expect(DEFAULT_TIMEOUTS.bulkApiSeconds * 1000).toBe(DEFAULT_BULK_API_TIMEOUT_MS);
+    expect(DEFAULT_TIMEOUTS.cloneSeconds * 1000).toBe(DEFAULT_CLONE_TIMEOUT_MS);
+    expect(DEFAULT_TIMEOUTS.tarSeconds * 1000).toBe(DEFAULT_TAR_TIMEOUT_MS);
+    expect(DEFAULT_TIMEOUTS.probeSeconds * 1000).toBe(DEFAULT_PROBE_TIMEOUT_MS);
+  });
+});
+
+describe("network event emission (T7)", () => {
+  // gh api -i wire format: status line + headers, blank line, body. The client parses this exactly
+  // as it parses real gh output, so these drive the real retry/throttle classification.
+  const wire = (status: number, headers: Record<string, string>, body = ""): string => {
+    const head = [`HTTP/2.0 ${status} X`, ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`)].join("\r\n");
+    return `${head}\r\n\r\n${body}`;
+  };
+
+  test("emits a retry{reason:no-response} on each transient no-response attempt (not the final throw)", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient(Array<SpawnResult>(6).fill(err("")), { events: (e) => events.push(e) });
+    await expect(client.restGet("rate_limit")).rejects.toThrow(/no HTTP response/);
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(5); // MAX_ATTEMPTS-1 — the final attempt throws, no retry follows
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "no-response", endpoint: "rate_limit", attempt: 0, maxAttempts: 6 });
+  });
+
+  test("emits a retry{reason:http-5xx} on a transient 5xx that then recovers", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient([ok(wire(503, {}, "")), ok(wire(200, {}, `{"ok":1}`))], { events: (e) => events.push(e) });
+    await client.restGet("rate_limit");
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "http-5xx", endpoint: "rate_limit", attempt: 0 });
+  });
+
+  test("emits a throttle{kind:primary} when a 403 primary rate-limit is hit", async () => {
+    const events: NetworkEvent[] = [];
+    const reset = String(1_000_000_000 + 60); // 60s ahead of the fake clock (1_000_000_000_000 ms)
+    const { client } = makeClient(
+      [ok(wire(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": reset }, "{}")), ok(wire(200, {}, `{"ok":1}`))],
+      { events: (e) => events.push(e) },
+    );
+    await client.restGet("rate_limit");
+    const throttles = events.filter((e) => e.kind === "throttle");
+    expect(throttles).toHaveLength(1);
+    expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "core", waitKind: "primary" });
+  });
+
+  // restGet and graphql each build their own retry/throttle telemetry inline — the piece they SHARE is
+  // ghBucketedAttempt's arm-the-pause-inside-the-lease, not a reporting helper. This pins that the
+  // graphql path stamps its OWN endpoint label ("graphql"), never restGet's.
+  test("graphql emits retry{reason:no-response, endpoint:graphql} on each transient attempt (not the final throw)", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient(Array<SpawnResult>(6).fill(err("")), { events: (e) => events.push(e) });
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/no HTTP response/);
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(5); // MAX_ATTEMPTS-1
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "no-response", endpoint: "graphql", attempt: 0, maxAttempts: 6 });
+  });
+
+  test("graphql emits retry{reason:http-5xx, endpoint:graphql} on a transient 5xx that recovers", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient([ok(wire(503, {}, "")), ok(wire(200, {}, `{"data":{"x":1}}`))], { events: (e) => events.push(e) });
+    await client.graphql("query{x}", {});
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "http-5xx", endpoint: "graphql", attempt: 0 });
+  });
+
+  // A truncated-transport re-drive (HTTP-200 head + nonzero exit) IS a retry — it must be emitted and
+  // counted, not re-driven silently. Previously restGet/graphql slept-and-continued without emitting,
+  // so retryTotal undercounted exactly the churn a flaky link produces most (see finding IMPORTANT-1).
+  test("emits a retry{reason:transport-truncated} on a truncated 200 that then recovers", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient(
+      [err(http(200, {}, "partial"), "read: connection reset"), ok(wire(200, {}, `{"ok":1}`))],
+      { events: (e) => events.push(e) },
+    );
+    await client.restGet("rate_limit");
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "transport-truncated", endpoint: "rate_limit", attempt: 0, maxAttempts: 6 });
+  });
+
+  test("graphql emits retry{reason:transport-truncated, endpoint:graphql} on a truncated envelope that recovers", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient(
+      [err(http(200, {}, ""), "curl: (56) Recv failure: Connection reset by peer"), ok(http(200, {}, `{"data":{"x":1}}`))],
+      { events: (e) => events.push(e) },
+    );
+    await client.graphql("query{x}", {});
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "transport-truncated", endpoint: "graphql", attempt: 0, maxAttempts: 6 });
+  });
+
+  test("a PERSISTENT truncated 200 emits MAX_ATTEMPTS-1 transport-truncated retries — the final attempt throws, no retry follows", async () => {
+    const events: NetworkEvent[] = [];
+    const truncated = err(http(200, {}, "partial"), "read: connection reset");
+    const { client } = makeClient(Array<SpawnResult>(6).fill(truncated), { events: (e) => events.push(e) });
+    await expect(client.restGet("rate_limit")).rejects.toThrow(/truncated/);
+    const retries = events.filter((e) => e.kind === "retry" && e.reason === "transport-truncated");
+    expect(retries).toHaveLength(5); // MAX_ATTEMPTS-1 — no retry line on the final throwing attempt
+  });
+
+  // graphql's truncated re-drive is a SEPARATE branch from restGet's; pin its final-attempt behavior too.
+  test("a PERSISTENT truncated graphql envelope emits MAX_ATTEMPTS-1 transport-truncated retries — none on the final throw", async () => {
+    const events: NetworkEvent[] = [];
+    const truncated = err(http(200, {}, ""), "curl: (56) Recv failure: Connection reset by peer");
+    const { client } = makeClient(Array<SpawnResult>(6).fill(truncated), { events: (e) => events.push(e) });
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/unparseable JSON body/);
+    const retries = events.filter((e) => e.kind === "retry" && e.reason === "transport-truncated");
+    expect(retries).toHaveLength(5); // MAX_ATTEMPTS-1 — graphql's final attempt throws without a retry line
+  });
+
+  test("the reporter counts a truncated re-drive in retryTotal AND serializes reason:transport-truncated", async () => {
+    const emitted: Array<Record<string, unknown>> = [];
+    const reporter = createNetworkReporter({ emit: (e) => emitted.push(e) }); // capture the reporter's SERIALIZED output
+    const { client } = makeClient(
+      [err(http(200, {}, "partial"), "read: connection reset"), ok(wire(200, {}, `{"ok":1}`))],
+      { events: (e) => reporter.emit(e) },
+    );
+    await client.restGet("rate_limit");
+    expect(reporter.counters().retryTotal).toBe(1);
+    // the reporter's OUTPUT line carries the new reason end-to-end (not just the internal counter)
+    const retries = emitted.filter((e) => e["event"] === "retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ event: "retry", reason: "transport-truncated", endpoint: "rate_limit" });
+  });
+
+  test("graphql emits throttle{bucket:graphql, waitKind:primary} on a primary rate-limit", async () => {
+    const events: NetworkEvent[] = [];
+    const reset = String(1_000_000_000 + 60); // 60s ahead of the fake clock
+    const { client } = makeClient(
+      [ok(wire(429, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": reset }, "{}")), ok(wire(200, {}, `{"data":{"x":1}}`))],
+      { events: (e) => events.push(e) },
+    );
+    await client.graphql("query{x}", {});
+    const throttles = events.filter((e) => e.kind === "throttle");
+    expect(throttles).toHaveLength(1);
+    expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "graphql", waitKind: "primary" });
+  });
+
+  // Only the PRIMARY throttle shape was asserted end-to-end; the SECONDARY branch (429/abuse with
+  // remaining>0) that constructs its own event in restGet and graphql was unexercised. (IMPORTANT-5c)
+  test("emits a throttle{waitKind:secondary} on a 429 with remaining>0 (restGet)", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient([ok(wire(429, { "x-ratelimit-remaining": "5" }, "{}")), ok(wire(200, {}, `{"ok":1}`))], { events: (e) => events.push(e) });
+    await client.restGet("rate_limit");
+    const throttles = events.filter((e) => e.kind === "throttle");
+    expect(throttles).toHaveLength(1);
+    expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "core", waitKind: "secondary" });
+  });
+
+  test("graphql emits a throttle{bucket:graphql, waitKind:secondary} on a RATE_LIMITED envelope with remaining>0", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient(
+      [ok(wire(200, { "x-ratelimit-remaining": "50" }, `{"errors":[{"type":"RATE_LIMITED"}]}`)), ok(wire(200, {}, `{"data":{"x":1}}`))],
+      { events: (e) => events.push(e) },
+    );
+    await client.graphql("query{x}", {});
+    const throttles = events.filter((e) => e.kind === "throttle");
+    expect(throttles).toHaveLength(1);
+    expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "graphql", waitKind: "secondary" });
+  });
+
+  test("emits a spawn-timeout when a child outruns its deadline", async () => {
+    const events: NetworkEvent[] = [];
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: (_bin, _args, opts) =>
+        new Promise<SpawnResult>((resolve) => { opts.signal?.onAbort(() => resolve({ exitCode: 137, stdout: "", stderr: "killed" })); }),
+      sleepImpl: async () => {},
+      env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: TEST_TMP,
+      timeouts: { tarMs: 15 },
+      events: (e) => events.push(e),
+    });
+    await client.tar(["--version"]); // times out at 15ms
+    const st = events.filter((e) => e.kind === "spawn-timeout");
+    expect(st.length).toBeGreaterThanOrEqual(1);
+    expect(st[0]).toMatchObject({ kind: "spawn-timeout", bin: BINS.tar, ms: 15 });
   });
 });
 

@@ -35,7 +35,7 @@ export function assertRunId(value: string): string {
 const CONFIG_PRECEDENCE = "Config path precedence: --config <path> > CONFIG_PATH env > ./config.json";
 
 export const ORCHESTRATE_USAGE =
-  "Usage: bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] [--rescan-branch <org>/<repo>@<branch>]... [--help]";
+  "Usage: bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] [--rescan-branch <org>/<repo>@<branch>]... [--verbose-units] [--help]";
 
 export const ORCHESTRATE_HELP = `package-audit — READ-ONLY npm-package-usage audit over GitHub orgs (gh CLI + Bun + SQLite)
 
@@ -52,6 +52,9 @@ Flags:
   --purge-cache       Only valid with --fresh: ALSO drop the caches (the real full wipe).
   --rescan-branch <org>/<repo>@<branch>
                       Force one branch unit back to pending (repeatable).
+  --verbose-units     Emit a per-unit skip-current/skip-cutoff line for every reused or
+                      cutoff branch. Off by default (a per-repo repo-done rollup summarizes
+                      them instead), so a resume of a large estate stays readable.
   --help, -h          Show this help and exit.
 
 The audit writes <outputDir>/run-<run_id>.json and <outputDir>/latest.json when it completes;
@@ -90,6 +93,7 @@ export interface OrchestrateArgs {
   readonly fresh: boolean;
   readonly purgeCache: boolean;
   readonly rescanBranches: readonly RescanTarget[]; // de-duplicated, order-stable
+  readonly verboseUnits: boolean; // T8: emit per-unit skip-current/skip-cutoff lines (default: repo-done rollup)
   readonly help: boolean; // --help/-h seen anywhere: print help, do nothing else
 }
 
@@ -115,7 +119,7 @@ const isHelpFlag = (a: string): boolean => a === "--help" || a === "-h";
 
 // A flag that consumes the following token as its value (or the `--flag=value` attached form).
 const VALUE_FLAGS = new Set(["--config", "--rescan-branch"]);
-const BOOL_FLAGS = new Set(["--fresh", "--purge-cache", "--plan"]);
+const BOOL_FLAGS = new Set(["--fresh", "--purge-cache", "--plan", "--verbose-units"]);
 
 // Normalize `--flag=value` into flag + attached value (shared by both parsers).
 function splitFlag(arg: string): { flag: string; attached: string | null } {
@@ -134,12 +138,13 @@ function requireValue(flag: string, attached: string | null, next: string | unde
 }
 
 export function parseArgs(argv: string[]): OrchestrateArgs {
-  if (argv.some(isHelpFlag)) return { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: true };
+  if (argv.some(isHelpFlag)) return { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: true };
 
   let configPath: string | null = null;
   let plan = false;
   let fresh = false;
   let purgeCache = false;
+  let verboseUnits = false;
   const rescanBranches: RescanTarget[] = [];
   const seen = new Set<string>(); // dedup rescan targets by org\0repo\0branch
 
@@ -151,6 +156,7 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
       if (attached !== null) fail(`${flag} takes no value`);
       if (flag === "--fresh") fresh = true;
       else if (flag === "--plan") plan = true;
+      else if (flag === "--verbose-units") verboseUnits = true;
       else purgeCache = true;
       continue;
     }
@@ -182,7 +188,7 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
   // reject the misleading combination rather than silently ignoring it (§3 CLI flags).
   if (purgeCache && !fresh) fail("--purge-cache requires --fresh (it only purges caches during a --fresh rebuild)");
 
-  return { configPath, plan, fresh, purgeCache, rescanBranches, help: false };
+  return { configPath, plan, fresh, purgeCache, rescanBranches, verboseUnits, help: false };
 }
 
 // ---- report arguments -----------------------------------------------------------------------

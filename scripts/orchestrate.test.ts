@@ -2,7 +2,9 @@ import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
+import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, githubDeadlines, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, RunProgress, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
+import { parseEvents } from "./testEvents.test.ts";
+import type { HeartbeatController } from "./heartbeat.ts";
 import type { TreeEntry } from "./unitPipeline.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
@@ -10,8 +12,10 @@ import { compileRepositoryPolicy, RepoPolicyMatchError } from "./repositoryPolic
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type RepoInfo, type SpawnFn } from "./github.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { Aborter } from "./boundedPool.ts";
-import type { Config } from "./config.ts";
+import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
 import type { OrchestrateArgs } from "./args.ts";
+import { setLogSink, resetLogSink, loggerStats, flushLogs, type LogSink } from "./log.ts";
+import type { NetworkReporter } from "./netEvents.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
 
@@ -163,7 +167,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       maxReposPerOrg: null,
       maxBranchesPerRepo: 25,
       cutoffDate: "2024-01-01",
-      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
       excludeDirGlobs: [],
       paths: { sqlitePath: join(root, "never-created.db"), outputDir: root },
@@ -201,7 +205,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     const config: Config = {
       githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [], excludeRepositories: [], includePersonalNamespace: false,
       includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
-      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
       excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
     };
@@ -237,7 +241,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [],
       excludeRepositories: ["org-a/legacy-*"], // case-insensitive → matches "org-a/Legacy-API"
       includePersonalNamespace: false, includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
-      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
       excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
     };
@@ -301,7 +305,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       githubHost: "github.com", organizations: [...OWNERS], excludeOrganizations: [], branches: null, excludeBranches: [],
       excludeRepositories: ["*/legacy-*"], // cross-org, case-insensitive
       includePersonalNamespace: false, includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
-      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
       excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
     };
@@ -333,7 +337,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
 const testConfig = (root: string, maxBranchesPerRepo = 25): Config => ({
   githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [], excludeRepositories: [], includePersonalNamespace: false,
   includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo, cutoffDate: "2024-01-01",
-  concurrency: { organizations: 1, repositories: 1, branches: 1 },
+  concurrency: { organizations: 1, repositories: 1, branches: 1 }, timeouts: DEFAULT_TIMEOUTS,
   packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
   excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
 });
@@ -350,8 +354,17 @@ async function captureJsonl(fn: () => Promise<unknown>): Promise<Array<Record<st
   } finally {
     spy.mockRestore();
   }
-  return chunks.join("").split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
+  return parseEvents(chunks.join("")); // T6: asserts + strips the ts each logLine event carries
 }
+
+describe("githubDeadlines (T11 config seconds → client ms)", () => {
+  test("maps each spawn category from seconds to ms; heartbeat (not a spawn deadline) is omitted", () => {
+    const root = mkdtempSync(join(tmpdir(), "deadlines-"));
+    const cfg: Config = { ...testConfig(root), timeouts: { controlApiSeconds: 1, bulkApiSeconds: 2, cloneSeconds: 3, tarSeconds: 4, probeSeconds: 5, heartbeatSeconds: 6 } };
+    expect(githubDeadlines(cfg)).toEqual({ controlApiMs: 1000, bulkApiMs: 2000, cloneMs: 3000, tarMs: 4000, probeMs: 5000 });
+    rmSync(root, { recursive: true, force: true });
+  });
+});
 
 describe("runPlan cache-less client guard (--plan zero-write)", () => {
   test("rejects a caching (db-backed) client before any discovery call", async () => {
@@ -637,6 +650,95 @@ describe("runPlan org-level discovery failure (fail-soft continue)", () => {
   });
 });
 
+describe("RunProgress (T8: phase/unit-start events + heartbeat plumbing)", () => {
+  function fakeHeartbeat(): { controller: HeartbeatController; calls: string[]; target: () => string | null; inFlight: () => number } {
+    const calls: string[] = [];
+    let target: string | null = null;
+    let inFlight = 0;
+    const controller: HeartbeatController = {
+      setPhase: (p) => calls.push(`phase:${p}`),
+      setTarget: (t, n = 0) => { target = t; inFlight = n; calls.push(`target:${t}:${n}`); },
+      setUnitsDone: (n) => calls.push(`units:${n}`),
+      tick: () => {},
+      stop: () => {},
+    };
+    return { controller, calls, target: () => target, inFlight: () => inFlight };
+  }
+
+  test("phase emits a `phase` event, sets the heartbeat phase, AND clears every in-flight target", async () => {
+    const hb = fakeHeartbeat();
+    const events = await captureJsonl(async () => new RunProgress(hb.controller, false).phase("scan"));
+    expect(events).toContainEqual({ event: "phase", phase: "scan" });
+    // a new phase means no unit from the prior phase is in flight — targets are cleared so heartbeats
+    // don't name a stale "current" branch during reconciliation/report.
+    expect(hb.calls).toEqual(["phase:scan", "target:null:0"]);
+  });
+
+  test("startUnit emits a unit action:start AND points the heartbeat at the target (inFlight:1)", async () => {
+    const hb = fakeHeartbeat();
+    let token: unknown;
+    const events = await captureJsonl(async () => { token = new RunProgress(hb.controller, false).startUnit("org-a", "svc", "main", "abc"); });
+    expect(events).toContainEqual({ event: "unit", org: "org-a", repo: "svc", branch: "main", commit: "abc", action: "start" });
+    expect(hb.calls).toEqual(["target:org-a/svc@main:1"]);
+    expect(token).toBeDefined();
+  });
+
+  // The heartbeat exists to name the wedged branch during a hang. Under the default concurrent
+  // branch fan-out (branches>1) a single mutable slot loses that: fast siblings finishing would null
+  // or reassign `current` while the slow one still runs. Track per-unit identity and name the OLDEST
+  // still-in-flight unit instead. (finding IMPORTANT-2)
+  test("the heartbeat names the OLDEST in-flight unit while fast siblings finish (concurrent branch fan-out)", () => {
+    const hb = fakeHeartbeat();
+    const p = new RunProgress(hb.controller, false);
+    const a = p.startUnit("o", "r", "slow", "1");
+    const b = p.startUnit("o", "r", "fastB", "2");
+    const c = p.startUnit("o", "r", "fastC", "3");
+    const d = p.startUnit("o", "r", "fastD", "4");
+    expect(hb.target()).toBe("o/r@slow");
+    expect(hb.inFlight()).toBe(4);
+    // the three fast siblings finish; the wedged branch keeps naming itself — not null, not a sibling
+    p.unitDone(b);
+    p.unitDone(c);
+    p.unitDone(d);
+    expect(hb.target()).toBe("o/r@slow");
+    expect(hb.inFlight()).toBe(1);
+    p.unitDone(a);
+    expect(hb.target()).toBeNull();
+    expect(hb.inFlight()).toBe(0);
+  });
+
+  test("a token-less unitDone (skip-current / skip-cutoff) advances the counter but never clears a sibling's in-flight target", () => {
+    const hb = fakeHeartbeat();
+    const p = new RunProgress(hb.controller, false);
+    p.startUnit("o", "r", "scanning", "1"); // a real scan is in flight in one fiber
+    p.unitDone(); // a skip in a sibling fiber — no token, so it must NOT clobber the running scan's target
+    expect(hb.target()).toBe("o/r@scanning");
+    expect(hb.inFlight()).toBe(1);
+    expect(hb.calls).toContain("units:1");
+  });
+
+  test("a started unit abandoned on a fatal releases its in-flight slot (no leak)", () => {
+    const hb = fakeHeartbeat();
+    const p = new RunProgress(hb.controller, false);
+    const a = p.startUnit("o", "r", "fatal", "1");
+    p.startUnit("o", "r", "survivor", "2");
+    p.abandonUnit(a); // a PolicyMatchError escaped before unitDone — its slot must still be released
+    expect(hb.target()).toBe("o/r@survivor");
+    expect(hb.inFlight()).toBe(1);
+  });
+
+  test("a null heartbeat makes the liveness updates no-ops while events still emit", async () => {
+    const events = await captureJsonl(async () => {
+      const p = new RunProgress(null, false);
+      p.phase("report");
+      const t = p.startUnit("o", "r", "x", "1");
+      p.unitDone(t); // no heartbeat → no throw
+      p.unitDone(); // token-less skip → no throw
+    });
+    expect(events).toContainEqual({ event: "phase", phase: "report" });
+  });
+});
+
 describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-cap untouched)", () => {
   // defaultBranch is REQUIRED and explicit: inferring it (a hardcoded "main", or "the first head")
   // would make a fixture agree with whatever the code resolved and hide a default-resolution defect.
@@ -675,7 +777,9 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
 
     const events = await captureJsonl(async () => {
-      await processRepo(db, client, rt(testConfig(root, 1), "h"), runId, "org-a", repo, [], new Set());
+      // --verbose-units so the per-unit skip lines are emitted (the default rolls them into repo-done);
+      // this test pins the skip-current/skip-cutoff CLASSIFICATION, so it wants the per-unit view.
+      await processRepo(db, client, rt(testConfig(root, 1), "h"), runId, "org-a", repo, [], new Set(), new Set(), undefined, undefined, new RunProgress(null, true));
     });
 
     // run_unit_head: stale → skipped-cutoff (empty sha), main+dev → scanned at their live heads with
@@ -765,6 +869,73 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
     ).rejects.toThrow(/scheduled twice/);
     // a DISTINCT repo in the SAME shared set is unaffected (no false positive — different canonical key)
     await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", { ...repo, name: "other" }, [], new Set(), shared));
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("T8 default: per-unit skip lines are ROLLED UP into one repo-done (no --verbose-units)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wiring-rollup-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const key = (branch: string): WorkUnitKey => ({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch });
+    // main + dev pre-seeded done at their live heads → both take the §3 skip-current (reused) path;
+    // stale is pre-cutoff → skip-cutoff. Default (non-verbose) progress rolls all three into repo-done.
+    db.enqueueUnit(key("main"), runId);
+    db.setUnitStatus(key("main"), { status: "done", runId, lastCommitSha: hexOid("o-main"), lastCommitDate: "2025-06-01T00:00:00Z" });
+    db.enqueueUnit(key("dev"), runId);
+    db.setUnitStatus(key("dev"), { status: "done", runId, lastCommitSha: hexOid("o-dev"), lastCommitDate: "2025-05-01T00:00:00Z" });
+    const client = makeClient(root, async () => ({ exitCode: 0, stderr: "", stdout: graphqlHeads([
+      { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+      { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
+      { name: "stale", oid: hexOid("o-stale"), date: "2023-06-01T00:00:00Z" },
+    ], "main") }));
+    const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+
+    const events = await captureJsonl(async () => {
+      await processRepo(db, client, rt(testConfig(root, 1), "h"), runId, "org-a", repo, [], new Set()); // default progress: verboseUnits=false
+    });
+
+    // no per-unit skip-current/skip-cutoff lines by default…
+    const unitActions = events.filter((e) => e["event"] === "unit").map((e) => e["action"]);
+    expect(unitActions).not.toContain("skip-current");
+    expect(unitActions).not.toContain("skip-cutoff");
+    // …exactly one repo-done rollup with the true tally
+    const rollups = events.filter((e) => e["event"] === "repo-done");
+    expect(rollups).toHaveLength(1);
+    expect(rollups[0]).toEqual({ event: "repo-done", org: "org-a", repo: "svc", scanned: 0, reused: 2, skippedCutoff: 1, errored: 0, deferred: 0 });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("T8 scanned units emit a unit action:start + scanned, and a repo-done rollup counts them", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wiring-start-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "configured",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const client = makeClient(root, async (_bin, args) =>
+      args.some((a) => a === "graphql")
+        ? { exitCode: 0, stderr: "", stdout: graphqlHeads([
+            { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" },
+            { name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" },
+          ], "main") }
+        : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    const repo: RepoInfo = { name: "svc", organization: "org-a", pushedAt: "2025-01-01T00:00:00Z", archived: false, fork: false, isPrivate: false };
+
+    const events = await captureJsonl(async () => {
+      await processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set());
+    });
+
+    const starts = events.filter((e) => e["event"] === "unit" && e["action"] === "start").map((e) => e["branch"]).sort();
+    const scans = events.filter((e) => e["event"] === "unit" && e["action"] === "scanned").map((e) => e["branch"]).sort();
+    expect(starts).toEqual(["dev", "main"]); // a start precedes each real scan
+    expect(scans).toEqual(["dev", "main"]);
+    const rollups = events.filter((e) => e["event"] === "repo-done");
+    expect(rollups[0]).toEqual({ event: "repo-done", org: "org-a", repo: "svc", scanned: 2, reused: 0, skippedCutoff: 0, errored: 0, deferred: 0 });
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -881,6 +1052,34 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  // Integration cover for the fatal-path token release (orchestrate.ts's `finally { abandonUnit }`):
+  // a PolicyMatchError escapes startUnit before unitDone, so the finally must release the in-flight
+  // slot — otherwise the wedged-then-aborted unit lingers as the heartbeat's `current`. (santa round 2)
+  test("processRepo releases the heartbeat's in-flight target when a unit throws a PolicyMatchError", async () => {
+    const root = mkdtempSync(join(tmpdir(), "policy-token-release-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const injected = new PolicyMatchError("excludeBranches", "x*", "main", new Error("simulated write-time incoherence"));
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    spyOn(db, "upsertRunUnitHead").mockImplementation((h) => {
+      if (h.status === "scanned") throw injected; // the scanned upsert inside processUnit → fatal after startUnit
+      return realUpsert(h);
+    });
+    const client = scanClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main");
+    let target: string | null = "SENTINEL"; // proves setTarget(null) actually ran, not just "was already null"
+    const hb: HeartbeatController = { setPhase: () => {}, setTarget: (t) => { target = t; }, setUnitsDone: () => {}, tick: () => {}, stop: () => {} };
+    let thrown: unknown;
+    await captureJsonl(async () => {
+      try {
+        await processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set(), new Set(), undefined, undefined, new RunProgress(hb, false));
+      } catch (e) { thrown = e; }
+    });
+    expect(thrown).toBe(injected); // the fatal propagated (startUnit ran, unitDone did not)
+    expect(target).toBeNull(); // the finally's abandonUnit released the slot — no wedged unit lingers as `current`
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("runScan marks the run FAILED on a PolicyMatchError and rethrows the original", async () => {
     const root = mkdtempSync(join(tmpdir(), "policy-failrun-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
@@ -890,7 +1089,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], "dev") };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
     const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy, repositoryPolicy: compileRepositoryPolicy([]) };
     let thrown: unknown = null;
     await captureJsonl(async () => {
@@ -942,7 +1141,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
     const client = makeClient(root, async () =>
       ({ exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` }));
-    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
     const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [] }, repositoryPolicy: throwingRepoPolicy };
     let thrown: unknown = null;
     await captureJsonl(async () => {
@@ -1187,7 +1386,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-  const noArgsT7: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const noArgsT7: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
   const policyWarnEvents = (events: Array<Record<string, unknown>>) => events.filter((e) => e["event"] === "policy-warning");
 
   test("runPlan emits an unmatched-pattern warning (before plan-summary) for a deny pattern that matched no branch", async () => {
@@ -1585,6 +1784,26 @@ describe("processRepo throttle requeue (§4)", () => {
     db.close();
   });
 
+  // Every repo-done rollup test pinned deferred/errored at 0; these two exercise the paths that
+  // increment them so a counter regression is caught, not silently rolled up as 0. (IMPORTANT-5d)
+  test("repo-done rolls a throttle-requeued unit up as deferred", async () => {
+    const { db, runId } = openRun();
+    const events = await captureJsonl(async () => {
+      await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), rt(config, "hash"), runId, "o", repo, [], new Set());
+    });
+    expect(events.find((e) => e["event"] === "repo-done")).toMatchObject({ event: "repo-done", deferred: 1, errored: 0, scanned: 0 });
+    db.close();
+  });
+
+  test("repo-done rolls a scan-errored unit up as errored", async () => {
+    const { db, runId } = openRun();
+    const events = await captureJsonl(async () => {
+      await processRepo(db, fakeClient(new GithubApiError("boom", { endpoint: "x" })), rt(config, "hash"), runId, "o", repo, [], new Set());
+    });
+    expect(events.find((e) => e["event"] === "repo-done")).toMatchObject({ event: "repo-done", errored: 1, deferred: 0, scanned: 0 });
+    db.close();
+  });
+
   test("a ThrottleExhausted during a unit's CONTENT fetch requeues the unit — never a silent done", async () => {
     // the api reader degrades ONLY a status-404 to null (file treated as absent); a throttle
     // means the unit was never fully read, and marking it done would let the §3 skip
@@ -1811,7 +2030,7 @@ describe("resolveOwnersWithDiscovery owner-membership throttle (§4, site a)", (
 });
 
 describe("runScan owner-discovery throttle (§4, site a — consumer wiring)", () => {
-  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
 
   test("a throttle during owner discovery ends cleanly WITHOUT starting a run (no phantom run row)", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
@@ -2048,7 +2267,7 @@ describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations
       const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
   const twoOwnerConfig = (root: string) => ({ ...testConfig(root, 25), organizations: ["org-a", "org-b"], concurrency: { organizations: 2, repositories: 2, branches: 1 } });
   const runStatus = (db: AuditDb): string | undefined => (db.read(`SELECT status FROM runs`).get() as { status: string } | null)?.status ?? undefined;
   const scannedOrgs = (db: AuditDb): string[] =>
@@ -2186,5 +2405,64 @@ describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations
     expect(db.read(`SELECT COUNT(*) AS n FROM run_unit_head WHERE organization='org-b' AND repository='r2'`).get()).toEqual({ n: 0 });
     db.close();
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+// The terminal `done` event was never asserted end-to-end: the only prior runScan call exits at the
+// owner-discovery-throttle early return, so its T7 retry/suppressed counters and its {terminal:true}
+// marking were unverified (PR1 review — pr-test-analyzer). Drive runScan to COMPLETION (empty repo
+// discovery → no tree scripting) and prove both, using a backpressured log sink so terminal delivery
+// is exercised, not merely observed on a clear channel.
+describe("runScan terminal `done` event (T7 counters + terminal delivery under backpressure)", () => {
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false };
+
+  test("`done` carries the reporter's retry/suppressed counters AND survives the buffer bound as terminal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "runscan-done-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // Empty repo discovery → runScan reaches completeRun + the `done` line with no branch/tree scripting.
+    const client = { sweepStaleTempDirs: () => [], listOrgRepos: async () => [] } as unknown as GithubClient;
+    // Bin-discovery packument fetch fails fast (discoverCliTerms is fail-soft) → no real network.
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => { throw new Error("offline test"); }) as unknown as typeof fetch);
+    // A reporter with NON-ZERO counters: the `done` line must fold them in.
+    const reporter: NetworkReporter = { emit: () => {}, counters: () => ({ retryTotal: 7, suppressed: 3 }) };
+    // A sink that accepts every line UNTIL the `reconciliation` phase, then backpressures (bound 1)
+    // so the following `report` phase line and the terminal `done` line contend for one buffer slot.
+    // resume() is a nested closure (like fakeSink) so it reads drainCb by its declared type.
+    function pauseAtReconcile() {
+      const received: string[] = [];
+      let paused = false;
+      let drainCb: (() => void) | null = null;
+      const sink: LogSink = {
+        write: (line) => {
+          received.push(line);
+          if (!paused && line.includes('"phase":"reconciliation"')) { paused = true; return false; }
+          return !paused;
+        },
+        onDrain: (cb) => { drainCb = cb; },
+      };
+      return { sink, received, resume: () => { paused = false; const cb = drainCb; drainCb = null; if (cb) cb(); } };
+    }
+    const s = pauseAtReconcile();
+    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
+    const before = loggerStats().dropped;
+    setLogSink(s.sink, 1); // bound 1: only a terminal event may exceed it
+    try {
+      await runScan(db, client, rt(testConfig(root), "hash"), noArgs, null, reporter, null);
+      s.resume(); // resume + drain the two buffered lines (report + terminal done)
+      await flushLogs();
+      const events = s.received.map((l) => JSON.parse(l) as Record<string, unknown>);
+      const done = events.find((e) => e["event"] === "done");
+      expect(done).toBeDefined();
+      expect(done).toMatchObject({ retryTotal: 7, suppressed: 3 }); // counters wired (kills the counter-drop mutant)
+      // the non-terminal `report` phase line buffered ALONGSIDE done survived → done bypassed the bound
+      expect(events.some((e) => e["event"] === "phase" && e["phase"] === "report")).toBe(true);
+      expect(loggerStats().dropped - before).toBe(0); // terminal never evicted the lifecycle line (kills the terminal-drop mutant)
+    } finally {
+      resetLogSink();
+      errSpy.mockRestore();
+      fetchSpy.mockRestore();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

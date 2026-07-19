@@ -15,7 +15,7 @@ import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
 import { ArtifactBundle, XRAY_DIR_NAME } from "./artifactWrite.ts";
 import { toCsv, type CsvCell } from "./csvWrite.ts";
 import { parseSemver } from "./semver.ts";
-import { logLine } from "./log.ts";
+import { logLine, flushLogs } from "./log.ts";
 import { assertRunUnitHeadSound } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
@@ -514,12 +514,24 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     process.stdout.write(EXPORT_HELP + "\n");
     return;
   }
-  const { config } = await loadConfig(argv);
-  process.stdout.write(runExport(config, { runId: eargs.runId, raw: eargs.raw }).line);
+  let rendered: { line: string };
+  try {
+    const { config } = await loadConfig(argv);
+    rendered = runExport(config, { runId: eargs.runId, raw: eargs.raw });
+  } finally {
+    // T7: runExport emits per-artifact events via logLine (buffered under a slow stdout consumer).
+    // Drain them in a finally so ordering holds before the summary AND so a throw doesn't discard
+    // buffered events — the entrypoint's fatal handler calls process.exit, which skips the natural
+    // stdout flush. Flushing here (not only in the import.meta.main catch) also makes the drain
+    // reachable in-process for tests.
+    await flushLogs();
+  }
+  process.stdout.write(rendered.line);
 }
 
 if (import.meta.main) {
   main().catch((e) => {
+    // main() already drained buffered events in its finally; here we only render the fatal and exit.
     process.stderr.write(renderFatal(e, { command: "export", usage: EXPORT_USAGE }));
     process.exit(1);
   });

@@ -5,7 +5,30 @@ import { join } from "node:path";
 import {
   validateAndNormalize, computeConfigHash, resolveConfigPath, loadConfig, ConfigError,
   CONFIG_ROOT_KEYS, CONFIG_CONCURRENCY_KEYS, CONFIG_PATHS_KEYS, CONFIG_PACKAGE_KEYS,
+  CONFIG_TIMEOUTS_KEYS, DEFAULT_TIMEOUTS,
+  type Config, type Timeouts,
 } from "./config.ts";
+
+// Compile-only (NEVER called): the `readonly` modifiers on Timeouts' fields and on Config.timeouts
+// must reject mutation of a validated, shared config. Each @ts-expect-error below turns into an
+// "unused directive" typecheck ERROR the instant its readonly regresses — so `bun run typecheck` is
+// the real assertion here. (finding ADVISORY-6d)
+function _readonlyTimeoutsCompileGuard(t: Timeouts, c: Config): void {
+  // @ts-expect-error — Timeouts.controlApiSeconds is readonly
+  t.controlApiSeconds = 0;
+  // @ts-expect-error — Timeouts.bulkApiSeconds is readonly
+  t.bulkApiSeconds = 0;
+  // @ts-expect-error — Timeouts.cloneSeconds is readonly
+  t.cloneSeconds = 0;
+  // @ts-expect-error — Timeouts.tarSeconds is readonly
+  t.tarSeconds = 0;
+  // @ts-expect-error — Timeouts.probeSeconds is readonly
+  t.probeSeconds = 0;
+  // @ts-expect-error — Timeouts.heartbeatSeconds is readonly
+  t.heartbeatSeconds = 0;
+  // @ts-expect-error — Config.timeouts is readonly (the whole validated object can't be swapped out)
+  c.timeouts = t;
+}
 
 const baseRaw = (): Record<string, unknown> => ({
   githubHost: "github.com",
@@ -66,6 +89,49 @@ describe("validateAndNormalize — happy path + defaults", () => {
   test("registryAuthEnvVar accepted when env var is set", () => {
     const c = norm({ ...baseRaw(), packages: [{ name: "x", registryAuthEnvVar: "MY_TOKEN" }] }, { MY_TOKEN: "secret" });
     expect(c.packages[0]!.registryAuthEnvVar).toBe("MY_TOKEN");
+  });
+});
+
+describe("timeouts (T11) — defaults, per-field override, validation, hash exclusion", () => {
+  test("omitted timeouts yields all defaults", () => {
+    const c = norm({ ...baseRaw() });
+    expect(c.timeouts).toEqual(DEFAULT_TIMEOUTS);
+  });
+  test("an explicit null timeouts also yields all defaults", () => {
+    expect(norm({ ...baseRaw(), timeouts: null }).timeouts).toEqual(DEFAULT_TIMEOUTS);
+  });
+  test("a partial override keeps the other fields at their defaults", () => {
+    const c = norm({ ...baseRaw(), timeouts: { bulkApiSeconds: 1800, probeSeconds: 5 } });
+    expect(c.timeouts.bulkApiSeconds).toBe(1800);
+    expect(c.timeouts.probeSeconds).toBe(5);
+    expect(c.timeouts.controlApiSeconds).toBe(DEFAULT_TIMEOUTS.controlApiSeconds);
+    expect(c.timeouts.cloneSeconds).toBe(DEFAULT_TIMEOUTS.cloneSeconds);
+    expect(c.timeouts.tarSeconds).toBe(DEFAULT_TIMEOUTS.tarSeconds);
+    expect(c.timeouts.heartbeatSeconds).toBe(DEFAULT_TIMEOUTS.heartbeatSeconds);
+  });
+  test("the default magnitudes are pinned (control tighter than the bulk/clone/tar budget)", () => {
+    expect(DEFAULT_TIMEOUTS).toEqual({
+      controlApiSeconds: 300, bulkApiSeconds: 900, cloneSeconds: 900, tarSeconds: 900, probeSeconds: 10, heartbeatSeconds: 30,
+    });
+  });
+  test("a non-positive or non-integer timeout is rejected (a nonpositive deadline instantly expires every spawn)", () => {
+    expect(() => norm({ ...baseRaw(), timeouts: { probeSeconds: 0 } })).toThrow(/timeouts\.probeSeconds must be a positive integer/);
+    expect(() => norm({ ...baseRaw(), timeouts: { cloneSeconds: -1 } })).toThrow(/timeouts\.cloneSeconds must be a positive integer/);
+    expect(() => norm({ ...baseRaw(), timeouts: { tarSeconds: 1.5 } })).toThrow(/timeouts\.tarSeconds must be a positive integer/);
+    expect(() => norm({ ...baseRaw(), timeouts: 5 })).toThrow(/timeouts must be an object/);
+  });
+  test("the whole timeouts object may be null (= all defaults), but a per-field null is rejected", () => {
+    expect(norm({ ...baseRaw(), timeouts: null }).timeouts).toEqual(DEFAULT_TIMEOUTS); // whole-object null OK
+    expect(() => norm({ ...baseRaw(), timeouts: { probeSeconds: null } })).toThrow(/timeouts\.probeSeconds must be a positive integer/); // per-field null rejected (schema says integer)
+  });
+  test("an unknown timeouts key is rejected with a did-you-mean hint", () => {
+    expect(() => norm({ ...baseRaw(), timeouts: { probeSecond: 5 } }))
+      .toThrow(/unknown config key \$\.timeouts\.probeSecond — did you mean "probeSeconds"\?/);
+  });
+  test("changing a timeout does NOT change the config hash (tuning deadlines never orphans resumable work)", () => {
+    const a = hashOf({ ...baseRaw() });
+    const b = hashOf({ ...baseRaw(), timeouts: { bulkApiSeconds: 1, controlApiSeconds: 1, cloneSeconds: 1, tarSeconds: 1, probeSeconds: 1, heartbeatSeconds: 1 } });
+    expect(a).toBe(b);
   });
 });
 
@@ -569,12 +635,14 @@ describe("config.schema.json ↔ runtime sync", () => {
   test("schema property sets exactly match the runtime's known keys at every strict level", () => {
     expect(Object.keys(schema["properties"]).sort()).toEqual([...CONFIG_ROOT_KEYS].sort());
     expect(Object.keys(schema["properties"]["concurrency"]["properties"]).sort()).toEqual([...CONFIG_CONCURRENCY_KEYS].sort());
+    expect(Object.keys(schema["properties"]["timeouts"]["properties"]).sort()).toEqual([...CONFIG_TIMEOUTS_KEYS].sort());
     expect(Object.keys(schema["properties"]["paths"]["properties"]).sort()).toEqual([...CONFIG_PATHS_KEYS].sort());
     expect(Object.keys(schema["properties"]["packages"]["items"]["properties"]).sort()).toEqual([...CONFIG_PACKAGE_KEYS].sort());
   });
   test("additionalProperties:false at every level the runtime rejects unknown keys", () => {
     expect(schema["additionalProperties"]).toBe(false);
     expect(schema["properties"]["concurrency"]["additionalProperties"]).toBe(false);
+    expect(schema["properties"]["timeouts"]["additionalProperties"]).toBe(false);
     expect(schema["properties"]["paths"]["additionalProperties"]).toBe(false);
     expect(schema["properties"]["packages"]["items"]["additionalProperties"]).toBe(false);
   });

@@ -10,12 +10,14 @@ import { tmpdir, devNull } from "node:os";
 import { join } from "node:path";
 import {
   assertReadOnlyGh, assertReadOnlyGit, assertReadOnlyTar, assertSpawnAllowed, assertContained,
+  type GitVerb,
 } from "./readOnlyGuard.ts";
 import type { AuditDb } from "./db.ts";
 import type { DiscoveryFailure } from "./discovery.ts";
 import { isIsoInstant } from "./isoDate.ts";
 import { logLine } from "./log.ts";
 import { classifyRepository, type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
+import type { NetworkEvent } from "./netEvents.ts";
 
 // ---- errors -----------------------------------------------------------------------------
 // Non-retryable API failure (404, permission, SSO enforcement, poisoned redirect, …) — the
@@ -213,17 +215,38 @@ type Env = Record<string, string | undefined>;
 // is pinned separately below.
 // No TMPDIR (an inherited value could redirect child scratch writes outside the contained
 // roots) and no USER/LOGNAME (unneeded) — children fall back to the OS default temp.
+// §H3/H4 transport env carried by BOTH gh and git children (enterprise flaky-VPN + TLS-inspection):
+// an env-delivered proxy or CA bundle is common in corporate setups, and silently stripping it
+// breaks every call against the proxy or the intercepting TLS root — surfacing mid-run on the
+// first truncated-tree clone rather than at preflight. Proxy family carries both cases
+// (Go-based gh reads UPPERCASE, libcurl/git reads lowercase — copy whichever is set). SSL_CERT_FILE/
+// SSL_CERT_DIR are the OpenSSL cert pointers gh (Go) and curl honor. DBUS_SESSION_BUS_ADDRESS +
+// XDG_RUNTIME_DIR reach the OS keyring: gh needs it for stored auth, and git needs it too because
+// its pinned credential helper spawns `gh auth git-credential`. None of these can redirect a WRITE
+// or inject git config (that stays pinned below) — they are auth/transport-critical ONLY.
+const TRANSPORT_PASSTHROUGH = [
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+  "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+  "SSL_CERT_FILE", "SSL_CERT_DIR",
+  "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
+] as const;
+// libcurl/git-only CA-bundle pointers — git-over-https honors these; the Go-based gh ignores them.
+const GIT_CA_PASSTHROUGH = ["GIT_SSL_CAINFO", "GIT_SSL_CAPATH", "CURL_CA_BUNDLE"] as const;
+
 const GH_PASSTHROUGH = [
   "HOME", "PATH",
   "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
   "GH_CONFIG_DIR", "XDG_CONFIG_HOME",
+  ...TRANSPORT_PASSTHROUGH,
 ] as const;
 // git's env ALSO carries the gh auth passthroughs: the pinned credential helper runs
-// `gh auth git-credential` as a child of git, so token/config-dir auth must survive.
+// `gh auth git-credential` as a child of git, so token/config-dir auth must survive. Plus the
+// libcurl CA pointers, since git-over-https (not gh) does the TLS clone against a custom root.
 const GIT_PASSTHROUGH = [
   "HOME", "PATH",
   "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
   "GH_CONFIG_DIR", "XDG_CONFIG_HOME",
+  ...TRANSPORT_PASSTHROUGH, ...GIT_CA_PASSTHROUGH,
 ] as const;
 const TAR_PASSTHROUGH = ["HOME", "PATH"] as const;
 
@@ -922,6 +945,28 @@ const TRANSIENT_BASE_WAIT_MS = 2_000;
 // expiry the child is killed and the empty result flows into the transient retry path.
 export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
 
+// T11 per-category defaults (ms). control-API is deliberately tighter than the bulk/clone/tar
+// budgets: a quick auth/version/rate-limit/listing call has no reason to hang 15 min, but a raw
+// blob/recursive-tree read or a shallow clone over a slow-but-live VPN link — or a large local
+// tarball extract — legitimately can — so those keep the 15-min budget while control drops to 5 min. probe is the
+// short reachability deadline RESERVED for the T2 connectivity gate landing in a later PR in this
+// series — it is resolved and validated here but not yet consumed by any spawn call. Each category
+// resolves as `timeouts.<cat> ?? spawnTimeoutMs ?? DEFAULT` (config seconds → ms by the caller).
+export const DEFAULT_CONTROL_API_TIMEOUT_MS = 5 * 60 * 1000;
+export const DEFAULT_BULK_API_TIMEOUT_MS = SPAWN_TIMEOUT_MS;
+export const DEFAULT_CLONE_TIMEOUT_MS = SPAWN_TIMEOUT_MS;
+export const DEFAULT_TAR_TIMEOUT_MS = SPAWN_TIMEOUT_MS;
+export const DEFAULT_PROBE_TIMEOUT_MS = 10 * 1000;
+
+// Per-category wall-clock kill deadlines (ms) resolved once in the constructor.
+export interface SpawnDeadlines {
+  controlApiMs: number;
+  bulkApiMs: number;
+  cloneMs: number;
+  tarMs: number;
+  probeMs: number;
+}
+
 export interface GithubClientOptions {
   githubHost: string;
   db?: AuditDb | null; // api_cache home; null disables caching
@@ -929,7 +974,16 @@ export interface GithubClientOptions {
   spawnImpl?: SpawnFn;
   sleepImpl?: (ms: number) => Promise<void>;
   nowImpl?: () => number;
-  spawnTimeoutMs?: number; // wall-clock kill deadline per spawn (default SPAWN_TIMEOUT_MS)
+  // UNIFORM per-spawn deadline (ms): a single knob applied to EVERY category. Kept for tests and
+  // as a back-compat override; production passes the per-category `timeouts` below instead.
+  spawnTimeoutMs?: number;
+  // Per-category deadline overrides (ms). Each category resolves to
+  // `timeouts.<cat> ?? spawnTimeoutMs ?? DEFAULT_<CAT>` (T11).
+  timeouts?: Partial<SpawnDeadlines>;
+  // T7: sink for retry/throttle/spawn-timeout visibility. Injected (not a logLine import) so the
+  // client stays decoupled from the coordinator and the single-spawn chokepoint is unaffected. The
+  // run-scoped reporter owns rate-limiting + counters; a bare no-op default keeps tests silent.
+  events?: (e: NetworkEvent) => void;
   env?: Env;
   binPaths?: { gh: string; git: string; tar: string };
   tempRoot?: string; // default realpath(os.tmpdir()); pkg-audit-* dirs live directly under it
@@ -958,7 +1012,8 @@ export class GithubClient {
   private readonly spawn: SpawnFn;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
-  private readonly spawnTimeoutMs: number;
+  private readonly deadlines: SpawnDeadlines;
+  private readonly emitEvent: (e: NetworkEvent) => void;
   private readonly bins: { gh: string; git: string; tar: string };
   private readonly ghEnv: Record<string, string>;
   private readonly baseEnv: Env;
@@ -979,12 +1034,27 @@ export class GithubClient {
     this.spawn = opts.spawnImpl ?? realSpawn;
     this.sleep = opts.sleepImpl ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.now = opts.nowImpl ?? Date.now;
-    this.spawnTimeoutMs = opts.spawnTimeoutMs ?? SPAWN_TIMEOUT_MS;
-    // fail-fast knob validation: 0/negative here does NOT mean "unlimited" — a zero-slot
-    // semaphore hangs the first acquire forever (no exception, and the spawn deadline never
-    // covers semaphore queueing), and a nonpositive deadline instantly expires every spawn.
-    if (!Number.isFinite(this.spawnTimeoutMs) || this.spawnTimeoutMs < 1)
-      throw new Error(`spawnTimeoutMs must be >= 1 (got ${this.spawnTimeoutMs}) — a nonpositive deadline instantly times out every spawn`);
+    // fail-fast knob validation: 0/negative does NOT mean "unlimited" — a nonpositive deadline
+    // instantly expires every spawn (and the spawn deadline never covers semaphore queueing).
+    // Validate the uniform knob first (preserving its message), then every RESOLVED per-category
+    // deadline, so a bad `timeouts` override can't slip a nonpositive value past the gate.
+    if (opts.spawnTimeoutMs !== undefined && (!Number.isFinite(opts.spawnTimeoutMs) || opts.spawnTimeoutMs < 1))
+      throw new Error(`spawnTimeoutMs must be >= 1 (got ${opts.spawnTimeoutMs}) — a nonpositive deadline instantly times out every spawn`);
+    const t = opts.timeouts ?? {};
+    const resolveDeadline = (cat: keyof SpawnDeadlines, dflt: number): number => {
+      const ms = t[cat] ?? opts.spawnTimeoutMs ?? dflt;
+      if (!Number.isFinite(ms) || ms < 1)
+        throw new Error(`timeouts.${cat} must be >= 1 (got ${ms}) — a nonpositive deadline instantly times out any spawn it governs`);
+      return ms;
+    };
+    this.deadlines = {
+      controlApiMs: resolveDeadline("controlApiMs", DEFAULT_CONTROL_API_TIMEOUT_MS),
+      bulkApiMs: resolveDeadline("bulkApiMs", DEFAULT_BULK_API_TIMEOUT_MS),
+      cloneMs: resolveDeadline("cloneMs", DEFAULT_CLONE_TIMEOUT_MS),
+      tarMs: resolveDeadline("tarMs", DEFAULT_TAR_TIMEOUT_MS),
+      probeMs: resolveDeadline("probeMs", DEFAULT_PROBE_TIMEOUT_MS),
+    };
+    this.emitEvent = opts.events ?? (() => {});
     const concurrency = opts.concurrency ?? 8;
     if (!Number.isFinite(concurrency) || concurrency < 1)
       throw new Error(`concurrency must be >= 1 (got ${concurrency}) — a zero-slot semaphore hangs the first acquire forever`);
@@ -1014,8 +1084,9 @@ export class GithubClient {
   private async spawnBounded(
     bin: string,
     args: string[],
-    opts: { env: Record<string, string>; cwd?: string },
+    opts: { env: Record<string, string>; cwd?: string; deadlineMs: number },
   ): Promise<SpawnResult> {
+    const deadlineMs = opts.deadlineMs;
     let aborted = false;
     const killers: Array<() => void> = [];
     const signal: SpawnAbortSignal = {
@@ -1036,7 +1107,7 @@ export class GithubClient {
         aborted = true;
         for (const kill of killers) kill();
         resolve();
-      }, this.spawnTimeoutMs);
+      }, deadlineMs);
     });
     try {
       const spawned = this.spawn(bin, args, { ...opts, signal });
@@ -1064,7 +1135,10 @@ export class GithubClient {
       // hold-until-exit window: a synthetic 124 would misclassify it as a transient
       // no-response and re-drive the oversized request through every retry.
       if (spawnRejected) throw spawnRejection;
-      return { exitCode: 124, stdout: "", stderr: `spawn timed out after ${this.spawnTimeoutMs}ms: ${bin}` };
+      // T7: a spawn timeout is its OWN event (not always a retry — auth/version/tar terminate; the
+      // CALLER decides whether a retry follows). Rare and load-bearing, so never rate-limited.
+      this.emitEvent({ kind: "spawn-timeout", bin, ms: deadlineMs });
+      return { exitCode: 124, stdout: "", stderr: `spawn timed out after ${deadlineMs}ms: ${bin}` };
     } finally {
       clearTimeout(timer);
       clearTimeout(settleTimer);
@@ -1077,13 +1151,15 @@ export class GithubClient {
   // subprocesses" holds for every path. `gh()` is the BARE form (no rate-limit bucket): it counts
   // against the cap but is not pause-aware. The pause-aware, bucketed path is ghBucketedAttempt
   // below (restGet/graphql), which arms any throttle pause INSIDE the lease so the slot is never
-  // released into an about-to-open pause window.
-  async gh(args: string[]): Promise<SpawnResult> {
+  // released into an about-to-open pause window. `deadlineMs` selects the per-category spawn budget
+  // (T11); it defaults to the control-API budget — the only bare-gh callers (preflight's auth +
+  // version probes) are control-plane (listings go through the bucketed restGet/graphql path).
+  async gh(args: string[], deadlineMs: number = this.deadlines.controlApiMs): Promise<SpawnResult> {
     assertSpawnAllowed(this.bins.gh, args);
     assertReadOnlyGh(args);
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
+      return await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv, deadlineMs });
     } finally {
       release();
     }
@@ -1110,7 +1186,7 @@ export class GithubClient {
   // re-loops (waitBucket sleeps it out, or ThrottleExhausted terminates the loop for an unfunded
   // budget-overflow tail — so the loop always makes progress).
   private async ghBucketedAttempt<T>(
-    args: string[], bucket: Bucket,
+    args: string[], bucket: Bucket, deadlineMs: number,
     analyze: (res: SpawnResult, now: number) => { outcome: T; pauseUntilMs: number | null },
   ): Promise<T> {
     assertSpawnAllowed(this.bins.gh, args);
@@ -1122,7 +1198,7 @@ export class GithubClient {
         continue;  // re-loop: acquireRespectingPause sleeps the window, re-acquires, re-checks
       }
       try {
-        const res = await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
+        const res = await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv, deadlineMs });
         const now = this.now();
         const { outcome, pauseUntilMs } = analyze(res, now);
         if (pauseUntilMs !== null) this.armBucketPause(bucket, pauseUntilMs, now);
@@ -1133,15 +1209,37 @@ export class GithubClient {
     }
   }
 
+  // Per-verb git spawn deadline (T11). Exhaustive over GitVerb: a `clone` may pull a large tree
+  // over a slow-but-live link (the clone budget), while rev-parse / show / --version are fast local
+  // commands on the tighter control budget. A new read verb added to the guard's allowlist forces
+  // a decision here (the `never` guard is a compile error) rather than silently taking control.
+  private gitDeadline(verb: GitVerb): number {
+    switch (verb) {
+      case "clone":
+        return this.deadlines.cloneMs;
+      case "rev-parse":
+      case "show":
+      case "--version":
+        return this.deadlines.controlApiMs;
+      default: {
+        const _exhaustive: never = verb;
+        return _exhaustive;
+      }
+    }
+  }
+
   async git(args: string[], cwd?: string): Promise<SpawnResult> {
     assertSpawnAllowed(this.bins.git, args);
-    assertReadOnlyGit(args);
+    // The guard both validates AND classifies: `verb` is the single source for the per-verb env
+    // and spawn-deadline decisions below (no re-derived `args[0] === …` string checks that could
+    // drift from the allowlist).
+    const verb = assertReadOnlyGit(args);
     // §0: git itself is the only process allowed to run with cwd inside a clone.
     if (cwd !== undefined) assertContained(cwd, [this.tempRoot]);
     // Clone DESTINATION containment lives HERE, not only in cloneShallow — the wrapper is the
     // chokepoint, so no caller can aim a hardened-looking clone outside the temp root. The
     // guard's grammar guarantees exactly two positionals: <url> <dest>.
-    if (args[0] === "clone") {
+    if (verb === "clone") {
       const positionals: string[] = [];
       for (let i = 1; i < args.length; i++) {
         const a = args[i]!;
@@ -1157,16 +1255,18 @@ export class GithubClient {
     // The `--version` probe (§2 preflight — also --plan's ONLY git invocation) needs no
     // credential helper: point its global config at devNull instead of materializing the temp
     // gitconfig, so plan mode truly writes nothing and leaks no pkg-audit-gitcfg-* dir.
-    const isVersionProbe = args.length === 1 && args[0] === "--version";
+    const isVersionProbe = verb === "--version";
     const env = buildGitEnv(this.baseEnv, isVersionProbe ? devNull : this.ensureGitConfig());
     // Count the clone against the GLOBAL in-flight cap (§4/§5.6): under fan-out a clone per branch-unit
     // would otherwise reach the composed organizations×branches degree and blow temp-dir/fd/memory.
     // Acquire HERE (not inside spawnBounded, which gh already wraps — a second acquire there would
     // deadlock gh at concurrency 1). Bare slot (no bucket): a clone is network work but consumes no
     // REST/GraphQL quota, so it sits OUTSIDE the rate-limit buckets — only the subprocess cap bounds it.
+    // The per-verb deadline comes from the typed gitDeadline(verb) switch (clone → clone budget;
+    // rev-parse/show/--version → control), so a new read verb forces a routing decision (F-M).
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded(this.bins.git, args, { env, cwd });
+      return await this.spawnBounded(this.bins.git, args, { env, cwd, deadlineMs: this.gitDeadline(verb) });
     } finally {
       release();
     }
@@ -1230,13 +1330,14 @@ export class GithubClient {
     // this level, never inside spawnBounded (gh already wraps it → double-acquire deadlock at 1).
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded(this.bins.tar, args, { env: buildTarEnv(this.baseEnv) });
+      return await this.spawnBounded(this.bins.tar, args, { env: buildTarEnv(this.baseEnv), deadlineMs: this.deadlines.tarMs });
     } finally {
       release();
     }
   }
 
   // ---- REST GET with cache + throttle handling ----
+
   private cacheKey(endpoint: string): string {
     // KEY EPOCH `gh3`: rows are statusless and survive --fresh, so every strengthening of cache
     // WRITE provenance quarantines all older rows by making their keys unreachable (--purge-cache
@@ -1345,9 +1446,12 @@ export class GithubClient {
     return HEX_OBJECT_ID_RE.test(ref); // same as isSha — a sha-shaped ?ref= pins an immutable object
   }
 
-  async restGet(endpoint: string, opts: { accept?: string; immutable?: boolean; noStore?: boolean } = {}): Promise<HttpResponse> {
+  async restGet(endpoint: string, opts: { accept?: string; immutable?: boolean; noStore?: boolean; bulk?: boolean } = {}): Promise<HttpResponse> {
     const accept = opts.accept ?? "";
     const immutable = opts.immutable === true && GithubClient.endpointIsShaPinned(endpoint);
+    // Raw content reads (blob/file/recursive-tree) are BULK: a large body on a slow-but-live link
+    // gets the longer deadline. Everything else (listings, rate_limit, user, metadata) is control.
+    const deadlineMs = opts.bulk === true ? this.deadlines.bulkApiMs : this.deadlines.controlApiMs;
     const key = this.cacheKey(endpoint);
     // `noStore` fully opts OUT of the conditional cache: no read, no If-None-Match, no persist. The
     // cache stores body+ETag but NOT the Link header, so a paginated page served from a 304 that
@@ -1375,9 +1479,9 @@ export class GithubClient {
       | { kind: "fatal"; status: number; ssoRequired: boolean; message: string }
       | { kind: "no-response"; stderr: string }
       | { kind: "truncated"; exitCode: number; stderr: string }
-      | { kind: "retry" };
+      | { kind: "retry"; event: NetworkEvent };
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      const outcome = await this.ghBucketedAttempt<RestOutcome>(args, this.core, (res, now) => {
+      const outcome = await this.ghBucketedAttempt<RestOutcome>(args, this.core, deadlineMs, (res, now) => {
         const parsed = parseGhApiOutput(res.stdout);
         // no HTTP response at all (network/auth plumbing failure; diagnostics on stderr)
         if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
@@ -1396,11 +1500,26 @@ export class GithubClient {
         if (cls.kind === "fatal") return { outcome: { kind: "fatal", status: cls.status, ssoRequired: cls.ssoRequired, message: cls.message }, pauseUntilMs: null };
         // primary → pause until the reset epoch; secondary/transient → now + backoff. Arming from
         // this pauseUntilMs happens inside the lease (ghBucketedAttempt), before the slot is released.
-        const pauseUntilMs = cls.kind === "primary" ? cls.untilMs : now + this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-        return { outcome: { kind: "retry" }, pauseUntilMs };
+        // Build the matching T7 telemetry (throttle for a rate-limit pause, retry for a 5xx service
+        // retry) and hand it back so the caller emits it OUTSIDE the lease only if a retry follows.
+        if (cls.kind === "primary") {
+          const event: NetworkEvent = { kind: "throttle", bucket: this.core.label, waitKind: "primary", waitMs: Math.max(0, cls.untilMs - now), untilMs: cls.untilMs, attempt };
+          return { outcome: { kind: "retry", event }, pauseUntilMs: cls.untilMs };
+        }
+        const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
+        const untilMs = now + waitMs;
+        const event: NetworkEvent = cls.kind === "secondary"
+          ? { kind: "throttle", bucket: this.core.label, waitKind: "secondary", waitMs, untilMs, attempt }
+          : { kind: "retry", reason: "http-5xx", endpoint, attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs: waitMs };
+        return { outcome: { kind: "retry", event }, pauseUntilMs: untilMs };
       });
       if (outcome.kind === "no-response") {
-        if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
+        if (attempt < MAX_ATTEMPTS - 1) {
+          const nextWaitMs = this.backoffWait("transient", attempt, null);
+          this.emitEvent({ kind: "retry", reason: "no-response", endpoint, attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs });
+          await this.sleep(nextWaitMs);
+          continue;
+        }
         throw new GithubApiError(`gh api produced no HTTP response: ${outcome.stderr.trim().slice(0, 300)}`, { endpoint });
       }
       if (outcome.kind === "not-modified") {
@@ -1414,7 +1533,14 @@ export class GithubClient {
         return { status: 200, headers: outcome.headers, body: outcome.body };
       }
       if (outcome.kind === "truncated") {
-        if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
+        if (attempt < MAX_ATTEMPTS - 1) {
+          // A truncated-transport re-drive IS a bounded retry — emit it (like no-response above) so the
+          // reporter counts it in retryTotal, then back off. No line on the final throwing attempt.
+          const nextWaitMs = this.backoffWait("transient", attempt, null);
+          this.emitEvent({ kind: "retry", reason: "transport-truncated", endpoint, attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs });
+          await this.sleep(nextWaitMs);
+          continue;
+        }
         throw new GithubApiError(`gh exited ${outcome.exitCode} with an HTTP 200 response — the body may be truncated: ${outcome.stderr.trim().slice(0, 300)}`, { endpoint });
       }
       if (outcome.kind === "ok") {
@@ -1437,13 +1563,16 @@ export class GithubClient {
       }
       if (outcome.kind === "fatal")
         throw new GithubApiError(`${outcome.message} (${endpoint})`, { status: outcome.status, endpoint, ssoRequired: outcome.ssoRequired });
-      // outcome.kind === "retry": pause already armed inside the lease; loop again (next acquire waits it out).
+      // outcome.kind === "retry": pause already armed inside the lease. Emit its telemetry OUTSIDE the
+      // lease — only when a retry actually follows (not the final attempt about to ThrottleExhausted) —
+      // then loop again (the next acquire waits out the armed pause).
+      if (attempt < MAX_ATTEMPTS - 1) this.emitEvent(outcome.event);
     }
     throw new ThrottleExhausted(endpoint);
   }
 
-  async restGetJson(endpoint: string, opts: { immutable?: boolean } = {}): Promise<unknown> {
-    const res = await this.restGet(endpoint, { immutable: opts.immutable });
+  async restGetJson(endpoint: string, opts: { immutable?: boolean; bulk?: boolean } = {}): Promise<unknown> {
+    const res = await this.restGet(endpoint, { immutable: opts.immutable, bulk: opts.bulk });
     try {
       return JSON.parse(res.body);
     } catch {
@@ -1513,9 +1642,9 @@ export class GithubClient {
       | { kind: "ok"; data: unknown; malformed: string | null; status: number; exitCode: number; stderr: string }
       | { kind: "fatal"; status: number; ssoRequired: boolean; message: string }
       | { kind: "no-response"; stderr: string }
-      | { kind: "retry" };
+      | { kind: "retry"; event: NetworkEvent };
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      const outcome = await this.ghBucketedAttempt<GqlOutcome>(args, this.graphqlBucket, (res, now) => {
+      const outcome = await this.ghBucketedAttempt<GqlOutcome>(args, this.graphqlBucket, this.deadlines.controlApiMs, (res, now) => {
         const parsed = parseGhApiOutput(res.stdout);
         if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
         // DELIBERATELY no broad restGet-style nonzero-exit truncation guard: gh exits 1 BY DESIGN after
@@ -1531,11 +1660,26 @@ export class GithubClient {
         if (cls.kind === "ok")
           return { outcome: { kind: "ok", data: env.data, malformed: env.malformed, status: parsed.status, exitCode: res.exitCode, stderr: res.stderr }, pauseUntilMs: null };
         if (cls.kind === "fatal") return { outcome: { kind: "fatal", status: cls.status, ssoRequired: cls.ssoRequired, message: cls.message }, pauseUntilMs: null };
-        const pauseUntilMs = cls.kind === "primary" ? cls.untilMs : now + this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-        return { outcome: { kind: "retry" }, pauseUntilMs };
+        // Build the matching T7 telemetry (throttle for a rate-limit pause, retry for a 5xx service
+        // retry) and hand it back so the caller emits it OUTSIDE the lease only if a retry follows.
+        if (cls.kind === "primary") {
+          const event: NetworkEvent = { kind: "throttle", bucket: this.graphqlBucket.label, waitKind: "primary", waitMs: Math.max(0, cls.untilMs - now), untilMs: cls.untilMs, attempt };
+          return { outcome: { kind: "retry", event }, pauseUntilMs: cls.untilMs };
+        }
+        const waitMs = this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
+        const untilMs = now + waitMs;
+        const event: NetworkEvent = cls.kind === "secondary"
+          ? { kind: "throttle", bucket: this.graphqlBucket.label, waitKind: "secondary", waitMs, untilMs, attempt }
+          : { kind: "retry", reason: "http-5xx", endpoint: "graphql", attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs: waitMs };
+        return { outcome: { kind: "retry", event }, pauseUntilMs: untilMs };
       });
       if (outcome.kind === "no-response") {
-        if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
+        if (attempt < MAX_ATTEMPTS - 1) {
+          const nextWaitMs = this.backoffWait("transient", attempt, null);
+          this.emitEvent({ kind: "retry", reason: "no-response", endpoint: "graphql", attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs });
+          await this.sleep(nextWaitMs);
+          continue;
+        }
         throw new GithubApiError(`gh api graphql produced no HTTP response: ${outcome.stderr.trim().slice(0, 300)}`, { endpoint: "graphql" });
       }
       if (outcome.kind === "fatal")
@@ -1549,7 +1693,11 @@ export class GithubClient {
           // exactly that shape so a COMPLETE errors envelope (parses fine → malformed===null) is never
           // blind-retried; every other malformed reason is a real spec violation → fatal.
           if (outcome.malformed === "unparseable JSON body" && outcome.exitCode !== 0 && attempt < MAX_ATTEMPTS - 1) {
-            await this.sleep(this.backoffWait("transient", attempt, null));
+            // Same transient re-drive as restGet's truncated branch — emit reason:"transport-truncated"
+            // so retryTotal counts it; no line on the final throwing attempt.
+            const nextWaitMs = this.backoffWait("transient", attempt, null);
+            this.emitEvent({ kind: "retry", reason: "transport-truncated", endpoint: "graphql", attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs });
+            await this.sleep(nextWaitMs);
             continue;
           }
           throw new GithubApiError(
@@ -1559,7 +1707,10 @@ export class GithubClient {
         }
         return outcome.data;
       }
-      // outcome.kind === "retry": pause already armed inside the lease; loop again (next acquire waits it out).
+      // outcome.kind === "retry": pause already armed inside the lease. Emit its telemetry OUTSIDE the
+      // lease — only when a retry actually follows (not the final attempt about to ThrottleExhausted) —
+      // then loop again (the next acquire waits out the armed pause).
+      if (attempt < MAX_ATTEMPTS - 1) this.emitEvent(outcome.event);
     }
     throw new ThrottleExhausted("graphql");
   }
@@ -1784,7 +1935,9 @@ export class GithubClient {
   async fetchTreeRecursive(org: string, repo: string, treeOid: string): Promise<TreeResponse> {
     const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(treeOid)}?recursive=1`;
     const immutable = GithubClient.isSha(treeOid);
-    const res = await this.restGet(endpoint, { immutable });
+    // Recursive-tree reads are BULK: a large tree body on a slow-but-live link gets the longer
+    // deadline (T11), same as the raw file/blob fetches below.
+    const res = await this.restGet(endpoint, { immutable, bulk: true });
     try {
       // Unreachable through restGet (its contract is exact-200), so this is DELIBERATE
       // defense-in-depth: a partial 206 body parsed here would read as a complete tree, and
@@ -1812,7 +1965,7 @@ export class GithubClient {
 
   async fetchFileRaw(org: string, repo: string, path: string, refSha: string): Promise<string> {
     const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/contents/${encodeContentsPath(path)}?ref=${encodeURIComponent(refSha)}`;
-    const res = await this.restGet(endpoint, { accept: RAW_ACCEPT, immutable: GithubClient.isSha(refSha) });
+    const res = await this.restGet(endpoint, { accept: RAW_ACCEPT, immutable: GithubClient.isSha(refSha), bulk: true });
     return res.body;
   }
 
@@ -1823,7 +1976,7 @@ export class GithubClient {
 
   async fetchBlobRaw(org: string, repo: string, blobSha: string): Promise<string> {
     const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(blobSha)}`;
-    const res = await this.restGet(endpoint, { accept: RAW_ACCEPT, immutable: GithubClient.isSha(blobSha) });
+    const res = await this.restGet(endpoint, { accept: RAW_ACCEPT, immutable: GithubClient.isSha(blobSha), bulk: true });
     return res.body;
   }
 

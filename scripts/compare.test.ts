@@ -11,7 +11,7 @@ import {
 import { ArgsError } from "./args.ts";
 import { buildReport } from "./report.ts";
 import { exportRun } from "./export.ts";
-import type { Config } from "./config.ts";
+import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
 
@@ -64,7 +64,7 @@ function site(
 }
 
 const config = (sqlitePath: string): Config => ({
-  concurrency: { branches: 1, organizations: 1, repositories: 1 },
+  concurrency: { branches: 1, organizations: 1, repositories: 1 }, timeouts: DEFAULT_TIMEOUTS,
   cutoffDate: "2024-01-01", excludeDirGlobs: [], githubHost: "github.com",
   includeArchived: false, includeForks: false, includePersonalNamespace: false,
   maxBranchesPerRepo: 25, maxReposPerOrg: null, organizations: null, excludeOrganizations: [],

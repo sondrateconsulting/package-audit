@@ -14,7 +14,7 @@ import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
 import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
-import { logLine } from "./log.ts";
+import { logLine, flushLogs } from "./log.ts";
 import { isPolicyExcluded, isDefaultOverride, assertRunUnitHeadSound, policyStatusOrThrow } from "./policyDisposition.ts";
 import { assertNever } from "./assertNever.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
@@ -533,8 +533,19 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     process.stdout.write(REPORT_HELP + "\n");
     return;
   }
-  const { config } = await loadConfig(argv);
-  process.stdout.write(runReport(config, rargs.runId, { html: rargs.html }).line);
+  let rendered: { line: string };
+  try {
+    const { config } = await loadConfig(argv);
+    rendered = runReport(config, rargs.runId, { html: rargs.html });
+  } finally {
+    // T7: runReport emits dossier events via logLine (buffered under a slow stdout consumer). Drain
+    // them in a finally so ordering holds before the summary AND so a throw doesn't discard buffered
+    // events — the entrypoint's fatal handler calls process.exit, which skips the natural stdout
+    // flush. Flushing here (not only in the import.meta.main catch) also makes the drain reachable
+    // in-process for tests.
+    await flushLogs();
+  }
+  process.stdout.write(rendered.line);
 }
 
 // Atomic (temp+rename) and SYNC — the old Bun.write here discarded its Promise, a latent
@@ -555,6 +566,7 @@ function mkdirCanonical(outputDir: string): void {
 
 if (import.meta.main) {
   main().catch((e) => {
+    // main() already drained buffered events in its finally; here we only render the fatal and exit.
     process.stderr.write(renderFatal(e, { command: "report", usage: REPORT_USAGE }));
     process.exit(1);
   });

@@ -25,7 +25,7 @@ describe("parseRescanTarget", () => {
 
 describe("parseArgs", () => {
   test("defaults with no args", () => {
-    expect(parseArgs([])).toEqual({ configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false });
+    expect(parseArgs([])).toEqual({ configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], verboseUnits: false, help: false });
   });
   test("--config with space and = forms", () => {
     expect(parseArgs(["--config", "/a.json"]).configPath).toBe("/a.json");
@@ -38,6 +38,11 @@ describe("parseArgs", () => {
   });
   test("--purge-cache without --fresh is rejected", () => {
     expect(() => parseArgs(["--purge-cache"])).toThrow(ArgsError);
+  });
+  test("--verbose-units is a boolean flag (default false; rejects a value)", () => {
+    expect(parseArgs([]).verboseUnits).toBe(false);
+    expect(parseArgs(["--verbose-units"]).verboseUnits).toBe(true);
+    expect(() => parseArgs(["--verbose-units=1"])).toThrow(ArgsError); // takes no value
   });
   test("repeatable --rescan-branch accumulates, de-duplicated, order-stable", () => {
     const a = parseArgs([
