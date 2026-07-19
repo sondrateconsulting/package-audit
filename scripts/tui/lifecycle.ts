@@ -288,8 +288,13 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
   // Returns HOW the wait ended — a non-"exited" outcome is a teardown fact the caller must
   // surface as a deferred warning, never silent success (a wedged Ink left a hidden cursor and
   // a sealed stream dropping its frames; the operator deserves the one line saying so).
+  // The wait's OWN timer-plumbing failures surface through the optional `warn` collector too
+  // (§U6: teardown-step failures become deferred warnings — bounded impact does not waive
+  // observability; dynamic text goes through errText, the callers' join writes verbatim). Only
+  // the clear-failure's EFFECT stays swallowed: the settled guard makes a later fire a no-op,
+  // and the leaked one-shot is a ≤2s ref'd timer — a bounded exit delay, never a hang.
   type ExitOutcome = "exited" | "timeout" | "wait-rejected" | "wait-threw" | "timer-failed";
-  const boundedExitWait = (h: TuiHandle): Promise<ExitOutcome> =>
+  const boundedExitWait = (h: TuiHandle, warn?: (msg: string) => void): Promise<ExitOutcome> =>
     new Promise<ExitOutcome>((resolve) => {
       let settled = false;
       const done = (outcome: ExitOutcome): void => {
@@ -300,8 +305,8 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
           t = null;
           try {
             timers.clearTimeout(timer);
-          } catch {
-            // a failing clear cannot matter more than finishing the wait
+          } catch (e) {
+            warn?.(`exit-wait: timer clear failed: ${errText(e)}`);
           }
         }
         resolve(outcome);
@@ -310,8 +315,9 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
       let timerFailed = false;
       try {
         t = timers.setTimeout(() => done("timeout"), TEARDOWN_EXIT_WAIT_MS);
-      } catch {
+      } catch (e) {
         timerFailed = true; // no timer → no way to bound the wait → end it now (below)
+        warn?.(`exit-wait: timer create failed: ${errText(e)}`);
       }
       try {
         h.waitUntilExit().then(
@@ -369,7 +375,7 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
             // what was just shown. The step-3 seal below stays idempotent.
             guarded("unmount-seal", () => proxy.sealEarly());
           }
-          exitOutcome = await boundedExitWait(h);
+          exitOutcome = await boundedExitWait(h, (m) => stepWarnings.push(m));
           if (exitOutcome !== "exited") stepWarnings.push(`exit-wait: unmount did not complete cleanly (${exitOutcome})`);
         }
         // 3. seal — from here NOTHING (a wedged Ink, queued renders, its console patch) can reach
@@ -470,7 +476,7 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         } catch (e) {
           unwindWarnings.push(`unmount: ${errText(e)}`);
         }
-        const unwindOutcome = await boundedExitWait(h);
+        const unwindOutcome = await boundedExitWait(h, (m) => unwindWarnings.push(m));
         if (unwindOutcome !== "exited") unwindWarnings.push(`exit-wait: ${unwindOutcome}`);
         if (unwindWarnings.length > 0) warnReal(`package-audit: dashboard unwind warnings — ${unwindWarnings.join("; ")}\n`);
       } else {

@@ -863,12 +863,12 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     }
   });
 
-  test("TOTAL teardown under a THROWING injected timer: the audit still completes, never hangs", async () => {
+  test("TOTAL teardown under a THROWING injected timer: the audit still completes, never hangs — and the warning names outcome AND cause", async () => {
     // §U0 has no exceptions: a broken timer dep must not leave the cached teardown promise
     // pending (the finally would await forever — a hang is a kill).
     const handle = makeFakeHandle({ exitMode: "never" }); // exit never settles either — worst case
     const capture: MountCapture = { store: null, opts: null };
-    const { deps } = makeDeps();
+    const { deps, stderr } = makeDeps();
     deps.mountImpl = makeFakeMount(handle, capture);
     deps.timers = {
       setTimeout: (() => {
@@ -880,6 +880,37 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     };
     const r = await runWithTui(deps, async () => 7); // must resolve, not hang
     expect(r).toBe(7);
+    // §U6 observability: the deferred warning carries BOTH the explicit ExitOutcome string and
+    // the underlying cause delivered through the warn collector (the outcome alone predates it)
+    expect(stderr.all()).toContain("unmount did not complete cleanly (timer-failed)");
+    expect(stderr.all()).toContain("timer create failed: timer subsystem broken");
+    // and a handle that never exited cleanly gets its cursor compensated (step 5a)
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1);
+  });
+
+  test("a THROWING clearTimeout surfaces as a deferred warning (sanitized); the wait still exits cleanly; the leaked one-shot is inert", async () => {
+    const handle = makeFakeHandle({ exitMode: "manual" }); // unmount resolves the exit — the timer is the loser
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    const leaked: Array<() => void> = [];
+    deps.timers = {
+      setTimeout: ((fn: () => void) => {
+        leaked.push(fn);
+        return leaked.length as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout,
+      clearTimeout: (() => {
+        throw new Error("clear \u001B[31mboom\u001B[0m"); // hostile bytes through the new warn channel
+      }) as unknown as typeof clearTimeout,
+    };
+    const r = await runWithTui(deps, async () => 5);
+    expect(r).toBe(5);
+    expect(stderr.all()).toContain("timer clear failed: clear boom"); // errText stripped the CSI bytes
+    expect(stderr.all()).not.toContain("\u001B[31m"); // no raw control bytes reached the terminal
+    expect(stderr.all()).not.toContain("did not complete cleanly"); // the wait itself exited cleanly
+    const before = stderr.writes.length;
+    for (const fn of leaked.splice(0)) fn(); // the leaked ≤2s one-shot fires later: the settled guard makes it a no-op
+    expect(stderr.writes.length).toBe(before);
   });
 
   test("mountTui throwing AFTER a renderer could exist: the proxy is SEALED so a leaked Ink cannot smear the bare run", async () => {
@@ -1036,7 +1067,7 @@ describe("routing equivalence (§U8.12)", () => {
     { event: "concurrency", organizations: 2, branches: 4, repositories: 6 },
     { event: "preflight", login: "u", coreRemaining: 4999 },
     { event: "unit", org: "o", repo: "r", branch: "main", commit: "c", action: "scanned", deps: 3, usage: 9, cli: 1 },
-    { event: "warning", reason: "clone-cleanup-failed", target: "/tmp/x", message: "EBUSY: [31mhostile[0m\nline2" },
+    { event: "warning", reason: "clone-cleanup-failed", target: "/tmp/x", message: "EBUSY: \u001B[31mhostile\u001B[0m\nline2" },
     { event: "done", runId: "fixed-run-id", errors: 0 },
   ];
 
