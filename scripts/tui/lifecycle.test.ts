@@ -976,7 +976,7 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     proxy.detach();
   });
 
-  test("writeAllSync delivers whole lines through SHORT writes and fails on nonpositive/non-integer counts", async () => {
+  test("writeAllSync delivers whole lines through SHORT writes and fails on nonpositive, non-integer, and OVERSHOOTING counts", async () => {
     const { writeAllSync } = await import("./lifecycle.ts");
     // short-write sequence: deliver 3 bytes, then 1, then the rest
     const chunks: Array<{ offset: number; wrote: number }> = [];
@@ -993,10 +993,15 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     );
     expect(chunks.map((c) => c.offset)).toEqual([0, 3, 4]); // resumed exactly where it left off
     expect(chunks.reduce((s, c) => s + c.wrote, 0)).toBe(14); // the WHOLE line delivered
-    // nonpositive and non-integer counts are WRITE FAILURES, never infinite retries
-    for (const bad of [0, -1, 0.5, NaN]) {
-      expect(() => writeAllSync(() => bad, 7, "line\n")).toThrow(/made no progress/);
+    // nonpositive, non-integer, and OVERSHOOTING counts are WRITE FAILURES — no-progress
+    // retries would hang, and a count above the remaining bytes claims a delivery the writer
+    // cannot have performed ("line\n" is 5 bytes; 6 overshoots from the first call)
+    for (const bad of [0, -1, 0.5, NaN, Infinity, 6]) {
+      expect(() => writeAllSync(() => bad, 7, "line\n")).toThrow(/invalid count/);
     }
+    // an overshoot on a LATER call — after honest progress — fails identically (99 > 2 remaining)
+    let laterCalls = 0;
+    expect(() => writeAllSync(() => (laterCalls++ === 0 ? 3 : 99), 7, "line\n")).toThrow(/invalid count/);
   });
 
   test("TOTAL teardown under a THROWING injected timer: the audit still completes, never hangs — and the warning names outcome AND cause", async () => {

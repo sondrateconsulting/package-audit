@@ -64,15 +64,18 @@ export interface DivertIo {
 // open/write/close failures at the call site, where the §U6 transitions can see them.
 // The short-write loop, factored over an injected write so the count semantics are directly
 // table-testable (§U8.4): writeSync may write SHORT without throwing — loop until the WHOLE
-// line is delivered (one logical write per event, ordering by construction). A nonpositive or
-// non-integer count is a WRITE FAILURE, not a retry: an unchanged infinite retry would hang
-// the audit (§U1).
+// line is delivered (one logical write per event, ordering by construction). A nonpositive,
+// non-integer, or OVERSHOOTING count is a WRITE FAILURE, not a retry: no-progress retries
+// would hang the audit (§U1), and a count above the remaining bytes claims a delivery the
+// writer cannot have performed — accepting it would announce a complete divert log that is
+// silently missing bytes, instead of taking the §U1 divert-failure reroute.
 export function writeAllSync(writeFn: (fd: number, buf: Buffer, offset: number) => number, fd: number, line: string): void {
   const buf = Buffer.from(line, "utf8");
   let offset = 0;
   while (offset < buf.length) {
     const n = writeFn(fd, buf, offset);
-    if (!Number.isInteger(n) || n <= 0) throw new Error(`divert write made no progress (write returned ${n})`);
+    if (!Number.isInteger(n) || n <= 0 || n > buf.length - offset)
+      throw new Error(`divert write returned an invalid count (${n} with ${buf.length - offset} bytes remaining)`);
     offset += n;
   }
 }
