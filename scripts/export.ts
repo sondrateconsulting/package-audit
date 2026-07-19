@@ -514,19 +514,24 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     process.stdout.write(EXPORT_HELP + "\n");
     return;
   }
-  const { config } = await loadConfig(argv);
-  const rendered = runExport(config, { runId: eargs.runId, raw: eargs.raw });
-  // T7: runExport emits per-artifact events via logLine (buffered under a slow stdout consumer);
-  // drain them before the summary line so ordering holds and nothing is left buffered at exit.
-  await flushLogs();
+  let rendered: { line: string };
+  try {
+    const { config } = await loadConfig(argv);
+    rendered = runExport(config, { runId: eargs.runId, raw: eargs.raw });
+  } finally {
+    // T7: runExport emits per-artifact events via logLine (buffered under a slow stdout consumer).
+    // Drain them in a finally so ordering holds before the summary AND so a throw doesn't discard
+    // buffered events — the entrypoint's fatal handler calls process.exit, which skips the natural
+    // stdout flush. Flushing here (not only in the import.meta.main catch) also makes the drain
+    // reachable in-process for tests.
+    await flushLogs();
+  }
   process.stdout.write(rendered.line);
 }
 
 if (import.meta.main) {
-  main().catch(async (e) => {
-    // T7: drain any buffered export events before the hard exit (process.exit skips the natural
-    // stdout flush), so a throw AFTER some events were emitted doesn't discard them.
-    await flushLogs();
+  main().catch((e) => {
+    // main() already drained buffered events in its finally; here we only render the fatal and exit.
     process.stderr.write(renderFatal(e, { command: "export", usage: EXPORT_USAGE }));
     process.exit(1);
   });

@@ -12,6 +12,7 @@ import {
 } from "./export.ts";
 import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
 import { parseEvents } from "./testEvents.test.ts";
+import { setLogSink, resetLogSink, flushLogs, loggerStats, type LogSink } from "./log.ts";
 
 // Bundle containment roots are caller-provided (unlike AuditDb's hardcoded ./data|./output), so
 // exportRun tests run entirely against disposable temp output dirs + :memory: databases.
@@ -575,6 +576,51 @@ describe("runExport guards (mirroring runReport, notices to stdout only)", () =>
     expect(runs.map((r) => r["run_id"])).toEqual([newRun.runId]);
     const manifest = JSON.parse(readXray(out, "manifest.json")) as { runId: string };
     expect(manifest.runId).toBe(newRun.runId);
+  });
+
+  // T7 flush wiring: runExport emits one `export` event per artifact via logLine; under a slow stdout
+  // consumer they buffer, and main()'s finally-flush drains them before exit. Prove every per-artifact
+  // line SURVIVES backpressure (none shed) and drains on flush. (finding IMPORTANT-5e)
+  test("runExport: every buffered per-artifact export event survives backpressure and drains on flush", async () => {
+    mkdirSync(DB_ROOT, { recursive: true });
+    const sqlitePath = join(DB_ROOT, `bp-${process.pid}-${Math.random().toString(36).slice(2)}.db`);
+    const db = AuditDb.open({ sqlitePath });
+    const { newRun } = seedTwoRuns(db);
+    db.close();
+    const out = nextOutputDir();
+    // Backpressure at the FIRST `export` line so the remaining per-artifact lines buffer behind it.
+    function pauseAtFirstExport() {
+      const received: string[] = [];
+      let paused = false;
+      let armed = true; // backpressure ONCE (all lines are `export`, so re-pausing would deadlock on resume)
+      let drainCb: (() => void) | null = null;
+      const eventOf = (line: string): unknown => { try { return (JSON.parse(line) as { event?: unknown }).event; } catch { return undefined; } };
+      const sink: LogSink = {
+        write: (line) => {
+          received.push(line);
+          if (armed && eventOf(line) === "export") { armed = false; paused = true; return false; }
+          return !paused;
+        },
+        onDrain: (cb) => { drainCb = cb; },
+      };
+      return { sink, received, resume: () => { paused = false; const cb = drainCb; drainCb = null; if (cb) cb(); } };
+    }
+    const s = pauseAtFirstExport();
+    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
+    const droppedBefore = loggerStats().dropped;
+    setLogSink(s.sink, EXPORT_TABLE_NAMES.length * 2 + 5); // bound holds every artifact line (one per table×format) — none should be shed
+    try {
+      const { line } = runExport(config(sqlitePath, out), { runId: newRun.runId, raw: false });
+      s.resume(); // drain the buffered per-artifact tail
+      await flushLogs();
+      const exportEvents = s.received.map((l) => JSON.parse(l) as Record<string, unknown>).filter((e) => e["event"] === "export");
+      expect(exportEvents.length).toBeGreaterThanOrEqual(2); // multiple artifact lines buffered behind the first, all drained
+      expect(loggerStats().dropped - droppedBefore).toBe(0); // nothing shed under the bound — buffered, not dropped
+      expect(JSON.parse(line)).toMatchObject({ event: "export-summary", runId: newRun.runId }); // summary still returned
+    } finally {
+      resetLogSink();
+      errSpy.mockRestore();
+    }
   });
 });
 

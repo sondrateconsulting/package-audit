@@ -9,6 +9,7 @@ import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
 import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
+import { setLogSink, resetLogSink, flushLogs, loggerStats, type LogSink } from "./log.ts";
 
 const mem = (): AuditDb => AuditDb.open({ sqlitePath: ":memory:" });
 
@@ -895,6 +896,58 @@ describe("report --html wiring (emitDossiers + runReport integration)", () => {
       }
     } finally {
       spy.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  // T7 flush wiring: runReport emits dossier events via logLine; under a slow stdout consumer they
+  // buffer, and main()'s finally-flush must drain them before exit. Prove they SURVIVE backpressure
+  // (a non-droppable dossier-summary must not be shed) and drain on flush. (finding IMPORTANT-5e)
+  test("runReport --html: buffered dossier events survive backpressure and drain on flush", async () => {
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-bp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const root = mkdtempSync(join(tmpdir(), "report-bp-"));
+    // Accept until the first `dossier` line, then backpressure (bound 1) so the following
+    // `dossier-summary` contends for the buffer — proving flushLogs drains what runReport queued.
+    function pauseAtDossier() {
+      const received: string[] = [];
+      let paused = false;
+      let armed = true; // backpressure ONCE so re-pausing on a second dossier can't deadlock on resume
+      let drainCb: (() => void) | null = null;
+      const eventOf = (line: string): unknown => { try { return (JSON.parse(line) as { event?: unknown }).event; } catch { return undefined; } };
+      const sink: LogSink = {
+        write: (line) => {
+          received.push(line);
+          // exact match: `dossier-summary` also contains the substring `"event":"dossier"`, so parse
+          if (armed && eventOf(line) === "dossier") { armed = false; paused = true; return false; }
+          return !paused;
+        },
+        onDrain: (cb) => { drainCb = cb; },
+      };
+      return { sink, received, resume: () => { paused = false; const cb = drainCb; drainCb = null; if (cb) cb(); } };
+    }
+    const s = pauseAtDossier();
+    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
+    const droppedBefore = loggerStats().dropped;
+    setLogSink(s.sink, 1); // bound 1: only a terminal event may exceed it — a shed dossier-summary would fail below
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      seed(db);
+      db.close();
+      const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
+      runReport(cfg, null, { html: true }); // emits `dossier` (backpressures) then `dossier-summary` (buffered behind it)
+      s.resume(); // drain the buffered tail
+      await flushLogs();
+      const events = s.received.map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(events.some((e) => e["event"] === "dossier")).toBe(true);
+      expect(events.some((e) => e["event"] === "dossier-summary")).toBe(true); // buffered non-droppable line survived + shipped
+      expect(loggerStats().dropped - droppedBefore).toBe(0); // nothing was shed under the bound — the summary drained, not dropped
+    } finally {
+      resetLogSink();
+      errSpy.mockRestore();
       rmSync(root, { recursive: true, force: true });
       rmSync(dbRoot, { recursive: true, force: true });
       if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });

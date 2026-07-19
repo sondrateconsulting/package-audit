@@ -533,11 +533,18 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     process.stdout.write(REPORT_HELP + "\n");
     return;
   }
-  const { config } = await loadConfig(argv);
-  const rendered = runReport(config, rargs.runId, { html: rargs.html });
-  // T7: runReport emits dossier events via logLine (buffered under a slow stdout consumer); drain
-  // them before the summary line so ordering holds and nothing is left buffered at exit.
-  await flushLogs();
+  let rendered: { line: string };
+  try {
+    const { config } = await loadConfig(argv);
+    rendered = runReport(config, rargs.runId, { html: rargs.html });
+  } finally {
+    // T7: runReport emits dossier events via logLine (buffered under a slow stdout consumer). Drain
+    // them in a finally so ordering holds before the summary AND so a throw doesn't discard buffered
+    // events — the entrypoint's fatal handler calls process.exit, which skips the natural stdout
+    // flush. Flushing here (not only in the import.meta.main catch) also makes the drain reachable
+    // in-process for tests.
+    await flushLogs();
+  }
   process.stdout.write(rendered.line);
 }
 
@@ -558,10 +565,8 @@ function mkdirCanonical(outputDir: string): void {
 }
 
 if (import.meta.main) {
-  main().catch(async (e) => {
-    // T7: drain any buffered dossier events before the hard exit, so a throw AFTER some events were
-    // emitted doesn't discard them (process.exit skips the natural stdout flush).
-    await flushLogs();
+  main().catch((e) => {
+    // main() already drained buffered events in its finally; here we only render the fatal and exit.
     process.stderr.write(renderFatal(e, { command: "report", usage: REPORT_USAGE }));
     process.exit(1);
   });
