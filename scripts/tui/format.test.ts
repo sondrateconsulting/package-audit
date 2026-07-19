@@ -96,6 +96,7 @@ describe("formatters (§U8.11)", () => {
 describe("limitTone (M1 — graded rate-limit headroom color)", () => {
   test("red below 10% of the limit, yellow below 25%, uncolored otherwise", () => {
     expect(limitTone(0, 5000)).toBe("red"); // fully exhausted
+    expect(limitTone(-100, 5000)).toBe("red"); // a negative remaining is worse than empty → red, not uncolored
     expect(limitTone(120, 5000)).toBe("red"); // 2.4%
     expect(limitTone(499, 5000)).toBe("red"); // 9.98%
     expect(limitTone(500, 5000)).toBe("yellow"); // exactly 10% → not red, still low
@@ -110,6 +111,16 @@ describe("limitTone (M1 — graded rate-limit headroom color)", () => {
     expect(limitTone(100, Number.POSITIVE_INFINITY)).toBeUndefined();
     expect(limitTone(100, 0)).toBeUndefined(); // degenerate limit — no divide
     expect(limitTone(100, -5)).toBeUndefined();
+  });
+  test("TOTAL against undefined and masquerading runtime values (§U0 — never enter a ratio)", () => {
+    // The quota seed's number-typed fields originate in an unvalidated external JSON body; the store's
+    // folds null non-finite values, but limitTone must ALSO be total on its own — a future emitter must
+    // never be able to render color from a string (or drive a NaN ratio) if it forgets to validate.
+    expect(limitTone(undefined as unknown as number, 5000)).toBeUndefined(); // absent value
+    expect(limitTone(100, undefined as unknown as number)).toBeUndefined();
+    expect(limitTone("120" as unknown as number, 5000)).toBeUndefined(); // Number.isFinite("120") is false — no coercion
+    expect(limitTone(120, "5000" as unknown as number)).toBeUndefined();
+    expect(limitTone(`${String.fromCharCode(0x9d)}0;pwn${String.fromCharCode(0x9c)}` as unknown as number, 5000)).toBeUndefined(); // hostile C1 string
   });
 });
 

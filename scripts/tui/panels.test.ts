@@ -7,11 +7,25 @@
 import { expect, test, describe, afterEach } from "bun:test";
 import { EventEmitter } from "node:events";
 import { mountTui } from "./mount.tsx";
+import { LimitSegment } from "./panels.tsx";
 import { createTuiStore, type TuiStore } from "./store.ts";
 import { sanitizeLine } from "./format.ts";
 import { PAUSE_BUDGET_CAP_MINUTES } from "./panels.tsx";
 import { MAX_TOTAL_PAUSE_MS } from "../github.ts";
 import { resetTuiFailure, type ProgressEvent } from "../progress.ts";
+
+// Extract the Text node that wraps a LimitSegment's remaining count, with its color prop. A
+// rendered-ANSI assertion is not CI-stable here (ink/chalk caches its color level at module load,
+// shared across bun's test process — verified: color appears when a file runs alone but not once
+// another file has already imported ink), so the M1 color wiring is proven structurally instead.
+function remainingNode(el: unknown): { color: unknown; remaining: unknown } {
+  const kids = (el as { props: { children: unknown } }).props.children as unknown[];
+  const text = kids.find(
+    (k): k is { props: { color?: unknown; children?: unknown } } =>
+      typeof k === "object" && k !== null && "props" in k && Object.prototype.hasOwnProperty.call((k as { props: object }).props, "color"),
+  );
+  return { color: text?.props.color, remaining: text?.props.children };
+}
 
 afterEach(() => {
   resetTuiFailure();
@@ -131,6 +145,20 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(text).toContain("JSONL → /out/logs/audit-log-20260718T211530Z-p4242.jsonl");
   });
 
+  test("M1 wiring: LimitSegment colors the remaining count by limitTone, uncolored when healthy (shared by full + compact)", () => {
+    const store: TuiStore = createTuiStore(() => NOW);
+    store.dispatch({ type: "rate-limit", resource: "core", remaining: 100, limit: 5000, resetEpochSec: null }); // 2% → red
+    store.dispatch({ type: "rate-limit", resource: "graphql", remaining: 4800, limit: 5000, resetEpochSec: null }); // 96% → uncolored
+    const snap = store.snapshot();
+    // Both LimitsPanel and CompactFrame render this one component; proving it here covers both modes.
+    const low = remainingNode(LimitSegment({ snap, resource: "core", nowMs: NOW }));
+    expect(low.remaining).toBe("100");
+    expect(low.color).toBe("red"); // fails if the color wiring is dropped — the text-only tests would not
+    const healthy = remainingNode(LimitSegment({ snap, resource: "graphql", nowMs: NOW }));
+    expect(healthy.remaining).toBe("4,800");
+    expect(healthy.color).toBeUndefined();
+  });
+
   test("session counters front-load the danger fields so end-truncation drops the least important first (M2)", async () => {
     const text = await frame([
       jsonl({ event: "unit", org: "o", repo: "r", branch: "a", action: "scanned", deps: 0, usage: 0, cli: 0 }),
@@ -150,6 +178,8 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(session.indexOf("errored")).toBeLessThan(session.indexOf("current"));
     expect(session.indexOf("retry-exhausted")).toBeLessThan(session.indexOf("skipped"));
     expect(session.indexOf("requeued")).toBeLessThan(session.indexOf("past-cap"));
+    // the full sequence, exactly — danger fields first, low-priority fields last
+    expect(session).toContain("scanned 1 · errored 1 · retry-exhausted 1 · requeued 1 · current 1 · skipped 1 · past-cap 1");
   });
 
   test("overflow: more active rows than the budget renders '… +N more'", async () => {
