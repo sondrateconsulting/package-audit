@@ -4,11 +4,11 @@
 // Scripted-fake style throughout (injected SpawnFn / fetchImpl / clocks); the progress sink is
 // restored in afterEach (§U8 hygiene).
 import { expect, test, describe, afterEach, spyOn } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { realpathSync } from "node:fs";
-import { GithubClient, ThrottleExhausted, GithubApiError, spawnLabel, MAX_TOTAL_PAUSE_MS, type SpawnFn, type SpawnResult, type BranchSnapshot, type RepoInfo, type TreeResponse } from "./github.ts";
+import { GithubClient, ThrottleExhausted, GithubApiError, spawnLabel, makeRealSpawn, MAX_TOTAL_PAUSE_MS, type SpawnFn, type SpawnResult, type BranchSnapshot, type RepoInfo, type TreeResponse } from "./github.ts";
 import { setProgressSink, resetTuiFailure, type ProgressEvent } from "./progress.ts";
 import { setLogSink, setLogTap } from "./log.ts";
 import { fetchPackument, introspectVersion, type FetchFn } from "./apiSurface.ts";
@@ -546,5 +546,185 @@ describe("orchestrate unit lifecycle events (§U8.9)", () => {
     const cfg = { ...testConfig("/tmp/x"), githubHost: "ghe.example.com" };
     (cfg.concurrency as { repositories: number }).repositories = 11;
     expect(preflightClientOptions(cfg)).toEqual({ githubHost: "ghe.example.com", concurrency: 11 });
+  });
+});
+
+// ---- escalation-remediation coverage (reviewer-named gaps) ------------------------------------
+const untilTrue = async (cond: () => boolean, ms = 4000): Promise<boolean> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return cond();
+};
+
+const alive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+describe("reviewer-named coverage gaps (escalation remediation)", () => {
+  test("the REAL byte-cap kill path still balances its spawn span (readCapped-driven, end to end)", async () => {
+    // The synthetic-rejection test above proves span balance for a rejected spawn promise; this
+    // drives the REAL pipeline — readCapped crossing → kill → SIGKILL escalation → exit — via
+    // makeRealSpawn and a TERM-trapping spewer child (github.test.ts's real-child pattern).
+    const dir = mkdtempSync(join(tmpdir(), "wiring-cap-"));
+    const pidFile = join(dir, "pid");
+    const script = join(dir, "spewer");
+    writeFileSync(script, `#!/bin/sh\ntrap '' TERM\necho $$ > ${pidFile}\nhead -c 256 /dev/zero\nsleep 300 &\nwait\n`);
+    chmodSync(script, 0o755);
+    const seen = captureProgress();
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: makeRealSpawn(64),
+      env: { PATH: "/bin:/usr/bin" },
+      binPaths: { gh: script, git: script, tar: script },
+      tempRoot: TEST_TMP,
+    });
+    try {
+      await expect(client.gh(["--version"])).rejects.toThrow(/spawn output exceeds 64 bytes/);
+      expect(spans(seen, "spawn-start").length).toBe(1);
+      expect(balanced(seen, "spawn-start", "spawn-end")).toBe(true); // the byte-cap kill still ended its span
+      const shPid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(alive(shPid)).toBe(false); // the rejection arrived AFTER the child died (composes 1908's hold guarantee)
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  test("GraphQL retry→success emits ONE snapshot per parsed attempt (the fatal-only coverage gap)", async () => {
+    const seen = captureProgress();
+    const gql = makeClient([
+      ok(http(500, { "X-RateLimit-Remaining": "11" }, "boom")), // transient retry attempt — live parsed response
+      ok(http(200, { "X-RateLimit-Remaining": "9", "X-RateLimit-Limit": "2000", "X-RateLimit-Reset": "1700000000" }, JSON.stringify({ data: { x: 1 } }))),
+    ]);
+    await gql.graphql("query{x}", {});
+    const rl = seen.filter((e) => e.type === "rate-limit") as Array<{ resource: string; remaining: number | null }>;
+    expect(rl).toEqual([
+      { type: "rate-limit", resource: "graphql", remaining: 11, limit: null, resetEpochSec: null },
+      { type: "rate-limit", resource: "graphql", remaining: 9, limit: 2000, resetEpochSec: 1700000000 },
+    ] as unknown as typeof rl);
+  });
+
+  test("no-sink zero-DERIVATION on the analyze-return path: zero header reads without a sink, exactly three with one (§U8.7)", async () => {
+    // Zero-delivery alone cannot catch a gating regression (emitProgress discards sinklessly
+    // either way) — so the derivation itself is observed through proxy-backed headers driven
+    // through the REAL private seam.
+    const reads: string[] = [];
+    const headers = new Proxy({} as Record<string, string>, {
+      get(_t, prop) {
+        reads.push(String(prop));
+        return undefined;
+      },
+    });
+    const direct = makeClient([ok("ignored"), ok("ignored")]);
+    type Analyze = (res: SpawnResult, now: number) => { outcome: string; pauseUntilMs: number | null; rateLimitHeaders?: Record<string, string> };
+    const seam = direct as unknown as { core: unknown; ghBucketedAttempt: (args: string[], bucket: unknown, analyze: Analyze) => Promise<string> };
+    const call = (): Promise<string> => seam.ghBucketedAttempt(["--version"], seam.core, () => ({ outcome: "ok", pauseUntilMs: null, rateLimitHeaders: headers }));
+    await call(); // NO sink installed
+    expect(reads).toEqual([]); // zero derivation — not a single header read
+    const seen = captureProgress();
+    await call(); // WITH a sink
+    expect([...reads].sort()).toEqual(["x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"]);
+    expect(seen.filter((e) => e.type === "rate-limit").length).toBe(1);
+    // and the behavioral integration half: a full restGet with rate-limit headers, sinkless,
+    // leaves nothing queued for a later sink
+    setProgressSink(null);
+    const integration = makeClient([ok(http(200, { "X-RateLimit-Remaining": "4750" }, `{"a":1}`))]);
+    await integration.restGet("user");
+    const late = captureProgress();
+    expect(late.length).toBe(0); // nothing was emitted or deferred while no sink existed
+  });
+
+  test("an owner-bracket throw at the runScan level: the pool rethrows, runScan rejects, brackets stay balanced", async () => {
+    const root = mkdtempSync(join(tmpdir(), "wiring-owner-throw-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    try {
+      const client = makeClient([], { tempRoot: root });
+      client.listOrgRepos = async () => [REPO];
+      client.listBranchHeads = async () => snapshot(["main"]);
+      db.enqueueUnit = () => {
+        throw new PolicyMatchError("excludeBranches", "dep*", "main", new Error("boom"));
+      };
+      const seen = captureProgress();
+      await expect(quietly(() => runScan(db, client, rt(testConfig(root)), ARGS, null))).rejects.toThrow(PolicyMatchError);
+      expect(seen.filter((e) => e.type === "owner-start").length).toBe(1);
+      expect(seen.filter((e) => e.type === "owner-end").length).toBe(1); // finally-closed through the pool rethrow
+      expect(seen.filter((e) => e.type === "repo-start").length).toBe(1);
+      expect(seen.filter((e) => e.type === "repo-end").length).toBe(1);
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("REAL concurrent arm→wait→re-arm against ONE bucket: two armed horizons, every waiting matches the latest armed at its emission", async () => {
+    const seen = captureProgress();
+    // Manual-resolution sleep gate: each sleep parks with its ABSOLUTE target; releasing
+    // advances the clock to max(now, target) — never a relative add, so overlapping waits on
+    // one horizon cannot double-count time.
+    let fakeNow = 1_000_000_000_000;
+    const parked: Array<{ targetMs: number; release: () => void }> = [];
+    const sleepImpl = (ms: number): Promise<void> =>
+      new Promise<void>((resolve) => {
+        parked.push({ targetMs: fakeNow + ms, release: resolve });
+      });
+    const releasePark = (i: number): void => {
+      const p = parked[i]!;
+      fakeNow = Math.max(fakeNow, p.targetMs);
+      p.release();
+    };
+    const nowSec = Math.floor(fakeNow / 1000);
+    const primary = (resetSec: number): SpawnResult => ok(http(403, { "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": String(resetSec) }, ""));
+    // spawn order is fully gated by the sleep releases below, so the response QUEUE is the
+    // caller key: A's first attempt, A's retry, then the two successes
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: scripted([primary(nowSec + 600), primary(nowSec + 1200), ok(http(200, {}, `{"a":1}`)), ok(http(200, {}, `{"b":2}`))]).spawn,
+      sleepImpl,
+      nowImpl: () => fakeNow,
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+    });
+    const throttles = (): Array<{ state: string; untilMs: number | null }> => seen.filter((e) => e.type === "throttle") as never;
+    const armedH = (): number[] => throttles().filter((t) => t.state === "armed").map((t) => t.untilMs ?? -1);
+    const a = client.restGet("user"); // attempt 1 arms H1, then A parks on waitBucket(H1)
+    expect(await untilTrue(() => armedH().length === 1 && parked.length === 1)).toBe(true);
+    const b = client.restGet("user"); // B observes the LIVE pause: waits without spawning
+    expect(await untilTrue(() => parked.length === 2)).toBe(true);
+    releasePark(0); // A wakes past H1 → retry spawns → re-arm extends to H2 → A re-parks
+    expect(await untilTrue(() => armedH().length === 2 && parked.length === 3)).toBe(true);
+    const [h1, h2] = armedH();
+    expect(h2!).toBeGreaterThan(h1!); // the horizon EXTENDED
+    releasePark(1); // B's H1 sleep releases — the pause is now H2, so B must RE-PARK at H2
+    expect(await untilTrue(() => parked.length === 4)).toBe(true); // B re-parked while A's H2 sleep (index 2) is STILL parked — B's identity is structural
+    try {
+      // the emission-order record IS the assertion: each waiting carries the horizon of the
+      // latest armed AT ITS EMISSION (H1, H1, then H2 after the re-arm — never retroactive)
+      expect(throttles().map((t) => ({ state: t.state, untilMs: t.untilMs }))).toEqual([
+        { state: "armed", untilMs: h1! },
+        { state: "waiting", untilMs: h1! }, // A
+        { state: "waiting", untilMs: h1! }, // B
+        { state: "armed", untilMs: h2! },
+        { state: "waiting", untilMs: h2! }, // A re-parks
+        { state: "waiting", untilMs: h2! }, // B re-parks
+      ]);
+    } finally {
+      // drain every sleeper (re-releasing an already-resolved park is a no-op) so a failing
+      // assertion cannot leak pending promises
+      for (const p of parked.splice(0)) {
+        fakeNow = Math.max(fakeNow, p.targetMs);
+        p.release();
+      }
+    }
+    await a; // both calls complete once the horizons pass — a rejection would fail the test
+    await b;
+    expect(armedH().length).toBe(2); // exactly two arms — single-exit per arm, no phantom re-emits
   });
 });
