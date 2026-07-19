@@ -41,7 +41,7 @@ export function Header({ snap, nowMs, mountedAtMs }: { snap: TuiSnapshot; nowMs:
   );
 }
 
-// One rate-limit segment ("core 4,812/5,000 resets 12:34"). The REMAINING count carries a graded
+// One rate-limit segment ("core 4,812/5,000 resets in 12:34"). The REMAINING count carries a graded
 // headroom color (§M1 limitTone) so a low quota stands out in the otherwise-monochrome healthy
 // frame; the label and denominator stay neutral. Text content is unchanged from the prior string
 // form (the panel tests assert it verbatim); color is stripped before those assertions.
@@ -49,7 +49,7 @@ function LimitSegment({ snap, resource, nowMs }: { snap: TuiSnapshot; resource: 
   const l = snap.limits[resource];
   if (l === null) return <>{`${resource} —`}</>;
   const remaining = l.remaining === null ? "?" : thousands(l.remaining);
-  const rest = `${l.limit === null ? "" : `/${thousands(l.limit)}`}${l.resetEpochSec === null ? "" : ` resets ${formatReset(l.resetEpochSec, nowMs)}`}`;
+  const rest = `${l.limit === null ? "" : `/${thousands(l.limit)}`}${l.resetEpochSec === null ? "" : ` resets in ${formatReset(l.resetEpochSec, nowMs)}`}`;
   return (
     <>
       {`${resource} `}
