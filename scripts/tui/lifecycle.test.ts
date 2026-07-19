@@ -1146,6 +1146,33 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     timers.fireAll();
     expect(await run).toBe(9);
   });
+
+  test("a proxy construction failure (throwing listener registration) degrades to a BARE run — body still runs, one warning", async () => {
+    // §U0 kill-guard: makeSealableStderr registers the stderr 'error' absorber BEFORE the setup
+    // try — a hostile injected stream must degrade to the mode-off shape (no proxy, no seams,
+    // no teardown), never reject runWithTui before body().
+    const { deps, stderr, capture } = makeDeps();
+    stderr.on = (() => {
+      throw new Error("listener registration refused");
+    }) as unknown as typeof stderr.on;
+    const r = await runWithTui(deps, async () => 41);
+    expect(r).toBe(41);
+    expect(capture.opts).toBeNull(); // the mount was never reached
+    expect(hasProgressSink()).toBe(false); // no seam was installed
+    expect(stderr.all()).toContain("dashboard disabled — listener registration refused");
+  });
+
+  test("proxy construction failure with a DEAD stderr still runs the audit — the warn is best-effort", async () => {
+    const { deps, stderr, capture } = makeDeps();
+    stderr.on = (() => {
+      throw new Error("no listeners");
+    }) as unknown as typeof stderr.on;
+    stderr.throwOnWrite = new Error("stderr dead too");
+    const r = await runWithTui(deps, async () => "ok");
+    expect(r).toBe("ok");
+    expect(capture.opts).toBeNull();
+    expect(stderr.all()).toBe(""); // nothing landed anywhere — and nothing threw
+  });
 });
 
 // ---- §U8.12 routing equivalence --------------------------------------------------------------

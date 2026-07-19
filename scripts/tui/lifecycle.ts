@@ -279,10 +279,6 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
   const degradeNow = (): void => {
     void teardownOnce();
   };
-  const proxy = makeSealableStderr(realStderr, (cause) => {
-    reportTuiFailure(cause);
-    degradeNow();
-  });
 
   const writeReal = (text: string): void => {
     // The noop callback RECEIVES AND DISCARDS the per-write error report, closing the
@@ -300,6 +296,24 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
       // nowhere left to warn to — the audit still runs
     }
   };
+
+  // Proxy construction touches the REAL stream (it registers the stderr 'error' absorber), and
+  // it runs BEFORE the setup try below — an injected stream whose listener registration throws
+  // must degrade to a bare run (the mode-off shape: no proxy, no seams, no teardown), never
+  // reject runWithTui before body() ran (§U0 degrade-never-kill). The IIFE keeps `proxy` a
+  // const, so the null-check narrowing holds inside every closure defined after it.
+  const proxy = ((): SealableStderr | null => {
+    try {
+      return makeSealableStderr(realStderr, (cause) => {
+        reportTuiFailure(cause);
+        degradeNow();
+      });
+    } catch (e) {
+      warnReal(`package-audit: dashboard disabled — ${errText(e)}\n`);
+      return null;
+    }
+  })();
+  if (proxy === null) return body();
 
   // waitUntilExit bounded by the INJECTED timers (§U6 step 2). TOTAL: never rejects, and a
   // throwing injected timer cannot hang it (a broken timer resolves the wait immediately —
