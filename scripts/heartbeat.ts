@@ -14,7 +14,7 @@ import { logLine, logActivitySeq } from "./log.ts";
 
 export interface HeartbeatController {
   setPhase(phase: string): void;
-  setTarget(target: string | null): void; // e.g. "org/repo@branch" currently in flight
+  setTarget(target: string | null, inFlight?: number): void; // OLDEST "org/repo@branch" in flight + concurrent in-flight count
   setUnitsDone(n: number): void;
   tick(): void; // the interval calls this; exposed so tests drive it without real timers
   stop(): void;
@@ -53,7 +53,8 @@ export function startHeartbeat(opts: HeartbeatOptions): HeartbeatController {
 
   const startedAt = nowMs();
   let phase = "starting";
-  let target: string | null = null;
+  let target: string | null = null; // OLDEST branch still in flight (set by RunProgress)
+  let inFlight = 0; // how many branches are concurrently in flight
   let unitsDone = 0;
   let lastSeen = activity();
   let stopped = false;
@@ -62,7 +63,8 @@ export function startHeartbeat(opts: HeartbeatOptions): HeartbeatController {
     if (activity() === lastSeen) {
       // genuinely quiet since the last tick — speak up.
       const line: Record<string, unknown> = { event: "heartbeat", phase };
-      if (target !== null) line["current"] = target;
+      if (target !== null) line["current"] = target; // the oldest wedged branch, so a hang keeps naming itself
+      if (inFlight > 0) line["inFlight"] = inFlight; // >1 tells the operator siblings are running alongside it
       line["unitsDone"] = unitsDone;
       line["elapsedSec"] = Math.round((nowMs() - startedAt) / 1000);
       Object.assign(line, extra());
@@ -81,8 +83,9 @@ export function startHeartbeat(opts: HeartbeatOptions): HeartbeatController {
     setPhase(p) {
       phase = p;
     },
-    setTarget(t) {
+    setTarget(t, n = 0) {
       target = t;
+      inFlight = n;
     },
     setUnitsDone(n) {
       unitsDone = n;

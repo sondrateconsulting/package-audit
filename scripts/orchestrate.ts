@@ -61,36 +61,63 @@ export interface AuditRuntime {
 }
 
 // ---- run-scoped progress (§8 observability — T8) --------------------------------------------
-// Emits `phase` transitions and per-unit `unit action:"start"` lines, keeps the liveness heartbeat's
-// phase/unitsDone current (its target is best-effort — one shared slot, so under concurrent branch
-// fibers the latest start/finish wins and it can name a sibling or clear while others still run), and gates the per-unit skip-current/skip-cutoff flood behind
-// --verbose-units (M4: a resume of a large estate otherwise drowns stdout in "nothing changed"
-// lines; the per-repo `repo-done` rollup summarizes them instead). A null heartbeat (tests and direct
-// `runScan` callers — `--plan` runs `runPlan` and never constructs `RunProgress`) makes the liveness
-// updates no-ops while the events still emit.
+// Emits `phase` transitions and per-unit `unit action:"start"` lines and keeps the liveness
+// heartbeat's phase/unitsDone/target current. Under the default concurrent branch fan-out
+// (branches>1) several unit fibers run at once, so the heartbeat's `current` tracks per-unit
+// IDENTITY (a token per started scan) and names the OLDEST still-in-flight branch plus an in-flight
+// count — a wedged branch keeps naming itself while fast siblings come and go, and a token-less
+// completion (a skip-current/skip-cutoff that never started a scan) can't clear a sibling's target.
+// Also gates the per-unit skip flood behind --verbose-units (M4: a large-estate resume otherwise
+// drowns stdout in "nothing changed" lines; the per-repo `repo-done` rollup summarizes them). A null
+// heartbeat (tests and direct `runScan` callers — `--plan` runs `runPlan`, never RunProgress) makes
+// the liveness updates no-ops while the events still emit.
 export class RunProgress {
   private unitsDone = 0;
+  private nextToken = 0;
+  // token → "org/repo@branch"; a Map preserves insertion order, so the first entry is the OLDEST
+  // in-flight unit — the one worth naming during a hang.
+  private readonly inFlight = new Map<number, string>();
   constructor(
     private readonly heartbeat: HeartbeatController | null,
     readonly verboseUnits: boolean,
   ) {}
   phase(p: string): void {
     this.heartbeat?.setPhase(p);
-    // a new phase means no specific unit is in flight — clear the stale target so a heartbeat during
-    // reconciliation/report doesn't keep naming the last-scanned branch as "current".
-    this.heartbeat?.setTarget(null);
+    // a new phase means no unit from the prior phase is in flight — drop them all so a heartbeat
+    // during reconciliation/report doesn't keep naming a stale branch as "current".
+    this.inFlight.clear();
+    this.pushTarget();
     logLine({ event: "phase", phase: p });
   }
-  startUnit(org: string, repo: string, branch: string, commit: string): void {
-    this.heartbeat?.setTarget(`${org}/${repo}@${branch}`);
+  // Register a started scan and return its token; pass that token to unitDone/abandonUnit so the
+  // right slot is released regardless of which sibling finishes first.
+  startUnit(org: string, repo: string, branch: string, commit: string): number {
+    const token = this.nextToken++;
+    this.inFlight.set(token, `${org}/${repo}@${branch}`);
+    this.pushTarget();
     logLine({ event: "unit", org, repo, branch, commit, action: "start" });
+    return token;
   }
-  unitDone(): void {
+  // A unit finished. Always advances unitsDone; releases the in-flight slot when a token is given.
+  // A token-less call is a skip-current/skip-cutoff that never started a scan — it counts as done but
+  // must NOT clear a concurrently-running sibling's target.
+  unitDone(token?: number): void {
     this.unitsDone += 1;
     this.heartbeat?.setUnitsDone(this.unitsDone);
-    // the unit is finished — clear the target so a heartbeat in the gap before the next unit (or
-    // during the next repository's branch discovery) doesn't keep naming this branch as "current".
-    this.heartbeat?.setTarget(null);
+    if (token !== undefined) this.release(token);
+  }
+  // Release a started unit's slot WITHOUT counting it done — the fatal-rethrow path (a PolicyMatchError
+  // escaping before unitDone) uses this so a wedged-then-aborted unit doesn't linger as `current`.
+  // Idempotent: a no-op if unitDone(token) already released it.
+  abandonUnit(token: number): void {
+    this.release(token);
+  }
+  private release(token: number): void {
+    if (this.inFlight.delete(token)) this.pushTarget();
+  }
+  private pushTarget(): void {
+    const oldest = this.inFlight.values().next();
+    this.heartbeat?.setTarget(oldest.done ? null : oldest.value, this.inFlight.size);
   }
 }
 
@@ -673,12 +700,12 @@ export async function processRepo(
       }
 
       db.setUnitStatus(key, { status: "in_progress", runId });
-      progress.startUnit(repo.organization, repo.name, h.name, h.oid);
+      const scanToken = progress.startUnit(repo.organization, repo.name, h.name, h.oid);
       try {
         const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
         db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
         tally.scanned++;
-        progress.unitDone();
+        progress.unitDone(scanToken);
       } catch (e) {
         // A PolicyMatchError is FATAL by contract — never downgraded to a per-unit scan error. It
         // escapes to the outer catch, which trips branchAbort; boundedPool captures it and processRepo
@@ -693,14 +720,18 @@ export async function processRepo(
           db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
           logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
           tally.deferred++;
-          progress.unitDone();
+          progress.unitDone(scanToken);
         } else {
           db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
           db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
           logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
           tally.errored++;
-          progress.unitDone();
+          progress.unitDone(scanToken);
         }
+      } finally {
+        // Release the in-flight slot on EVERY exit — including the PolicyMatchError rethrow above, which
+        // skips unitDone. Idempotent: a no-op after unitDone(scanToken) already released it.
+        progress.abandonUnit(scanToken);
       }
     } catch (e) {
       // A fatal escaped this unit (PolicyMatchError, or the internal bucket-wiring assertion — the

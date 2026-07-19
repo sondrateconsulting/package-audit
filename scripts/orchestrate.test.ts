@@ -651,49 +651,89 @@ describe("runPlan org-level discovery failure (fail-soft continue)", () => {
 });
 
 describe("RunProgress (T8: phase/unit-start events + heartbeat plumbing)", () => {
-  function fakeHeartbeat(): { controller: HeartbeatController; calls: string[] } {
+  function fakeHeartbeat(): { controller: HeartbeatController; calls: string[]; target: () => string | null; inFlight: () => number } {
     const calls: string[] = [];
+    let target: string | null = null;
+    let inFlight = 0;
     const controller: HeartbeatController = {
       setPhase: (p) => calls.push(`phase:${p}`),
-      setTarget: (t) => calls.push(`target:${t}`),
+      setTarget: (t, n = 0) => { target = t; inFlight = n; calls.push(`target:${t}:${n}`); },
       setUnitsDone: (n) => calls.push(`units:${n}`),
       tick: () => {},
       stop: () => {},
     };
-    return { controller, calls };
+    return { controller, calls, target: () => target, inFlight: () => inFlight };
   }
 
-  test("phase emits a `phase` event, sets the heartbeat phase, AND clears the stale target", async () => {
+  test("phase emits a `phase` event, sets the heartbeat phase, AND clears every in-flight target", async () => {
     const hb = fakeHeartbeat();
     const events = await captureJsonl(async () => new RunProgress(hb.controller, false).phase("scan"));
     expect(events).toContainEqual({ event: "phase", phase: "scan" });
-    // a new phase means no unit is in flight — the target is cleared so heartbeats don't name a
-    // stale "current" branch during reconciliation/report.
-    expect(hb.calls).toEqual(["phase:scan", "target:null"]);
+    // a new phase means no unit from the prior phase is in flight — targets are cleared so heartbeats
+    // don't name a stale "current" branch during reconciliation/report.
+    expect(hb.calls).toEqual(["phase:scan", "target:null:0"]);
   });
 
-  test("startUnit emits a unit action:start AND points the heartbeat at the target", async () => {
+  test("startUnit emits a unit action:start AND points the heartbeat at the target (inFlight:1)", async () => {
     const hb = fakeHeartbeat();
-    const events = await captureJsonl(async () => new RunProgress(hb.controller, false).startUnit("org-a", "svc", "main", "abc"));
+    let token: unknown;
+    const events = await captureJsonl(async () => { token = new RunProgress(hb.controller, false).startUnit("org-a", "svc", "main", "abc"); });
     expect(events).toContainEqual({ event: "unit", org: "org-a", repo: "svc", branch: "main", commit: "abc", action: "start" });
-    expect(hb.calls).toEqual(["target:org-a/svc@main"]);
+    expect(hb.calls).toEqual(["target:org-a/svc@main:1"]);
+    expect(token).toBeDefined();
   });
 
-  test("unitDone advances a running counter into the heartbeat AND clears the completed target", () => {
+  // The heartbeat exists to name the wedged branch during a hang. Under the default concurrent
+  // branch fan-out (branches>1) a single mutable slot loses that: fast siblings finishing would null
+  // or reassign `current` while the slow one still runs. Track per-unit identity and name the OLDEST
+  // still-in-flight unit instead. (finding IMPORTANT-2)
+  test("the heartbeat names the OLDEST in-flight unit while fast siblings finish (concurrent branch fan-out)", () => {
     const hb = fakeHeartbeat();
     const p = new RunProgress(hb.controller, false);
-    p.unitDone();
-    p.unitDone();
-    p.unitDone();
-    // each completed unit ticks unitsDone and clears the target (no unit is in flight until the next start)
-    expect(hb.calls).toEqual(["units:1", "target:null", "units:2", "target:null", "units:3", "target:null"]);
+    const a = p.startUnit("o", "r", "slow", "1");
+    const b = p.startUnit("o", "r", "fastB", "2");
+    const c = p.startUnit("o", "r", "fastC", "3");
+    const d = p.startUnit("o", "r", "fastD", "4");
+    expect(hb.target()).toBe("o/r@slow");
+    expect(hb.inFlight()).toBe(4);
+    // the three fast siblings finish; the wedged branch keeps naming itself — not null, not a sibling
+    p.unitDone(b);
+    p.unitDone(c);
+    p.unitDone(d);
+    expect(hb.target()).toBe("o/r@slow");
+    expect(hb.inFlight()).toBe(1);
+    p.unitDone(a);
+    expect(hb.target()).toBeNull();
+    expect(hb.inFlight()).toBe(0);
+  });
+
+  test("a token-less unitDone (skip-current / skip-cutoff) advances the counter but never clears a sibling's in-flight target", () => {
+    const hb = fakeHeartbeat();
+    const p = new RunProgress(hb.controller, false);
+    p.startUnit("o", "r", "scanning", "1"); // a real scan is in flight in one fiber
+    p.unitDone(); // a skip in a sibling fiber — no token, so it must NOT clobber the running scan's target
+    expect(hb.target()).toBe("o/r@scanning");
+    expect(hb.inFlight()).toBe(1);
+    expect(hb.calls).toContain("units:1");
+  });
+
+  test("a started unit abandoned on a fatal releases its in-flight slot (no leak)", () => {
+    const hb = fakeHeartbeat();
+    const p = new RunProgress(hb.controller, false);
+    const a = p.startUnit("o", "r", "fatal", "1");
+    p.startUnit("o", "r", "survivor", "2");
+    p.abandonUnit(a); // a PolicyMatchError escaped before unitDone — its slot must still be released
+    expect(hb.target()).toBe("o/r@survivor");
+    expect(hb.inFlight()).toBe(1);
   });
 
   test("a null heartbeat makes the liveness updates no-ops while events still emit", async () => {
     const events = await captureJsonl(async () => {
       const p = new RunProgress(null, false);
       p.phase("report");
-      p.unitDone(); // no heartbeat → no throw
+      const t = p.startUnit("o", "r", "x", "1");
+      p.unitDone(t); // no heartbeat → no throw
+      p.unitDone(); // token-less skip → no throw
     });
     expect(events).toContainEqual({ event: "phase", phase: "report" });
   });
