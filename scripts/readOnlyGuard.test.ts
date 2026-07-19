@@ -9,6 +9,8 @@ import {
   assertSpawnAllowed,
   assertContained,
   ReadOnlyViolation,
+  GIT_READ_VERBS,
+  type GitVerb,
 } from "./readOnlyGuard.ts";
 
 const sh = (s: string): string[] => s.split(" ").filter(Boolean);
@@ -127,10 +129,18 @@ describe("assertReadOnlyGit", () => {
   test("--version passes", () => ok(() => assertReadOnlyGit(["--version"])));
   // The guard also RETURNS the validated verb — load-bearing in github.ts (per-verb spawn deadline +
   // env selection). Assert the value directly: types alone can't catch a wrong-verb-for-valid-input.
-  test("returns the validated verb for each read verb", () => {
-    expect(assertReadOnlyGit(HARDENED)).toBe("clone");
-    expect(assertReadOnlyGit(["rev-parse", "HEAD"])).toBe("rev-parse");
-    expect(assertReadOnlyGit(["--version"])).toBe("--version");
+  // `satisfies Record<GitVerb, …>` makes the fixture EXHAUSTIVE — a verb added to GIT_READ_VERBS
+  // without an argv here is a compile error, mirroring the producer's own `never`-guarded switch.
+  test("returns the validated verb for EVERY read verb (exhaustive identity, incl. show)", () => {
+    const argvByVerb = {
+      clone: HARDENED,
+      "rev-parse": ["rev-parse", "HEAD"],
+      show: SHOW_DATE,
+      "--version": ["--version"],
+    } satisfies Record<GitVerb, readonly string[]>;
+    for (const verb of GIT_READ_VERBS) {
+      expect(assertReadOnlyGit([...argvByVerb[verb]])).toBe(verb);
+    }
   });
   test("push throws", () => throws(() => assertReadOnlyGit(["push"])));
   test("clone -c injection throws", () =>

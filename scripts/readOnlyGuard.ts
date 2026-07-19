@@ -214,6 +214,9 @@ export function assertGraphqlQueryIsReadOnly(rest: string[]): void {
 export const GIT_READ_VERBS = ["clone", "rev-parse", "show", "--version"] as const;
 export type GitVerb = (typeof GIT_READ_VERBS)[number];
 const GIT_READ = new Set<string>(GIT_READ_VERBS);
+// Narrow a raw argv token to GitVerb so the dispatch below can be an EXHAUSTIVE switch (a `never`
+// guard forces a new verb to be handled at the producer, not silently misrouted into clone parsing).
+const isGitVerb = (v: string): v is GitVerb => GIT_READ.has(v);
 // The tool runs EXACTLY ONE `show` form: read a cloned HEAD's committer date (the
 // clone-fallback scan). There is NO general show/log parser — that would reopen --output/textconv/
 // --ext-diff/alternate-format/revision surface. Instead an EXACT raw-argv allowlist: --no-patch
@@ -230,32 +233,41 @@ export function assertReadOnlyGit(rawArgs: string[]): GitVerb {
   const args = canon(rawArgs);
   if (args.length === 0) deny("git with no subcommand");
   const verb = args[0]!;
-  if (!GIT_READ.has(verb)) deny(`git ${verb}`); // a pre-verb global (`git -c x clone`) also lands here
+  if (!isGitVerb(verb)) deny(`git ${verb}`); // a pre-verb global (`git -c x clone`) also lands here; narrows verb → GitVerb
 
   // config-injection short options on ANY verb, incl. attached `-cfoo=baz` / `-ufoo`.
   // (Runs BEFORE the --version return so `git --version -c core.x=y` cannot dodge it.)
   for (const a of args) if (/^-c/.test(a) || /^-u/.test(a)) deny(`git option ${a}`);
 
-  if (verb === "--version") {
-    if (args.length !== 1) deny("git --version must be the sole argument");
-    return "--version";
-  }
-
-  if (verb === "rev-parse") {
-    // the tool only runs `git rev-parse HEAD`; NO option is needed, so reject every flag
-    // (incl. --git-dir/--work-tree and any abbreviation) — only bare positionals allowed.
-    for (const a of args.slice(1)) if (a.startsWith("-")) deny(`git rev-parse option ${a}`);
-    return "rev-parse";
-  }
-
-  if (verb === "show") {
-    // Compare the RAW argv (NOT canon'd — canon splits `--format=%cI` into two tokens): the ONLY
-    // permitted show is the exact commit-date tuple. No option parser, no abbreviations, no reorder.
-    const ok =
-      rawArgs.length === GIT_SHOW_DATE_ARGV.length &&
-      rawArgs.every((a, i) => a === GIT_SHOW_DATE_ARGV[i]);
-    if (!ok) deny("git show is restricted to the exact commit-date form");
-    return "show";
+  // EXHAUSTIVE over GitVerb: the `never` default forces a verb added to GIT_READ_VERBS to be handled
+  // here (a compile error), symmetric with github.ts's gitDeadline switch — this producer can no
+  // longer silently misroute a new verb into the clone grammar. `clone` breaks to the parser below.
+  // isGitVerb above already proved membership, so the cast is a justified narrowing for the switch.
+  const readVerb = verb as GitVerb;
+  switch (readVerb) {
+    case "--version":
+      if (args.length !== 1) deny("git --version must be the sole argument");
+      return "--version";
+    case "rev-parse":
+      // the tool only runs `git rev-parse HEAD`; NO option is needed, so reject every flag
+      // (incl. --git-dir/--work-tree and any abbreviation) — only bare positionals allowed.
+      for (const a of args.slice(1)) if (a.startsWith("-")) deny(`git rev-parse option ${a}`);
+      return "rev-parse";
+    case "show": {
+      // Compare the RAW argv (NOT canon'd — canon splits `--format=%cI` into two tokens): the ONLY
+      // permitted show is the exact commit-date tuple. No option parser, no abbreviations, no reorder.
+      const ok =
+        rawArgs.length === GIT_SHOW_DATE_ARGV.length &&
+        rawArgs.every((a, i) => a === GIT_SHOW_DATE_ARGV[i]);
+      if (!ok) deny("git show is restricted to the exact commit-date form");
+      return "show";
+    }
+    case "clone":
+      break; // the hardened-clone grammar below validates the argv and returns "clone"
+    default: {
+      const _exhaustive: never = readVerb;
+      deny(`git ${String(_exhaustive)}`);
+    }
   }
 
   // verb === "clone": parse the RAW argv (not canon'd) as an exact GRAMMAR. Parsing raw
