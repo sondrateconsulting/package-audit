@@ -139,6 +139,9 @@ export function createTuiStore(nowMs: () => number): TuiStore {
       }
       case "unit": {
         const action = str(ev["action"]);
+        // Identity-field tolerance (the fold is TOTAL, §U4): an absent or mistyped
+        // org/repo/branch renders as a "?" placeholder — "?/?@?" is the honest unknown — rather
+        // than throwing or dropping the problem row over its label.
         const target = `${str(ev["org"]) ?? "?"}/${str(ev["repo"]) ?? "?"}@${str(ev["branch"]) ?? "?"}`;
         if (action === "scanned") {
           counters.scanned++;

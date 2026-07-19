@@ -11,7 +11,7 @@ package-audit is an operator-run instrument that measures org-wide coupling of t
 ```sh
 git clone https://github.com/sondrateconsulting/package-audit.git
 cd package-audit
-bun install   # required: `typescript` powers the .d.ts/source scanners at runtime; dev-only `@types/bun` + `zod` (report-schema tests)
+bun install   # runtime: `typescript` (the scanners) + `ink`/`react` (the opt-outable dashboard); dev-only `@types/bun`, `zod`, `@types/react`, `ink-testing-library`
 ```
 
 1. **Edit [config.json](config.json)** — set the packages you track. Your editor validates it against [config.schema.json](config.schema.json) via the `$schema` key, and unknown keys are rejected at startup (close typos get a did-you-mean hint). One *owner*-scoping decision matters up front: `"organizations": null` (the default) is discovery mode — the tool enumerates *every* organization your gh token is a member of and scans all of them. Right for "audit everything I can see"; wrong for a client engagement run under a token with memberships outside the engagement. For engagements, set an explicit allowlist: `"organizations": ["client-org"]`. Branch scope is a separate lever — see [Branch policy](#branch-policy).

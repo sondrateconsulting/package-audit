@@ -141,6 +141,8 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
       cb?.();
     };
     try {
+      // `as never` satisfies every WriteStream.write overload while forwarding Ink's chunk
+      // verbatim — the proxy must not re-type or convert what Ink hands it at runtime.
       return encoding !== undefined ? real.write(chunk as never, encoding, ack) : real.write(chunk as never, ack);
     } catch (e) {
       absorb(`stderr write threw: ${errText(e)}`);
