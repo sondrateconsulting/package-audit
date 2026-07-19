@@ -614,7 +614,10 @@ describe("runExport guards (mirroring runReport, notices to stdout only)", () =>
       s.resume(); // drain the buffered per-artifact tail
       await flushLogs();
       const exportEvents = s.received.map((l) => JSON.parse(l) as Record<string, unknown>).filter((e) => e["event"] === "export");
-      expect(exportEvents.length).toBeGreaterThanOrEqual(2); // multiple artifact lines buffered behind the first, all drained
+      // EXACT: one export line per (table × {csv,jsonl}); every artifact buffered behind the first drained
+      expect(exportEvents.length).toBe(EXPORT_TABLE_NAMES.length * 2);
+      const pairs = new Set(exportEvents.map((e) => `${String(e["table"])}.${String(e["format"])}`));
+      expect(pairs.size).toBe(EXPORT_TABLE_NAMES.length * 2); // no duplicate/lost (table,format) pair
       expect(loggerStats().dropped - droppedBefore).toBe(0); // nothing shed under the bound — buffered, not dropped
       expect(JSON.parse(line)).toMatchObject({ event: "export-summary", runId: newRun.runId }); // summary still returned
     } finally {

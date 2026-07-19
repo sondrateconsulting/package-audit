@@ -64,7 +64,7 @@ export function startHeartbeat(opts: HeartbeatOptions): HeartbeatController {
       // genuinely quiet since the last tick — speak up.
       const line: Record<string, unknown> = { event: "heartbeat", phase };
       if (target !== null) line["current"] = target; // the oldest wedged branch, so a hang keeps naming itself
-      if (inFlight > 0) line["inFlight"] = inFlight; // >1 tells the operator siblings are running alongside it
+      if (inFlight > 1) line["inFlight"] = inFlight; // only when siblings run ALONGSIDE `current` (1 is implied by current)
       line["unitsDone"] = unitsDone;
       line["elapsedSec"] = Math.round((nowMs() - startedAt) / 1000);
       Object.assign(line, extra());

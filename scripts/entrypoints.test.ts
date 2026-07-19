@@ -12,8 +12,56 @@ import { realpathSync } from "node:fs";
 import { join } from "node:path";
 import { main as orchestrateMain } from "./orchestrate.ts";
 import { main as reportMain } from "./report.ts";
+import { main as exportMain } from "./export.ts";
 import { ORCHESTRATE_HELP, REPORT_HELP } from "./args.ts";
 import { activeHeartbeats } from "./heartbeat.ts";
+import { AuditDb, nowIso } from "./db.ts";
+import { setLogSink, resetLogSink, type LogSink } from "./log.ts";
+
+// Seed a COMPLETED run tracking `expo` with one scanned unit + a usage finding, so report --html
+// emits a `dossier` and export emits per-table `export` events. Opened at the cwd-relative path the
+// fixture config points at, so it must run INSIDE inFixture (cwd = fixture root).
+function seedReportableRun(): void {
+  const db = AuditDb.open({ sqlitePath: "./data/audit.db" });
+  try {
+    const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    const unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "abc123def" };
+    db.upsertRunUnitHead({ runId, ...unit, status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    db.upsertUsageFinding({ runId, ...unit, packageName: "expo", dependencyKey: "expo", usageType: "named-import", exportName: "registerRootComponent", context: "", filePath: "src/index.ts", lineNumber: 1, permalink: "https://github.com/org-a/svc/blob/abc123def/src/index.ts#L1", snippet: "import { registerRootComponent } from 'expo';", foundAt: nowIso() });
+    db.completeRun(runId);
+  } finally {
+    db.close();
+  }
+}
+
+// A stdout sink that backpressures once paused. `hitArtifact` resolves the instant the FIRST artifact
+// line (dossier/export) is written under backpressure — i.e. runReport/runExport has started emitting,
+// so main() is (synchronously, no await before the finally) about to await flushLogs. That lets a test
+// prove main() BLOCKS on its finally-flush: if the finally were removed, main() would write its summary
+// and return before we ever resume, so `summaryWritten` would already be true at the checkpoint.
+function pausedArtifactSink(markerEvent: string) {
+  const received: string[] = [];
+  let paused = false;
+  let signalled = false;
+  let drainCb: (() => void) | null = null;
+  let onArtifact: () => void = () => {};
+  const hitArtifact = new Promise<void>((r) => { onArtifact = r; });
+  const eventOf = (line: string): unknown => { try { return (JSON.parse(line) as { event?: unknown }).event; } catch { return undefined; } };
+  const sink: LogSink = {
+    write: (line) => {
+      received.push(line);
+      if (paused) {
+        if (!signalled && eventOf(line) === markerEvent) { signalled = true; onArtifact(); }
+        return false;
+      }
+      return true;
+    },
+    onDrain: (cb) => { drainCb = cb; },
+    isClosed: () => false,
+    onClose: () => {},
+  };
+  return { sink, received, hitArtifact, pause: () => { paused = true; }, resume: () => { paused = false; const cb = drainCb; drainCb = null; if (cb) cb(); } };
+}
 
 // Capture BOTH streams while `fn` runs (help text and JSONL go to stdout; summaries to stderr).
 async function captureStreams(fn: () => Promise<void>): Promise<{ out: string; err: string }> {
@@ -225,6 +273,68 @@ describe("report main() wiring (missing DB stays a no-op through the real entryp
       expect(readdirSync(join(fx.cwdDir, "data"))).toEqual([]);
       expect(readdirSync(join(fx.cwdDir, "output"))).toEqual([]);
     } finally {
+      rmSync(fx.root, { recursive: true, force: true });
+    }
+  });
+});
+
+// The finally-flush moved from the (untestable) import.meta.main catch into main()'s own try/finally.
+// These drive the REAL main() under a paused sink and prove main() BLOCKS on that finally-flush before
+// its summary — deleting the finally would let main() write the summary and return without draining,
+// failing the `summaryWritten === false` checkpoint below. (santa round 2 — B/C: tests bypassed main)
+describe("report/export main() await their finally-flush before the summary (T7)", () => {
+  test("report --html main() blocks on its finally-flush until buffered dossiers drain", async () => {
+    const fx = makeFixture();
+    const g = pausedArtifactSink("dossier");
+    let summaryWritten = false;
+    const outSpy = spyOn(process.stdout, "write").mockImplementation(((c: unknown) => { void c; summaryWritten = true; return true; }) as typeof process.stdout.write);
+    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
+    setLogSink(g.sink);
+    try {
+      await inFixture(fx, async () => {
+        seedReportableRun();
+        g.pause();
+        const p = reportMain(["--config", fx.configPath, "--html"]);
+        await g.hitArtifact; // a `dossier` backpressured the sink → main is (synchronously) at its finally `await flushLogs()`
+        await Promise.resolve();
+        expect(summaryWritten).toBe(false); // TEETH: main is BLOCKED on the finally-flush; without it the summary is already out
+        g.resume(); // drain the buffered dossiers → flush resolves → main writes its summary
+        await p;
+      });
+      expect(summaryWritten).toBe(true);
+      expect(g.received.map((l) => JSON.parse(l).event)).toContain("dossier-summary"); // the buffered tail shipped via the flush
+    } finally {
+      resetLogSink();
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+      rmSync(fx.root, { recursive: true, force: true });
+    }
+  });
+
+  test("export main() blocks on its finally-flush until buffered export events drain", async () => {
+    const fx = makeFixture();
+    const g = pausedArtifactSink("export");
+    let summaryWritten = false;
+    const outSpy = spyOn(process.stdout, "write").mockImplementation(((c: unknown) => { void c; summaryWritten = true; return true; }) as typeof process.stdout.write);
+    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
+    setLogSink(g.sink);
+    try {
+      await inFixture(fx, async () => {
+        seedReportableRun();
+        g.pause();
+        const p = exportMain(["--config", fx.configPath]);
+        await g.hitArtifact; // the first `export` line backpressured the sink → main is at its finally-flush
+        await Promise.resolve();
+        expect(summaryWritten).toBe(false); // TEETH: main blocked on the finally-flush before the export-summary
+        g.resume();
+        await p;
+      });
+      expect(summaryWritten).toBe(true);
+      expect(g.received.map((l) => JSON.parse(l).event).filter((e) => e === "export").length).toBeGreaterThan(1); // buffered tail shipped
+    } finally {
+      resetLogSink();
+      outSpy.mockRestore();
+      errSpy.mockRestore();
       rmSync(fx.root, { recursive: true, force: true });
     }
   });

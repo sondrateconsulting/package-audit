@@ -1052,6 +1052,34 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  // Integration cover for the fatal-path token release (orchestrate.ts's `finally { abandonUnit }`):
+  // a PolicyMatchError escapes startUnit before unitDone, so the finally must release the in-flight
+  // slot — otherwise the wedged-then-aborted unit lingers as the heartbeat's `current`. (santa round 2)
+  test("processRepo releases the heartbeat's in-flight target when a unit throws a PolicyMatchError", async () => {
+    const root = mkdtempSync(join(tmpdir(), "policy-token-release-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const injected = new PolicyMatchError("excludeBranches", "x*", "main", new Error("simulated write-time incoherence"));
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+      if (h.status === "scanned") throw injected; // the scanned upsert inside processUnit → fatal after startUnit
+      return realUpsert(h);
+    };
+    const client = scanClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main");
+    let target: string | null = "SENTINEL"; // proves setTarget(null) actually ran, not just "was already null"
+    const hb: HeartbeatController = { setPhase: () => {}, setTarget: (t) => { target = t; }, setUnitsDone: () => {}, tick: () => {}, stop: () => {} };
+    let thrown: unknown;
+    await captureJsonl(async () => {
+      try {
+        await processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set(), new Set(), undefined, undefined, new RunProgress(hb, false));
+      } catch (e) { thrown = e; }
+    });
+    expect(thrown).toBe(injected); // the fatal propagated (startUnit ran, unitDone did not)
+    expect(target).toBeNull(); // the finally's abandonUnit released the slot — no wedged unit lingers as `current`
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("runScan marks the run FAILED on a PolicyMatchError and rethrows the original", async () => {
     const root = mkdtempSync(join(tmpdir(), "policy-failrun-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });

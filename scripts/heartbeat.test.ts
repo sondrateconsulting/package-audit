@@ -72,6 +72,18 @@ describe("heartbeat controller (T6)", () => {
     expect(h.events[0]).toMatchObject({ event: "heartbeat", phase: "scan", current: "org/repo@main", unitsDone: 7, elapsedSec: 65 });
   });
 
+  test("emits `inFlight` only when siblings run alongside `current` (>1), never for a single unit", () => {
+    const h = harness();
+    h.hb.setPhase("scan");
+    h.hb.setTarget("org/repo@a", 1); // exactly one unit in flight
+    h.hb.tick();
+    expect(h.events[0]).toMatchObject({ event: "heartbeat", current: "org/repo@a" });
+    expect(h.events[0]!["inFlight"]).toBeUndefined(); // 1 is implied by `current` — README says inFlight is for >1
+    h.hb.setTarget("org/repo@a", 3); // now three concurrent, oldest still `current`
+    h.hb.tick();
+    expect(h.events[1]).toMatchObject({ event: "heartbeat", current: "org/repo@a", inFlight: 3 });
+  });
+
   test("omits `current` until a target is set", () => {
     const h = harness();
     h.hb.tick();
