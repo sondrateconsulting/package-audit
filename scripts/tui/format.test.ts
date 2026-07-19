@@ -49,6 +49,18 @@ describe("formatters (§U8.11)", () => {
     expect(thousands(1204)).toBe("1,204");
     expect(thousands(77)).toBe("77");
   });
+  test("thousands and formatReset are TOTAL against non-finite and masquerading values", () => {
+    // toLocaleString on a runtime STRING returns the string VERBATIM — control bytes included —
+    // so anything but a finite number must render as the honest placeholder instead.
+    expect(thousands(NaN)).toBe("?");
+    expect(thousands(Infinity)).toBe("?");
+    expect(thousands(-Infinity)).toBe("?");
+    expect(thousands("4812" as unknown as number)).toBe("?");
+    expect(thousands(`${String.fromCharCode(0x9d)}0;pwn${String.fromCharCode(0x9c)}` as unknown as number)).toBe("?");
+    expect(formatReset(NaN, 0)).toBe("—");
+    expect(formatReset("999" as unknown as number, 0)).toBe("—");
+    expect(formatReset(999, 0)).toBe("16:39"); // honest epochs still format
+  });
   test("formatSpan: decimals under 10s, whole seconds, then minutes", () => {
     expect(formatSpan(800)).toBe("0.8s");
     expect(formatSpan(2_100)).toBe("2.1s");

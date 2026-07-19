@@ -108,7 +108,8 @@ export interface SealableStderr {
   sealEarly(): void; // seal + cursor-show compensation in ONE synchronous step (§U1)
   compensateCursor(): void; // write the cursor-show escape once (idempotent; for post-seal paths
   //                           where Ink's own restore write was — or will be — dropped)
-  detach(): void; // remove the 'error' absorber from the real stream (teardown)
+  detach(): void; // remove the 'error' absorber from the real stream (TEST-ONLY: production
+  //                 teardown deliberately RETAINS the absorber — see teardown step 7)
 }
 
 type WriteCb = (err?: Error | null) => void;
@@ -450,6 +451,13 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
             // bounded wait below cannot exit cursorless, and a queued Ink render cannot re-hide
             // what was just shown. The step-3 seal below stays idempotent.
             guarded("unmount-seal", () => proxy.sealEarly());
+            // The renderer just PROVED itself damaged — close the resize re-entry channel in
+            // the same synchronous step, never after the grace wait: ink detaches its own
+            // resize listener only on the unmount path that just threw, so a terminal resize
+            // landing inside the bounded wait below would re-enter the damaged renderer from
+            // an event context and throw uncaught (a kill, §U0). Step 3a still covers the
+            // WEDGE case, where damage is only proven once the wait times out.
+            guarded("unmount-strip-resize", () => realStderr.removeAllListeners("resize"));
           }
           exitOutcome = await boundedExitWait(h, (m) => stepWarnings.push(m));
           if (exitOutcome !== "exited") stepWarnings.push(`exit-wait: unmount did not complete cleanly (${exitOutcome})`);
@@ -458,11 +466,13 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         // the real stderr; sealed-off attempts are counted into the step-6 warning.
         guarded("seal", () => proxy.seal());
         // 3a. residual resize listeners: dispose detaches only the ADAPTER's wake hook — Ink's
-        // own resize subscription is Ink's to remove at unmount, and an unmount that wedged or
-        // threw never got there. Post-seal nothing legitimate listens for resize on this stream
-        // (the App's channel went in step 1, every render byte is now dropped, and the audit's
-        // core registers no resize hooks) — so after a non-"exited" outcome strip EVERY
-        // remaining one: a later terminal resize must not re-enter damaged Ink state from an
+        // own resize subscription is Ink's to remove at unmount. A THROWN unmount was already
+        // stripped inside step 2's catch (damage proven there, before the wait); an unmount
+        // that WEDGED never reached ink's removal and is only proven damaged now — so after a
+        // non-"exited" outcome strip EVERY remaining one (idempotent when step 2 already did).
+        // Post-seal nothing legitimate listens for resize on this stream: the App's channel
+        // went in step 1, every render byte is now dropped, and the audit's core registers no
+        // resize hooks. A later terminal resize must not re-enter damaged Ink state from an
         // event context (degrade-never-kill has no exception for already-broken Ink). The
         // retained 'error' absorber lives on a different event and survives untouched.
         if (h !== null && exitOutcome !== "exited") guarded("strip-resize", () => realStderr.removeAllListeners("resize"));
@@ -571,6 +581,13 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
           h.requestUnmount();
         } catch (e) {
           unwindWarnings.push(`unmount: ${errText(e)}`);
+          // same immediate strip as teardown's thrown-unmount path: the renderer just proved
+          // damaged, and its resize listener must not stay callable through the bounded wait
+          try {
+            realStderr.removeAllListeners("resize");
+          } catch (stripErr) {
+            unwindWarnings.push(`strip-resize: ${errText(stripErr)}`);
+          }
         }
         const unwindOutcome = await boundedExitWait(h, (m) => unwindWarnings.push(m));
         if (unwindOutcome !== "exited") {

@@ -22,9 +22,13 @@ export function sanitizeLine(input: string): string {
 }
 
 // ---- numbers & time --------------------------------------------------------------------------
-// Locale-pinned so frames are byte-stable across machines.
+// Locale-pinned so frames are byte-stable across machines. TOTAL against non-finite and
+// MASQUERADING values (the store's folds validate quota slots; this stays safe even if a
+// future emitter forgets): toLocaleString on a hostile runtime STRING returns the string
+// VERBATIM — control bytes included — so anything but a finite number renders as the honest
+// placeholder instead.
 export function thousands(n: number): string {
-  return n.toLocaleString("en-US");
+  return Number.isFinite(n) ? n.toLocaleString("en-US") : "?";
 }
 
 // Span elapsed for active rows: sub-10s with one decimal ("0.8s", "2.1s"), then whole seconds
@@ -55,9 +59,10 @@ export function formatCountdown(untilMs: number, nowMs: number): string {
   return formatClock(untilMs - nowMs);
 }
 
-// Countdown to a rate-limit reset epoch (seconds), or "—" when unknown.
+// Countdown to a rate-limit reset epoch (seconds), or "—" when unknown. Non-finite (or
+// masquerading non-number) epochs count as unknown — same totality posture as thousands().
 export function formatReset(resetEpochSec: number | null, nowMs: number): string {
-  if (resetEpochSec === null) return "—";
+  if (resetEpochSec === null || !Number.isFinite(resetEpochSec)) return "—";
   return formatClock(resetEpochSec * 1000 - nowMs);
 }
 

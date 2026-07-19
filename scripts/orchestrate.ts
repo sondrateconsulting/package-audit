@@ -161,7 +161,9 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   if (decision.mode === "error") throw new TuiActivationError(decision.message);
 
   // Everything from the `config` logLine through runScan runs inside the TUI lifecycle wrapper
-  // (a passthrough when the decision is off — plan/CI/piped runs are byte-identical to before).
+  // (a passthrough when the decision is off — plan/CI/piped-STDERR runs are byte-identical to
+  // before; "piped" means a non-TTY stderr — a piped stdout with an interactive stderr still
+  // mounts and diverts the JSONL per §U1).
   // The summary is rendered AFTER teardown so it lands below the terminated frame (§U1).
   const outcome = await runWithTui(
     {

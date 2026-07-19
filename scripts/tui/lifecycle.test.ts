@@ -1332,6 +1332,61 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     expect(stderr.all()).toContain("dashboard unwind warnings");
   });
 
+  test("a THROWING requestUnmount strips resize listeners IMMEDIATELY — inside the wait window, not after it", async () => {
+    // The renderer PROVED itself damaged at the throw; a terminal resize landing inside the
+    // ≤2s bounded wait would re-enter it from an event context and throw uncaught (a kill).
+    // The strip must therefore happen in the same synchronous catch as sealEarly — the
+    // post-wait step 3a alone would leave the listener callable for the whole grace window.
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    const handle = makeFakeHandle({
+      exitMode: "never",
+      onUnmount: () => {
+        throw new Error("unmount exploded");
+      },
+    });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.out.on("resize", () => {}); // "ink's" subscription, via the proxy's delegation
+      },
+    });
+    let resolved = false;
+    const run = runWithTui(deps, async () => 2).then((v) => {
+      resolved = true;
+      return v;
+    });
+    await until(() => timers.pending.length > 0); // teardown parked on the bounded wait
+    expect(resolved).toBe(false);
+    expect(stderr.listenerCount("resize")).toBe(0); // ALREADY stripped, inside the window
+    timers.fireAll();
+    expect(await run).toBe(2);
+    expect(stderr.all()).toContain("unmount: unmount exploded");
+    expect(stderr.all()).toContain(SHOW_CURSOR); // sealEarly compensated in the same catch
+  });
+
+  test("a THROWING requestUnmount in the late-handle unwind strips immediately too", async () => {
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    const handle = makeFakeHandle({
+      exitMode: "never",
+      onUnmount: () => {
+        throw new Error("late unmount exploded");
+      },
+    });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.onDegrade(); // teardown races ahead → the unwind owns this renderer
+        opts.out.on("resize", () => {}); // "ink's" subscription arriving with the late render
+      },
+    });
+    const run = runWithTui(deps, async () => 3);
+    await until(() => timers.pending.length > 0); // the unwind parked on its bounded wait
+    expect(stderr.listenerCount("resize")).toBe(0); // stripped in the unwind's catch, pre-wait
+    timers.fireAll();
+    expect(await run).toBe(3);
+    expect(stderr.all()).toContain("late unmount exploded");
+  });
+
   test("a CLEAN unmount leaves resize listeners to ink's own cleanup — no strip on the exited path", async () => {
     const capture: MountCapture = { store: null, opts: null };
     const { deps, stderr } = makeDeps();

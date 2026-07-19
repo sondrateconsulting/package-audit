@@ -115,6 +115,25 @@ describe("limits + throttle (§U4)", () => {
     expect(store.snapshot().limits.graphql).toBeNull();
   });
 
+  test("quota folds VALIDATE their number slots — hostile runtime values fold to null, never into the snapshot", () => {
+    // The seed's values originate in an UNVALIDATED external JSON body (preflight reads the
+    // rate_limit response through a bare type assertion), so a hostile GHES/proxy payload can
+    // put ANY runtime value in a number-typed field — including a control-byte string whose
+    // toLocaleString would return its bytes verbatim into the render stream (§U0 pillar 9).
+    // Spelled via fromCharCode so this source file itself carries no raw control bytes.
+    const hostile = `${String.fromCharCode(0x9d)}0;pwn${String.fromCharCode(0x9c)}` as unknown as number;
+    const { store } = makeClock(2_000);
+    store.dispatch({ type: "rate-limit-seed", resource: "graphql", remaining: hostile });
+    expect(store.snapshot().limits.graphql).toEqual({ remaining: null, limit: null, resetEpochSec: null, asOfMs: 2_000 });
+    expect(JSON.stringify(store.snapshot())).not.toContain("pwn"); // the bytes never entered the store
+    // the LIVE fold validates identically (NaN/Infinity/strings are not quota numbers)
+    store.dispatch({ type: "rate-limit", resource: "core", remaining: NaN, limit: Infinity, resetEpochSec: "999" as unknown as number });
+    expect(store.snapshot().limits.core).toEqual({ remaining: null, limit: null, resetEpochSec: null, asOfMs: 2_000 });
+    // honest numbers still fold — the guard rejects shapes, not values
+    store.dispatch({ type: "rate-limit", resource: "core", remaining: 4_000, limit: 5_000, resetEpochSec: 999 });
+    expect(store.snapshot().limits.core).toEqual({ remaining: 4_000, limit: 5_000, resetEpochSec: 999, asOfMs: 2_000 });
+  });
+
   test("PAUSED is DERIVED from horizon vs now — time, not events, clears it (no 'cleared' exists)", () => {
     const { store, now } = makeClock(1_000);
     store.dispatch({ type: "throttle", bucket: "core", state: "armed", untilMs: 5_000, budgetSpentMs: 4_000 });

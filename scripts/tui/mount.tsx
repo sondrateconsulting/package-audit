@@ -1,7 +1,7 @@
 // mount.tsx — the ONE Ink/React mount adapter (§U5 of PROMPT-TUI.md). Everything JSX/React/Ink
 // lives behind this module, which lifecycle.ts loads EXCLUSIVELY via dynamic import: a broken
-// display dependency must never break the audit, and non-TUI runs (help/--plan/CI/piped) never
-// pay the load cost.
+// display dependency must never break the audit, and non-TUI runs (help/--plan/CI/piped-stderr
+// — activation keys on the stderr TTY) never pay the load cost.
 //
 // Display-only (§U0): no useInput anywhere (Ink never enables raw mode), exitOnCtrlC: false
 // (SIGINT keeps its default kill-and-resume semantics; Ink's own signal-exit cursor cleanup is

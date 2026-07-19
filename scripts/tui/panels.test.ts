@@ -80,6 +80,17 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(text).not.toContain("PAUSED");
   });
 
+  test("a hostile rate-limit seed cannot smuggle bytes into the render stream — validated at the fold, total at the formatter", async () => {
+    // C1/OSC control bytes masquerading as a number in the seed's number-typed field — the
+    // shape an unvalidated rate_limit JSON body can hand the display (§U0 pillar 9). Spelled
+    // via fromCharCode so this source file itself carries no raw control bytes.
+    const hostile = `${String.fromCharCode(0x9d)}0;pwn${String.fromCharCode(0x9c)}` as unknown as number;
+    const out = await frameCapture([{ type: "rate-limit-seed", resource: "graphql", remaining: hostile }]);
+    expect(out.raw()).not.toContain("pwn"); // the bytes never reached Ink's stream at all
+    expect(out.raw()).not.toContain(String.fromCharCode(0x9d)); // no raw C1 OSC introducer either
+    expect(out.text()).toContain("graphql ?"); // the honest placeholder renders instead
+  });
+
   test("populated state: run identity, phase, limits, work rows, net rows, findings, footer path", async () => {
     const text = await frame([
       jsonl({ event: "run", runId: "2f9c1a77-aaaa-bbbb", resumed: true }),

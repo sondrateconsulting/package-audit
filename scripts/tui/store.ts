@@ -212,11 +212,20 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         fetches.delete(e.id);
         break;
       case "rate-limit":
-        limits[e.resource] = { remaining: e.remaining, limit: e.limit, resetEpochSec: e.resetEpochSec, asOfMs: nowMs() };
+        // Quota number slots are VALIDATED AT THE FOLD (the same num() the tapped JSONL folds
+        // use), never trusted from the event type: the seed's values originate in an
+        // unvalidated external JSON body (preflight reads the rate_limit response through a
+        // bare type assertion — pre-existing code this branch must not edit), so a hostile or
+        // malformed API payload can put ANY runtime value in a number-typed field — including
+        // a string whose toLocaleString would render its bytes VERBATIM. §U0's sanitized-
+        // rendering pillar means the display validates everything at its own boundary: a
+        // non-finite-number value folds to null and renders as the honest "?".
+        limits[e.resource] = { remaining: num(e.remaining), limit: num(e.limit), resetEpochSec: num(e.resetEpochSec), asOfMs: nowMs() };
         break;
       case "rate-limit-seed":
-        // fold-if-absent ONLY: a live snapshot always wins — the seed must not clobber it with nulls
-        if (limits[e.resource] === null) limits[e.resource] = { remaining: e.remaining, limit: null, resetEpochSec: null, asOfMs: nowMs() };
+        // fold-if-absent ONLY: a live snapshot always wins — the seed must not clobber it with
+        // nulls. Same finite validation as the live fold above (the seed IS the external one).
+        if (limits[e.resource] === null) limits[e.resource] = { remaining: num(e.remaining), limit: null, resetEpochSec: null, asOfMs: nowMs() };
         break;
       case "throttle": {
         if (e.state === "exhausted") {
