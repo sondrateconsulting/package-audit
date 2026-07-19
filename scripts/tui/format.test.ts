@@ -2,7 +2,7 @@
 // the pure layout planner: budgets, degradation order, compact/single-line/empty modes).
 // Control bytes in fixtures are spelled as \u escapes so the SOURCE stays pure ASCII.
 import { expect, test, describe } from "bun:test";
-import { sanitizeLine, thousands, formatSpan, formatClock, formatCountdown, formatReset, planLayout, WORK_ROWS_MAX, NET_ROWS_MAX, type LayoutDemand } from "./format.ts";
+import { sanitizeLine, thousands, formatSpan, formatClock, formatCountdown, formatReset, limitTone, planLayout, WORK_ROWS_MAX, NET_ROWS_MAX, type LayoutDemand } from "./format.ts";
 
 const ESC = "\u001B";
 const BEL = "\u0007";
@@ -90,6 +90,26 @@ describe("formatters (§U8.11)", () => {
   test("formatReset from an epoch, or an em-dash when unknown", () => {
     expect(formatReset(1_000, 246_000)).toBe("12:34");
     expect(formatReset(null, 0)).toBe("—");
+  });
+});
+
+describe("limitTone (M1 — graded rate-limit headroom color)", () => {
+  test("red below 10% of the limit, yellow below 25%, uncolored otherwise", () => {
+    expect(limitTone(0, 5000)).toBe("red"); // fully exhausted
+    expect(limitTone(120, 5000)).toBe("red"); // 2.4%
+    expect(limitTone(499, 5000)).toBe("red"); // 9.98%
+    expect(limitTone(500, 5000)).toBe("yellow"); // exactly 10% → not red, still low
+    expect(limitTone(1249, 5000)).toBe("yellow"); // 24.98%
+    expect(limitTone(1250, 5000)).toBeUndefined(); // exactly 25% → healthy
+    expect(limitTone(4812, 5000)).toBeUndefined(); // healthy
+  });
+  test("uncolored unless BOTH remaining and limit are finite and the limit is positive", () => {
+    expect(limitTone(null, 5000)).toBeUndefined(); // remaining unknown
+    expect(limitTone(1998, null)).toBeUndefined(); // seeded remaining, no limit → no ratio
+    expect(limitTone(Number.NaN, 5000)).toBeUndefined();
+    expect(limitTone(100, Number.POSITIVE_INFINITY)).toBeUndefined();
+    expect(limitTone(100, 0)).toBeUndefined(); // degenerate limit — no divide
+    expect(limitTone(100, -5)).toBeUndefined();
   });
 });
 

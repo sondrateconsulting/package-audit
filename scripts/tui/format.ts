@@ -72,6 +72,22 @@ export function formatReset(resetEpochSec: number | null, nowMs: number): string
   return formatClock(resetEpochSec * 1000 - nowMs);
 }
 
+// Graded headroom color for a rate-limit remaining count (M1): red under 10% of the limit,
+// yellow under 25%, uncolored otherwise — so a crisis like `core 120/5,000` no longer looks
+// identical to a healthy `core 4,812/5,000` in the otherwise-monochrome healthy frame. Returns
+// undefined (no color, the honest neutral) unless BOTH values are finite and the limit is a
+// positive number: a seeded remaining without a known limit, or any non-finite/degenerate input,
+// stays uncolored. Same totality posture as thousands()/formatReset — never trusts a masquerading
+// value into a comparison.
+export function limitTone(remaining: number | null, limit: number | null): "red" | "yellow" | undefined {
+  if (remaining === null || limit === null) return undefined;
+  if (!Number.isFinite(remaining) || !Number.isFinite(limit) || limit <= 0) return undefined;
+  const ratio = remaining / limit;
+  if (ratio < 0.1) return "red";
+  if (ratio < 0.25) return "yellow";
+  return undefined;
+}
+
 // ---- the pure frame-layout planner (§U5 terminal-size discipline) ----------------------------
 // A frame taller than the viewport cannot be fully erased on redraw and smears scrollback, so
 // the frame is hard-capped at rows-1 by degrading in priority order: shrink NET_ROWS → shrink

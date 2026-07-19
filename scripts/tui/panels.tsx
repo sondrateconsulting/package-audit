@@ -12,7 +12,7 @@ import { Box, Text } from "ink";
 import type { ReactNode } from "react";
 import type { TuiSnapshot } from "./store.ts";
 import { isPaused } from "./store.ts";
-import { sanitizeLine, thousands, formatSpan, formatClock, formatCountdown, formatReset, PROBLEM_ROWS, type Layout } from "./format.ts";
+import { sanitizeLine, thousands, formatSpan, formatClock, formatCountdown, formatReset, limitTone, PROBLEM_ROWS, type Layout } from "./format.ts";
 
 const GUTTER = 9; // label column width
 // The cumulative pause-budget cap in minutes — the "/<N>m" denominator the operator reads. Mirrors
@@ -41,13 +41,22 @@ export function Header({ snap, nowMs, mountedAtMs }: { snap: TuiSnapshot; nowMs:
   );
 }
 
-function limitText(snap: TuiSnapshot, resource: "core" | "graphql", nowMs: number): string {
+// One rate-limit segment ("core 4,812/5,000 resets 12:34"). The REMAINING count carries a graded
+// headroom color (§M1 limitTone) so a low quota stands out in the otherwise-monochrome healthy
+// frame; the label and denominator stay neutral. Text content is unchanged from the prior string
+// form (the panel tests assert it verbatim); color is stripped before those assertions.
+function LimitSegment({ snap, resource, nowMs }: { snap: TuiSnapshot; resource: "core" | "graphql"; nowMs: number }) {
   const l = snap.limits[resource];
-  if (l === null) return `${resource} —`;
+  if (l === null) return <>{`${resource} —`}</>;
   const remaining = l.remaining === null ? "?" : thousands(l.remaining);
-  const limit = l.limit === null ? "" : `/${thousands(l.limit)}`;
-  const reset = l.resetEpochSec === null ? "" : ` resets ${formatReset(l.resetEpochSec, nowMs)}`;
-  return `${resource} ${remaining}${limit}${reset}`;
+  const rest = `${l.limit === null ? "" : `/${thousands(l.limit)}`}${l.resetEpochSec === null ? "" : ` resets ${formatReset(l.resetEpochSec, nowMs)}`}`;
+  return (
+    <>
+      {`${resource} `}
+      <Text color={limitTone(l.remaining, l.limit)}>{remaining}</Text>
+      {rest}
+    </>
+  );
 }
 
 export function LimitsPanel({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number }) {
@@ -60,7 +69,7 @@ export function LimitsPanel({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number 
     <Box flexDirection="column">
       <Row>
         <Text dimColor>{"limits".padEnd(GUTTER)}</Text>
-        {limitText(snap, "core", nowMs)} · {limitText(snap, "graphql", nowMs)}
+        <LimitSegment snap={snap} resource="core" nowMs={nowMs} /> · <LimitSegment snap={snap} resource="graphql" nowMs={nowMs} />
       </Row>
       <Row>
         <Text dimColor>{"".padEnd(GUTTER)}</Text>
@@ -227,7 +236,7 @@ export function CompactFrame({ snap, nowMs, mountedAtMs }: { snap: TuiSnapshot; 
       <Header snap={snap} nowMs={nowMs} mountedAtMs={mountedAtMs} />
       <Row>
         <Text dimColor>{"limits".padEnd(GUTTER)}</Text>
-        {limitText(snap, "core", nowMs)} · {limitText(snap, "graphql", nowMs)}
+        <LimitSegment snap={snap} resource="core" nowMs={nowMs} /> · <LimitSegment snap={snap} resource="graphql" nowMs={nowMs} />
       </Row>
       <Row>
         <Text dimColor>{"".padEnd(GUTTER)}</Text>
