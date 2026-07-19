@@ -97,7 +97,10 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
   // already inert (disposed/tick guards), but a still-live REF'D interval would hold the event
   // loop open and hang the process at exit — a hang is a kill (§U0) — so the catch also tries
   // unref() where the timer token supports it. A collector, when given, records the failure for
-  // the §U6 deferred-warning channel.
+  // the §U6 deferred-warning channel. A token whose unref ALSO throws leaves nothing further to
+  // call — that DOUBLE-fault residual (an inert but still-ref'd interval that can hold the
+  // process open) is accepted and recorded in the PR body: both faults require an injected
+  // scheduler broken in two independent ways, and no third release API exists on the token.
   const stopTick = (collect?: (msg: string) => void): void => {
     if (timer === null) return;
     const t = timer;

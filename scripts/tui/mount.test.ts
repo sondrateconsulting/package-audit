@@ -401,7 +401,11 @@ describe("post-render rollback + adapter cleanup (§U6 remediation)", () => {
       const n = out.listenerCount("resize");
       expect(n).toBeGreaterThanOrEqual(1); // the adapter's listener at minimum (Ink may add its own)
       handle.dispose();
-      expect(out.listenerCount("resize")).toBe(n - 1); // exactly the adapter's went away; Ink's stays until unmount
+      // Exactly the adapter's went away: Ink's own subscription belongs to Ink's unmount
+      // cleanup, never to dispose. When that unmount then wedges or throws, the LIFECYCLE's
+      // teardown (step 3a, post-seal, non-"exited" outcomes only) strips the residual —
+      // dispose stays scoped to what the adapter itself registered.
+      expect(out.listenerCount("resize")).toBe(n - 1);
     });
   });
 

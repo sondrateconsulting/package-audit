@@ -454,6 +454,15 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         // 3. seal — from here NOTHING (a wedged Ink, queued renders, its console patch) can reach
         // the real stderr; sealed-off attempts are counted into the step-6 warning.
         guarded("seal", () => proxy.seal());
+        // 3a. residual resize listeners: dispose detaches only the ADAPTER's wake hook — Ink's
+        // own resize subscription is Ink's to remove at unmount, and an unmount that wedged or
+        // threw never got there. Post-seal nothing legitimate listens for resize on this stream
+        // (the App's channel went in step 1, every render byte is now dropped, and the audit's
+        // core registers no resize hooks) — so after a non-"exited" outcome strip EVERY
+        // remaining one: a later terminal resize must not re-enter damaged Ink state from an
+        // event context (degrade-never-kill has no exception for already-broken Ink). The
+        // retained 'error' absorber lives on a different event and survives untouched.
+        if (h !== null && exitOutcome !== "exited") guarded("strip-resize", () => realStderr.removeAllListeners("resize"));
         // 4. clear the seams (restores stdout)
         guarded("clear-seams", () => {
           setProgressSink(null);
@@ -561,7 +570,16 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
           unwindWarnings.push(`unmount: ${errText(e)}`);
         }
         const unwindOutcome = await boundedExitWait(h, (m) => unwindWarnings.push(m));
-        if (unwindOutcome !== "exited") unwindWarnings.push(`exit-wait: ${unwindOutcome}`);
+        if (unwindOutcome !== "exited") {
+          unwindWarnings.push(`exit-wait: ${unwindOutcome}`);
+          // the same residual-listener strip teardown's step 3a performs: a failed unwind
+          // leaves Ink's own resize subscription live against the sealed stream
+          try {
+            realStderr.removeAllListeners("resize");
+          } catch (e) {
+            unwindWarnings.push(`strip-resize: ${errText(e)}`);
+          }
+        }
         // The pre-wait compensation above may have been REFUSED by a transiently broken stderr
         // (the once-flag is callback-aware) — one post-wait retry keeps the unwind's cursor
         // discipline total: this renderer hid the cursor, so the unwind must not end with zero

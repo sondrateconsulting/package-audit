@@ -1281,6 +1281,69 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     expect(stderr.all()).toContain("dashboard disabled — stderr write threw: EIO at restore time");
   });
 
+  test("a WEDGED unmount's residual resize listeners are STRIPPED by teardown after the non-exited outcome", async () => {
+    // dispose removes only the ADAPTER's wake hook (deliberately — see mount.test.ts); Ink's
+    // own subscription is Ink's to remove at unmount, which wedged. Post-seal nothing
+    // legitimate listens for resize, and a later terminal resize must not re-enter damaged
+    // Ink state from an event context — teardown step 3a strips every remaining listener.
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    const handle = makeFakeHandle({ exitMode: "never" });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.out.on("resize", () => {}); // "ink's" subscription, via the proxy's delegation
+      },
+    });
+    let resolved = false;
+    const run = runWithTui(deps, async () => 5).then((v) => {
+      resolved = true;
+      return v;
+    });
+    await until(() => timers.pending.length > 0); // teardown parked on the bounded exit wait
+    expect(resolved).toBe(false);
+    expect(stderr.listenerCount("resize")).toBe(1); // still attached while the wait runs
+    timers.fireAll(); // → timeout outcome
+    expect(await run).toBe(5);
+    expect(stderr.listenerCount("resize")).toBe(0); // the residual was stripped
+    expect(stderr.listenerCount("error")).toBe(1); // the retained absorber survives — different event
+    expect(stderr.all()).toContain("unmount did not complete cleanly (timeout)");
+  });
+
+  test("a WEDGED late-handle unwind strips residual resize listeners too", async () => {
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    const handle = makeFakeHandle({ exitMode: "never" });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.onDegrade(); // teardown races ahead → the unwind owns this renderer
+        opts.out.on("resize", () => {}); // "ink's" subscription arriving with the late render
+      },
+    });
+    const run = runWithTui(deps, async () => 1);
+    await until(() => timers.pending.length > 0); // the unwind parked on its bounded wait
+    timers.fireAll(); // → non-exited unwind outcome
+    expect(await run).toBe(1);
+    expect(stderr.listenerCount("resize")).toBe(0); // stripped by the unwind's own net
+    expect(stderr.all()).toContain("dashboard unwind warnings");
+  });
+
+  test("a CLEAN unmount leaves resize listeners to ink's own cleanup — no strip on the exited path", async () => {
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    const handle = makeFakeHandle({ exitMode: "manual" });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.out.on("resize", () => {});
+      },
+    });
+    await runWithTui(deps, async () => {});
+    // the fake renderer never removed its listener and teardown must not have either: on a
+    // clean exit the subscription is the renderer's property (real ink detaches it inside
+    // unmount) — the strip is scoped to the damaged-Ink outcomes only
+    expect(stderr.listenerCount("resize")).toBe(1);
+    stderr.removeAllListeners("resize");
+  });
+
   test("the late-handle unwind RETRIES a refused pre-wait compensation after its bounded wait", async () => {
     // The unwind compensates BEFORE its bounded wait; a transiently broken stderr refuses that
     // first attempt (the callback-aware flag stays unset) — the post-wait retry must land it.
