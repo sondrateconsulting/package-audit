@@ -47,7 +47,7 @@ export interface PolicyDispositionRow {
   // NULL ONLY on a v3→v4-migrated row (the pre-upgrade provenance sentinel). Used to scope the
   // default⇒scanned rule to NATIVE rows: the migration copies v3 rows verbatim, so a CHECK — or an
   // ungated read rule — that a real pre-v4 row might violate would fail an UPGRADE to defend against a
-  // forged row. A native row always carries a real date (non-scanned rows get the discovered-head date).
+  // forged row. A native row always carries a real date (a scan-attempt row its observed commit's date, a discovery-time row the discovered-head date).
   readonly scanned_commit_date: string | null;
 }
 
@@ -99,8 +99,8 @@ export function policyStatusOrThrow(r: PolicyDispositionRow, where: string): Pol
 // (the drift that let a 'policy-excluded' row naming no rule be counted while the ledger omitted it).
 //
 // It rejects every disagreement the write chokepoint forbids that a read surface could be fooled by:
-//   - a status outside the known four — it belongs to NO disposition bucket, silently breaking the
-//     partition the counts rest on (and is exactly how a future 'error' status would first arrive);
+//   - a status outside the known NINE — it belongs to NO disposition family, silently breaking the
+//     partition the counts rest on;
 //   - a policy_status outside the known two — a bogus token is otherwise counted AND emitted;
 //   - an is_default_branch outside 1/0/NULL (the column has no SQL CHECK, so 2 is schema-valid and
 //     the read surfaces' `=== 1` coercion would silently relabel it "not the default");
@@ -170,8 +170,9 @@ export function assertRunUnitHeadSound(r: PolicyDispositionRow, where: string): 
     throw new Error(`internal: run_unit_head ${where} carries policy_matched_pattern=${JSON.stringify(r.policy_matched_pattern)} on policy_status=${JSON.stringify(r.policy_status)} — only a deny names a causing pattern`);
   }
   // commit_sha ↔ disposition family (§3.1a: the findings-join partition). A SCAN-ATTEMPT row pins the
-  // OBSERVED head commit (scanned/reused name the current head; deferred-*/error name the head the
-  // failed attempt saw); every DISCOVERY-time disposition stores ''. Only scanned/reused JOIN findings,
+  // OBSERVED head commit (scanned/reused name the head they reported — current when recorded, possibly
+  // preserved-stale after a moved-head transient; deferred-*/error name the head the failed attempt saw);
+  // every DISCOVERY-time disposition stores ''. Only scanned/reused JOIN findings,
   // but the whole scan-attempt family carries a real commit (the commit-aware upsert precedence relies
   // on it). r.status is a validated UnitHeadStatus here (isKnownStatus ran above).
   if (isScanAttemptStatus(r.status as UnitHeadStatus)) {

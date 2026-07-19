@@ -159,11 +159,13 @@ const OUTCOME_RANK: Record<RunOutcome, number> = {
 };
 // The scanned-slice: unit dispositions whose findings JOIN into the report (§3.1a ripple). A
 // deferred/errored/cutoff/policy/cap unit contributes no findings, so only these two are reportable
-// heads (a 'reused' skip-as-current unit carries a CURRENT, findings-bearing head).
+// heads (a 'reused' skip-as-current unit carries a findings-bearing head — current WHEN RECORDED, but
+// possibly preserved-stale after a later moved-head transient failure, §3.1a).
 export const REPORTABLE_UNIT_STATUSES = ["scanned", "reused"] as const;
 // §3.1a disposition FAMILY partition. SCAN-ATTEMPT dispositions are decided AT a known head and carry
-// the OBSERVED commit_sha (scanned/reused name the current head; deferred-*/error name the head the
-// failed attempt saw); DISCOVERY-time dispositions are decided before any scan and carry commit_sha=''.
+// the OBSERVED commit_sha (scanned/reused name the head they REPORTED — current when recorded, possibly
+// preserved-stale after a moved-head transient, §3.1a; deferred-*/error name the head the failed attempt
+// saw); DISCOVERY-time dispositions are decided before any scan and carry commit_sha=''.
 // The default branch is ALWAYS scan-attempted. Record<UnitHeadStatus,…> makes this EXHAUSTIVE: adding a
 // disposition to the union forces a family decision here (a build error until it is classified), and
 // this ONE definition is shared by the write gate (assertRunUnitHeadInvariants) and the read gate
@@ -310,9 +312,10 @@ export interface RunUnitHeadInput {
   branch: string;
   // '' for the DISCOVERY-time dispositions that name no scanned commit (skipped-cutoff / past-cap /
   // policy-excluded). The SCAN-ATTEMPT dispositions carry the OBSERVED head oid: 'scanned'/'reused'
-  // name the current head, and 'deferred-*'/'error' name the head the failed attempt saw — REQUIRED
-  // (not '') so the commit-aware upsert precedence keeps a same-head good scan when a later same-run
-  // attempt at that head is throttled/errored (§3.1a: a same-commit deferred never downgrades a scan).
+  // name the head they reported (current when recorded, possibly preserved-stale after a moved-head
+  // transient — §3.1a), and 'deferred-*'/'error' name the head the failed attempt saw — REQUIRED (not '')
+  // so the commit-aware upsert precedence keeps a good scan when a later attempt at any head is
+  // throttled/errored (§3.1a: a transient never downgrades a reportable scan, same-commit or moved).
   commitSha: string;
   status: UnitHeadStatus;
   // Tri-state, REQUIRED (not optional — `undefined` must never silently become "not default"):
@@ -326,8 +329,8 @@ export interface RunUnitHeadInput {
   policyStatus: PolicyStatus | null; // null = no exclusion (the branch is policy-eligible)
   policyMatchedPattern: string | null; // non-empty ONLY when policyStatus === 'excluded-by-deny'
   // The commit date (GitHub committedDate / git-%cI family — an ISO instant, offset preserved,
-  // stored RAW, NOT the nowIso millisecond form). scanned → the ACTUALLY-scanned commit's date (the clone HEAD's
-  // own date under the clone fallback); non-scanned → the discovered head date. REQUIRED non-null:
+  // stored RAW, NOT the nowIso millisecond form). A SCAN-ATTEMPT row → the OBSERVED commit's date (the clone
+  // HEAD's own date under the clone fallback); a DISCOVERY-time row → the discovered head date. REQUIRED non-null:
   // every fresh upsert has a real date (the DB column stays nullable only for pre-v4 migrated rows,
   // which the migration writes directly, never through this input). A runtime guard rejects ''/null.
   scannedCommitDate: string;
@@ -2589,11 +2592,13 @@ export class AuditDb {
   // §3.1a commit-aware precedence (codex r4): the PK is (run_id,org,repo,branch), so a crash-resume
   // revisits the SAME row. The SCAN-OUTCOME TRIPLE {commit_sha, status, scanned_commit_date} is
   // replaced together, gated: if the OBSERVED head DIFFERS from the stored one, the newer observation
-  // REPLACES it (a branch that advanced A→B then failed must not keep scanned@A). Only WITHIN the same
-  // commit does precedence apply — scanned > reused > skipped-cutoff > (policy-excluded > past-cap >)
-  // error > deferred-* — so a later same-commit pass never downgrades a real scan; a same-commit
-  // deferred↔deferred tie takes the latest observation. scanned_commit_date rides WITH commit_sha (it
-  // describes that commit), so it is gated by the SAME condition. The DISCOVERY-KNOWN attributes
+  // REPLACES it — EXCEPT the findings-preservation guard, which keeps a REPORTABLE scan (scanned/reused)
+  // over a later TRANSIENT error/deferred-* even at a different commit (a branch that advanced A→B then
+  // merely FAILED keeps scanned@A; only a real re-scan, or a genuine discovery-time re-disposition, at B
+  // supersedes it). WITHIN the same commit, rank precedence applies — scanned > reused > skipped-cutoff >
+  // (policy-excluded > past-cap >) error > deferred-* — so a later same-commit pass never downgrades a real
+  // scan; a same-commit deferred↔deferred tie takes the latest observation. scanned_commit_date rides WITH
+  // commit_sha (it describes that commit), so it is gated by the SAME condition. The DISCOVERY-KNOWN attributes
   // {is_default_branch, policy_status, policy_matched_pattern} are run-stable (deterministic per branch
   // name under a fixed config_hash), so they always overwrite independently — clearing stale values in
   // every direction (§6) without ever contradicting a kept status (a branch's policy verdict cannot

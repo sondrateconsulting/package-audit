@@ -99,7 +99,8 @@ export interface ReportSummary {
   //
   // Deferral: a throttle/network/service-deferred branch is un-covered, not terminal — it floors the run to
   // partial-deferred (via a deferred-* head, or coverage_complete=0 when the deferral was preserved over a
-  // prior scan), but appears in NO summary count here and (via the row-key exclusion) NOT in branchesErrored.
+  // prior scan). A deferral with NO prior scan is in no summary count here (only runOutcome); one PRESERVED
+  // over a prior scan is counted in branchesScanned via that retained scan. Either way, NOT in branchesErrored.
   branchesErrored: number;
   totalDependencyFindings: number;
   totalUsageFindings: number;
@@ -163,7 +164,8 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   const tracked = JSON.stringify(run.trackedPackages);
 
   // The reportable ("scanned-slice") heads for this run: a freshly 'scanned' unit AND a 'reused'
-  // skip-as-current unit both carry a CURRENT, findings-bearing head, so both JOIN into the report;
+  // skip-as-current unit both carry a findings-bearing head (current when recorded, possibly
+  // preserved-stale after a moved-head transient — §3.1a), so both JOIN into the report;
   // skipped-cutoff/policy-excluded/past-cap/error/deferred-* carry no reportable findings.
   // REPORTABLE_UNIT_STATUSES (from db.ts) is the single source of truth shared by this in-memory filter
   // and the SQL JOINs below. The full column set (incl. the policy columns) feeds the policy-disposition

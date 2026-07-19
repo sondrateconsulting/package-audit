@@ -162,8 +162,9 @@ One row per branch that reached a per-run DISPOSITION this run — the immutable
 snapshot. Unlike the findings tables, this exports every disposition TYPE. There are NINE, in two families:
 
 - **SCAN-ATTEMPT** dispositions, decided AT a known head and carrying the OBSERVED commit in `commit_sha`:
-  `scanned` (freshly scanned), `reused` (skip-as-current — the stored head is still live, so its prior-run
-  findings stand and JOIN into the report), `deferred-throttle` / `deferred-network` / `deferred-service`
+  `scanned` (freshly scanned), `reused` (skip-as-current — the stored head was live WHEN RECORDED, so its
+  prior-run findings stand and JOIN into the report; like `scanned`, it may be preserved-stale after a later
+  moved-head transient failure — see the retention note below), `deferred-throttle` / `deferred-network` / `deferred-service`
   (attempted but requeued — un-covered THIS run, finished on a later run), and `error` (a permanent scan
   failure — a terminal "covered-by-failure" result recorded at the commit that was attempted).
 - **DISCOVERY-time** dispositions, decided BEFORE any scan and carrying `commit_sha=''`: `skipped-cutoff`,
@@ -267,9 +268,10 @@ DuckDB reads them with `from_json(...)`, jq with `fromjson`.
 outcome a default report/export serves, alongside migrated `legacy-unknown`), a `partial-*`
 variant (`partial-deferred`/`partial-degraded`/`partial-budget` — the run stopped early or
 left units un-scanned), `fatal`, or `NULL` for a crashed, never-finalized run. `coverage_complete`
-is `1` when discovery enumerated the whole estate, `0` when a discovery failure/deferral left the
-denominator unknown, `NULL` for migrated pre-v5 runs. `discovery_failures`/`discovery_deferrals`
-count those discovery-level gaps.
+is `1` when this run covered the whole estate, `0` when a coverage gap remained — a discovery
+failure/deferral left the denominator unknown, OR a unit-level deferral left a known branch un-scanned
+(including a deferral preserved over a prior scan, which writes no deferred-* row) — `NULL` for migrated
+pre-v5 runs. `discovery_failures`/`discovery_deferrals` count the discovery-level gaps specifically.
 
 ## Analyzing the exports
 

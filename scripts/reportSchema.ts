@@ -181,7 +181,7 @@ export const summarySchema = z
     totalDependencyFindings: z.number().int().min(0),
     totalUsageFindings: z.number().int().min(0),
   })
-  .describe("Per-run disposition counts + finding totals, from the immutable run_unit_head snapshot. scanned + skippedByCutoff + excludedByPolicy + pastCap + errored account for every branch that reached a TERMINAL outcome this run (errored = error-status heads + rowless scan errors; see branchesErrored) — an EQUALITY on a single-invocation run, and an UPPER BOUND on a resumed run, where an earlier invocation's rowless error persists in errored even when the final invocation recorded a row (errors[] is append-only bar the excluded-owner prune; rows are pruned/superseded). A DEFERRED branch (deferred-throttle/network/service) is NOT terminal — un-covered, finished on a later run; it floors the run to partial-deferred (via a deferred-* row, or coverage_complete=0 when the deferral was preserved over a prior scan) and appears in NONE of these counts");
+  .describe("Per-run disposition counts + finding totals, from the immutable run_unit_head snapshot. scanned + skippedByCutoff + excludedByPolicy + pastCap + errored account for every branch that reached a TERMINAL outcome this run (errored = error-status heads + rowless scan errors; see branchesErrored) — an EQUALITY on a single-invocation run, and an UPPER BOUND on a resumed run, where an earlier invocation's rowless error persists in errored even when the final invocation recorded NO row for it (the branch is now gone or unvisited; errors[] is append-only bar the excluded-owner prune, rows are pruned/superseded). A DEFERRED branch (deferred-throttle/network/service) is NOT terminal — un-covered, finished on a later run; it floors the run to partial-deferred (via a deferred-* row, or coverage_complete=0 when the deferral was preserved over a prior scan) and appears in no terminal count of its own — though a deferral PRESERVED over a prior scan is still counted in branchesScanned via that retained scan");
 
 export const policyBranchSchema = z.strictObject({
   organization: z.string(),
@@ -207,7 +207,7 @@ export const scanScopeSchema = z
 export const runOutcomeSchema = z
   .strictObject({
     outcome: runOutcomeEnumSchema.describe("runs.outcome — always present: an unfinalized run (outcome NULL) is served as notReportable, never as a report"),
-    coverageComplete: z.boolean().nullable().describe("Did discovery enumerate the whole estate: true=full, false=a discovery gap, null=unknowable (migrated pre-v4 run)"),
+    coverageComplete: z.boolean().nullable().describe("Did this run cover the whole estate: true=full, false=a coverage gap (a discovery gap OR a unit-level deferral — incl. a deferral preserved over a prior scan, which writes no deferred-* row), null=unknowable (migrated pre-v4 run)"),
     discoveryFailures: z.number().int().min(0).describe("Permanent owner/repo/branch discovery failures this run (each makes the denominator unknown)"),
     discoveryDeferrals: z.number().int().min(0).describe("Discovery enumerations deferred by rate-limiting this run (re-run to complete)"),
     units: z

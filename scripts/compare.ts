@@ -30,8 +30,8 @@ import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
 // The reportable-head SQL fragment (`'scanned', 'reused'`), from the db.ts source of truth so this
-// run-to-run diff's scanned-slice stays in lockstep with report.ts/export.ts (a reused skip-as-
-// current unit carries a CURRENT head). Fixed enum literals → injection-safe.
+// run-to-run diff's scanned-slice stays in lockstep with report.ts/export.ts (a reused skip-as-current
+// unit carries a findings-bearing head — current when recorded, possibly preserved-stale, §3.1a). Fixed enum literals → injection-safe.
 const REPORTABLE_HEAD_SQL = REPORTABLE_UNIT_STATUSES.map((s) => `'${s}'`).join(", ");
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);

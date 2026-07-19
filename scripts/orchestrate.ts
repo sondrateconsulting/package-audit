@@ -762,16 +762,18 @@ export async function processRepo(
           // and nothing re-reads pending units within the run. Handled here (not a fatal), so it never
           // trips branchAbort — one throttled branch must not cancel its siblings.
           db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
-          // T5 §3.1a: this run left the unit un-scanned (deferred, not covered) → the run must floor to
+          // T5 §3.1a/§3.1b: this run left the unit un-scanned (deferred, not covered) → floor the run to
           // partial-deferred. markCoverageIncomplete records that gap DIRECTLY (coverage_complete=0) rather
-          // than relying on a deferred-* head row — because the commit-aware upsert PRESERVES a prior
+          // than relying on the deferred-* head row — because the commit-aware upsert PRESERVES a prior
           // reportable scan over this transient deferral (findings-preservation, §3.1a), so a moved-head
-          // deferral over an existing scan writes NO deferred row yet must STILL floor. The deferred head is
-          // still upserted at the OBSERVED head (the clone's real HEAD under a truncated-tree fallback, else
-          // the discovery head) so the no-prior-scan case records its disposition; the precedence keeps any
-          // same-/moved-head good scan intact.
-          db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: observed.commitSha, status: "deferred-throttle", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: observed.committedDate });
+          // deferral over an existing scan writes NO deferred row yet must STILL floor. It runs FIRST, BEFORE
+          // the head upsert, for crash-safety (§3.1b): a crash between the two can then only leave coverage
+          // INCOMPLETE (never optimistically complete), and a crash before it leaves the unit `pending` for a
+          // clean retry. The deferred head is still upserted at the OBSERVED head (the clone's real HEAD under
+          // a truncated-tree fallback, else the discovery head) so the no-prior-scan case records its
+          // disposition; the precedence keeps any same-/moved-head good scan intact.
           db.markCoverageIncomplete(runId);
+          db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: observed.commitSha, status: "deferred-throttle", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: observed.committedDate });
           logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: observed.commitSha, action: "requeue-throttle", message: (e as Error).message });
           tally.deferred++;
           progress.unitDone();
@@ -860,11 +862,12 @@ export async function processRepo(
   // commit_sha is the clone's real HEAD, deliberately != the discovered h.oid — see processUnit) and the
   // commit_sha='' sentinels the non-scanned dispositions rely on, hiding a real branch's real findings
   // entirely rather than reporting them one commit late.
-  // Sharp edge worth knowing: the ERROR variant is loud (an errors[] row + a JSONL `action:"error"`
-  // line, visible beside the stale row), but the THROTTLE variant writes neither — only a stdout
-  // requeue line — so a completed run can present the old head with no in-report signal. Related: the
-  // retained row also masks that branch from the report's branchesErrored, which counts only errored
-  // branches holding NO row (see report.ts).
+  // Sharp edge worth knowing: the ERROR variant is loud (an errors[] row + a JSONL `action:"error"` line,
+  // visible beside the preserved scan), and the THROTTLE variant now ALSO floors the run to partial-deferred
+  // via markCoverageIncomplete — so a preserved-over-scan deferral is NOT silent; the partial outcome
+  // signals it. A preserved/retained scanned row keeps the branch in branchesScanned and out of
+  // branchesErrored (which counts error heads + rowless scan errors — see report.ts): correct, because the
+  // branch IS covered by that real scan, one commit stale.
   const pruned = db.reconcileRunUnitHead(runId, repo.organization, repo.name, heads.map((h) => h.name));
   if (pruned > 0)
     logLine({ event: "reconciliation", target: "run_unit_head", runId, org: repo.organization, repo: repo.name, action: "prune-stale", pruned });

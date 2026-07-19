@@ -1242,6 +1242,31 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("C1 (accepted fail-safe): a clone that resolves HEAD but FAILS date capture records the COHERENT discovery head, never a clone-sha + discovery-date pair", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-datefail-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    // Truncated tree → clone fallback. rev-parse resolves the MOVED head (o-moved), but `git show` (the
+    // committer-date capture) FAILS, so cloneShallow throws BEFORE returning — the `observed` carrier is
+    // never advanced past the discovery head. The unit errors, and the error head records the COHERENT
+    // discovery head (o-main + its own valid date), NOT an incoherent o-moved-sha + o-main-date pair. This
+    // is the deliberate fail-safe (§3.1a): a head whose date could not be validated is never pinned.
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      if (args[0] === "clone") { const dest = args[args.length - 1]!; mkdirSync(dest, { recursive: true }); writeFileSync(join(dest, "package.json"), "{}"); return { exitCode: 0, stderr: "", stdout: "" }; }
+      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: hexOid("o-moved") + "\n" };
+      if (args[0] === "show") return { exitCode: 1, stderr: "fatal: bad object", stdout: "" }; // date capture FAILS → cloneShallow throws
+      return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // truncated → clone fallback
+    });
+    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    const head = db.read(`SELECT commit_sha, status, scanned_commit_date FROM run_unit_head WHERE run_id = ? AND branch = 'main'`).get(runId) as { commit_sha: string; status: string; scanned_commit_date: string };
+    expect(head.status).toBe("error");
+    expect(head.commit_sha).toBe(hexOid("o-main")); // the COHERENT discovery head — never the half-resolved o-moved
+    expect(head.scanned_commit_date).toContain("2025-06-01"); // its MATCHING discovery date (a coherent sha+date pair)
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("a clone-cleanup FAILURE after a successful scan is surfaced as a warning, not swallowed", async () => {
     if (typeof process.getuid === "function" && process.getuid() === 0) return; // root ignores modes
     const root = mkdtempSync(join(tmpdir(), "clone-cleanup-"));
