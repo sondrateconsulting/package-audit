@@ -1151,8 +1151,9 @@ export class GithubClient {
     } finally {
       clearTimeout(timer);
       clearTimeout(settleTimer);
-      // deadline timeouts and byte-cap kills still end their span (finally-scoped)
-      if (spanId !== 0) emitProgress({ type: "spawn-end", id: spanId });
+      // deadline timeouts and byte-cap kills still end their span (finally-scoped); the sink
+      // gate keeps even the end-event allocation off a post-degrade path (§U0)
+      if (spanId !== 0 && hasProgressSink()) emitProgress({ type: "spawn-end", id: spanId });
     }
   }
 

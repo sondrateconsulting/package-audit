@@ -185,7 +185,7 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
     } catch (e) {
       throw new PreflightError(`registry ${registryUrl} unreachable (DNS/TLS/connect): ${(e as Error).message}`);
     } finally {
-      if (spanId !== 0) emitProgress({ type: "fetch-end", id: spanId });
+      if (spanId !== 0 && hasProgressSink()) emitProgress({ type: "fetch-end", id: spanId });
     }
   }
 

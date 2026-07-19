@@ -56,6 +56,14 @@ function markPhase(phase: "preflight" | "resolve-owners" | "cli-terms" | "scan" 
   if (hasProgressSink()) emitProgress({ type: "phase", phase });
 }
 
+// The preflight client's construction options (PROMPT-TUI §U1): the CONFIGURED subprocess width,
+// so the dashboard's subprocess-cap gauge is honest for the whole run. Preflight's calls are
+// sequential one-shot awaits — the wider semaphore is never contended, zero behavioral change.
+// Exported as the testable seam pinning that width (main() constructs from exactly this).
+export function preflightClientOptions(config: Config): { githubHost: string; concurrency: number } {
+  return { githubHost: config.githubHost, concurrency: config.concurrency.repositories };
+}
+
 // The values that TOGETHER define one coherent scan/plan: the config, its hash, and the compiled
 // branch + repository policies. Threaded as ONE object through runScan/processOwner/processRepo/runPlan
 // so a policy can never be dropped or mismatched against its config. Both policies are the SINGLE
@@ -171,11 +179,9 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
       logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
 
       // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
-      // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls),
-      // constructed at the CONFIGURED subprocess width: its calls are sequential one-shot awaits, so
-      // the wider semaphore is never contended — zero behavioral change — but the dashboard's
-      // subprocess-cap gauge is then honest for the whole run (PROMPT-TUI §U1).
-      const preflightClient = new GithubClient({ githubHost: config.githubHost, concurrency: config.concurrency.repositories });
+      // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot
+      // calls) at the configured width (see preflightClientOptions).
+      const preflightClient = new GithubClient(preflightClientOptions(config));
       markPhase("preflight");
       const preflight = await runPreflight(preflightClient, config);
       logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });

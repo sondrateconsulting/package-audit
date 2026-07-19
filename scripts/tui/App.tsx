@@ -5,7 +5,7 @@
 import { useEffect, useReducer } from "react";
 import { Box, Text, useStdout, useWindowSize } from "ink";
 import type { TuiStore } from "./store.ts";
-import { planLayout } from "./format.ts";
+import { planLayout, sanitizeLine } from "./format.ts";
 import { bannerLineCount, CompactFrame, Footer, Header, LimitsPanel, NetPanel, ProblemsPanel, ThrottleBanner, WorkPanel } from "./panels.tsx";
 
 export interface AppProps {
@@ -41,7 +41,7 @@ export function App({ store, subscribe, nowMs, mountedAtMs }: AppProps) {
   if (layout.mode === "single-line") {
     return (
       <Box width="100%" overflow="hidden">
-        <Text wrap="truncate-end">package-audit · {snap.phase ?? "scanning"} · terminal too small</Text>
+        <Text wrap="truncate-end">package-audit · {sanitizeLine(snap.phase ?? "scanning")} · terminal too small</Text>
       </Box>
     );
   }

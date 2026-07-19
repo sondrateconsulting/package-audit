@@ -769,6 +769,77 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     expect(stderr.all()).toContain("dispose exploded");
   });
 
+  test("TOTAL teardown under a THROWING injected timer: the audit still completes, never hangs", async () => {
+    // §U0 has no exceptions: a broken timer dep must not leave the cached teardown promise
+    // pending (the finally would await forever — a hang is a kill).
+    const handle = makeFakeHandle({ exitMode: "never" }); // exit never settles either — worst case
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    deps.timers = {
+      setTimeout: (() => {
+        throw new Error("timer subsystem broken");
+      }) as unknown as typeof setTimeout,
+      clearTimeout: (() => {
+        throw new Error("clear broken");
+      }) as unknown as typeof clearTimeout,
+    };
+    const r = await runWithTui(deps, async () => 7); // must resolve, not hang
+    expect(r).toBe(7);
+  });
+
+  test("mountTui throwing AFTER a renderer could exist: the proxy is SEALED so a leaked Ink cannot smear the bare run", async () => {
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    const handle = makeFakeHandle();
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: () => {
+        throw new Error("post-render mount explosion"); // opts captured, then the throw
+      },
+    });
+    await runWithTui(deps, async () => {
+      // a leaked renderer writing through the proxy during the bare body must be dropped
+      capture.opts!.out.write("leaked-frame");
+    });
+    expect(stderr.all()).not.toContain("leaked-frame"); // sealed at the mount-failure catch
+    expect(stderr.all()).toContain("dashboard disabled");
+    expect(stderr.all()).toContain("post-render mount explosion");
+  });
+
+  test("a BROKEN stderr cannot turn a mount-failure warn into a kill: body still runs", async () => {
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = async () => {
+      throw new Error("no ink");
+    };
+    stderr.throwOnWrite = new Error("EBADF: stderr is gone");
+    let bodyRan = false;
+    const r = await runWithTui(deps, async () => {
+      bodyRan = true;
+      return "ok";
+    });
+    expect(bodyRan).toBe(true);
+    expect(r).toBe("ok"); // the warn had nowhere to go; the audit did not care (§U0)
+  });
+
+  test("late-handle unwind failures surface as a best-effort warning, never silently", async () => {
+    const handle = makeFakeHandle({ exitMode: "manual" });
+    handle.dispose = () => {
+      handle.calls.push("dispose");
+      throw new Error("dispose kaboom");
+    };
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.onDegrade(); // teardown starts null-handle; the returned handle must be unwound
+      },
+    });
+    await runWithTui(deps, async () => {});
+    expect(stderr.all()).toContain("unwind warnings");
+    expect(stderr.all()).toContain("dispose kaboom");
+    expect(handle.calls).toContain("requestUnmount"); // the unwind still completed the other steps
+  });
+
   test("latch reset at lifecycle start: a stale pre-existing latch does not poison a fresh run", async () => {
     reportTuiFailure("stale from a previous lifecycle");
     const { deps, stderr } = makeDeps();

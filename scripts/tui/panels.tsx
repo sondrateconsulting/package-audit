@@ -101,8 +101,11 @@ export function WorkPanel({ snap, nowMs, workRows, showFindings }: { snap: TuiSn
   const owners = snap.owners.length === 0 ? "" : `: ${snap.owners.map((o) => sanitizeLine(o)).join(", ")}`;
   const c = snap.counters;
   const skipped = c.skipCutoff + c.skipPolicy;
+  // The row budget covers the "+N more" line too, and a ZERO budget renders neither rows nor
+  // the more-line — the planner counted zero lines, so zero lines it is (the summary line above
+  // already carries the worker count). Exceeding rows-1 would smear scrollback (§U5).
   const shownUnits = workRows >= snap.unitWorkers.length ? snap.unitWorkers : snap.unitWorkers.slice(0, Math.max(0, workRows - 1));
-  const moreUnits = snap.unitWorkers.length - shownUnits.length;
+  const moreUnits = workRows === 0 ? 0 : snap.unitWorkers.length - shownUnits.length;
   const introspections = snap.introspections;
   return (
     <Box flexDirection="column">

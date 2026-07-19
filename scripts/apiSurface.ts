@@ -684,28 +684,16 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
   const registryOrigin = new URL(registryUrl).origin;
 
   // Introspection WORK span (PROMPT-TUI §U3.7): brackets the WHOLE operation — fetch → verify →
-  // extract → scan → persist — so "packages being introspected" is a first-class work row,
-  // distinct from its inner HTTP span (above) and its inner tar spawns (spawnBounded's spans).
-  // The zero-work completion-marker dedup return above deliberately opens no span.
+  // extract → scan → persist, the fail-soft catch included — so "packages being introspected"
+  // is a first-class work row, distinct from its inner HTTP span (below) and its inner tar
+  // spawns (spawnBounded's spans). The zero-work completion-marker dedup return above
+  // deliberately opens no span, and a no-sink run allocates nothing here (§U0).
   let workSpanId = 0;
   if (hasProgressSink()) {
     workSpanId = nextProgressId();
     emitProgress({ type: "introspect-start", id: workSpanId, packageName, version });
   }
   try {
-    await introspectVersionInner(opts, { fetchImpl, authToken, registryOrigin });
-  } finally {
-    if (workSpanId !== 0) emitProgress({ type: "introspect-end", id: workSpanId });
-  }
-}
-
-async function introspectVersionInner(
-  opts: IntrospectOptions,
-  ctx: { fetchImpl: FetchFn; authToken: string | null; registryOrigin: string },
-): Promise<void> {
-  const { client, db, runId, packageName, registryUrl, version, versionSource } = opts;
-  const { fetchImpl, authToken, registryOrigin } = ctx;
-
   try {
     const packument = opts.packument ?? (await fetchPackument(opts));
     const dist = selectVersionDist(packument, version);
@@ -734,7 +722,7 @@ async function introspectVersionInner(
     try {
       ({ bytes } = await fetchFollowing(dist.tarball, registryOrigin, (u) => isSafeArtifactPath(u, basePrefix), true, authToken, fetchImpl, true, opts.fetchTimeoutMs ?? FETCH_TIMEOUT_MS));
     } finally {
-      if (fetchSpanId !== 0) emitProgress({ type: "fetch-end", id: fetchSpanId });
+      if (fetchSpanId !== 0 && hasProgressSink()) emitProgress({ type: "fetch-end", id: fetchSpanId });
     }
     verifyIntegrity(bytes, dist.integrity, dist.shasum); // BEFORE extraction
 
@@ -777,6 +765,9 @@ async function introspectVersionInner(
     const message = (e as Error).message;
     db.insertError({ runId, scope: "introspection", packageName, version, message });
     logLine({ event: "introspection", packageName, version, error: message });
+  }
+  } finally {
+    if (workSpanId !== 0 && hasProgressSink()) emitProgress({ type: "introspect-end", id: workSpanId });
   }
 }
 
@@ -834,7 +825,7 @@ export async function fetchPackument(req: PackumentRequest): Promise<Packument> 
   try {
     ({ text } = await fetchFollowing(url, registryOrigin, isPackumentPath, false, authToken, fetchImpl, false, req.fetchTimeoutMs ?? FETCH_TIMEOUT_MS));
   } finally {
-    if (fetchSpanId !== 0) emitProgress({ type: "fetch-end", id: fetchSpanId });
+    if (fetchSpanId !== 0 && hasProgressSink()) emitProgress({ type: "fetch-end", id: fetchSpanId });
   }
   let parsed: unknown;
   try {

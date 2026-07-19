@@ -33,13 +33,16 @@ class CaptureStream extends EventEmitter {
   text(): string {
     return sanitizeLine(this.frames.join("")); // strip ANSI before asserting (§U8.11)
   }
+  raw(): string {
+    return this.frames.join(""); // the UNstripped bytes, for hostile-injection assertions
+  }
 }
 
 const NOW = 1_000_000;
 
 // Mount the real adapter over a canned store, let a frame land, unmount, return the whole
 // captured text. Content assertions on the full stream are CI-safe (final frame at unmount).
-async function frame(events: ProgressEvent[], opts: { columns?: number | undefined; rows?: number | undefined; nowMs?: number } = {}): Promise<string> {
+async function frameCapture(events: ProgressEvent[], opts: { columns?: number | undefined; rows?: number | undefined; nowMs?: number } = {}): Promise<CaptureStream> {
   const out = new CaptureStream(
     "columns" in opts ? opts.columns : 120,
     "rows" in opts ? opts.rows : 40,
@@ -56,7 +59,10 @@ async function frame(events: ProgressEvent[], opts: { columns?: number | undefin
   handle.dispose();
   handle.requestUnmount();
   await Promise.race([handle.waitUntilExit(), new Promise((r) => setTimeout(r, 2000))]);
-  return out.text();
+  return out;
+}
+async function frame(events: ProgressEvent[], opts: { columns?: number | undefined; rows?: number | undefined; nowMs?: number } = {}): Promise<string> {
+  return (await frameCapture(events, opts)).text();
 }
 
 const jsonl = (event: Record<string, unknown>): ProgressEvent => ({ type: "jsonl", event });
@@ -153,17 +159,34 @@ describe("panel frames over canned store states (§U8.11)", () => {
   });
 
   test("hostile bytes in displayed strings render inert (§U0 sanitization at render)", async () => {
-    const text = await frame([
+    const capture = await frameCapture([
       jsonl({ event: "unit", org: "acme", repo: "api", branch: "dev", action: "error", message: "clone failed: \u001B]0;pwn\u0007\u001B[2J\u001B[9999;9999H stderr\nline2" }),
       { type: "spawn-start", id: 1, tool: "gh", label: "gh api \u001B[31mevil" },
     ]);
+    const text = capture.text();
     expect(text).toContain("clone failed:  stderr line2"); // escapes stripped, newline collapsed
     expect(text).toContain("gh api evil");
-    // the CAPTURED stream contains only Ink's own frame-control ANSI — the hostile CSI targets
-    // (full-screen erase, absolute cursor jump) never appear
-    const raw = (await Promise.resolve(text), text);
+    // the RAW byte stream contains only Ink's own frame-control ANSI — the hostile sequences
+    // (title-set OSC, full-screen erase, absolute cursor jump) never reach the terminal
+    const raw = capture.raw();
+    expect(raw).not.toContain("]0;pwn");
     expect(raw).not.toContain("[2J");
     expect(raw).not.toContain("9999;9999");
+  });
+
+  test("a ZERO work-row budget renders neither unit rows nor the '+N more' line (rows-1 cap conformance)", async () => {
+    const events: ProgressEvent[] = [];
+    for (let i = 0; i < 12; i++) events.push({ type: "unit-dispatch", owner: "o", repo: "r", branch: `branch-${i}` });
+    events.push({ type: "introspect-start", id: 1, packageName: "expo", version: "1.0.0" });
+    for (let i = 0; i < 6; i++) events.push(jsonl({ event: "unit", org: "o", repo: "r", branch: `e${i}`, action: "error", message: `m${i}` }));
+    // rows=12 is full mode's floor; under this demand the ladder ends at workRows 0, findings
+    // dropped, problems collapsed — and the panel must render EXACTLY that, not one line more
+    const text = await frame(events, { columns: 120, rows: 12 });
+    expect(text).toContain("unit workers 12"); // the summary still carries the truth
+    expect(text).not.toContain("… +"); // no overflow line for a zero budget
+    expect(text).not.toContain("o/r@branch-"); // and no unit rows
+    expect(text).not.toContain("findings (session)"); // dropped by the ladder
+    expect(text).toContain("recent (6 errors)"); // problems collapsed to the one-line count
   });
 
   test("compact mode (<60 columns): header + limits strip + counters + footer only", async () => {

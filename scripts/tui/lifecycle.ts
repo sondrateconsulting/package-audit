@@ -131,9 +131,11 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
 
   const overrides: Record<PropertyKey, unknown> = { write };
   const stream = new Proxy(real, {
-    get(target, prop, receiver) {
+    get(target, prop) {
       if (prop in overrides) return overrides[prop];
-      const value = Reflect.get(target, prop, receiver === undefined ? target : target);
+      // receiver = target on purpose: getters (isTTY/columns/rows) must read the REAL stream's
+      // state, and returned methods are bound to it — true fallthrough delegation (§U1).
+      const value = Reflect.get(target, prop, target);
       return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
     },
   }) as unknown as NodeJS.WriteStream;
@@ -218,22 +220,39 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
   const writeReal = (text: string): void => {
     realStderr.write(text);
   };
+  // Best-effort variant for every OUTSIDE-teardown warning site: a broken stderr must degrade
+  // the dashboard, never throw into the setup path and kill the audit (§U0 has no exceptions).
+  const warnReal = (text: string): void => {
+    try {
+      writeReal(text);
+    } catch {
+      // nowhere left to warn to — the audit still runs
+    }
+  };
 
-  // waitUntilExit bounded by the INJECTED timers (§U6 step 2); never rejects; ALWAYS clears the
-  // loser timer when the exit settles first.
+  // waitUntilExit bounded by the INJECTED timers (§U6 step 2). TOTAL: never rejects, and a
+  // throwing injected timer cannot hang it (a broken timer resolves the wait immediately —
+  // skipping the grace beats an unbounded hang); ALWAYS clears the loser when the exit wins.
   const boundedExitWait = (h: TuiHandle): Promise<void> =>
     new Promise<void>((resolve) => {
-      let t: ReturnType<typeof setTimeout> | null = timers.setTimeout(() => {
-        t = null;
-        resolve();
-      }, TEARDOWN_EXIT_WAIT_MS);
+      let t: ReturnType<typeof setTimeout> | null = null;
       const done = (): void => {
         if (t !== null) {
-          timers.clearTimeout(t);
+          const timer = t;
           t = null;
+          try {
+            timers.clearTimeout(timer);
+          } catch {
+            // a failing clear cannot matter more than finishing the wait
+          }
         }
         resolve();
       };
+      try {
+        t = timers.setTimeout(done, TEARDOWN_EXIT_WAIT_MS);
+      } catch {
+        done(); // no timer available → no way to bound the wait → end it now
+      }
       try {
         h.waitUntilExit().then(done, done);
       } catch {
@@ -262,56 +281,67 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         stepWarnings.push(`${label}: ${errText(e)}`);
       }
     };
+    // TOTAL by construction: every step individually guarded, the awaited wait never rejects,
+    // and the finally publishes completion no matter what — a teardown defect can never leave
+    // the cached promise pending (which would hang the finally awaiting it: a kill, §U0).
     void (async () => {
-      const h = state.handle;
-      // 1. stop the tick + App-side hooks (skipped when the handle never arrived)
-      guarded("dispose", () => h?.dispose());
-      // 2. unmount + bounded exit wait
-      const sealedBeforeUnmount = proxy.sealed;
-      if (h !== null) {
-        guarded("unmount", () => h.requestUnmount());
-        await boundedExitWait(h);
-      }
-      // 3. seal — from here NOTHING (a wedged Ink, queued renders, its console patch) can reach
-      // the real stderr; sealed-off attempts are counted into the step-6 warning.
-      guarded("seal", () => proxy.seal());
-      guarded("detach-error-absorber", () => proxy.detach());
-      // 4. clear the seams (restores stdout)
-      guarded("clear-seams", () => {
-        setProgressSink(null);
-        setLogTap(null);
-        setLogSink(null);
-      });
-      // 5. close the divert + announce the ACTUAL path, partial-file wording when incomplete
-      if (state.divertFd !== null) {
-        guarded("close-divert", () => io.close(state.divertFd!));
-        const latch = tuiFailure();
-        const exitLine =
-          latch?.divertFailedMidRun === true
-            ? `JSONL log (partial — divert failed mid-run, remainder went to stdout): ${state.divertPath}`
-            : state.divertClosedEarly
-              ? `JSONL log (partial — dashboard ended mid-run, remainder went to stdout): ${state.divertPath}`
-              : `JSONL log: ${state.divertPath}`;
-        guarded("exit-line", () => writeReal(exitLine + "\n"));
-      }
-      // 5a. defensive cursor compensation: every pre-unmount seal site uses sealEarly() (which
-      // compensates itself), so this never fires in correct operation.
-      if (sealedBeforeUnmount && !proxy.cursorCompensated) guarded("cursor-show", () => writeReal(SHOW_CURSOR));
-      // 6. the ONE latched-failure warning (first cause + sealed-write count), if any
-      const latch = tuiFailure();
-      if (latch !== null) {
-        const drops = proxy.sealedDrops > 0 ? ` (${proxy.sealedDrops} suppressed frame write${proxy.sealedDrops === 1 ? "" : "s"})` : "";
-        guarded("failure-warning", () => writeReal(`package-audit: dashboard disabled — ${latch.firstCause}${drops}\n`));
-      }
-      if (stepWarnings.length > 0) {
-        try {
-          writeReal(`package-audit: dashboard teardown warnings — ${stepWarnings.join("; ")}\n`);
-        } catch {
-          // teardown NEVER throws — a propagating payload error must not be masked
+      try {
+        const h = state.handle;
+        // 1. stop the tick + App-side hooks (skipped when the handle never arrived)
+        guarded("dispose", () => h?.dispose());
+        // 2. unmount + bounded exit wait
+        const sealedBeforeUnmount = proxy.sealed;
+        if (h !== null) {
+          guarded("unmount", () => h.requestUnmount());
+          await boundedExitWait(h);
         }
+        // 3. seal — from here NOTHING (a wedged Ink, queued renders, its console patch) can reach
+        // the real stderr; sealed-off attempts are counted into the step-6 warning.
+        guarded("seal", () => proxy.seal());
+        // 4. clear the seams (restores stdout)
+        guarded("clear-seams", () => {
+          setProgressSink(null);
+          setLogTap(null);
+          setLogSink(null);
+        });
+        // 5. close the divert + announce the ACTUAL path, partial-file wording when incomplete
+        if (state.divertFd !== null) {
+          guarded("close-divert", () => io.close(state.divertFd!));
+          const latch = tuiFailure();
+          const exitLine =
+            latch?.divertFailedMidRun === true
+              ? `JSONL log (partial — divert failed mid-run, remainder went to stdout): ${state.divertPath}`
+              : state.divertClosedEarly
+                ? `JSONL log (partial — dashboard ended mid-run, remainder went to stdout): ${state.divertPath}`
+                : `JSONL log: ${state.divertPath}`;
+          guarded("exit-line", () => writeReal(exitLine + "\n"));
+        }
+        // 5a. defensive cursor compensation: every pre-unmount seal site uses sealEarly() (which
+        // compensates itself), so this never fires in correct operation.
+        if (sealedBeforeUnmount && !proxy.cursorCompensated) guarded("cursor-show", () => writeReal(SHOW_CURSOR));
+        // 6. the ONE latched-failure warning (first cause + sealed-write count), if any
+        const latch = tuiFailure();
+        if (latch !== null) {
+          const drops = proxy.sealedDrops > 0 ? ` (${proxy.sealedDrops} suppressed frame write${proxy.sealedDrops === 1 ? "" : "s"})` : "";
+          guarded("failure-warning", () => writeReal(`package-audit: dashboard disabled — ${latch.firstCause}${drops}\n`));
+        }
+        if (stepWarnings.length > 0) {
+          try {
+            writeReal(`package-audit: dashboard teardown warnings — ${stepWarnings.join("; ")}\n`);
+          } catch {
+            // teardown NEVER throws — a propagating payload error must not be masked
+          }
+        }
+        // 7. detach the stderr error absorber LAST, so teardown's own step-5/6 writes stayed
+        // covered; after this the stream's error semantics are exactly the pre-feature baseline.
+        guarded("detach-error-absorber", () => proxy.detach());
+      } finally {
+        resolveTeardown();
       }
-      resolveTeardown();
-    })();
+    })().catch(() => {
+      // unreachable (the body is total), kept so a future defect degrades instead of surfacing
+      // as an unhandled rejection
+    });
     return state.teardown;
   };
 
@@ -329,18 +359,21 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
       if (state.teardown !== null) {
         // Teardown ran with a null handle — unwind the LATE-ARRIVING handle fully: dispose,
         // then unmount + bounded wait (the proxy is already sealed, so a late frame cannot
-        // smear output; the unwind is about not leaking Ink's timers/hooks).
+        // smear output; the unwind is about not leaking Ink's timers/hooks). Unwind failures
+        // surface as a best-effort warning, never silently (§U6's deferred-warning rule).
+        const unwindWarnings: string[] = [];
         try {
           h.dispose();
-        } catch {
-          // unwind is best-effort
+        } catch (e) {
+          unwindWarnings.push(`dispose: ${errText(e)}`);
         }
         try {
           h.requestUnmount();
-        } catch {
-          // unwind is best-effort
+        } catch (e) {
+          unwindWarnings.push(`unmount: ${errText(e)}`);
         }
         await boundedExitWait(h);
+        if (unwindWarnings.length > 0) warnReal(`package-audit: dashboard unwind warnings — ${unwindWarnings.join("; ")}\n`);
       } else {
         state.handle = h;
         mounted = true;
@@ -359,8 +392,17 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
           }
         });
         // The tap: hasProgressSink() keeps it allocation-free once the sink is gone (§U0).
+        // Self-reporting (§U1): a throwing tap clears itself, latches, and degrades — the
+        // unified failure channel, not log.ts's dependency-free self-clear backstop. (In
+        // practice emitProgress never throws; this is the contract made local.)
         setLogTap((ev) => {
-          if (hasProgressSink()) emitProgress({ type: "jsonl", event: ev });
+          try {
+            if (hasProgressSink()) emitProgress({ type: "jsonl", event: ev });
+          } catch (err) {
+            setLogTap(null);
+            reportTuiFailure(errText(err));
+            degradeNow();
+          }
         });
         // Never open the divert into a dead lifecycle (§U6): a synchronous degrade between the
         // seam installs and here means teardown owns the collapse — install nothing further.
@@ -426,9 +468,19 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
       }
     }
   } catch (e) {
-    // Load/mount failure (§U6): warn once on stderr, run with TUI off. Nothing was installed.
+    // Load/mount failure (§U6): warn once on stderr, run with TUI off. Install order guarantees
+    // no seam was installed — but a mountTui that threw AFTER Ink's render() succeeded could
+    // leave a live renderer with no handle, so SEAL the proxy defensively: a leaked Ink can
+    // never smear frames over the bare run (sealEarly also restores the cursor Ink may have
+    // hidden before the throw; a stray cursor-show on a plain import failure is a no-op).
+    // Both the seal and the warn are total — a broken stderr must degrade, never kill (§U0).
+    try {
+      proxy.sealEarly();
+    } catch {
+      // sealEarly is internally total; belt-and-braces only
+    }
     // (When a degrade already started teardown, its step-6 warning covers the cause instead.)
-    if (state.teardown === null) writeReal(`package-audit: dashboard disabled — ${errText(e)}\n`);
+    if (state.teardown === null) warnReal(`package-audit: dashboard disabled — ${errText(e)}\n`);
   }
 
   try {

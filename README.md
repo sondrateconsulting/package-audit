@@ -233,7 +233,7 @@ Ctrl+C keeps its exact semantics — the process dies, the run stays resumable, 
 
 The audit's **analysis path** has exactly one runtime npm dependency: `typescript` — the scanner parses target code with the TS compiler API. The report path imports zero npm packages (the export/dossier surfaces are built to the same rule). The **opt-outable interactive dashboard** adds two more: `ink` + `react`, exact-pinned in `package.json` and locked in `bun.lock`. They are display-layer only, and that boundary is enforced, not asserted:
 
-- They load **only** via a dynamic import when the dashboard actually mounts — `--no-ui`, `--plan`, CI, and piped runs never evaluate a byte of them.
+- They load **only** via a dynamic import when the dashboard actually mounts — `--no-ui`, `--plan`, CI, and non-interactive runs (stderr not a terminal) never evaluate a byte of them. (An interactive run with only *stdout* piped does mount the dashboard, per the matrix above — stdout still receives pure JSONL.)
 - A grep-enforced test ([scripts/tuiPurity.test.ts](scripts/tuiPurity.test.ts)) pins the display layer away from the machine stdout stream, the filesystem write APIs (one audited exception: the contained divert-log writer), the spawn surface, and the DB/GitHub modules; the repo-wide single-chokepoint scan walks the dashboard sources too.
 - **Lifecycle scripts: verified none.** At the pinned resolution (ink 7.1.1 + react 19.2.7 and their transitive closure), no package in `node_modules` declares a `preinstall`/`install`/`postinstall` script — verified against the installed tree (`bun pm untrusted` agrees), not assumed from Bun's default script-blocking. Re-verify when bumping pins.
 
