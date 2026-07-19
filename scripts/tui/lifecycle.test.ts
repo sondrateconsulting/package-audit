@@ -1037,6 +1037,45 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1); // still exactly once
   });
 
+  test("hostile bytes latched as a failure CAUSE are sanitized at the step-6 write site (§U0 end-to-end)", async () => {
+    const { deps, stderr } = makeDeps();
+    await runWithTui(deps, async () => {
+      // Latch RAW hostile text directly — the WRITE SITE's sanitizeLine must strip it. (A
+      // storeImpl-thrown shape would be pre-sanitized by errText at the latch site and could
+      // not catch a write-site regression.)
+      reportTuiFailure("evil \u001B]0;title\u0007 \u001B[2J \u009B31m red\nnext\rline");
+    });
+    const warning = stderr.writes.find((w) => w.includes("dashboard disabled"));
+    expect(warning).toBeDefined();
+    expect(warning!).toContain("evil");
+    expect(warning!).not.toContain("\u001B"); // no ESC byte reaches the terminal
+    expect(warning!).not.toContain("\u009B"); // no raw C1 CSI either
+    expect(warning!).not.toContain("\u0007"); // no BEL
+    expect(warning!.endsWith("\n")).toBe(true);
+    expect(warning!.slice(0, -1)).not.toContain("\n"); // ONE display line + terminator
+    expect(warning!.slice(0, -1)).not.toContain("\r");
+  });
+
+  test("a hostile divert path is sanitized in the JSONL exit line (operator-config bytes flow into 'our' path)", async () => {
+    const { deps, stderr } = makeDeps({ divert: true });
+    deps.logPathFor = () => "/fake/logs/evil-\u001B[31mpath\u001B[0m.jsonl";
+    await runWithTui(deps, async () => {});
+    const exitLine = stderr.writes.find((w) => w.startsWith("JSONL log"));
+    expect(exitLine).toBeDefined();
+    expect(exitLine!).toContain("evil-path.jsonl"); // the CSI sequences stripped, the text intact
+    expect(exitLine!).not.toContain("\u001B");
+  });
+
+  test("post-teardown: the stderr 'error' absorber STAYS attached and consumes a delayed write error (no crash)", async () => {
+    const { deps, stderr } = makeDeps();
+    await runWithTui(deps, async () => {});
+    // An EventEmitter 'error' with ZERO listeners THROWS — the retained absorber (teardown
+    // step 7) is exactly what makes a dying-pipe EIO delivered after teardown inert instead of
+    // fatal (§U0). This test fails if step 7 ever goes back to detaching.
+    expect(stderr.listenerCount("error")).toBeGreaterThanOrEqual(1);
+    expect(() => stderr.emit("error", new Error("EIO delivered late"))).not.toThrow();
+  });
+
   test("the late-handle unwind compensates the cursor BEFORE its bounded wait releases", async () => {
     const handle = makeFakeHandle({ exitMode: "never" });
     const capture: MountCapture = { store: null, opts: null };

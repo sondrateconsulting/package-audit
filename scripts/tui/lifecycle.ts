@@ -268,8 +268,10 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
   });
 
   const writeReal = (text: string): void => {
-    // the noop callback routes an async write failure to the callback instead of a later
-    // 'error' event — our own teardown lines can never seed a post-detach crash
+    // The noop callback RECEIVES AND DISCARDS the per-write error report, closing the
+    // callback-shaped unhandled path. It does NOT prevent a stream 'error' event — a failed
+    // Writable.write can invoke its callback with the error AND still emit 'error' — the
+    // RETAINED stderr absorber (teardown step 7) is the protection for that event path.
     realStderr.write(text, () => {});
   };
   // Best-effort variant for every OUTSIDE-teardown warning site: a broken stderr must degrade
@@ -427,8 +429,12 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         // 7. the stderr error absorber deliberately STAYS attached: an asynchronous write
         // error from teardown's own step-5/6 lines (a dying pipe delivering EIO a tick later)
         // must never surface as an unhandled 'error' event and kill an otherwise completed
-        // audit (§U0). The remaining window is teardown→process-exit — milliseconds — and the
-        // absorber is inert observability by construction. (proxy.detach() exists for tests.)
+        // audit (§U0). The remaining window is teardown→process-exit — milliseconds. This
+        // assumes the ONE-SHOT CLI shape (one runWithTui per process): a post-teardown 'error'
+        // still mutates the now-unread failure latch and calls degradeNow — which merely
+        // retrieves the already-settled cached teardown promise and discards it — and repeated
+        // lifecycles against one stream would stack absorbers. (proxy.detach() exists for
+        // tests.)
       } finally {
         resolveTeardown();
       }
