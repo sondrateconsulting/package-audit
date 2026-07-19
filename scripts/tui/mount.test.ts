@@ -6,7 +6,7 @@
 // interactive checks (repaint, resize, SIGINT/cursor) are the MANUAL P0 gate in the PR body.
 import { expect, test, describe, spyOn, afterEach } from "bun:test";
 import { EventEmitter } from "node:events";
-import { mountTui, DEFAULT_TICK_MS, type TuiHandle } from "./mount.tsx";
+import { mountTui, DEFAULT_TICK_MS, type TuiHandle, type MountTuiOptions } from "./mount.tsx";
 import { createTuiStore, type TuiStore } from "./store.ts";
 import { resetTuiFailure, reportTuiFailure } from "../progress.ts";
 
@@ -197,6 +197,167 @@ describe("P0 automated gate — real mountTui under Bun against capture streams"
       so.mockRestore();
     }
     expect(writes).toEqual([]);
+  });
+});
+
+// ---- escalation-remediation coverage: rollback, cleanup aggregation, resize detach ------------
+type RenderSeam = NonNullable<MountTuiOptions["renderImpl"]>;
+
+describe("post-render rollback + adapter cleanup (§U6 remediation)", () => {
+  test("rollback (i): a throwing setInterval unmounts the renderer and rethrows the original error", () => {
+    const out = new CaptureStream();
+    const events: string[] = [];
+    const instance = {
+      unmount: (): void => {
+        events.push("unmount");
+      },
+      waitUntilExit: (): Promise<void> => Promise.resolve(),
+    };
+    const throwingSched = {
+      setInterval: (() => {
+        throw new Error("scheduler broken");
+      }) as unknown as typeof setInterval,
+      clearInterval: (() => {}) as unknown as typeof clearInterval,
+    };
+    expect(() =>
+      mountTui(createTuiStore(() => 0), {
+        out: out as unknown as NodeJS.WriteStream,
+        onDegrade: () => {},
+        scheduler: throwingSched,
+        renderImpl: (() => instance) as unknown as RenderSeam,
+      }),
+    ).toThrow("scheduler broken");
+    expect(events).toEqual(["unmount"]); // the live renderer was rolled back
+    expect(out.listenerCount("resize")).toBe(0); // nothing leaked
+  });
+
+  test("rollback (ii): a synchronous waitUntilExit throw AFTER registrations — cleanup runs BEFORE the unmount", () => {
+    const out = new CaptureStream();
+    const sched = makeFakeScheduler();
+    const degrades: number[] = [];
+    const atUnmountEntry: Array<{ listeners: number; degradesDuringProbe: number }> = [];
+    const events: string[] = [];
+    const instance = {
+      unmount: (): void => {
+        // AT ENTRY: cleanup must already have run — the resize listener is gone, and a retained
+        // tick fired now is inert (the disposed guard wins BEFORE the latch check, so the probe
+        // latch below cannot trigger a degrade).
+        reportTuiFailure("probe: retained tick must be inert");
+        sched.fire();
+        atUnmountEntry.push({ listeners: out.listenerCount("resize"), degradesDuringProbe: degrades.length });
+        events.push("unmount");
+      },
+      waitUntilExit: (): Promise<void> => {
+        throw new Error("wue broken"); // the rejection-handler attach is the faulting tail step
+      },
+    };
+    expect(() =>
+      mountTui(createTuiStore(() => 0), {
+        out: out as unknown as NodeJS.WriteStream,
+        onDegrade: () => degrades.push(1),
+        scheduler: sched.scheduler,
+        renderImpl: (() => instance) as unknown as RenderSeam,
+      }),
+    ).toThrow("wue broken");
+    expect(events).toEqual(["unmount"]);
+    expect(atUnmountEntry).toEqual([{ listeners: 0, degradesDuringProbe: 0 }]); // cleanup-BEFORE-unmount proven
+    expect(sched.activeCount()).toBe(0); // the created interval was cleared (1 → 0)
+    expect(out.listenerCount("resize")).toBe(0); // registered, then detached — back to baseline
+  });
+
+  test("rollback (iii): a throwing clearInterval cannot mask the original error; the timer is unref'd and inert", () => {
+    const out = new CaptureStream();
+    let unrefs = 0;
+    let tickFn: (() => void) | null = null;
+    const token = {
+      unref: (): void => {
+        unrefs++;
+      },
+    };
+    const sched = {
+      setInterval: ((fn: () => void) => {
+        tickFn = fn;
+        return token as unknown as ReturnType<typeof setInterval>;
+      }) as unknown as typeof setInterval,
+      clearInterval: (() => {
+        throw new Error("clear broken");
+      }) as unknown as typeof clearInterval,
+    };
+    const events: string[] = [];
+    const instance = {
+      unmount: (): void => {
+        events.push("unmount");
+      },
+      waitUntilExit: (): Promise<void> => {
+        throw new Error("wue broken");
+      },
+    };
+    expect(() =>
+      mountTui(createTuiStore(() => 0), {
+        out: out as unknown as NodeJS.WriteStream,
+        onDegrade: () => {},
+        scheduler: sched,
+        renderImpl: (() => instance) as unknown as RenderSeam,
+      }),
+    ).toThrow("wue broken"); // the ORIGINAL error — the rollback discards its cleanup failures
+    expect(events).toEqual(["unmount"]);
+    expect(unrefs).toBe(1); // the uncancellable interval no longer holds the event loop
+    (tickFn as unknown as () => void)(); // a still-firing interval callback is inert (no throw)
+  });
+
+  test("dispose() without unmount detaches exactly the adapter's resize listener (wedged-unmount shape)", async () => {
+    await mounted(async ({ out, handle }) => {
+      const n = out.listenerCount("resize");
+      expect(n).toBeGreaterThanOrEqual(1); // the adapter's listener at minimum (Ink may add its own)
+      handle.dispose();
+      expect(out.listenerCount("resize")).toBe(n - 1); // exactly the adapter's went away; Ink's stays until unmount
+    });
+  });
+
+  test("dispose() aggregates cleanup failures AFTER completing every attempt; the second call is a no-op", async () => {
+    const out = new CaptureStream();
+    const origOff = out.off.bind(out);
+    (out as unknown as { off: unknown }).off = () => {
+      throw new Error("off broken");
+    };
+    let unrefs = 0;
+    let tickFn: (() => void) | null = null;
+    const token = {
+      unref: (): void => {
+        unrefs++;
+      },
+    };
+    const sched = {
+      setInterval: ((fn: () => void) => {
+        tickFn = fn;
+        return token as unknown as ReturnType<typeof setInterval>;
+      }) as unknown as typeof setInterval,
+      clearInterval: (() => {
+        throw new Error("clear broken");
+      }) as unknown as typeof clearInterval,
+    };
+    const handle = mountTui(createTuiStore(() => 0), {
+      out: out as unknown as NodeJS.WriteStream,
+      onDegrade: () => {},
+      scheduler: sched,
+    });
+    let thrown: unknown = null;
+    try {
+      handle.dispose();
+    } catch (e) {
+      thrown = e;
+    }
+    // ONE aggregate naming BOTH failures — proof that the second attempt ran despite the first
+    expect(String(thrown)).toContain("adapter cleanup:");
+    expect(String(thrown)).toContain("clear-tick: clear broken");
+    expect(String(thrown)).toContain("detach-resize: off broken");
+    expect(unrefs).toBe(1); // the timer was unref'd on the failed clear
+    (tickFn as unknown as () => void)(); // retained interval callback: inert after cleanup
+    handle.dispose(); // idempotent: no second throw
+    // restore off so Ink's own unmount cleanup works, then unmount for hygiene
+    (out as unknown as { off: unknown }).off = origOff;
+    handle.requestUnmount();
+    await Promise.race([handle.waitUntilExit(), new Promise((r) => setTimeout(r, 2000))]);
   });
 });
 
