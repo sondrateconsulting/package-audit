@@ -141,6 +141,26 @@ describe("buildCompare — added/removed sites", () => {
     db.close();
   });
 
+  test("a 'reused' head's usage sites are included in the diff, same as 'scanned' (§3.1a scanned-slice)", () => {
+    // Symmetric with report/export: compare's per-run slice must include 'reused' (skip-as-current)
+    // heads — their same-commit findings are still current. Run A has no sites; run B scans a unit
+    // whose head is 'reused'. If compare's JOIN regressed to a bare status='scanned', B's site would
+    // vanish (added=[]) and its flag would default to null — this test locks both widened sites.
+    const db = mem();
+    const runA = startCompleted(db, ["expo"]);
+    const runB = startCompleted(db, ["expo"]);
+    const uB: Unit = { organization: "org-a", repository: "svc", branch: "main", commitSha: "reusedSha" };
+    db.upsertRunUnitHead({ runId: runB.runId, ...uB, status: "reused", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    site(db, runB.runId, uB, { filePath: "src/reused.ts", lineNumber: 2 });
+
+    const res = buildCompare(db, runA, runB);
+    const pkg = res.compare.packages.find((p) => p.name === "expo")!;
+    expect(pkg.added.map((e) => e.filePath)).toEqual(["src/reused.ts"]); // usage JOIN (compare.ts:202) includes reused
+    expect(pkg.added[0]!.isDefaultBranch).toBe(true); // the default-branch flags filter (compare.ts:190) includes reused
+    expect(pkg.summary.usageSitesAdded).toBe(1);
+    db.close();
+  });
+
   test("packages are the sorted UNION of both runs' tracked lists, each slice filtered to ITS run's tracked packages", () => {
     const db = mem();
     const runA = startCompleted(db, ["zeta", "unused"]);
@@ -328,8 +348,8 @@ describe("buildCompare — policy churn", () => {
       // A status outside the four belongs to NO bucket, so the counts silently stop summing — this is
       // also exactly how a future 'error' disposition would arrive.
       "an UNKNOWN status with no policy — it would land in no disposition bucket at all",
-      `'', 'reused', 0, NULL, NULL`,
-      /status="reused", outside the four known dispositions/,
+      `'', 'bogus-status', 0, NULL, NULL`,
+      /status="bogus-status", outside the known dispositions/,
     ],
     [
       "a SCANNED policy row that is not the default (schema-valid, still not an override)",
@@ -344,9 +364,9 @@ describe("buildCompare — policy churn", () => {
       /is scanned but has commit_sha=''/,
     ],
     [
-      "a NON-scanned row carrying a commit_sha — only a scanned row pins a commit",
+      "a NON-scanned row carrying a commit_sha — only a scan-attempt row pins a commit",
       `'abc123', 'skipped-cutoff', 0, NULL, NULL`,
-      /only a scanned row pins a commit/,
+      /only a scan-attempt row pins a commit/,
     ],
     [
       // The SQL deny CHECK is IS NOT NULL, so '' satisfies it — schema-valid.

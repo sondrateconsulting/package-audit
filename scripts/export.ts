@@ -11,7 +11,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig, type Config } from "./config.ts";
-import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
+import { AuditDb, REPORTABLE_UNIT_STATUSES, type AuditDbReader, type RunRecord } from "./db.ts";
 import { ArtifactBundle, XRAY_DIR_NAME } from "./artifactWrite.ts";
 import { toCsv, type CsvCell } from "./csvWrite.ts";
 import { parseSemver } from "./semver.ts";
@@ -19,6 +19,10 @@ import { logLine, flushLogs } from "./log.ts";
 import { assertRunUnitHeadSound } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
+
+// The reportable-head SQL fragment (`'scanned', 'reused'`), from the db.ts source of truth so the
+// run-scoped export JOINs stay in lockstep with report.ts. Fixed enum literals → injection-safe.
+const REPORTABLE_HEAD_SQL = REPORTABLE_UNIT_STATUSES.map((s) => `'${s}'`).join(", ");
 
 // ---- usage / help -----------------------------------------------------------------------------
 export const EXPORT_USAGE =
@@ -141,6 +145,12 @@ const RUNS_COLUMNS = [
   { name: "cutoff_date", type: "string" },
   { name: "github_host", type: "string" },
   { name: "status", type: "string" },
+  // T5 durable coverage (§3.1b). Order mirrors SCHEMA_SQL so the registry stays a declaration-order
+  // subsequence of PRAGMA table_info. outcome/coverage_complete are nullable (NULL = crashed/legacy).
+  { name: "outcome", type: "nullable-string" },
+  { name: "coverage_complete", type: "nullable-number" },
+  { name: "discovery_failures", type: "number" },
+  { name: "discovery_deferrals", type: "number" },
 ] as const satisfies readonly ExportColumn[];
 
 const USAGE_FINDINGS_COLUMNS = [
@@ -241,6 +251,8 @@ export type RunsExportRow = {
   run_id: string; started_at: string; completed_at: string | null; config_hash: string;
   effective_owners: string; owners_source: string; tracked_packages: string;
   cutoff_date: string; github_host: string; status: string;
+  outcome: string | null; coverage_complete: number | null;
+  discovery_failures: number; discovery_deferrals: number;
 };
 export type UsageFindingsExportRow = {
   run_id: string; organization: string; repository: string; branch: string; commit_sha: string;
@@ -288,7 +300,7 @@ function collectSnapshots(db: AuditDbReader, run: RunRecord, raw: boolean): read
 }
 
 // DEFAULT scope — the load-bearing decision, inherited from report.ts VERBATIM: findings join
-// through run_unit_head (run_id = selected run, status='scanned', matching unit columns) and
+// through run_unit_head (run_id = selected run, reportable head status, matching unit columns) and
 // filter to the run's tracked_packages. NEVER filter by findings.run_id: upserts move run_id
 // to the latest writer, but the head snapshot is per-run (stable once the run completes).
 function collectRunScoped(db: AuditDbReader, run: RunRecord): ExportSnapshot[] {
@@ -296,7 +308,7 @@ function collectRunScoped(db: AuditDbReader, run: RunRecord): ExportSnapshot[] {
 
   const dep = db.read(
     `SELECT ${selectList(DEPENDENCY_FINDINGS_COLUMNS, "df.")} FROM dependency_findings df
-     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status='scanned'
+     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status IN (${REPORTABLE_HEAD_SQL})
        AND ruh.organization=df.organization AND ruh.repository=df.repository
        AND ruh.branch=df.branch AND ruh.commit_sha=df.commit_sha
      WHERE df.package_name IN (SELECT value FROM json_each(?))
@@ -305,7 +317,7 @@ function collectRunScoped(db: AuditDbReader, run: RunRecord): ExportSnapshot[] {
 
   const usage = db.read(
     `SELECT ${selectList(USAGE_FINDINGS_COLUMNS, "uf.")} FROM usage_findings uf
-     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status='scanned'
+     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status IN (${REPORTABLE_HEAD_SQL})
        AND ruh.organization=uf.organization AND ruh.repository=uf.repository
        AND ruh.branch=uf.branch AND ruh.commit_sha=uf.commit_sha
      WHERE uf.package_name IN (SELECT value FROM json_each(?))

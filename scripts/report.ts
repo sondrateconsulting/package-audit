@@ -10,7 +10,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { loadConfig, type Config } from "./config.ts";
-import { AuditDb, type AuditDbReader, type RunRecord } from "./db.ts";
+import { AuditDb, REPORTABLE_UNIT_STATUSES, type AuditDbReader, type RunRecord } from "./db.ts";
 import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
@@ -22,6 +22,11 @@ import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
 import { renderFatal } from "./cliErrors.ts";
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+// The reportable-head SQL fragment (`'scanned', 'reused'`), derived from the db.ts constant so the
+// findings JOINs can never drift from the in-memory filter. Values are fixed enum literals (never
+// input), so interpolating them into the JOIN's IN(...) is injection-safe and passes read()'s guard.
+const REPORTABLE_HEAD_SQL = REPORTABLE_UNIT_STATUSES.map((s) => `'${s}'`).join(", ");
 
 interface DepRow {
   organization: string; repository: string; branch: string; commit_sha: string;
@@ -139,9 +144,14 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   const runId = run.runId;
   const tracked = JSON.stringify(run.trackedPackages);
 
-  // scanned snapshot heads for this run (skipped-cutoff carry commit_sha='' and no findings).
+  // The reportable ("scanned-slice") heads for this run: a freshly 'scanned' unit AND a 'reused'
+  // skip-as-current unit both carry a CURRENT, findings-bearing head, so both JOIN into the report;
+  // skipped-cutoff/policy-excluded/past-cap/error/deferred-* carry no reportable findings.
+  // REPORTABLE_UNIT_STATUSES (from db.ts) is the single source of truth shared by this in-memory filter
+  // and the SQL JOINs below. The full column set (incl. the policy columns) feeds the policy-disposition
+  // rendering (assertRunUnitHeadSound / isPolicyExcluded) unchanged.
   const heads = db.read(`SELECT organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date FROM run_unit_head WHERE run_id = ?`).all(runId) as HeadRow[];
-  const scannedHeads = heads.filter((h) => h.status === "scanned");
+  const scannedHeads = heads.filter((h) => (REPORTABLE_UNIT_STATUSES as readonly string[]).includes(h.status));
   const scannedKeys = new Set(scannedHeads.map((h) => unitKey(h.organization, h.repository, h.branch, h.commit_sha)));
   // Tri-state default-branch flag per scanned unit (§5.B): true/false from v3 runs, null for
   // pre-v3 rows — the renderer shows null as its own "(default branch unknown)" state.
@@ -155,14 +165,14 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   // findings joined through the immutable snapshot, filtered to tracked_packages.
   const depRows = (db.read(
     `SELECT df.* FROM dependency_findings df
-     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status='scanned'
+     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status IN (${REPORTABLE_HEAD_SQL})
        AND ruh.organization=df.organization AND ruh.repository=df.repository
        AND ruh.branch=df.branch AND ruh.commit_sha=df.commit_sha
      WHERE df.package_name IN (SELECT value FROM json_each(?))`,
   ).all(runId, tracked) as DepRow[]);
   const usageRows = (db.read(
     `SELECT uf.* FROM usage_findings uf
-     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status='scanned'
+     JOIN run_unit_head ruh ON ruh.run_id = ? AND ruh.status IN (${REPORTABLE_HEAD_SQL})
        AND ruh.organization=uf.organization AND ruh.repository=uf.repository
        AND ruh.branch=uf.branch AND ruh.commit_sha=uf.commit_sha
      WHERE uf.package_name IN (SELECT value FROM json_each(?))`,

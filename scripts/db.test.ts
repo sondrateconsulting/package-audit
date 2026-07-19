@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, rmSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, assertOwnedDatabase, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, migrateV3toV4, normalizeCheck, nowIso, tableShapesAt, type RunInput, type RunUnitHeadInput, extractChecks } from "./db.ts";
+import { AuditDb, DbError, SCHEMA_VERSION, SURFACE_SCHEMA_VERSION, assertOwnedDatabase, initWritableConnection, isOwnedOrEmpty, mapReadOnlyOpenError, migrateV3toV4, migrateV4toV5, normalizeCheck, nowIso, tableShapesAt, type RunInput, type RunUnitHeadInput, extractChecks } from "./db.ts";
 import { buildReport } from "./report.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import { parseEvents } from "./testEvents.test.ts";
@@ -984,6 +984,31 @@ describe("ownership — every database this tool legitimately produces still ope
     `ALTER TABLE run_unit_head__era RENAME TO run_unit_head`,
     `CREATE INDEX IF NOT EXISTS ix_ruh_loc ON run_unit_head(organization, repository, branch, commit_sha)`,
   ];
+  // The v4-era body (branch policy, pre-resilience CHECK). Regressing a v5 run_unit_head to this shape
+  // is the v4 damage class the self-heal must rebuild to v5. Copies the SAME 10 columns (v4/v5 share the
+  // column tuple) into the narrower 4-disposition CHECK.
+  const RUH_V4_ERA_REBUILD: readonly string[] = [
+    `CREATE TABLE run_unit_head__era (
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      organization TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL,
+      commit_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'scanned'
+        CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap')),
+      is_default_branch INTEGER,
+      policy_status TEXT
+        CHECK (policy_status IS NULL OR policy_status IN ('excluded-by-deny','excluded-by-allow')),
+      policy_matched_pattern TEXT,
+      scanned_commit_date TEXT,
+      CHECK (policy_status <> 'excluded-by-deny' OR policy_matched_pattern IS NOT NULL),
+      CHECK (status <> 'policy-excluded' OR policy_status IS NOT NULL),
+      CHECK (status NOT IN ('skipped-cutoff','past-cap') OR policy_status IS NULL),
+      PRIMARY KEY (run_id, organization, repository, branch))`,
+    `INSERT INTO run_unit_head__era (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date)
+       SELECT run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date FROM run_unit_head`,
+    `DROP TABLE run_unit_head`,
+    `ALTER TABLE run_unit_head__era RENAME TO run_unit_head`,
+    `CREATE INDEX IF NOT EXISTS ix_ruh_loc ON run_unit_head(organization, repository, branch, commit_sha)`,
+  ];
 
   test("a current-stamped database missing a table AND carrying a v2-era run_unit_head heals on one open (mixed-era shapes)", () => {
     // Externally damaged twice over: `errors` dropped AND run_unit_head regressed to its TRUE v2
@@ -1010,7 +1035,7 @@ describe("ownership — every database this tool legitimately produces still ope
     // arbitration exists to prevent. The SPECIFIC policy-columns message is asserted (not the
     // generic repair phrasing): this fixture is also missing `errors`, whose missing-TABLE advice
     // matches the generic phrasing too, and would mask the exact-v2 disjunct being dropped.
-    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/missing the v4 policy columns/);
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/older shape than this tool's v5/);
 
     const db = AuditDb.open({ sqlitePath: path });
     try {
@@ -1035,6 +1060,7 @@ describe("ownership — every database this tool legitimately produces still ope
     const DOWN_TRANSFORMS: Record<number, readonly string[]> = {
       2: [...RUH_V3_ERA_REBUILD, "ALTER TABLE run_unit_head DROP COLUMN is_default_branch"],
       3: RUH_V3_ERA_REBUILD,
+      4: RUH_V4_ERA_REBUILD,
     };
     for (let v = 2; v < SCHEMA_VERSION; v++) expect(DOWN_TRANSFORMS[v]?.length ?? 0).toBeGreaterThan(0);
 
@@ -1042,21 +1068,27 @@ describe("ownership — every database this tool legitimately produces still ope
     // production fingerprint surface (columns + rowid/STRICT + FKs + PK/UNIQUE indexes +
     // AUTOINCREMENT) — a heal that restored columns but lost a constraint would otherwise
     // pass here and strand the database as matching no era on its NEXT open.
-    const shapeOf = (d: Database, t: string): string =>
-      JSON.stringify({
+    const shapeOf = (d: Database, t: string): string => {
+      const tableSql = (d.query("SELECT sql FROM sqlite_master WHERE type='table' AND name = ?").get(t) as { sql: string | null } | null)?.sql ?? "";
+      return JSON.stringify({
         cols: d.query(`PRAGMA table_xinfo(${t})`).all(),
         meta: d.query("SELECT wr, strict FROM pragma_table_list WHERE schema='main' AND name = ?").get(t),
         fks: d.query(`PRAGMA foreign_key_list(${t})`).all(),
         idx: (d.query(`PRAGMA index_list(${t})`).all() as Array<{ name: string; origin: string }>)
           .filter((i) => i.origin !== "c")
           .map((i) => ({ i, cols: d.query(`PRAGMA index_xinfo(${JSON.stringify(i.name)})`).all() })),
+        // CHECK bodies too — a v4↔v5 run_unit_head regression differs ONLY in the status CHECK (the
+        // column tuple is identical), so without this the v4 downgrade would be invisible here and the
+        // era's healability would go untested. Mirrors production tableShape's CHECK fingerprint.
+        checks: extractChecks(tableSql).map(normalizeCheck).sort(),
         autoinc: /\bautoincrement\b/i.test(
-          ((d.query("SELECT sql FROM sqlite_master WHERE type='table' AND name = ?").get(t) as { sql: string | null } | null)?.sql ?? "")
+          tableSql
             .replace(/\/\*[\s\S]*?\*\//g, " ")
             .replace(/'(?:[^']|'')*'/g, "''")
             .replace(/"(?:[^"]|"")*"/g, '""'),
         ),
       });
+    };
     const refPath = nextFile();
     AuditDb.open({ sqlitePath: refPath }).close();
     const refDb = new Database(refPath, { readonly: true, strict: true });
@@ -1088,8 +1120,10 @@ describe("ownership — every database this tool legitimately produces still ope
       // refabricated); the v2 transform additionally loses is_default_branch, while the v3 era
       // KEEPS it (its body carries the column, so the heal must preserve the stored 1).
       expect((healed.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n).toBe(1);
+      // The v2/v3 era bodies lack scanned_commit_date, so the downgrade LOSES it (heal re-adds NULL); the
+      // v4 body CARRIES it, so the v4 downgrade PRESERVES the seeded date verbatim through to the heal.
       expect(healed.query("SELECT branch, commit_sha, is_default_branch, scanned_commit_date FROM run_unit_head").all())
-        .toEqual([{ branch: "main", commit_sha: "s", is_default_branch: v >= 3 ? 1 : null, scanned_commit_date: null }]);
+        .toEqual([{ branch: "main", commit_sha: "s", is_default_branch: v >= 3 ? 1 : null, scanned_commit_date: v >= 4 ? "2025-06-01T12:00:00Z" : null }]);
       healed.close();
     }
   });
@@ -1866,7 +1900,8 @@ describe("run lifecycle — startup rules (§3)", () => {
     const db = mem();
     expect(db.latestReportableRun()).toBeNull();
     const a = db.startRun(runInput()).runId;
-    db.completeRun(a);
+    // T5: only a FINALIZED run is reportable — a bare completeRun (outcome NULL) never wins.
+    db.finalizeRun(a, "complete");
     // an empty-tracked (pre-migration-shaped) completed run must never win
     raw(db)
       .query(
@@ -2534,7 +2569,7 @@ function buildV2Db(path: string): void {
   // Explicit NONCONTIGUOUS ids everywhere an id exists: a faulty rebuild that renumbers rows
   // would otherwise survive projection equality (and the id-dependent tie-breaks with it).
   raw.exec(`INSERT INTO work_queue (id, config_hash, created_run_id, last_run_id, scope, organization, repository, branch, last_commit_sha, last_commit_date, status, error_message, updated_at)
-    VALUES (7, 'h-v2', 'v2-run', 'v2-run', 'branch', 'org-a', 'repo', 'main', 'sha1', '2026-01-01T00:00:00.000Z', 'done', NULL, '2026-01-01T00:30:00.000Z')`);
+    VALUES (7, 'h-v2', 'v2-run', 'v2-run', 'branch', 'org-a', 'repo', 'main', 'sha1', '2026-01-01T00:00:00.000Z', 'done', NULL, '2026-01-01T00:30:00Z')`);
   raw.exec(`INSERT INTO dependency_findings (id, run_id, organization, repository, branch, commit_sha, date_fetched,
     package_name, dependency_key, dependency_type, manifest_path, manifest_line, manifest_permalink,
     declared_version, lockfile_path, lockfile_kind, lockfile_lines, lockfile_permalink, resolved_version, resolved_version_source)
@@ -2694,6 +2729,364 @@ describe("migration — v2 → v3 (version-stepped, CRITICAL round-trip)", () =>
     } finally {
       db.close();
     }
+  });
+});
+
+// ---- T5 durable coverage model (§3.1) — migration + lifecycle -------------------------------
+// A genuine v3 database: the immutable v2 schema + the v3 is_default_branch ALTER, stamped at
+// user_version=3 so AuditDb.open runs the REAL migration chain (v3→v4→v5) — the rebuilds + backfill,
+// not the current-version self-heal branch.
+function buildRealV3Db(path: string): void {
+  const raw = new Database(path, { create: true, strict: true });
+  raw.exec(V2_SCHEMA_SQL);
+  raw.exec("ALTER TABLE run_unit_head ADD COLUMN is_default_branch INTEGER");
+  raw.exec(`INSERT INTO runs VALUES
+    ('v3-done',    '2026-01-01T00:00:00.000Z', '2026-01-01T01:00:00.000Z', 'h-v3', '["org-a"]', 'configured', '["expo"]', '2024-01-01', 'github.com', 'completed'),
+    ('v3-failed',  '2026-01-02T00:00:00.000Z', NULL,                       'h-v3', '["org-a"]', 'configured', '["expo"]', '2024-01-01', 'github.com', 'failed'),
+    ('v3-running', '2026-01-03T00:00:00.000Z', NULL,                       'h-v3', '["org-a"]', 'configured', '["expo"]', '2024-01-01', 'github.com', 'running')`);
+  // A scanned head and a skipped-cutoff head (commit_sha='') — the rebuilds must copy both verbatim.
+  raw.exec(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch) VALUES
+    ('v3-done', 'org-a', 'repo', 'main',  'sha1', 'scanned',        1),
+    ('v3-done', 'org-a', 'repo', 'stale', '',     'skipped-cutoff', 0)`);
+  raw.exec("PRAGMA user_version = 3");
+  raw.close();
+}
+
+// A genuine v4 database (branch-policy era), stamped at user_version=4 so AuditDb.open runs ONLY the
+// migrateV4toV5 step. Built by driving the exported migrateV3toV4 over a v3 fixture (its own tests
+// pin that step), then adding a v4-native policy-excluded head so the v4→v5 rebuild's preservation of
+// the policy columns is exercised.
+function buildRealV4Db(path: string): void {
+  buildRealV3Db(path);
+  const raw = new Database(path, { strict: true });
+  raw.exec("PRAGMA foreign_keys = ON;");
+  migrateV3toV4(raw); // v3 → v4: rebuild run_unit_head to the policy body, stamp 4
+  raw.exec(`INSERT INTO run_unit_head
+      (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date)
+    VALUES ('v3-done', 'org-a', 'repo', 'wip', '', 'policy-excluded', 0, 'excluded-by-deny', 'wip*', '2026-01-01T00:30:00Z')`);
+  raw.close();
+}
+
+describe("migration to v5 (T5 durable coverage, CRITICAL)", () => {
+  test("a v3 database opens under v5 via the chain: stamped 5, run_unit_head widened, runs backfilled", () => {
+    const path = nextFile();
+    buildRealV3Db(path);
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      const r = raw(db);
+      expect(SCHEMA_VERSION).toBe(5);
+      expect((r.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+      // run_unit_head rows preserved verbatim through BOTH rebuilds (commit_sha, status, tri-state flag);
+      // the v4 policy columns arrive NULL (v3 predates them).
+      const heads = r
+        .query("SELECT run_id, branch, commit_sha, status, is_default_branch, policy_status FROM run_unit_head ORDER BY branch")
+        .all();
+      expect(heads).toEqual([
+        { run_id: "v3-done", branch: "main", commit_sha: "sha1", status: "scanned", is_default_branch: 1, policy_status: null },
+        { run_id: "v3-done", branch: "stale", commit_sha: "", status: "skipped-cutoff", is_default_branch: 0, policy_status: null },
+      ]);
+      // The v5 CHECK now accepts a deferred-* disposition (rejected under the v3 CHECK).
+      expect(() =>
+        db.upsertRunUnitHead({ runId: "v3-running", organization: "o", repository: "r", branch: "b", commitSha: "s9", status: "deferred-throttle", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2026-01-03T00:30:00Z" }),
+      ).not.toThrow();
+      // §3.1f legacy backfill: completed→legacy-unknown, failed→legacy-failed, running→failed (the
+      // migration-boundary rule fails it, then the backfill stamps it legacy-failed).
+      expect(db.getRun("v3-done")?.outcome).toBe("legacy-unknown");
+      expect(db.getRun("v3-failed")?.outcome).toBe("legacy-failed");
+      expect(db.getRun("v3-running")?.status).toBe("failed");
+      expect(db.getRun("v3-running")?.outcome).toBe("legacy-failed");
+      // coverage_complete is unknowable for migrated rows → NULL; the counters default to 0.
+      const done = db.getRun("v3-done")!;
+      expect(done.coverageComplete).toBeNull();
+      expect(done.discoveryFailures).toBe(0);
+      expect(done.discoveryDeferrals).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("a v4 database opens under v5: only migrateV4toV5 runs; policy columns ride through the rebuild", () => {
+    const path = nextFile();
+    buildRealV4Db(path);
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      const r = raw(db);
+      expect((r.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(5);
+      // The v4-native policy-excluded head survives the v4→v5 rebuild with its policy columns intact.
+      const wip = r
+        .query("SELECT commit_sha, status, policy_status, policy_matched_pattern FROM run_unit_head WHERE branch='wip'")
+        .get() as { commit_sha: string; status: string; policy_status: string; policy_matched_pattern: string };
+      expect(wip).toEqual({ commit_sha: "", status: "policy-excluded", policy_status: "excluded-by-deny", policy_matched_pattern: "wip*" });
+      // v5 dispositions now accepted.
+      expect(() =>
+        db.upsertRunUnitHead({ runId: "v3-done", organization: "o", repository: "r", branch: "def", commitSha: "s5", status: "deferred-service", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2026-01-01T00:45:00Z" }),
+      ).not.toThrow();
+      // Legacy backfill applied at the v4→v5 boundary too.
+      expect(db.getRun("v3-done")?.outcome).toBe("legacy-unknown");
+      expect(db.getRun("v3-failed")?.outcome).toBe("legacy-failed");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("a migrated legacy-unknown run IS latest-reportable (the estate was covered under old code)", () => {
+    const path = nextFile();
+    buildRealV3Db(path);
+    const db = AuditDb.open({ sqlitePath: path });
+    try {
+      expect(db.latestReportableRun()?.runId).toBe("v3-done");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("idempotent: a second open is a clean no-op (rows intact, still v5, no re-backfill)", () => {
+    const path = nextFile();
+    buildRealV3Db(path);
+    AuditDb.open({ sqlitePath: path }).close(); // first: the real v3→v4→v5 migration chain
+    const db = AuditDb.open({ sqlitePath: path }); // second: current-version self-heal only
+    try {
+      const r = raw(db);
+      expect((r.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+      expect((r.query("SELECT COUNT(*) AS n FROM run_unit_head").get() as { n: number }).n).toBe(2);
+      expect(db.getRun("v3-done")?.outcome).toBe("legacy-unknown");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("--fresh on a v3 database migrates cleanly through to v5", () => {
+    const path = nextFile();
+    buildRealV3Db(path);
+    let db!: AuditDb;
+    captureStdout(() => {
+      db = AuditDb.open({ sqlitePath: path, fresh: true }); // swallows the drop-warning JSONL line
+    });
+    try {
+      const r = raw(db);
+      expect((r.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+      expect(db.getRun("v3-done")).toBeNull(); // run-scoped data dropped, as --fresh promises
+      // v5 shape present: a deferred-* head inserts without tripping the CHECK.
+      const id = db.startRun(runInput()).runId;
+      expect(() =>
+        db.upsertRunUnitHead({ runId: id, organization: "o", repository: "r", branch: "b", commitSha: "s", status: "deferred-service", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2026-01-03T00:30:00Z" }),
+      ).not.toThrow();
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("upsertRunUnitHead — commit-aware precedence (§3.1a)", () => {
+  const base = { runId: "r1", organization: "o", repository: "r", branch: "b" };
+  // The T5 coverage tests predate branch policy — inject the null-policy defaults + a real date so
+  // every scan-attempt row satisfies the write invariants. `commitSha`/`status`/`isDefaultBranch` are
+  // per-call.
+  const up = (db: AuditDb, o: { commitSha: string; status: string; isDefaultBranch: boolean | null }) =>
+    db.upsertRunUnitHead({ ...base, commitSha: o.commitSha, status: o.status as never, isDefaultBranch: o.isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+  const head = (db: AuditDb) =>
+    raw(db)
+      .query("SELECT commit_sha, status, is_default_branch AS d FROM run_unit_head WHERE run_id='r1'")
+      .get() as { commit_sha: string; status: string; d: unknown };
+  const seeded = (): AuditDb => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    return db;
+  };
+
+  test("same commit: a higher-rank disposition upgrades; a lower-rank one never downgrades", () => {
+    const db = seeded();
+    up(db, { commitSha: "c1", status: "reused", isDefaultBranch: null });
+    up(db, { commitSha: "c1", status: "scanned", isDefaultBranch: null }); // reused→scanned upgrade
+    expect(head(db).status).toBe("scanned");
+    up(db, { commitSha: "c1", status: "error", isDefaultBranch: null }); // must NOT downgrade
+    expect(head(db).status).toBe("scanned");
+    up(db, { commitSha: "c1", status: "deferred-network", isDefaultBranch: null }); // must NOT downgrade
+    expect(head(db).status).toBe("scanned");
+    db.close();
+  });
+
+  test("differing observed commit REPLACES disposition+commit regardless of rank (advanced then failed)", () => {
+    const db = seeded();
+    up(db, { commitSha: "cOLD", status: "scanned", isDefaultBranch: null });
+    up(db, { commitSha: "cNEW", status: "error", isDefaultBranch: null });
+    const h = head(db);
+    expect(h.commit_sha).toBe("cNEW");
+    expect(h.status).toBe("error"); // newer observed head wins even though error < scanned
+    db.close();
+  });
+
+  test("skipped-cutoff (commit_sha='') then a real scan of the same branch: differing commit → scan wins", () => {
+    const db = seeded();
+    up(db, { commitSha: "", status: "skipped-cutoff", isDefaultBranch: null });
+    up(db, { commitSha: "c1", status: "scanned", isDefaultBranch: null });
+    const h = head(db);
+    expect(h.commit_sha).toBe("c1");
+    expect(h.status).toBe("scanned");
+    db.close();
+  });
+
+  test("same-commit deferred↔deferred tie: the latest observation wins", () => {
+    const db = seeded();
+    up(db, { commitSha: "c1", status: "deferred-throttle", isDefaultBranch: null });
+    up(db, { commitSha: "c1", status: "deferred-network", isDefaultBranch: null });
+    expect(head(db).status).toBe("deferred-network");
+    db.close();
+  });
+
+  test("is_default_branch updates INDEPENDENTLY of the disposition precedence gate", () => {
+    const db = seeded();
+    up(db, { commitSha: "c1", status: "scanned", isDefaultBranch: false });
+    // a later same-commit, lower-rank upsert must NOT change status, but MUST refresh is_default_branch.
+    up(db, { commitSha: "c1", status: "error", isDefaultBranch: true });
+    const h = head(db);
+    expect(h.status).toBe("scanned"); // disposition preserved
+    expect(h.d).toBe(1); // is_default_branch refreshed to true
+    db.close();
+  });
+});
+
+describe("finalizeRun — floor derivation + precedence + guard (§3.1b)", () => {
+  const scan = (db: AuditDb, id: string, status: string) =>
+    db.upsertRunUnitHead({ runId: id, organization: "o", repository: "r", branch: "b", commitSha: "c", status: status as never, isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+
+  test("clean run: 'complete' with full coverage and no deferred units → complete + completed_at", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    scan(db, id, "scanned");
+    expect(db.finalizeRun(id, "complete")).toBe("complete");
+    const run = db.getRun(id)!;
+    expect(run.status).toBe("completed");
+    expect(run.outcome).toBe("complete");
+    expect(run.completedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    db.close();
+  });
+
+  test("a deferred unit floors an optimistic 'complete' to 'partial-deferred'", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    scan(db, id, "deferred-throttle");
+    expect(db.finalizeRun(id, "complete")).toBe("partial-deferred");
+    expect(db.getRun(id)?.outcome).toBe("partial-deferred");
+    db.close();
+  });
+
+  test("a discovery failure floors 'complete' to 'partial-deferred' with no deferred unit rows present", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    db.recordDiscoveryFailure(id);
+    expect(db.finalizeRun(id, "complete")).toBe("partial-deferred");
+    db.close();
+  });
+
+  test("permanent 'error' unit rows alone do NOT force partial (a 404 repo is covered)", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    scan(db, id, "error");
+    expect(db.finalizeRun(id, "complete")).toBe("complete");
+    db.close();
+  });
+
+  test("precedence-max: a more-severe REQUESTED outcome wins over the floor", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    scan(db, id, "deferred-throttle"); // floor = partial-deferred (rank 1)
+    expect(db.finalizeRun(id, "partial-budget")).toBe("partial-budget"); // requested rank 3 wins
+    db.close();
+  });
+
+  test("fatal ⇒ status='failed', completed_at STAMPED (handled end), and the run is not reportable", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    expect(db.finalizeRun(id, "fatal")).toBe("fatal");
+    const run = db.getRun(id)!;
+    expect(run.status).toBe("failed");
+    expect(run.outcome).toBe("fatal");
+    expect(run.completedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(db.latestReportableRun()).toBeNull();
+    db.close();
+  });
+
+  test("finalizeRun REJECTS a backfill-only outcome (defence behind the compile-time narrowing)", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    expect(() => db.finalizeRun(id, "legacy-unknown" as never)).toThrow(/backfill-only outcome/);
+    expect(() => db.finalizeRun(id, "legacy-failed" as never)).toThrow(/backfill-only outcome/);
+    expect(db.getRun(id)?.status).toBe("running");
+    expect(db.getRun(id)?.outcome).toBeNull();
+    db.close();
+  });
+
+  test("GUARD: finalizeRun only stamps a running, unfinalized run — it never re-finalizes", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    expect(db.finalizeRun(id, "complete")).toBe("complete");
+    expect(db.finalizeRun(id, "fatal")).toBeNull(); // second call is a no-op
+    expect(db.getRun(id)?.outcome).toBe("complete");
+    db.close();
+  });
+
+  test("GUARD: a still-running run that already carries an outcome is left untouched (defense in depth)", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    raw(db).query("UPDATE runs SET outcome='partial-deferred' WHERE run_id = ?").run(id);
+    expect(db.finalizeRun(id, "complete")).toBeNull();
+    const run = db.getRun(id)!;
+    expect(run.status).toBe("running");
+    expect(run.outcome).toBe("partial-deferred");
+    db.close();
+  });
+
+  test("GUARD: a crash-failed run (status='failed', outcome NULL) is never finalized", () => {
+    const db = mem();
+    rawRun(db, "crashed", "failed");
+    expect(db.finalizeRun("crashed", "complete")).toBeNull();
+    expect(db.getRun("crashed")?.outcome).toBeNull();
+    db.close();
+  });
+
+  test("a finalized partial-* run is NOT latest-reportable", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    db.recordDiscoveryDeferral(id);
+    db.finalizeRun(id, "complete"); // floored to partial-deferred
+    expect(db.latestReportableRun()).toBeNull();
+    db.close();
+  });
+});
+
+describe("discovery coverage setters (§3.1b)", () => {
+  test("a new run starts optimistically complete (coverage_complete=1, counters 0)", () => {
+    const db = mem();
+    const run = db.getRun(db.startRun(runInput()).runId)!;
+    expect(run.coverageComplete).toBe(true);
+    expect(run.discoveryFailures).toBe(0);
+    expect(run.discoveryDeferrals).toBe(0);
+    db.close();
+  });
+
+  test("recordDiscoveryFailure/Deferral atomically flip coverage_complete=0 and bump the cause counter", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    db.recordDiscoveryFailure(id);
+    db.recordDiscoveryFailure(id);
+    db.recordDiscoveryDeferral(id);
+    const run = db.getRun(id)!;
+    expect(run.coverageComplete).toBe(false);
+    expect(run.discoveryFailures).toBe(2);
+    expect(run.discoveryDeferrals).toBe(1);
+    db.close();
+  });
+
+  test("markCoverageIncomplete flips coverage without touching either discovery counter", () => {
+    const db = mem();
+    const id = db.startRun(runInput()).runId;
+    db.markCoverageIncomplete(id);
+    const run = db.getRun(id)!;
+    expect(run.coverageComplete).toBe(false);
+    expect(run.discoveryFailures).toBe(0);
+    expect(run.discoveryDeferrals).toBe(0);
+    db.close();
   });
 });
 
@@ -2934,8 +3327,8 @@ describe("upsertRunUnitHead — branch allow/deny (§3 mapping, write-boundary g
 
   test("G7: a KNOWN default branch may not be non-scanned (the default is always scanned)", () => {
     const db = fresh();
-    expect(() => seed(db, { status: "skipped-cutoff", commitSha: "", isDefaultBranch: true })).toThrow(/default branch is always scanned/);
-    expect(() => seed(db, { status: "past-cap", commitSha: "", isDefaultBranch: true })).toThrow(/default branch is always scanned/);
+    expect(() => seed(db, { status: "skipped-cutoff", commitSha: "", isDefaultBranch: true })).toThrow(/default branch is always scan-attempted/);
+    expect(() => seed(db, { status: "past-cap", commitSha: "", isDefaultBranch: true })).toThrow(/default branch is always scan-attempted/);
     db.close();
   });
 
@@ -3141,7 +3534,7 @@ describe("openReadOnly (read seam)", () => {
     const db = AuditDb.open({ sqlitePath: path });
     const { runId } = db.startRun(runInput());
     db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
-    db.completeRun(runId);
+    db.finalizeRun(runId, "complete"); // T5: reportable only once finalized (outcome='complete')
     db.close();
     return runId;
   }
@@ -3377,16 +3770,18 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     (db.query(`PRAGMA table_info(${t})`).all() as Array<{ name: string }>).map((c) => c.name);
   const uv = (db: Database): number => (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
 
-  test("fresh-create is exactly ours-v4: 10 cols, status admits {scanned,skipped-cutoff,policy-excluded,past-cap}, policy CHECKs enforced", () => {
+  test("fresh-create is exactly ours-v5: 10 cols, status admits the 9 v5 dispositions, policy CHECKs enforced", () => {
     const path = nextFile();
     const db = AuditDb.open({ sqlitePath: path });
     const r = raw(db);
-    expect(cols(r, "run_unit_head")).toEqual(RUH_V4_COLS);
+    expect(cols(r, "run_unit_head")).toEqual(RUH_V4_COLS); // v5 shares the v4 column tuple; the CHECK differs
     expect(uv(r)).toBe(SCHEMA_VERSION);
     const { runId } = db.startRun(runInput());
-    // past-cap accepted; a foreign status ('reused', a sibling value) rejected.
+    // v5 dispositions accepted (past-cap, reused, deferred-*); a truly foreign status rejected.
     expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status) VALUES ('${runId}','o','r','b1','past-cap')`)).not.toThrow();
-    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status) VALUES ('${runId}','o','r','b2','reused')`)).toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status) VALUES ('${runId}','o','r','b2','reused')`)).not.toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status) VALUES ('${runId}','o','r','b2b','deferred-network')`)).not.toThrow();
+    expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status) VALUES ('${runId}','o','r','b2c','sibling-value')`)).toThrow();
     // deny requires a matched pattern; a foreign policy_status rejected; a valid deny+pattern OK.
     expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status) VALUES ('${runId}','o','r','b3','policy-excluded','excluded-by-deny')`)).toThrow();
     expect(() => r.exec(`INSERT INTO run_unit_head (run_id,organization,repository,branch,status,policy_status,policy_matched_pattern) VALUES ('${runId}','o','r','b4','policy-excluded','excluded-by-deny','dep*')`)).not.toThrow();
@@ -3428,25 +3823,10 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     reader.close();
   });
 
-  test("an incompatible sibling v4 (runs.outcome) is rejected by open / --fresh / --fresh+purge / read-only — data preserved", () => {
-    const path = nextFile();
-    buildNativeV4(path);
-    const forge = new Database(path, { strict: true });
-    forge.exec("ALTER TABLE runs ADD COLUMN outcome TEXT"); // a DIFFERENT v4 (sibling branch), still stamped 4
-    forge.close();
-    // The extra runs column fails shape-level ownership on the READ-ONLY preflight ("did not
-    // create", nothing mutated) — the classifier's runs.outcome discriminator remains the layered
-    // in-gate + in-migration backstop for the same marker (pinned direct-drive elsewhere).
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
-    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/did not create|incompatible/);
-    expect(() => AuditDb.open({ sqlitePath: path, fresh: true, purgeCache: true })).toThrow(/did not create|incompatible/);
-    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/did not create|incompatible with this tool build/);
-    // NOTHING destroyed — the --fresh drops never ran (the gate rejects first).
-    const check = new Database(path, { readonly: true });
-    expect((check.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n).toBe(1);
-    expect(cols(check, "runs")).toContain("outcome");
-    check.close();
-  });
+  // (Removed: the pre-T5 "sibling v4 = runs.outcome is foreign" rejection test. At v5 runs.outcome is
+  // OUR coverage column, so the discriminator is gone by design; a genuine foreign/sibling database is
+  // still refused by run_unit_head SHAPE — see the classifier-seam cases and the foreign-file ownership
+  // tests — and buildNativeV4 now produces a v5 database that already carries the column.)
 
   test("a v4 stamp on a v3-shaped run_unit_head is HEALED by the writer open — rows ride through; the read path advises the repair", () => {
     // The chain itself cannot produce this state (each step stamps atomically with its reshape),
@@ -3740,11 +4120,13 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     { name: "duplicated v3 CHECK (v3-columns arm)", base: buildV3TwinDb,
       mutate: (s) => s.replace("CHECK (status IN ('scanned','skipped-cutoff'))", "CHECK (status IN ('scanned','skipped-cutoff')) CHECK (status IN ('scanned','skipped-cutoff'))"),
       reason: /not the exact v3 CHECK set/ },
-    { name: "duplicated v4 CHECK (v4-columns arm, physically-v4 under stamp 3)", base: (p) => buildNativeV4(p),
+    { name: "duplicated v5 CHECK (v4/v5-columns arm, physically-v5 under stamp 3)", base: (p) => buildNativeV4(p),
+      // Duplicate the v5 status CHECK VERBATIM — the doubled CHECK makes the multiset differ from the
+      // exact v5 set (extractChecks counts it twice) while still admitting the existing rows' statuses.
       mutate: (s) => s.replace(
-        "CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap'))",
-        "CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap')) CHECK (status IN ('scanned','skipped-cutoff','policy-excluded','past-cap'))"),
-      reason: /not the exact v4 CHECK set/ },
+        "CHECK (status IN ('scanned','reused','skipped-cutoff','policy-excluded','past-cap','deferred-throttle','deferred-network','deferred-service','error'))",
+        "CHECK (status IN ('scanned','reused','skipped-cutoff','policy-excluded','past-cap','deferred-throttle','deferred-network','deferred-service','error')) CHECK (status IN ('scanned','reused','skipped-cutoff','policy-excluded','past-cap','deferred-throttle','deferred-network','deferred-service','error'))"),
+      reason: /neither the exact v4 nor v5 CHECK set/ },
   ];
   for (const c of CLASSIFIER_SEAM_CASES) {
     test(`classifier names its OWN reason via migrateV3toV4 (ownership preflight shadows it at AuditDb.open): ${c.name}`, () => {
@@ -3840,18 +4222,9 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
   });
 
-  test("case-insensitive gate: a runs.OUTCOME (uppercase) sibling column is still detected and rejected", () => {
-    const path = nextFile();
-    buildNativeV4(path);
-    const f = new Database(path, { strict: true });
-    f.exec("ALTER TABLE runs ADD COLUMN OUTCOME TEXT"); // uppercase — SQLite resolves names case-insensitively
-    f.close();
-    // The extra runs column now also fails shape-level ownership on the preflight ("did not
-    // create"); the classifier's case-insensitive outcome discriminator remains the layered
-    // in-gate backstop for the same state (pinned direct-drive below).
-    expect(() => AuditDb.open({ sqlitePath: path })).toThrow(/did not create|incompatible/);
-    expect(() => AuditDb.open({ sqlitePath: path, fresh: true })).toThrow(/did not create|incompatible/);
-  });
+  // (Removed: the pre-T5 case-insensitive runs.OUTCOME sibling-rejection test — same rationale as the
+  // "incompatible sibling v4 (runs.outcome)" removal above. runs.outcome is OUR v5 column now, and
+  // buildNativeV4 produces a v5 database that already carries it.)
 
   // Rebuild ONE audit table with a mutated CREATE (columns preserved, rows copied) inside an
   // otherwise-native file — the whole-DB sibling construction: identical to ours except where the
@@ -4343,7 +4716,7 @@ describe("live compat backstop — states the base-image preflight cannot see", 
     // preflight's zero-handle guarantee is driven directly: assertOwnedDatabase itself must throw.
     const path = nextFile();
     const raw = new Database(path, { create: true, strict: true });
-    raw.exec("PRAGMA user_version = 5"); // zero objects, stamp newer than SCHEMA_VERSION (4)
+    raw.exec("PRAGMA user_version = 6"); // zero objects, stamp newer than SCHEMA_VERSION (5)
     raw.close();
     expect(() => assertOwnedDatabase(path)).toThrow(/newer than this tool's/);
     // …while an empty file at the CURRENT stamp stays adoptable — the exact on-disk state a

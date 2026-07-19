@@ -44,7 +44,7 @@ function seed(db: AuditDb) {
     { exportName: "AppConfig", exportKind: "type", source: "index.d.ts" },
     { exportName: "expo", exportKind: "cli-bin", source: "package.json#bin" },
   ] });
-  db.completeRun(runId);
+  db.finalizeRun(runId, "complete"); // T5: reportable only once finalized (full coverage → 'complete')
   return db.getRun(runId)!;
 }
 
@@ -332,7 +332,7 @@ describe("buildReport (§7)", () => {
       forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'policy-excluded', 0, 'excluded-by-deny', 'rel*', NULL)`).run(runId);
       forge.close();
       const db2 = AuditDb.open({ sqlitePath });
-      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/cannot be a migrated row/);
+      expect(() => buildReport(db2, db2.getRun(runId)!)).toThrow(/may be a migrated row/);
       // Round-5's shape: the policy COLUMNS are v4-only too — a scanned default override with NULL
       // provenance is equally impossible and must not slip a status-only version of the rule.
       const forge2 = new Database(sqlitePath, { strict: true });
@@ -340,7 +340,7 @@ describe("buildReport (§7)", () => {
       forge2.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'main', 'abc', 'scanned', 1, 'excluded-by-deny', 'rel*', NULL)`).run(runId);
       forge2.close();
       const db3 = AuditDb.open({ sqlitePath });
-      expect(() => buildReport(db3, db3.getRun(runId)!)).toThrow(/carrying policy_status.*cannot be a migrated row/);
+      expect(() => buildReport(db3, db3.getRun(runId)!)).toThrow(/carrying policy_status.*may be a migrated row/);
       db3.close();
       db2.close();
     } finally {
@@ -410,8 +410,8 @@ describe("buildReport (§7)", () => {
       // A status outside the four belongs to NO bucket, so the counts silently stop summing — this is
       // also exactly how a future 'error' disposition would arrive.
       "an UNKNOWN status with no policy — it would land in no disposition bucket at all",
-      `'', 'reused', 0, NULL, NULL`,
-      /status="reused", outside the four known dispositions/,
+      `'', 'bogus-status', 0, NULL, NULL`,
+      /status="bogus-status", outside the known dispositions/,
     ],
     [
       "a SCANNED policy row that is not the default is schema-VALID (scanned may carry a counterfactual) but must not be guessed into an override",
@@ -426,9 +426,9 @@ describe("buildReport (§7)", () => {
       /is scanned but has commit_sha=''/,
     ],
     [
-      "a NON-scanned row carrying a commit_sha — only a scanned row pins a commit",
+      "a NON-scanned row carrying a commit_sha — only a scan-attempt row pins a commit",
       `'abc123', 'skipped-cutoff', 0, NULL, NULL`,
-      /only a scanned row pins a commit/,
+      /only a scan-attempt row pins a commit/,
     ],
     [
       // The SQL deny CHECK is IS NOT NULL, so '' satisfies it — schema-valid.
@@ -982,6 +982,47 @@ describe("buildReport — run-scope head-join discrimination (M7)", () => {
     // dependency_findings join (a df.run_id regression drops this)
     const versions = expo?.usageByRepo.flatMap((u) => u.declarations.map((d) => d.resolvedVersion)) ?? [];
     expect(versions).toContain("50.0.9");
+    db.close();
+  });
+
+  test("a 'reused' (skip-as-current) head contributes findings; a skipped-cutoff head does not (§3.1a scanned-slice)", () => {
+    // T5: the report's reportable slice is REPORTABLE_UNIT_STATUSES = ('scanned','reused'). A reused
+    // unit carries a CURRENT head — its same-commit findings are still valid — so the widened IN()
+    // MUST join it. A skipped-cutoff unit carries no reportable findings and stays excluded. If the
+    // JOIN regresses to a bare status='scanned', the reused finding silently vanishes and this fails.
+    const db = mem();
+    const input = {
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered" as const,
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    };
+    const reused = { organization: "org-a", repository: "svc", branch: "main", commitSha: "reused1234567" };
+    const cutoff = { organization: "org-a", repository: "svc", branch: "stale", commitSha: "cutoff7654321" };
+    const { runId } = db.startRun(input);
+    db.upsertRunUnitHead({ runId, ...reused, status: "reused", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    // A discovery-time skipped-cutoff head carries commit_sha='' (§3.1a); its finding below is parked at
+    // the branch's real head commit and therefore joins no reportable head — excluded by BOTH the status
+    // filter and the commit partition, exactly as a real cutoff branch contributes nothing.
+    db.upsertRunUnitHead({ runId, ...cutoff, commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    db.upsertDependencyFinding({
+      runId, ...reused, dateFetched: nowIso(), packageName: "expo", dependencyKey: "expo",
+      dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 3,
+      manifestPermalink: "https://github.com/org-a/svc/blob/reused1234567/package.json#L3",
+      declaredVersion: "^50.0.0", resolvedVersion: "50.1.0", resolvedVersionSource: "lockfile",
+    });
+    db.upsertDependencyFinding({
+      runId, ...cutoff, dateFetched: nowIso(), packageName: "expo", dependencyKey: "expo",
+      dependencyType: "dependencies", manifestPath: "package.json", manifestLine: 9,
+      manifestPermalink: "https://github.com/org-a/svc/blob/cutoff7654321/package.json#L9",
+      declaredVersion: "^49.0.0", resolvedVersion: "49.9.9", resolvedVersionSource: "lockfile",
+    });
+    db.finalizeRun(runId, "complete");
+
+    const report = buildReport(db, db.getRun(runId)!);
+    expect(report.summary.branchesScanned).toBe(1); // reused counts in the slice; skipped-cutoff does not
+    const expo = report.packages.find((p) => p.name === "expo");
+    const versions = expo?.usageByRepo.flatMap((u) => u.declarations.map((d) => d.resolvedVersion)) ?? [];
+    expect(versions).toContain("50.1.0"); // reused head joined
+    expect(versions).not.toContain("49.9.9"); // skipped-cutoff head excluded
     db.close();
   });
 });

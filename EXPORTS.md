@@ -238,11 +238,23 @@ rows are always `0`.
 | cutoff_date | string |
 | github_host | string |
 | status | string |
+| outcome | nullable-string |
+| coverage_complete | nullable-number |
+| discovery_failures | number |
+| discovery_deferrals | number |
 
 Row order: `run_id`
 
 Notes: `effective_owners` and `tracked_packages` are JSON arrays serialized as text —
 DuckDB reads them with `from_json(...)`, jq with `fromjson`.
+
+`outcome` is the run's finalized disposition — `complete` (full estate coverage; the only
+outcome a default report/export serves, alongside migrated `legacy-unknown`), a `partial-*`
+variant (`partial-deferred`/`partial-degraded`/`partial-budget` — the run stopped early or
+left units un-scanned), `fatal`, or `NULL` for a crashed, never-finalized run. `coverage_complete`
+is `1` when discovery enumerated the whole estate, `0` when a discovery failure/deferral left the
+denominator unknown, `NULL` for migrated pre-v5 runs. `discovery_failures`/`discovery_deferrals`
+count those discovery-level gaps.
 
 ## Analyzing the exports
 
