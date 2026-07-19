@@ -2011,6 +2011,16 @@ describe("network event emission (T7)", () => {
     expect(retries).toHaveLength(5); // MAX_ATTEMPTS-1 — no retry line on the final throwing attempt
   });
 
+  // graphql's truncated re-drive is a SEPARATE branch from restGet's; pin its final-attempt behavior too.
+  test("a PERSISTENT truncated graphql envelope emits MAX_ATTEMPTS-1 transport-truncated retries — none on the final throw", async () => {
+    const events: NetworkEvent[] = [];
+    const truncated = err(http(200, {}, ""), "curl: (56) Recv failure: Connection reset by peer");
+    const { client } = makeClient(Array<SpawnResult>(6).fill(truncated), { events: (e) => events.push(e) });
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/unparseable JSON body/);
+    const retries = events.filter((e) => e.kind === "retry" && e.reason === "transport-truncated");
+    expect(retries).toHaveLength(5); // MAX_ATTEMPTS-1 — graphql's final attempt throws without a retry line
+  });
+
   test("the reporter counts a truncated re-drive in retryTotal (no longer silently uncounted)", async () => {
     const reporter = createNetworkReporter({ emit: () => {} }); // swallow output; assert the counter only
     const { client } = makeClient(

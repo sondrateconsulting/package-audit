@@ -535,7 +535,7 @@ describe("stdout backpressure writer (T7)", () => {
     resetLogSink();
     const outSpy = spyOn(process.stdout, "write").mockImplementation((() => true) as typeof process.stdout.write);
     try {
-      expect(() => logLine({ event: "x", n: BigInt(1) } as unknown as Record<string, unknown>)).toThrow();
+      expect(() => logLine({ event: "x", n: BigInt(1) })).toThrow(); // BigInt is a valid Record<string, unknown> value — no cast needed
       expect(loggerStats().closed).toBe(false); // NOT a channel death — the sink degrade never ran
     } finally {
       outSpy.mockRestore();

@@ -1061,10 +1061,10 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const runId = startScanRun(db);
     const injected = new PolicyMatchError("excludeBranches", "x*", "main", new Error("simulated write-time incoherence"));
     const realUpsert = db.upsertRunUnitHead.bind(db);
-    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+    spyOn(db, "upsertRunUnitHead").mockImplementation((h) => {
       if (h.status === "scanned") throw injected; // the scanned upsert inside processUnit → fatal after startUnit
       return realUpsert(h);
-    };
+    });
     const client = scanClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main");
     let target: string | null = "SENTINEL"; // proves setTarget(null) actually ran, not just "was already null"
     const hb: HeartbeatController = { setPhase: () => {}, setTarget: (t) => { target = t; }, setUnitsDone: () => {}, tick: () => {}, stop: () => {} };

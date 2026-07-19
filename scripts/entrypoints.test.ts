@@ -349,9 +349,10 @@ describe("report/export main() await their finally-flush before the summary (T7)
   test("report --html main() drains buffered dossiers in its finally even when runReport throws (rejects with the ORIGINAL error)", async () => {
     const fx = makeFixture();
     const g = pausedArtifactSink("dossier");
+    const boom = new Error("BOOM-index-write");
     const realWrite = ArtifactBundle.prototype.write;
     const bundleSpy = spyOn(ArtifactBundle.prototype, "write").mockImplementation(function (this: ArtifactBundle, name: string, content: string) {
-      if (name === INDEX_FILENAME) throw new Error("BOOM-index-write"); // the index write, AFTER the first dossier's logLine
+      if (name === INDEX_FILENAME) throw boom; // the index write, AFTER the first dossier's logLine
       return realWrite.call(this, name, content);
     } as typeof ArtifactBundle.prototype.write);
     const outSpy = spyOn(process.stdout, "write").mockImplementation((() => true) as typeof process.stdout.write);
@@ -368,7 +369,7 @@ describe("report/export main() await their finally-flush before the summary (T7)
         g.resume(); // drain the buffered dossier → flush resolves → main rethrows the ORIGINAL error
         await p;
       });
-      expect((rejectedWith as Error).message).toMatch(/BOOM-index-write/); // the ORIGINAL error, not a flush error
+      expect(rejectedWith).toBe(boom); // the EXACT original error object propagated through the finally — not re-wrapped/masked
       expect(g.received.map((l) => JSON.parse(l).event)).toContain("dossier"); // buffered event drained despite the throw
     } finally {
       resetLogSink();
@@ -381,8 +382,9 @@ describe("report/export main() await their finally-flush before the summary (T7)
   test("export main() drains buffered export events in its finally even when runExport throws (rejects with the ORIGINAL error)", async () => {
     const fx = makeFixture();
     const g = pausedArtifactSink("export");
+    const boom = new Error("BOOM-export-stderr");
     // exportRun writes its human summary to stderr AFTER emitting every `export` line — throw there
-    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => { throw new Error("BOOM-export-stderr"); }) as typeof process.stderr.write);
+    const errSpy = spyOn(process.stderr, "write").mockImplementation((() => { throw boom; }) as typeof process.stderr.write);
     const outSpy = spyOn(process.stdout, "write").mockImplementation((() => true) as typeof process.stdout.write);
     let rejectedWith: unknown;
     setLogSink(g.sink);
@@ -397,7 +399,7 @@ describe("report/export main() await their finally-flush before the summary (T7)
         g.resume(); // drain buffered export events → flush resolves → main rethrows the ORIGINAL error
         await p;
       });
-      expect((rejectedWith as Error).message).toMatch(/BOOM-export-stderr/); // the ORIGINAL error, not a flush error
+      expect(rejectedWith).toBe(boom); // the EXACT original error object propagated through the finally — not re-wrapped/masked
       expect(g.received.map((l) => JSON.parse(l).event).filter((e) => e === "export").length).toBeGreaterThan(0); // buffered events drained despite the throw
     } finally {
       resetLogSink();
