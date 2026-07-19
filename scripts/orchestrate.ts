@@ -188,10 +188,10 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
       // Seed the limits panel from preflight's report (PROMPT-TUI §U3.6): fold-if-absent only —
       // the preflight REST calls themselves already emitted live snapshots through the §U3.3
       // channel, and the seed must not clobber them with nulls.
-      if (hasProgressSink()) {
-        emitProgress({ type: "rate-limit-seed", resource: "core", remaining: preflight.coreRemaining });
-        emitProgress({ type: "rate-limit-seed", resource: "graphql", remaining: preflight.graphqlRemaining });
-      }
+      // Per-emission gates (§U0: ALL derivation/allocation behind hasProgressSink) — a degrade
+      // tripped by the FIRST seed clears the sink, and the second must then allocate nothing.
+      if (hasProgressSink()) emitProgress({ type: "rate-limit-seed", resource: "core", remaining: preflight.coreRemaining });
+      if (hasProgressSink()) emitProgress({ type: "rate-limit-seed", resource: "graphql", remaining: preflight.graphqlRemaining });
 
       // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
       // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).

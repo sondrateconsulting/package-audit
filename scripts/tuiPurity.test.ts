@@ -128,6 +128,31 @@ describe("tui purity (grep-enforced, §U8.14)", () => {
     expect(allowedTotal).toBe(1);
   });
 
+  test("no display file imports the process module or namespace-imports the log module (stdout/logLine side doors)", () => {
+    // `import { stdout } from "node:process"` reaches the machine stream without the literal
+    // `process.stdout` token; `import * as log from "../log.ts"` reaches logLine without a
+    // brace-named binding. Both side doors are banned outright: the global `process` needs no
+    // import, and the two log seams lifecycle.ts uses (setLogSink/setLogTap) are brace-named.
+    const PROCESS_IMPORT_RE = new RegExp(
+      `^\\s*(?:import|export)\\b${NOTQ}*?\\bfrom\\s*${Q}(?:node:)?process${Q}` +
+        `|^\\s*import\\s*${Q}(?:node:)?process${Q}` +
+        `|\\bimport\\s*\\(\\s*${Q}(?:node:)?process${Q}\\s*\\)` +
+        `|\\brequire\\s*\\(\\s*${Q}(?:node:)?process${Q}\\s*\\)`,
+      "m",
+    );
+    const LOG_NAMESPACE_RE = /import\s*\*\s*as\s+\w+\s+from\s*["'][^"']*\/log(?:\.ts)?["']/;
+    for (const { file, src } of tuiSources()) {
+      expect({ file, processImport: PROCESS_IMPORT_RE.test(src), logNamespace: LOG_NAMESPACE_RE.test(src) }).toEqual({ file, processImport: false, logNamespace: false });
+    }
+    // meta: the side-door forms match; the legitimate forms do not
+    expect(PROCESS_IMPORT_RE.test('import { stdout } from "node:process"')).toBe(true);
+    expect(PROCESS_IMPORT_RE.test("const p = require('process')")).toBe(true);
+    expect(PROCESS_IMPORT_RE.test('import proc from "process-utils"')).toBe(false);
+    expect(LOG_NAMESPACE_RE.test("import * as log from '../log.ts'")).toBe(true);
+    expect(LOG_NAMESPACE_RE.test('import { setLogSink, setLogTap } from "../log.ts"')).toBe(false);
+    expect(LOG_NAMESPACE_RE.test('import * as fmt from "./format.ts"')).toBe(false);
+  });
+
   test("no display file reaches a dynamic builtin-module escape hatch (getBuiltinModule / createRequire)", () => {
     // process.getBuiltinModule("node:fs") and module.createRequire(...)("fs") acquire builtin
     // modules WITHOUT any import statement — they would bypass the import chokepoint above.

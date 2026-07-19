@@ -171,9 +171,13 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
   // resize could re-enter it from a timer context and throw unhandled (a kill, §U0). Snapshot
   // the stream's listeners first; on a throw, remove exactly the delta the failed construction
   // added, then rethrow into the lifecycle's mount-failure path (which seals the proxy, so any
-  // pending render output is dropped). Residual, stated honestly: Ink-internal timers/state
-  // created before the throw are unreachable without an instance — the sealed proxy absorbs
-  // their writes; removing the listeners closes the re-entry channels that are reachable.
+  // pending render output is dropped). Residual, stated honestly: ink's CONSTRUCTOR registers a
+  // signal-exit unmount hook and its console patch before the first paint, and both live in
+  // instance state that a construction throw makes unreachable — they cannot be deregistered
+  // from here. The sealed proxy absorbs anything they later write, and the stream-listener
+  // delta removal closes the re-entry channels that ARE reachable; a leaked signal-exit hook
+  // invoking a half-built unmount at SIGINT time is ink-internal behavior this adapter cannot
+  // reach (recorded in the PR body as the mount-failure class's accepted residual).
   const listenersBefore = new Map<string | symbol, Set<unknown>>();
   for (const ev of opts.out.eventNames()) listenersBefore.set(ev, new Set(opts.out.rawListeners(ev)));
   let instance: ReturnType<typeof render>;
@@ -214,10 +218,15 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
   try {
     timer = scheduler.setInterval(tick, tickMs);
     opts.out.on("resize", onResize);
-    // Rejection handler attached AT MOUNT (§U5): an unhandled waitUntilExit rejection would
-    // violate degrade-never-kill (§U0), and a dead React tree cannot be relied on to poll any
-    // latch.
-    instance.waitUntilExit().catch((e: unknown) => {
+    // The exit promise is obtained ONCE and shared: ink's waitUntilExit() (re)registers a
+    // process 'beforeExit' handler whenever none is present — calling it again through the
+    // handle AFTER requestUnmount (which removes that handler) would re-register it, retaining
+    // the instance and a process-level listener until process exit. One call, one registration;
+    // the handle reuses the memoized promise. Its rejection handler is attached AT MOUNT (§U5):
+    // an unhandled waitUntilExit rejection would violate degrade-never-kill (§U0), and a dead
+    // React tree cannot be relied on to poll any latch.
+    const exitPromise = instance.waitUntilExit();
+    exitPromise.catch((e: unknown) => {
       onCrash(causeText(e));
     });
 
@@ -226,7 +235,7 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
         instance.unmount();
       },
       waitUntilExit(): Promise<void> {
-        return instance.waitUntilExit().then(() => undefined);
+        return exitPromise.then(() => undefined);
       },
       dispose(): void {
         if (disposed) return;

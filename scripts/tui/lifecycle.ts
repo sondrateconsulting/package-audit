@@ -156,12 +156,23 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
   // whenever `columns && rows` is falsy that helper falls through to the terminal-size package —
   // which can SHELL OUT (tput/resize helpers) — a spawn route outside github.ts, inside our
   // process. The proxy therefore never hands ink a non-renderable dimension: real positive
-  // integers delegate untouched; everything else (undefined, 0, NaN, negatives, fractions,
-  // Infinity — the falsy spawn triggers plus the nonsense numerics ink would misrender) pins to
-  // ink's own documented 80x24 defaults. The App does NOT read the pinned values for layout:
-  // getRawDims() exposes the real stream's actual values (undefined included), so §U5's
-  // EMPTY-frame discipline still sees the truth.
-  const pinDim = (v: unknown, fallback: number): number => (typeof v === "number" && Number.isInteger(v) && v > 0 ? v : fallback);
+  // integers delegate untouched (and are remembered); everything else (undefined, 0, NaN,
+  // negatives, fractions, Infinity — the falsy spawn triggers plus the nonsense numerics ink
+  // would misrender) pins to the LAST KNOWN GOOD real geometry — so a terminal that stops
+  // reporting dimensions mid-run leaves ink believing the geometry it was already rendering
+  // against (its erase/viewport math stays coherent with what is actually on screen) instead of
+  // snapping to an arbitrary size. Before any usable read, the fallback is ink's own documented
+  // 80x24 defaults. The App does NOT read the pinned values for layout: getRawDims() exposes
+  // the real stream's actual values (undefined included), so §U5's EMPTY-frame discipline still
+  // sees the truth.
+  const lastGood = { columns: 80, rows: 24 };
+  const pinDim = (v: unknown, axis: "columns" | "rows"): number => {
+    if (typeof v === "number" && Number.isInteger(v) && v > 0) {
+      lastGood[axis] = v;
+      return v;
+    }
+    return lastGood[axis];
+  };
   const rawDim = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
   const getRawDims = (): { columns: number | undefined; rows: number | undefined } => ({
     columns: rawDim((real as { columns?: unknown }).columns),
@@ -170,8 +181,8 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
   const overrides: Record<PropertyKey, unknown> = { write };
   const stream = new Proxy(real, {
     get(target, prop) {
-      if (prop === "columns") return pinDim((target as { columns?: unknown }).columns, 80);
-      if (prop === "rows") return pinDim((target as { rows?: unknown }).rows, 24);
+      if (prop === "columns") return pinDim((target as { columns?: unknown }).columns, "columns");
+      if (prop === "rows") return pinDim((target as { rows?: unknown }).rows, "rows");
       if (prop === "getRawDims") return getRawDims;
       if (prop in overrides) return overrides[prop];
       // receiver = target on purpose: getters (isTTY etc.) must read the REAL stream's state,
@@ -198,15 +209,19 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
     compensateCursor(): void {
       // Write the cursor-show escape ONCE on Ink's behalf — for any path where Ink's own
       // restore write was (or will be) dropped by the seal: sealEarly, a timed-out/failed
-      // unmount, or a late-handle unwind against an already-sealed proxy. Idempotent;
-      // best-effort (a dead stderr cannot be compensated, and must not throw here). A
-      // redundant show when the cursor is already visible is a terminal no-op.
+      // unmount, or a late-handle unwind against an already-sealed proxy. Idempotent on
+      // SUCCESS; best-effort (a dead stderr cannot be compensated, and must not throw here).
+      // The once-flag is set only AFTER a non-throwing write: a transiently broken stderr
+      // must not consume the single compensation attempt — a later caller (step 5a's net)
+      // can still retry, so one cursor hide can never end with zero successful shows while
+      // any compensation site remains. A redundant show when the cursor is already visible
+      // is a terminal no-op.
       if (cursorCompensated) return;
-      cursorCompensated = true;
       try {
         real.write(SHOW_CURSOR, () => {});
+        cursorCompensated = true;
       } catch {
-        // best-effort only
+        // best-effort only — the flag stays unset so a later site may retry
       }
     },
     sealEarly(): void {
@@ -326,9 +341,14 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
       try {
         h.waitUntilExit().then(
           () => done("exited"),
-          () => done("wait-rejected"),
+          (e: unknown) => {
+            // the REASON is a teardown fact the operator is owed, not just the outcome label
+            warn?.(`exit-wait: unmount wait rejected: ${errText(e)}`);
+            done("wait-rejected");
+          },
         );
-      } catch {
+      } catch (e) {
+        warn?.(`exit-wait: unmount wait threw: ${errText(e)}`);
         done("wait-threw");
       }
       if (timerFailed) done("timer-failed");

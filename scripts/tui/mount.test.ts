@@ -343,9 +343,10 @@ describe("post-render rollback + adapter cleanup (§U6 remediation)", () => {
       // mid-run collapse: the terminal stops reporting usable dimensions
       (real as unknown as { columns: unknown }).columns = undefined;
       (real as unknown as { rows: unknown }).rows = 0;
-      // LIVE, not a creation-time snapshot: the pin and the raw channel both track the mutation
-      expect((proxy.stream as unknown as { columns: number }).columns).toBe(80);
-      expect((proxy.stream as unknown as { rows: number }).rows).toBe(24);
+      // LIVE, not a creation-time snapshot: the pin keeps the LAST KNOWN GOOD geometry (the
+      // 100x30 ink was already rendering against) while the raw channel reports the collapse
+      expect((proxy.stream as unknown as { columns: number }).columns).toBe(100);
+      expect((proxy.stream as unknown as { rows: number }).rows).toBe(30);
       const raw = (proxy.stream as unknown as { getRawDims: () => { columns: number | undefined; rows: number | undefined } }).getRawDims();
       expect(raw).toEqual({ columns: undefined, rows: 0 });
       const framesBefore = real.frames.length;
@@ -356,11 +357,43 @@ describe("post-render rollback + adapter cleanup (§U6 remediation)", () => {
       handle.requestUnmount();
       await Promise.race([handle.waitUntilExit(), new Promise((r) => setTimeout(r, 2000))]);
       // everything from the post-collapse commit onward carries NO panel content: the App
-      // planned EMPTY from the RAW dims while ink itself laid out against the pinned 80x24
+      // planned EMPTY from the RAW dims while ink itself laid out against the pinned geometry
       expect(real.all().slice(mark)).not.toContain("package-audit");
     } finally {
       handle.dispose();
     }
+  });
+
+  test("the handle reuses ONE memoized exit promise — ink's waitUntilExit is never re-invoked after unmount", async () => {
+    // ink's waitUntilExit() re-registers a process 'beforeExit' handler whenever none is
+    // present; calling it through the handle after requestUnmount (which removed the handler)
+    // would retain the instance and a process listener until process exit.
+    let waitCalls = 0;
+    let resolveExit: () => void = () => {};
+    const instance = {
+      unmount: (): void => {
+        resolveExit();
+      },
+      waitUntilExit: (): Promise<void> => {
+        waitCalls++;
+        return new Promise<void>((r) => {
+          resolveExit = r;
+        });
+      },
+    };
+    const handle = mountTui(createTuiStore(() => 0), {
+      out: new CaptureStream() as unknown as NodeJS.WriteStream,
+      onDegrade: () => {},
+      scheduler: makeFakeScheduler().scheduler,
+      renderImpl: (() => instance) as unknown as RenderSeam,
+    });
+    expect(waitCalls).toBe(1); // the mount-time rejection attach is the ONE call
+    const w1 = handle.waitUntilExit();
+    handle.requestUnmount();
+    const w2 = handle.waitUntilExit();
+    await Promise.all([w1, w2]);
+    expect(waitCalls).toBe(1); // the handle reused the memoized promise both times
+    handle.dispose();
   });
 
   test("dispose() without unmount detaches exactly the adapter's resize listener (wedged-unmount shape)", async () => {

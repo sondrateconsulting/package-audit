@@ -448,10 +448,12 @@ describe("sealable stderr proxy (§U8.13a)", () => {
     proxy.detach();
   });
 
-  test("ink-facing dimension pin: positive integers delegate; every non-renderable value pins to 80x24; getRawDims reports the truth", () => {
+  test("ink-facing dimension pin: positive integers delegate; non-renderable values pin to the LAST KNOWN GOOD geometry; getRawDims reports the truth", () => {
     // A RECORDED DEVIATION from the §U1 delegation letter, grounded in §U0: ink's internal
     // layout consults a helper that can shell out when `columns && rows` is falsy — the proxy
-    // never hands ink a non-renderable dimension, while getRawDims() keeps the App honest.
+    // never hands ink a non-renderable dimension, while getRawDims() keeps the App honest. The
+    // pin is the LAST usable geometry (ink's erase/viewport math stays coherent with what is
+    // actually on screen when the terminal stops reporting), 80x24 only before any usable read.
     const real = new FakeStream();
     const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
     const s = proxy.stream as unknown as { columns: number; rows: number; getRawDims: () => { columns: number | undefined; rows: number | undefined } };
@@ -460,10 +462,27 @@ describe("sealable stderr proxy (§U8.13a)", () => {
     for (const v of [undefined, 0, -1, 3.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       (real as unknown as { columns: unknown }).columns = v;
       (real as unknown as { rows: unknown }).rows = v;
-      expect({ v, columns: s.columns, rows: s.rows }).toEqual({ v, columns: 80, rows: 24 }); // ink never sees it
+      expect({ v, columns: s.columns, rows: s.rows }).toEqual({ v, columns: 100, rows: 30 }); // ink keeps the last real geometry
       const expectedRaw = typeof v === "number" ? v : undefined;
       expect({ v, raw: s.getRawDims() }).toEqual({ v, raw: { columns: expectedRaw, rows: expectedRaw } });
     }
+    // a NEW usable geometry updates the pin...
+    (real as unknown as { columns: unknown }).columns = 55;
+    (real as unknown as { rows: unknown }).rows = 20;
+    expect({ c: s.columns, r: s.rows }).toEqual({ c: 55, r: 20 });
+    (real as unknown as { columns: unknown }).columns = Number.NaN;
+    (real as unknown as { rows: unknown }).rows = 0;
+    expect({ c: s.columns, r: s.rows }).toEqual({ c: 55, r: 20 }); // ...and survives the next loss
+    proxy.detach();
+  });
+
+  test("a proxy that NEVER saw usable dimensions pins to ink's 80x24 defaults", () => {
+    const real = new FakeStream();
+    (real as unknown as { columns: unknown }).columns = undefined;
+    (real as unknown as { rows: unknown }).rows = undefined;
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    const s = proxy.stream as unknown as { columns: number; rows: number };
+    expect({ c: s.columns, r: s.rows }).toEqual({ c: 80, r: 24 });
     proxy.detach();
   });
 
@@ -837,7 +856,39 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     deps.mountImpl = makeFakeMount(handle, capture);
     await runWithTui(deps, async () => {});
     expect(stderr.all()).toContain("unmount did not complete cleanly (wait-rejected)");
+    expect(stderr.all()).toContain("unmount wait rejected: exit machinery broke"); // the REASON, not just the label
     expect(stderr.all()).toContain(SHOW_CURSOR); // rejection = no clean restore either
+  });
+
+  test("a SYNCHRONOUSLY-throwing waitUntilExit at teardown surfaces outcome AND cause", async () => {
+    const handle = makeFakeHandle({ exitMode: "never" });
+    handle.waitUntilExit = () => {
+      throw new Error("wait plumbing exploded");
+    };
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    const r = await runWithTui(deps, async () => 3);
+    expect(r).toBe(3);
+    expect(stderr.all()).toContain("unmount did not complete cleanly (wait-threw)");
+    expect(stderr.all()).toContain("unmount wait threw: wait plumbing exploded");
+    expect(stderr.all()).toContain(SHOW_CURSOR);
+  });
+
+  test("compensateCursor does NOT consume its once-flag on a throwing write — a later site retries successfully", () => {
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    real.throwOnWrite = new Error("transient EIO");
+    proxy.compensateCursor(); // best-effort attempt against a broken stream
+    expect(proxy.cursorCompensated).toBe(false); // the attempt did not count
+    expect(real.all()).toBe("");
+    real.throwOnWrite = null; // the stream recovers
+    proxy.compensateCursor(); // e.g. step 5a's belt-and-braces net
+    expect(proxy.cursorCompensated).toBe(true);
+    expect(real.all()).toBe(SHOW_CURSOR); // one hide can never end with zero successful shows
+    proxy.compensateCursor();
+    expect(real.all()).toBe(SHOW_CURSOR); // still exactly once on success
+    proxy.detach();
   });
 
   test("writeAllSync delivers whole lines through SHORT writes and fails on nonpositive/non-integer counts", async () => {
