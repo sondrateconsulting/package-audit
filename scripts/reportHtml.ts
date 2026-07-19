@@ -93,7 +93,7 @@ export interface PolicyBranchRow {
   readonly organization: string;
   readonly repository: string;
   readonly branch: string;
-  readonly disposition: "excluded" | "scanned-default-override";
+  readonly disposition: "excluded" | "scanned-default-override" | "attempted-default-override";
   readonly policyStatus: "excluded-by-deny" | "excluded-by-allow";
   readonly matchedPattern: string | null;
 }

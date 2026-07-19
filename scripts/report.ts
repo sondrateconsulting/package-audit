@@ -211,17 +211,29 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     packageName: e["package_name"], version: e["version"], message: e["message"], occurredAt: e["occurred_at"],
   }));
 
-  // §5: branches DISCOVERED but holding no disposition row because their scan ERRORED this run — each has
-  // a scope='scan' errors[] entry. Counted so the disposition buckets + branchesErrored reconcile to the
-  // discovered heads. A branch with BOTH a scan error AND a row (e.g. scanned on an earlier resume attempt,
-  // errored on this one) is already a disposition and is excluded here — hence the row-key exclusion.
+  // §5/§3.1a: branches whose scan FAILED this run — the UNION of two disjoint sets:
+  //   (a) error-status HEADS — a permanent scan failure is now a TERMINAL disposition recorded at the
+  //       observed commit (run_unit_head status='error'), so it must count here even though it holds a row;
+  //   (b) ROWLESS scan errors — a scope='scan' errors[] entry on a branch holding NO run_unit_head row
+  //       (a failure BEFORE any disposition: discovery-time, or a resume whose earlier invocation errored
+  //       before a row). The row-key exclusion keeps these out of (a)'s domain and vice-versa.
+  // The two are disjoint by construction: an error head IS a head, so it is excluded from (b)'s rowless
+  // filter; and (b) carries no head by definition. A branch with a SCANNED row PLUS a scope='scan' error
+  // (a post-persistence log/queue write throwing after the scanned row committed) is counted under
+  // branchesScanned, never here. DEFERRED (throttle-requeue) heads are NOT failures — un-covered, surfaced
+  // via runOutcome — and are excluded. Restores the summary partition (see reportSchema branchesErrored):
+  // scanned + skippedByCutoff + excludedByPolicy + pastCap + errored == terminal branches.
   const headKeys = new Set(heads.map((h) => `${h.organization}\0${h.repository}\0${h.branch}`));
-  const branchesErrored = new Set(
+  const errorHeadKeys = new Set(
+    heads.filter((h) => h.status === "error").map((h) => `${h.organization}\0${h.repository}\0${h.branch}`),
+  );
+  const rowlessScanErrorKeys = new Set(
     errors
       .filter((e) => e.scope === "scan" && typeof e.branch === "string" && e.branch !== "")
       .map((e) => `${String(e.organization)}\0${String(e.repository)}\0${String(e.branch)}`)
       .filter((k) => !headKeys.has(k)),
-  ).size;
+  );
+  const branchesErrored = errorHeadKeys.size + rowlessScanErrorKeys.size;
 
   // Validate the WHOLE head set ONCE, then feed the SAME validated array to BOTH derivations below. This
   // replaces the old reliance on object-literal evaluation order (assertHeadsWellFormed ran INSIDE the
@@ -308,13 +320,20 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
 // The ledger's disposition for ONE policy-bearing row, via the shared predicates only. The fail-closed
 // case lives in policyDisposition.ts (the ONE definition) so this surface and compare's policy churn
 // cannot drift apart on what an unrecognised policy-bearing row means.
-function dispositionOf(h: HeadRow): "scanned-default-override" | "excluded" {
+function dispositionOf(h: HeadRow): "scanned-default-override" | "attempted-default-override" | "excluded" {
   // Deliberately re-runs the gate even though buildReportInner's assertHeadsWellFormed already swept
   // every head: this function LABELS a row, and the label must never outlive a refactor that changes
   // which caller reaches it first. The gate is cheap, idempotent, and this is the defense-in-depth
   // layer review chose to keep rather than trust call-order.
   assertRunUnitHeadSound(h, `${h.organization}/${h.repository}@${h.branch}`);
-  return isDefaultOverride(h) ? "scanned-default-override" : "excluded";
+  // A default-branch override is always scan-ATTEMPTED, but the attempt does not always COMPLETE. Split on
+  // reportability so the ledger never claims a branch was scanned when it wasn't: a reportable head
+  // (scanned/reused, folded into branchesScanned) → 'scanned-default-override'; a deferred-*/error attempt
+  // reached no reportable head → 'attempted-default-override'. A non-override policy row → 'excluded'.
+  if (!isDefaultOverride(h)) return "excluded";
+  return (REPORTABLE_UNIT_STATUSES as readonly string[]).includes(h.status)
+    ? "scanned-default-override"
+    : "attempted-default-override";
 }
 
 // Scan-scope diagnostics (PROMPT.md §7 scanScope). policyBranches lists every head with a policy_status (both the excluded
@@ -363,7 +382,13 @@ function buildScanScope(allHeads: HeadRow[]): ScanScope {
   return {
     excludedByDeny,
     excludedByAllow,
-    defaultBranchPolicyOverrides: allHeads.filter(isDefaultOverride).length,
+    // Restricted to REPORTABLE overrides (scanned/reused) so the count stays a true subset of
+    // branchesScanned (its documented "OVERLAPPING (within branchesScanned)" contract). A deferred-*/error
+    // default-override attempt is NOT scanned — it appears in policyBranches as 'attempted-default-override'
+    // and is counted only by its non-reportable disposition bucket, never here.
+    defaultBranchPolicyOverrides: allHeads.filter(
+      (h) => isDefaultOverride(h) && (REPORTABLE_UNIT_STATUSES as readonly string[]).includes(h.status),
+    ).length,
     policyBranches,
     // Provenance is trustworthy ONLY for a v4-native run with at least one recorded head. A migrated
     // pre-v4 run (the NULL scanned_commit_date backfilled by migrateV3toV4) never persisted past-cap

@@ -195,6 +195,27 @@ describe("renderIndex — edge states", () => {
     expect(html).not.toContain("were not fully recorded");
   });
 
+  test("B2/C3: attempted-default-override renders 'attempted (default-branch override)', never falls through to 'excluded'", () => {
+    const report: DossierReport = {
+      ...baseReport([]),
+      summary: { repositoriesScanned: 2, branchesScanned: 1, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+      scanScope: {
+        excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 1, // only the SCANNED override
+        policyBranches: [
+          { organization: "org-a", repository: "r1", branch: "main", disposition: "scanned-default-override", policyStatus: "excluded-by-deny", matchedPattern: "main" },
+          { organization: "org-a", repository: "r2", branch: "main", disposition: "attempted-default-override", policyStatus: "excluded-by-deny", matchedPattern: "main" },
+        ],
+        provenance: "complete",
+      },
+    };
+    const html = renderIndex(report, OPTS);
+    expect(html).toContain("scanned (default-branch override)"); // the completed attempt
+    expect(html).toContain("attempted (default-branch override)"); // the errored/deferred attempt — NOT "scanned"
+    // Neither override may fall through the disposition guards into the excluded-policyStatus switch (the
+    // pre-fix bug: an 'attempted-default-override' row would have been mislabeled "excluded (deny)").
+    expect(html).not.toContain("excluded (deny)");
+  });
+
   test("scan-scope panel: an unverifiable-provenance run (pre-v4 OR zero-head) caveats the understated counts", () => {
     const complete = renderIndex(baseReport([]), OPTS);
     expect(complete).not.toContain("were not fully recorded"); // default fixture is v4-native

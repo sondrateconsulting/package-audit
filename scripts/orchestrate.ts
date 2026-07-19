@@ -739,8 +739,14 @@ export async function processRepo(
 
       db.setUnitStatus(key, { status: "in_progress", runId });
       progress.startUnit(repo.organization, repo.name, h.name, h.oid);
+      // The ACTUAL observed head for THIS attempt: seeded to the discovery head, but processUnit
+      // OVERWRITES it with the clone's real HEAD on the truncated-tree fallback (the branch may have
+      // moved between GraphQL discovery and the clone). A deferred/error disposition below must pin to
+      // what was truly attempted — NOT the possibly-stale h.oid — so the commit-aware upsert precedence
+      // and the report's head invariant stay honest under fallback. Mutated in place by processUnit.
+      const observed = { commitSha: h.oid, committedDate: h.committedDate };
       try {
-        const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
+        const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen, observed);
         db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
         tally.scanned++;
         progress.unitDone();
@@ -758,9 +764,10 @@ export async function processRepo(
           db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
           // T5 §3.1a: record the per-run disposition so finalizeRun's floor sees this run left the unit
           // un-scanned (deferred, not covered) → the run outcome becomes partial-deferred, not complete.
-          // The observed head (h.oid + its date) is stored so the commit-aware upsert precedence keeps a
+          // The OBSERVED head (observed.commitSha + its date — the clone's real HEAD under a truncated-tree
+          // fallback, else the discovery head) is stored so the commit-aware upsert precedence keeps a
           // same-head good scan if one exists from a prior/sibling attempt.
-          db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "deferred-throttle", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
+          db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: observed.commitSha, status: "deferred-throttle", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: observed.committedDate });
           logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
           tally.deferred++;
           progress.unitDone();
@@ -768,9 +775,11 @@ export async function processRepo(
           db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
           db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
           // T5 §3.1a: a permanent unit error is a terminal, "covered" result (its absence is a real
-          // outcome) — record it as the run's head disposition at the observed commit; it does NOT by
-          // itself force a partial outcome (finalizeRun's floor ignores 'error').
-          db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "error", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
+          // outcome) — record it as the run's head disposition at the OBSERVED commit (observed.commitSha:
+          // the clone's real HEAD under a truncated-tree fallback, else the discovery head — never the
+          // possibly-stale h.oid); it does NOT by itself force a partial outcome (finalizeRun's floor
+          // ignores 'error').
+          db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: observed.commitSha, status: "error", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: observed.committedDate });
           logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
           tally.errored++;
           progress.unitDone();
@@ -869,6 +878,10 @@ export async function processRepo(
 async function processUnit(
   db: AuditDb, client: GithubClient, config: Config, runId: string,
   repo: RepoInfo, decision: BranchDecision, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+  // Out-param: the caller seeds it to the discovery head and reads it back in its throttle/error arms.
+  // We OVERWRITE it the instant the clone fallback resolves the real HEAD (below), so a failure AFTER
+  // that point records the truly-attempted commit, not the stale discovery oid.
+  observed: { commitSha: string; committedDate: string },
 ): Promise<{ commitSha: string; committedDate: string }> {
   const h = decision.head;
   const tree = await client.fetchTreeRecursive(repo.organization, repo.name, h.treeOid);
@@ -892,6 +905,10 @@ async function processUnit(
       cloneDir = cloned.dir;
       commitSha = cloned.headSha;
       committedDate = cloned.headCommittedDate;
+      // Surface the real scanned head to the caller's throttle/error arms BEFORE the scan pipeline runs
+      // — so a walkClone/scanUnit throw past this point records THIS commit, not the stale discovery oid.
+      observed.commitSha = commitSha;
+      observed.committedDate = committedDate;
       entries = walkClone(cloned.dir);
       readFile = cloneReader(cloned.dir);
     } else {

@@ -255,6 +255,28 @@ describe("buildReport (§7)", () => {
     db.close();
   });
 
+  test("B2/C3: an errored/deferred default-branch override is 'attempted-default-override', never labeled 'scanned'", () => {
+    const db = mem();
+    const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    const DENY = { policyStatus: "excluded-by-deny", policyMatchedPattern: "main", scannedCommitDate: "2025-06-01T12:00:00Z" } as const;
+    // Three repos, each a default branch a deny rule WOULD drop but which is overridden (the default is
+    // always scan-attempted). The ATTEMPT differs: r1 scanned, r2 errored, r3 throttle-deferred.
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r1", branch: "main", commitSha: "c1", status: "scanned", isDefaultBranch: true, ...DENY });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r2", branch: "main", commitSha: "c2", status: "error", isDefaultBranch: true, ...DENY });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r3", branch: "main", commitSha: "c3", status: "deferred-throttle", isDefaultBranch: true, ...DENY });
+    db.finalizeRun(runId, "complete"); // floors to partial-deferred (r3), fine for buildReport
+    const report = buildReport(db, db.getRun(runId)!);
+    const byRepo = (repo: string) => report.scanScope.policyBranches.find((p) => p.repository === repo)!;
+    expect(byRepo("r1").disposition).toBe("scanned-default-override"); // completed → truly scanned
+    expect(byRepo("r2").disposition).toBe("attempted-default-override"); // errored → NOT scanned
+    expect(byRepo("r3").disposition).toBe("attempted-default-override"); // deferred → NOT scanned
+    // defaultBranchPolicyOverrides is documented "within branchesScanned" → only the reportable override.
+    expect(report.scanScope.defaultBranchPolicyOverrides).toBe(1); // r1 only
+    expect(report.summary.branchesScanned).toBe(1); // r1 only — errored/deferred overrides are NOT scanned
+    expect(report.summary.branchesErrored).toBe(1); // r2's error head
+    db.close();
+  });
+
   test("the scan-scope ledger FAILS CLOSED on a policy-bearing row that is neither excluded nor an override", () => {
     // The ledger must decide via BOTH shared predicates, never `isDefaultOverride(h) ? … : "excluded"` —
     // that binary form would re-define "excluded" as "policy-bearing but not an override", a second
@@ -667,6 +689,34 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
     });
     // fixed key order (byte-determinism): the units keys serialize in enum order
     expect(Object.keys(report.runOutcome.units)).toEqual(["scanned", "reused", "skippedCutoff", "policyExcluded", "pastCap", "deferredThrottle", "deferredNetwork", "deferredService", "error"]);
+    // B1/C2: the error-status HEAD (f2) is a scan FAILURE → counted in branchesErrored (it is NOT invisible
+    // just because it holds a row), restoring the terminal partition. The DEFERRED head (f1) is un-covered,
+    // NOT terminal, so it stays out of that sum.
+    expect(report.summary.branchesErrored).toBe(1); // the error head f2
+    const s = report.summary;
+    expect(s.branchesScanned + s.branchesSkippedByCutoff + s.branchesExcludedByPolicy + s.branchesPastCap + s.branchesErrored).toBe(6); // 6 terminal; f1 (deferred) is the 7th, non-terminal row
+    db.close();
+  });
+
+  test("B1/C2: branchesErrored = error heads + rowless scan errors, DISJOINT (an error head + its own errors[] row counts once)", () => {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const P = { policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" } as const;
+    // e1: a permanent scan error — an error HEAD at the observed commit AND a scope='scan' errors[] entry
+    // (exactly what the orchestrator writes). e2: a rowless scan error (failed before any row). A scanned
+    // sibling proves the scanned branch is NOT mis-counted as errored.
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "e1", commitSha: "c-e1", status: "error", isDefaultBranch: null, ...P });
+    db.insertError({ runId, scope: "scan", organization: "o", repository: "r", branch: "e1", message: "boom-with-head" });
+    db.insertError({ runId, scope: "scan", organization: "o", repository: "r", branch: "e2", message: "boom-rowless" });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "c-main", status: "scanned", isDefaultBranch: true, ...P });
+    db.finalizeRun(runId, "complete");
+    const report = buildReport(db, db.getRun(runId)!);
+    // e1 counts ONCE (via its error head, not double via its errors[] row); e2 counts once (rowless) → 2.
+    expect(report.summary.branchesErrored).toBe(2);
+    expect(report.summary.branchesScanned).toBe(1); // main only — the error head is NOT reportable
     db.close();
   });
 

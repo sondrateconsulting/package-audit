@@ -1217,6 +1217,31 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("C1: a clone-fallback that MOVED the head then FAILS records the error head at the CLONE's commit, not the stale discovery oid", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-moved-err-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    // Discovery sees o-main; the branch MOVED to o-moved by clone time (rev-parse). The truncated tree
+    // forces the clone fallback; walkClone then throws (dest never materialized) → the unit errors AFTER
+    // the clone resolved the real head. The error head — and its commit-aware upsert precedence — must pin
+    // to o-moved (what was actually attempted), NEVER the stale discovery oid o-main.
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      if (args[0] === "clone") return { exitCode: 0, stderr: "", stdout: "" }; // exits 0, no dest → walkClone throws
+      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: hexOid("o-moved") + "\n" };
+      if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
+      return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // truncated → clone fallback
+    });
+    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    const head = db.read(`SELECT commit_sha, status, scanned_commit_date FROM run_unit_head WHERE run_id = ? AND branch = 'main'`).get(runId) as { commit_sha: string; status: string; scanned_commit_date: string };
+    expect(head.status).toBe("error");
+    expect(head.commit_sha).toBe(hexOid("o-moved")); // the CLONE's real head — NOT hexOid("o-main")
+    expect(head.commit_sha).not.toBe(hexOid("o-main"));
+    expect(head.scanned_commit_date).toContain("2025-06-15"); // the clone head's date, not the 2025-06-01 discovery date
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("a clone-cleanup FAILURE after a successful scan is surfaced as a warning, not swallowed", async () => {
     if (typeof process.getuid === "function" && process.getuid() === 0) return; // root ignores modes
     const root = mkdtempSync(join(tmpdir(), "clone-cleanup-"));
