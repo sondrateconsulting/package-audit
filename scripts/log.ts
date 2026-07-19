@@ -100,7 +100,10 @@ class BufferedWriter {
     // dead channel can still drop them — capacity is guaranteed, delivery is not) AND never evicting
     // a counted line (which would leave their own inline suppressed count stale).
     if (this.buffer.length >= this.maxBuffered && !terminal) {
-      const di = this.buffer.findIndex((p) => p.droppable);
+      // Shed the oldest droppable NON-terminal line: a line can be both droppable and terminal, and
+      // terminal protection dominates — never evict a terminal for capacity, via this arm or the one
+      // below. (The lifecycle arm already excludes terminals; this arm must match it.)
+      const di = this.buffer.findIndex((p) => p.droppable && !p.terminal);
       if (di >= 0) {
         // there is droppable telemetry to shed — drop the OLDEST of it, keep the incoming line.
         this.buffer.splice(di, 1);

@@ -400,6 +400,27 @@ describe("stdout backpressure writer (T7)", () => {
     }
   });
 
+  // A line can be BOTH droppable and terminal (the two logLine flags are independent). The capacity
+  // eviction has two arms; the lifecycle arm already excludes terminals, but the DROPPABLE arm must
+  // too — otherwise a buffered droppable-terminal line is shed via the droppable path, breaking the
+  // "terminals are never evicted for capacity" invariant. Latent today (no caller sets both). (6a)
+  test("a buffered DROPPABLE terminal is never evicted via the droppable arm either", () => {
+    const f = fakeSink();
+    setLogSink(f.sink, 1);
+    try {
+      f.pause();
+      logLine({ event: "b" }); // sink, writer pauses
+      logLine({ event: "done" }, { droppable: true, terminal: true }); // both flags → bypasses the bound → buffer [done]
+      logLine({ event: "u1" }); // full → eviction runs; the droppable arm must NOT pick the terminal
+      f.resume();
+      const events = f.received.map(evName);
+      expect(events).toContain("done"); // droppable+terminal survived — terminal protection dominates droppability
+      expect(events).toContain("u1"); // the incoming lifecycle line still shipped
+    } finally {
+      resetLogSink();
+    }
+  });
+
   test("a sink with onClose but NO isClosed still un-hangs a pending flushLogs on async close", async () => {
     const received: string[] = [];
     let accept = true;
