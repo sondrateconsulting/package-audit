@@ -67,6 +67,12 @@
       "default": [],
       "description": "Branch-name denylist — exact name or Bun glob. Matching branches are excluded from scanning (recorded as policy-excluded), EXCEPT the default branch, which is always eligible. Deny wins over 'branches'. null = use the default (none). A leading '!' is rejected at runtime."
     },
+    "excludeRepositories": {
+      "type": ["array", "null"],
+      "items": { "type": "string", "minLength": 1 },
+      "default": [],
+      "description": "Repository denylist — exact 'owner/repo' name or Bun glob over the full 'owner/repo' name. Matching repositories are dropped from every scan BEFORE archived/fork filtering and the maxReposPerOrg cap (a denied repo never consumes a cap slot). 'acme/*' drops one org; '*/legacy-*' drops a family across orgs; 'acme/legacy-api' drops one repo. '*' does NOT cross '/' (so ['*'] matches nothing) while '**' does (['**'] matches everything). Matching is CASE-INSENSITIVE (ASCII fold) — UNLIKE the case-sensitive 'excludeBranches', because GitHub repository identity is case-insensitive. Deny-only (there is no repository allowlist). A leading '!' or empty entry is rejected at runtime. There is NO dead-pattern warning for repositories (unlike excludeBranches) — confirm a pattern caught the repos you meant via the 'audit --plan' excluded list. null = use the default (none)."
+    },
     "cutoffDate": {
       "type": "string",
       "pattern": "^\\d{4}-\\d{2}-\\d{2}$",

@@ -15,6 +15,7 @@ import type { AuditDb } from "./db.ts";
 import type { DiscoveryFailure } from "./discovery.ts";
 import { isIsoInstant } from "./isoDate.ts";
 import { logLine } from "./log.ts";
+import { classifyRepository, type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
 
 // ---- errors -----------------------------------------------------------------------------
 // Non-retryable API failure (404, permission, SSO enforcement, poisoned redirect, …) — the
@@ -813,13 +814,32 @@ export function mapRestRepo(raw: unknown, endpoint: string, index: number, expec
   if (typeof isPrivate !== "boolean") throw fail("private is not a boolean");
   return { name, organization: login, pushedAt, archived, fork, isPrivate };
 }
-// Client-side policy (§5.A): archived/fork filtering never trusts a server-side filter, then
-// sort pushed_at DESC (nulls last, name ASC tie-break) and cap at maxReposPerOrg.
+// Client-side policy (§5.A): the excludeRepositories denylist runs FIRST, then archived/fork filtering
+// (never trusting a server-side filter), then sort pushed_at DESC (nulls last, name ASC tie-break) and
+// cap at maxReposPerOrg. Returns { kept, excluded }: `kept` is the scanned/planned set; `excluded` is
+// the ORIGINAL-case `owner/repo` names dropped SPECIFICALLY by the denylist (for --plan), in raw
+// discovery order — the real scan ignores it, --plan surfaces it (T6).
+//
+// DENY-FIRST is load-bearing: applying it to the RAW list before archived/fork AND before the cap means
+// a denylisted repo never consumes a maxReposPerOrg slot an eligible repo could use (the repo-grain
+// analog of branch policy running before the cap). A SEPARATE first pass keeps `excluded` denylist-ONLY
+// — archived/fork/past-cap drops are NOT policy exclusions and never appear in it. classifyRepository
+// folds the `owner/repo` INTERNALLY (case-insensitive match), so this passes the ORIGINAL-case name
+// straight through; the reported name in `excluded` keeps that original case.
 export function filterSortCapRepos(
   repos: RepoInfo[],
-  opts: { includeArchived: boolean; includeForks: boolean; maxReposPerOrg: number | null },
-): RepoInfo[] {
-  const filtered = repos.filter(
+  opts: { policy: CompiledRepositoryPolicy; includeArchived: boolean; includeForks: boolean; maxReposPerOrg: number | null },
+): { readonly kept: readonly RepoInfo[]; readonly excluded: readonly string[] } {
+  const excluded: string[] = [];
+  const surviving: RepoInfo[] = [];
+  for (const r of repos) {
+    const ownerRepo = `${r.organization}/${r.name}`;
+    // classifyRepository may throw a fatal RepoPolicyMatchError (a compiled glob threw at match time) —
+    // fail-closed by contract, propagated to the run driver which fails the run and rethrows unchanged.
+    if (classifyRepository(opts.policy, ownerRepo)) excluded.push(ownerRepo);
+    else surviving.push(r);
+  }
+  const filtered = surviving.filter(
     (r) => (opts.includeArchived || !r.archived) && (opts.includeForks || !r.fork),
   );
   const sorted = [...filtered].sort((a, b) => {
@@ -829,7 +849,8 @@ export function filterSortCapRepos(
     if (a.pushedAt !== b.pushedAt) return a.pushedAt < b.pushedAt ? 1 : -1;
     return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
   });
-  return opts.maxReposPerOrg === null ? sorted : sorted.slice(0, opts.maxReposPerOrg);
+  const kept = opts.maxReposPerOrg === null ? sorted : sorted.slice(0, opts.maxReposPerOrg);
+  return { kept, excluded };
 }
 
 export interface BranchHead {

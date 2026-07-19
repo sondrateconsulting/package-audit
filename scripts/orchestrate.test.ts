@@ -6,6 +6,7 @@ import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, planSumma
 import type { TreeEntry } from "./unitPipeline.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
+import { compileRepositoryPolicy, RepoPolicyMatchError } from "./repositoryPolicy.ts";
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type RepoInfo, type SpawnFn } from "./github.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { Aborter } from "./boundedPool.ts";
@@ -31,7 +32,11 @@ const rt = (config: Config, configHash = "hash"): AuditRuntime => ({
   config,
   configHash,
   branchPolicy: compileBranchPolicy(config.branches, config.excludeBranches),
+  repositoryPolicy: compileRepositoryPolicy(config.excludeRepositories),
 });
+
+// An empty repository denylist for the discoverOwnerRepos call sites that don't exercise repo policy.
+const NO_DENY = compileRepositoryPolicy([]);
 
 // Scripted client factory — every test client shares this boilerplate (offline binPaths, noop
 // sleep, tempRoot under the test dir) and differs ONLY in its spawn script and cache role.
@@ -151,6 +156,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
       excludeOrganizations: [],
       branches: null,
       excludeBranches: [],
+      excludeRepositories: [],
       includePersonalNamespace: false,
       includeForks: false,
       includeArchived: false,
@@ -166,7 +172,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     const totals = await runPlan(client, rt(config), "rvo");
     expect(totals).toEqual({
       owners: ["org-a"], ownersSource: "configured",
-      reposDiscovered: 1, reposKept: 1,
+      reposDiscovered: 1, reposKept: 1, repositoriesExcluded: 0,
       branchesEligible: 1, branchesSkippedByCutoff: 1, branchesPastCap: 0, branchesExcludedByPolicy: 0,
       excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, discoveryErrors: 0,
     });
@@ -193,7 +199,7 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     let n = 0;
     const client = makeClient(root, async () => responses[Math.min(n++, responses.length - 1)]!);
     const config: Config = {
-      githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [], includePersonalNamespace: false,
+      githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [], excludeRepositories: [], includePersonalNamespace: false,
       includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
       concurrency: { organizations: 1, repositories: 1, branches: 1 },
       packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
@@ -205,11 +211,127 @@ describe("runPlan (integration, scripted client — zero-write contract)", () =>
     expect(readdirSync(root)).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
+
+  test("emits a plan-excluded event (original-case names, before that owner's plan events) + a repositoriesExcluded count", async () => {
+    const root = mkdtempSync(join(tmpdir(), "plan-deny-"));
+    const responses = [
+      // 1) listOrgRepos("org-a") — two repos; the denylist drops the (case-insensitively) matching one
+      { exitCode: 0, stderr: "", stdout: http(200, {}, JSON.stringify([
+        { name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
+        { name: "Legacy-API", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-02-01T00:00:00Z", archived: false, fork: false, private: false },
+      ])) },
+      // 2) listBranchHeads("org-a","svc") — ONLY the kept repo is planned (legacy-api was denied)
+      { exitCode: 0, stderr: "", stdout: http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [{ name: "main", target: { oid: hexOid("o-main"), committedDate: "2025-06-01T00:00:00Z", tree: { oid: hexOid("t1") } } }],
+      } } } })) },
+    ];
+    const calls: Array<{ bin: string; args: string[] }> = [];
+    const client = makeClient(root, async (bin, args) => {
+      calls.push({ bin, args });
+      const r = responses[calls.length - 1];
+      if (r === undefined) throw new Error(`unexpected spawn #${calls.length}: ${bin} ${args.join(" ")}`);
+      return r;
+    });
+    const config: Config = {
+      githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [],
+      excludeRepositories: ["org-a/legacy-*"], // case-insensitive → matches "org-a/Legacy-API"
+      includePersonalNamespace: false, includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
+      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
+    };
+    let totals: PlanTotals | undefined;
+    const events = await captureJsonl(async () => { totals = await runPlan(client, rt(config), "rvo"); });
+    expect(totals!.reposDiscovered).toBe(2);
+    expect(totals!.reposKept).toBe(1);
+    expect(totals!.repositoriesExcluded).toBe(1); // denylist-only count
+    // the plan-excluded event lists the denied repo in ORIGINAL case, raw discovery order
+    const excludedEvents = events.filter((e) => e["event"] === "plan-excluded");
+    expect(excludedEvents).toHaveLength(1);
+    expect(excludedEvents[0]!["org"]).toBe("org-a");
+    expect(excludedEvents[0]!["repositories"]).toEqual(["org-a/Legacy-API"]);
+    // placement: the owner's plan-excluded event precedes its per-repo plan events (verify at preview time)
+    const idxExcluded = events.findIndex((e) => e["event"] === "plan-excluded");
+    const idxPlan = events.findIndex((e) => e["event"] === "plan");
+    expect(idxExcluded).toBeGreaterThanOrEqual(0);
+    expect(idxPlan).toBeGreaterThan(idxExcluded);
+    // the plan-summary carries the aggregate count
+    const summary = events.find((e) => e["event"] === "plan-summary");
+    expect(summary!["repositoriesExcluded"]).toBe(1);
+    expect(readdirSync(root)).toEqual([]); // zero-write preserved
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("MULTI-OWNER: repositoriesExcluded/reposKept AGGREGATE across owners (+=, not =); each denying owner emits its own plan-excluded; a zero-denial owner emits none", async () => {
+    // Three configured owners exercise the per-owner ACCUMULATION the single-owner tests can't reach:
+    //   org-a denies 2 (keeps 1) · org-b denies 1 (keeps 1) · org-c denies 0 (keeps 1).
+    // "*/legacy-*" is cross-org + case-insensitive. This pins two otherwise-surviving mutations:
+    //   (A) `repositoriesExcluded = excluded.length` (instead of `+=`) → reports the LAST owner's count (0), not 3.
+    //   (B) dropping the `excluded.length > 0` guard → org-c emits a spurious empty plan-excluded.
+    const root = mkdtempSync(join(tmpdir(), "plan-deny-multi-"));
+    const reposByOwner: Record<string, Array<{ name: string; pushed: string }>> = {
+      "org-a": [
+        { name: "svc-a", pushed: "2025-01-01T00:00:00Z" }, // kept
+        { name: "Legacy-API", pushed: "2025-02-01T00:00:00Z" }, // denied (case-insensitively)
+        { name: "legacy-portal", pushed: "2025-03-01T00:00:00Z" }, // denied
+      ],
+      "org-b": [
+        { name: "svc-b", pushed: "2025-01-01T00:00:00Z" }, // kept
+        { name: "legacy-worker", pushed: "2025-02-01T00:00:00Z" }, // denied
+      ],
+      "org-c": [{ name: "svc-c", pushed: "2025-01-01T00:00:00Z" }], // kept, nothing denied
+    };
+    const OWNERS = ["org-a", "org-b", "org-c"] as const;
+    const listing = (owner: string): string =>
+      http(200, {}, JSON.stringify(reposByOwner[owner]!.map((r) => ({
+        name: r.name, owner: { login: owner }, default_branch: "main", pushed_at: r.pushed, archived: false, fork: false, private: false,
+      }))));
+    const heads = http(200, {}, JSON.stringify({ data: { repository: { defaultBranchRef: { name: "main" }, refs: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{ name: "main", target: { oid: hexOid("o-main"), committedDate: "2025-06-01T00:00:00Z", tree: { oid: hexOid("t1") } } }],
+    } } } }));
+    const client = makeClient(root, async (bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads };
+      const owner = OWNERS.find((o) => args.some((a) => a.includes(`orgs/${o}/repos`)));
+      if (owner === undefined) throw new Error(`unexpected spawn: ${bin} ${args.join(" ")}`);
+      return { exitCode: 0, stderr: "", stdout: listing(owner) };
+    });
+    const config: Config = {
+      githubHost: "github.com", organizations: [...OWNERS], excludeOrganizations: [], branches: null, excludeBranches: [],
+      excludeRepositories: ["*/legacy-*"], // cross-org, case-insensitive
+      includePersonalNamespace: false, includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
+      concurrency: { organizations: 1, repositories: 1, branches: 1 },
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: [], paths: { sqlitePath: join(root, "never.db"), outputDir: root },
+    };
+    let totals: PlanTotals | undefined;
+    const events = await captureJsonl(async () => { totals = await runPlan(client, rt(config), "rvo"); });
+    // Discovered = 3+2+1 = 6; kept = 1+1+1 = 3; excluded = 2+1+0 = 3. `=`-instead-of-`+=` would yield the
+    // last owner's counts (kept 1, excluded 0), so these three aggregates kill mutation (A).
+    expect(totals!.reposDiscovered).toBe(6);
+    expect(totals!.reposKept).toBe(3);
+    expect(totals!.repositoriesExcluded).toBe(3);
+    // Compare plan-excluded events BY OWNER (not by emission order): exactly org-a + org-b emit; org-c does not.
+    const planExcludedRaw = events.filter((e) => e["event"] === "plan-excluded");
+    // Assert the RAW event count FIRST: exactly two events total — one per denying owner, NONE for org-c,
+    // and NONE duplicated. A Map keyed by owner alone would silently collapse a duplicate-per-owner event.
+    expect(planExcludedRaw.length).toBe(2);
+    const excludedByOrg = new Map(planExcludedRaw.map((e) => [e["org"] as string, e["repositories"] as string[]]));
+    expect(excludedByOrg.size).toBe(2); // org-c emitted NONE → kills mutation (B); the empty-guard drop would make this 3
+    expect(excludedByOrg.get("org-a")).toEqual(["org-a/Legacy-API", "org-a/legacy-portal"]); // original case, raw discovery order
+    expect(excludedByOrg.get("org-b")).toEqual(["org-b/legacy-worker"]);
+    expect(excludedByOrg.has("org-c")).toBe(false);
+    // plan-summary carries the AGGREGATE count (not a per-owner snapshot)
+    expect(events.find((e) => e["event"] === "plan-summary")!["repositoriesExcluded"]).toBe(3);
+    expect(readdirSync(root)).toEqual([]); // zero-write preserved
+    rmSync(root, { recursive: true, force: true });
+  });
 });
 
 // Shared minimal Config for the guard/wiring tests below (single configured org, cap via arg).
 const testConfig = (root: string, maxBranchesPerRepo = 25): Config => ({
-  githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [], includePersonalNamespace: false,
+  githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [], branches: null, excludeBranches: [], excludeRepositories: [], includePersonalNamespace: false,
   includeForks: false, includeArchived: false, maxReposPerOrg: null, maxBranchesPerRepo, cutoffDate: "2024-01-01",
   concurrency: { organizations: 1, repositories: 1, branches: 1 },
   packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
@@ -291,7 +413,7 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
 
     let kept: unknown;
     const events = await captureJsonl(async () => {
-      kept = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-a", false);
+      kept = await discoverOwnerRepos(db, client, testConfig(root), NO_DENY, runId, "org-a", false);
     });
 
     expect(kept).toEqual({ ok: false, reason: "failed" }); // fail-soft: a permanent-failure outcome, no partial items
@@ -324,12 +446,28 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
       });
 
     const events = await captureJsonl(async () => {
-      const keptA = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-a", false);
-      const keptB = await discoverOwnerRepos(db, client, testConfig(root), runId, "org-b", false);
+      const keptA = await discoverOwnerRepos(db, client, testConfig(root), NO_DENY, runId, "org-a", false);
+      const keptB = await discoverOwnerRepos(db, client, testConfig(root), NO_DENY, runId, "org-b", false);
       expect(keptA).toEqual({ ok: false, reason: "failed" }); // permanent discovery failure
       expect(keptB.ok && keptB.items.map((r) => r.name)).toEqual(["svc"]); // archived repo filtered by config
     });
     expect(events.filter((e) => e["event"] === "discovery")).toHaveLength(1); // only org-a's failure
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("threads the repository denylist: a matching repo is dropped from the returned kept set", async () => {
+    const root = mkdtempSync(join(tmpdir(), "own-disc-deny-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const client = makeClient(root, async () => ({ exitCode: 0, stderr: "", stdout: http(200, JSON.stringify([
+      { name: "keep", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false },
+      { name: "legacy-api", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-02-01T00:00:00Z", archived: false, fork: false, private: false },
+    ])) }));
+    // deny "org-a/legacy-*" (case-insensitive) — the newer repo, which would otherwise sort first.
+    const policy = compileRepositoryPolicy(["ORG-A/legacy-*"]);
+    const kept = await discoverOwnerRepos(db, client, testConfig(root), policy, runId, "org-a", false);
+    expect(kept.ok && kept.items.map((r) => r.name)).toEqual(["keep"]); // legacy-api excluded by the denylist
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -348,7 +486,7 @@ describe("discoverOwnerRepos (run-path org-level discovery, fail-soft — README
         ])) };
       });
 
-    const kept = await discoverOwnerRepos(db, client, testConfig(root), runId, "rvo", true);
+    const kept = await discoverOwnerRepos(db, client, testConfig(root), NO_DENY, runId, "rvo", true);
     expect(kept.ok && kept.items.map((r) => r.name)).toEqual(["dotfiles"]); // discovered via user/repos, owner "rvo" validated
     expect(calls).toHaveLength(1);
     expect(calls[0]!.join(" ")).toContain("user/repos?affiliation=owner");
@@ -658,6 +796,10 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
   const throwingGlob = (thrown: unknown): Bun.Glob => ({ match() { throw thrown; } }) as unknown as Bun.Glob;
   const badGlobError = new Error("bad glob"); // the exact injected cause — used to prove identity on rethrow
   const throwingPolicy = { include: null, exclude: [{ pattern: "boom*", glob: throwingGlob(badGlobError) }] };
+  // The repository-denylist analog: a compiled repo glob that throws at .match() time. The repo "org-a/svc"
+  // never equals "boom*", so the exact-first pass misses and classifyRepository reaches the throwing glob.
+  const badRepoGlobError = new Error("bad repo glob");
+  const throwingRepoPolicy = [{ pattern: "boom*", glob: throwingGlob(badRepoGlobError) }];
 
   test("a denied NON-default branch persists as policy-excluded + policy attribution, and is never scanned", async () => {
     const root = mkdtempSync(join(tmpdir(), "policy-deny-"));
@@ -697,7 +839,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
     const client = scanClient(root, [{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], "dev");
-    const runtime: AuditRuntime = { config: testConfig(root, 25), configHash: "h", branchPolicy: throwingPolicy };
+    const runtime: AuditRuntime = { config: testConfig(root, 25), configHash: "h", branchPolicy: throwingPolicy, repositoryPolicy: compileRepositoryPolicy([]) };
     await expect(processRepo(db, client, runtime, runId, "org-a", repo, [], new Set())).rejects.toThrow(PolicyMatchError);
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -749,7 +891,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
     const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
-    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy };
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy, repositoryPolicy: compileRepositoryPolicy([]) };
     let thrown: unknown = null;
     await captureJsonl(async () => {
       thrown = await runScan(db, client, runtime, noArgs, null).then(() => null, (e: unknown) => e);
@@ -778,7 +920,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], "dev") };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy };
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy, repositoryPolicy: compileRepositoryPolicy([]) };
     let thrown: unknown = null;
     const events = await captureJsonl(async () => {
       thrown = await runPlan(client, runtime, "rvo").then(() => null, (e: unknown) => e);
@@ -789,6 +931,49 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     // and it aborted MID-plan — a completed plan would have logged a plan-summary; a fail-open swallow
     // would have too (with the denied repo silently skipped). Its absence proves the fatal abort.
     expect(events.some((e) => e["event"] === "plan-summary")).toBe(false);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("runScan marks the run FAILED on a RepoPolicyMatchError from the denylist and rethrows the original", async () => {
+    const root = mkdtempSync(join(tmpdir(), "repo-policy-failrun-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // packages:[] so discoverCliTerms is a no-op; the denylist glob throws during OWNER discovery (before
+    // any branch planning), so NO branch policy is configured — the fatal is purely repository-grained.
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
+    const client = makeClient(root, async () =>
+      ({ exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` }));
+    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [] }, repositoryPolicy: throwingRepoPolicy };
+    let thrown: unknown = null;
+    await captureJsonl(async () => {
+      thrown = await runScan(db, client, runtime, noArgs, null).then(() => null, (e: unknown) => e);
+    });
+    // the ORIGINAL error is rethrown UNCHANGED — a RepoPolicyMatchError carrying the exact injected cause.
+    expect(thrown).toBeInstanceOf(RepoPolicyMatchError);
+    expect((thrown as { cause?: unknown }).cause).toBe(badRepoGlobError);
+    // a repository-policy config defect must exclude the run from latest, exactly like a branch PolicyMatchError.
+    const run = db.read("SELECT status FROM runs ORDER BY started_at DESC LIMIT 1").get() as { status: string };
+    expect(run.status).toBe("failed");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("runPlan propagates a RepoPolicyMatchError from the denylist and writes NOTHING (the --plan zero-write twin)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "repo-plan-throw-"));
+    // The denylist glob throws in filterSortCapRepos — AFTER repo discovery, BEFORE listBranchHeads —
+    // so it must abort the whole plan (never degrade into a per-repo continue) with NO DB/output write.
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
+    const client = makeClient(root, async () =>
+      ({ exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` }));
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [] }, repositoryPolicy: throwingRepoPolicy };
+    let thrown: unknown = null;
+    const events = await captureJsonl(async () => {
+      thrown = await runPlan(client, runtime, "rvo").then(() => null, (e: unknown) => e);
+    });
+    expect(thrown).toBeInstanceOf(RepoPolicyMatchError);
+    expect((thrown as { cause?: unknown }).cause).toBe(badRepoGlobError);
+    expect(events.some((e) => e["event"] === "plan-summary")).toBe(false); // aborted mid-plan
+    expect(readdirSync(root)).toEqual([]); // zero-write invariant: no db, no output, nothing at all
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -1072,7 +1257,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const badError = new Error("shadowed");
     // deny ['main' exact winner, 'z*' throwing]: classification wins on the exact 'main', but the
     // coverage sweep invokes z*.match('main') and throws — the run must fail with no branch rows.
-    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [{ pattern: "main", glob: new Bun.Glob("main") }, { pattern: "z*", glob: throwingGlob(badError) }] } };
+    const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [{ pattern: "main", glob: new Bun.Glob("main") }, { pattern: "z*", glob: throwingGlob(badError) }] }, repositoryPolicy: compileRepositoryPolicy([]) };
     let thrown: unknown = null;
     await captureJsonl(async () => { thrown = await runScan(db, fullClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main"), runtime, noArgsT7, null).then(() => null, (e: unknown) => e); });
     expect(thrown).toBeInstanceOf(PolicyMatchError);
@@ -1299,7 +1484,7 @@ describe("planSummaryText", () => {
   // a full PlanTotals with all-zero policy diagnostics; spread + override per test
   const totals: PlanTotals = {
     owners: ["org-a", "org-b"], ownersSource: "discovered",
-    reposDiscovered: 42, reposKept: 37,
+    reposDiscovered: 42, reposKept: 37, repositoriesExcluded: 0,
     branchesEligible: 210, branchesSkippedByCutoff: 58, branchesPastCap: 12, branchesExcludedByPolicy: 0,
     excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, discoveryErrors: 0,
   };
@@ -1310,12 +1495,18 @@ describe("planSummaryText", () => {
     expect(text).toContain("no database opened");
     expect(text).toContain("org-a, org-b");
     expect(text).toContain("42 discovered, 37 kept");
+    expect(text).not.toContain("repository denylist"); // repositoriesExcluded: 0 → the denylist segment is suppressed
     expect(text).toContain("210 eligible");
     expect(text).toContain("58 skipped by cutoff (< 2024-01-01)");
     expect(text).toContain("12 past the per-repo cap (25)");
     expect(text).toContain("3 excluded by branch policy");
     expect(text).toContain("expo");
     expect(text).toMatch(/Discovery errors:\s+0\b/);
+  });
+
+  test("Repos line appends the repository-denylist count ONLY when it excluded something", () => {
+    const text = planSummaryText(config, { ...totals, repositoriesExcluded: 5 });
+    expect(text).toContain("42 discovered, 37 kept after archive/fork filters and caps (5 excluded first by the repository denylist)");
   });
 
   test("policy detail line: shown with the deny/allow split + override count when policy removed branches", () => {
@@ -1353,7 +1544,7 @@ const liveSnapshot: BranchSnapshot = { heads: [liveHead], defaultBranch: "main" 
 const config = Object.freeze({
   cutoffDate: "2000-01-01", maxBranchesPerRepo: 10, maxReposPerOrg: 10,
   includeArchived: true, includeForks: true, includePersonalNamespace: false,
-  organizations: null, excludeOrganizations: [],
+  organizations: null, excludeOrganizations: [], excludeRepositories: [],
   concurrency: { organizations: 1, repositories: 1, branches: 1 }, // sequential in tests (derived stubs inherit)
 }) as unknown as Config;
 const KEY: WorkUnitKey = { configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "main" };

@@ -30,6 +30,7 @@ import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { GithubClient, GithubApiError, ThrottleExhausted, filterSortCapRepos, type RepoInfo, type BranchSnapshot, type BranchDiscoveryOutcome } from "./github.ts";
 import { planRepoBranches, planPolicyDiagnostics, policyAttribution, type BranchDecision } from "./branchPlanner.ts";
 import { PolicyMatchError, type CompiledBranchPolicy, type RepoPolicyCoverage } from "./branchPolicy.ts";
+import { RepoPolicyMatchError, type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
 import { discovered, discoveryFailed, type DiscoveryOutcome } from "./discovery.ts";
 import { computePolicyWarnings, isEmptyAllowlist, policyWarningLines, type PolicyWarning } from "./policyWarnings.ts";
 import { assertContained } from "./readOnlyGuard.ts";
@@ -46,13 +47,15 @@ import type { CliTermSet } from "./cliScanner.ts";
 import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
 import { logLine } from "./log.ts";
 
-// The three values that TOGETHER define one coherent scan/plan: the config, its hash, and the
-// compiled branch policy. Threaded as ONE object through runScan/processOwner/processRepo/runPlan so
-// the policy can never be dropped or mismatched against its config.
+// The values that TOGETHER define one coherent scan/plan: the config, its hash, and the compiled
+// branch + repository policies. Threaded as ONE object through runScan/processOwner/processRepo/runPlan
+// so a policy can never be dropped or mismatched against its config. Both policies are the SINGLE
+// load-time instances from loadConfig (never recompiled downstream).
 export interface AuditRuntime {
   readonly config: Config;
   readonly configHash: string;
   readonly branchPolicy: CompiledBranchPolicy;
+  readonly repositoryPolicy: CompiledRepositoryPolicy;
 }
 
 // ---- per-unit read helpers ------------------------------------------------------------------
@@ -121,8 +124,8 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
     process.stdout.write(ORCHESTRATE_HELP + "\n");
     return;
   }
-  const { config, configHash, branchPolicy } = await loadConfig(argv);
-  const runtime: AuditRuntime = { config, configHash, branchPolicy };
+  const { config, configHash, branchPolicy, repositoryPolicy } = await loadConfig(argv);
+  const runtime: AuditRuntime = { config, configHash, branchPolicy, repositoryPolicy };
   const trackedNames = config.packages.map((p) => p.name);
 
   logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
@@ -261,10 +264,11 @@ export async function runScan(
   logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
 
   // §5.A/§5.B discover + process, fanned out across owners bounded by concurrency.organizations (§5).
-  // A PolicyMatchError (a compiled branch matcher THREW at match time — fail-closed) is a GLOBAL
-  // config defect — never a per-repo soft error — so it ABORTS the whole run: mark it failed (excluded
-  // from latest selection) and rethrow the ORIGINAL operator-facing error unchanged (registered in
-  // KNOWN_OPERATOR_ERRORS).
+  // A policy-match fatal — a PolicyMatchError (a compiled BRANCH matcher threw at match time) or a
+  // RepoPolicyMatchError (a compiled REPOSITORY denylist glob threw during owner discovery) — is a
+  // GLOBAL config defect, never a per-repo soft error, so it ABORTS the whole run: mark it failed
+  // (excluded from latest selection) and rethrow the ORIGINAL operator-facing error unchanged (both are
+  // registered in KNOWN_OPERATOR_ERRORS).
   //
   // boundedPool SETTLES ALL: an owner that throws never tears its siblings down, and every owner fiber
   // (with its nested per-repo branch pools) DRAINS before this returns — so main()'s finally
@@ -295,23 +299,24 @@ export async function runScan(
 
   // Fatal lifecycle over the collected REAL failures (rejections). Under boundary-only cancellation
   // nothing throws an AbortError, so every rejection is a genuine fatal. failRun iff ANY is a
-  // PolicyMatchError (a config defect must exclude the run from latest) — even when a lower-index
-  // generic escape is the one surfaced. A run with NO PolicyMatchError stays resumable (no failRun).
-  // Rethrow the FIRST rejection in owner order (deterministic surfaced error) AFTER the full drain.
+  // policy-match fatal — a PolicyMatchError (branch) OR a RepoPolicyMatchError (repository denylist) —
+  // since a config defect must exclude the run from latest, even when a lower-index generic escape is
+  // the one surfaced. A run with NO policy-match fatal stays resumable (no failRun). Rethrow the FIRST
+  // rejection in owner order (deterministic surfaced error) AFTER the full drain.
   //
   // ACCEPTED trade-off (prompt fan-out cancellation): the predicate sees only COLLECTED failures. A
   // generic fatal (a DB-write failure, the bucket-wiring assertion) in an earlier owner now trips the
-  // run Aborter promptly (onFatal), which can SKIP a later sibling owner's would-be PolicyMatchError —
+  // run Aborter promptly (onFatal), which can SKIP a later sibling owner's would-be policy-match fatal —
   // so that run stays resumable rather than failed. This is benign: a fatal run emits NO report (the
   // throw below precedes completeRun/emitReport) and is never served as "latest" (that filters
   // status='completed'), and the config defect is DETERMINISTIC — it recurs and fails the next run
-  // THAT re-scans that branch (a run that never reaches it cannot surface it, but also emits no report
-  // implicating that branch). Guaranteeing failRun on a masked-behind-a-generic-fatal PolicyMatchError
+  // THAT re-scans that owner/branch (a run that never reaches it cannot surface it, but also emits no
+  // report implicating it). Guaranteeing failRun on a masked-behind-a-generic-fatal policy-match error
   // would need estate-wide up-front policy validation, out of scope here. The masking already existed
   // pre-fan-out (any abort stops siblings); onFatal only narrows the window.
   const failures = ownerResults.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
   if (failures.length > 0) {
-    if (failures.some((reason) => reason instanceof PolicyMatchError)) db.failRun(runId);
+    if (failures.some((reason) => reason instanceof PolicyMatchError || reason instanceof RepoPolicyMatchError)) db.failRun(runId);
     throw failures[0];
   }
 
@@ -383,7 +388,7 @@ export async function processOwner(
   // the org endpoint. (personalLogin here is the resolved preflight login; includePersonalNamespace
   // gates whether personal routing applies — the `personalLogin !== null` check is just defensive.)
   const isPersonal = runtime.config.includePersonalNamespace && personalLogin !== null && owner.toLowerCase() === personalLogin.toLowerCase();
-  const outcome = await discoverOwnerRepos(db, client, runtime.config, runId, owner, isPersonal);
+  const outcome = await discoverOwnerRepos(db, client, runtime.config, runtime.repositoryPolicy, runId, owner, isPersonal);
   if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
   // Repos stay SEQUENTIAL within an owner (§4): each repo's discover→plan→scan→reconcile must be
   // atomic (branches fan out INSIDE processRepo). Check the run-level abort before each repo so a
@@ -406,7 +411,8 @@ export async function processOwner(
 // only runtime caller. The --plan twin lives in runPlan, deliberately separate — plan mode has no DB
 // and counts failures into its totals instead.
 export async function discoverOwnerRepos(
-  db: AuditDb, client: GithubClient, config: Config, runId: string, owner: string, isPersonal: boolean,
+  db: AuditDb, client: GithubClient, config: Config, repositoryPolicy: CompiledRepositoryPolicy,
+  runId: string, owner: string, isPersonal: boolean,
 ): Promise<DiscoveryOutcome<RepoInfo>> {
   let repos: RepoInfo[];
   try {
@@ -424,9 +430,13 @@ export async function discoverOwnerRepos(
     logLine({ event: "discovery", org: owner, error: message });
     return discoveryFailed("failed");
   }
+  // The real scan consumes only `kept`; the denylist `excluded` list is surfaced by --plan (runPlan),
+  // not persisted here. A fatal RepoPolicyMatchError (match-time glob throw) propagates OUT of here to
+  // the run driver, which fails the run and rethrows it — never a silent scan of a denylisted repo.
   return discovered(filterSortCapRepos(repos, {
+    policy: repositoryPolicy,
     includeArchived: config.includeArchived, includeForks: config.includeForks, maxReposPerOrg: config.maxReposPerOrg,
-  }));
+  }).kept);
 }
 
 // Branch-head discovery for ONE repo as a typed outcome — extracted so both the run (here) and
@@ -928,6 +938,9 @@ export interface PlanTotals {
   readonly ownersSource: OwnersSource;
   readonly reposDiscovered: number;
   readonly reposKept: number;
+  // Repos dropped SPECIFICALLY by the excludeRepositories denylist (distinct from archived/fork/cap
+  // drops). Denylist-only; the per-owner excluded names are emitted as `plan-excluded` events.
+  readonly repositoriesExcluded: number;
   readonly branchesEligible: number;
   readonly branchesSkippedByCutoff: number;
   readonly branchesPastCap: number;
@@ -941,7 +954,7 @@ export interface PlanTotals {
   readonly discoveryErrors: number;
 }
 export async function runPlan(client: GithubClient, runtime: AuditRuntime, personalLogin: string): Promise<PlanTotals> {
-  const { config, branchPolicy } = runtime;
+  const { config, branchPolicy, repositoryPolicy } = runtime;
   // Warning parity: the empty-allowlist warning is emitted at mode entry, unconditionally, exactly as in
   // runScan — so --plan and the real run produce identical policy-warning events for the same config.
   if (isEmptyAllowlist(branchPolicy)) logLine({ event: "policy-warning", kind: "empty-allowlist" });
@@ -955,7 +968,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   if (client.cachesToDb) throw new Error("runPlan requires a cache-less client (db: null) — plan mode must not write api_cache");
   const { owners, source } = await resolveOwners(client, config, personalLogin);
 
-  let reposDiscovered = 0, reposKept = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, branchesExcludedByPolicy = 0, discoveryErrors = 0;
+  let reposDiscovered = 0, reposKept = 0, repositoriesExcluded = 0, branchesEligible = 0, branchesSkippedByCutoff = 0, branchesPastCap = 0, branchesExcludedByPolicy = 0, discoveryErrors = 0;
   let excludedByDeny = 0, excludedByAllow = 0, defaultBranchPolicyOverrides = 0; // policy diagnostics (overlays)
   const coverages: RepoPolicyCoverage[] = []; // per successfully-discovered repo, for the warning finalizer
   for (const owner of owners) {
@@ -969,10 +982,20 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
       continue;
     }
     reposDiscovered += repos.length;
-    const kept = filterSortCapRepos(repos, {
+    // --plan applies the SAME denylist the real scan does (deny before archived/fork + cap), so
+    // reposKept already reflects denial. A fatal RepoPolicyMatchError propagates with NO DB write
+    // (plan mode has no DB — the zero-write invariant holds).
+    const { kept, excluded } = filterSortCapRepos(repos, {
+      policy: repositoryPolicy,
       includeArchived: config.includeArchived, includeForks: config.includeForks, maxReposPerOrg: config.maxReposPerOrg,
     });
     reposKept += kept.length;
+    repositoriesExcluded += excluded.length;
+    // DX: surface the denied owner/repo names (original case, raw order) at PREVIEW time — a developer
+    // confirms each pattern caught the repos they meant BEFORE a repo silently goes missing from a real
+    // audit. Emitted per owner (only when it denied something), BEFORE that owner's per-repo plan events.
+    // This is the confirm-a-pattern-is-live path that replaces the (deliberately absent) dead-pattern warning.
+    if (excluded.length > 0) logLine({ event: "plan-excluded", org: owner, repositories: excluded });
     for (const repo of kept) {
       // --plan has no DB, so it consumes the client directly rather than via discoverBranchHeads. It
       // must still take the default branch from the SAME snapshot as the heads (§5.B) — a --plan that
@@ -1011,7 +1034,7 @@ export async function runPlan(client: GithubClient, runtime: AuditRuntime, perso
   // Emit the unmatched-pattern warnings (before plan-summary) — identical to runScan's set.
   const warnings = emitPolicyWarnings(branchPolicy, coverages);
 
-  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, excludedByDeny, excludedByAllow, defaultBranchPolicyOverrides, discoveryErrors };
+  const totals: PlanTotals = { owners, ownersSource: source, reposDiscovered, reposKept, repositoriesExcluded, branchesEligible, branchesSkippedByCutoff, branchesPastCap, branchesExcludedByPolicy, excludedByDeny, excludedByAllow, defaultBranchPolicyOverrides, discoveryErrors };
   logLine({ event: "plan-summary", ...totals });
   process.stderr.write(planSummaryText(config, totals, warnings));
   return totals;
@@ -1027,7 +1050,7 @@ export function planSummaryText(
     "",
     "PLAN — preview only: no database opened, nothing scanned, nothing written",
     `  Owners (${t.ownersSource}):  ${t.owners.join(", ")}`,
-    `  Repos:                ${t.reposDiscovered} discovered, ${t.reposKept} kept after archive/fork filters and caps`,
+    `  Repos:                ${t.reposDiscovered} discovered, ${t.reposKept} kept after archive/fork filters and caps${t.repositoriesExcluded > 0 ? ` (${t.repositoriesExcluded} excluded first by the repository denylist)` : ""}`,
     `  Branches:             ${t.branchesEligible} eligible to scan (a real run may skip already-current ones)`,
     `                        ${t.branchesSkippedByCutoff} skipped by cutoff (< ${config.cutoffDate}) · ${t.branchesPastCap} past the per-repo cap (${config.maxBranchesPerRepo}) · ${t.branchesExcludedByPolicy} excluded by branch policy`,
     // Policy breakdown, shown only when policy actually removed or overrode branches. Wording avoids

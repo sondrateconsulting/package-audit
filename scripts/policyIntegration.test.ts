@@ -17,8 +17,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso, type RunRecord } from "./db.ts";
 import { GithubClient, type SpawnFn } from "./github.ts";
-import { runScan, type AuditRuntime } from "./orchestrate.ts";
+import { runScan, runPlan, type AuditRuntime } from "./orchestrate.ts";
 import { compileBranchPolicy } from "./branchPolicy.ts";
+import { compileRepositoryPolicy } from "./repositoryPolicy.ts";
 import { buildReport } from "./report.ts";
 import { exportRun } from "./export.ts";
 import { buildCompare } from "./compare.ts";
@@ -30,7 +31,7 @@ const NO_ARGS: OrchestrateArgs = { configPath: null, plan: false, fresh: false, 
 // A full Config, policy fields overridable per scenario. packages default []: no registry fetch.
 const mkConfig = (root: string, over: Partial<Config> = {}): Config => ({
   githubHost: "github.com", organizations: ["org-a"], excludeOrganizations: [],
-  branches: null, excludeBranches: [], includePersonalNamespace: false, includeForks: false, includeArchived: false,
+  branches: null, excludeBranches: [], excludeRepositories: [], includePersonalNamespace: false, includeForks: false, includeArchived: false,
   maxReposPerOrg: null, maxBranchesPerRepo: 25, cutoffDate: "2024-01-01",
   concurrency: { organizations: 1, repositories: 1, branches: 1 },
   packages: [], excludeDirGlobs: [],
@@ -39,7 +40,7 @@ const mkConfig = (root: string, over: Partial<Config> = {}): Config => ({
 });
 
 const rt = (config: Config, configHash: string): AuditRuntime =>
-  ({ config, configHash, branchPolicy: compileBranchPolicy(config.branches, config.excludeBranches) });
+  ({ config, configHash, branchPolicy: compileBranchPolicy(config.branches, config.excludeBranches), repositoryPolicy: compileRepositoryPolicy(config.excludeRepositories) });
 
 // One org repo `svc` (default main) + GraphQL heads + EMPTY trees; any git spawn is a failure (pins the
 // no-clone assumption — a non-truncated tree never triggers cloneShallow).
@@ -237,6 +238,110 @@ describe("branch allow/deny — a policy-excluded branch never leaks stale findi
       expect(usageCsv).not.toContain(",feature/x,");
       expect(usageCsv).not.toContain("src/poison.ts"); // the poison, specifically, is excluded by status='scanned'
       expect(depCsv).not.toContain(",feature/x,");
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- repository denylist (excludeRepositories) END-TO-END seam ----------------------------------
+// The layers compose: a config with excludeRepositories → the compiled repositoryPolicy on the runtime →
+// filterSortCapRepos denies matching repos on the RAW list (before archived/fork + cap) → only the
+// survivors reach processRepo → persisted run_unit_head + the report agree on what was scanned.
+describe("repository denylist — end-to-end scan/plan seam", () => {
+  interface RepoFixture { name: string; archived: boolean; fork: boolean; pushed: string }
+  // Three org-a repos. The two denied ones are NEWER than `svc` and one is archived, one forked — so if
+  // denial ran AFTER the archived/fork filter or the cap, the outcome would differ. Denial runs FIRST on
+  // the raw list, so `svc` (oldest, clean) is the sole survivor and the only repo ever scanned.
+  const REPOS: RepoFixture[] = [
+    { name: "svc", archived: false, fork: false, pushed: "2025-01-01T00:00:00Z" },           // OLDEST, kept
+    { name: "Legacy-API", archived: true, fork: false, pushed: "2025-03-01T00:00:00Z" },      // NEWEST, denied (case-insensitively) + archived
+    { name: "legacy-portal", archived: false, fork: true, pushed: "2025-02-01T00:00:00Z" },   // denied + forked
+  ];
+  const listingBody = (repos: RepoFixture[]): string =>
+    `HTTP/2.0 200 X\r\n\r\n${JSON.stringify(repos.map((r) => ({ name: r.name, owner: { login: "org-a" }, default_branch: "main", pushed_at: r.pushed, archived: r.archived, fork: r.fork, private: false })))}`;
+  // A multi-repo client (the shared scanClient hardcodes one repo). `calls` is a ledger of every spawn's
+  // args, so a test can prove no denied repo was ever REQUESTED (denied repos are dropped before branch
+  // discovery, so their names never appear in a heads/tree request — only in the discovery RESPONSE body).
+  const multiRepoClient = (root: string, repos: RepoFixture[], calls: string[][]): GithubClient => {
+    const spawn: SpawnFn = async (bin, args) => {
+      calls.push(args);
+      if (bin.endsWith("/git")) throw new Error(`unexpected git spawn (${args.join(" ")})`);
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: "aaaa000000000000000000000000000000000001", date: "2025-06-01T00:00:00Z" }], "main") };
+      if (args.some((a) => a.includes("git/trees"))) {
+        const ep = args.find((a) => a.includes("/git/trees/")) ?? "";
+        const sha = decodeURIComponent(ep.split("/git/trees/")[1]?.split("?")[0] ?? "");
+        return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ sha, truncated: false, tree: [] })}` };
+      }
+      return { exitCode: 0, stderr: "", stdout: listingBody(repos) };
+    };
+    return new GithubClient({
+      githubHost: "github.com", db: null, spawnImpl: spawn, sleepImpl: async () => {},
+      env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
+    });
+  };
+  const noDeniedRepoRequested = (calls: string[][]): boolean =>
+    calls.every((a) => { const j = a.join(" "); return !j.includes("Legacy-API") && !j.includes("legacy-portal"); });
+
+  test("runScan: denial runs before archived/fork + cap; only the surviving repo is scanned (case-insensitive, cap:1)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "repo-deny-seam-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    try {
+      const calls: string[][] = [];
+      // deny "org-a/legacy-*" — case-insensitively catches "org-a/Legacy-API" AND "org-a/legacy-portal",
+      // both NEWER than svc; with maxReposPerOrg:1, deny-AFTER-cap would give the slot to a denied repo
+      // and scan nothing, so `svc` being scanned proves deny-before-cap end-to-end.
+      const cfg = mkConfig(root, { excludeRepositories: ["org-a/legacy-*"], maxReposPerOrg: 1 });
+      const ev = await captureJsonl(() => runScan(db, multiRepoClient(root, REPOS, calls), rt(cfg, "hashRepoDeny"), NO_ARGS, null));
+      const runId = runIdOf(ev);
+      expect(db.getRun(runId)!.status).toBe("completed"); // a denylisted estate is a valid scan, not a failure
+      // ONLY svc produced run_unit_head rows — the denied repos were never planned or scanned
+      const scannedRepos = (db.read(`SELECT DISTINCT repository FROM run_unit_head WHERE run_id = ? ORDER BY repository`).all(runId) as Array<{ repository: string }>).map((r) => r.repository);
+      expect(scannedRepos).toEqual(["svc"]);
+      // and no gh call ever REQUESTED a denied repo (dropped before branch discovery)
+      expect(noDeniedRepoRequested(calls)).toBe(true);
+      // the report agrees: exactly one repository scanned
+      const report = buildReport(db, db.getRun(runId)!) as { summary: { repositoriesScanned: number } };
+      expect(report.summary.repositoriesScanned).toBe(1);
+      // Resume-safety note: adding a non-empty excludeRepositories CHANGES config_hash (pinned in
+      // config.test.ts), so a denied repo can never surface in a SAME-HASH resumed run — the read model is
+      // run-scoped and a denied repo has NO run_unit_head row in this run. No per-repo reconciliation is
+      // built or needed (deliberately out of scope — repos have no fact table).
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("--plan over the same denylist: totals = 3 discovered / 1 kept / 2 excluded; plan-excluded lists both denied repos in ORIGINAL case", async () => {
+    const root = mkdtempSync(join(tmpdir(), "repo-deny-plan-"));
+    const calls: string[][] = [];
+    const cfg = mkConfig(root, { excludeRepositories: ["org-a/legacy-*"], maxReposPerOrg: 1 });
+    let totals: Awaited<ReturnType<typeof runPlan>> | undefined;
+    const ev = await captureJsonl(async () => { totals = await runPlan(multiRepoClient(root, REPOS, calls), rt(cfg, "hashRepoDenyPlan"), "rvo"); });
+    expect(totals!.reposDiscovered).toBe(3);
+    expect(totals!.reposKept).toBe(1);
+    expect(totals!.repositoriesExcluded).toBe(2);
+    const excluded = ev.find((e) => e["event"] === "plan-excluded");
+    expect(excluded!["org"]).toBe("org-a");
+    // ORIGINAL case, raw discovery order (Legacy-API listed before legacy-portal)
+    expect(excluded!["repositories"]).toEqual(["org-a/Legacy-API", "org-a/legacy-portal"]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("every repo denied → the run COMPLETES with zero repositories scanned (a valid empty scan)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "repo-deny-all-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    try {
+      const calls: string[][] = [];
+      const cfg = mkConfig(root, { excludeRepositories: ["org-a/*"] }); // denies svc AND both legacy repos
+      const ev = await captureJsonl(() => runScan(db, multiRepoClient(root, REPOS, calls), rt(cfg, "hashAllDeny"), NO_ARGS, null));
+      const runId = runIdOf(ev);
+      expect(db.getRun(runId)!.status).toBe("completed");
+      expect((db.read(`SELECT COUNT(*) AS n FROM run_unit_head WHERE run_id = ?`).get(runId) as { n: number }).n).toBe(0);
+      // no branch discovery ever happened — nothing survived denial
+      expect(calls.some((a) => a.some((x) => x === "graphql"))).toBe(false);
     } finally {
       db.close();
       rmSync(root, { recursive: true, force: true });

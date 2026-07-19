@@ -34,6 +34,11 @@ export const KNOWN_OPERATOR_ERRORS: ReadonlySet<string> = new Set([
   //                     coherence). Both are operator-actionable; the run driver fails the run and
   //                     rethrows it UNCHANGED (unlike BranchPolicyError, which loadConfig always
   //                     converts to ConfigError).
+  "RepoPolicyMatchError", // repositoryPolicy.ts — an excludeRepositories glob threw at .match() time
+  //                         (fail-closed: a throw is FATAL, never a `false` that would silently scan a
+  //                         denylisted repo). None is known to do this on the exercised Bun, so the
+  //                         class is insurance. The run driver fails the run and rethrows it UNCHANGED
+  //                         (unlike RepositoryPolicyError, which loadConfig always converts to ConfigError).
 ]);
 
 export function isKnownOperatorError(e: unknown): e is Error {

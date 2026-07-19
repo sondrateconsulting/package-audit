@@ -109,6 +109,16 @@ below).
                                        //   (always scanned); it records the counterfactual instead — a
                                        //   policy_status on a SCANNED row is the default-branch
                                        //   override, NOT an exclusion (§3).
+  "excludeRepositories": [],           // DENY-ONLY denylist over `owner/repo` full names (exact or Bun
+                                       //   glob). CASE-INSENSITIVE (ASCII fold), UNLIKE case-sensitive
+                                       //   `excludeBranches` — GitHub repo identity is case-insensitive.
+                                       //   `*` does not cross '/' (`["*"]` matches nothing); `**` does.
+                                       //   Applied to the RAW list BEFORE archived/fork + `maxReposPerOrg`
+                                       //   (a denied repo never consumes a cap slot). Leading '!'/empty
+                                       //   rejected. No dead-pattern warning — confirm via `--plan`. Like
+                                       //   the branch keys, folded into config_hash ONLY when non-empty
+                                       //   (gated INDEPENDENTLY of the branch-policy keys, over the
+                                       //   ASCII-folded form).
   "cutoffDate": "2024-01-01",          // ISO date; ignore non-default branches with no commits since this
   "maxBranchesPerRepo": 25,
   "maxReposPerOrg": null,              // null = unlimited
@@ -770,11 +780,18 @@ A. Resolve the effective owner list per the NORMATIVE algorithm in §1 (base set
    personal repos; `type` is mutually exclusive with `affiliation` here, so forks are
    likewise filtered CLIENT-SIDE); read each page's rate-limit headers (§4) and follow
    `Link: rel="next"` until absent, accumulating the repo objects into one flat list.
-   Then, in TypeScript: filter out `archived` when `includeArchived=false` (the REST
-   endpoints have no server-side archived filter) and forks per policy (exclude by default
-   so a package's own forks don't double-count; `includeForks: true` opts in), SORT by
-   `pushed_at` DESC (nulls last), and TAKE the first N when maxReposPerOrg is finite (all
-   when null). The REST shape is snake_case (`pushed_at`, `archived`, `fork`,
+   Then, in TypeScript, IN THIS ORDER: FIRST apply the `excludeRepositories` denylist to the
+   RAW accumulated list — drop every repo whose `owner/repo` full name matches a compiled
+   pattern (case-INsensitive ASCII fold; exact-equality first, then a fail-closed glob whose
+   match-time throw is FATAL, never a silent keep) — BEFORE the archived/fork filter AND the
+   cap, so a denylisted repo never consumes a `maxReposPerOrg` slot an eligible repo could use
+   (the repo-grain analog of branch policy running before the cap); THEN filter out `archived`
+   when `includeArchived=false` (the REST endpoints have no server-side archived filter) and
+   forks per policy (exclude by default so a package's own forks don't double-count;
+   `includeForks: true` opts in), SORT by `pushed_at` DESC (nulls last), and TAKE the first N
+   when maxReposPerOrg is finite (all when null). The denylist is deny-only and case-insensitive
+   (UNLIKE case-sensitive `excludeBranches`), with NO dead-pattern warning — `--plan` emits the
+   excluded `owner/repo` names (`plan-excluded`) + a `repositoriesExcluded` count instead. The REST shape is snake_case (`pushed_at`, `archived`, `fork`,
    `default_branch` as a flat STRING) — map it into the one internal shape the rest of the
    workflow uses, but DELIBERATELY DROP `default_branch`: this listing is a DIFFERENT (older)
    EPOCH than §5.B branch discovery — the whole owner is listed up front, then each repo's
