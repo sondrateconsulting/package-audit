@@ -163,6 +163,45 @@ describe("tui purity (grep-enforced, §U8.14)", () => {
     }
   });
 
+  test("no display file reaches a Bun IO surface or destructures stdout off the global process", () => {
+    // Bun.file(path).writer(), Bun.stdout / Bun.stderr (each with .writer()), and Bun.write are
+    // standard-library IO routes that need NO module import — they bypass both chokepoints
+    // above — and `{ stdout } = process` grabs the machine stream off the GLOBAL process object
+    // without the dotted token the stdout scan matches. The display layer has no legitimate use
+    // for any of them: its render target arrives injected (the lifecycle's sealable proxy), and
+    // its one fs user is lifecycle.ts's audited divert quartet. Banned outright, comments
+    // included — lifecycle.ts gets no exemption here because the divert region is node:fs only.
+    const BUN_IO_RE = /\bBun\s*\.\s*(?:file|stdout|stderr|write)\b/;
+    const STDOUT_DESTRUCTURE_RE = /\{[^}]*\bstdout\b[^}]*\}\s*=\s*process\b/;
+    for (const { file, src } of tuiSources()) {
+      expect({ file, bunIo: BUN_IO_RE.test(src), stdoutDestructure: STDOUT_DESTRUCTURE_RE.test(src) }).toEqual({
+        file,
+        bunIo: false,
+        stdoutDestructure: false,
+      });
+    }
+    // meta: the evasive forms match…
+    const bunHits = ['Bun.file("/tmp/x").writer()', "Bun . stdout", "await Bun.write(dest, data)", "Bun.stderr.writer()", "Bun\n  .file(p)"];
+    for (const s of bunHits) expect({ s, hit: BUN_IO_RE.test(s) }).toEqual({ s, hit: true });
+    const destructureHits = [
+      "const { stdout } = process",
+      "const { stdout: out } = process",
+      "let { stderr, stdout } = process;",
+      "({ stdout } = process)",
+    ];
+    for (const s of destructureHits) expect({ s, hit: STDOUT_DESTRUCTURE_RE.test(s) }).toEqual({ s, hit: true });
+    // …and the neighboring legitimate forms do not
+    const bunMisses = ["Bun.env", "myBun.file(x)", "Bundler.stdout", "Bun.version", "the bundle.stdout capture"];
+    for (const s of bunMisses) expect({ s, hit: BUN_IO_RE.test(s) }).toEqual({ s, hit: false });
+    const destructureMisses = [
+      "const { stdout } = deps.streams",
+      "const { stdout } = opts",
+      "const { CI } = process.env",
+      "const { columns } = stream",
+    ];
+    for (const s of destructureMisses) expect({ s, hit: STDOUT_DESTRUCTURE_RE.test(s) }).toEqual({ s, hit: false });
+  });
+
   test("the fs-import scanner recognizes every promised form and rejects near-misses (meta)", () => {
     const hits = [
       'import { openSync } from "node:fs"',
