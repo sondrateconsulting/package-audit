@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { logLine, setLogSink, setLogTap } from "../log.ts";
 import { setProgressSink, hasProgressSink, emitProgress, reportTuiFailure, resetTuiFailure, tuiFailure, type ProgressEvent } from "../progress.ts";
 import { ReadOnlyViolation } from "../readOnlyGuard.ts";
-import type { TuiStore } from "./store.ts";
+import { createTuiStore, type TuiStore } from "./store.ts";
 import {
   logPathFor, utcLogStamp, makeDivertPathFor, realDivertIo, makeSealableStderr, runWithTui,
   DIVERT_OPEN_ATTEMPTS, type DivertIo, type TuiDeps,
@@ -177,20 +177,7 @@ const until = async (cond: () => boolean, ms = 2000): Promise<boolean> => {
   return cond();
 };
 
-function makeStore(): TuiStore {
-  let version = 0;
-  let logPath: string | null = null;
-  return {
-    get version() {
-      return version;
-    },
-    snapshot: () => ({ logPath }),
-    dispatch(e: ProgressEvent): void {
-      if (e.type === "divert") logPath = e.path;
-      version++;
-    },
-  };
-}
+const makeStore = (): TuiStore => createTuiStore(() => 1_000);
 
 // deps builder: everything faked; individual tests override
 function makeDeps(over: Partial<TuiDeps> & { divert?: boolean } = {}): { deps: TuiDeps; stderr: FakeStream; io: FakeIo; timers: FakeTimers; capture: MountCapture; handle: FakeHandle } {
@@ -747,13 +734,13 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     const capture: MountCapture = { store: null, opts: null };
     const { deps } = makeDeps({ divert: true });
     deps.mountImpl = makeFakeMount(handle, capture);
-    deps.storeImpl = () => ({
-      version: 0,
-      snapshot: () => ({ logPath: null }),
-      dispatch(e: ProgressEvent): void {
+    deps.storeImpl = () => {
+      const s = makeStore();
+      s.dispatch = (e: ProgressEvent): void => {
         if (e.type === "divert") throw new Error("setup-time fold bug"); // trips DURING setup
-      },
-    });
+      };
+      return s;
+    };
     const { done } = spyStdout(async () => {
       await runWithTui(deps, async () => {
         order.push("body");
