@@ -15,6 +15,7 @@ import type { AuditDb } from "./db.ts";
 import type { DiscoveryFailure } from "./discovery.ts";
 import { isIsoInstant } from "./isoDate.ts";
 import { logLine } from "./log.ts";
+import { emitProgress, hasProgressSink, nextProgressId } from "./progress.ts";
 import { classifyRepository, type CompiledRepositoryPolicy } from "./repositoryPolicy.ts";
 
 // ---- errors -----------------------------------------------------------------------------
@@ -78,6 +79,57 @@ export type SpawnFn = (
   // `signal` aborts when the caller's wall-clock deadline expires — the impl must kill the child.
   opts: { env: Record<string, string>; cwd?: string; signal?: SpawnAbortSignal },
 ) => Promise<SpawnResult>;
+
+// The subprocess kinds the client spawns. Threaded EXPLICITLY through spawnBounded (PROMPT-TUI
+// §U3.1): binPaths is injectable and tests point several tools at the same binary, so the tool
+// can never be inferred from the path — each call site knows what it is.
+export type SpawnTool = "gh" | "git" | "tar";
+
+// PURE, TOTAL, never-throwing display label for a spawn span (PROMPT-TUI §U3.1). Allowlist-shaped
+// — `gh api <endpoint>` / `gh api graphql` / `gh <verb>` / `git clone <owner/repo>` (parsed from
+// the URL positional) / `git <verb>` / `tar extract|list|--version` — never a raw argv join, and
+// capped at 100 chars. argv never carries credentials (§6), but the label still shows only the
+// operation identity. Built ONLY when a progress sink is installed.
+export const SPAWN_LABEL_MAX = 100;
+export function spawnLabel(tool: SpawnTool, args: readonly string[]): string {
+  const cap = (s: string): string => (s.length > SPAWN_LABEL_MAX ? s.slice(0, SPAWN_LABEL_MAX - 1) + "…" : s);
+  try {
+    const first = args[0] ?? "";
+    if (tool === "gh") {
+      if (first !== "api") return cap(first === "" ? "gh" : `gh ${first}`);
+      // gh api [-i] <endpoint> …: the endpoint is the first non-flag after "api"
+      for (let i = 1; i < args.length; i++) {
+        const a = args[i]!;
+        if (a === "-H" || a === "-f" || a === "-F") {
+          i++; // value-taking flags: skip the value
+          continue;
+        }
+        if (a.startsWith("-")) continue;
+        return cap(a === "graphql" ? "gh api graphql" : `gh api ${a}`);
+      }
+      return "gh api";
+    }
+    if (tool === "git") {
+      if (first !== "clone") return cap(first === "" ? "git" : `git ${first}`);
+      // label the repo, never the full URL: find the https positional, take the last two path segments
+      for (const a of args.slice(1)) {
+        if (!a.startsWith("https://")) continue;
+        const path = new URL(a).pathname.replace(/\.git$/, "").replace(/^\/+|\/+$/g, "");
+        const segments = path.split("/").filter((s) => s !== "");
+        if (segments.length >= 2) return cap(`git clone ${segments.slice(-2).join("/")}`);
+        break;
+      }
+      return "git clone";
+    }
+    // tar
+    if (args.includes("--version")) return "tar --version";
+    if (args.some((a) => a === "--extract" || /^-[A-Za-z]*x/.test(a))) return "tar extract";
+    if (args.some((a) => a === "--list" || /^-[A-Za-z]*t/.test(a))) return "tar list";
+    return "tar";
+  } catch {
+    return tool; // total on hostile argv — the label is display plumbing, never control flow
+  }
+}
 
 const MAX_SPAWN_OUTPUT_BYTES = 110 * 1024 * 1024; // raw contents cap is 100 MB (§5.C) + slack
 // §4 hardening: SIGTERM is refusable — a signal-trapping/wedged child, or a descendant that
@@ -882,22 +934,34 @@ export type BranchDiscoveryOutcome = { readonly ok: true; readonly snapshot: Bra
 class Semaphore {
   private available: number;
   private readonly waiters: Array<() => void> = [];
-  constructor(n: number) {
+  // Waiter-pressure gauge (PROMPT-TUI §U3.2): invoked SYNCHRONOUSLY whenever the waiter queue
+  // grows or shrinks. The callback must never throw (the client passes a never-throwing
+  // progress emit); in-flight count needs no callback — it is the store's live span set.
+  private readonly onWaitersChanged: ((waiting: number) => void) | undefined;
+  constructor(n: number, onWaitersChanged?: (waiting: number) => void) {
     this.available = n;
+    this.onWaitersChanged = onWaitersChanged;
   }
   async acquire(): Promise<() => void> {
     if (this.available > 0) {
       this.available--;
     } else {
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
+      await new Promise<void>((resolve) => {
+        this.waiters.push(resolve);
+        this.onWaitersChanged?.(this.waiters.length);
+      });
     }
     let released = false;
     return () => {
       if (released) return;
       released = true;
       const next = this.waiters.shift();
-      if (next) next();
-      else this.available++;
+      if (next) {
+        this.onWaitersChanged?.(this.waiters.length);
+        next();
+      } else {
+        this.available++;
+      }
     };
   }
 }
@@ -910,6 +974,12 @@ class Semaphore {
 function whichIn(env: Env, bin: string): string {
   const path = env["PATH"];
   return (path !== undefined ? Bun.which(bin, { PATH: path }) : Bun.which(bin)) ?? bin;
+}
+
+// Rate-limit header → integer for the display snapshot; absent/non-numeric folds to null.
+function headerInt(value: string | undefined): number | null {
+  if (value === undefined || value === "" || !/^\d+$/.test(value.trim())) return null;
+  return Number(value.trim());
 }
 
 const RAW_ACCEPT = "application/vnd.github.raw+json";
@@ -936,7 +1006,7 @@ export interface GithubClientOptions {
 }
 
 interface Bucket {
-  label: string;
+  label: "core" | "graphql"; // also the progress-event resource discriminant (PROMPT-TUI §U3.3)
   // The published pause window end — every caller in this bucket sleeps until here (or, if the tail
   // is unfunded, throws). Published even on budget overflow so a queued caller can never inherit a
   // freed slot and spawn INTO an active rate-limit window (§4 admission).
@@ -995,7 +1065,11 @@ export class GithubClient {
       tar: whichIn(this.baseEnv, "tar"),
     };
     this.ghEnv = buildGhEnv(this.baseEnv, this.githubHost);
-    this.sem = new Semaphore(concurrency);
+    // PROMPT-TUI §U3.2: the waiter gauge. Both clients (preflight + scan) emit through the same
+    // hub, so their waiters simply aggregate; emitProgress never throws.
+    this.sem = new Semaphore(concurrency, (waiting) => {
+      if (hasProgressSink()) emitProgress({ type: "spawn-queue", waiting });
+    });
     this.tempRoot = opts.tempRoot ?? realpathSync(tmpdir());
   }
 
@@ -1012,6 +1086,7 @@ export class GithubClient {
   // The loser promise gets a no-op catch so a late rejection (e.g. the byte cap) is never
   // unhandled.
   private async spawnBounded(
+    tool: SpawnTool,
     bin: string,
     args: string[],
     opts: { env: Record<string, string>; cwd?: string },
@@ -1038,6 +1113,14 @@ export class GithubClient {
         resolve();
       }, this.spawnTimeoutMs);
     });
+    // PROMPT-TUI §U3.1: ONE span per attempt through the one funnel every gh/git/tar spawn flows
+    // through (preflight and plan included). Synchronous, O(1), no-throw; label construction is
+    // gated behind the sink check (§U0 — a bare run pays only this boolean).
+    let spanId = 0;
+    if (hasProgressSink()) {
+      spanId = nextProgressId();
+      emitProgress({ type: "spawn-start", id: spanId, tool, label: spawnLabel(tool, args) });
+    }
     try {
       const spawned = this.spawn(bin, args, { ...opts, signal });
       // the settle observer doubles as the no-op catch (a late rejection is never unhandled)
@@ -1068,6 +1151,8 @@ export class GithubClient {
     } finally {
       clearTimeout(timer);
       clearTimeout(settleTimer);
+      // deadline timeouts and byte-cap kills still end their span (finally-scoped)
+      if (spanId !== 0) emitProgress({ type: "spawn-end", id: spanId });
     }
   }
 
@@ -1083,7 +1168,7 @@ export class GithubClient {
     assertReadOnlyGh(args);
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
+      return await this.spawnBounded("gh", this.bins.gh, args, { env: this.ghEnv });
     } finally {
       release();
     }
@@ -1109,9 +1194,13 @@ export class GithubClient {
   // and spawnBounded nothing can interleave to arm a pause. A pause seen live releases the slot and
   // re-loops (waitBucket sleeps it out, or ThrottleExhausted terminates the loop for an unfunded
   // budget-overflow tail — so the loop always makes progress).
+  // Analyze contract extension (PROMPT-TUI §U3.3): the closures stay PURE and return DATA only —
+  // `rateLimitHeaders` is the headers object each closure ALREADY parsed (a reference, zero new
+  // allocation; omitted on the no-response path). ghBucketedAttempt — already impure — derives
+  // and emits the rate-limit snapshot, gated on hasProgressSink(), inside the lease.
   private async ghBucketedAttempt<T>(
     args: string[], bucket: Bucket,
-    analyze: (res: SpawnResult, now: number) => { outcome: T; pauseUntilMs: number | null },
+    analyze: (res: SpawnResult, now: number) => { outcome: T; pauseUntilMs: number | null; rateLimitHeaders?: Record<string, string> },
   ): Promise<T> {
     assertSpawnAllowed(this.bins.gh, args);
     assertReadOnlyGh(args);
@@ -1122,10 +1211,21 @@ export class GithubClient {
         continue;  // re-loop: acquireRespectingPause sleeps the window, re-acquires, re-checks
       }
       try {
-        const res = await this.spawnBounded(this.bins.gh, args, { env: this.ghEnv });
+        const res = await this.spawnBounded("gh", this.bins.gh, args, { env: this.ghEnv });
         const now = this.now();
-        const { outcome, pauseUntilMs } = analyze(res, now);
+        const { outcome, pauseUntilMs, rateLimitHeaders } = analyze(res, now);
+        // `!== null`/`!== undefined` on purpose, never truthiness: a zero-valued injected horizon
+        // must not change the contract, and an empty headers object is still a live response.
         if (pauseUntilMs !== null) this.armBucketPause(bucket, pauseUntilMs, now);
+        if (rateLimitHeaders !== undefined && hasProgressSink()) {
+          emitProgress({
+            type: "rate-limit",
+            resource: bucket.label,
+            remaining: headerInt(rateLimitHeaders["x-ratelimit-remaining"]),
+            limit: headerInt(rateLimitHeaders["x-ratelimit-limit"]),
+            resetEpochSec: headerInt(rateLimitHeaders["x-ratelimit-reset"]),
+          });
+        }
         return outcome;
       } finally {
         release();
@@ -1166,7 +1266,7 @@ export class GithubClient {
     // REST/GraphQL quota, so it sits OUTSIDE the rate-limit buckets — only the subprocess cap bounds it.
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded(this.bins.git, args, { env, cwd });
+      return await this.spawnBounded("git", this.bins.git, args, { env, cwd });
     } finally {
       release();
     }
@@ -1230,7 +1330,7 @@ export class GithubClient {
     // this level, never inside spawnBounded (gh already wraps it → double-acquire deadlock at 1).
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded(this.bins.tar, args, { env: buildTarEnv(this.baseEnv) });
+      return await this.spawnBounded("tar", this.bins.tar, args, { env: buildTarEnv(this.baseEnv) });
     } finally {
       release();
     }
@@ -1264,9 +1364,29 @@ export class GithubClient {
     // the window's wall-clock cost was charged ONCE when it was armed (the union tail), not once per
     // sleeper — fixing the old per-caller ledger that tripped the budget N× too early for the
     // concurrent caller this feature adds.
-    if (bucket.pausedUntilMs > bucket.accountedUntilMs)
+    if (bucket.pausedUntilMs > bucket.accountedUntilMs) {
+      // reason "budget": the cumulative pause budget is spent — a RUN-level condition (PROMPT-TUI
+      // §U3.4; the store's sticky flag), distinct from a single call's retries running out.
+      this.emitThrottle(bucket, "exhausted", "budget");
       throw new ThrottleExhausted(`${bucket.label} bucket (cumulative pause budget ${MAX_TOTAL_PAUSE_MS}ms exceeded)`);
+    }
+    this.emitThrottle(bucket, "waiting"); // with the horizon it is about to sleep to
     await this.sleep(wait); // semaphore NOT held while sleeping
+  }
+
+  // Throttle-state display events (PROMPT-TUI §U3.4): synchronous, no-throw, fully gated — a run
+  // with no sink pays one boolean. The event carries the PUBLISHED horizon and the CURRENT
+  // (post-funding, for the armed emit) budget.
+  private emitThrottle(bucket: Bucket, state: "armed" | "waiting" | "exhausted", reason?: "budget" | "retries"): void {
+    if (!hasProgressSink()) return;
+    emitProgress({
+      type: "throttle",
+      bucket: bucket.label,
+      state,
+      ...(reason !== undefined ? { reason } : {}),
+      untilMs: bucket.pausedUntilMs > 0 ? bucket.pausedUntilMs : null,
+      budgetSpentMs: bucket.budgetSpentMs,
+    });
   }
 
   // Acquire a slot with the pause re-checked AFTER acquisition: a caller queued on the
@@ -1298,24 +1418,32 @@ export class GithubClient {
   //      it). If funding the tail
   //      would exceed MAX_TOTAL_PAUSE_MS, publish the pause but do NOT advance accountedUntilMs — the
   //      tail stays unfunded and waitBucket throws ThrottleExhausted for it instead of over-sleeping.
+  // SINGLE-EXIT (PROMPT-TUI §U3.4): the early returns became one try/finally so the armed event
+  // is emitted exactly ONCE per arm — after the horizon publish AND the funding logic — carrying
+  // the published horizon and the POST-funding budgetSpentMs (the displayed budget is never one
+  // arm behind), for funded, already-funded, and unfunded-overflow arms alike.
   private armBucketPause(bucket: Bucket, untilMs: number, now: number): void {
-    bucket.pausedUntilMs = Math.max(bucket.pausedUntilMs, untilMs);
-    // Fund toward the PUBLISHED horizon (pausedUntilMs), not this candidate's raw untilMs. Every
-    // caller sleeps to pausedUntilMs — or throws — so that horizon is the only wall-clock a charge can
-    // buy. Charging raw untilMs let a SHORTER pause arriving under an already-published-but-UNFUNDED
-    // longer tail spend budget on coverage no caller ever sleeps (waitBucket throws for the WHOLE
-    // window while the tail is unfunded): a phantom charge that, under fan-out where sibling callers
-    // arm the shared bucket out of order, could drain the budget for time never actually paused.
-    // Targeting the horizon also keeps the two invariants intact: N callers arming the SAME window
-    // charge it once (the second sees delta 0), and an already-unfundable horizon stays unfunded WHILE
-    // its tail exceeds the remaining budget (the delta re-overflows) — until enough wall-clock elapses
-    // that the shrunken (horizon − now) tail fits, when a later arm funds it.
-    const horizon = bucket.pausedUntilMs;
-    const delta = Math.max(0, horizon - Math.max(now, bucket.accountedUntilMs));
-    if (delta === 0) return; // horizon already funded or entirely in the past — nothing new to charge
-    if (bucket.budgetSpentMs + delta > MAX_TOTAL_PAUSE_MS) return; // overflow: published, unfunded tail
-    bucket.budgetSpentMs += delta;
-    bucket.accountedUntilMs = horizon;
+    try {
+      bucket.pausedUntilMs = Math.max(bucket.pausedUntilMs, untilMs);
+      // Fund toward the PUBLISHED horizon (pausedUntilMs), not this candidate's raw untilMs. Every
+      // caller sleeps to pausedUntilMs — or throws — so that horizon is the only wall-clock a charge can
+      // buy. Charging raw untilMs let a SHORTER pause arriving under an already-published-but-UNFUNDED
+      // longer tail spend budget on coverage no caller ever sleeps (waitBucket throws for the WHOLE
+      // window while the tail is unfunded): a phantom charge that, under fan-out where sibling callers
+      // arm the shared bucket out of order, could drain the budget for time never actually paused.
+      // Targeting the horizon also keeps the two invariants intact: N callers arming the SAME window
+      // charge it once (the second sees delta 0), and an already-unfundable horizon stays unfunded WHILE
+      // its tail exceeds the remaining budget (the delta re-overflows) — until enough wall-clock elapses
+      // that the shrunken (horizon − now) tail fits, when a later arm funds it.
+      const horizon = bucket.pausedUntilMs;
+      const delta = Math.max(0, horizon - Math.max(now, bucket.accountedUntilMs));
+      if (delta === 0) return; // horizon already funded or entirely in the past — nothing new to charge
+      if (bucket.budgetSpentMs + delta > MAX_TOTAL_PAUSE_MS) return; // overflow: published, unfunded tail
+      bucket.budgetSpentMs += delta;
+      bucket.accountedUntilMs = horizon;
+    } finally {
+      this.emitThrottle(bucket, "armed");
+    }
   }
 
   // MUST stay PURE (no state, no jitter, no counters): it is evaluated inside analyze closures whose
@@ -1379,10 +1507,15 @@ export class GithubClient {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       const outcome = await this.ghBucketedAttempt<RestOutcome>(args, this.core, (res, now) => {
         const parsed = parseGhApiOutput(res.stdout);
-        // no HTTP response at all (network/auth plumbing failure; diagnostics on stderr)
+        // no HTTP response at all (network/auth plumbing failure; diagnostics on stderr) — the ONE
+        // path with no rateLimitHeaders: no response happened, so there is no snapshot to report.
         if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
+        // Every other branch is a LIVE response with live headers — its snapshot rides the return
+        // as a reference (PROMPT-TUI §U3.3; purity intact, zero new allocation). The zero-network
+        // immutable-cache return above this loop never gets here and emits nothing; a 304
+        // revalidation IS a live response, snapshot included.
         if (parsed.status === 304 && cached !== null && cached.responseBody !== null)
-          return { outcome: { kind: "not-modified", headers: parsed.headers, body: cached.responseBody }, pauseUntilMs: null };
+          return { outcome: { kind: "not-modified", headers: parsed.headers, body: cached.responseBody }, pauseUntilMs: null, rateLimitHeaders: parsed.headers };
         // A parsed SUCCESS from a FAILED gh process is untrustworthy: gh api -i streams the body
         // AFTER the header block, so a mid-body transport cut leaves a well-formed 200 head + a
         // TRUNCATED body + a nonzero exit — invisible to every status gate. HTTP-error statuses also
@@ -1390,14 +1523,14 @@ export class GithubClient {
         // normally below; only a 200-with-nonzero-exit is the truncation shape. Same transient class
         // as no-response: retry, then surface stderr.
         if (parsed.status === 200 && res.exitCode !== 0)
-          return { outcome: { kind: "truncated", exitCode: res.exitCode, stderr: res.stderr }, pauseUntilMs: null };
+          return { outcome: { kind: "truncated", exitCode: res.exitCode, stderr: res.stderr }, pauseUntilMs: null, rateLimitHeaders: parsed.headers };
         const cls = classifyRest(parsed.status, parsed.headers, parsed.body, now);
-        if (cls.kind === "ok") return { outcome: { kind: "ok", parsed }, pauseUntilMs: null };
-        if (cls.kind === "fatal") return { outcome: { kind: "fatal", status: cls.status, ssoRequired: cls.ssoRequired, message: cls.message }, pauseUntilMs: null };
+        if (cls.kind === "ok") return { outcome: { kind: "ok", parsed }, pauseUntilMs: null, rateLimitHeaders: parsed.headers };
+        if (cls.kind === "fatal") return { outcome: { kind: "fatal", status: cls.status, ssoRequired: cls.ssoRequired, message: cls.message }, pauseUntilMs: null, rateLimitHeaders: parsed.headers };
         // primary → pause until the reset epoch; secondary/transient → now + backoff. Arming from
         // this pauseUntilMs happens inside the lease (ghBucketedAttempt), before the slot is released.
         const pauseUntilMs = cls.kind === "primary" ? cls.untilMs : now + this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-        return { outcome: { kind: "retry" }, pauseUntilMs };
+        return { outcome: { kind: "retry" }, pauseUntilMs, rateLimitHeaders: parsed.headers };
       });
       if (outcome.kind === "no-response") {
         if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
@@ -1439,6 +1572,7 @@ export class GithubClient {
         throw new GithubApiError(`${outcome.message} (${endpoint})`, { status: outcome.status, endpoint, ssoRequired: outcome.ssoRequired });
       // outcome.kind === "retry": pause already armed inside the lease; loop again (next acquire waits it out).
     }
+    this.emitThrottle(this.core, "exhausted", "retries"); // ONE call gave up (MAX_ATTEMPTS)
     throw new ThrottleExhausted(endpoint);
   }
 
@@ -1517,6 +1651,8 @@ export class GithubClient {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       const outcome = await this.ghBucketedAttempt<GqlOutcome>(args, this.graphqlBucket, (res, now) => {
         const parsed = parseGhApiOutput(res.stdout);
+        // no-response omits rateLimitHeaders (no response happened); every parsed response below
+        // rides its already-parsed headers out as a reference (PROMPT-TUI §U3.3).
         if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
         // DELIBERATELY no broad restGet-style nonzero-exit truncation guard: gh exits 1 BY DESIGN after
         // a COMPLETE HTTP-200 envelope whose body carries `errors` (incl. genuine RATE_LIMITED), so a
@@ -1529,10 +1665,10 @@ export class GithubClient {
         const env = parseGraphqlEnvelope(parsed.body);
         const cls = classifyGraphql(parsed.status, parsed.headers, env.errors, now);
         if (cls.kind === "ok")
-          return { outcome: { kind: "ok", data: env.data, malformed: env.malformed, status: parsed.status, exitCode: res.exitCode, stderr: res.stderr }, pauseUntilMs: null };
-        if (cls.kind === "fatal") return { outcome: { kind: "fatal", status: cls.status, ssoRequired: cls.ssoRequired, message: cls.message }, pauseUntilMs: null };
+          return { outcome: { kind: "ok", data: env.data, malformed: env.malformed, status: parsed.status, exitCode: res.exitCode, stderr: res.stderr }, pauseUntilMs: null, rateLimitHeaders: parsed.headers };
+        if (cls.kind === "fatal") return { outcome: { kind: "fatal", status: cls.status, ssoRequired: cls.ssoRequired, message: cls.message }, pauseUntilMs: null, rateLimitHeaders: parsed.headers };
         const pauseUntilMs = cls.kind === "primary" ? cls.untilMs : now + this.backoffWait(cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
-        return { outcome: { kind: "retry" }, pauseUntilMs };
+        return { outcome: { kind: "retry" }, pauseUntilMs, rateLimitHeaders: parsed.headers };
       });
       if (outcome.kind === "no-response") {
         if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
@@ -1561,6 +1697,7 @@ export class GithubClient {
       }
       // outcome.kind === "retry": pause already armed inside the lease; loop again (next acquire waits it out).
     }
+    this.emitThrottle(this.graphqlBucket, "exhausted", "retries"); // ONE call gave up (MAX_ATTEMPTS)
     throw new ThrottleExhausted("graphql");
   }
 

@@ -47,8 +47,14 @@ import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
 import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
 import { logLine } from "./log.ts";
+import { emitProgress, hasProgressSink } from "./progress.ts";
 import { decideTuiActivation, TuiActivationError } from "./tui/activation.ts";
 import { runWithTui, makeDivertPathFor, utcLogStamp } from "./tui/lifecycle.ts";
+
+// Display-phase marker (PROMPT-TUI §U3.6): synchronous, no-throw, allocation gated on the sink.
+function markPhase(phase: "preflight" | "resolve-owners" | "cli-terms" | "scan" | "reconcile" | "report"): void {
+  if (hasProgressSink()) emitProgress({ type: "phase", phase });
+}
 
 // The values that TOGETHER define one coherent scan/plan: the config, its hash, and the compiled
 // branch + repository policies. Threaded as ONE object through runScan/processOwner/processRepo/runPlan
@@ -170,8 +176,16 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
       // the wider semaphore is never contended — zero behavioral change — but the dashboard's
       // subprocess-cap gauge is then honest for the whole run (PROMPT-TUI §U1).
       const preflightClient = new GithubClient({ githubHost: config.githubHost, concurrency: config.concurrency.repositories });
+      markPhase("preflight");
       const preflight = await runPreflight(preflightClient, config);
       logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
+      // Seed the limits panel from preflight's report (PROMPT-TUI §U3.6): fold-if-absent only —
+      // the preflight REST calls themselves already emitted live snapshots through the §U3.3
+      // channel, and the seed must not clobber them with nulls.
+      if (hasProgressSink()) {
+        emitProgress({ type: "rate-limit-seed", resource: "core", remaining: preflight.coreRemaining });
+        emitProgress({ type: "rate-limit-seed", resource: "graphql", remaining: preflight.graphqlRemaining });
+      }
 
       // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
       // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
@@ -262,6 +276,7 @@ export async function runScan(
   // §1 effective owner resolution (discovery runs every invocation). A throttle here is
   // TRANSIENT (§4): end the run cleanly and let the next invocation re-discover, rather than
   // crashing the whole process with no report.
+  markPhase("resolve-owners");
   const resolved = await resolveOwnersWithDiscovery(client, config, personalLogin);
   if (resolved === null) {
     logLine({ event: "owner-discovery-throttled", action: "retry-next-run" });
@@ -310,6 +325,7 @@ export async function runScan(
   // front to learn its bin names, so the per-unit CLI scan runs specifier + bin terms in a
   // SINGLE pass (no fragile post-introspection re-scan). Bins are version-stable, and this also
   // covers a CLI-only package invoked with no manifest declaration (§5.G/§7 usageByRepo union).
+  markPhase("cli-terms");
   const cliTermSets = await discoverCliTerms(db, client, config, runId);
   logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
 
@@ -334,12 +350,17 @@ export async function runScan(
   // idempotent, so the two paths compose without double-firing.
   const aborter = new Aborter();
   const onFatal = (): void => aborter.abort();
+  markPhase("scan");
   const ownerResults = await boundedPool(owners, config.concurrency.organizations, async (owner) => {
+    // owner bracket (PROMPT-TUI §U3.6): end in finally, so throw paths still close the row
+    if (hasProgressSink()) emitProgress({ type: "owner-start", owner });
     try {
       return await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, aborter, onFatal);
     } catch (e) {
       aborter.abort(); // trip so sibling owners stop dispatching new work immediately
       throw e; // captured by the pool; the run lifecycle is decided AFTER every owner has drained
+    } finally {
+      if (hasProgressSink()) emitProgress({ type: "owner-end", owner });
     }
   }, { signal: aborter });
 
@@ -374,10 +395,12 @@ export async function runScan(
   const warnings = emitPolicyWarnings(runtime.branchPolicy, coverages);
 
   // §5.E introspection reconciliation over the run's reportable slice.
+  markPhase("reconcile");
   await reconcileIntrospection(db, client, config, runId);
 
   // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at).
   db.completeRun(runId);
+  markPhase("report");
   // §8 step 7: produce the consolidated §7 report (run-<id>.json + latest.json) from SQLite,
   // then the machine done-event (stdout) and the human summary — BOTH derived from the emitted
   // report object itself, so the three can never disagree. The summary TEXT is returned to the
@@ -448,8 +471,14 @@ export async function processOwner(
   const coverages: RepoPolicyCoverage[] = [];
   for (const repo of outcome.items) {
     if (signal?.aborted) break;
-    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, signal, onFatal);
-    if (cov !== null) coverages.push(cov);
+    // repo bracket (PROMPT-TUI §U3.6): end in finally, so a throwing repo still closes its row
+    if (hasProgressSink()) emitProgress({ type: "repo-start", owner, repo: repo.name });
+    try {
+      const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, signal, onFatal);
+      if (cov !== null) coverages.push(cov);
+    } finally {
+      if (hasProgressSink()) emitProgress({ type: "repo-end", owner, repo: repo.name });
+    }
   }
   return coverages;
 }
@@ -605,6 +634,11 @@ export async function processRepo(
   // no-op if the callback already fired (a run-level abort).
   const unsubscribe = signal?.onAbort(() => branchAbort.abort()); // run-level fatal → stop this pool too (fires immediately if already aborted)
   const unitResults = await boundedPool(plan.toScan, config.concurrency.branches, async (d) => {
+    // unit-dispatch/unit-settle bracket the WHOLE worker body — including skip-current and
+    // abort-return paths, via the finally below — the truthful pool-slot occupancy signal
+    // (PROMPT-TUI §U2/§U3.6). Tapped JSONL events never clear active state; settle does.
+    if (hasProgressSink()) emitProgress({ type: "unit-dispatch", owner: repo.organization, repo: repo.name, branch: d.head.name });
+    try {
     if (branchAbort.aborted) return; // a fatal (this repo's own or a sibling owner's) tripped the run — dispatch no new units
     try {
       const h = d.head;
@@ -624,6 +658,9 @@ export async function processRepo(
         return;
       }
 
+      // unit-start (PROMPT-TUI §U2/§U3.6): a REAL scan begins — the active-scan list keys off
+      // this and is cleared by unit-settle alone; a skip-current unit never emits it.
+      if (hasProgressSink()) emitProgress({ type: "unit-start", owner: repo.organization, repo: repo.name, branch: h.name });
       db.setUnitStatus(key, { status: "in_progress", runId });
       try {
         const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
@@ -660,6 +697,11 @@ export async function processRepo(
       branchAbort.abort();
       onFatal?.();
       throw e;
+    }
+    } finally {
+      // settle is the ONLY reliable end (PROMPT-TUI §U2): the `scanned` JSONL line fires before
+      // cleanup finishes, and a fatal escape emits no terminal unit line at all.
+      if (hasProgressSink()) emitProgress({ type: "unit-settle", owner: repo.organization, repo: repo.name, branch: d.head.name });
     }
   }, { signal: branchAbort }).finally(() => unsubscribe?.()); // drop this repo's run-Aborter callback once the pool settles
   // A PolicyMatchError (or any other escaping fatal — the internal bucket-wiring assertion, a DB
