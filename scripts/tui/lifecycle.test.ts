@@ -501,6 +501,60 @@ describe("sealable stderr proxy (§U8.13a)", () => {
     expect(real.all()).toBe(SHOW_CURSOR);
     proxy.detach();
   });
+
+  test("a THROWING ink callback through a synchronously-acknowledging stream is invoked exactly once, absorbed, never re-thrown", () => {
+    // FakeStream acknowledges synchronously — the shape that let the old ack path double-fire:
+    // the callback's throw propagated up through real.write into the proxy's catch, which
+    // re-invoked the callback and let the SECOND throw escape into the caller (Ink internals).
+    const causes: string[] = [];
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, (c) => causes.push(c));
+    const s = proxy.stream as unknown as { write: (c: string, cb?: () => void) => boolean };
+    let invocations = 0;
+    expect(() =>
+      s.write("frame", () => {
+        invocations++;
+        throw new Error("ink callback exploded");
+      }),
+    ).not.toThrow();
+    expect(invocations).toBe(1); // exactly once — never the double-invoke
+    expect(real.all()).toBe("frame"); // the write itself still landed
+    expect(causes.some((c) => c.includes("ink write callback threw") && c.includes("ink callback exploded"))).toBe(true);
+    proxy.detach();
+  });
+
+  test("a THROWING ink callback on the SEALED branch is absorbed too — the drop still counts", () => {
+    const causes: string[] = [];
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, (c) => causes.push(c));
+    const s = proxy.stream as unknown as { write: (c: string, cb?: () => void) => boolean };
+    proxy.seal();
+    let invocations = 0;
+    expect(() =>
+      s.write("late-frame", () => {
+        invocations++;
+        throw new Error("sealed cb throw");
+      }),
+    ).not.toThrow();
+    expect(invocations).toBe(1);
+    expect(proxy.sealedDrops).toBe(1);
+    expect(real.all()).toBe(""); // dropped, as sealed writes must be
+    expect(causes.some((c) => c.includes("sealed cb throw"))).toBe(true);
+    proxy.detach();
+  });
+
+  test("a stream that THROWS on write still acknowledges ink's callback exactly once (no ack, no flush-sync resolution — a hang)", () => {
+    const real = new FakeStream();
+    real.throwOnWrite = new Error("EIO");
+    const causes: string[] = [];
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, (c) => causes.push(c));
+    const s = proxy.stream as unknown as { write: (c: string, cb?: () => void) => boolean };
+    let acks = 0;
+    expect(s.write("frame", () => acks++)).toBe(true);
+    expect(acks).toBe(1);
+    expect(causes.some((c) => c.includes("stderr write threw") && c.includes("EIO"))).toBe(true);
+    proxy.detach();
+  });
 });
 
 // ---- §U8.13 lifecycle ------------------------------------------------------------------------

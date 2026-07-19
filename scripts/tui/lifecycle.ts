@@ -108,8 +108,10 @@ type WriteCb = (err?: Error | null) => void;
 // Three jobs, all load-bearing (§U1): transparent while live (Ink must see a real interactive
 // TTY and register real resize listeners), absorbing (a broken stderr degrades the dashboard,
 // never throws into React internals or kills the audit — Ink's callbacks are ALWAYS acknowledged
-// as complete, or its flush-sync write("", cb) would hang waitUntilExit), and sealed (after
-// seal(), counted-and-dropped — what makes "below the terminated frame" a guarantee).
+// as complete, EXACTLY ONCE, with a throwing callback absorbed rather than re-thrown; anything
+// less and its flush-sync write("", cb) would hang waitUntilExit or double-fire its resolution),
+// and sealed (after seal(), counted-and-dropped — what makes "below the terminated frame" a
+// guarantee).
 export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (cause: string) => void): SealableStderr {
   let sealed = false;
   let sealedDrops = 0;
@@ -129,24 +131,42 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
     const cb: WriteCb | undefined =
       typeof encodingOrCb === "function" ? (encodingOrCb as WriteCb) : typeof maybeCb === "function" ? (maybeCb as WriteCb) : undefined;
     const encoding = typeof encodingOrCb === "string" ? (encodingOrCb as BufferEncoding) : undefined;
+    // Ink's callback is invoked EXACTLY ONCE per write, and a throw from it is absorbed, never
+    // re-thrown into Ink: a stream that acknowledges SYNCHRONOUSLY lets a throwing callback
+    // propagate up through real.write into the catch below — which would otherwise misread it
+    // as a write failure, invoke the callback a second time, and let the second throw escape
+    // back into React internals.
+    let acked = false;
+    const ackOnce = (): void => {
+      if (acked) return;
+      acked = true;
+      try {
+        cb?.();
+      } catch (e) {
+        absorb(`ink write callback threw: ${errText(e)}`);
+      }
+    };
     if (sealed) {
       sealedDrops++;
-      cb?.();
+      ackOnce();
       return true;
     }
     // acknowledge WITHOUT the error: a broken stderr must degrade the dashboard, never surface
     // through React internals — the absorb path latches and degrades instead.
     const ack: WriteCb = (err) => {
       if (err != null) absorb(`stderr write callback error: ${errText(err)}`);
-      cb?.();
+      ackOnce();
     };
     try {
       // `as never` satisfies every WriteStream.write overload while forwarding Ink's chunk
       // verbatim — the proxy must not re-type or convert what Ink hands it at runtime.
       return encoding !== undefined ? real.write(chunk as never, encoding, ack) : real.write(chunk as never, ack);
     } catch (e) {
+      // Either a real write failure (pre-ack throw) or a stream that acknowledged and then
+      // threw anyway — absorbed identically; the acked guard keeps this catch from invoking
+      // Ink's callback a second time.
       absorb(`stderr write threw: ${errText(e)}`);
-      cb?.();
+      ackOnce();
       return true;
     }
   };
