@@ -1923,8 +1923,9 @@ describe("network event emission (T7)", () => {
     expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "core", waitKind: "primary" });
   });
 
-  // restGet and graphql share one arm-and-report helper (armAndReportRateLimit); it must carry the
-  // GRAPHQL endpoint/bucket labels on the graphql path, not the REST ones. (Previously REST-only.)
+  // restGet and graphql each build their own retry/throttle telemetry inline — the piece they SHARE is
+  // ghBucketedAttempt's arm-the-pause-inside-the-lease, not a reporting helper. This pins that the
+  // graphql path stamps its OWN endpoint label ("graphql"), never restGet's.
   test("graphql emits retry{reason:no-response, endpoint:graphql} on each transient attempt (not the final throw)", async () => {
     const events: NetworkEvent[] = [];
     const { client } = makeClient(Array<SpawnResult>(6).fill(err("")), { events: (e) => events.push(e) });
