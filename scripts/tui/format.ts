@@ -73,7 +73,7 @@ export function formatReset(resetEpochSec: number | null, nowMs: number): string
 }
 
 // Graded headroom color for a rate-limit remaining count (M1): red under 10% of the limit,
-// yellow under 25%, uncolored otherwise — so a crisis like `core 120/5,000` no longer looks
+// yellow under 25%, uncolored otherwise — so a crisis like `core 100/5,000` no longer looks
 // identical to a healthy `core 4,812/5,000` in the otherwise-monochrome healthy frame. Returns
 // undefined (no color, the honest neutral) unless BOTH values are finite and the limit is a
 // positive number: a seeded remaining without a known limit, or any non-finite/degenerate input,

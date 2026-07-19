@@ -7,6 +7,7 @@
 import { expect, test, describe, afterEach } from "bun:test";
 import { EventEmitter } from "node:events";
 import { isValidElement } from "react";
+import { Text } from "ink";
 import { mountTui } from "./mount.tsx";
 import { CompactFrame, LimitSegment, LimitsPanel } from "./panels.tsx";
 import { createTuiStore, type TuiStore } from "./store.ts";
@@ -28,20 +29,23 @@ function textOf(node: unknown): string {
   return "";
 }
 
-// The flattened text of every element in a BUILT tree whose `color` prop equals `want`. Guards with
-// isValidElement / Array.isArray before ANY property access — no blind root or children casts.
-// LimitSegment IS executed so its inner tone-colored Text is reached, which proves LimitsPanel and
-// CompactFrame actually route the remaining count through a colored Text: the ANSI-stripped text
-// assertions cannot, since a plain-text render would satisfy them. (A rendered-ANSI assertion is not
-// CI-stable: ink/chalk fixes its color level at module load, shared across bun's single test process
-// — a color SGR appears when a file runs alone but is suppressed once another file has imported ink.)
-function coloredTexts(node: unknown, want: string): string[] {
-  if (Array.isArray(node)) return node.flatMap((child) => coloredTexts(child, want));
+// The `color` prop of every INK Text (node.type === Text — NOT merely any element carrying a color
+// prop) whose flattened content is EXACTLY `text`. The color is returned verbatim, undefined
+// included, so a healthy count must be provably uncolored (a stray third tone is caught) and a low
+// count must carry the exact tone. Guards with isValidElement / Array.isArray before any property
+// access; LimitSegment (pure, hookless) is executed so its inner Text is reached. This proves
+// LimitsPanel and CompactFrame route the remaining count through a tone-colored Ink Text — the
+// ANSI-stripped text assertions cannot (a plain-text render satisfies them), and a rendered-ANSI
+// assertion is not CI-stable (ink/chalk fixes its color level at module load, shared across bun's
+// single test process: a color SGR appears when a file runs alone but is suppressed once another
+// file has imported ink).
+function textColorsOf(node: unknown, text: string): unknown[] {
+  if (Array.isArray(node)) return node.flatMap((child) => textColorsOf(child, text));
   if (!isValidElement(node)) return [];
-  if (node.type === LimitSegment) return coloredTexts(LimitSegment(node.props as LimitSegmentProps), want);
+  if (node.type === LimitSegment) return textColorsOf(LimitSegment(node.props as LimitSegmentProps), text);
   const props = node.props as { color?: unknown; children?: unknown };
-  const here = props.color === want ? [textOf(props.children)] : [];
-  return [...here, ...coloredTexts(props.children, want)];
+  const here = node.type === Text && textOf(props.children) === text ? [props.color] : [];
+  return [...here, ...textColorsOf(props.children, text)];
 }
 
 afterEach(() => {
@@ -163,7 +167,7 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(text).toContain("JSONL → /out/logs/audit-log-20260718T211530Z-p4242.jsonl");
   });
 
-  test("M1 wiring: LimitsPanel AND CompactFrame color the remaining count by tone (red/yellow), uncolored when healthy", () => {
+  test("M1 wiring: LimitsPanel AND CompactFrame wrap the remaining count in an Ink Text of the exact tone; a healthy count is provably uncolored", () => {
     const snapAt = (remaining: number): ReturnType<TuiStore["snapshot"]> => {
       const store: TuiStore = createTuiStore(() => NOW);
       store.dispatch({ type: "rate-limit", resource: "core", remaining, limit: 5000, resetEpochSec: null });
@@ -172,15 +176,16 @@ describe("panel frames over canned store states (§U8.11)", () => {
     const red = snapAt(100); // 2% → red
     const yellow = snapAt(1000); // 20% → yellow
     const ok = snapAt(4800); // 96% → uncolored
-    // Walk each panel's real element tree. Fails if EITHER mode stops routing the count through
-    // LimitSegment (e.g. reverts to plain text), which the ANSI-stripped text assertions would miss.
-    expect(coloredTexts(LimitsPanel({ snap: red, nowMs: NOW }), "red")).toContain("100");
-    expect(coloredTexts(CompactFrame({ snap: red, nowMs: NOW, mountedAtMs: NOW }), "red")).toContain("100");
-    expect(coloredTexts(LimitsPanel({ snap: yellow, nowMs: NOW }), "yellow")).toContain("1,000");
-    expect(coloredTexts(CompactFrame({ snap: yellow, nowMs: NOW, mountedAtMs: NOW }), "yellow")).toContain("1,000");
-    expect(coloredTexts(LimitsPanel({ snap: ok, nowMs: NOW }), "red")).toEqual([]);
-    expect(coloredTexts(LimitsPanel({ snap: ok, nowMs: NOW }), "yellow")).toEqual([]);
-    expect(coloredTexts(CompactFrame({ snap: ok, nowMs: NOW, mountedAtMs: NOW }), "red")).toEqual([]);
+    // The Ink Text holding EXACTLY the remaining count, in each panel's real element tree. Fails if a
+    // mode stops routing it through LimitSegment (reverts to plain text → no such Text → []), drops
+    // the color (→ [undefined]), or applies a stray tone (→ [that tone]). The ANSI-stripped text
+    // assertions catch none of these.
+    expect(textColorsOf(LimitsPanel({ snap: red, nowMs: NOW }), "100")).toEqual(["red"]);
+    expect(textColorsOf(CompactFrame({ snap: red, nowMs: NOW, mountedAtMs: NOW }), "100")).toEqual(["red"]);
+    expect(textColorsOf(LimitsPanel({ snap: yellow, nowMs: NOW }), "1,000")).toEqual(["yellow"]);
+    expect(textColorsOf(CompactFrame({ snap: yellow, nowMs: NOW, mountedAtMs: NOW }), "1,000")).toEqual(["yellow"]);
+    expect(textColorsOf(LimitsPanel({ snap: ok, nowMs: NOW }), "4,800")).toEqual([undefined]);
+    expect(textColorsOf(CompactFrame({ snap: ok, nowMs: NOW, mountedAtMs: NOW }), "4,800")).toEqual([undefined]);
   });
 
   test("session counters front-load the danger fields so end-truncation drops the least important first (M2)", async () => {
