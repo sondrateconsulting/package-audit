@@ -5,8 +5,9 @@
 //
 // Display-only (§U0): no useInput anywhere (Ink never enables raw mode), exitOnCtrlC: false
 // (SIGINT keeps its default kill-and-resume semantics; Ink's own signal-exit cursor cleanup is
-// accepted), and nothing here writes to process.stdout or the filesystem — the render target is
-// exactly `opts.out` (the lifecycle's sealable stderr proxy).
+// accepted), and nothing here can reach the machine stdout stream or the filesystem (the
+// tuiPurity scan enforces both) — the render target is exactly `opts.out` (the lifecycle's
+// sealable stderr proxy).
 import { Component, type ReactNode } from "react";
 import { render } from "ink";
 import { reportTuiFailure, tuiFailure } from "../progress.ts";

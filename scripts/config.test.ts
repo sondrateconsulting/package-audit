@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   validateAndNormalize, computeConfigHash, resolveConfigPath, loadConfig, ConfigError,
   CONFIG_ROOT_KEYS, CONFIG_CONCURRENCY_KEYS, CONFIG_PATHS_KEYS, CONFIG_PACKAGE_KEYS,
+  type Config,
 } from "./config.ts";
 
 const baseRaw = (): Record<string, unknown> => ({
@@ -656,5 +657,24 @@ describe("config.schema.json ↔ runtime sync", () => {
     expect(props["organizations"]!.default).toBe(rt.organizations);
     expect(props["repositories"]!.default).toBe(rt.repositories);
     expect(props["branches"]!.default).toBe(rt.branches);
+  });
+});
+
+describe("config_hash tripwire (PROMPT-TUI §U8.15 — resumability across the TUI feature)", () => {
+  test("a populated fixture's hash matches its pre-feature literal — the TUI added NO config keys", () => {
+    // config_hash is computed from the normalized config content; ANY new key would change the
+    // normalized form, change the hash, and orphan every resumable run. TUI activation is CLI
+    // flags + runtime environment only, so this literal (captured from the same fixture before
+    // the feature landed) must never move.
+    const fixture: Config = {
+      githubHost: "github.com", organizations: ["acme", "initech"], excludeOrganizations: ["ops"],
+      branches: ["main", "release/*"], excludeBranches: ["dep*"], excludeRepositories: ["acme/sandbox-*"],
+      includePersonalNamespace: false, includeForks: false, includeArchived: true,
+      maxReposPerOrg: 50, maxBranchesPerRepo: 10, cutoffDate: "2024-01-01",
+      concurrency: { organizations: 2, repositories: 6, branches: 4 },
+      packages: [{ name: "expo", registryUrl: "https://registry.npmjs.org", registryAuthEnvVar: null }],
+      excludeDirGlobs: ["**/node_modules/**"], paths: { sqlitePath: "./data/audit.db", outputDir: "./output" },
+    };
+    expect(computeConfigHash(fixture)).toBe("c2b2e14d7ee3611d0aa8065e93aa5b0a03949e5c90cea9607bf37f599dacfa15");
   });
 });
