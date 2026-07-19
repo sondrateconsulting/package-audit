@@ -14,7 +14,7 @@ import { z } from "zod";
 // Type-only import — zero runtime coupling: the emit path never touches this module, and this
 // module never touches the DB: the enum literals below are pinned to db.ts's unions at compile
 // time, so a new/renamed member on either side fails `bun run typecheck` instead of drifting.
-import type { ExportKind, UsageType } from "./db.ts";
+import type { ExportKind, RunOutcome, UsageType } from "./db.ts";
 // Runtime value import — a plain numeric const, NO cycle (artifactWrite imports only node built-ins +
 // readOnlyGuard). Pins formatVersion below so the schema is a TRUE shape discriminator: a v2-shaped
 // report mislabeled formatVersion:1 must FAIL validation, and a version bump auto-updates the literal.
@@ -42,12 +42,20 @@ export const exportKindSchema = z
   .enum(["named", "default", "type"])
   .describe("§5.E export classification ('cli-bin' rows surface as cli.binNames, the '__complete__' marker is never emitted)");
 
+// The run's finalized outcome (§3.1b). Pinned to db.ts's RunOutcome union (all seven members — no
+// exclusions) so a new/renamed outcome fails typecheck here. The report carries it verbatim.
+export const runOutcomeEnumSchema = z
+  .enum(["complete", "partial-deferred", "partial-degraded", "partial-budget", "fatal", "legacy-unknown", "legacy-failed"])
+  .describe("runs.outcome — the run's coverage disposition");
+
 // Bidirectional compile-time sync with db.ts (report enums = DB unions minus the CLI members,
-// which surface via cliUsage / cli.binNames instead). Equal<> fails in BOTH drift directions.
+// which surface via cliUsage / cli.binNames instead; runOutcome is the FULL union). Equal<> fails
+// in BOTH drift directions.
 type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
 type Expect<T extends true> = T;
 export type UsageEnumSyncedWithDb = Expect<Equal<(typeof usageTypeSchema.options)[number], Exclude<UsageType, "cli">>>;
 export type ExportEnumSyncedWithDb = Expect<Equal<(typeof exportKindSchema.options)[number], Exclude<ExportKind, "cli-bin">>>;
+export type RunOutcomeEnumSyncedWithDb = Expect<Equal<(typeof runOutcomeEnumSchema.options)[number], RunOutcome>>;
 
 const lockfileRefSchema = z
   .strictObject({
@@ -165,7 +173,7 @@ export const summarySchema = z
   .strictObject({
     organizationsScanned: z.number().int().min(0).describe("DISTINCT orgs among the run's scanned branch snapshots"),
     repositoriesScanned: z.number().int().min(0).describe("DISTINCT org/repo among scanned snapshots"),
-    branchesScanned: z.number().int().min(0).describe("run_unit_head rows with status='scanned' (includes skipped-as-current + scanned default-override units)"),
+    branchesScanned: z.number().int().min(0).describe("run_unit_head rows with a REPORTABLE status (scanned + reused/skip-as-current) — the findings-bearing slice; includes scanned default-override units"),
     branchesSkippedByCutoff: z.number().int().min(0).describe("GENUINE cutoff skips: run_unit_head rows with status='skipped-cutoff' (a policy exclusion is its own status, never counted here)"),
     branchesExcludedByPolicy: z.number().int().min(0).describe("Branch allow/deny exclusions: run_unit_head rows with status='policy-excluded'"),
     branchesPastCap: z.number().int().min(0).describe("Eligible branches past the per-repo cap (not scanned this run)"),
@@ -193,11 +201,37 @@ export const scanScopeSchema = z
   })
   .describe("Branch allow/deny scan-scope diagnostics (§5) — SEPARATE from the disjoint summary counts (subcounts overlap)");
 
+// §3.1b run coverage — a top-level block (NOT in summary) so a consumer can see, at a glance,
+// whether the run covered the whole estate and, if not, what was deferred or failed. `units` counts
+// every run_unit_head disposition in a FIXED key order so the emitted JSON stays byte-reproducible.
+export const runOutcomeSchema = z
+  .strictObject({
+    outcome: runOutcomeEnumSchema.describe("runs.outcome — always present: an unfinalized run (outcome NULL) is served as notReportable, never as a report"),
+    coverageComplete: z.boolean().nullable().describe("Did discovery enumerate the whole estate: true=full, false=a discovery gap, null=unknowable (migrated pre-v4 run)"),
+    discoveryFailures: z.number().int().min(0).describe("Permanent owner/repo/branch discovery failures this run (each makes the denominator unknown)"),
+    discoveryDeferrals: z.number().int().min(0).describe("Discovery enumerations deferred by rate-limiting this run (re-run to complete)"),
+    units: z
+      .strictObject({
+        scanned: z.number().int().min(0).describe("Freshly scanned this run"),
+        reused: z.number().int().min(0).describe("Skip-as-current: unchanged head, findings reused from the prior scan"),
+        skippedCutoff: z.number().int().min(0).describe("Head predates cutoffDate — intentionally not scanned"),
+        policyExcluded: z.number().int().min(0).describe("Dropped by the branch allow/deny policy (§5)"),
+        pastCap: z.number().int().min(0).describe("Eligible branch past the per-repo cap — not scanned this run"),
+        deferredThrottle: z.number().int().min(0).describe("Deferred by rate-limiting — re-run to finish"),
+        deferredNetwork: z.number().int().min(0).describe("Deferred by a transport outage — re-run to finish"),
+        deferredService: z.number().int().min(0).describe("Deferred by a GitHub service failure — re-run to finish"),
+        error: z.number().int().min(0).describe("A permanent, terminal scan error (a covered, real result)"),
+      })
+      .describe("Per-run unit disposition counts from run_unit_head, in fixed enum order (byte-determinism)"),
+  })
+  .describe("§3.1 run coverage disposition — did this run cover the whole estate, and if not, what is outstanding");
+
 export const reportSchema = z
   .strictObject({
     formatVersion: z.literal(XRAY_FORMAT_VERSION).describe("XRAY_FORMAT_VERSION — the report/export/HTML artifact-set version; PINNED so this schema is a true shape discriminator"),
     runId: z.string().describe("The reported run's identifier (report --run-id <id> re-emits it)"),
     generatedAt: isoUtc.describe("completed_at of the run (started_at fallback for a --run-id report of a non-completed run)"),
+    runOutcome: runOutcomeSchema,
     config: z.strictObject({
       packages: z.array(z.string()).describe("The run's tracked package names (runs.tracked_packages)"),
       cutoffDate: z.string().describe("The run's cutoff date (YYYY-MM-DD)"),

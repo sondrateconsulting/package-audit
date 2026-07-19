@@ -37,7 +37,7 @@ function startCompleted(db: AuditDb, trackedPackages: string[], configHash = "h"
     configHash, effectiveOwners: ["org-a"], ownersSource: "discovered",
     trackedPackages, cutoffDate: "2024-01-01", githubHost: "github.com",
   });
-  db.completeRun(runId);
+  db.finalizeRun(runId, "complete"); // T5: a report/compare source must be FINALIZED (outcome set), not just completed
   return db.getRun(runId)!;
 }
 

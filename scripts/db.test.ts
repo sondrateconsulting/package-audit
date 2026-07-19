@@ -2614,14 +2614,14 @@ function buildV3TwinDb(path: string): void {
   buildV2Db(path);
   const raw = new Database(path, { strict: true });
   raw.exec("ALTER TABLE run_unit_head ADD COLUMN is_default_branch INTEGER");
-  // LITERAL 3, never SCHEMA_VERSION: this is a native v3-shaped fixture. Stamping SCHEMA_VERSION
-  // would falsely claim the current version once the constant bumps (a v3-shaped table stamped v4
-  // is treated as current-stamp DAMAGE and healed, not migrated). Opening it drives the real
-  // v3→v4 migration, the same path the migrated-v2 database takes, so their reports stay
-  // byte-identical.
+  // LITERAL 3, never SCHEMA_VERSION: this is a native v3-shaped fixture. Opening it drives the REAL
+  // migration chain (v3→v4→v5), the same path the migrated-v2 database takes — and the v4→v5 step's
+  // legacy backfill sets outcome='legacy-unknown' + coverage NULL on both, so their runOutcome blocks
+  // (T5c) and thus their whole reports stay byte-identical WITHOUT hand-adding the columns here.
   raw.exec("PRAGMA user_version = 3");
   raw.close();
 }
+
 
 // Explicit v2 column projections (stable order) — deliberately NOT SELECT *: the migration
 // legitimately adds is_default_branch, so preservation is asserted on the v2 columns exactly.

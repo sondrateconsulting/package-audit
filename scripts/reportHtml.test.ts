@@ -94,7 +94,7 @@ function seed(db: AuditDb) {
     { exportName: "unusedThing", exportKind: "named", source: "index.d.ts" },
     { exportName: "expo", exportKind: "cli-bin", source: "package.json#bin" },
   ] });
-  db.completeRun(runId);
+  db.finalizeRun(runId, "complete"); // buildReport requires a finalized run (§3.1e)
   return db.getRun(runId)!;
 }
 
@@ -313,7 +313,7 @@ describe("adversarial fixture — hostile snippets, paths, branch names (escape-
     // hostile permalink: must never become an href
     use(main, "e", "src/e.ts", 5, "import { e } from 'evil';", "javascript:alert(1)");
     use(hostileBranch, "a", "src/f.ts", 6, "import { a } from 'evil';");
-    db.completeRun(runId);
+    db.finalizeRun(runId, "complete"); // buildReport requires a finalized run (§3.1e)
     const report = buildReport(db, db.getRun(runId)!);
     db.close();
     return report.packages[0]!;
@@ -378,7 +378,7 @@ describe("copy-as-markdown: hostile identifiers cannot inject links/images (H1)"
     use(BEACON, "src/b.ts", 2);
     use(BEACON, "src/c.ts", 3);
     use("plain", "src/d.ts", 4);
-    db.completeRun(runId);
+    db.finalizeRun(runId, "complete"); // buildReport requires a finalized run (§3.1e)
     const report = buildReport(db, db.getRun(runId)!);
     db.close();
     return report.packages[0]!;
@@ -419,7 +419,7 @@ describe("bidi controls in a hostile export name are neutralized in observation 
     use(`use${RLO}State`, "src/b.ts", 2);
     use(`use${RLO}State`, "src/c.ts", 3);
     use("plain", "src/d.ts", 4);
-    db.completeRun(runId);
+    db.finalizeRun(runId, "complete"); // buildReport requires a finalized run (§3.1e)
     const report = buildReport(db, db.getRun(runId)!);
     db.close();
     return report.packages[0]!;
@@ -781,7 +781,7 @@ test("the CLI usage location cell is wrapped in .loc so a hostile repo/file name
     context: "npx expo", filePath: "scripts/‮lmth.evil", lineNumber: 1,
     permalink: `https://github.com/org-a/svc/blob/${main.commitSha}/x#L1`, snippet: "npx expo start", foundAt: T0,
   });
-  db.completeRun(runId);
+  db.finalizeRun(runId, "complete"); // buildReport requires a finalized run (§3.1e)
   const report = buildReport(db, db.getRun(runId)!);
   const html = renderDossier(report.packages[0]!, FIXED_CTX);
   db.close();

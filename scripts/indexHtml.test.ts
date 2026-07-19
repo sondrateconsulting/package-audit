@@ -31,7 +31,7 @@ function fixtureReport(): DossierReport {
     permalink: "https://github.com/org-a/app/blob/abc123def4567/src/icons.tsx#L3",
     snippet: "import { Ionicons } from '@expo/vector-icons';", foundAt: T0,
   });
-  db.completeRun(runId);
+  db.finalizeRun(runId, "complete"); // buildReport requires a finalized run (§3.1e)
   const report = buildReport(db, db.getRun(runId)!) as unknown as DossierReport;
   db.close();
   // Pin the two nondeterministic envelope fields so the index renders byte-identically

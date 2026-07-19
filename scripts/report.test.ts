@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso, type UnitHeadStatus } from "./db.ts";
 import { downgradeToFaithfulV2 } from "./testFixtures.ts";
-import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines, runReport } from "./report.ts";
-import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
+import { buildNotReportableNotice, buildReport, emitDossiers, emitReportDetailed, parseLockfileLines, runReport } from "./report.ts";
+import { reportSchema, notReportableSchema, runOutcomeSchema, summarySchema } from "./reportSchema.ts";
 import { XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import { type Config, DEFAULT_TIMEOUTS } from "./config.ts";
 
@@ -141,7 +141,7 @@ describe("buildReport (§7)", () => {
       ops.push(() => db.writeApiSurface({ packageName: "expo", version: "1.0.0", versionSource: "lockfile", rows: [{ exportName: "x", exportKind: "named", source: "d.ts" }] }));
       ops.push(() => db.writeApiSurface({ packageName: "react", version: "1.0.0", versionSource: "lockfile", rows: [{ exportName: "x", exportKind: "named", source: "d.ts" }] }));
       for (const op of reversed ? [...ops].reverse() : ops) op();
-      db.completeRun(runId);
+      db.finalizeRun(runId, "complete");
       return db.getRun(runId)!;
     };
     const norm = (db: AuditDb, run: ReturnType<typeof seedMulti>): string =>
@@ -205,7 +205,7 @@ describe("buildReport (§7)", () => {
     head("feature/x", "policy-excluded", { isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*" });
     head("wip/y", "policy-excluded", { isDefaultBranch: false, policyStatus: "excluded-by-allow", policyMatchedPattern: null }); // allow-list miss
     head("over-cap", "past-cap", { isDefaultBranch: false });
-    db.completeRun(runId);
+    db.finalizeRun(runId, "complete");
     const report = buildReport(db, db.getRun(runId)!) as any;
 
     const s = report.summary;
@@ -242,7 +242,7 @@ describe("buildReport (§7)", () => {
     // ERRORED — it writes NO run_unit_head row (only an errors[] entry), so it is in no disposition bucket.
     db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "main", commitSha: "sha-main", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T00:00:00Z" });
     db.insertError({ runId, scope: "scan", organization: "org-a", repository: "svc", branch: "feature", message: "tree fetch failed" });
-    db.completeRun(runId);
+    db.finalizeRun(runId, "complete");
     const report = buildReport(db, db.getRun(runId)!) as any;
     // the four disposition buckets sum to the RECORDED rows (1: main) — 'feature' is in none of them…
     expect(report.summary).toMatchObject({ branchesScanned: 1, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0 });
@@ -271,7 +271,7 @@ describe("buildReport (§7)", () => {
       const sqlitePath = join(dbRoot, "audit.db");
       const db = AuditDb.open({ sqlitePath });
       const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
-      db.completeRun(runId);
+      db.finalizeRun(runId, "complete");
       db.close();
       // forge past-cap + policy_status: forbidden by the write path AND by a v4 CHECK, so enforcement
       // is suspended for this one INSERT (the pragma is connection-scoped and never touches the file's
@@ -302,7 +302,7 @@ describe("buildReport (§7)", () => {
       const sqlitePath = join(dbRoot, "audit.db");
       const db = AuditDb.open({ sqlitePath });
       const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
-      db.completeRun(runId);
+      db.finalizeRun(runId, "complete");
       db.close();
       const forge = new Database(sqlitePath, { strict: true });
       forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'policy-excluded', 0, 'excluded-by-deny', x'78', '2025-06-01T00:00:00Z')`).run(runId);
@@ -326,7 +326,7 @@ describe("buildReport (§7)", () => {
       const sqlitePath = join(dbRoot, "audit.db");
       const db = AuditDb.open({ sqlitePath });
       const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
-      db.completeRun(runId);
+      db.finalizeRun(runId, "complete");
       db.close();
       const forge = new Database(sqlitePath, { strict: true });
       forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', '', 'policy-excluded', 0, 'excluded-by-deny', 'rel*', NULL)`).run(runId);
@@ -359,7 +359,7 @@ describe("buildReport (§7)", () => {
       const sqlitePath = join(dbRoot, "audit.db");
       const db = AuditDb.open({ sqlitePath });
       const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
-      db.completeRun(runId);
+      db.finalizeRun(runId, "complete");
       db.close();
       const forge = new Database(sqlitePath, { strict: true });
       forge.query(`INSERT INTO run_unit_head (run_id, organization, repository, branch, commit_sha, status, is_default_branch, policy_status, policy_matched_pattern, scanned_commit_date) VALUES (?, 'org-a', 'svc', 'weird', 'abc', 'scanned', 0, NULL, NULL, 'not-an-iso-date')`).run(runId);
@@ -472,7 +472,7 @@ describe("buildReport (§7)", () => {
       const sqlitePath = join(dbRoot, "audit.db");
       const db = AuditDb.open({ sqlitePath });
       const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
-      db.completeRun(runId);
+      db.finalizeRun(runId, "complete");
       db.close();
       const forge = new Database(sqlitePath, { strict: true });
       forge.exec("PRAGMA ignore_check_constraints = ON"); // only the first shape needs this; the second is schema-valid
@@ -503,7 +503,7 @@ describe("buildReport (§7)", () => {
       const sqlitePath = join(dbRoot, "audit.db");
       const db = AuditDb.open({ sqlitePath });
       const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
-      db.completeRun(runId);
+      db.finalizeRun(runId, "complete");
       db.close();
       // ignore_check_constraints is what makes this forge possible at all: the column CHECK genuinely
       // rejects this literal, so the write path AND SQLite both have to be stepped around to simulate
@@ -535,7 +535,7 @@ describe("buildReport (§7)", () => {
     const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
     db.upsertRunUnitHead({ runId, organization: "org-a", repository: "svc", branch: "main", commitSha: "sha-A", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-05-01T00:00:00Z" });
     db.insertError({ runId, scope: "scan", organization: "org-a", repository: "svc", branch: "main", message: "tree boom at sha-B" });
-    db.completeRun(runId);
+    db.finalizeRun(runId, "complete");
     const report = buildReport(db, db.getRun(runId)!) as any;
     expect(report.summary.branchesErrored).toBe(0); // suppressed by the row-key exclusion — NOT a bug
     expect(report.summary.branchesScanned).toBe(1); // counted here instead, at the OLDER head
@@ -553,7 +553,7 @@ describe("buildReport (§7)", () => {
       configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
-    db.completeRun(runId); // reportable, but no run_unit_head rows were ever written (e.g. all discovery failed)
+    db.finalizeRun(runId, "complete"); // reportable, but no run_unit_head rows were ever written (e.g. all discovery failed)
     const report = buildReport(db, db.getRun(runId)!) as any;
     // zero heads carry NO sentinel, so `.some()` is vacuously false — must NOT be reported as complete
     expect(report.scanScope.provenance).toBe("pre-upgrade");
@@ -615,13 +615,68 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
     expect(parsed.success ? [] : parsed.error.issues).toEqual([]);
     db.close();
   });
+  test("buildReport REJECTS an unfinalized run (outcome NULL) — a report requires a finalized outcome (§3.1e)", () => {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["o"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    db.completeRun(runId); // status='completed' but outcome stays NULL — never finalized
+    expect(() => buildReport(db, db.getRun(runId)!)).toThrow(/unfinalized run.*outcome is NULL/);
+    db.close();
+  });
+
+  test("a COMPLETE run's runOutcome block: outcome/coverage + only scanned+skippedCutoff counted", () => {
+    const db = mem();
+    const run = seed(db); // 1 scanned + 1 skipped-cutoff head, finalized 'complete'
+    const report = buildReport(db, run);
+    expect(report.runOutcome).toEqual({
+      outcome: "complete",
+      coverageComplete: true,
+      discoveryFailures: 0,
+      discoveryDeferrals: 0,
+      units: { scanned: 1, reused: 0, skippedCutoff: 1, policyExcluded: 0, pastCap: 0, deferredThrottle: 0, deferredNetwork: 0, deferredService: 0, error: 0 },
+    });
+    db.close();
+  });
+
+  test("a PARTIAL run's runOutcome block: per-disposition counts, coverage gap, fixed key order (§3.1b)", () => {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    const P = { policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" } as const;
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "c1", status: "scanned", isDefaultBranch: null, ...P });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "dev", commitSha: "c2", status: "reused", isDefaultBranch: null, ...P });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, ...P });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "px", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "px*", scannedCommitDate: "2025-06-01T12:00:00Z" });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "pc", commitSha: "", status: "past-cap", isDefaultBranch: false, ...P });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "f1", commitSha: "c3", status: "deferred-throttle", isDefaultBranch: null, ...P });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "f2", commitSha: "c4", status: "error", isDefaultBranch: null, ...P });
+    db.recordDiscoveryDeferral(runId); // a discovery gap → coverage incomplete
+    expect(db.finalizeRun(runId, "complete")).toBe("partial-deferred"); // floored (deferred unit + discovery gap)
+
+    const report = buildReport(db, db.getRun(runId)!);
+    expect(report.runOutcome).toEqual({
+      outcome: "partial-deferred",
+      coverageComplete: false,
+      discoveryFailures: 0,
+      discoveryDeferrals: 1,
+      units: { scanned: 1, reused: 1, skippedCutoff: 1, policyExcluded: 1, pastCap: 1, deferredThrottle: 1, deferredNetwork: 0, deferredService: 0, error: 1 },
+    });
+    // fixed key order (byte-determinism): the units keys serialize in enum order
+    expect(Object.keys(report.runOutcome.units)).toEqual(["scanned", "reused", "skippedCutoff", "policyExcluded", "pastCap", "deferredThrottle", "deferredNetwork", "deferredService", "error"]);
+    db.close();
+  });
+
   test("an empty run (no findings) still emits the full, schema-valid shape", () => {
     const db = mem();
     const { runId } = db.startRun({
       configHash: "h2", effectiveOwners: ["org-b"], ownersSource: "configured",
       trackedPackages: ["left-pad"], cutoffDate: "2024-01-01", githubHost: "ghe.corp.example",
     });
-    db.completeRun(runId);
+    db.finalizeRun(runId, "complete"); // §3.1e: a report requires a finalized outcome (schema-non-null)
     const parsed = reportSchema.safeParse(buildReport(db, db.getRun(runId)!));
     expect(parsed.success ? [] : parsed.error.issues).toEqual([]);
     db.close();
@@ -668,6 +723,37 @@ describe("reportSchema (§7 contract as a strict Zod schema)", () => {
     // ReportSummary type — this pins the runtime keys to the schema so neither can drift alone.
     expect(Object.keys(buildReport(db, run).summary).sort()).toEqual(Object.keys(summarySchema.shape).sort());
     db.close();
+  });
+
+  test("buildReport's runOutcome keys (and units keys) match runOutcomeSchema exactly (§3.1b key-sync)", () => {
+    const db = mem();
+    const run = seed(db);
+    const block = buildReport(db, run).runOutcome;
+    expect(Object.keys(block).sort()).toEqual(Object.keys(runOutcomeSchema.shape).sort());
+    expect(Object.keys(block.units).sort()).toEqual(Object.keys(runOutcomeSchema.shape.units.shape).sort());
+    db.close();
+  });
+
+  test("emitReportDetailed defense-in-depth: alsoLatest=true on a PARTIAL run still does NOT write latest.json", () => {
+    const db = mem();
+    const { runId } = db.startRun({
+      configHash: "h", effectiveOwners: ["o"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "c", status: "deferred-throttle", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    expect(db.finalizeRun(runId, "complete")).toBe("partial-deferred");
+    const root = mkdtempSync(join(tmpdir(), "emit-dind-"));
+    try {
+      // A caller MISTAKENLY asks for latest on a partial run — the independent outcome re-check must
+      // still refuse to serve it as latest (the orchestrator already gates, this is defense in depth).
+      const emitted = emitReportDetailed(db, db.getRun(runId)!, root, { alsoLatest: true });
+      expect(readdirSync(root)).toContain(`run-${runId}.json`); // the run report IS written
+      expect(readdirSync(root)).not.toContain("latest.json"); // …but the partial is NOT served as latest
+      expect(emitted.report.runOutcome.outcome).toBe("partial-deferred");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      db.close();
+    }
   });
 
   test("schema strength: an apiSurface key NOT in versionsSeen is rejected (the documented subset invariant)", () => {
@@ -776,6 +862,36 @@ describe("runReport zero-write on a missing database", () => {
       expect(readdirSync(join(root, "output"))).toEqual(["latest.json"]); // only latest.json, no run-<id>.json
       const written = JSON.parse(readFileSync(join(root, "output", "latest.json"), "utf8"));
       expect(notReportableSchema.safeParse(written).success).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(dbRoot, { recursive: true, force: true });
+      if (!dataExistedBefore && existsSync("./data") && readdirSync("./data").length === 0) rmSync("./data", { recursive: true });
+    }
+  });
+
+  test("report --run-id on an UNFINALIZED run (outcome NULL) → notReportable 'did not finalize', not a report", () => {
+    const dataExistedBefore = existsSync("./data");
+    const dbRoot = `./data/.reporttest-unfin-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const root = mkdtempSync(join(tmpdir(), "report-unfin-"));
+    try {
+      const sqlitePath = join(dbRoot, "audit.db");
+      const db = AuditDb.open({ sqlitePath });
+      const { runId } = db.startRun({
+        configHash: "h", effectiveOwners: ["o"], ownersSource: "discovered",
+        trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+      });
+      db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "c", status: "scanned", isDefaultBranch: null, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+      db.completeRun(runId); // status='completed' but outcome stays NULL — the run never FINALIZED
+      db.close();
+      const cfg: Config = { ...config(root), paths: { sqlitePath, outputDir: join(root, "output") } };
+      const { line } = runReport(cfg, runId);
+      const notice = JSON.parse(line);
+      expect(notice.notReportable).toBe(true);
+      expect(notice.reason).toContain("did not finalize");
+      expect(notReportableSchema.safeParse(notice).success).toBe(true);
+      // the notice went to run-<id>.json (never latest.json); NO report was emitted
+      expect(readdirSync(join(root, "output"))).toEqual([`run-${runId}.json`]);
+      expect(JSON.parse(readFileSync(join(root, "output", `run-${runId}.json`), "utf8")).notReportable).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(dbRoot, { recursive: true, force: true });
@@ -916,7 +1032,7 @@ test("emitReportDetailed: a ..-chain outputDir creates no directories outside it
       configHash: "h", effectiveOwners: ["o"], ownersSource: "configured",
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
-    db.completeRun(runId);
+    db.finalizeRun(runId, "complete"); // buildReport requires a finalized run (§3.1e)
     const run = db.getRun(runId)!;
     const outputDir = `${tmp}/out/../evil/../out/sub`; // canonical: <tmp>/out/sub
     emitReportDetailed(db, run, outputDir, { alsoLatest: false });
@@ -960,13 +1076,13 @@ describe("buildReport — run-scope head-join discrimination (M7)", () => {
     db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.upsertUsageFinding({ runId: rA, ...usage });
     db.upsertDependencyFinding({ runId: rA, ...dep });
-    db.completeRun(rA);
+    db.finalizeRun(rA, "complete"); // buildReport requires a finalized run (§3.1e)
     Bun.sleepSync(2);
     const { runId: rB } = db.startRun(input);
     db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.upsertUsageFinding({ runId: rB, ...usage }); // same UNIQUE key → uf.run_id moves to rB
     db.upsertDependencyFinding({ runId: rB, ...dep }); // same UNIQUE key → df.run_id moves to rB
-    db.completeRun(rB);
+    db.finalizeRun(rB, "complete");
 
     // Precondition: BOTH findings' run_ids really did move (otherwise this test discriminates nothing).
     const movedU = db.read("SELECT run_id FROM usage_findings WHERE file_path = 'src/shared.ts'").get() as { run_id: string };

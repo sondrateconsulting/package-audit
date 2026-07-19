@@ -206,7 +206,7 @@ describe("branch allow/deny — a policy-excluded branch never leaks stale findi
       }
       db.upsertRunUnitHead(scannedHead(runIdA, "main", MAIN_SHA, true));
       db.upsertRunUnitHead(scannedHead(runIdA, "feature/x", FX_SHA, false));
-      db.completeRun(runIdA);
+      db.finalizeRun(runIdA, "complete");
       const reportA = buildReport(db, db.getRun(runIdA)!) as any;
       const aBranches = new Set(reportA.packages[0].usageByRepo.map((u: any) => u.branch));
       expect(aBranches.has("feature/x")).toBe(true); // non-vacuous: feature/x DID have findings when scanned
@@ -215,7 +215,7 @@ describe("branch allow/deny — a policy-excluded branch never leaks stale findi
       const runIdB = db.startRun({ configHash: "b", effectiveOwners: [ORG], ownersSource: "configured", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" }).runId;
       db.upsertRunUnitHead(scannedHead(runIdB, "main", MAIN_SHA, true));
       db.upsertRunUnitHead({ runId: runIdB, organization: ORG, repository: REPO, branch: "feature/x", commitSha: "", status: "policy-excluded", isDefaultBranch: false, policyStatus: "excluded-by-deny", policyMatchedPattern: "feature/*", scannedCommitDate: "2025-06-01T00:00:00Z" });
-      db.completeRun(runIdB);
+      db.finalizeRun(runIdB, "complete");
 
       // report(B): the positive control surfaces, the excluded branch does NOT (real via commit mismatch,
       // poison via the status='scanned' predicate — the poison shares feature/x's blank commit with run B's head).

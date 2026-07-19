@@ -10,7 +10,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { loadConfig, type Config } from "./config.ts";
-import { AuditDb, REPORTABLE_UNIT_STATUSES, type AuditDbReader, type RunRecord } from "./db.ts";
+import { AuditDb, REPORTABLE_UNIT_STATUSES, type AuditDbReader, type RunOutcome, type RunRecord, type UnitHeadStatus } from "./db.ts";
 import { ArtifactBundle, writeFileAtomic, XRAY_DIR_NAME, XRAY_FORMAT_VERSION } from "./artifactWrite.ts";
 import { dossierFilename, renderDossierDetailed, type DossierContext, type ScanScope, type PolicyBranchRow } from "./reportHtml.ts";
 import { INDEX_FILENAME, renderIndex } from "./indexHtml.ts";
@@ -42,7 +42,7 @@ interface UsageRowDb {
   context: string; file_path: string; line_number: number; permalink: string; snippet: string; found_at: string;
 }
 interface HeadRow {
-  organization: string; repository: string; branch: string; commit_sha: string; status: string;
+  organization: string; repository: string; branch: string; commit_sha: string; status: UnitHeadStatus;
   is_default_branch: number | null; // 1/0/NULL — NULL = unknown (pre-v3 run rows)
   policy_status: string | null; // 'excluded-by-deny' | 'excluded-by-allow' | NULL (PROMPT.md §3)
   policy_matched_pattern: string | null; // the causing deny pattern; NULL for allow-miss / no-policy
@@ -119,6 +119,19 @@ export interface ReportSummary {
 // call stops compiling here instead of throwing at render time. The full report shape (declarations,
 // cli, dateFetched — a superset of the renderer's view) is preserved for run-<id>.json; its JSON
 // contract is separately enforced by reportSchema.ts in tests. errors[] stays untyped (leaf only).
+// §3.1b run coverage block (key-synced to reportSchema.runOutcomeSchema by test). `units` counts
+// every run_unit_head disposition in a FIXED key order for byte-determinism.
+export interface RunOutcomeBlock {
+  outcome: RunOutcome; // never null — buildReport rejects an unfinalized run (§3.1e)
+  coverageComplete: boolean | null;
+  discoveryFailures: number;
+  discoveryDeferrals: number;
+  units: {
+    scanned: number; reused: number; skippedCutoff: number; policyExcluded: number; pastCap: number;
+    deferredThrottle: number; deferredNetwork: number; deferredService: number; error: number;
+  };
+}
+
 export interface EmittedReport {
   // PINNED to the constant, not a bare `number` (the COMPARE_FORMAT_VERSION precedent): this shape IS
   // v2, so a build that emitted some other version here would be mislabelling itself, and reportSchema
@@ -126,6 +139,7 @@ export interface EmittedReport {
   formatVersion: typeof XRAY_FORMAT_VERSION; // the report/export/HTML artifact-set version
   runId: string;
   generatedAt: string;
+  runOutcome: RunOutcomeBlock;
   config: { packages: string[]; cutoffDate: string; githubHost: string; organizations: string[]; organizationsSource: string };
   packages: ReadonlyArray<ReturnType<typeof buildPackage>>;
   errors: unknown[];
@@ -141,6 +155,12 @@ export function buildReport(db: AuditDbReader, run: RunRecord): EmittedReport {
 }
 
 function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
+  // §3.1e invariant, made TOTAL here: a report requires a FINALIZED run — runOutcome.outcome is a
+  // real coverage disposition, never null. The CLI (runReport) and orchestrator both gate on this
+  // before emitting, so a null outcome reaching here is a caller bug, not a reportable state. This
+  // guard also NARROWS run.outcome to RunOutcome for the block below (schema outcome is non-nullable).
+  if (run.outcome === null)
+    throw new Error(`cannot build a report for the unfinalized run ${run.runId} (outcome is NULL — it never finalized)`);
   const runId = run.runId;
   const tracked = JSON.stringify(run.trackedPackages);
 
@@ -210,10 +230,40 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
   // identical — it just makes "gate before trust" a data-flow fact instead of a source-order coincidence.
   const validatedHeads = assertHeadsWellFormed(heads);
 
+  // T5c §3.1b: disposition counts over EVERY (validated) head — not just the reportable slice — in a
+  // FIXED enum order for byte-determinism. The switch is exhaustive over the v5 UnitHeadStatus (9
+  // dispositions incl. the branch-policy policy-excluded/past-cap): a new disposition added to db.ts
+  // fails to compile here (the `never` assignment) rather than being silently dropped from the view.
+  const units = { scanned: 0, reused: 0, skippedCutoff: 0, policyExcluded: 0, pastCap: 0, deferredThrottle: 0, deferredNetwork: 0, deferredService: 0, error: 0 };
+  for (const h of validatedHeads) {
+    switch (h.status) {
+      case "scanned": units.scanned++; break;
+      case "reused": units.reused++; break;
+      case "skipped-cutoff": units.skippedCutoff++; break;
+      case "policy-excluded": units.policyExcluded++; break;
+      case "past-cap": units.pastCap++; break;
+      case "deferred-throttle": units.deferredThrottle++; break;
+      case "deferred-network": units.deferredNetwork++; break;
+      case "deferred-service": units.deferredService++; break;
+      case "error": units.error++; break;
+      default: {
+        const _exhaustive: never = h.status;
+        throw new Error(`unhandled run_unit_head status in report coverage counts: ${String(_exhaustive)}`);
+      }
+    }
+  }
+
   return {
     formatVersion: XRAY_FORMAT_VERSION,
     runId,
     generatedAt: run.completedAt ?? run.startedAt, // §7: COALESCE(completed_at, started_at)
+    runOutcome: {
+      outcome: run.outcome,
+      coverageComplete: run.coverageComplete,
+      discoveryFailures: run.discoveryFailures,
+      discoveryDeferrals: run.discoveryDeferrals,
+      units,
+    },
     config: {
       packages: run.trackedPackages, cutoffDate: run.cutoffDate, githubHost: run.githubHost,
       organizations: run.effectiveOwners, organizationsSource: run.ownersSource,
@@ -433,24 +483,36 @@ export function emitReportDetailed(
   const report = buildReport(db, run);
   const runPath = join(outputDir, `run-${run.runId}.json`);
   writeJson(runPath, outputDir, report);
-  if (opts.alsoLatest) writeJson(join(outputDir, "latest.json"), outputDir, report);
+  // latest.json is written for a run-<id> report ONLY when the caller asks AND the run is genuinely
+  // reportable (§3.1e). The orchestrator already gates alsoLatest on a complete outcome, and the
+  // CLI default path selects latestReportableRun — but this independent re-check is defense in depth:
+  // a partial/fatal run must never be served as "latest" even if a caller passes alsoLatest by mistake.
+  if (opts.alsoLatest && (run.outcome === "complete" || run.outcome === "legacy-unknown"))
+    writeJson(join(outputDir, "latest.json"), outputDir, report);
   return { path: runPath, report };
 }
 // The "nothing to report" notice (no completed reportable run, or an unknown/pre-migration
 // --run-id). Exported so tests validate the REAL emitted object against notReportableSchema,
 // not a hand-written lookalike.
-export function buildNotReportableNotice(runIdArg: string | null, missingDbPath?: string): { notReportable: true; reason: string } {
+export function buildNotReportableNotice(
+  runIdArg: string | null,
+  missingDbPath?: string,
+  unfinalized?: boolean,
+): { notReportable: true; reason: string } {
   // A missing database is the most fundamental "nothing to report" cause and gets an actionable
   // reason (run the audit first); it takes precedence over the run-id/empty cases, which only
-  // make sense once a database exists.
+  // make sense once a database exists. `unfinalized` is the §3.1e case: a --run-id run that exists
+  // but never finalized (outcome NULL) — a coherent report needs a finalized coverage outcome.
   return {
     notReportable: true,
     reason:
       missingDbPath !== undefined
         ? `no database at ${missingDbPath} — run \`bun run audit\` first`
-        : runIdArg !== null
-          ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)`
-          : "no completed reportable run yet",
+        : unfinalized === true
+          ? `run ${runIdArg} did not finalize (crashed or never completed) — no coverage outcome to report`
+          : runIdArg !== null
+            ? `run ${runIdArg} not found or pre-migration (empty tracked_packages)`
+            : "no completed reportable run yet",
   };
 }
 
@@ -514,8 +576,14 @@ export function runReport(config: Config, runIdArg: string | null, opts: { html?
     const outputDir = config.paths.outputDir;
     mkdirCanonical(outputDir);
 
-    if (run === null || run.trackedPackages.length === 0) {
-      const notice = buildNotReportableNotice(runIdArg);
+    // §3.1e: a --run-id run that EXISTS and has tracked packages but never FINALIZED (outcome NULL —
+    // crashed mid-run, or a legacy running row failed on the next start) has undefined coverage and
+    // is not a coherent report. Surface it as notReportable ("did not finalize") rather than emit a
+    // report with a null outcome. (The default path selects latestReportableRun, which already
+    // requires a non-null reportable outcome, so it never reaches here.)
+    const unfinalized = runIdArg !== null && run !== null && run.trackedPackages.length > 0 && run.outcome === null;
+    if (run === null || run.trackedPackages.length === 0 || unfinalized) {
+      const notice = buildNotReportableNotice(runIdArg, undefined, unfinalized);
       const path = join(outputDir, runIdArg !== null ? `run-${runIdArg}.json` : "latest.json");
       writeJson(path, outputDir, notice);
       return { line: `${JSON.stringify(notice)}\n` };
