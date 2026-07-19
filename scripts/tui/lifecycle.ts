@@ -546,7 +546,6 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
   };
 
   // ---- setup (§U1 normative order); any failure degrades per §U6 and body() runs regardless --
-  let mounted = false;
   try {
     const load = deps.mountImpl ?? (() => import("./mount.tsx"));
     const mod = await load();
@@ -614,7 +613,6 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         if (unwindWarnings.length > 0) warnReal(`package-audit: dashboard unwind warnings — ${unwindWarnings.join("; ")}\n`);
       } else {
         state.handle = h;
-        mounted = true;
         // Install order (§U1): seams only after a successful mount — a mount failure leaves
         // JSONL on stdout, the exact pre-feature behavior.
         // The GUARDED progress sink: a store fold bug clears the sink SYNCHRONOUSLY (later
