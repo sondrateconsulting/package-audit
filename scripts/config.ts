@@ -37,13 +37,18 @@ export interface Concurrency {
 // Per-category spawn deadlines plus the heartbeat cadence, in SECONDS (§3 resilience — T11). Operational tuning
 // only: like `concurrency`, EXCLUDED from config_hash so raising a timeout never orphans
 // resumable work. Every field is optional in the file; omitted fields fall back to DEFAULT_TIMEOUTS.
+// `readonly` (fields AND the containing Config.timeouts property below): the values are validated
+// once at load (normalizeTimeouts/isPosInt) and then shared across the concurrent fan-out, so a
+// stray downstream `config.timeouts.controlApiSeconds = 0` — which would reinstate the exact
+// "nonpositive deadline instantly times out every spawn" state the validation rejects — must not
+// type-check. Matches the OrchestrateArgs readonly convention already in this repo.
 export interface Timeouts {
-  controlApiSeconds: number; // gh auth/version/rate_limit/user, GraphQL, listings — quick control calls
-  bulkApiSeconds: number; // raw content GETs (file/blob/recursive-tree) — large, slow-link tolerant
-  cloneSeconds: number; // git clone fallback
-  tarSeconds: number; // registry tarball extraction
-  probeSeconds: number; // T2 connectivity probe (wired in the outage-lifecycle PR)
-  heartbeatSeconds: number; // liveness heartbeat cadence (orchestrate, not a spawn deadline)
+  readonly controlApiSeconds: number; // gh auth/version/rate_limit/user, GraphQL, listings — quick control calls
+  readonly bulkApiSeconds: number; // raw content GETs (file/blob/recursive-tree) — large, slow-link tolerant
+  readonly cloneSeconds: number; // git clone fallback
+  readonly tarSeconds: number; // registry tarball extraction
+  readonly probeSeconds: number; // T2 connectivity probe (wired in the outage-lifecycle PR)
+  readonly heartbeatSeconds: number; // liveness heartbeat cadence (orchestrate, not a spawn deadline)
 }
 
 export interface Config {
@@ -66,7 +71,7 @@ export interface Config {
   excludeRepositories: string[];
   cutoffDate: string; // YYYY-MM-DD
   concurrency: Concurrency;
-  timeouts: Timeouts;
+  readonly timeouts: Timeouts; // readonly so the whole validated object can't be swapped for an invalid one
   packages: PackageConfig[];
   excludeDirGlobs: string[];
   paths: { sqlitePath: string; outputDir: string };

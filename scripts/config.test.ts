@@ -6,7 +6,21 @@ import {
   validateAndNormalize, computeConfigHash, resolveConfigPath, loadConfig, ConfigError,
   CONFIG_ROOT_KEYS, CONFIG_CONCURRENCY_KEYS, CONFIG_PATHS_KEYS, CONFIG_PACKAGE_KEYS,
   CONFIG_TIMEOUTS_KEYS, DEFAULT_TIMEOUTS,
+  type Config, type Timeouts,
 } from "./config.ts";
+
+// Compile-only (NEVER called): the `readonly` modifiers on Timeouts' fields and on Config.timeouts
+// must reject mutation of a validated, shared config. Each @ts-expect-error below turns into an
+// "unused directive" typecheck ERROR the instant its readonly regresses — so `bun run typecheck` is
+// the real assertion here. (finding ADVISORY-6d)
+function _readonlyTimeoutsCompileGuard(t: Timeouts, c: Config): void {
+  // @ts-expect-error — Timeouts.controlApiSeconds is readonly
+  t.controlApiSeconds = 0;
+  // @ts-expect-error — Timeouts.heartbeatSeconds is readonly
+  t.heartbeatSeconds = 0;
+  // @ts-expect-error — Config.timeouts is readonly (the whole validated object can't be swapped out)
+  c.timeouts = t;
+}
 
 const baseRaw = (): Record<string, unknown> => ({
   githubHost: "github.com",
