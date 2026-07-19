@@ -541,7 +541,7 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
               } catch (e) {
                 openErr = e;
                 if ((e as { code?: unknown }).code === "EEXIST") continue; // try the next suffix
-                break; // any other open/mkdir failure degrades
+                break; // any other open/directory-create failure degrades
               }
             }
           }
