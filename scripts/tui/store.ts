@@ -77,7 +77,8 @@ export interface TuiSnapshot {
 }
 
 export interface TuiStore {
-  readonly version: number; // incremented per mutation (render-skip signal)
+  readonly version: number; // incremented per DISPATCH, changed state or not (render-skip
+  //                             signal: cheap monotonic "anything arrived", not a diff)
   snapshot(): TuiSnapshot;
   dispatch(e: ProgressEvent): void;
 }

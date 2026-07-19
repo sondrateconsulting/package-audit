@@ -1075,8 +1075,11 @@ export class GithubClient {
       tar: whichIn(this.baseEnv, "tar"),
     };
     this.ghEnv = buildGhEnv(this.baseEnv, this.githubHost);
-    // PROMPT-TUI §U3.2: the waiter gauge. Both clients (preflight + scan) emit through the same
-    // hub, so their waiters simply aggregate; emitProgress never throws.
+    // PROMPT-TUI §U3.2: the waiter gauge. Both clients (preflight + scan) report their OWN
+    // semaphore's queue depth through the one hub — each emission overwrites the scalar, and it
+    // stays truthful because the clients' lifetimes are SEQUENTIAL (preflight completes before
+    // the scan client works), so at any moment the gauge is the sole live semaphore's depth;
+    // emitProgress never throws.
     this.sem = new Semaphore(concurrency, (waiting) => {
       if (hasProgressSink()) emitProgress({ type: "spawn-queue", waiting });
     });
