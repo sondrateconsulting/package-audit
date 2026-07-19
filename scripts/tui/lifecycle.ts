@@ -18,7 +18,16 @@ export const TEARDOWN_EXIT_WAIT_MS = 2_000; // §U6 step 2: bounded unmount wait
 export const DIVERT_OPEN_ATTEMPTS = 10; // §U1: candidates attempt 0..9, then degrade
 const SHOW_CURSOR = "\u001B[?25h";
 
-const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+// TOTAL: a hostile thrown value (throwing toString/message getter) must never make a guard or
+// teardown step itself throw — cleanup runs to completion no matter what it is cleaning up after.
+const errText = (e: unknown): string => {
+  try {
+    if (e instanceof Error && typeof e.message === "string") return e.message;
+    return String(e);
+  } catch {
+    return "unprintable error";
+  }
+};
 
 // ---- divert log path (pure grammar + contained production builder) ---------------------------
 // `<outputDir>/logs/audit-log-<UTC yyyyMMddTHHmmssZ>-p<pid>.jsonl` for attempt 0; `-2`, `-3`, …
@@ -50,22 +59,28 @@ export interface DivertIo {
 // createWriteStream opens asynchronously and reports failures via a later 'error' event — the
 // wrong shape for a sink that must be usable before the first event. The synchronous trio keeps
 // open/write/close failures at the call site, where the §U6 transitions can see them.
+// The short-write loop, factored over an injected write so the count semantics are directly
+// table-testable (§U8.4): writeSync may write SHORT without throwing — loop until the WHOLE
+// line is delivered (one logical write per event, ordering by construction). A nonpositive or
+// non-integer count is a WRITE FAILURE, not a retry: an unchanged infinite retry would hang
+// the audit (§U1).
+export function writeAllSync(writeFn: (fd: number, buf: Buffer, offset: number) => number, fd: number, line: string): void {
+  const buf = Buffer.from(line, "utf8");
+  let offset = 0;
+  while (offset < buf.length) {
+    const n = writeFn(fd, buf, offset);
+    if (!Number.isInteger(n) || n <= 0) throw new Error(`divert write made no progress (write returned ${n})`);
+    offset += n;
+  }
+}
+
 export const realDivertIo: DivertIo = {
   open(path: string): number {
     mkdirSync(dirname(path), { recursive: true });
     return openSync(path, "wx", 0o644);
   },
   write(fd: number, line: string): void {
-    // writeSync may write SHORT without throwing — loop until the WHOLE line is delivered (one
-    // logical write per event, ordering by construction). A nonpositive/invalid count is a WRITE
-    // FAILURE, not a retry: an unchanged infinite retry would hang the audit (§U1).
-    const buf = Buffer.from(line, "utf8");
-    let offset = 0;
-    while (offset < buf.length) {
-      const n = writeSync(fd, buf, offset);
-      if (!Number.isInteger(n) || n <= 0) throw new Error(`divert write made no progress (writeSync returned ${n})`);
-      offset += n;
-    }
+    writeAllSync(writeSync, fd, line);
   },
   close(fd: number): void {
     closeSync(fd); // no fsync — the DB, not the log, is the durable state
@@ -77,9 +92,11 @@ export interface SealableStderr {
   readonly stream: NodeJS.WriteStream; // hand THIS to Ink; delegates everything else to the real stream
   readonly sealed: boolean;
   readonly sealedDrops: number; // write attempts counted-and-dropped after seal
-  readonly cursorCompensated: boolean; // sealEarly wrote the cursor-show escape
+  readonly cursorCompensated: boolean; // the cursor-show escape was written on Ink's behalf
   seal(): void; // idempotent; writes stop reaching the real stream
   sealEarly(): void; // seal + cursor-show compensation in ONE synchronous step (§U1)
+  compensateCursor(): void; // write the cursor-show escape once (idempotent; for post-seal paths
+  //                           where Ink's own restore write was — or will be — dropped)
   detach(): void; // remove the 'error' absorber from the real stream (teardown)
 }
 
@@ -154,18 +171,27 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
     seal(): void {
       sealed = true;
     },
+    compensateCursor(): void {
+      // Write the cursor-show escape ONCE on Ink's behalf — for any path where Ink's own
+      // restore write was (or will be) dropped by the seal: sealEarly, a timed-out/failed
+      // unmount, or a late-handle unwind against an already-sealed proxy. Idempotent;
+      // best-effort (a dead stderr cannot be compensated, and must not throw here). A
+      // redundant show when the cursor is already visible is a terminal no-op.
+      if (cursorCompensated) return;
+      cursorCompensated = true;
+      try {
+        real.write(SHOW_CURSOR, () => {});
+      } catch {
+        // best-effort only
+      }
+    },
     sealEarly(): void {
       // seal + cursor-show compensation in the SAME synchronous step: Ink hid the cursor at
       // mount and its own restore write would be dropped by the seal; a SIGINT landing inside
       // the unmount wait must not strand a hidden cursor (§U1). Idempotent.
       if (sealed) return;
       sealed = true;
-      cursorCompensated = true;
-      try {
-        real.write(SHOW_CURSOR);
-      } catch {
-        // best-effort: a dead stderr cannot be compensated, and must not throw here
-      }
+      this.compensateCursor();
     },
     detach(): void {
       real.off("error", errorAbsorber);
@@ -218,7 +244,9 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
   });
 
   const writeReal = (text: string): void => {
-    realStderr.write(text);
+    // the noop callback routes an async write failure to the callback instead of a later
+    // 'error' event — our own teardown lines can never seed a post-detach crash
+    realStderr.write(text, () => {});
   };
   // Best-effort variant for every OUTSIDE-teardown warning site: a broken stderr must degrade
   // the dashboard, never throw into the setup path and kill the audit (§U0 has no exceptions).
@@ -233,10 +261,16 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
   // waitUntilExit bounded by the INJECTED timers (§U6 step 2). TOTAL: never rejects, and a
   // throwing injected timer cannot hang it (a broken timer resolves the wait immediately —
   // skipping the grace beats an unbounded hang); ALWAYS clears the loser when the exit wins.
-  const boundedExitWait = (h: TuiHandle): Promise<void> =>
-    new Promise<void>((resolve) => {
-      let t: ReturnType<typeof setTimeout> | null = null;
-      const done = (): void => {
+  // Returns HOW the wait ended — a non-"exited" outcome is a teardown fact the caller must
+  // surface as a deferred warning, never silent success (a wedged Ink left a hidden cursor and
+  // a sealed stream dropping its frames; the operator deserves the one line saying so).
+  type ExitOutcome = "exited" | "timeout" | "wait-rejected" | "wait-threw" | "timer-failed";
+  const boundedExitWait = (h: TuiHandle): Promise<ExitOutcome> =>
+    new Promise<ExitOutcome>((resolve) => {
+      let settled = false;
+      const done = (outcome: ExitOutcome): void => {
+        if (settled) return;
+        settled = true;
         if (t !== null) {
           const timer = t;
           t = null;
@@ -246,18 +280,24 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
             // a failing clear cannot matter more than finishing the wait
           }
         }
-        resolve();
+        resolve(outcome);
       };
+      let t: ReturnType<typeof setTimeout> | null = null;
+      let timerFailed = false;
       try {
-        t = timers.setTimeout(done, TEARDOWN_EXIT_WAIT_MS);
+        t = timers.setTimeout(() => done("timeout"), TEARDOWN_EXIT_WAIT_MS);
       } catch {
-        done(); // no timer available → no way to bound the wait → end it now
+        timerFailed = true; // no timer → no way to bound the wait → end it now (below)
       }
       try {
-        h.waitUntilExit().then(done, done);
+        h.waitUntilExit().then(
+          () => done("exited"),
+          () => done("wait-rejected"),
+        );
       } catch {
-        done();
+        done("wait-threw");
       }
+      if (timerFailed) done("timer-failed");
     });
 
   // The ONE teardown sequence (§U6) — cached promise; degrade and the finally both await it.
@@ -289,11 +329,14 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         const h = state.handle;
         // 1. stop the tick + App-side hooks (skipped when the handle never arrived)
         guarded("dispose", () => h?.dispose());
-        // 2. unmount + bounded exit wait
+        // 2. unmount + bounded exit wait. A non-"exited" outcome is NOT silent success: it is a
+        // teardown fact the operator must see (a wedged Ink whose frames the seal will drop).
         const sealedBeforeUnmount = proxy.sealed;
+        let exitOutcome: "exited" | "timeout" | "wait-rejected" | "wait-threw" | "timer-failed" | "no-handle" = "no-handle";
         if (h !== null) {
           guarded("unmount", () => h.requestUnmount());
-          await boundedExitWait(h);
+          exitOutcome = await boundedExitWait(h);
+          if (exitOutcome !== "exited") stepWarnings.push(`exit-wait: unmount did not complete cleanly (${exitOutcome})`);
         }
         // 3. seal — from here NOTHING (a wedged Ink, queued renders, its console patch) can reach
         // the real stderr; sealed-off attempts are counted into the step-6 warning.
@@ -316,9 +359,13 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
                 : `JSONL log: ${state.divertPath}`;
           guarded("exit-line", () => writeReal(exitLine + "\n"));
         }
-        // 5a. defensive cursor compensation: every pre-unmount seal site uses sealEarly() (which
-        // compensates itself), so this never fires in correct operation.
-        if (sealedBeforeUnmount && !proxy.cursorCompensated) guarded("cursor-show", () => writeReal(SHOW_CURSOR));
+        // 5a. cursor compensation for every path where Ink's own restore write did not land:
+        // a seal that preceded unmount without sealEarly's compensation (a defensive
+        // impossibility — every pre-unmount seal site uses sealEarly), and the REAL case a
+        // bounded-exit failure leaves behind — a wedged/failed unmount never restored the
+        // cursor, and the step-3 seal has closed the stream to any late restore attempt.
+        if (!proxy.cursorCompensated && (sealedBeforeUnmount || (state.handle !== null && exitOutcome !== "exited")))
+          guarded("cursor-show", () => proxy.compensateCursor());
         // 6. the ONE latched-failure warning (first cause + sealed-write count), if any
         const latch = tuiFailure();
         if (latch !== null) {
@@ -372,7 +419,15 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         } catch (e) {
           unwindWarnings.push(`unmount: ${errText(e)}`);
         }
-        await boundedExitWait(h);
+        const unwindOutcome = await boundedExitWait(h);
+        if (unwindOutcome !== "exited") unwindWarnings.push(`exit-wait: ${unwindOutcome}`);
+        // The teardown that ran ahead of this unwind sealed the proxy, so the late renderer's
+        // OWN cursor restore was dropped — compensate on its behalf (idempotent, best-effort).
+        try {
+          proxy.compensateCursor();
+        } catch {
+          // best-effort
+        }
         if (unwindWarnings.length > 0) warnReal(`package-audit: dashboard unwind warnings — ${unwindWarnings.join("; ")}\n`);
       } else {
         state.handle = h;
@@ -452,6 +507,16 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
                 // BEFORE any JSONL can reach a same-terminal stdout (sealEarly also compensates
                 // the cursor), latch the divert flag, start teardown, then rethrow — the log
                 // seam restores stdout and re-emits this exact line (no event is lost).
+                //
+                // DOCUMENTED ORDER DEVIATION (recorded in the PR): §U1's numbered list reads
+                // seal → restore+re-emit → report → degrade, but its own mechanism sentences
+                // (the closure reports; the log seam — the one module allowed to touch the
+                // machine stdout — restores and re-emits downstream of this rethrow) make that
+                // literal order unimplementable. Actual order: seal, report, degrade, rethrow,
+                // then the seam's restore+re-emit — still ONE synchronous call, and every
+                // stated invariant holds: the seal precedes any stdout byte, the failing line
+                // is re-emitted in the same call, and the flag is set long before teardown
+                // reads it (teardown suspends at its first await before any of its output).
                 proxy.sealEarly();
                 reportDivertFailure(errText(err));
                 degradeNow();

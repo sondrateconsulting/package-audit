@@ -44,6 +44,17 @@ export function hasProgressSink(): boolean {
   return activeSink !== null;
 }
 
+// TOTAL error rendering: even a hostile thrown value (a throwing toString/message getter) must
+// not make the never-throws functions below throw.
+function causeText(e: unknown): string {
+  try {
+    if (e instanceof Error && typeof e.message === "string") return e.message;
+    return String(e);
+  } catch {
+    return "unprintable error";
+  }
+}
+
 // NEVER throws: the first sink throw clears the sink (later emits are single null-checks again)
 // and latches the failure — the reaction (degrade) belongs to the lifecycle's guarded sink
 // closure, which catches its own store errors before they ever reach this backstop (§U1).
@@ -54,7 +65,7 @@ export function emitProgress(e: ProgressEvent): void {
     sink(e);
   } catch (err) {
     activeSink = null;
-    reportTuiFailure(err instanceof Error ? err.message : String(err));
+    reportTuiFailure(causeText(err));
   }
 }
 

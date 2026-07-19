@@ -942,13 +942,23 @@ class Semaphore {
     this.available = n;
     this.onWaitersChanged = onWaitersChanged;
   }
+  // The gauge callback is called through this guard so a throwing observer can NEVER corrupt
+  // acquire/release accounting (orphan a queued waiter, leak a permit) — the semaphore's
+  // correctness must not depend on an observer honoring its no-throw contract.
+  private notifyWaiters(): void {
+    try {
+      this.onWaitersChanged?.(this.waiters.length);
+    } catch {
+      // observability only — never a participant
+    }
+  }
   async acquire(): Promise<() => void> {
     if (this.available > 0) {
       this.available--;
     } else {
       await new Promise<void>((resolve) => {
         this.waiters.push(resolve);
-        this.onWaitersChanged?.(this.waiters.length);
+        this.notifyWaiters();
       });
     }
     let released = false;
@@ -957,7 +967,7 @@ class Semaphore {
       released = true;
       const next = this.waiters.shift();
       if (next) {
-        this.onWaitersChanged?.(this.waiters.length);
+        this.notifyWaiters();
         next();
       } else {
         this.available++;

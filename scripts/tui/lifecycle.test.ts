@@ -769,6 +769,65 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     expect(stderr.all()).toContain("dispose exploded");
   });
 
+  test("a CLEAN wedged unmount (no prior latch) is NOT silent success: the timeout surfaces as a teardown warning and the cursor is restored", async () => {
+    const handle = makeFakeHandle({ exitMode: "never" }); // wedged: waitUntilExit never settles
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    let resolved = false;
+    const p = runWithTui(deps, async () => {}).then(() => {
+      resolved = true;
+    });
+    await until(() => timers.pending.length > 0);
+    timers.fireAll(); // the bounded wait times out
+    await until(() => resolved);
+    await p;
+    // NOTHING latched — yet the incomplete unmount must still be one visible line, not silence
+    expect(stderr.all()).toContain("teardown warnings");
+    expect(stderr.all()).toContain("unmount did not complete cleanly (timeout)");
+    expect(stderr.all()).not.toContain("dashboard disabled"); // no latch → no failure warning
+    // ...and the wedged Ink never restored the cursor; the seal would drop its late attempt —
+    // teardown compensates on its behalf
+    expect(stderr.all()).toContain(SHOW_CURSOR);
+  });
+
+  test("a REJECTING waitUntilExit at teardown surfaces as a warning too", async () => {
+    const handle = makeFakeHandle({ exitMode: "never" });
+    handle.waitUntilExit = () => {
+      handle.calls.push("waitUntilExit");
+      return Promise.reject(new Error("exit machinery broke"));
+    };
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    await runWithTui(deps, async () => {});
+    expect(stderr.all()).toContain("unmount did not complete cleanly (wait-rejected)");
+    expect(stderr.all()).toContain(SHOW_CURSOR); // rejection = no clean restore either
+  });
+
+  test("writeAllSync delivers whole lines through SHORT writes and fails on nonpositive/non-integer counts", async () => {
+    const { writeAllSync } = await import("./lifecycle.ts");
+    // short-write sequence: deliver 3 bytes, then 1, then the rest
+    const chunks: Array<{ offset: number; wrote: number }> = [];
+    const script = [3, 1, 100];
+    let call = 0;
+    writeAllSync(
+      (fd, buf, offset) => {
+        const n = Math.min(script[call++] ?? 100, buf.length - offset);
+        chunks.push({ offset, wrote: n });
+        return n;
+      },
+      7,
+      '{"event":"x"}\n',
+    );
+    expect(chunks.map((c) => c.offset)).toEqual([0, 3, 4]); // resumed exactly where it left off
+    expect(chunks.reduce((s, c) => s + c.wrote, 0)).toBe(14); // the WHOLE line delivered
+    // nonpositive and non-integer counts are WRITE FAILURES, never infinite retries
+    for (const bad of [0, -1, 0.5, NaN]) {
+      expect(() => writeAllSync(() => bad, 7, "line\n")).toThrow(/made no progress/);
+    }
+  });
+
   test("TOTAL teardown under a THROWING injected timer: the audit still completes, never hangs", async () => {
     // §U0 has no exceptions: a broken timer dep must not leave the cached teardown promise
     // pending (the finally would await forever — a hang is a kill).

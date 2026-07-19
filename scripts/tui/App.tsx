@@ -3,7 +3,7 @@
 // error boundary live in mount.tsx (a React error boundary cannot catch timer callbacks); this
 // component is pure display.
 import { useEffect, useReducer } from "react";
-import { Box, Text, useStdout, useWindowSize } from "ink";
+import { Box, Text, useStdout } from "ink";
 import type { TuiStore } from "./store.ts";
 import { planLayout, sanitizeLine } from "./format.ts";
 import { bannerLineCount, CompactFrame, Footer, Header, LimitsPanel, NetPanel, ProblemsPanel, ThrottleBanner, WorkPanel } from "./panels.tsx";
@@ -18,12 +18,19 @@ export interface AppProps {
 export function App({ store, subscribe, nowMs, mountedAtMs }: AppProps) {
   const [, bump] = useReducer((n: number) => n + 1, 0);
   useEffect(() => subscribe(() => bump()), [subscribe]);
-  // Resize-driven re-render (P0-verified under Bun: the stream emits 'resize' on SIGWINCH), but
-  // layout decisions read the RAW stream dimensions — useWindowSize's fallback would substitute
-  // ambient terminal values exactly when the stream reports none, and undefined dimensions must
-  // render the EMPTY frame (§U5).
-  useWindowSize();
   const { stdout } = useStdout();
+  // Resize-driven re-render via a DIRECT 'resize' subscription on the render stream (P0-verified:
+  // Bun emits it on SIGWINCH). Deliberately NOT ink's useWindowSize: its getWindowSize fallback
+  // reaches the terminal-size package — which can shell out to tput/resize helpers — exactly
+  // when the stream reports falsy dimensions. This feature's code spawns nothing (§U0), and
+  // undefined dimensions must render the EMPTY frame, never consult the ambient terminal (§U5).
+  useEffect(() => {
+    const onResize = (): void => bump();
+    stdout.on("resize", onResize);
+    return () => {
+      stdout.off("resize", onResize);
+    };
+  }, [stdout]);
 
   const snap = store.snapshot();
   const now = nowMs();

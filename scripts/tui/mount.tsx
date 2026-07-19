@@ -16,6 +16,17 @@ import { App } from "./App.tsx";
 
 export const DEFAULT_TICK_MS = 125;
 
+// TOTAL error rendering: a hostile thrown value (throwing toString/message getter) must never
+// make a failure handler itself throw into React or a timer callback.
+function causeText(e: unknown): string {
+  try {
+    if (e instanceof Error && typeof e.message === "string") return e.message;
+    return String(e);
+  } catch {
+    return "unprintable error";
+  }
+}
+
 export interface TuiHandle {
   requestUnmount(): void;
   waitUntilExit(): Promise<void>;
@@ -45,7 +56,7 @@ class Boundary extends Component<{ onCrash: (cause: string) => void; children: R
     return { crashed: true };
   }
   override componentDidCatch(error: unknown): void {
-    this.props.onCrash(error instanceof Error ? error.message : String(error));
+    this.props.onCrash(causeText(error));
   }
   override render(): ReactNode {
     return this.state.crashed ? null : this.props.children;
@@ -91,10 +102,18 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
   let timer: ReturnType<typeof setInterval> | null = null;
   let lastVersion = -1;
   let lastSecond = -1;
+  // TOTAL: a throwing injected clearInterval must neither escape a caller (dispose, the tick's
+  // own catch) nor mark the stop as done-without-clearing more than once — the timer slot is
+  // nulled first, and the disposed flag makes a still-firing uncancellable interval a no-op.
   const stopTick = (): void => {
-    if (timer !== null) {
-      scheduler.clearInterval(timer);
-      timer = null;
+    if (timer === null) return;
+    const t = timer;
+    timer = null;
+    try {
+      scheduler.clearInterval(t);
+    } catch {
+      // a scheduler that cannot cancel leaves a firing interval; the disposed check below
+      // makes every later tick a no-op, and teardown proceeds regardless
     }
   };
   // Guarded tick (§U5): a React error boundary cannot catch timer callbacks — this try/catch is
@@ -104,6 +123,7 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
   // change; otherwise skip the setState entirely.
   const tick = (): void => {
     try {
+      if (disposed) return; // an uncancellable interval still firing after dispose does nothing
       if (tuiFailure() !== null) {
         stopTick();
         opts.onDegrade();
@@ -117,7 +137,7 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
       }
     } catch (err) {
       stopTick();
-      onCrash(err instanceof Error ? err.message : String(err));
+      onCrash(causeText(err));
     }
   };
   timer = scheduler.setInterval(tick, tickMs);
@@ -125,7 +145,7 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
   // Rejection handler attached AT MOUNT (§U5): an unhandled waitUntilExit rejection would violate
   // degrade-never-kill (§U0), and a dead React tree cannot be relied on to poll any latch.
   instance.waitUntilExit().catch((e: unknown) => {
-    onCrash(e instanceof Error ? e.message : String(e));
+    onCrash(causeText(e));
   });
 
   return {

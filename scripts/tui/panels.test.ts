@@ -217,6 +217,29 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(wide).toContain("package-audit · scan · terminal too s"); // 39 columns shows more
   });
 
+  test("a 'resize' event on the render stream re-renders at the NEW dimensions (direct subscription, no terminal-size fallback)", async () => {
+    const out = new CaptureStream(120, 40);
+    const store: TuiStore = createTuiStore(() => NOW);
+    store.dispatch({ type: "phase", phase: "scan" });
+    const handle = mountTui(store, {
+      out: out as unknown as NodeJS.WriteStream,
+      onDegrade: () => {},
+      scheduler: { setInterval: (() => 0 as unknown as ReturnType<typeof setInterval>) as typeof setInterval, clearInterval: (() => {}) as typeof clearInterval },
+      nowMs: () => NOW,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    // shrink below the 40x5 floor mid-run and fire the stream's own resize event
+    out.columns = 30;
+    out.rows = 10;
+    out.emit("resize");
+    await new Promise((r) => setTimeout(r, 60));
+    handle.dispose();
+    handle.requestUnmount();
+    await Promise.race([handle.waitUntilExit(), new Promise((r) => setTimeout(r, 2000))]);
+    // the single-line frame took over, itself truncated to the NEW 30-column width by Ink
+    expect(out.text()).toContain("package-audit · scan · termin…");
+  });
+
   test("EMPTY frame below the render floor and for undefined dimensions — render nothing at all", async () => {
     for (const [columns, rows] of [
       [15, 30],
