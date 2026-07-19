@@ -19,18 +19,13 @@ export function App({ store, subscribe, nowMs, mountedAtMs }: AppProps) {
   const [, bump] = useReducer((n: number) => n + 1, 0);
   useEffect(() => subscribe(() => bump()), [subscribe]);
   const { stdout } = useStdout();
-  // Resize-driven re-render via a DIRECT 'resize' subscription on the render stream (P0-verified:
-  // Bun emits it on SIGWINCH). Deliberately NOT ink's useWindowSize: its getWindowSize fallback
-  // reaches the terminal-size package — which can shell out to tput/resize helpers — exactly
-  // when the stream reports falsy dimensions. This feature's code spawns nothing (§U0), and
-  // undefined dimensions must render the EMPTY frame, never consult the ambient terminal (§U5).
-  useEffect(() => {
-    const onResize = (): void => bump();
-    stdout.on("resize", onResize);
-    return () => {
-      stdout.off("resize", onResize);
-    };
-  }, [stdout]);
+  // Resize wakes arrive through the mount-owned frame bus (mount.tsx subscribes the render
+  // stream's 'resize' event directly and detaches it in dispose() — deterministic even when a
+  // wedged unmount never runs effect cleanup). Deliberately NOT ink's useWindowSize: its
+  // getWindowSize fallback reaches the terminal-size package — which can shell out to
+  // tput/resize helpers — exactly when the stream reports falsy dimensions. This feature's code
+  // spawns nothing (§U0), and undefined dimensions must render the EMPTY frame, never consult
+  // the ambient terminal (§U5). Layout reads the RAW stream dimensions below.
 
   const snap = store.snapshot();
   const now = nowMs();

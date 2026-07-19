@@ -98,6 +98,10 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
     },
   );
 
+  // Everything AFTER the render is wrapped so a failure here (a throwing injected scheduler,
+  // a broken listener registration) can never lose the live renderer: unmount it best-effort,
+  // then rethrow into the lifecycle's mount-failure path — no leaked Ink, no stranded handle.
+  try {
   let disposed = false;
   let timer: ReturnType<typeof setInterval> | null = null;
   let lastVersion = -1;
@@ -142,6 +146,19 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
   };
   timer = scheduler.setInterval(tick, tickMs);
 
+  // Resize wake channel, OWNED HERE (not an App effect) so dispose() detaches it
+  // deterministically even when a wedged/failed unmount never runs React's effect cleanup —
+  // no post-teardown re-renders, no listener left doing work against a sealed stream. It rides
+  // the same frame bus as the tick. (Deliberately not ink's useWindowSize — see App.tsx.)
+  const onResize = (): void => {
+    try {
+      if (!disposed) frameListener?.();
+    } catch {
+      // waking React is best-effort; a resize can never become a crash channel
+    }
+  };
+  opts.out.on("resize", onResize);
+
   // Rejection handler attached AT MOUNT (§U5): an unhandled waitUntilExit rejection would violate
   // degrade-never-kill (§U0), and a dead React tree cannot be relied on to poll any latch.
   instance.waitUntilExit().catch((e: unknown) => {
@@ -159,7 +176,20 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
       if (disposed) return;
       disposed = true;
       stopTick();
+      try {
+        opts.out.off("resize", onResize);
+      } catch {
+        // detaching is best-effort; the disposed flag already inerts the callback
+      }
       frameListener = null;
     },
   };
+  } catch (e) {
+    try {
+      instance.unmount(); // roll the live renderer back before surfacing the mount failure
+    } catch {
+      // best-effort rollback
+    }
+    throw e;
+  }
 }

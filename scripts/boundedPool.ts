@@ -1,6 +1,7 @@
 // boundedPool.ts — the orchestrator's fan-out primitive (§5 concurrency). A hand-rolled bounded
 // worker pool + a lib-agnostic abort signal, matching github.ts's Semaphore style (no external
-// dependency; the repo ships only `typescript`). Used by runScan (owner pool) and processRepo
+// dependency on the analysis path; see README "Runtime dependencies"). Used by runScan (owner
+// pool) and processRepo
 // (per-repo branch-unit pool). Deliberately SEPARATE from github.ts's gh-spawn Semaphore: this
 // bounds how many owner/branch UNITS are dispatched at once, while that bounds how many network
 // subprocesses run at once — the two caps compose (see PROMPT.md §4).

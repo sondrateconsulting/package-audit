@@ -10,6 +10,7 @@ import { join, dirname } from "node:path";
 import { setLogSink, setLogTap } from "../log.ts";
 import { setProgressSink, hasProgressSink, emitProgress, reportTuiFailure, reportDivertFailure, tuiFailure, resetTuiFailure } from "../progress.ts";
 import { assertContained } from "../readOnlyGuard.ts";
+import { sanitizeLine } from "./format.ts";
 import { createTuiStore, type TuiStore } from "./store.ts";
 import type { ActivationDecision } from "./activation.ts";
 import type { mountTui, TuiHandle } from "./mount.tsx";
@@ -19,11 +20,13 @@ export const DIVERT_OPEN_ATTEMPTS = 10; // §U1: candidates attempt 0..9, then d
 const SHOW_CURSOR = "\u001B[?25h";
 
 // TOTAL: a hostile thrown value (throwing toString/message getter) must never make a guard or
-// teardown step itself throw — cleanup runs to completion no matter what it is cleaning up after.
+// teardown step itself throw — cleanup runs to completion no matter what it is cleaning up
+// after. SANITIZED: error text can embed child-process stderr (§U0), and these strings end up
+// on the operator's terminal in our warning/exit lines — control bytes render inert.
 const errText = (e: unknown): string => {
   try {
-    if (e instanceof Error && typeof e.message === "string") return e.message;
-    return String(e);
+    if (e instanceof Error && typeof e.message === "string") return sanitizeLine(e.message);
+    return sanitizeLine(String(e));
   } catch {
     return "unprintable error";
   }
@@ -351,12 +354,15 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         if (state.divertFd !== null) {
           guarded("close-divert", () => io.close(state.divertFd!));
           const latch = tuiFailure();
+          // the path is ours (contained, our grammar) — sanitized anyway: nothing dynamic
+          // reaches the terminal unsanitized (§U0), operator-config bytes included
+          const shownPath = sanitizeLine(state.divertPath ?? "");
           const exitLine =
             latch?.divertFailedMidRun === true
-              ? `JSONL log (partial — divert failed mid-run, remainder went to stdout): ${state.divertPath}`
+              ? `JSONL log (partial — divert failed mid-run, remainder went to stdout): ${shownPath}`
               : state.divertClosedEarly
-                ? `JSONL log (partial — dashboard ended mid-run, remainder went to stdout): ${state.divertPath}`
-                : `JSONL log: ${state.divertPath}`;
+                ? `JSONL log (partial — dashboard ended mid-run, remainder went to stdout): ${shownPath}`
+                : `JSONL log: ${shownPath}`;
           guarded("exit-line", () => writeReal(exitLine + "\n"));
         }
         // 5a. cursor compensation for every path where Ink's own restore write did not land:
@@ -370,7 +376,9 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         const latch = tuiFailure();
         if (latch !== null) {
           const drops = proxy.sealedDrops > 0 ? ` (${proxy.sealedDrops} suppressed frame write${proxy.sealedDrops === 1 ? "" : "s"})` : "";
-          guarded("failure-warning", () => writeReal(`package-audit: dashboard disabled — ${latch.firstCause}${drops}\n`));
+          // firstCause can carry error text from any failing site — sanitized at the ONE place
+          // it reaches the terminal (§U0)
+          guarded("failure-warning", () => writeReal(`package-audit: dashboard disabled — ${sanitizeLine(latch.firstCause)}${drops}\n`));
         }
         if (stepWarnings.length > 0) {
           try {
@@ -379,9 +387,11 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
             // teardown NEVER throws — a propagating payload error must not be masked
           }
         }
-        // 7. detach the stderr error absorber LAST, so teardown's own step-5/6 writes stayed
-        // covered; after this the stream's error semantics are exactly the pre-feature baseline.
-        guarded("detach-error-absorber", () => proxy.detach());
+        // 7. the stderr error absorber deliberately STAYS attached: an asynchronous write
+        // error from teardown's own step-5/6 lines (a dying pipe delivering EIO a tick later)
+        // must never surface as an unhandled 'error' event and kill an otherwise completed
+        // audit (§U0). The remaining window is teardown→process-exit — milliseconds — and the
+        // absorber is inert observability by construction. (proxy.detach() exists for tests.)
       } finally {
         resolveTeardown();
       }
