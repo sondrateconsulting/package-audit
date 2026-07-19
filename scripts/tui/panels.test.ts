@@ -9,6 +9,8 @@ import { EventEmitter } from "node:events";
 import { mountTui } from "./mount.tsx";
 import { createTuiStore, type TuiStore } from "./store.ts";
 import { sanitizeLine } from "./format.ts";
+import { PAUSE_BUDGET_CAP_MINUTES } from "./panels.tsx";
+import { MAX_TOTAL_PAUSE_MS } from "../github.ts";
 import { resetTuiFailure, type ProgressEvent } from "../progress.ts";
 
 afterEach(() => {
@@ -183,6 +185,37 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(raw).not.toContain("]0;pwn");
     expect(raw).not.toContain("[2J");
     expect(raw).not.toContain("9999;9999");
+  });
+
+  test("hostile bytes are inert through EVERY sanitized panel field (runId, owner/repo/branch, introspection, logPath)", async () => {
+    // Not just the error-message + spawn-label paths above: drive the same payload through the
+    // header runId, the owners list, the unit-worker key, the introspection package@version, and
+    // the footer divert path — the fields whose sanitize call sites had no hostile-byte assertion.
+    const H = "\u001B]0;PWN\u0007\u001B[2J\u001B[8888;8888H\u202Ex"; // OSC title + erase + cursor-jump + RLO
+    const capture = await frameCapture([
+      jsonl({ event: "run", runId: `${H}runid`, resumed: false }),
+      { type: "owner-start", owner: `acme${H}` },
+      { type: "unit-dispatch", owner: `acme${H}`, repo: `api${H}`, branch: `dev${H}` },
+      { type: "introspect-start", id: 1, packageName: `pkg${H}`, version: `1.0${H}` },
+      { type: "divert", path: `/tmp/out${H}/log.jsonl` },
+    ]);
+    const raw = capture.raw();
+    expect(raw).not.toContain("]0;PWN"); // OSC title-set from any field
+    expect(raw).not.toContain("[2J"); // full-screen erase
+    expect(raw).not.toContain("8888;8888"); // absolute cursor jump
+    expect(raw).not.toContain("\u202E"); // RIGHT-TO-LEFT OVERRIDE (bidi display spoofing)
+    // and the cleaned field text still rendered (proving the fields were displayed, not just absent)
+    const text = capture.text();
+    expect(text).toContain("acmex"); // owner survived, escapes+bidi gone
+    expect(text).toContain("pkgx"); // introspection package survived
+  });
+
+  test("the rendered pause-budget cap denominator stays pinned to the source cap (drift guard)", async () => {
+    // panels.tsx hardcodes the "/<N>m" denominator and CANNOT import github.ts (tui-purity), so pin
+    // PAUSE_BUDGET_CAP_MINUTES to MAX_TOTAL_PAUSE_MS here (tests MAY import github.ts): changing the
+    // source cap without updating the display trips this instead of silently showing a stale figure.
+    expect(PAUSE_BUDGET_CAP_MINUTES).toBe(MAX_TOTAL_PAUSE_MS / 60_000);
+    expect(await frame([])).toContain(`/${PAUSE_BUDGET_CAP_MINUTES}m`); // the denominator the operator sees
   });
 
   test("a ZERO work-row budget renders neither unit rows nor the '+N more' line (rows-1 cap conformance)", async () => {

@@ -8,10 +8,10 @@
 import { openSync, writeSync, closeSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { setLogSink, setLogTap } from "../log.ts";
-import { setProgressSink, hasProgressSink, emitProgress, reportTuiFailure, reportDivertFailure, tuiFailure, resetTuiFailure } from "../progress.ts";
+import { setProgressSink, hasProgressSink, emitProgress, reportTuiFailure, reportDivertFailure, tuiFailure, resetTuiFailure, causeText } from "../progress.ts";
 import { assertContained } from "../readOnlyGuard.ts";
 import { sanitizeLine } from "./format.ts";
-import { GET_RAW_DIMS, type RawDims, type DimsAwareStream } from "./dims.ts";
+import { GET_RAW_DIMS, isPositiveIntegerDim, type RawDims, type DimsAwareStream } from "./dims.ts";
 import { createTuiStore, type TuiStore } from "./store.ts";
 import type { ActivationDecision } from "./activation.ts";
 import type { mountTui, TuiHandle } from "./mount.tsx";
@@ -26,10 +26,9 @@ const SHOW_CURSOR = "\u001B[?25h";
 // on the operator's terminal in our warning/exit lines — control bytes render inert.
 const errText = (e: unknown): string => {
   try {
-    if (e instanceof Error && typeof e.message === "string") return sanitizeLine(e.message);
-    return sanitizeLine(String(e));
+    return sanitizeLine(causeText(e)); // ONE cause→string primitive (progress.ts), sanitized for the terminal
   } catch {
-    return "unprintable error";
+    return "unprintable error"; // belt-and-braces (matches this file's defensively-wrapped idiom)
   }
 };
 
@@ -199,7 +198,7 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
   // sees the truth.
   const lastGood = { columns: 80, rows: 24 };
   const pinDim = (v: unknown, axis: "columns" | "rows"): number => {
-    if (typeof v === "number" && Number.isInteger(v) && v > 0) {
+    if (isPositiveIntegerDim(v)) {
       lastGood[axis] = v;
       return v;
     }
@@ -281,7 +280,10 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
 
 // ---- the lifecycle wrapper -------------------------------------------------------------------
 export interface TuiDeps {
-  decision: ActivationDecision;
+  // Off/on only: the "error" arm is an operator error the caller resolves BEFORE the lifecycle
+  // (orchestrate throws TuiActivationError), so it is unrepresentable here — runWithTui never has
+  // to decide what an unhandled error decision would mean.
+  decision: Exclude<ActivationDecision, { mode: "error" }>;
   mountImpl?: () => Promise<{ mountTui: typeof mountTui }>; // default: import("./mount.tsx")
   divertIo?: DivertIo; // default: realDivertIo
   logPathFor?: (attempt: number) => string; // contained candidate builder (main injects makeDivertPathFor(...))
@@ -440,7 +442,7 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         // teardown fact the operator must see (a wedged Ink whose frames the seal will drop).
         const sealedBeforeUnmount = proxy.sealed;
         const absorbedBeforeUnmount = proxy.absorbedFailures; // step 5a compares: failures AFTER this are unmount-window trouble
-        let exitOutcome: "exited" | "timeout" | "wait-rejected" | "wait-threw" | "timer-failed" | "no-handle" = "no-handle";
+        let exitOutcome: ExitOutcome | "no-handle" = "no-handle";
         if (h !== null) {
           try {
             h.requestUnmount();

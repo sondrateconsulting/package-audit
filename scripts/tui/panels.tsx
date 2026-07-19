@@ -15,6 +15,11 @@ import { isPaused } from "./store.ts";
 import { sanitizeLine, thousands, formatSpan, formatClock, formatCountdown, formatReset, PROBLEM_ROWS, type Layout } from "./format.ts";
 
 const GUTTER = 9; // label column width
+// The cumulative pause-budget cap in minutes — the "/<N>m" denominator the operator reads. Mirrors
+// github.ts's MAX_TOTAL_PAUSE_MS (8h = 480m). The TUI must NOT import github.ts (tui-purity), so the
+// value is duplicated here; a drift-detect test (panels.test.ts, which MAY import github.ts) pins
+// the two equal, so changing the source cap without updating this display trips CI.
+export const PAUSE_BUDGET_CAP_MINUTES = 480;
 
 function Row({ children }: { children: ReactNode }) {
   return (
@@ -59,7 +64,7 @@ export function LimitsPanel({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number 
       </Row>
       <Row>
         <Text dimColor>{"".padEnd(GUTTER)}</Text>
-        {`subprocs ${spawnsLive}/${cap}${queued} · pause budget ${budgetMinutes(spentMs)}/480m`}
+        {`subprocs ${spawnsLive}/${cap}${queued} · pause budget ${budgetMinutes(spentMs)}/${PAUSE_BUDGET_CAP_MINUTES}m`}
       </Row>
     </Box>
   );

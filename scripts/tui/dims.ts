@@ -22,3 +22,13 @@ export const GET_RAW_DIMS = "getRawDims" as const;
 
 // Ink's stream surface plus the raw-dimension accessor the lifecycle proxy staples on.
 export type DimsAwareStream = NodeJS.WriteStream & { [GET_RAW_DIMS](): RawDims };
+
+// The ONE "usable dimension" predicate — a positive integer. Shared so activation eligibility
+// (§U1), the render planner (§U5 planLayout), and the ink-facing proxy pin can never disagree on
+// what counts as renderable: NaN/Infinity/fractions/0/negatives/undefined all fail here, exactly
+// once. Each old site carried a "must agree" comment; this makes them agree by construction.
+// Takes `unknown` so the lifecycle pin (which reads off an untyped stream) and the number|undefined
+// callers share it; narrows to `number` for the callers that need the guard.
+export function isPositiveIntegerDim(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v > 0;
+}

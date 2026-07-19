@@ -45,8 +45,10 @@ export function hasProgressSink(): boolean {
 }
 
 // TOTAL error rendering: even a hostile thrown value (a throwing toString/message getter) must
-// not make the never-throws functions below throw.
-function causeText(e: unknown): string {
+// not make the never-throws functions below throw. Exported as the ONE cause→string primitive:
+// mount.tsx uses it as-is, lifecycle.ts wraps it in sanitizeLine. progress.ts stays a dependency-
+// free leaf — this is an EXPORT, not a new import.
+export function causeText(e: unknown): string {
   try {
     if (e instanceof Error && typeof e.message === "string") return e.message;
     return String(e);

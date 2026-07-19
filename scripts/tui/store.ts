@@ -100,6 +100,12 @@ const num = (v: unknown): number | null => (typeof v === "number" && Number.isFi
 const copyRate = (r: RateSnapshot | null): RateSnapshot | null => (r === null ? null : { ...r });
 const copyThrottle = (t: ThrottleSnapshot | null): ThrottleSnapshot | null => (t === null ? null : { ...t });
 
+// Active-map keys: repos by owner/repo, branch units by owner/repo@branch. One place so the
+// dispatch cases that correlate start↔end (repo) and dispatch↔settle (unit, §U2) never drift on
+// the key grammar.
+const repoKey = (owner: string, repo: string): string => `${owner}/${repo}`;
+const unitKey = (owner: string, repo: string, branch: string): string => `${owner}/${repo}@${branch}`;
+
 export function createTuiStore(nowMs: () => number): TuiStore {
   let version = 0;
   let phase: string | null = null;
@@ -284,29 +290,29 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         changed = activeOwners.delete(e.owner);
         break;
       case "repo-start": {
-        const repoKey = `${e.owner}/${e.repo}`;
-        changed = !activeRepos.has(repoKey);
-        activeRepos.add(repoKey);
+        const key = repoKey(e.owner, e.repo);
+        changed = !activeRepos.has(key);
+        activeRepos.add(key);
         break;
       }
       case "repo-end":
-        changed = activeRepos.delete(`${e.owner}/${e.repo}`);
+        changed = activeRepos.delete(repoKey(e.owner, e.repo));
         break;
       case "unit-dispatch":
-        unitWorkers.set(`${e.owner}/${e.repo}@${e.branch}`, { sinceMs: nowMs() });
+        unitWorkers.set(unitKey(e.owner, e.repo, e.branch), { sinceMs: nowMs() });
         break;
       case "unit-settle": {
         // settle is the ONLY reliable end (§U2): it clears BOTH the worker slot and any active
         // scan — tapped JSONL events never clear active state (the `scanned` line fires before
         // cleanup finishes, and fatal escapes emit no terminal unit line at all).
-        const key = `${e.owner}/${e.repo}@${e.branch}`;
+        const key = unitKey(e.owner, e.repo, e.branch);
         const workerGone = unitWorkers.delete(key);
         const scanGone = scanningUnits.delete(key);
         changed = workerGone || scanGone;
         break;
       }
       case "unit-start":
-        scanningUnits.set(`${e.owner}/${e.repo}@${e.branch}`, { sinceMs: nowMs() });
+        scanningUnits.set(unitKey(e.owner, e.repo, e.branch), { sinceMs: nowMs() });
         break;
       case "introspect-start":
         introspections.set(e.id, { packageName: e.packageName, version: e.version, sinceMs: nowMs() });

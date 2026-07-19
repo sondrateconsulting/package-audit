@@ -10,22 +10,14 @@
 // sealable stderr proxy).
 import { Component, type ReactNode } from "react";
 import { render } from "ink";
-import { reportTuiFailure, tuiFailure } from "../progress.ts";
+import { reportTuiFailure, tuiFailure, causeText } from "../progress.ts";
 import type { TuiStore } from "./store.ts";
 import { App } from "./App.tsx";
 
 export const DEFAULT_TICK_MS = 125;
 
-// TOTAL error rendering: a hostile thrown value (throwing toString/message getter) must never
-// make a failure handler itself throw into React or a timer callback.
-function causeText(e: unknown): string {
-  try {
-    if (e instanceof Error && typeof e.message === "string") return e.message;
-    return String(e);
-  } catch {
-    return "unprintable error";
-  }
-}
+// causeText (the total cause→string primitive) is shared from progress.ts — one source of truth
+// for the "hostile thrown value must never make a failure handler throw" contract.
 
 export interface TuiHandle {
   requestUnmount(): void;

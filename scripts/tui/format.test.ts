@@ -28,6 +28,15 @@ describe("sanitizeLine (§U0 — hostile bytes render inert)", () => {
     expect(sanitizeLine("x\u0085y\u0090z")).toBe("xyz");
     expect(sanitizeLine(`o\u009D0;title${BEL}k`)).toBe("ok"); // C1 OSC introducer
   });
+  test("strips Unicode bidi/isolate formatting controls (Trojan-Source display spoofing)", () => {
+    // Beyond \u00A7U0's C0/C1+ANSI minimum: a hostile branch/repo name could embed RIGHT-TO-LEFT
+    // OVERRIDE etc. to visually reorder a dashboard row without any control-byte injection. These
+    // display-only formatting chars are stripped as defense-in-depth so the frame reads as authored.
+    expect(sanitizeLine("git\u202Ekcatta\u202Cbranch")).toBe("gitkcattabranch"); // RLO + PDF
+    expect(sanitizeLine("\u2066a\u2069\u2067b\u2069")).toBe("ab"); // LRI/RLI/PDI isolates
+    expect(sanitizeLine("safe\u200E\u200F\u061Cname")).toBe("safename"); // LRM/RLM/ALM marks
+    expect(sanitizeLine("\u202A\u202B\u202Dembedded\u202C")).toBe("embedded"); // LRE/RLE/LRO
+  });
   test("collapses newlines and CR to ONE display line (CR cannot overwrite)", () => {
     expect(sanitizeLine("line1\nline2\r\nline3\rline4")).toBe("line1 line2 line3 line4");
     expect(sanitizeLine("tab\there")).toBe("tab here");
