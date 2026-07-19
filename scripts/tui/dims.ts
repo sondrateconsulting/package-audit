@@ -8,9 +8,11 @@
 // instead of silently falling through to the pinned dimensions. The trap key and the type's method
 // name are the SAME literal (GET_RAW_DIMS), so they can never drift apart.
 //
-// Type-only + a single string const — dependency-free. App imports the types with `import type`
-// (verbatimModuleSyntax erases them), so the display layer gains NO runtime edge into lifecycle.ts;
-// only lifecycle.ts imports the GET_RAW_DIMS value, and it already owns this capability.
+// Dependency-free LEAF: two types (RawDims, DimsAwareStream) plus two tiny runtime members — the
+// GET_RAW_DIMS key and the isPositiveIntegerDim predicate. App imports ONLY the types (`import
+// type`, erased by verbatimModuleSyntax), so the display layer gains NO runtime edge into
+// lifecycle.ts. The runtime members are value-imported by lifecycle.ts (both), and the predicate by
+// activation.ts and format.ts — all React/Ink-free, so activation still imports on every run.
 
 export interface RawDims {
   readonly columns: number | undefined;
