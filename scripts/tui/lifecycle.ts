@@ -191,8 +191,10 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
     sealEarly(): void {
       // seal + cursor-show compensation in the SAME synchronous step: Ink hid the cursor at
       // mount and its own restore write would be dropped by the seal; a SIGINT landing inside
-      // the unmount wait must not strand a hidden cursor (§U1). Idempotent.
-      if (sealed) return;
+      // the unmount wait must not strand a hidden cursor (§U1). ALWAYS compensates — even when
+      // a plain seal() got there first (a teardown racing a mount failure): the contract is
+      // seal+show, and compensateCursor's own once-flag carries the idempotence, so a repeat
+      // call still writes the escape at most once.
       sealed = true;
       this.compensateCursor();
     },
@@ -337,7 +339,17 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         const sealedBeforeUnmount = proxy.sealed;
         let exitOutcome: "exited" | "timeout" | "wait-rejected" | "wait-threw" | "timer-failed" | "no-handle" = "no-handle";
         if (h !== null) {
-          guarded("unmount", () => h.requestUnmount());
+          try {
+            h.requestUnmount();
+          } catch (e) {
+            stepWarnings.push(`unmount: ${errText(e)}`);
+            // §U6-ORDER DEVIATION (failure path only; recorded in the PR): an unmount that
+            // THREW forfeited its own cursor restore and its grace-window painting — seal NOW
+            // (sealEarly shows the cursor in the same synchronous step) so a SIGINT inside the
+            // bounded wait below cannot exit cursorless, and a queued Ink render cannot re-hide
+            // what was just shown. The step-3 seal below stays idempotent.
+            guarded("unmount-seal", () => proxy.sealEarly());
+          }
           exitOutcome = await boundedExitWait(h);
           if (exitOutcome !== "exited") stepWarnings.push(`exit-wait: unmount did not complete cleanly (${exitOutcome})`);
         }
@@ -419,6 +431,16 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         // smear output; the unwind is about not leaking Ink's timers/hooks). Unwind failures
         // surface as a best-effort warning, never silently (§U6's deferred-warning rule).
         const unwindWarnings: string[] = [];
+        // The teardown that ran ahead of this unwind sealed the proxy, so the late renderer's
+        // OWN cursor restore was (or will be) dropped — compensate FIRST, before the unmount
+        // and its bounded wait: a SIGINT inside that wait must not exit cursorless (§U1).
+        // Plain compensate, not sealEarly — the proxy is already sealed; idempotent,
+        // best-effort (compensateCursor is internally total).
+        try {
+          proxy.compensateCursor();
+        } catch {
+          // best-effort
+        }
         try {
           h.dispose();
         } catch (e) {
@@ -431,13 +453,6 @@ export async function runWithTui<T>(deps: TuiDeps, body: () => Promise<T>): Prom
         }
         const unwindOutcome = await boundedExitWait(h);
         if (unwindOutcome !== "exited") unwindWarnings.push(`exit-wait: ${unwindOutcome}`);
-        // The teardown that ran ahead of this unwind sealed the proxy, so the late renderer's
-        // OWN cursor restore was dropped — compensate on its behalf (idempotent, best-effort).
-        try {
-          proxy.compensateCursor();
-        } catch {
-          // best-effort
-        }
         if (unwindWarnings.length > 0) warnReal(`package-audit: dashboard unwind warnings — ${unwindWarnings.join("; ")}\n`);
       } else {
         state.handle = h;

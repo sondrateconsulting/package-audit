@@ -447,6 +447,22 @@ describe("sealable stderr proxy (§U8.13a)", () => {
     expect(real.all()).toBe("");
     proxy.detach();
   });
+
+  test("seal() then sealEarly(): the late sealEarly STILL compensates, exactly once (the contract is seal+show)", () => {
+    // A teardown's plain step-3 seal can race ahead of a mount-failure path's sealEarly — the
+    // late caller still owes the cursor show; compensateCursor's once-flag carries the
+    // idempotence (a redundant show when the cursor is visible is a terminal no-op).
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    proxy.seal();
+    expect(real.all()).toBe(""); // plain seal alone writes nothing
+    proxy.sealEarly();
+    expect(proxy.cursorCompensated).toBe(true);
+    expect(real.all()).toBe(SHOW_CURSOR);
+    proxy.sealEarly(); // still once
+    expect(real.all()).toBe(SHOW_CURSOR);
+    proxy.detach();
+  });
 });
 
 // ---- §U8.13 lifecycle ------------------------------------------------------------------------
@@ -920,6 +936,75 @@ describe("runWithTui lifecycle (§U8.13)", () => {
     });
     await done;
     expect(calls).toEqual([`{"event":"config"}\n`, `{"event":"done"}\n`]);
+  });
+
+  test("compound mount failure: a synchronous degrade DURING mountTui + a post-render throw still shows the cursor exactly once", async () => {
+    // The teardown that onDegrade starts runs its null-handle path synchronously to the plain
+    // step-3 seal; the mount-failure catch's sealEarly then arrives against an already-sealed
+    // proxy — and must STILL compensate (the always-compensate contract), or this compound
+    // fault strands a hidden cursor.
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = async () => ({
+      mountTui: (_store: MountableStore, opts: MountTuiOptions): TuiHandle => {
+        opts.onDegrade(); // an error boundary crashing during the initial render pass
+        throw new Error("post-render tail broke"); // and the tail then throws (compound fault)
+      },
+    });
+    const r = await runWithTui(deps, async () => 41);
+    expect(r).toBe(41); // §U0: the audit ran regardless
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1);
+  });
+
+  test("a THROWING requestUnmount seals+shows the cursor BEFORE the bounded wait; late frames are dropped; the warning names the step", async () => {
+    const handle = makeFakeHandle({
+      exitMode: "never",
+      onUnmount: () => {
+        throw new Error("unmount exploded");
+      },
+    });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    let resolved = false;
+    const run = runWithTui(deps, async () => 7).then((v) => {
+      resolved = true;
+      return v;
+    });
+    await until(() => timers.pending.length > 0); // teardown parked on the bounded exit wait
+    expect(resolved).toBe(false); // provably parked
+    // sealEarly already ran AT the throw site: the cursor-show is on the real stream NOW,
+    // before the wait releases — a SIGINT in this window no longer exits cursorless
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1);
+    // and the seal half holds: a late wedge write through the mount-captured proxy stream
+    // produces NO bytes on the real stream (proven by absence)
+    const before = stderr.writes.length;
+    capture.opts!.out.write("late wedge frame");
+    expect(stderr.writes.length).toBe(before);
+    timers.fireAll();
+    expect(await run).toBe(7);
+    expect(stderr.all()).toContain("unmount: unmount exploded"); // the deferred warning names the step
+    expect(stderr.all()).toContain("unmount did not complete cleanly (timeout)");
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1); // still exactly once
+  });
+
+  test("the late-handle unwind compensates the cursor BEFORE its bounded wait releases", async () => {
+    const handle = makeFakeHandle({ exitMode: "never" });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => opts.onDegrade(), // teardown races ahead of the returning handle
+    });
+    let resolved = false;
+    const run = runWithTui(deps, async () => 9).then((v) => {
+      resolved = true;
+      return v;
+    });
+    await until(() => timers.pending.length > 0); // the UNWIND parked on its bounded wait
+    expect(resolved).toBe(false);
+    // compensation happened before the wait — not after it releases
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1);
+    timers.fireAll();
+    expect(await run).toBe(9);
   });
 });
 
