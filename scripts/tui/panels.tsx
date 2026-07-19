@@ -43,11 +43,12 @@ export function Header({ snap, nowMs, mountedAtMs }: { snap: TuiSnapshot; nowMs:
 
 // One rate-limit segment ("core 4,812/5,000 resets in 12:34"). The REMAINING count carries a graded
 // headroom color (limitTone, finding M1) so a low quota stands out in the otherwise-monochrome
-// healthy frame; the label and denominator stay neutral. Text content is unchanged from the prior
-// string form (the panel tests assert it verbatim); color is stripped before those assertions.
-// Exported so a unit test can inspect the returned element tree and assert the remaining count is
-// wrapped in a tone-colored Text — a rendered-ANSI assertion is not CI-stable (ink/chalk caches its
-// color level at module load, shared across bun's test process).
+// healthy frame; the label and denominator stay neutral. Text content matches the prior string form
+// EXCEPT the intentional M3 "resets" → "resets in" wording (the panel tests assert it verbatim);
+// color is stripped before those text assertions. Exported so a unit test can walk the returned
+// element tree and assert the remaining count is wrapped in a tone-colored Text — a rendered-ANSI
+// assertion is not CI-stable (ink/chalk caches its color level at module load, shared across bun's
+// test process).
 export function LimitSegment({ snap, resource, nowMs }: { snap: TuiSnapshot; resource: "core" | "graphql"; nowMs: number }) {
   const l = snap.limits[resource];
   if (l === null) return <>{`${resource} —`}</>;

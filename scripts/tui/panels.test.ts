@@ -6,25 +6,42 @@
 // AND CI rendering modes (P0 measurement).
 import { expect, test, describe, afterEach } from "bun:test";
 import { EventEmitter } from "node:events";
+import { isValidElement } from "react";
 import { mountTui } from "./mount.tsx";
-import { LimitSegment } from "./panels.tsx";
+import { CompactFrame, LimitSegment, LimitsPanel } from "./panels.tsx";
 import { createTuiStore, type TuiStore } from "./store.ts";
 import { sanitizeLine } from "./format.ts";
 import { PAUSE_BUDGET_CAP_MINUTES } from "./panels.tsx";
 import { MAX_TOTAL_PAUSE_MS } from "../github.ts";
 import { resetTuiFailure, type ProgressEvent } from "../progress.ts";
 
-// Extract the Text node that wraps a LimitSegment's remaining count, with its color prop. A
-// rendered-ANSI assertion is not CI-stable here (ink/chalk caches its color level at module load,
-// shared across bun's test process — verified: color appears when a file runs alone but not once
-// another file has already imported ink), so the M1 color wiring is proven structurally instead.
-function remainingNode(el: unknown): { color: unknown; remaining: unknown } {
-  const kids = (el as { props: { children: unknown } }).props.children as unknown[];
-  const text = kids.find(
-    (k): k is { props: { color?: unknown; children?: unknown } } =>
-      typeof k === "object" && k !== null && "props" in k && Object.prototype.hasOwnProperty.call((k as { props: object }).props, "color"),
-  );
-  return { color: text?.props.color, remaining: text?.props.children };
+type LimitSegmentProps = Parameters<typeof LimitSegment>[0];
+
+// Flatten an element subtree to plain text. LimitSegment is a pure, hookless render helper, so it is
+// executed to reach the Text it returns; Ink host elements are read via props.children, never run.
+function textOf(node: unknown): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  if (isValidElement(node)) {
+    return node.type === LimitSegment ? textOf(LimitSegment(node.props as LimitSegmentProps)) : textOf((node.props as { children?: unknown }).children);
+  }
+  return "";
+}
+
+// The flattened text of every element in a BUILT tree whose `color` prop equals `want`. Guards with
+// isValidElement / Array.isArray before ANY property access — no blind root or children casts.
+// LimitSegment IS executed so its inner tone-colored Text is reached, which proves LimitsPanel and
+// CompactFrame actually route the remaining count through a colored Text: the ANSI-stripped text
+// assertions cannot, since a plain-text render would satisfy them. (A rendered-ANSI assertion is not
+// CI-stable: ink/chalk fixes its color level at module load, shared across bun's single test process
+// — a color SGR appears when a file runs alone but is suppressed once another file has imported ink.)
+function coloredTexts(node: unknown, want: string): string[] {
+  if (Array.isArray(node)) return node.flatMap((child) => coloredTexts(child, want));
+  if (!isValidElement(node)) return [];
+  if (node.type === LimitSegment) return coloredTexts(LimitSegment(node.props as LimitSegmentProps), want);
+  const props = node.props as { color?: unknown; children?: unknown };
+  const here = props.color === want ? [textOf(props.children)] : [];
+  return [...here, ...coloredTexts(props.children, want)];
 }
 
 afterEach(() => {
@@ -142,21 +159,28 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(text).toContain("registry packument expo");
     expect(text).toContain("introspect expo@52.0.0");
     expect(text).toContain("findings (session): 512 dep · 1,204 usage · 77 cli");
+    expect(text).toContain("session: scanned 1 · errored 0 · current 0 · skipped 0 · past-cap 0"); // M2 order, zero-conditional case (requeued/retry-exhausted omitted when 0)
     expect(text).toContain("JSONL → /out/logs/audit-log-20260718T211530Z-p4242.jsonl");
   });
 
-  test("M1 wiring: LimitSegment colors the remaining count by limitTone, uncolored when healthy (shared by full + compact)", () => {
-    const store: TuiStore = createTuiStore(() => NOW);
-    store.dispatch({ type: "rate-limit", resource: "core", remaining: 100, limit: 5000, resetEpochSec: null }); // 2% → red
-    store.dispatch({ type: "rate-limit", resource: "graphql", remaining: 4800, limit: 5000, resetEpochSec: null }); // 96% → uncolored
-    const snap = store.snapshot();
-    // Both LimitsPanel and CompactFrame render this one component; proving it here covers both modes.
-    const low = remainingNode(LimitSegment({ snap, resource: "core", nowMs: NOW }));
-    expect(low.remaining).toBe("100");
-    expect(low.color).toBe("red"); // fails if the color wiring is dropped — the text-only tests would not
-    const healthy = remainingNode(LimitSegment({ snap, resource: "graphql", nowMs: NOW }));
-    expect(healthy.remaining).toBe("4,800");
-    expect(healthy.color).toBeUndefined();
+  test("M1 wiring: LimitsPanel AND CompactFrame color the remaining count by tone (red/yellow), uncolored when healthy", () => {
+    const snapAt = (remaining: number): ReturnType<TuiStore["snapshot"]> => {
+      const store: TuiStore = createTuiStore(() => NOW);
+      store.dispatch({ type: "rate-limit", resource: "core", remaining, limit: 5000, resetEpochSec: null });
+      return store.snapshot();
+    };
+    const red = snapAt(100); // 2% → red
+    const yellow = snapAt(1000); // 20% → yellow
+    const ok = snapAt(4800); // 96% → uncolored
+    // Walk each panel's real element tree. Fails if EITHER mode stops routing the count through
+    // LimitSegment (e.g. reverts to plain text), which the ANSI-stripped text assertions would miss.
+    expect(coloredTexts(LimitsPanel({ snap: red, nowMs: NOW }), "red")).toContain("100");
+    expect(coloredTexts(CompactFrame({ snap: red, nowMs: NOW, mountedAtMs: NOW }), "red")).toContain("100");
+    expect(coloredTexts(LimitsPanel({ snap: yellow, nowMs: NOW }), "yellow")).toContain("1,000");
+    expect(coloredTexts(CompactFrame({ snap: yellow, nowMs: NOW, mountedAtMs: NOW }), "yellow")).toContain("1,000");
+    expect(coloredTexts(LimitsPanel({ snap: ok, nowMs: NOW }), "red")).toEqual([]);
+    expect(coloredTexts(LimitsPanel({ snap: ok, nowMs: NOW }), "yellow")).toEqual([]);
+    expect(coloredTexts(CompactFrame({ snap: ok, nowMs: NOW, mountedAtMs: NOW }), "red")).toEqual([]);
   });
 
   test("session counters front-load the danger fields so end-truncation drops the least important first (M2)", async () => {
