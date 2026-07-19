@@ -483,6 +483,29 @@ describe("stdout backpressure writer (T7)", () => {
       resetLogSink(); // clears the EPIPE flag so later tests get a clean channel
     }
   });
+
+  // Channel death is not EPIPE-only: a destroyed stream throws ERR_STREAM_DESTROYED, a reset pipe
+  // ECONNRESET, etc. — all mean the channel is unusable, exactly like the async 'error' listener
+  // already assumes. A non-EPIPE SYNC throw must degrade the same way, not crash the run / mask an
+  // outer error via a finally-flush. (finding IMPORTANT-3)
+  test("a synchronous NON-EPIPE stdout error also degrades to a no-op (channel death is not EPIPE-only)", async () => {
+    resetLogSink(); // real process.stdout default sink
+    const wsSpy = spyOn(fs, "writeSync").mockImplementation((() => 0) as typeof fs.writeSync); // swallow the fd-2 trace
+    const spy = spyOn(process.stdout, "write").mockImplementation((() => {
+      // a destroyed stream throws ERR_STREAM_DESTROYED SYNCHRONOUSLY — not code:"EPIPE"
+      throw Object.assign(new Error("write after end"), { code: "ERR_STREAM_DESTROYED" });
+    }) as typeof process.stdout.write);
+    try {
+      expect(() => logLine({ event: "x" })).not.toThrow(); // absorbed, not propagated up through logLine
+      expect(loggerStats().closed).toBe(true); // channel marked closed, same as EPIPE
+      expect(() => logLine({ event: "y" })).not.toThrow(); // stays a no-op afterward
+      await expect(flushLogs()).resolves.toBeUndefined(); // the flush waiter still resolves — no hang, no mask
+    } finally {
+      spy.mockRestore();
+      wsSpy.mockRestore();
+      resetLogSink();
+    }
+  });
 });
 
 // S1: a dead stdout channel silently discards buffered telemetry — including the terminal `done`
@@ -517,6 +540,24 @@ describe("stdout channel closure surfaces a diagnostic (S1)", () => {
     try {
       const warns = captureFd2(() => {
         logLine({ event: "x" }); // sync throw → markStdoutClosed → one trace
+        logLine({ event: "y" }); // already closed → no second trace
+      });
+      expect(warns.filter((l) => l.includes("stdout closed early"))).toHaveLength(1);
+      expect(loggerStats().closed).toBe(true);
+    } finally {
+      outSpy.mockRestore();
+      resetLogSink();
+    }
+  });
+
+  test("a synchronous NON-EPIPE stdout error surfaces the same one-shot stderr trace", () => {
+    resetLogSink();
+    const outSpy = spyOn(process.stdout, "write").mockImplementation((() => {
+      throw Object.assign(new Error("write ECONNRESET"), { code: "ECONNRESET" }); // reset pipe, not EPIPE
+    }) as typeof process.stdout.write);
+    try {
+      const warns = captureFd2(() => {
+        logLine({ event: "x" }); // sync non-EPIPE throw → markStdoutClosed → one trace
         logLine({ event: "y" }); // already closed → no second trace
       });
       expect(warns.filter((l) => l.includes("stdout closed early"))).toHaveLength(1);

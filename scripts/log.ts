@@ -191,13 +191,10 @@ class BufferedWriter {
   }
 }
 
-function isEpipe(e: unknown): boolean {
-  return typeof e === "object" && e !== null && (e as { code?: string }).code === "EPIPE";
-}
-
-// Default sink: process.stdout with EPIPE swallowed. The reader closing the pipe (`… | head`)
-// surfaces as an 'error' event OR a synchronous throw depending on platform; either way we flip to
-// a no-op that reports "accepted" so a closed consumer degrades logging instead of crashing the run.
+// Default sink: process.stdout with any write error swallowed. The reader closing the pipe
+// (`… | head`) surfaces as an 'error' event OR a synchronous throw depending on platform; either way
+// we flip to a no-op that reports "accepted" so a closed consumer degrades logging instead of
+// crashing the run.
 let stdoutClosed = false;
 // The current writer's wake callback (registered via onClose). Only one writer is active at a time,
 // so the latest registration wins — no listener leak across setLogSink/resetLogSink.
@@ -231,21 +228,24 @@ function markStdoutClosed(): void {
   stdoutCloseCb?.();
 }
 
-// Default sink: process.stdout with EPIPE routed through markStdoutClosed. The reader closing the
-// pipe (`… | head`) surfaces as an 'error' event OR a synchronous throw depending on platform;
-// either way we flip to a no-op that reports "accepted" so a closed consumer degrades logging
-// (with one stderr trace) instead of crashing the run.
+// Default sink: process.stdout with any write error routed through markStdoutClosed. The reader
+// closing the pipe (`… | head`) surfaces as an 'error' event OR a synchronous throw depending on
+// platform; either way we flip to a no-op that reports "accepted" so a closed consumer degrades
+// logging (with one stderr trace) instead of crashing the run.
 const DEFAULT_SINK: LogSink = {
   write: (line) => {
     if (stdoutClosed) return true;
     try {
       return process.stdout.write(line);
-    } catch (e) {
-      if (isEpipe(e)) {
-        markStdoutClosed();
-        return true;
-      }
-      throw e;
+    } catch {
+      // ANY synchronous write error means the channel is unusable — the reader closed the pipe
+      // (EPIPE on some platforms, ERR_STREAM_DESTROYED / ECONNRESET on others). Degrade exactly the
+      // way the async 'error' listener below does: mark closed, warn once, report accepted. Never
+      // rethrow — a rethrow crashes the run from any logLine (e.g. a heartbeat tick) or masks the
+      // real error when a finally-flush hits it. Serialization already ran in logLine (JSON.stringify),
+      // so a bad-value error can't reach here — only genuine I/O failures do.
+      markStdoutClosed();
+      return true;
     }
   },
   onDrain: (cb) => {
