@@ -21,7 +21,10 @@ const GUTTER = 9; // label column width
 // the two equal, so changing the source cap without updating this display trips CI.
 export const PAUSE_BUDGET_CAP_MINUTES = 480;
 
-function Row({ children }: { children: ReactNode }) {
+// Exported (like LimitSegment) so the M1 wiring test can execute it and resolve the `<Text
+// wrap="truncate-end">` it wraps around every row — making the test's effective-color model account
+// for a tone inherited through that wrapper. Pure and hookless.
+export function Row({ children }: { children: ReactNode }) {
   return (
     <Box width="100%" overflow="hidden">
       <Text wrap="truncate-end">{children}</Text>

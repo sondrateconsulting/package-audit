@@ -6,10 +6,10 @@
 // AND CI rendering modes (P0 measurement).
 import { expect, test, describe, afterEach } from "bun:test";
 import { EventEmitter } from "node:events";
-import { isValidElement } from "react";
+import { createElement, isValidElement } from "react";
 import { Text } from "ink";
 import { mountTui } from "./mount.tsx";
-import { CompactFrame, LimitSegment, LimitsPanel } from "./panels.tsx";
+import { CompactFrame, LimitSegment, LimitsPanel, Row } from "./panels.tsx";
 import { createTuiStore, type TuiStore } from "./store.ts";
 import { sanitizeLine } from "./format.ts";
 import { PAUSE_BUDGET_CAP_MINUTES } from "./panels.tsx";
@@ -17,14 +17,17 @@ import { MAX_TOTAL_PAUSE_MS } from "../github.ts";
 import { resetTuiFailure, type ProgressEvent } from "../progress.ts";
 
 type LimitSegmentProps = Parameters<typeof LimitSegment>[0];
+type RowProps = Parameters<typeof Row>[0];
 
-// Flatten an element subtree to plain text. LimitSegment is a pure, hookless render helper, so it is
-// executed to reach the Text it returns; Ink host elements are read via props.children, never run.
+// Flatten an element subtree to plain text. LimitSegment and Row are pure, hookless render helpers,
+// so they are executed to reach the Text they return; Ink host elements are read via props.children.
 function textOf(node: unknown): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(textOf).join("");
   if (isValidElement(node)) {
-    return node.type === LimitSegment ? textOf(LimitSegment(node.props as LimitSegmentProps)) : textOf((node.props as { children?: unknown }).children);
+    if (node.type === LimitSegment) return textOf(LimitSegment(node.props as LimitSegmentProps));
+    if (node.type === Row) return textOf(Row(node.props as RowProps));
+    return textOf((node.props as { children?: unknown }).children);
   }
   return "";
 }
@@ -32,18 +35,23 @@ function textOf(node: unknown): string {
 // The EFFECTIVE color of every Ink Text whose flattened content is EXACTLY `text` AND which is
 // reached THROUGH a LimitSegment execution. Two subtleties, both raised in review:
 //  - effective color = the Text's OWN `color` if set, else the nearest ancestor Text's color (Ink
-//    inheritance). So an ancestor `<Text color=…>` that would visibly tint an otherwise-uncolored
-//    count is caught: a healthy count reports undefined only if NOTHING above it colors it.
+//    inheritance). To make that complete, the walker EXECUTES the custom components on the count's
+//    path that hide a Text behind a component boundary — LimitSegment (the tone-colored Text) and
+//    Row (its `<Text wrap="truncate-end">` wrapper) — so a tone on EITHER is reflected in the
+//    effective color; these panels place no other colored-Text ancestor above the count. Ink Box/Text
+//    are read via props (Box carries no color; Text's color is read directly). A healthy count
+//    reports undefined only if nothing above it colors it.
 //  - `viaSegment` gates collection to counts reached via LimitSegment, so inlining an identical
 //    colored Text WITHOUT LimitSegment fails (→ []). The helper wiring, not just the color, is proven.
-// LimitSegment (pure, hookless) is executed to reach its inner Text. Guards with isValidElement /
-// Array.isArray before any property access. (A rendered-ANSI assertion is not CI-stable here:
-// ink/chalk fixes its color level at module load, shared across bun's single test process — a color
-// SGR appears when a file runs alone but is suppressed once another file has imported ink.)
+// LimitSegment and Row are pure and hookless, so executing them directly is safe. Guards with
+// isValidElement / Array.isArray before any property access. (A rendered-ANSI assertion is not
+// CI-stable here: ink/chalk fixes its color level at module load, shared across bun's single test
+// process — a color SGR appears when a file runs alone but is suppressed once another has imported ink.)
 function textColorsOf(node: unknown, text: string, viaSegment = false, inherited: unknown = undefined): unknown[] {
   if (Array.isArray(node)) return node.flatMap((child) => textColorsOf(child, text, viaSegment, inherited));
   if (!isValidElement(node)) return [];
   if (node.type === LimitSegment) return textColorsOf(LimitSegment(node.props as LimitSegmentProps), text, true, inherited);
+  if (node.type === Row) return textColorsOf(Row(node.props as RowProps), text, viaSegment, inherited);
   const props = node.props as { color?: unknown; children?: unknown };
   const effective = node.type === Text && props.color !== undefined ? props.color : inherited; // Ink: own color wins, else inherit
   const here = viaSegment && node.type === Text && textOf(props.children) === text ? [effective] : [];
@@ -196,6 +204,20 @@ describe("panel frames over canned store states (§U8.11)", () => {
       expect(textColorsOf(panel(mixed), "100")).toEqual(["red"]);
       expect(textColorsOf(panel(mixed), "1,000")).toEqual(["yellow"]);
     }
+  });
+
+  test("M1 wiring: an ancestor Text tone tints an otherwise-uncolored count via Ink inheritance, and textColorsOf reflects it (proves the effective-color model resolves wrapper Texts)", () => {
+    const store: TuiStore = createTuiStore(() => NOW);
+    store.dispatch({ type: "rate-limit", resource: "core", remaining: 4800, limit: 5000, resetEpochSec: null }); // healthy → the count's OWN color is undefined
+    const snap = store.snapshot();
+    // Row wraps every row's content in a <Text wrap="truncate-end">; were a tone ever added there, the
+    // healthy count would inherit it in Ink. Simulate that ancestor Text and confirm the walker's
+    // effective-color model reports the INHERITED tone (not undefined) — it resolves such wrappers now,
+    // rather than reading the count's own color in isolation.
+    const tinted = createElement(Text, { color: "magenta" }, createElement(LimitSegment, { snap, resource: "core" as const, nowMs: NOW }));
+    expect(textColorsOf(tinted, "4,800")).toEqual(["magenta"]); // inherited from the ancestor Text
+    // control: with no ancestor tone, the same healthy count is uncolored
+    expect(textColorsOf(createElement(LimitSegment, { snap, resource: "core" as const, nowMs: NOW }), "4,800")).toEqual([undefined]);
   });
 
   test("session counters front-load the danger fields so end-truncation drops the least important first (M2)", async () => {
