@@ -115,6 +115,8 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(text).toContain("run 2f9c1a77…"); // 8-char id
     expect(text).toContain("(resumed)");
     expect(text).toContain("phase: scan");
+    expect(text).toContain("(resumed) · phase: scan · elapsed"); // header fields joined by · , not runs of spaces (P1)
+    expect(text).not.toContain("(resumed)   phase"); // no triple-space separator
     expect(text).toContain("core 4,812/5,000 resets in 12:34"); // countdown, phrased like the banner's "resumes in" (M3)
     expect(text).toContain("graphql 1,998"); // the seed shows remaining without a limit
     expect(text).toContain("(+2 queued)");

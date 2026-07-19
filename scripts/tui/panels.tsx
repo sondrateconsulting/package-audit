@@ -31,12 +31,12 @@ function Row({ children }: { children: ReactNode }) {
 
 export function Header({ snap, nowMs, mountedAtMs }: { snap: TuiSnapshot; nowMs: number; mountedAtMs: number }) {
   const run = snap.runId === null ? "starting…" : `run ${sanitizeLine(snap.runId).slice(0, 8)}… ${snap.resumed === true ? "(resumed)" : "(fresh)"}`;
-  const phase = snap.phase === null ? "" : `   phase: ${sanitizeLine(snap.phase)}`;
+  const phase = snap.phase === null ? "" : ` · phase: ${sanitizeLine(snap.phase)}`;
   return (
     <Row>
       <Text bold>package-audit</Text> ▸ {run}
       {phase}
-      {`   elapsed ${formatClock(nowMs - mountedAtMs)}`}
+      {` · elapsed ${formatClock(nowMs - mountedAtMs)}`}
     </Row>
   );
 }
