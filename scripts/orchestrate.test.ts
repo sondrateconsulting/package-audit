@@ -1756,6 +1756,26 @@ describe("processRepo throttle requeue (§4)", () => {
     db.close();
   });
 
+  // Every repo-done rollup test pinned deferred/errored at 0; these two exercise the paths that
+  // increment them so a counter regression is caught, not silently rolled up as 0. (IMPORTANT-5d)
+  test("repo-done rolls a throttle-requeued unit up as deferred", async () => {
+    const { db, runId } = openRun();
+    const events = await captureJsonl(async () => {
+      await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), rt(config, "hash"), runId, "o", repo, [], new Set());
+    });
+    expect(events.find((e) => e["event"] === "repo-done")).toMatchObject({ event: "repo-done", deferred: 1, errored: 0, scanned: 0 });
+    db.close();
+  });
+
+  test("repo-done rolls a scan-errored unit up as errored", async () => {
+    const { db, runId } = openRun();
+    const events = await captureJsonl(async () => {
+      await processRepo(db, fakeClient(new GithubApiError("boom", { endpoint: "x" })), rt(config, "hash"), runId, "o", repo, [], new Set());
+    });
+    expect(events.find((e) => e["event"] === "repo-done")).toMatchObject({ event: "repo-done", errored: 1, deferred: 0, scanned: 0 });
+    db.close();
+  });
+
   test("a ThrottleExhausted during a unit's CONTENT fetch requeues the unit — never a silent done", async () => {
     // the api reader degrades ONLY a status-404 to null (file treated as absent); a throttle
     // means the unit was never fully read, and marking it done would let the §3 skip

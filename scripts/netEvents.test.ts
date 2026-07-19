@@ -64,6 +64,17 @@ describe("network reporter flood control + counters (T7)", () => {
     expect(h.reporter.counters()).toEqual({ retryTotal: 0, suppressed: 1 }); // only the secondary throttle
   });
 
+  // The throttle test above only ASSERTS the primary shape (the secondary is suppressed by the
+  // token budget), so `waitKind:"secondary"` → `kind:"secondary"` serialization was untested. Emit a
+  // secondary FIRST so it wins the token and its serialized shape is pinned. (finding IMPORTANT-5c)
+  test("a secondary throttle emitted FIRST serializes to event kind:'secondary'", () => {
+    const h = harness();
+    h.reporter.emit({ kind: "throttle", bucket: "graphql", waitKind: "secondary", waitMs: 1000, untilMs: 2000, attempt: 0 });
+    expect(h.emitted).toHaveLength(1);
+    expect(h.emitted[0]!.e).toMatchObject({ event: "throttle", bucket: "graphql", kind: "secondary", waitMs: 1000, untilMs: 2000, attempt: 0 });
+    expect(h.emitted[0]!.droppable).toBe(true);
+  });
+
   test("suppressed folds in the stdout writer's backpressure drops", () => {
     const h = harness();
     h.reporter.emit(retry(0)); // emit

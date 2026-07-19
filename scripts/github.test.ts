@@ -486,11 +486,13 @@ describe("path encoding + repo shaping", () => {
 
 describe("sanitized env construction", () => {
   const base = {
-    HOME: "/home/u", PATH: "/bin", GH_TOKEN: "tok", GH_DEBUG: "api", GIT_ASKPASS: "/evil",
+    HOME: "/home/u", PATH: "/bin", GH_TOKEN: "tok", GITHUB_TOKEN: "", GH_DEBUG: "api", GIT_ASKPASS: "/evil",
     GIT_SSH_COMMAND: "evil", TAR_OPTIONS: "--evil", GH_CONFIG_DIR: "/cfg", XDG_CONFIG_HOME: "/xdg",
     EMPTY: "",
-    // §H3/H4 transport env (T10): proxy family (both cases), OpenSSL + libcurl CA pointers, keyring.
-    HTTPS_PROXY: "http://proxy:8080", https_proxy: "http://lc-proxy:8080", NO_PROXY: "localhost", ALL_PROXY: "socks5://p",
+    // §H3/H4 transport env (T10): the FULL proxy family (upper AND lower case), OpenSSL + libcurl CA
+    // pointers, keyring. GITHUB_TOKEN above is allowlisted but EMPTY — it must be dropped by the guard.
+    HTTP_PROXY: "http://up-proxy:8080", HTTPS_PROXY: "http://proxy:8080", NO_PROXY: "localhost", ALL_PROXY: "socks5://p",
+    http_proxy: "http://lc-http:8080", https_proxy: "http://lc-proxy:8080", no_proxy: "127.0.0.1", all_proxy: "socks5://lc-p",
     SSL_CERT_FILE: "/etc/ssl/corp.pem", SSL_CERT_DIR: "/etc/ssl/certs",
     GIT_SSL_CAINFO: "/etc/ssl/git-ca.pem", GIT_SSL_CAPATH: "/etc/ssl/gitdir", CURL_CA_BUNDLE: "/etc/ssl/curl.pem",
     DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus", XDG_RUNTIME_DIR: "/run/user/1000",
@@ -504,11 +506,16 @@ describe("sanitized env construction", () => {
     expect(env["GH_CONFIG_DIR"]).toBe("/cfg"); // auth state passthrough
     expect(env["GH_DEBUG"]).toBeUndefined();
     expect(env["GIT_ASKPASS"]).toBeUndefined();
-    // §H3/H4 (T10): proxy family (upper AND lower), OpenSSL cert pointers, keyring DBus/runtime survive
+    // §H3/H4 (T10): the WHOLE proxy family (upper AND lower), OpenSSL cert pointers, keyring survive
+    expect(env["HTTP_PROXY"]).toBe("http://up-proxy:8080");
     expect(env["HTTPS_PROXY"]).toBe("http://proxy:8080");
-    expect(env["https_proxy"]).toBe("http://lc-proxy:8080");
     expect(env["NO_PROXY"]).toBe("localhost");
     expect(env["ALL_PROXY"]).toBe("socks5://p");
+    expect(env["http_proxy"]).toBe("http://lc-http:8080");
+    expect(env["https_proxy"]).toBe("http://lc-proxy:8080");
+    expect(env["no_proxy"]).toBe("127.0.0.1");
+    expect(env["all_proxy"]).toBe("socks5://lc-p");
+    expect(env["GITHUB_TOKEN"]).toBeUndefined(); // allowlisted but EMPTY → dropped by the empty-value guard
     expect(env["SSL_CERT_FILE"]).toBe("/etc/ssl/corp.pem");
     expect(env["SSL_CERT_DIR"]).toBe("/etc/ssl/certs");
     expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBe("unix:path=/run/user/1000/bus");
@@ -532,10 +539,15 @@ describe("sanitized env construction", () => {
     expect(env["GH_CONFIG_DIR"]).toBe("/cfg");
     // §H3/H4 (T10): git does the actual TLS clone, so it ALSO carries the transport env AND the
     // libcurl CA pointers, plus DBus/runtime for the `gh auth git-credential` keyring child.
+    expect(env["HTTP_PROXY"]).toBe("http://up-proxy:8080");
     expect(env["HTTPS_PROXY"]).toBe("http://proxy:8080");
-    expect(env["https_proxy"]).toBe("http://lc-proxy:8080");
     expect(env["NO_PROXY"]).toBe("localhost");
     expect(env["ALL_PROXY"]).toBe("socks5://p");
+    expect(env["http_proxy"]).toBe("http://lc-http:8080");
+    expect(env["https_proxy"]).toBe("http://lc-proxy:8080");
+    expect(env["no_proxy"]).toBe("127.0.0.1");
+    expect(env["all_proxy"]).toBe("socks5://lc-p");
+    expect(env["GITHUB_TOKEN"]).toBeUndefined(); // allowlisted but EMPTY → dropped by the empty-value guard
     expect(env["SSL_CERT_FILE"]).toBe("/etc/ssl/corp.pem");
     expect(env["SSL_CERT_DIR"]).toBe("/etc/ssl/certs");
     expect(env["GIT_SSL_CAINFO"]).toBe("/etc/ssl/git-ca.pem");
@@ -550,7 +562,14 @@ describe("sanitized env construction", () => {
     expect(env["EMPTY"]).toBeUndefined();
     expect(env["PATH"]).toBe("/bin");
     // tar extracts a locally-fetched tarball — it does no network, so proxy/CA/keyring env never leaks in
+    expect(env["HTTP_PROXY"]).toBeUndefined();
     expect(env["HTTPS_PROXY"]).toBeUndefined();
+    expect(env["NO_PROXY"]).toBeUndefined();
+    expect(env["ALL_PROXY"]).toBeUndefined();
+    expect(env["http_proxy"]).toBeUndefined();
+    expect(env["https_proxy"]).toBeUndefined();
+    expect(env["no_proxy"]).toBeUndefined();
+    expect(env["all_proxy"]).toBeUndefined();
     expect(env["SSL_CERT_FILE"]).toBeUndefined();
     expect(env["DBUS_SESSION_BUS_ADDRESS"]).toBeUndefined();
   });
@@ -1857,6 +1876,18 @@ describe("per-category spawn deadlines (T11)", () => {
     const client = stall({ controlApiMs: 9_000_000, cloneMs: 15 });
     await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/spawn timed out after 15ms/);
   });
+
+  // graphql() and bare gh() route through the control-API budget; only restGet was deadline-tested.
+  // Both budgets are short (11/31) so a routing mutant fires fast instead of hanging. (IMPORTANT-5b)
+  test("a graphql call times out on controlApiMs, never the clone budget", async () => {
+    const client = stall({ controlApiMs: 11, cloneMs: 31 });
+    await expect(client.graphql("query{x}", {})).rejects.toThrow(/spawn timed out after 11ms/);
+  });
+  test("a bare gh control call (--version) times out on controlApiMs", async () => {
+    const client = stall({ controlApiMs: 11, cloneMs: 31 });
+    const res = await client.gh(["--version"]);
+    expect(res.stderr).toMatch(/spawn timed out after 11ms/);
+  });
   test("the uniform spawnTimeoutMs override still applies to every category (back-compat)", async () => {
     const client = new GithubClient({
       githubHost: "github.com",
@@ -2001,6 +2032,29 @@ describe("network event emission (T7)", () => {
     const throttles = events.filter((e) => e.kind === "throttle");
     expect(throttles).toHaveLength(1);
     expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "graphql", waitKind: "primary" });
+  });
+
+  // Only the PRIMARY throttle shape was asserted end-to-end; the SECONDARY branch (429/abuse with
+  // remaining>0) that constructs its own event in restGet and graphql was unexercised. (IMPORTANT-5c)
+  test("emits a throttle{waitKind:secondary} on a 429 with remaining>0 (restGet)", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient([ok(wire(429, { "x-ratelimit-remaining": "5" }, "{}")), ok(wire(200, {}, `{"ok":1}`))], { events: (e) => events.push(e) });
+    await client.restGet("rate_limit");
+    const throttles = events.filter((e) => e.kind === "throttle");
+    expect(throttles).toHaveLength(1);
+    expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "core", waitKind: "secondary" });
+  });
+
+  test("graphql emits a throttle{bucket:graphql, waitKind:secondary} on a RATE_LIMITED envelope with remaining>0", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient(
+      [ok(wire(200, { "x-ratelimit-remaining": "50" }, `{"errors":[{"type":"RATE_LIMITED"}]}`)), ok(wire(200, {}, `{"data":{"x":1}}`))],
+      { events: (e) => events.push(e) },
+    );
+    await client.graphql("query{x}", {});
+    const throttles = events.filter((e) => e.kind === "throttle");
+    expect(throttles).toHaveLength(1);
+    expect(throttles[0]).toMatchObject({ kind: "throttle", bucket: "graphql", waitKind: "secondary" });
   });
 
   test("emits a spawn-timeout when a child outruns its deadline", async () => {
