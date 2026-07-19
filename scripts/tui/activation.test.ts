@@ -46,6 +46,19 @@ describe("decideTuiActivation — the §U1 matrix, row by row", () => {
     expect(decideTuiActivation(input({ columns: undefined }))).toEqual({ mode: "off" });
     expect(decideTuiActivation(input({ rows: undefined }))).toEqual({ mode: "off" });
   });
+  test("NON-INTEGER dimensions are ineligible — NaN/Infinity/fractions must not slip a less-than check", () => {
+    // `NaN < 40` is false: a blocker-shaped size test would wave these through eligibility and
+    // mount a dashboard that renders the EMPTY frame while the divert reroutes JSONL.
+    for (const v of [Number.NaN, Number.POSITIVE_INFINITY, 80.5]) {
+      expect({ v, d: decideTuiActivation(input({ columns: v })) }).toEqual({ v, d: { mode: "off" } });
+      expect({ v, d: decideTuiActivation(input({ rows: v })) }).toEqual({ v, d: { mode: "off" } });
+    }
+  });
+  test("--ui with NaN dimensions fails fast naming the dimension blocker", () => {
+    const d = decideTuiActivation(input({ uiFlag: true, columns: Number.NaN }));
+    expect(d.mode).toBe("error");
+    expect((d as { message: string }).message).toContain("terminal is NaNx40");
+  });
   test("stderr not a TTY, auto → off", () => {
     expect(decideTuiActivation(input({ stderrIsTTY: false }))).toEqual({ mode: "off" });
   });

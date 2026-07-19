@@ -4,8 +4,11 @@
 // Validation runs in TESTS (report.test.ts), never in the emit path — a schema bug must not be
 // able to fail a completed scan's report write (§7 determinism).
 //
-// DEPENDENCY JUSTIFICATION (§6 — minimize deps): zod is one of the repo's two devDependencies
-// (with `@types/bun`) — test-only (`typescript`, used for .d.ts AST parsing, is the sole runtime dep).
+// DEPENDENCY JUSTIFICATION (§6 — minimize deps): zod is test-only, one of the repo's
+// devDependencies (alongside `@types/bun` and the dashboard's `@types/react` +
+// `ink-testing-library`). The ANALYSIS path's sole runtime dependency remains `typescript`
+// (.d.ts AST parsing); `ink`/`react` are display-layer-only runtime deps for the opt-outable
+// dashboard (dynamic-import-only — see README "Runtime dependencies").
 // Justification: a schema-as-docs contract for the report consumed by downstream tooling, with
 // validation errors that name the failing path — hand-rolling that (or maintaining prose docs
 // against a moving shape) is strictly worse. zod v4 is dependency-free and pinned exactly.

@@ -36,12 +36,20 @@ export const MIN_ROWS = 5;
 // mode must never divert in CI), and at least the 40x5 floor. Undefined dimensions are
 // ineligible. A terminal that SHRINKS below the floor mid-run is a render concern (§U5), never
 // an activation concern.
+//
+// The size check is POSITIVE ("dimensions are usable integers at/above the floor"), never a
+// less-than blocker test: `NaN < 40` is false, so a blocker-shaped check would wave NaN (and
+// Infinity/fractions) through eligibility — mounting a dashboard that renders the EMPTY frame
+// while the divert reroutes JSONL with nothing visible. Same positive-integer predicate as the
+// render layer (planLayout) and the proxy's ink-facing pin.
+const usableDim = (v: number | undefined, min: number): boolean => v !== undefined && Number.isInteger(v) && v >= min;
+
 function eligibility(i: ActivationInput): { eligible: boolean; blockers: string[] } {
   const blockers: string[] = [];
   if (!i.stderrIsTTY) blockers.push("stderr is not a TTY");
   if (i.term === "dumb") blockers.push("TERM is 'dumb'");
   if (i.ci) blockers.push("CI is set");
-  if ((i.columns ?? 0) < MIN_COLUMNS || (i.rows ?? 0) < MIN_ROWS)
+  if (!usableDim(i.columns, MIN_COLUMNS) || !usableDim(i.rows, MIN_ROWS))
     blockers.push(`terminal is ${i.columns ?? "?"}x${i.rows ?? "?"} (needs at least ${MIN_COLUMNS}x${MIN_ROWS})`);
   return { eligible: blockers.length === 0, blockers };
 }

@@ -165,20 +165,46 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
     return failures;
   };
 
-  const instance = renderImpl(
-    <Boundary onCrash={onCrash}>
-      <App store={store} subscribe={subscribe} nowMs={nowMs} mountedAtMs={nowMs()} />
-    </Boundary>,
-    {
-      stdout: opts.out, // load-bearing: Ink's "stdout" IS our (sealable) stderr proxy
-      stderr: opts.out,
-      exitOnCtrlC: false, // §U0 display-only: SIGINT keeps its default kill-and-resume semantics
-      patchConsole: true, // stray console.* (React warnings!) render ABOVE the frame, never smear it
-      // `stdin` is deliberately ABSENT (not `stdin: undefined`): Ink spreads the caller's options
-      // over its defaults, so an explicit undefined CLOBBERS the default stream and silently wedges
-      // rendering (P0 finding). Display-only — nothing here ever reads input.
-    },
-  );
+  // The render call ITSELF is guarded, not just the tail below: a synchronous throw inside
+  // Ink's construction leaves NO instance to unmount, but whatever listeners it registered on
+  // the render stream before failing would keep firing into a half-built renderer — a later
+  // resize could re-enter it from a timer context and throw unhandled (a kill, §U0). Snapshot
+  // the stream's listeners first; on a throw, remove exactly the delta the failed construction
+  // added, then rethrow into the lifecycle's mount-failure path (which seals the proxy, so any
+  // pending render output is dropped). Residual, stated honestly: Ink-internal timers/state
+  // created before the throw are unreachable without an instance — the sealed proxy absorbs
+  // their writes; removing the listeners closes the re-entry channels that are reachable.
+  const listenersBefore = new Map<string | symbol, Set<unknown>>();
+  for (const ev of opts.out.eventNames()) listenersBefore.set(ev, new Set(opts.out.rawListeners(ev)));
+  let instance: ReturnType<typeof render>;
+  try {
+    instance = renderImpl(
+      <Boundary onCrash={onCrash}>
+        <App store={store} subscribe={subscribe} nowMs={nowMs} mountedAtMs={nowMs()} />
+      </Boundary>,
+      {
+        stdout: opts.out, // load-bearing: Ink's "stdout" IS our (sealable) stderr proxy
+        stderr: opts.out,
+        exitOnCtrlC: false, // §U0 display-only: SIGINT keeps its default kill-and-resume semantics
+        patchConsole: true, // stray console.* (React warnings!) render ABOVE the frame, never smear it
+        // `stdin` is deliberately ABSENT (not `stdin: undefined`): Ink spreads the caller's options
+        // over its defaults, so an explicit undefined CLOBBERS the default stream and silently wedges
+        // rendering (P0 finding). Display-only — nothing here ever reads input.
+      },
+    );
+  } catch (e) {
+    try {
+      for (const ev of opts.out.eventNames()) {
+        const before = listenersBefore.get(ev);
+        for (const l of opts.out.rawListeners(ev)) {
+          if (before === undefined || !before.has(l)) opts.out.off(ev as string, l as () => void);
+        }
+      }
+    } catch {
+      // best-effort rollback of the failed construction's listeners
+    }
+    throw e;
+  }
 
   // Everything AFTER the render is wrapped so a failure here (a throwing injected scheduler, a
   // broken listener registration, a throwing waitUntilExit at the rejection-handler attach) can

@@ -3,7 +3,7 @@
 // preflight fetch/introspect spans; orchestrate anchors (phases, brackets, unit lifecycle).
 // Scripted-fake style throughout (injected SpawnFn / fetchImpl / clocks); the progress sink is
 // restored in afterEach (§U8 hygiene).
-import { expect, test, describe, afterEach, spyOn } from "bun:test";
+import { expect, test, describe, afterEach, afterAll, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +22,10 @@ import type { OrchestrateArgs } from "./args.ts";
 
 const TEST_TMP = mkdtempSync(join(realpathSync(tmpdir()), "progress-wiring-"));
 const BINS = { gh: "/opt/bin/tool", git: "/opt/bin/tool", tar: "/opt/bin/tool" }; // IDENTICAL on purpose (§U8.7)
+
+afterAll(() => {
+  rmSync(TEST_TMP, { recursive: true, force: true });
+});
 
 afterEach(() => {
   setProgressSink(null);

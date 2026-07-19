@@ -116,14 +116,26 @@ describe("tui purity (grep-enforced, §U8.14)", () => {
       if (file === join("tui", "lifecycle.ts")) {
         allowedTotal += matches.length;
         // EXACTLY ONE fs-module import across the whole display layer, and it is the quartet —
-        // an fs API cannot be called without importing the module, so import-level enforcement
-        // closes the unlisted-API hole (truncateSync, cpSync, fs/promises, …) at the chokepoint
+        // an fs API cannot be called without importing the module OR reaching a dynamic
+        // builtin escape hatch, and the companion test below bans those outright — so
+        // import-level enforcement closes the unlisted-API hole (truncateSync, cpSync,
+        // fs/promises, …) at the chokepoint
         expect({ file, matches }).toEqual({ file, matches: ['import { openSync, writeSync, closeSync, mkdirSync } from "node:fs"'] });
       } else {
         expect({ file, matches }).toEqual({ file, matches: [] });
       }
     }
     expect(allowedTotal).toBe(1);
+  });
+
+  test("no display file reaches a dynamic builtin-module escape hatch (getBuiltinModule / createRequire)", () => {
+    // process.getBuiltinModule("node:fs") and module.createRequire(...)("fs") acquire builtin
+    // modules WITHOUT any import statement — they would bypass the import chokepoint above.
+    // The display layer has no legitimate use for either; banned outright, comments included.
+    const ESCAPE_RE = /\bgetBuiltinModule\b|\bcreateRequire\b/;
+    for (const { file, src } of tuiSources()) {
+      expect({ file, escapeHatch: ESCAPE_RE.test(src) }).toEqual({ file, escapeHatch: false });
+    }
   });
 
   test("the fs-import scanner recognizes every promised form and rejects near-misses (meta)", () => {

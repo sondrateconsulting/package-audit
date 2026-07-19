@@ -127,7 +127,9 @@ describe("P0 automated gate — real mountTui under Bun against capture streams"
   });
 
   test("store-driven frame updates: a dispatched event + tick reaches the rendered frame", async () => {
+    const seen = { out: null as CaptureStream | null };
     await mounted(async ({ out, store, sched }) => {
+      seen.out = out;
       store.dispatch({ type: "phase", phase: "reconcile" });
       sched.fire();
       if (!IN_CI) {
@@ -136,7 +138,9 @@ describe("P0 automated gate — real mountTui under Bun against capture streams"
         await new Promise((r) => setTimeout(r, 50)); // let React commit before the final frame
       }
     });
-    // the finally unmounted; in both modes the LAST content must have reached the stream
+    // asserted AFTER the finally's unmount, in BOTH modes: under CI Ink writes only the final
+    // frame at unmount — without this line the gate would be vacuous there
+    expect(seen.out!.all()).toContain("phase: reconcile");
   });
 
   test("a tick with an unchanged version and unchanged second does not wake React (render-skip)", async () => {
@@ -264,6 +268,30 @@ describe("post-render rollback + adapter cleanup (§U6 remediation)", () => {
     expect(atUnmountEntry).toEqual([{ listeners: 0, degradesDuringProbe: 0 }]); // cleanup-BEFORE-unmount proven
     expect(sched.activeCount()).toBe(0); // the created interval was cleared (1 → 0)
     expect(out.listenerCount("resize")).toBe(0); // registered, then detached — back to baseline
+  });
+
+  test("a THROWING render construction rolls back exactly the listeners it added, then rethrows (no re-entry channel)", () => {
+    const out = new CaptureStream();
+    const preexisting = (): void => {};
+    out.on("resize", preexisting); // a listener that predates the mount must SURVIVE the rollback
+    const failingRender = ((): never => {
+      // simulate Ink registering stream hooks during construction, then failing before returning
+      out.on("resize", () => {});
+      out.on("error", () => {});
+      throw new Error("ink construction failed");
+    }) as unknown as RenderSeam;
+    expect(() =>
+      mountTui(createTuiStore(() => 0), {
+        out: out as unknown as NodeJS.WriteStream,
+        onDegrade: () => {},
+        scheduler: makeFakeScheduler().scheduler,
+        renderImpl: failingRender,
+      }),
+    ).toThrow("ink construction failed");
+    // exactly the delta the failed construction added was removed — nothing more, nothing less
+    expect(out.listenerCount("resize")).toBe(1);
+    expect(out.rawListeners("resize")).toEqual([preexisting]);
+    expect(out.listenerCount("error")).toBe(0);
   });
 
   test("rollback (iii): a throwing clearInterval cannot mask the original error; the timer is unref'd and inert", () => {
