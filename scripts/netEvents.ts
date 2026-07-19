@@ -3,8 +3,9 @@
 // (no orchestrate import; the single-spawn chokepoint is unaffected). A large flaky-VPN run can
 // produce a flood of retry attempts; emitting every one would drown the log, so this reporter:
 //   - counts every retry event it RECEIVES (retryTotal) and every suppressed candidate (suppressed)
-//     — note a github.ts truncated/malformed-body re-drive retries WITHOUT emitting a retry event, so
-//     it reaches neither counter (the README scopes retryTotal to no-response/http-5xx accordingly);
+//     — including a github.ts truncated-transport re-drive, which emits reason:"transport-truncated",
+//     so every bounded retry (no-response / http-5xx / transport-truncated) reaches retryTotal even
+//     when its line is rate-limited away;
 //   - rate-limits the retry/throttle flood to a global burst-1 / refill-1-per-second budget, so an
 //     operator sees the first event after a quiet window plus a trickle, never a wall of lines;
 //   - marks emitted retry/throttle lines DROPPABLE so the stdout backpressure buffer sheds them
@@ -18,7 +19,7 @@
 import { logLine, loggerStats } from "./log.ts";
 
 export type NetworkEvent =
-  | { kind: "retry"; reason: "no-response" | "http-5xx"; endpoint: string; attempt: number; maxAttempts: number; nextWaitMs: number }
+  | { kind: "retry"; reason: "no-response" | "http-5xx" | "transport-truncated"; endpoint: string; attempt: number; maxAttempts: number; nextWaitMs: number }
   | { kind: "throttle"; bucket: string; waitKind: "primary" | "secondary"; waitMs: number; untilMs: number; attempt: number }
   | { kind: "spawn-timeout"; bin: string; ms: number };
 

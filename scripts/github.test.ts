@@ -15,7 +15,7 @@ import { DEFAULT_TIMEOUTS } from "./config.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import { AuditDb } from "./db.ts";
 import { compileRepositoryPolicy } from "./repositoryPolicy.ts";
-import type { NetworkEvent } from "./netEvents.ts";
+import { createNetworkReporter, type NetworkEvent } from "./netEvents.ts";
 
 const NO_DENY = compileRepositoryPolicy([]); // empty denylist: filterSortCapRepos behaves as pre-feature
 
@@ -1941,6 +1941,52 @@ describe("network event emission (T7)", () => {
     const retries = events.filter((e) => e.kind === "retry");
     expect(retries).toHaveLength(1);
     expect(retries[0]).toMatchObject({ kind: "retry", reason: "http-5xx", endpoint: "graphql", attempt: 0 });
+  });
+
+  // A truncated-transport re-drive (HTTP-200 head + nonzero exit) IS a retry — it must be emitted and
+  // counted, not re-driven silently. Previously restGet/graphql slept-and-continued without emitting,
+  // so retryTotal undercounted exactly the churn a flaky link produces most (see finding IMPORTANT-1).
+  test("emits a retry{reason:transport-truncated} on a truncated 200 that then recovers", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient(
+      [err(http(200, {}, "partial"), "read: connection reset"), ok(wire(200, {}, `{"ok":1}`))],
+      { events: (e) => events.push(e) },
+    );
+    await client.restGet("rate_limit");
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "transport-truncated", endpoint: "rate_limit", attempt: 0, maxAttempts: 6 });
+  });
+
+  test("graphql emits retry{reason:transport-truncated, endpoint:graphql} on a truncated envelope that recovers", async () => {
+    const events: NetworkEvent[] = [];
+    const { client } = makeClient(
+      [err(http(200, {}, ""), "curl: (56) Recv failure: Connection reset by peer"), ok(http(200, {}, `{"data":{"x":1}}`))],
+      { events: (e) => events.push(e) },
+    );
+    await client.graphql("query{x}", {});
+    const retries = events.filter((e) => e.kind === "retry");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({ kind: "retry", reason: "transport-truncated", endpoint: "graphql", attempt: 0, maxAttempts: 6 });
+  });
+
+  test("a PERSISTENT truncated 200 emits MAX_ATTEMPTS-1 transport-truncated retries — the final attempt throws, no retry follows", async () => {
+    const events: NetworkEvent[] = [];
+    const truncated = err(http(200, {}, "partial"), "read: connection reset");
+    const { client } = makeClient(Array<SpawnResult>(6).fill(truncated), { events: (e) => events.push(e) });
+    await expect(client.restGet("rate_limit")).rejects.toThrow(/truncated/);
+    const retries = events.filter((e) => e.kind === "retry" && e.reason === "transport-truncated");
+    expect(retries).toHaveLength(5); // MAX_ATTEMPTS-1 — no retry line on the final throwing attempt
+  });
+
+  test("the reporter counts a truncated re-drive in retryTotal (no longer silently uncounted)", async () => {
+    const reporter = createNetworkReporter({ emit: () => {} }); // swallow output; assert the counter only
+    const { client } = makeClient(
+      [err(http(200, {}, "partial"), "read: connection reset"), ok(wire(200, {}, `{"ok":1}`))],
+      { events: (e) => reporter.emit(e) },
+    );
+    await client.restGet("rate_limit");
+    expect(reporter.counters().retryTotal).toBe(1);
   });
 
   test("graphql emits throttle{bucket:graphql, waitKind:primary} on a primary rate-limit", async () => {

@@ -1533,7 +1533,14 @@ export class GithubClient {
         return { status: 200, headers: outcome.headers, body: outcome.body };
       }
       if (outcome.kind === "truncated") {
-        if (attempt < MAX_ATTEMPTS - 1) { await this.sleep(this.backoffWait("transient", attempt, null)); continue; }
+        if (attempt < MAX_ATTEMPTS - 1) {
+          // A truncated-transport re-drive IS a bounded retry — emit it (like no-response above) so the
+          // reporter counts it in retryTotal, then back off. No line on the final throwing attempt.
+          const nextWaitMs = this.backoffWait("transient", attempt, null);
+          this.emitEvent({ kind: "retry", reason: "transport-truncated", endpoint, attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs });
+          await this.sleep(nextWaitMs);
+          continue;
+        }
         throw new GithubApiError(`gh exited ${outcome.exitCode} with an HTTP 200 response — the body may be truncated: ${outcome.stderr.trim().slice(0, 300)}`, { endpoint });
       }
       if (outcome.kind === "ok") {
@@ -1686,7 +1693,11 @@ export class GithubClient {
           // exactly that shape so a COMPLETE errors envelope (parses fine → malformed===null) is never
           // blind-retried; every other malformed reason is a real spec violation → fatal.
           if (outcome.malformed === "unparseable JSON body" && outcome.exitCode !== 0 && attempt < MAX_ATTEMPTS - 1) {
-            await this.sleep(this.backoffWait("transient", attempt, null));
+            // Same transient re-drive as restGet's truncated branch — emit reason:"transport-truncated"
+            // so retryTotal counts it; no line on the final throwing attempt.
+            const nextWaitMs = this.backoffWait("transient", attempt, null);
+            this.emitEvent({ kind: "retry", reason: "transport-truncated", endpoint: "graphql", attempt, maxAttempts: MAX_ATTEMPTS, nextWaitMs });
+            await this.sleep(nextWaitMs);
             continue;
           }
           throw new GithubApiError(
