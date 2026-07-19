@@ -1,5 +1,6 @@
 // orchestrate.ts — the scan coordinator (§5, §8). Entry point:
 //   bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
+//                                  [--ui | --no-ui] \
 //                                  [--rescan-branch <org>/<repo>@<branch>]... [--help]
 // Flow (§8): restate config → preflight (§2) → resolve effective owners (§1) → start/resume run
 // (§3) → discover repos+branches and process each branch unit (§5.A-H) → reconcile introspection
@@ -46,6 +47,8 @@ import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
 import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
 import { logLine } from "./log.ts";
+import { decideTuiActivation, TuiActivationError } from "./tui/activation.ts";
+import { runWithTui, makeDivertPathFor, utcLogStamp } from "./tui/lifecycle.ts";
 
 // The values that TOGETHER define one coherent scan/plan: the config, its hash, and the compiled
 // branch + repository policies. Threaded as ONE object through runScan/processOwner/processRepo/runPlan
@@ -128,38 +131,73 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const runtime: AuditRuntime = { config, configHash, branchPolicy, repositoryPolicy };
   const trackedNames = config.packages.map((p) => p.name);
 
-  logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
-  // §5 configured fan-out widths. Emitted for both audit and --plan; in --plan runPlan traverses
-  // owners/repos SEQUENTIALLY, so organizations/branches are reported but not fanned out there (only
-  // repositories, the gh/git/tar subprocess cap, applies in plan mode). `repositories` is the GLOBAL
-  // in-flight subprocess cap, NOT a repo-loop degree — so at most `repositories` gh/git/tar run at
-  // once no matter how organizations×branches compose. Set-vocabulary event (documented in README).
-  logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
+  // TUI activation (PROMPT-TUI §U1): a PURE decision over flags + the real streams/env. NO config
+  // keys are consulted (config_hash is untouchable). An ineligible environment is an operator
+  // error only under an explicit --ui demand; auto mode just runs without the dashboard.
+  const decision = decideTuiActivation({
+    plan: args.plan,
+    uiFlag: args.ui,
+    stderrIsTTY: process.stderr.isTTY === true,
+    stdoutIsTTY: process.stdout.isTTY === true,
+    columns: process.stderr.columns,
+    rows: process.stderr.rows,
+    term: process.env["TERM"],
+    ci: (process.env["CI"] ?? "") !== "",
+  });
+  if (decision.mode === "error") throw new TuiActivationError(decision.message);
 
-  // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
-  // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls).
-  const preflightClient = new GithubClient({ githubHost: config.githubHost });
-  const preflight = await runPreflight(preflightClient, config);
-  logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
+  // Everything from the `config` logLine through runScan runs inside the TUI lifecycle wrapper
+  // (a passthrough when the decision is off — plan/CI/piped runs are byte-identical to before).
+  // The summary is rendered AFTER teardown so it lands below the terminated frame (§U1).
+  const outcome = await runWithTui(
+    {
+      decision,
+      streams: { stderr: process.stderr },
+      logPathFor: makeDivertPathFor(config.paths.outputDir, utcLogStamp(new Date()), process.pid),
+    },
+    async (): Promise<ScanOutcome | null> => {
+      logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
+      // §5 configured fan-out widths. Emitted for both audit and --plan; in --plan runPlan traverses
+      // owners/repos SEQUENTIALLY, so organizations/branches are reported but not fanned out there (only
+      // repositories, the gh/git/tar subprocess cap, applies in plan mode). `repositories` is the GLOBAL
+      // in-flight subprocess cap, NOT a repo-loop degree — so at most `repositories` gh/git/tar run at
+      // once no matter how organizations×branches compose. Set-vocabulary event (documented in README).
+      logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
 
-  // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
-  // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
-  if (args.plan) {
-    const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories });
-    await runPlan(planClient, runtime, preflight.githubLogin);
-    return;
-  }
+      // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
+      // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls),
+      // constructed at the CONFIGURED subprocess width: its calls are sequential one-shot awaits, so
+      // the wider semaphore is never contended — zero behavioral change — but the dashboard's
+      // subprocess-cap gauge is then honest for the whole run (PROMPT-TUI §U1).
+      const preflightClient = new GithubClient({ githubHost: config.githubHost, concurrency: config.concurrency.repositories });
+      const preflight = await runPreflight(preflightClient, config);
+      logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
 
-  // Only AFTER preflight passes do we touch the database (open/migrate/--fresh) and build the
-  // caching client for the scan.
-  const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath, fresh: args.fresh, purgeCache: args.purgeCache });
-  const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories });
+      // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
+      // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
+      // Plan mode never mounts the TUI (activation returned off), so runPlan's own stderr summary
+      // writes land exactly as today.
+      if (args.plan) {
+        const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories });
+        await runPlan(planClient, runtime, preflight.githubLogin);
+        return null;
+      }
 
-  try {
-    await runScan(db, client, runtime, args, preflight.githubLogin);
-  } finally {
-    db.close();
-  }
+      // Only AFTER preflight passes do we touch the database (open/migrate/--fresh) and build the
+      // caching client for the scan.
+      const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath, fresh: args.fresh, purgeCache: args.purgeCache });
+      const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories });
+
+      try {
+        return await runScan(db, client, runtime, args, preflight.githubLogin);
+      } finally {
+        db.close();
+      }
+    },
+  );
+  // §8 step 7's human summary, AFTER the dashboard tore down — below the terminated frame. Plan
+  // mode and the owner-discovery-throttled clean exit return null (they have no scan summary).
+  if (outcome !== null) process.stderr.write(runSummaryText(outcome.runId, outcome.summary, outcome.errorCount, outcome.reportPath, outcome.warnings));
 }
 
 // §8 step 7's "concise human-readable summary": stderr only — stdout stays pure JSONL. The
@@ -194,13 +232,25 @@ function emitPolicyWarnings(branchPolicy: CompiledBranchPolicy, coverages: reado
   return [...(isEmptyAllowlist(branchPolicy) ? [{ kind: "empty-allowlist" } as const] : []), ...dead];
 }
 
+// What a completed scan hands back to main() for the human summary (rendered AFTER the TUI
+// teardown, so it lands below the terminated frame — PROMPT-TUI §U1). The `done` event and
+// runSummaryText themselves are unchanged; only the WRITE SITE moved to the caller.
+export interface ScanOutcome {
+  readonly runId: string;
+  readonly summary: ReportSummary;
+  readonly errorCount: number;
+  readonly reportPath: string;
+  readonly warnings: readonly PolicyWarning[];
+}
+
 // The full scan lifecycle (§0/§1/§3/§5/§8), after preflight opened the db + caching client.
 // EXPORTED for tests: the site-(a) owner-discovery throttle contract — end cleanly WITHOUT
 // starting a run — is pinned here (a run started on throttle would leave a phantom run row).
+// Returns null for that owner-discovery-throttled clean exit (nothing to summarize).
 export async function runScan(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime,
   args: OrchestrateArgs, personalLogin: string | null,
-): Promise<void> {
+): Promise<ScanOutcome | null> {
   const { config, configHash } = runtime;
   // §0 startup: sweep stale temp dirs from a prior crash.
   client.sweepStaleTempDirs();
@@ -215,7 +265,7 @@ export async function runScan(
   const resolved = await resolveOwnersWithDiscovery(client, config, personalLogin);
   if (resolved === null) {
     logLine({ event: "owner-discovery-throttled", action: "retry-next-run" });
-    return; // clean exit; the caller closes the db. No run started, nothing to report.
+    return null; // clean exit; the caller closes the db. No run started, nothing to report.
   }
   const { owners, source } = resolved;
 
@@ -329,14 +379,15 @@ export async function runScan(
   // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at).
   db.completeRun(runId);
   // §8 step 7: produce the consolidated §7 report (run-<id>.json + latest.json) from SQLite,
-  // then the machine done-event (stdout) and the human summary (stderr) — BOTH derived from
-  // the emitted report object itself, so the three can never disagree.
+  // then the machine done-event (stdout) and the human summary — BOTH derived from the emitted
+  // report object itself, so the three can never disagree. The summary TEXT is returned to the
+  // caller (main renders it after the TUI teardown, PROMPT-TUI §U1) rather than written here.
   const completedRun = db.getRun(runId)!;
   const emitted = emitReportDetailed(db, completedRun, config.paths.outputDir, { alsoLatest: true });
   const summary = emitted.report.summary;
   const errorCount = emitted.report.errors.length;
   logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount });
-  process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path, warnings));
+  return { runId, summary, errorCount, reportPath: emitted.path, warnings };
 }
 
 // ---- owner resolution + branch classification (shared by the run and --plan paths) -----------

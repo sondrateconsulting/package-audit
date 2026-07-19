@@ -25,7 +25,7 @@ describe("parseRescanTarget", () => {
 
 describe("parseArgs", () => {
   test("defaults with no args", () => {
-    expect(parseArgs([])).toEqual({ configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false });
+    expect(parseArgs([])).toEqual({ configPath: null, plan: false, fresh: false, purgeCache: false, ui: null, rescanBranches: [], help: false });
   });
   test("--config with space and = forms", () => {
     expect(parseArgs(["--config", "/a.json"]).configPath).toBe("/a.json");
@@ -94,6 +94,33 @@ describe("parseArgs", () => {
     expect(parseArgs(["--wat", "--help"]).help).toBe(true); // no throw: help wins
     expect(parseArgs(["--purge-cache", "-h"]).help).toBe(true); // conflict check skipped under help
   });
+  // ---- --ui/--no-ui (PROMPT-TUI §U1 / §U8.2) --------------------------------------------------
+  test("--ui / --no-ui / neither parse to true / false / null (auto)", () => {
+    expect(parseArgs(["--ui"]).ui).toBe(true);
+    expect(parseArgs(["--no-ui"]).ui).toBe(false);
+    expect(parseArgs([]).ui).toBeNull();
+  });
+  test("--ui and --no-ui together are rejected as mutually exclusive", () => {
+    expect(() => parseArgs(["--ui", "--no-ui"])).toThrow(/mutually exclusive/);
+    expect(() => parseArgs(["--no-ui", "--ui"])).toThrow(/mutually exclusive/);
+  });
+  test("--plan --ui is rejected (plan mode has no dashboard); --plan --no-ui is a harmless no-op", () => {
+    expect(() => parseArgs(["--plan", "--ui"])).toThrow(/plan mode has no dashboard/);
+    expect(() => parseArgs(["--ui", "--plan"])).toThrow(/plan mode has no dashboard/);
+    const a = parseArgs(["--plan", "--no-ui"]);
+    expect(a.plan).toBe(true);
+    expect(a.ui).toBe(false);
+  });
+  test("--ui/--no-ui reject the attached =value form, like every bool flag", () => {
+    expect(() => parseArgs(["--ui=1"])).toThrow(/--ui takes no value/);
+    expect(() => parseArgs(["--no-ui=1"])).toThrow(/--no-ui takes no value/);
+  });
+  test("--ui composes with the other flags", () => {
+    const a = parseArgs(["--ui", "--fresh", "--config", "/c.json"]);
+    expect(a.ui).toBe(true);
+    expect(a.fresh).toBe(true);
+    expect(a.configPath).toBe("/c.json");
+  });
 });
 
 describe("parseReportArgs", () => {
@@ -143,7 +170,7 @@ describe("parseReportArgs", () => {
 
 describe("help text", () => {
   test("orchestrate help names every flag", () => {
-    for (const flag of ["--config", "--plan", "--fresh", "--purge-cache", "--rescan-branch", "--help"])
+    for (const flag of ["--config", "--plan", "--fresh", "--purge-cache", "--rescan-branch", "--ui", "--no-ui", "--help"])
       expect(ORCHESTRATE_HELP).toContain(flag);
   });
   test("report help names every flag and the config precedence", () => {
