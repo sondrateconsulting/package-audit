@@ -5,6 +5,7 @@
 import { useEffect, useReducer } from "react";
 import { Box, Text, useStdout } from "ink";
 import type { TuiStore } from "./store.ts";
+import type { DimsAwareStream, RawDims } from "./dims.ts";
 import { planLayout, sanitizeLine } from "./format.ts";
 import { bannerLineCount, CompactFrame, Footer, Header, LimitsPanel, NetPanel, ProblemsPanel, ThrottleBanner, WorkPanel } from "./panels.tsx";
 
@@ -30,8 +31,8 @@ export function App({ store, subscribe, nowMs, mountedAtMs }: AppProps) {
   // that same spawn-capable helper on falsy values) and exposes the truth via getRawDims() —
   // function-detected here so direct capture-stream mounts (tests, ITL) fall back to the plain
   // props unchanged.
-  const rawDims = (stdout as unknown as { getRawDims?: () => { columns: number | undefined; rows: number | undefined } }).getRawDims;
-  const dims = rawDims !== undefined ? rawDims() : { columns: stdout.columns, rows: stdout.rows };
+  const rawDims = (stdout as unknown as Partial<DimsAwareStream>).getRawDims;
+  const dims: RawDims = rawDims !== undefined ? rawDims() : { columns: stdout.columns, rows: stdout.rows };
 
   const snap = store.snapshot();
   const now = nowMs();

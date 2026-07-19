@@ -47,6 +47,13 @@ export interface MountTuiOptions {
   tickMs?: number; // default DEFAULT_TICK_MS; tests inject to drive frames deterministically
   renderImpl?: typeof render; // test seam (like lifecycle's storeImpl): rollback proof needs a
   //                             spy renderer that is CI-stable; production default is ink's render
+  onWake?: () => void; // test seam: fires once per frame-bus wake the tick DECIDES to emit — lets
+  //                      the render-skip and 1s-granularity gates be asserted directly, without
+  //                      counting Ink frame bytes (Ink dedupes unchanged output and defers all
+  //                      frames to unmount under CI, which made the old byte-count tests both
+  //                      CI-blind and unable to distinguish a skip from a deduped repaint).
+  //                      Undefined in production — a bare one-boolean check per wake, and this
+  //                      module is never imported on the no-sink path (§U0).
 }
 
 // Belt-and-braces for RENDER throws (§U5): timer callbacks never reach a boundary — the guarded
@@ -70,6 +77,7 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
   const tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
   const nowMs = opts.nowMs ?? Date.now;
   const renderImpl = opts.renderImpl ?? render;
+  const onWake = opts.onWake;
 
   // One-listener frame bus: the tick (outside React) wakes the App (inside React) without the
   // scheduler ever living in a component — dispose() can then stop everything non-reentrantly.
@@ -134,6 +142,7 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
         lastVersion = store.version;
         lastSecond = second;
         frameListener?.();
+        onWake?.(); // test-only observer of the wake DECISION (undefined in production)
       }
     } catch (err) {
       stopTick();

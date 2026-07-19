@@ -24,8 +24,14 @@ afterEach(() => {
   resetTuiFailure();
 });
 
-// A fake interactive terminal: enough surface for Ink (write/isTTY/columns/rows/on/off — the
-// exact member set Ink reads, measured at P0), capturing every byte ever written.
+// A fake interactive terminal: the surface Ink's RENDER path drives (write/isTTY/columns/rows/
+// on/off), capturing every byte ever written. NOT the exhaustive set Ink touches — its
+// unmount/flush path also reads Writable-state props (destroyed, writableEnded, writable,
+// _writableState, writableLength, via ink.js getWritableStreamState). CaptureStream deliberately
+// leaves those undefined, so Ink's finish-unmount write-barrier takes its setImmediate branch here.
+// Production is unaffected because makeSealableStderr delegates every non-overridden member to the
+// real stream via Reflect.get fallthrough (lifecycle.ts) — that pass-through must stay COMPLETE;
+// do NOT narrow the production proxy to this render-only subset.
 class CaptureStream extends EventEmitter {
   frames: string[] = [];
   isTTY = true;
@@ -85,7 +91,7 @@ interface Ctx {
   degrades: number[];
   advance: (ms: number) => void;
 }
-async function mounted(fn: (ctx: Ctx) => Promise<void>): Promise<void> {
+async function mounted(fn: (ctx: Ctx) => Promise<void>, extraOpts?: Partial<MountTuiOptions>): Promise<void> {
   const out = new CaptureStream();
   let now = 10_000;
   const store = createTuiStore(() => now);
@@ -97,6 +103,7 @@ async function mounted(fn: (ctx: Ctx) => Promise<void>): Promise<void> {
     scheduler: sched.scheduler,
     tickMs: DEFAULT_TICK_MS,
     nowMs: () => now,
+    ...extraOpts,
   });
   try {
     await fn({ out, store, sched, handle, degrades, advance: (ms) => (now += ms) });
@@ -149,26 +156,41 @@ describe("P0 automated gate — real mountTui under Bun against capture streams"
     expect(seen.out!.all()).toContain("phase: reconcile");
   });
 
+  // These two assert the tick's WAKE DECISION directly through the onWake seam, not by counting
+  // Ink frame bytes: Ink dedupes unchanged output and (under CI) defers every frame to unmount, so
+  // a byte-count test could neither run in CI nor tell a genuine render-skip from a deduped
+  // repaint. onWake fires exactly when tick() decides to pump the frame bus, so these run
+  // everywhere and FAIL if the `version !== lastVersion || second !== lastSecond` gate is removed.
   test("a tick with an unchanged version and unchanged second does not wake React (render-skip)", async () => {
-    await mounted(async ({ out, sched }) => {
-      if (IN_CI) return; // frame-count observation needs interactive per-frame writes
-      await waitFor(() => out.all().includes("package-audit"));
-      const framesBefore = out.frames.length;
-      sched.fire();
-      sched.fire();
-      await new Promise((r) => setTimeout(r, 100));
-      expect(out.frames.length).toBe(framesBefore); // no version/second change → no new frame bytes
-    });
+    let wakes = 0;
+    await mounted(
+      async ({ sched }) => {
+        sched.fire(); // the first tick always wakes (lastVersion=-1 sentinel) — prime, then observe
+        expect(wakes).toBe(1);
+        sched.fire(); // unchanged version + same second → the gate must skip
+        sched.fire();
+        expect(wakes).toBe(1); // both extra ticks skipped: no redundant re-render
+      },
+      { onWake: () => wakes++ },
+    );
   });
 
   test("a 1s-granularity clock change wakes React even with an unchanged store version", async () => {
-    await mounted(async ({ out, sched, advance }) => {
-      if (IN_CI) return;
-      await waitFor(() => out.all().includes("elapsed 00:00"));
-      advance(2_000); // the visible elapsed digit changes
-      sched.fire();
-      expect(await waitFor(() => out.all().includes("elapsed 00:02"))).toBe(true);
-    });
+    let wakes = 0;
+    await mounted(
+      async ({ sched, advance }) => {
+        sched.fire(); // prime
+        expect(wakes).toBe(1);
+        sched.fire(); // same second, no version change → skip
+        expect(wakes).toBe(1);
+        advance(1_000); // cross a 1-second boundary — the visible elapsed/countdown digit changes
+        sched.fire();
+        expect(wakes).toBe(2); // woke on the second change alone, store version untouched
+        sched.fire(); // same (new) second again → skip
+        expect(wakes).toBe(2);
+      },
+      { onWake: () => wakes++ },
+    );
   });
 
   test("the tick's latch check is the belt-and-braces net: a latched failure stops the tick and degrades", async () => {
@@ -351,9 +373,9 @@ describe("post-render rollback + adapter cleanup (§U6 remediation)", () => {
       (real as unknown as { rows: unknown }).rows = 0;
       // LIVE, not a creation-time snapshot: the pin keeps the LAST KNOWN GOOD geometry (the
       // 100x30 ink was already rendering against) while the raw channel reports the collapse
-      expect((proxy.stream as unknown as { columns: number }).columns).toBe(100);
-      expect((proxy.stream as unknown as { rows: number }).rows).toBe(30);
-      const raw = (proxy.stream as unknown as { getRawDims: () => { columns: number | undefined; rows: number | undefined } }).getRawDims();
+      expect(proxy.stream.columns).toBe(100);
+      expect(proxy.stream.rows).toBe(30);
+      const raw = proxy.stream.getRawDims(); // the shared DimsAwareStream contract — no re-declared shape
       expect(raw).toEqual({ columns: undefined, rows: 0 });
       const framesBefore = real.frames.length;
       real.emit("resize"); // the adapter's wake channel (registered through the proxy's delegation)

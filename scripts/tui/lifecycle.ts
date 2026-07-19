@@ -11,6 +11,7 @@ import { setLogSink, setLogTap } from "../log.ts";
 import { setProgressSink, hasProgressSink, emitProgress, reportTuiFailure, reportDivertFailure, tuiFailure, resetTuiFailure } from "../progress.ts";
 import { assertContained } from "../readOnlyGuard.ts";
 import { sanitizeLine } from "./format.ts";
+import { GET_RAW_DIMS, type RawDims, type DimsAwareStream } from "./dims.ts";
 import { createTuiStore, type TuiStore } from "./store.ts";
 import type { ActivationDecision } from "./activation.ts";
 import type { mountTui, TuiHandle } from "./mount.tsx";
@@ -95,7 +96,7 @@ export const realDivertIo: DivertIo = {
 
 // ---- the sealable stderr proxy (§U1 — Ink's whole world) -------------------------------------
 export interface SealableStderr {
-  readonly stream: NodeJS.WriteStream; // hand THIS to Ink; delegates everything else to the real stream
+  readonly stream: DimsAwareStream; // hand THIS to Ink (it IS a WriteStream); ALSO serves getRawDims (§U5), delegates everything else to the real stream
   readonly sealed: boolean;
   readonly sealedDrops: number; // write attempts counted-and-dropped after seal
   readonly absorbedFailures: number; // every failure routed through the absorb channel (write
@@ -205,7 +206,7 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
     return lastGood[axis];
   };
   const rawDim = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
-  const getRawDims = (): { columns: number | undefined; rows: number | undefined } => ({
+  const getRawDims = (): RawDims => ({
     columns: rawDim((real as { columns?: unknown }).columns),
     rows: rawDim((real as { rows?: unknown }).rows),
   });
@@ -214,14 +215,14 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
     get(target, prop) {
       if (prop === "columns") return pinDim((target as { columns?: unknown }).columns, "columns");
       if (prop === "rows") return pinDim((target as { rows?: unknown }).rows, "rows");
-      if (prop === "getRawDims") return getRawDims;
+      if (prop === GET_RAW_DIMS) return getRawDims;
       if (prop in overrides) return overrides[prop];
       // receiver = target on purpose: getters (isTTY etc.) must read the REAL stream's state,
       // and returned methods are bound to it — true fallthrough delegation (§U1).
       const value = Reflect.get(target, prop, target);
       return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
     },
-  }) as unknown as NodeJS.WriteStream;
+  }) as unknown as DimsAwareStream;
 
   return {
     stream,

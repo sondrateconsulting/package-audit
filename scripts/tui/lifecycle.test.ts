@@ -456,7 +456,7 @@ describe("sealable stderr proxy (§U8.13a)", () => {
     // actually on screen when the terminal stops reporting), 80x24 only before any usable read.
     const real = new FakeStream();
     const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
-    const s = proxy.stream as unknown as { columns: number; rows: number; getRawDims: () => { columns: number | undefined; rows: number | undefined } };
+    const s = proxy.stream; // typed DimsAwareStream — columns/rows (pinned) + getRawDims() (raw), no re-declared shape
     expect(s.columns).toBe(100); // real positive integers delegate untouched (live, per test above)
     expect(s.rows).toBe(30);
     for (const v of [undefined, 0, -1, 3.5, Number.NaN, Number.POSITIVE_INFINITY]) {

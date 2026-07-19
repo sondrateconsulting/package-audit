@@ -16,15 +16,15 @@ export type FetchKind = "packument" | "tarball" | "registry-probe";
 export type LimitResource = "core" | "graphql";
 
 export interface RateSnapshot {
-  remaining: number | null;
-  limit: number | null;
-  resetEpochSec: number | null;
-  asOfMs: number;
+  readonly remaining: number | null;
+  readonly limit: number | null;
+  readonly resetEpochSec: number | null;
+  readonly asOfMs: number;
 }
 
 export interface ThrottleSnapshot {
-  horizonMs: number; // PAUSED is DERIVED at render: horizonMs > nowMs() — time, not events, clears it
-  budgetSpentMs: number;
+  readonly horizonMs: number; // PAUSED is DERIVED at render: horizonMs > nowMs() — time, not events, clears it
+  readonly budgetSpentMs: number;
 }
 
 // There is deliberately NO "cleared" event (§U2): with concurrent callers the pause horizon can
@@ -34,11 +34,11 @@ export function isPaused(t: ThrottleSnapshot | null, nowMs: number): boolean {
 }
 
 export interface Problem {
-  atMs: number;
-  kind: "error" | "warning";
-  scope: string;
-  target: string;
-  message: string;
+  readonly atMs: number;
+  readonly kind: "error" | "warning";
+  readonly scope: string;
+  readonly target: string;
+  readonly message: string;
 }
 
 export interface SessionCounters {
@@ -91,6 +91,14 @@ export interface TuiStore {
 const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
 const bool = (v: unknown): boolean | null => (typeof v === "boolean" ? v : null);
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+
+// snapshot() deep-copies these bounded value objects so a returned snapshot is fully independent of
+// live state. The store already REPLACES them by reference (never mutates in place), so this guards
+// the OTHER direction: a consumer mutating a returned snapshot must not reach back into the store.
+// Fields are readonly (compile-time); these clones make it hold at runtime too. Cost is trivial and
+// bounded — 2 rate + 2 throttle + at most PROBLEM_RING_CAP problems, each a flat object.
+const copyRate = (r: RateSnapshot | null): RateSnapshot | null => (r === null ? null : { ...r });
+const copyThrottle = (t: ThrottleSnapshot | null): ThrottleSnapshot | null => (t === null ? null : { ...t });
 
 export function createTuiStore(nowMs: () => number): TuiStore {
   let version = 0;
@@ -340,13 +348,13 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         scanning: [...scanningUnits.entries()].map(([key, u]) => ({ key, ...u })),
         ownerCap,
         branchCap,
-        limits: { ...limits },
-        throttle: { ...throttle },
+        limits: { core: copyRate(limits.core), graphql: copyRate(limits.graphql) },
+        throttle: { core: copyThrottle(throttle.core), graphql: copyThrottle(throttle.graphql) },
         budgetExhausted,
         retryExhaustions,
         counters: { ...counters },
         findings: { ...findings },
-        problems: [...problems],
+        problems: problems.map((p) => ({ ...p })),
       };
     },
   };
