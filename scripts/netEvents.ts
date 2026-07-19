@@ -2,7 +2,9 @@
 // retry/throttle/spawn-timeout through an INJECTED sink so it stays decoupled from the coordinator
 // (no orchestrate import; the single-spawn chokepoint is unaffected). A large flaky-VPN run can
 // produce a flood of retry attempts; emitting every one would drown the log, so this reporter:
-//   - counts EVERY retry attempt (retryTotal) and every suppressed candidate (suppressed);
+//   - counts every retry event it RECEIVES (retryTotal) and every suppressed candidate (suppressed)
+//     — note a github.ts truncated/malformed-body re-drive retries WITHOUT emitting a retry event, so
+//     it reaches neither counter (the README scopes retryTotal to no-response/http-5xx accordingly);
 //   - rate-limits the retry/throttle flood to a global burst-1 / refill-1-per-second budget, so an
 //     operator sees the first event after a quiet window plus a trickle, never a wall of lines;
 //   - marks emitted retry/throttle lines DROPPABLE so the stdout backpressure buffer sheds them

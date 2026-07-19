@@ -947,8 +947,8 @@ export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
 
 // T11 per-category defaults (ms). control-API is deliberately tighter than the bulk/clone/tar
 // budgets: a quick auth/version/rate-limit/listing call has no reason to hang 15 min, but a raw
-// blob/recursive-tree read, a shallow clone, or a tarball extract over a slow-but-live VPN link
-// legitimately can — so those keep the 15-min budget while control drops to 5 min. probe is the
+// blob/recursive-tree read or a shallow clone over a slow-but-live VPN link — or a large local
+// tarball extract — legitimately can — so those keep the 15-min budget while control drops to 5 min. probe is the
 // short reachability deadline RESERVED for the T2 connectivity gate landing in a later PR in this
 // series — it is resolved and validated here but not yet consumed by any spawn call. Each category
 // resolves as `timeouts.<cat> ?? spawnTimeoutMs ?? DEFAULT` (config seconds → ms by the caller).
@@ -1044,7 +1044,7 @@ export class GithubClient {
     const resolveDeadline = (cat: keyof SpawnDeadlines, dflt: number): number => {
       const ms = t[cat] ?? opts.spawnTimeoutMs ?? dflt;
       if (!Number.isFinite(ms) || ms < 1)
-        throw new Error(`timeouts.${cat} must be >= 1 (got ${ms}) — a nonpositive deadline instantly times out every spawn`);
+        throw new Error(`timeouts.${cat} must be >= 1 (got ${ms}) — a nonpositive deadline instantly times out any spawn it governs`);
       return ms;
     };
     this.deadlines = {
@@ -1152,8 +1152,8 @@ export class GithubClient {
   // against the cap but is not pause-aware. The pause-aware, bucketed path is ghBucketedAttempt
   // below (restGet/graphql), which arms any throttle pause INSIDE the lease so the slot is never
   // released into an about-to-open pause window. `deadlineMs` selects the per-category spawn budget
-  // (T11); it defaults to the control-API budget — the only bare-gh callers (preflight, listings)
-  // are all control-plane.
+  // (T11); it defaults to the control-API budget — the only bare-gh callers (preflight's auth +
+  // version probes) are control-plane (listings go through the bucketed restGet/graphql path).
   async gh(args: string[], deadlineMs: number = this.deadlines.controlApiMs): Promise<SpawnResult> {
     assertSpawnAllowed(this.bins.gh, args);
     assertReadOnlyGh(args);

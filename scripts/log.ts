@@ -297,8 +297,10 @@ export function logLine(event: Record<string, unknown>, opts?: { droppable?: boo
   writer.write(JSON.stringify(line) + "\n", opts?.droppable === true, opts?.terminal === true);
 }
 
-// Awaited by every entrypoint's finally so buffered events (above all the terminal `done`/summary
-// lines) reach stdout before the process exits. Resolves immediately on a clear or dead channel.
+// Awaited by every entrypoint before it exits — orchestrate in its outer `finally`; report/export
+// before the summary write and again in their error `catch` — so buffered events (above all the
+// terminal `done`/summary lines) reach stdout before the process exits. Resolves immediately on a
+// clear or dead channel.
 export function flushLogs(): Promise<void> {
   return writer.flush();
 }

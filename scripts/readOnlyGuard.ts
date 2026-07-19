@@ -206,9 +206,11 @@ export function assertGraphqlQueryIsReadOnly(rest: string[]): void {
 // exact raw-argv tuple (below). Other read verbs (cat-file, log) stay excluded entirely — they
 // accept --output/--textconv/--filters, which would breach read-only.
 //
-// The read-only git verbs are ONE source of truth: a tuple the guard validates against and RETURNS,
-// so github.ts's per-verb env + spawn-deadline policy is an exhaustive switch over this exact set —
-// adding a verb here forces a routing decision there (a compile error), never a silent default.
+// The read-only git verbs are ONE source of truth: a tuple the guard validates against and RETURNS.
+// github.ts consumes the returned verb for env selection and an EXHAUSTIVE per-verb spawn-deadline
+// switch over this exact set — adding a verb here forces a deadline-routing decision there (a compile
+// error via the switch's `never` guard), never a silent default (the env branch is a `--version`-vs-
+// generated-config conditional, not itself exhaustive).
 export const GIT_READ_VERBS = ["clone", "rev-parse", "show", "--version"] as const;
 export type GitVerb = (typeof GIT_READ_VERBS)[number];
 const GIT_READ = new Set<string>(GIT_READ_VERBS);

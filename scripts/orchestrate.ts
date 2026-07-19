@@ -62,10 +62,12 @@ export interface AuditRuntime {
 
 // ---- run-scoped progress (§8 observability — T8) --------------------------------------------
 // Emits `phase` transitions and per-unit `unit action:"start"` lines, keeps the liveness heartbeat's
-// phase/target/unitsDone current, and gates the per-unit skip-current/skip-cutoff flood behind
+// phase/unitsDone current (its target is best-effort — one shared slot, so under concurrent branch
+// fibers the latest start/finish wins and it can name a sibling or clear while others still run), and gates the per-unit skip-current/skip-cutoff flood behind
 // --verbose-units (M4: a resume of a large estate otherwise drowns stdout in "nothing changed"
-// lines; the per-repo `repo-done` rollup summarizes them instead). A null heartbeat (tests, --plan)
-// makes the liveness updates no-ops while the events still emit.
+// lines; the per-repo `repo-done` rollup summarizes them instead). A null heartbeat (tests and direct
+// `runScan` callers — `--plan` runs `runPlan` and never constructs `RunProgress`) makes the liveness
+// updates no-ops while the events still emit.
 export class RunProgress {
   private unitsDone = 0;
   constructor(
@@ -271,7 +273,7 @@ export async function runScan(
   // unaffected; production always injects the same reporter the clients emit through.
   reporter: NetworkReporter = createNetworkReporter(),
   // T8: the run-scoped liveness heartbeat, so phase/target/unitsDone stay current as the scan runs.
-  // Optional (null in tests / --plan).
+  // Optional (null in tests / direct `runScan` callers; `--plan` runs `runPlan`, not `runScan`).
   heartbeat: HeartbeatController | null = null,
 ): Promise<void> {
   const { config, configHash } = runtime;
@@ -413,7 +415,7 @@ export async function runScan(
   const emitted = emitReportDetailed(db, completedRun, config.paths.outputDir, { alsoLatest: true });
   const summary = emitted.report.summary;
   const errorCount = emitted.report.errors.length;
-  // T7: fold the run-scoped retry/throttle churn into the terminal event. `done` is a TERMINAL,
+  // T7: fold the run-scoped retry total and suppressed-line count into the terminal event. `done` is a TERMINAL,
   // non-droppable line; the outer finally awaits flushLogs() so it (and its counters) ship whenever
   // the stdout channel is still alive at exit (a channel that died mid-run leaves loggerStats().closed
   // set and one stderr trace — delivery of `done` is best-effort, its capacity slot is guaranteed).
@@ -779,9 +781,12 @@ export async function processRepo(
   if (pruned > 0)
     logLine({ event: "reconciliation", target: "run_unit_head", runId, org: repo.organization, repo: repo.name, action: "prune-stale", pruned });
 
-  // T8: one per-repo rollup replaces the per-unit skip flood by default (M4). Reached only on a
-  // successfully-discovered repo whose branch pool drained without a fatal (a discovery failure
-  // returned null above; a fatal threw at the rejection check) — so it summarizes a completed repo.
+  // T8: one per-repo rollup replaces the per-unit skip flood by default (M4). Reached on a
+  // successfully-discovered repo whose branch pool drained (a discovery failure returned null above;
+  // a fatal ORIGINATING in this repo's units threw at the rejection check). Caveat: a run-level fatal
+  // from a SIBLING owner aborts this pool too, leaving undispatched branches `skipped` (not scanned,
+  // so absent from the tally) — this rollup can then summarize an incompletely-scanned repo, just
+  // before the run itself fails and rethrows.
   logLine({ event: "repo-done", org: repo.organization, repo: repo.name, ...tally });
   return plan.coverage; // a SUCCESSFULLY-discovered repo (even if empty) — folds into the run's warnings
 }

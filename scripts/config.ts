@@ -34,7 +34,7 @@ export interface Concurrency {
   branches: number;
 }
 
-// Per-category spawn + liveness deadlines, in SECONDS (§3 resilience — T11). Operational tuning
+// Per-category spawn deadlines plus the heartbeat cadence, in SECONDS (§3 resilience — T11). Operational tuning
 // only: like `concurrency`, EXCLUDED from config_hash so raising a timeout never orphans
 // resumable work. Every field is optional in the file; omitted fields fall back to DEFAULT_TIMEOUTS.
 export interface Timeouts {
@@ -377,9 +377,11 @@ function normalizeConcurrency(o: Record<string, unknown>): Concurrency {
 
 // timeouts is OPTIONAL and per-field defaulted: an operator may override just one knob (e.g.
 // bulkApiSeconds on a slow VPN) and inherit the rest. An absent `timeouts` block yields all
-// defaults. Each present field must be a positive integer (a nonpositive deadline would instantly
-// expire every spawn — the github client also fail-fast validates this, but reject it here first
-// with a config-shaped error).
+// defaults. Each present field must be a positive integer. The five non-heartbeat fields — four
+// active spawn deadlines plus the reserved `probeSeconds` — are ALSO fail-fast validated by the
+// github client (a nonpositive value would instantly expire any spawn it governs); `heartbeatSeconds`
+// is a cadence, not a spawn deadline, so it is validated only here. Rejecting at this config layer
+// first yields a config-shaped error.
 function normalizeTimeouts(o: Record<string, unknown>): Timeouts {
   const raw = o["timeouts"];
   if (raw === undefined || raw === null) return { ...DEFAULT_TIMEOUTS };
