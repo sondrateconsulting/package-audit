@@ -1,23 +1,29 @@
-// mount.test.ts — the P0 AUTOMATED toolchain gate (§U7): the REAL mountTui under Bun against
-// capture streams — mount, tick, store-driven frame updates, unmount, bounded-exit path. Ink
-// detects CI (is-in-ci) and renders non-interactively there (final frame at unmount only,
-// measured at P0), so this gate asserts CONTENT and LIFECYCLE, never interactive repaint —
-// intermediate-frame progression is asserted only outside CI. The interactive checks (repaint,
-// resize, SIGINT/cursor) are the MANUAL P0 gate, recorded in the PR body.
-import { expect, test, describe, spyOn } from "bun:test";
+// mount.test.ts — the P0 AUTOMATED toolchain gate (§U7), now against the REAL App: the real
+// mountTui under Bun against capture streams — mount, guarded tick, store-driven frame updates,
+// unmount, bounded-exit path. Ink detects CI (is-in-ci) and renders non-interactively there
+// (final frame at unmount only, measured at P0), so this gate asserts CONTENT and LIFECYCLE,
+// never interactive repaint — intermediate-frame progression is asserted only outside CI. The
+// interactive checks (repaint, resize, SIGINT/cursor) are the MANUAL P0 gate in the PR body.
+import { expect, test, describe, spyOn, afterEach } from "bun:test";
 import { EventEmitter } from "node:events";
-import { mountTui, DEFAULT_TICK_MS, type MountableStore, type TuiHandle } from "./mount.tsx";
+import { mountTui, DEFAULT_TICK_MS, type TuiHandle } from "./mount.tsx";
+import { createTuiStore, type TuiStore } from "./store.ts";
+import { resetTuiFailure, reportTuiFailure } from "../progress.ts";
 
 // Ink treats a CI environment as non-interactive regardless of isTTY (is-in-ci reads these).
 const IN_CI = Boolean(process.env["CI"] ?? process.env["GITHUB_ACTIONS"]);
+
+afterEach(() => {
+  resetTuiFailure();
+});
 
 // A fake interactive terminal: enough surface for Ink (write/isTTY/columns/rows/on/off — the
 // exact member set Ink reads, measured at P0), capturing every byte ever written.
 class CaptureStream extends EventEmitter {
   frames: string[] = [];
   isTTY = true;
-  columns = 80;
-  rows = 24;
+  columns = 100;
+  rows = 30;
   write = (chunk: unknown, cb?: (err?: Error | null) => void): boolean => {
     this.frames.push(String(chunk));
     if (typeof cb === "function") cb(); // Ink flush-syncs via write("", cb) — always acknowledge
@@ -31,8 +37,8 @@ class CaptureStream extends EventEmitter {
 // Manual scheduler: the test drives ticks deterministically; the returned token is inert.
 interface FakeScheduler {
   scheduler: { setInterval: typeof setInterval; clearInterval: typeof clearInterval };
-  fire(): void; // invoke the registered tick callback once
-  activeCount(): number; // intervals registered minus cleared
+  fire(): void;
+  activeCount(): number;
 }
 function makeFakeScheduler(): FakeScheduler {
   let tickFn: (() => void) | null = null;
@@ -53,19 +59,6 @@ function makeFakeScheduler(): FakeScheduler {
   };
 }
 
-function makeStore(): MountableStore & { bump(): void } {
-  let version = 0;
-  return {
-    get version() {
-      return version;
-    },
-    snapshot: () => ({}),
-    bump() {
-      version++;
-    },
-  };
-}
-
 // Bounded poll: Ink renders asynchronously (reconciler + frame throttle), so content lands a few
 // macrotasks after the state change — poll rather than sleep a magic constant.
 async function waitFor(predicate: () => boolean, ms = 3000): Promise<boolean> {
@@ -77,9 +70,18 @@ async function waitFor(predicate: () => boolean, ms = 3000): Promise<boolean> {
   return predicate();
 }
 
-async function mounted(fn: (ctx: { out: CaptureStream; store: ReturnType<typeof makeStore>; sched: FakeScheduler; handle: TuiHandle; degrades: number[] }) => Promise<void>): Promise<void> {
+interface Ctx {
+  out: CaptureStream;
+  store: TuiStore;
+  sched: FakeScheduler;
+  handle: TuiHandle;
+  degrades: number[];
+  advance: (ms: number) => void;
+}
+async function mounted(fn: (ctx: Ctx) => Promise<void>): Promise<void> {
   const out = new CaptureStream();
-  const store = makeStore();
+  let now = 10_000;
+  const store = createTuiStore(() => now);
   const sched = makeFakeScheduler();
   const degrades: number[] = [];
   const handle = mountTui(store, {
@@ -87,9 +89,10 @@ async function mounted(fn: (ctx: { out: CaptureStream; store: ReturnType<typeof 
     onDegrade: () => degrades.push(1),
     scheduler: sched.scheduler,
     tickMs: DEFAULT_TICK_MS,
+    nowMs: () => now,
   });
   try {
-    await fn({ out, store, sched, handle, degrades });
+    await fn({ out, store, sched, handle, degrades, advance: (ms) => (now += ms) });
   } finally {
     handle.dispose();
     handle.requestUnmount();
@@ -98,14 +101,15 @@ async function mounted(fn: (ctx: { out: CaptureStream; store: ReturnType<typeof 
 }
 
 describe("P0 automated gate — real mountTui under Bun against capture streams", () => {
-  test("mounts, renders content, unmounts, and waitUntilExit resolves (bounded-exit lifecycle)", async () => {
+  test("mounts, renders the dashboard frame, unmounts, and waitUntilExit resolves (bounded-exit lifecycle)", async () => {
     const out = new CaptureStream();
-    const store = makeStore();
+    const store = createTuiStore(() => 10_000);
     const sched = makeFakeScheduler();
     const handle = mountTui(store, {
       out: out as unknown as NodeJS.WriteStream,
       onDegrade: () => {},
       scheduler: sched.scheduler,
+      nowMs: () => 10_000,
     });
     // CI renders only the final frame at unmount (P0 measurement) — so unmount FIRST, then
     // assert content: valid in both modes, and the exit path is the lifecycle under test.
@@ -115,19 +119,18 @@ describe("P0 automated gate — real mountTui under Bun against capture streams"
     await Promise.race([handle.waitUntilExit().then(() => (exited = true)), new Promise((r) => setTimeout(r, 2000))]);
     expect(exited).toBe(true); // waitUntilExit settles after a manual unmount — the §U6 step-2 wait relies on this
     expect(out.all()).toContain("package-audit"); // content reached the capture stream in EVERY mode
+    expect(out.all()).toContain("Ctrl+C aborts (resumable)"); // the footer rendered
     handle.dispose(); // dispose after exit is a safe no-op (idempotence)
     handle.dispose();
     expect(sched.activeCount()).toBe(0);
   });
 
-  test("store-driven frame updates: version bump + tick reaches the rendered frame", async () => {
+  test("store-driven frame updates: a dispatched event + tick reaches the rendered frame", async () => {
     await mounted(async ({ out, store, sched }) => {
-      store.bump();
-      store.bump();
+      store.dispatch({ type: "phase", phase: "reconcile" });
       sched.fire();
       if (!IN_CI) {
-        // interactive mode writes each frame live; CI defers to the final frame (asserted below)
-        expect(await waitFor(() => out.all().includes("frame v2"))).toBe(true);
+        expect(await waitFor(() => out.all().includes("phase: reconcile"))).toBe(true);
       } else {
         await new Promise((r) => setTimeout(r, 50)); // let React commit before the final frame
       }
@@ -135,15 +138,35 @@ describe("P0 automated gate — real mountTui under Bun against capture streams"
     // the finally unmounted; in both modes the LAST content must have reached the stream
   });
 
-  test("a tick with an unchanged version does not wake React (render-skip signal)", async () => {
+  test("a tick with an unchanged version and unchanged second does not wake React (render-skip)", async () => {
     await mounted(async ({ out, sched }) => {
       if (IN_CI) return; // frame-count observation needs interactive per-frame writes
-      await waitFor(() => out.all().includes("frame v0"));
+      await waitFor(() => out.all().includes("package-audit"));
       const framesBefore = out.frames.length;
       sched.fire();
       sched.fire();
       await new Promise((r) => setTimeout(r, 100));
-      expect(out.frames.length).toBe(framesBefore); // no version change → no new frame bytes
+      expect(out.frames.length).toBe(framesBefore); // no version/second change → no new frame bytes
+    });
+  });
+
+  test("a 1s-granularity clock change wakes React even with an unchanged store version", async () => {
+    await mounted(async ({ out, sched, advance }) => {
+      if (IN_CI) return;
+      await waitFor(() => out.all().includes("elapsed 00:00"));
+      advance(2_000); // the visible elapsed digit changes
+      sched.fire();
+      expect(await waitFor(() => out.all().includes("elapsed 00:02"))).toBe(true);
+    });
+  });
+
+  test("the tick's latch check is the belt-and-braces net: a latched failure stops the tick and degrades", async () => {
+    await mounted(async ({ sched, degrades }) => {
+      expect(sched.activeCount()).toBe(1);
+      reportTuiFailure("latched by some site that could not call degradeNow");
+      sched.fire();
+      expect(sched.activeCount()).toBe(0); // interval stopped
+      expect(degrades.length).toBe(1); // onDegrade called directly
     });
   });
 
@@ -166,7 +189,7 @@ describe("P0 automated gate — real mountTui under Bun against capture streams"
     }) as typeof process.stdout.write);
     try {
       await mounted(async ({ out, store, sched }) => {
-        store.bump();
+        store.dispatch({ type: "phase", phase: "scan" });
         sched.fire();
         await waitFor(() => out.frames.length > 0, 500);
       });

@@ -1,15 +1,17 @@
 // mount.tsx — the ONE Ink/React mount adapter (§U5 of PROMPT-TUI.md). Everything JSX/React/Ink
 // lives behind this module, which lifecycle.ts loads EXCLUSIVELY via dynamic import: a broken
 // display dependency must never break the audit, and non-TUI runs (help/--plan/CI/piped) never
-// pay the load cost. P0 ships the minimal adapter — mount, guarded tick, error boundary,
-// exit-rejection wiring, dispose — with a placeholder frame; the real panels land in P4.
+// pay the load cost.
 //
 // Display-only (§U0): no useInput anywhere (Ink never enables raw mode), exitOnCtrlC: false
 // (SIGINT keeps its default kill-and-resume semantics; Ink's own signal-exit cursor cleanup is
 // accepted), and nothing here writes to process.stdout or the filesystem — the render target is
 // exactly `opts.out` (the lifecycle's sealable stderr proxy).
-import { Component, useEffect, useReducer, type ReactNode } from "react";
-import { render, Box, Text } from "ink";
+import { Component, type ReactNode } from "react";
+import { render } from "ink";
+import { reportTuiFailure, tuiFailure } from "../progress.ts";
+import type { TuiStore } from "./store.ts";
+import { App } from "./App.tsx";
 
 export const DEFAULT_TICK_MS = 125;
 
@@ -19,8 +21,7 @@ export interface TuiHandle {
   dispose(): void; // stops the tick + detaches the App-side frame hook; idempotent
 }
 
-// The store surface the adapter needs (structural; the concrete TuiStore lands in P2). `version`
-// is the render-skip signal — the tick only wakes React when it moved.
+// The store surface the adapter itself needs (the App consumes the full TuiStore).
 export interface MountableStore {
   readonly version: number;
   snapshot(): unknown;
@@ -29,14 +30,14 @@ export interface MountableStore {
 export interface MountTuiOptions {
   out: NodeJS.WriteStream; // the lifecycle's SEALABLE stderr proxy — Ink's render target
   onDegrade: () => void; // = lifecycle degradeNow; called DIRECTLY on any App failure (§U5)
-  nowMs?: () => number; // P4: elapsed/countdown derivation at render; events stay timeless
+  nowMs?: () => number; // elapsed/countdown derivation at render; events stay timeless
   scheduler?: { setInterval: typeof setInterval; clearInterval: typeof clearInterval };
   tickMs?: number; // default DEFAULT_TICK_MS; tests inject to drive frames deterministically
 }
 
 // Belt-and-braces for RENDER throws (§U5): timer callbacks never reach a boundary — the guarded
 // tick below is the real protection there. The fallback renders nothing; the crash handler
-// degrades directly (a dead React tree cannot be relied on to poll a latch).
+// latches AND degrades directly (a dead React tree cannot be relied on to poll the latch).
 class Boundary extends Component<{ onCrash: (cause: string) => void; children: ReactNode }, { crashed: boolean }> {
   override state = { crashed: false };
   static getDerivedStateFromError(): { crashed: boolean } {
@@ -50,23 +51,10 @@ class Boundary extends Component<{ onCrash: (cause: string) => void; children: R
   }
 }
 
-// P0 placeholder frame: proves store-driven updates end-to-end (the tick bumps the reducer, the
-// re-render reads the live store). P4 replaces the body with the real panels.
-function App({ store, subscribe }: { store: MountableStore; subscribe: (fn: () => void) => () => void }) {
-  const [, bump] = useReducer((n: number) => n + 1, 0);
-  useEffect(() => subscribe(() => bump()), [subscribe]);
-  void store.snapshot(); // placeholder: the P0 frame renders no snapshot fields yet
-  return (
-    <Box flexDirection="column">
-      <Text>package-audit ▸ dashboard</Text>
-      <Text dimColor>frame v{store.version}</Text>
-    </Box>
-  );
-}
-
-export function mountTui(store: MountableStore, opts: MountTuiOptions): TuiHandle {
+export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
   const scheduler = opts.scheduler ?? { setInterval, clearInterval };
   const tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
+  const nowMs = opts.nowMs ?? Date.now;
 
   // One-listener frame bus: the tick (outside React) wakes the App (inside React) without the
   // scheduler ever living in a component — dispose() can then stop everything non-reentrantly.
@@ -79,13 +67,13 @@ export function mountTui(store: MountableStore, opts: MountTuiOptions): TuiHandl
   };
 
   const onCrash = (cause: string): void => {
-    void cause; // P1 wires reportTuiFailure(cause) here; the degrade channel is DIRECT (§U5)
-    opts.onDegrade();
+    reportTuiFailure(cause);
+    opts.onDegrade(); // the degrade channel is DIRECT, never tick-dependent (§U5)
   };
 
   const instance = render(
     <Boundary onCrash={onCrash}>
-      <App store={store} subscribe={subscribe} />
+      <App store={store} subscribe={subscribe} nowMs={nowMs} mountedAtMs={nowMs()} />
     </Boundary>,
     {
       stdout: opts.out, // load-bearing: Ink's "stdout" IS our (sealable) stderr proxy
@@ -101,18 +89,29 @@ export function mountTui(store: MountableStore, opts: MountTuiOptions): TuiHandl
   let disposed = false;
   let timer: ReturnType<typeof setInterval> | null = null;
   let lastVersion = -1;
+  let lastSecond = -1;
   const stopTick = (): void => {
     if (timer !== null) {
       scheduler.clearInterval(timer);
       timer = null;
     }
   };
-  // Guarded tick (§U5): its own throw stops the interval and degrades directly — a React error
-  // boundary cannot catch timer callbacks, so this try/catch is the real protection here.
+  // Guarded tick (§U5): a React error boundary cannot catch timer callbacks — this try/catch is
+  // the real protection here. The latch check is belt-and-braces, NOT the degrade channel (every
+  // failing site calls degradeNow directly); it is the second net for anything that only latched.
+  // Wake React when the store moved OR a visible 1s-granularity digit (elapsed/countdown) would
+  // change; otherwise skip the setState entirely.
   const tick = (): void => {
     try {
-      if (store.version !== lastVersion) {
+      if (tuiFailure() !== null) {
+        stopTick();
+        opts.onDegrade();
+        return;
+      }
+      const second = Math.floor(nowMs() / 1000);
+      if (store.version !== lastVersion || second !== lastSecond) {
         lastVersion = store.version;
+        lastSecond = second;
         frameListener?.();
       }
     } catch (err) {
