@@ -86,38 +86,49 @@ export function LimitsPanel({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number 
   );
 }
 
-// The throttle banner: PAUSED is DERIVED (horizon vs now — §U4); the budget-exhausted notice is
-// sticky, never conflated with per-call retry exhaustion (surfaced as a count).
-export function ThrottleBanner({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number }) {
-  const lines: ReactNode[] = [];
+// The throttle banner's active reasons, in render order (§U5): PAUSED is DERIVED (horizon vs now —
+// §U4); the budget-exhausted notice is sticky, never conflated with per-call retry exhaustion. This
+// is the ONE source of truth — both ThrottleBanner (below) AND the layout planner's reserved row
+// count (bannerLineCount) derive from it, so the rendered banner and the reserved §U5 row budget
+// can never drift: a new banner dimension added here updates the render and the count together.
+type BannerReason =
+  | { kind: "paused"; resource: "core" | "graphql"; horizonMs: number }
+  | { kind: "budget-exhausted" };
+
+export function activeBannerReasons(snap: TuiSnapshot, nowMs: number): BannerReason[] {
+  const reasons: BannerReason[] = [];
   for (const resource of ["core", "graphql"] as const) {
     const t = snap.throttle[resource];
-    if (t !== null && isPaused(t, nowMs)) {
-      lines.push(
-        <Row key={resource}>
-          <Text color="yellow">{`⏸ ${resource} PAUSED — resumes in ${formatCountdown(t.horizonMs, nowMs)}`}</Text>
-        </Row>,
-      );
-    }
+    if (t !== null && isPaused(t, nowMs)) reasons.push({ kind: "paused", resource, horizonMs: t.horizonMs });
   }
-  if (snap.budgetExhausted) {
-    lines.push(
-      <Row key="budget">
-        <Text color="red">✖ pause budget exhausted — remaining throttled work defers to the next run</Text>
-      </Row>,
-    );
-  }
-  if (lines.length === 0) return null;
-  return <Box flexDirection="column">{lines}</Box>;
+  if (snap.budgetExhausted) reasons.push({ kind: "budget-exhausted" });
+  return reasons;
 }
 
-// How many banner lines the layout planner must reserve — mirrors ThrottleBanner exactly.
+export function ThrottleBanner({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number }) {
+  const reasons = activeBannerReasons(snap, nowMs);
+  if (reasons.length === 0) return null;
+  return (
+    <Box flexDirection="column">
+      {reasons.map((r) =>
+        r.kind === "paused" ? (
+          <Row key={r.resource}>
+            <Text color="yellow">{`⏸ ${r.resource} PAUSED — resumes in ${formatCountdown(r.horizonMs, nowMs)}`}</Text>
+          </Row>
+        ) : (
+          <Row key="budget">
+            <Text color="red">✖ pause budget exhausted — remaining throttled work defers to the next run</Text>
+          </Row>
+        ),
+      )}
+    </Box>
+  );
+}
+
+// How many banner rows the layout planner must reserve — the SAME list ThrottleBanner renders, so
+// the reserved §U5 row budget and the rendered banner can never disagree.
 export function bannerLineCount(snap: TuiSnapshot, nowMs: number): number {
-  let n = 0;
-  if (isPaused(snap.throttle.core, nowMs)) n++;
-  if (isPaused(snap.throttle.graphql, nowMs)) n++;
-  if (snap.budgetExhausted) n++;
-  return n;
+  return activeBannerReasons(snap, nowMs).length;
 }
 
 export function WorkPanel({ snap, nowMs, workRows, showFindings }: { snap: TuiSnapshot; nowMs: number; workRows: number; showFindings: boolean }) {

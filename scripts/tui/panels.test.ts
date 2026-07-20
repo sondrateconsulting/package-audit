@@ -9,8 +9,8 @@ import { EventEmitter } from "node:events";
 import { createElement, isValidElement } from "react";
 import { Text } from "ink";
 import { mountTui } from "./mount.tsx";
-import { CompactFrame, LimitSegment, LimitsPanel, Row } from "./panels.tsx";
-import { createTuiStore, type TuiStore } from "./store.ts";
+import { CompactFrame, LimitSegment, LimitsPanel, Row, bannerLineCount, ThrottleBanner, activeBannerReasons } from "./panels.tsx";
+import { createTuiStore, type TuiStore, type TuiSnapshot } from "./store.ts";
 import { sanitizeLine } from "./format.ts";
 import { PAUSE_BUDGET_CAP_MINUTES } from "./panels.tsx";
 import { MAX_TOTAL_PAUSE_MS } from "../github.ts";
@@ -417,5 +417,65 @@ describe("panel frames over canned store states (§U8.11)", () => {
       expect(text).not.toContain("package-audit");
       expect(text).not.toContain("terminal too small");
     }
+  });
+});
+
+// §U5 row budget: bannerLineCount feeds a FIXED, non-shrinkable contributor to planLayout. If it
+// ever disagrees with what ThrottleBanner renders, an undercount smears scrollback (the exact bug
+// the degradation ladder exists to prevent). The count and the render must derive from ONE source.
+describe("throttle banner: count and render stay in lockstep (§U5)", () => {
+  const NOW = 10_000;
+  const LIVE = 15_000; // horizon > now → paused
+  const EXPIRED = 5_000; // horizon < now → not paused
+  const EXACT = NOW; // horizon === now → not paused (isPaused is strictly >)
+
+  // Build a real snapshot via the store fold: arm a bucket to a horizon, and/or latch the sticky
+  // budget flag. untilMs=null on the exhausted emit leaves any existing horizon untouched, so
+  // "budget only" produces no phantom pause.
+  function snapWith(opts: { coreUntil?: number | null; gqlUntil?: number | null; budget?: boolean }): TuiSnapshot {
+    const store = createTuiStore(() => 1_000);
+    if (opts.coreUntil != null) store.dispatch({ type: "throttle", bucket: "core", state: "armed", untilMs: opts.coreUntil, budgetSpentMs: 0 });
+    if (opts.gqlUntil != null) store.dispatch({ type: "throttle", bucket: "graphql", state: "armed", untilMs: opts.gqlUntil, budgetSpentMs: 0 });
+    if (opts.budget) store.dispatch({ type: "throttle", bucket: "core", state: "exhausted", reason: "budget", untilMs: null, budgetSpentMs: 1 });
+    return store.snapshot();
+  }
+
+  // The number of <Row> elements ThrottleBanner actually emits (null frame → 0).
+  function renderedRows(snap: TuiSnapshot, nowMs: number): number {
+    const el = ThrottleBanner({ snap, nowMs });
+    if (el === null) return 0;
+    const kids = (el.props as { children: unknown }).children;
+    return Array.isArray(kids) ? kids.length : 1;
+  }
+
+  test("count, reasons list, and rendered rows agree across all 8 banner states", () => {
+    for (const core of [null, LIVE] as const)
+      for (const gql of [null, LIVE] as const)
+        for (const budget of [false, true] as const) {
+          const snap = snapWith({ coreUntil: core, gqlUntil: gql, budget });
+          const expected = (core ? 1 : 0) + (gql ? 1 : 0) + (budget ? 1 : 0);
+          const label = `core=${core != null} gql=${gql != null} budget=${budget}`;
+          expect(activeBannerReasons(snap, NOW).length, label).toBe(expected);
+          expect(bannerLineCount(snap, NOW), label).toBe(expected);
+          expect(renderedRows(snap, NOW), label).toBe(expected);
+        }
+  });
+
+  test("expired and exact-boundary horizons are not paused (0 banner rows)", () => {
+    for (const until of [EXPIRED, EXACT] as const) {
+      const snap = snapWith({ coreUntil: until, gqlUntil: until });
+      expect(activeBannerReasons(snap, NOW).length).toBe(0);
+      expect(bannerLineCount(snap, NOW)).toBe(0);
+      expect(renderedRows(snap, NOW)).toBe(0);
+    }
+  });
+
+  test("reason order is stable: core, then graphql, then budget-exhausted", () => {
+    const snap = snapWith({ coreUntil: LIVE, gqlUntil: LIVE, budget: true });
+    expect(activeBannerReasons(snap, NOW).map((r) => (r.kind === "paused" ? r.resource : r.kind))).toEqual([
+      "core",
+      "graphql",
+      "budget-exhausted",
+    ]);
   });
 });
