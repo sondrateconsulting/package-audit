@@ -2,7 +2,7 @@
 // from horizon vs injected now; sticky budget-exhausted vs retryExhaustions; seed-vs-live
 // precedence; unknown tapped events ignored; version bumps. Deterministic injected clock.
 import { expect, test, describe } from "bun:test";
-import { createTuiStore, isPaused, PROBLEM_RING_CAP, type TuiStore } from "./store.ts";
+import { createTuiStore, isPaused, PROBLEM_RING_CAP, type TuiStore, type TuiSnapshot } from "./store.ts";
 import type { ProgressEvent } from "../progress.ts";
 
 function makeClock(startMs = 1_000): { store: TuiStore; tick: (ms: number) => void; now: () => number } {
@@ -305,5 +305,20 @@ describe("totality + version (§U4)", () => {
     expect(after.limits.core!.remaining).toBe(4000);
     expect(after.throttle.core!.horizonMs).toBe(9_000);
     expect(after.problems[0]!.message).toBe("m");
+  });
+});
+
+describe("TuiSnapshot.phase is the closed Phase union, not a bare string (§U4)", () => {
+  test("an arbitrary string is NOT assignable to the phase slot (compile-time guard for the narrowing)", () => {
+    // Real pipeline phases and null are assignable.
+    const scan: TuiSnapshot["phase"] = "scan";
+    const nul: TuiSnapshot["phase"] = null;
+    expect([scan, nul]).toEqual(["scan", null]);
+    // "scanning" is a DISPLAY fallback string (App.tsx's `snap.phase ?? "scanning"`), NOT a pipeline
+    // phase — assigning it to the phase slot must be a TYPE error. This would silently pass if phase
+    // were widened back to a bare `string`, so it is the regression guard for the Phase narrowing.
+    // @ts-expect-error "scanning" is not a member of the closed Phase union
+    const bad: TuiSnapshot["phase"] = "scanning";
+    void bad;
   });
 });
