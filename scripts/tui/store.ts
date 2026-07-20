@@ -14,6 +14,9 @@ export const PROBLEM_RING_CAP = 50;
 export type SpawnTool = "gh" | "git" | "tar";
 export type FetchKind = "packument" | "tarball" | "registry-probe";
 export type LimitResource = "core" | "graphql";
+// The closed set of pipeline phases (mirrors ProgressEvent's "phase" member) — narrower than a bare
+// string, so a future phase-keyed lookup gets exhaustiveness instead of a silent fall-through.
+export type Phase = Extract<ProgressEvent, { type: "phase" }>["phase"];
 
 export interface RateSnapshot {
   readonly remaining: number | null;
@@ -52,7 +55,7 @@ export interface SessionCounters {
 }
 
 export interface TuiSnapshot {
-  readonly phase: string | null;
+  readonly phase: Phase | null;
   readonly runId: string | null; // header shows run <id8> (resumed)/(fresh) — NOTHING from counts
   readonly resumed: boolean | null;
   readonly logPath: string | null; // the ACTUAL divert path, once known
@@ -66,7 +69,7 @@ export interface TuiSnapshot {
   readonly unitWorkers: ReadonlyArray<{ key: string; sinceMs: number }>; // dispatch→settle occupancy
   readonly scanning: ReadonlyArray<{ key: string; sinceMs: number }>; // start→settle real scans
   readonly ownerCap: number | null;
-  readonly branchCap: number | null; // PER-REPO — render "≤B per repo", never a global fraction
+  readonly branchCap: number | null; // PER-REPO — render "≤B/repo", never a global fraction
   readonly limits: Readonly<Record<LimitResource, RateSnapshot | null>>;
   readonly throttle: Readonly<Record<LimitResource, ThrottleSnapshot | null>>;
   readonly budgetExhausted: boolean; // sticky — it cannot un-happen within a run
@@ -108,7 +111,7 @@ const unitKey = (owner: string, repo: string, branch: string): string => `${owne
 
 export function createTuiStore(nowMs: () => number): TuiStore {
   let version = 0;
-  let phase: string | null = null;
+  let phase: Phase | null = null;
   let runId: string | null = null;
   let resumed: boolean | null = null;
   let logPath: string | null = null;
