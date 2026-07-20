@@ -1393,19 +1393,21 @@ export class GithubClient {
   }
 
   // Throttle-state display events (PROMPT-TUI §U3.4): synchronous, no-throw, fully gated — a run
-  // with no sink pays one boolean. The event carries the PUBLISHED horizon and the CURRENT
-  // (post-funding, for the armed emit) budget.
-  // Discriminated rest-tuple so a `reason` is REQUIRED for "exhausted" and REJECTED for
-  // "armed"/"waiting" at the call site (mirrors the split ProgressEvent union) — no cast, no
-  // silently-droppable optional. `rest[0] === "exhausted"` narrows `rest[1]` to the reason.
-  private emitThrottle(bucket: Bucket, ...rest: ["armed" | "waiting"] | ["exhausted", "budget" | "retries"]): void {
-    if (!hasProgressSink()) return;
+  // with no sink pays ONE boolean and constructs NOTHING (§U0). Overloads (NOT a rest parameter,
+  // which allocates a rest array at every call BEFORE the sink gate runs) keep the call-site
+  // contract exact: `reason` is REQUIRED for "exhausted" and REJECTED for "armed"/"waiting". The
+  // event carries the PUBLISHED horizon and the CURRENT (post-funding, for the armed emit) budget.
+  private emitThrottle(bucket: Bucket, state: "armed" | "waiting"): void;
+  private emitThrottle(bucket: Bucket, state: "exhausted", reason: "budget" | "retries"): void;
+  private emitThrottle(bucket: Bucket, state: "armed" | "waiting" | "exhausted", reason?: "budget" | "retries"): void {
+    if (!hasProgressSink()) return; // gate FIRST — no derivation or event object on a no-sink run
     const untilMs = bucket.pausedUntilMs > 0 ? bucket.pausedUntilMs : null;
     const budgetSpentMs = bucket.budgetSpentMs;
     emitProgress(
-      rest[0] === "exhausted"
-        ? { type: "throttle", bucket: bucket.label, state: rest[0], reason: rest[1], untilMs, budgetSpentMs }
-        : { type: "throttle", bucket: bucket.label, state: rest[0], untilMs, budgetSpentMs },
+      state === "exhausted"
+        // reason is guaranteed present by the "exhausted" overload; the impl signature can't see it.
+        ? { type: "throttle", bucket: bucket.label, state, reason: reason as "budget" | "retries", untilMs, budgetSpentMs }
+        : { type: "throttle", bucket: bucket.label, state, untilMs, budgetSpentMs },
     );
   }
 
