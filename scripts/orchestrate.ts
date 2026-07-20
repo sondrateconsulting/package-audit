@@ -1,5 +1,6 @@
 // orchestrate.ts — the scan coordinator (§5, §8). Entry point:
 //   bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
+//                                  [--ui | --no-ui] \
 //                                  [--rescan-branch <org>/<repo>@<branch>]... [--help]
 // Flow (§8): restate config → preflight (§2) → resolve effective owners (§1) → start/resume run
 // (§3) → discover repos+branches and process each branch unit (§5.A-H) → reconcile introspection
@@ -46,6 +47,46 @@ import { emitReportDetailed, type ReportSummary } from "./report.ts";
 import type { CliTermSet } from "./cliScanner.ts";
 import { boundedPool, Aborter, type AbortLike } from "./boundedPool.ts";
 import { logLine } from "./log.ts";
+import { emitProgress, hasProgressSink } from "./progress.ts";
+import { decideTuiActivation, TuiActivationError, isInkCiEnv, type ActivationInput } from "./tui/activation.ts";
+import { runWithTui, makeDivertPathFor, utcLogStamp } from "./tui/lifecycle.ts";
+
+// Display-phase marker (PROMPT-TUI §U3.6): synchronous, no-throw, allocation gated on the sink.
+function markPhase(phase: "preflight" | "resolve-owners" | "cli-terms" | "scan" | "reconcile" | "report"): void {
+  if (hasProgressSink()) emitProgress({ type: "phase", phase });
+}
+
+// The preflight client's construction options (PROMPT-TUI §U1): the CONFIGURED subprocess width,
+// so the dashboard's subprocess-cap gauge is honest for the whole run. Preflight's calls are
+// sequential one-shot awaits — the wider semaphore is never contended, zero behavioral change.
+// Exported as the testable seam pinning that width (main() constructs from exactly this).
+export function preflightClientOptions(config: Config): { githubHost: string; concurrency: number } {
+  return { githubHost: config.githubHost, concurrency: config.concurrency.repositories };
+}
+
+// The TUI-activation glue as a pure, testable seam (mirrors preflightClientOptions): main() reads
+// the live process streams + env through exactly this function, so pinning its field mapping pins
+// the routing decision's inputs. A transposed columns/rows, a stdoutIsTTY read off the wrong
+// stream, or a naive CI check (losing isInkCiEnv's "0"/"false"/CONTINUOUS_INTEGRATION semantics)
+// would silently mis-route the dashboard or the JSONL divert — none of which the compiler or the
+// pure decideTuiActivation table would catch. Activation is flags + runtime environment only; NO
+// config keys are consulted (config_hash is untouchable).
+export function activationInputFrom(
+  args: { plan: boolean; ui: boolean | null },
+  streams: { stderr: { isTTY?: boolean; columns?: number; rows?: number }; stdout: { isTTY?: boolean } },
+  env: Record<string, string | undefined>,
+): ActivationInput {
+  return {
+    plan: args.plan,
+    uiFlag: args.ui,
+    stderrIsTTY: streams.stderr.isTTY === true,
+    stdoutIsTTY: streams.stdout.isTTY === true, // decides the divert — sourced from stdout, never stderr
+    columns: streams.stderr.columns,
+    rows: streams.stderr.rows,
+    term: env["TERM"],
+    ci: isInkCiEnv(env), // ink's own CI definition — the gate and the renderer must agree
+  };
+}
 
 // The values that TOGETHER define one coherent scan/plan: the config, its hash, and the compiled
 // branch + repository policies. Threaded as ONE object through runScan/processOwner/processRepo/runPlan
@@ -128,38 +169,73 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
   const runtime: AuditRuntime = { config, configHash, branchPolicy, repositoryPolicy };
   const trackedNames = config.packages.map((p) => p.name);
 
-  logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
-  // §5 configured fan-out widths. Emitted for both audit and --plan; in --plan runPlan traverses
-  // owners/repos SEQUENTIALLY, so organizations/branches are reported but not fanned out there (only
-  // repositories, the gh/git/tar subprocess cap, applies in plan mode). `repositories` is the GLOBAL
-  // in-flight subprocess cap, NOT a repo-loop degree — so at most `repositories` gh/git/tar run at
-  // once no matter how organizations×branches compose. Set-vocabulary event (documented in README).
-  logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
+  // TUI activation (PROMPT-TUI §U1): a PURE decision over flags + the real streams/env. NO config
+  // keys are consulted (config_hash is untouchable). An ineligible environment is an operator
+  // error only under an explicit --ui demand; auto mode just runs without the dashboard.
+  const decision = decideTuiActivation(activationInputFrom(args, { stderr: process.stderr, stdout: process.stdout }, process.env));
+  if (decision.mode === "error") throw new TuiActivationError(decision.message);
 
-  // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
-  // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot calls).
-  const preflightClient = new GithubClient({ githubHost: config.githubHost });
-  const preflight = await runPreflight(preflightClient, config);
-  logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
+  // Everything from the `config` logLine through runScan runs inside the TUI lifecycle wrapper
+  // (a passthrough when the decision is off — plan/CI/piped-STDERR runs are byte-identical to
+  // before; "piped" means a non-TTY stderr — a piped stdout with an interactive stderr still
+  // mounts, and the JSONL stays on that piped stdout: the divert exists ONLY for a
+  // same-terminal stdout TTY, per the §U1 matrix).
+  // The summary is rendered AFTER teardown so it lands below the terminated frame (§U1).
+  const outcome = await runWithTui(
+    {
+      decision,
+      streams: { stderr: process.stderr },
+      logPathFor: makeDivertPathFor(config.paths.outputDir, utcLogStamp(new Date()), process.pid),
+    },
+    async (): Promise<ScanOutcome | null> => {
+      logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
+      // §5 configured fan-out widths. Emitted for both audit and --plan; in --plan runPlan traverses
+      // owners/repos SEQUENTIALLY, so organizations/branches are reported but not fanned out there (only
+      // repositories, the gh/git/tar subprocess cap, applies in plan mode). `repositories` is the GLOBAL
+      // in-flight subprocess cap, NOT a repo-loop degree — so at most `repositories` gh/git/tar run at
+      // once no matter how organizations×branches compose. Set-vocabulary event (documented in README).
+      logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
 
-  // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
-  // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
-  if (args.plan) {
-    const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories });
-    await runPlan(planClient, runtime, preflight.githubLogin);
-    return;
-  }
+      // §2/§8: preflight runs BEFORE any work — especially before opening/migrating the DB or a
+      // destructive --fresh drop. Preflight uses a cache-less client (a handful of one-shot
+      // calls) at the configured width (see preflightClientOptions).
+      const preflightClient = new GithubClient(preflightClientOptions(config));
+      markPhase("preflight");
+      const preflight = await runPreflight(preflightClient, config);
+      logLine({ event: "preflight", login: preflight.githubLogin, tarFlavor: preflight.tarFlavor, coreRemaining: preflight.coreRemaining, graphqlRemaining: preflight.graphqlRemaining });
+      // Seed the limits panel from preflight's report (PROMPT-TUI §U3.6): fold-if-absent only —
+      // the preflight REST calls themselves already emitted live snapshots through the §U3.3
+      // channel, and the seed must not clobber them with nulls.
+      // Per-emission gates (§U0: ALL derivation/allocation behind hasProgressSink) — a degrade
+      // tripped by the FIRST seed clears the sink, and the second must then allocate nothing.
+      if (hasProgressSink()) emitProgress({ type: "rate-limit-seed", resource: "core", remaining: preflight.coreRemaining });
+      if (hasProgressSink()) emitProgress({ type: "rate-limit-seed", resource: "graphql", remaining: preflight.graphqlRemaining });
 
-  // Only AFTER preflight passes do we touch the database (open/migrate/--fresh) and build the
-  // caching client for the scan.
-  const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath, fresh: args.fresh, purgeCache: args.purgeCache });
-  const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories });
+      // --plan: preview the scan scope and exit BEFORE the database is opened (§8). Everything past
+      // this point in plan mode is read-only discovery through a CACHE-LESS client (db: null).
+      // Plan mode never mounts the TUI (activation returned off), so runPlan's own stderr summary
+      // writes land exactly as today.
+      if (args.plan) {
+        const planClient = new GithubClient({ githubHost: config.githubHost, db: null, concurrency: config.concurrency.repositories });
+        await runPlan(planClient, runtime, preflight.githubLogin);
+        return null;
+      }
 
-  try {
-    await runScan(db, client, runtime, args, preflight.githubLogin);
-  } finally {
-    db.close();
-  }
+      // Only AFTER preflight passes do we touch the database (open/migrate/--fresh) and build the
+      // caching client for the scan.
+      const db = AuditDb.open({ sqlitePath: config.paths.sqlitePath, fresh: args.fresh, purgeCache: args.purgeCache });
+      const client = new GithubClient({ githubHost: config.githubHost, db, concurrency: config.concurrency.repositories });
+
+      try {
+        return await runScan(db, client, runtime, args, preflight.githubLogin);
+      } finally {
+        db.close();
+      }
+    },
+  );
+  // §8 step 7's human summary, AFTER the dashboard tore down — below the terminated frame. Plan
+  // mode and the owner-discovery-throttled clean exit return null (they have no scan summary).
+  if (outcome !== null) process.stderr.write(runSummaryText(outcome.runId, outcome.summary, outcome.errorCount, outcome.reportPath, outcome.warnings));
 }
 
 // §8 step 7's "concise human-readable summary": stderr only — stdout stays pure JSONL. The
@@ -194,13 +270,25 @@ function emitPolicyWarnings(branchPolicy: CompiledBranchPolicy, coverages: reado
   return [...(isEmptyAllowlist(branchPolicy) ? [{ kind: "empty-allowlist" } as const] : []), ...dead];
 }
 
+// What a completed scan hands back to main() for the human summary (rendered AFTER the TUI
+// teardown, so it lands below the terminated frame — PROMPT-TUI §U1). The `done` event and
+// runSummaryText themselves are unchanged; only the WRITE SITE moved to the caller.
+export interface ScanOutcome {
+  readonly runId: string;
+  readonly summary: ReportSummary;
+  readonly errorCount: number;
+  readonly reportPath: string;
+  readonly warnings: readonly PolicyWarning[];
+}
+
 // The full scan lifecycle (§0/§1/§3/§5/§8), after preflight opened the db + caching client.
 // EXPORTED for tests: the site-(a) owner-discovery throttle contract — end cleanly WITHOUT
 // starting a run — is pinned here (a run started on throttle would leave a phantom run row).
+// Returns null for that owner-discovery-throttled clean exit (nothing to summarize).
 export async function runScan(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime,
   args: OrchestrateArgs, personalLogin: string | null,
-): Promise<void> {
+): Promise<ScanOutcome | null> {
   const { config, configHash } = runtime;
   // §0 startup: sweep stale temp dirs from a prior crash.
   client.sweepStaleTempDirs();
@@ -212,10 +300,11 @@ export async function runScan(
   // §1 effective owner resolution (discovery runs every invocation). A throttle here is
   // TRANSIENT (§4): end the run cleanly and let the next invocation re-discover, rather than
   // crashing the whole process with no report.
+  markPhase("resolve-owners");
   const resolved = await resolveOwnersWithDiscovery(client, config, personalLogin);
   if (resolved === null) {
     logLine({ event: "owner-discovery-throttled", action: "retry-next-run" });
-    return; // clean exit; the caller closes the db. No run started, nothing to report.
+    return null; // clean exit; the caller closes the db. No run started, nothing to report.
   }
   const { owners, source } = resolved;
 
@@ -260,6 +349,7 @@ export async function runScan(
   // front to learn its bin names, so the per-unit CLI scan runs specifier + bin terms in a
   // SINGLE pass (no fragile post-introspection re-scan). Bins are version-stable, and this also
   // covers a CLI-only package invoked with no manifest declaration (§5.G/§7 usageByRepo union).
+  markPhase("cli-terms");
   const cliTermSets = await discoverCliTerms(db, client, config, runId);
   logLine({ event: "cli-terms", terms: cliTermSets.map((t) => ({ name: t.name, bins: t.binNames })) });
 
@@ -284,12 +374,17 @@ export async function runScan(
   // idempotent, so the two paths compose without double-firing.
   const aborter = new Aborter();
   const onFatal = (): void => aborter.abort();
+  markPhase("scan");
   const ownerResults = await boundedPool(owners, config.concurrency.organizations, async (owner) => {
+    // owner bracket (PROMPT-TUI §U3.6): end in finally, so throw paths still close the row
+    if (hasProgressSink()) emitProgress({ type: "owner-start", owner });
     try {
       return await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, aborter, onFatal);
     } catch (e) {
       aborter.abort(); // trip so sibling owners stop dispatching new work immediately
       throw e; // captured by the pool; the run lifecycle is decided AFTER every owner has drained
+    } finally {
+      if (hasProgressSink()) emitProgress({ type: "owner-end", owner });
     }
   }, { signal: aborter });
 
@@ -324,19 +419,22 @@ export async function runScan(
   const warnings = emitPolicyWarnings(runtime.branchPolicy, coverages);
 
   // §5.E introspection reconciliation over the run's reportable slice.
+  markPhase("reconcile");
   await reconcileIntrospection(db, client, config, runId);
 
   // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at).
   db.completeRun(runId);
+  markPhase("report");
   // §8 step 7: produce the consolidated §7 report (run-<id>.json + latest.json) from SQLite,
-  // then the machine done-event (stdout) and the human summary (stderr) — BOTH derived from
-  // the emitted report object itself, so the three can never disagree.
+  // then the machine done-event (stdout) and the human summary — BOTH derived from the emitted
+  // report object itself, so the three can never disagree. The summary TEXT is returned to the
+  // caller (main renders it after the TUI teardown, PROMPT-TUI §U1) rather than written here.
   const completedRun = db.getRun(runId)!;
   const emitted = emitReportDetailed(db, completedRun, config.paths.outputDir, { alsoLatest: true });
   const summary = emitted.report.summary;
   const errorCount = emitted.report.errors.length;
   logLine({ event: "done", runId, report: emitted.path, summary, errors: errorCount });
-  process.stderr.write(runSummaryText(runId, summary, errorCount, emitted.path, warnings));
+  return { runId, summary, errorCount, reportPath: emitted.path, warnings };
 }
 
 // ---- owner resolution + branch classification (shared by the run and --plan paths) -----------
@@ -397,8 +495,14 @@ export async function processOwner(
   const coverages: RepoPolicyCoverage[] = [];
   for (const repo of outcome.items) {
     if (signal?.aborted) break;
-    const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, signal, onFatal);
-    if (cov !== null) coverages.push(cov);
+    // repo bracket (PROMPT-TUI §U3.6): end in finally, so a throwing repo still closes its row
+    if (hasProgressSink()) emitProgress({ type: "repo-start", owner, repo: repo.name });
+    try {
+      const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, signal, onFatal);
+      if (cov !== null) coverages.push(cov);
+    } finally {
+      if (hasProgressSink()) emitProgress({ type: "repo-end", owner, repo: repo.name });
+    }
   }
   return coverages;
 }
@@ -554,61 +658,74 @@ export async function processRepo(
   // no-op if the callback already fired (a run-level abort).
   const unsubscribe = signal?.onAbort(() => branchAbort.abort()); // run-level fatal → stop this pool too (fires immediately if already aborted)
   const unitResults = await boundedPool(plan.toScan, config.concurrency.branches, async (d) => {
-    if (branchAbort.aborted) return; // a fatal (this repo's own or a sibling owner's) tripped the run — dispatch no new units
+    // unit-dispatch/unit-settle bracket the WHOLE worker body — including skip-current and
+    // abort-return paths, via the finally below — the truthful pool-slot occupancy signal
+    // (PROMPT-TUI §U2/§U3.6). Tapped JSONL events never clear active state; settle does.
+    if (hasProgressSink()) emitProgress({ type: "unit-dispatch", owner: repo.organization, repo: repo.name, branch: d.head.name });
     try {
-      const h = d.head;
-      if (!d.isDefaultBranch && d.rawPolicyResult.kind !== "no-exclusion")
-        throw new Error(`internal: non-default scanned branch ${repo.organization}/${repo.name}@${h.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
-      const key = keyFor(h.name);
-      const attr = policyAttribution(d.rawPolicyResult); // (null, null) unless the default-branch override
-      db.enqueueUnit(key, runId);
-      const unit = db.getUnit(key);
-      // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is reused
-      // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate. This
-      // enqueue→get→upsert→setStatus RMW is await-free, so it runs to completion atomically vs siblings.
-      if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
-        db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
-        db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
-        logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
-        return;
-      }
-
-      db.setUnitStatus(key, { status: "in_progress", runId });
+      if (branchAbort.aborted) return; // a fatal (this repo's own or a sibling owner's) tripped the run — dispatch no new units
       try {
-        const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
-        db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
-      } catch (e) {
-        // A PolicyMatchError is FATAL by contract — never downgraded to a per-unit scan error. It
-        // escapes to the outer catch, which trips branchAbort; boundedPool captures it and processRepo
-        // rethrows it below AFTER draining every in-flight sibling. Today it can arise from the write
-        // chokepoint's attribution-coherence verification inside processUnit's upserts.
-        if (e instanceof PolicyMatchError) throw e;
-        if (e instanceof ThrottleExhausted) {
-          // §4: throttle exhaustion is NOT a permanent unit failure — reset to pending so a LATER run
-          // retries it. No same-run spin: the pool dispatches each fixed plan.toScan unit exactly once
-          // and nothing re-reads pending units within the run. Handled here (not a fatal), so it never
-          // trips branchAbort — one throttled branch must not cancel its siblings.
-          db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
-          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
-        } else {
-          db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
-          db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
-          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
+        const h = d.head;
+        if (!d.isDefaultBranch && d.rawPolicyResult.kind !== "no-exclusion")
+          throw new Error(`internal: non-default scanned branch ${repo.organization}/${repo.name}@${h.name} carries policy ${d.rawPolicyResult.kind} (planner bucket-wiring bug)`);
+        const key = keyFor(h.name);
+        const attr = policyAttribution(d.rawPolicyResult); // (null, null) unless the default-branch override
+        db.enqueueUnit(key, runId);
+        const unit = db.getUnit(key);
+        // §3 skip predicate: a done unit of THIS config whose stored head equals the LIVE head is reused
+        // (skip-as-current) — the scanned commit is h.oid, so its date is h.committedDate. This
+        // enqueue→get→upsert→setStatus RMW is await-free, so it runs to completion atomically vs siblings.
+        if (unit !== null && unit.status === "done" && unit.lastCommitSha === h.oid) {
+          db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: h.oid, status: "scanned", isDefaultBranch: d.isDefaultBranch, policyStatus: attr.policyStatus, policyMatchedPattern: attr.policyMatchedPattern, scannedCommitDate: h.committedDate });
+          db.setUnitStatus(key, { status: "done", runId, lastCommitSha: h.oid, lastCommitDate: h.committedDate });
+          logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "skip-current" });
+          return;
         }
+
+        // unit-start (PROMPT-TUI §U2/§U3.6): a REAL scan begins — the active-scan list keys off
+        // this and is cleared by unit-settle alone; a skip-current unit never emits it.
+        if (hasProgressSink()) emitProgress({ type: "unit-start", owner: repo.organization, repo: repo.name, branch: h.name });
+        db.setUnitStatus(key, { status: "in_progress", runId });
+        try {
+          const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
+          db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
+        } catch (e) {
+          // A PolicyMatchError is FATAL by contract — never downgraded to a per-unit scan error. It
+          // escapes to the outer catch, which trips branchAbort; boundedPool captures it and processRepo
+          // rethrows it below AFTER draining every in-flight sibling. Today it can arise from the write
+          // chokepoint's attribution-coherence verification inside processUnit's upserts.
+          if (e instanceof PolicyMatchError) throw e;
+          if (e instanceof ThrottleExhausted) {
+            // §4: throttle exhaustion is NOT a permanent unit failure — reset to pending so a LATER run
+            // retries it. No same-run spin: the pool dispatches each fixed plan.toScan unit exactly once
+            // and nothing re-reads pending units within the run. Handled here (not a fatal), so it never
+            // trips branchAbort — one throttled branch must not cancel its siblings.
+            db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
+            logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "requeue-throttle", message: (e as Error).message });
+          } else {
+            db.insertError({ runId, scope: "scan", organization: repo.organization, repository: repo.name, branch: h.name, message: (e as Error).message });
+            db.setUnitStatus(key, { status: "error", runId, errorMessage: (e as Error).message });
+            logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: h.oid, action: "error", message: (e as Error).message });
+          }
+        }
+      } catch (e) {
+        // A fatal escaped this unit (PolicyMatchError, or the internal bucket-wiring assertion — the
+        // handled throttle/scan-error cases above never reach here). Trip branchAbort so THIS pool
+        // dispatches NO further units at once (fail-fast). Also trip the RUN-level Aborter PROMPTLY via
+        // onFatal: without it the run Aborter is only tripped in runScan's owner-worker catch, which runs
+        // AFTER this whole branch pool drains and processRepo rethrows — so during that drain sibling
+        // OWNERS keep dispatching new repos. onFatal (= aborter.abort) stops sibling owners at their next
+        // repo check and trips sibling repos' branchAborts at once. Settle-all is preserved: abort only
+        // stops NEW dispatch; in-flight units still drain, so db.close() never races a live writer. Then
+        // rethrow so boundedPool captures it and processRepo surfaces the first rejection after the drain.
+        branchAbort.abort();
+        onFatal?.();
+        throw e;
       }
-    } catch (e) {
-      // A fatal escaped this unit (PolicyMatchError, or the internal bucket-wiring assertion — the
-      // handled throttle/scan-error cases above never reach here). Trip branchAbort so THIS pool
-      // dispatches NO further units at once (fail-fast). Also trip the RUN-level Aborter PROMPTLY via
-      // onFatal: without it the run Aborter is only tripped in runScan's owner-worker catch, which runs
-      // AFTER this whole branch pool drains and processRepo rethrows — so during that drain sibling
-      // OWNERS keep dispatching new repos. onFatal (= aborter.abort) stops sibling owners at their next
-      // repo check and trips sibling repos' branchAborts at once. Settle-all is preserved: abort only
-      // stops NEW dispatch; in-flight units still drain, so db.close() never races a live writer. Then
-      // rethrow so boundedPool captures it and processRepo surfaces the first rejection after the drain.
-      branchAbort.abort();
-      onFatal?.();
-      throw e;
+    } finally {
+      // settle is the ONLY reliable end (PROMPT-TUI §U2): the `scanned` JSONL line fires before
+      // cleanup finishes, and a fatal escape emits no terminal unit line at all.
+      if (hasProgressSink()) emitProgress({ type: "unit-settle", owner: repo.organization, repo: repo.name, branch: d.head.name });
     }
   }, { signal: branchAbort }).finally(() => unsubscribe?.()); // drop this repo's run-Aborter callback once the pool settles
   // A PolicyMatchError (or any other escaping fatal — the internal bucket-wiring assertion, a DB

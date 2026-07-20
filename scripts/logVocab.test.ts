@@ -17,8 +17,12 @@ const README = readFileSync(join(SCRIPTS_DIR, "..", "README.md"), "utf8");
 function emittedLiterals(key: "event" | "action"): string[] {
   const found = new Set<string>();
   const re = new RegExp(`${key}:\\s*"([^"]+)"`, "g");
-  for (const file of readdirSync(SCRIPTS_DIR)) {
-    if (!file.endsWith(".ts") || file.endsWith(".test.ts")) continue;
+  // RECURSIVE and .tsx-inclusive (PROMPT-TUI §U8.14): scripts/tui/ can never emit an
+  // undocumented stdout token either. (The TUI's own hub deliberately uses a different
+  // discriminant key — `type:` — so display plumbing never collides with this scan.)
+  for (const file of readdirSync(SCRIPTS_DIR, { recursive: true }) as string[]) {
+    if (!file.endsWith(".ts") && !file.endsWith(".tsx")) continue;
+    if (file.includes(".test.")) continue;
     const src = readFileSync(join(SCRIPTS_DIR, file), "utf8");
     for (const m of src.matchAll(re)) found.add(m[1]!);
   }

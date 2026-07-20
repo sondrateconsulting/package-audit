@@ -2914,8 +2914,9 @@ describe("single chokepoint (grep-enforced)", () => {
       if (f.endsWith("scripts/github.ts")) {
         // the single realSpawn site; zero on every other surface
         expect({ file: f, ...counts }).toEqual({ file: f, ...zero, bun: 1 });
-      } else if (f.endsWith("scripts/github.test.ts")) {
-        // this test file names the patterns in its own assertions — exempt it from the scan
+      } else if (f.endsWith("scripts/github.test.ts") || f.endsWith("scripts/tuiPurity.test.ts")) {
+        // these SCANNER test files name the patterns in their own assertions — exempt them
+        // (tuiPurity.test.ts is the display-layer purity scan; it must spell the same tokens)
       } else {
         expect({ file: f, ...counts }).toEqual({ file: f, ...zero });
       }

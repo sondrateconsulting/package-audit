@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { main as orchestrateMain } from "./orchestrate.ts";
 import { main as reportMain } from "./report.ts";
 import { ORCHESTRATE_HELP, REPORT_HELP } from "./args.ts";
+import { setProgressSink, type ProgressEvent } from "./progress.ts";
 
 // Capture BOTH streams while `fn` runs (help text and JSONL go to stdout; summaries to stderr).
 async function captureStreams(fn: () => Promise<void>): Promise<{ out: string; err: string }> {
@@ -166,6 +167,30 @@ describe("orchestrate main() --plan (offline shims — the zero-write early retu
       const tmpAfter = readdirSync(realpathSync(tmpdir())).filter((n) => n.startsWith("pkg-audit-"));
       expect(tmpAfter.filter((n) => !tmpBefore.has(n))).toEqual([]);
     } finally {
+      rmSync(fx.root, { recursive: true, force: true });
+    }
+  });
+
+  test("main() body anchors (PROMPT-TUI §U3.6): the preflight phase marker and the rate-limit seeds fire after runPreflight", async () => {
+    // The progress hub is module-global, so a test-installed sink observes main()'s own gated
+    // emissions even with the TUI off (plan mode never mounts; the off passthrough neither
+    // installs nor clears sinks). This is the ONE test that reaches the two main-body anchor
+    // lines — every other phase/seed anchor lives in runScan and is covered there.
+    const fx = makeFixture();
+    const seen: ProgressEvent[] = [];
+    setProgressSink((e) => seen.push(e));
+    try {
+      await captureStreams(() => inFixture(fx, () => orchestrateMain(["--plan", "--config", fx.configPath])));
+      expect(seen.filter((e) => e.type === "phase").map((e) => (e.type === "phase" ? e.phase : ""))).toEqual(["preflight"]);
+      const seeds = seen.filter((e) => e.type === "rate-limit-seed");
+      expect(seeds).toEqual([
+        { type: "rate-limit-seed", resource: "core", remaining: 5000 },
+        { type: "rate-limit-seed", resource: "graphql", remaining: 5000 },
+      ]);
+      // the shim gh responses also flowed through the §U3.3 live channel (preflight REST calls)
+      expect(seen.some((e) => e.type === "rate-limit")).toBe(true);
+    } finally {
+      setProgressSink(null);
       rmSync(fx.root, { recursive: true, force: true });
     }
   });

@@ -12,6 +12,7 @@ import { gunzipSync } from "node:zlib";
 import { join, relative, sep } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { logLine } from "./log.ts";
+import { emitProgress, hasProgressSink, nextProgressId } from "./progress.ts";
 import type { GithubClient } from "./github.ts";
 import type { AuditDb, ApiSurfaceRow, ResolvedVersionSource } from "./db.ts";
 import { parseJsoncObject } from "./jsonc.ts";
@@ -682,6 +683,17 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
   const authToken = opts.registryAuthEnvVar !== null ? (env[opts.registryAuthEnvVar] ?? null) : null;
   const registryOrigin = new URL(registryUrl).origin;
 
+  // Introspection WORK span (PROMPT-TUI §U3.7): brackets the WHOLE operation — fetch → verify →
+  // extract → scan → persist, the fail-soft catch included — so "packages being introspected"
+  // is a first-class work row, distinct from its inner HTTP span (below) and its inner tar
+  // spawns (spawnBounded's spans). The zero-work completion-marker dedup return above
+  // deliberately opens no span, and a no-sink run allocates nothing here (§U0).
+  let workSpanId = 0;
+  if (hasProgressSink()) {
+    workSpanId = nextProgressId();
+    emitProgress({ type: "introspect-start", id: workSpanId, packageName, version });
+  }
+  try {
   try {
     const packument = opts.packument ?? (await fetchPackument(opts));
     const dist = selectVersionDist(packument, version);
@@ -697,7 +709,21 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
     if (!isSafeArtifactPath(new URL(dist.tarball), basePrefix))
       throw new IntrospectionError(`tarball path ${new URL(dist.tarball).pathname} is outside the registry base ${basePrefix} or is not an artifact path`);
 
-    const { bytes } = await fetchFollowing(dist.tarball, registryOrigin, (u) => isSafeArtifactPath(u, basePrefix), true, authToken, fetchImpl, true, opts.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
+    // Fetch span (PROMPT-TUI §U3.5): the HTTP transfer ONLY, redirect hops included — the
+    // verify/extract/scan work after the bytes land is the introspect span's job, so the network
+    // panel never pretends the whole introspection is a download. Label: name@version, never the
+    // URL (the registry may be private), never headers.
+    let fetchSpanId = 0;
+    if (hasProgressSink()) {
+      fetchSpanId = nextProgressId();
+      emitProgress({ type: "fetch-start", id: fetchSpanId, kind: "tarball", label: `tarball ${packageName}@${version}` });
+    }
+    let bytes: Uint8Array;
+    try {
+      ({ bytes } = await fetchFollowing(dist.tarball, registryOrigin, (u) => isSafeArtifactPath(u, basePrefix), true, authToken, fetchImpl, true, opts.fetchTimeoutMs ?? FETCH_TIMEOUT_MS));
+    } finally {
+      if (fetchSpanId !== 0 && hasProgressSink()) emitProgress({ type: "fetch-end", id: fetchSpanId });
+    }
     verifyIntegrity(bytes, dist.integrity, dist.shasum); // BEFORE extraction
 
     const scan = scanTarball(bytes, (b) => inflateBounded(b));
@@ -739,6 +765,9 @@ export async function introspectVersion(opts: IntrospectOptions): Promise<void> 
     const message = (e as Error).message;
     db.insertError({ runId, scope: "introspection", packageName, version, message });
     logLine({ event: "introspection", packageName, version, error: message });
+  }
+  } finally {
+    if (workSpanId !== 0 && hasProgressSink()) emitProgress({ type: "introspect-end", id: workSpanId });
   }
 }
 
@@ -786,7 +815,18 @@ export async function fetchPackument(req: PackumentRequest): Promise<Packument> 
   // wrongly reject that). A same-origin redirect is followed WITHOUT the token (path no longer
   // matches), closing the confused-deputy without breaking scoped fetches on private registries.
   const isPackumentPath = (u: URL): boolean => u.origin === baseUrl.origin && u.pathname === expectedPath;
-  const { text } = await fetchFollowing(url, registryOrigin, isPackumentPath, false, authToken, fetchImpl, false, req.fetchTimeoutMs ?? FETCH_TIMEOUT_MS);
+  // Fetch span (PROMPT-TUI §U3.5): the logical packument transfer, redirect hops included.
+  let fetchSpanId = 0;
+  if (hasProgressSink()) {
+    fetchSpanId = nextProgressId();
+    emitProgress({ type: "fetch-start", id: fetchSpanId, kind: "packument", label: `packument ${req.packageName}` });
+  }
+  let text: string;
+  try {
+    ({ text } = await fetchFollowing(url, registryOrigin, isPackumentPath, false, authToken, fetchImpl, false, req.fetchTimeoutMs ?? FETCH_TIMEOUT_MS));
+  } finally {
+    if (fetchSpanId !== 0 && hasProgressSink()) emitProgress({ type: "fetch-end", id: fetchSpanId });
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);

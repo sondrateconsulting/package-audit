@@ -890,7 +890,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "dev", oid: hexOid("o-dev"), date: "2025-05-01T00:00:00Z" }], "dev") };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, ui: null, rescanBranches: [], help: false };
     const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: throwingPolicy, repositoryPolicy: compileRepositoryPolicy([]) };
     let thrown: unknown = null;
     await captureJsonl(async () => {
@@ -942,7 +942,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
     const client = makeClient(root, async () =>
       ({ exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` }));
-    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+    const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, ui: null, rescanBranches: [], help: false };
     const runtime: AuditRuntime = { config, configHash: "h", branchPolicy: { include: null, exclude: [] }, repositoryPolicy: throwingRepoPolicy };
     let thrown: unknown = null;
     await captureJsonl(async () => {
@@ -1187,7 +1187,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-  const noArgsT7: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const noArgsT7: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, ui: null, rescanBranches: [], help: false };
   const policyWarnEvents = (events: Array<Record<string, unknown>>) => events.filter((e) => e["event"] === "policy-warning");
 
   test("runPlan emits an unmatched-pattern warning (before plan-summary) for a deny pattern that matched no branch", async () => {
@@ -1811,7 +1811,7 @@ describe("resolveOwnersWithDiscovery owner-membership throttle (§4, site a)", (
 });
 
 describe("runScan owner-discovery throttle (§4, site a — consumer wiring)", () => {
-  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, ui: null, rescanBranches: [], help: false };
 
   test("a throttle during owner discovery ends cleanly WITHOUT starting a run (no phantom run row)", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
@@ -2048,7 +2048,7 @@ describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations
       const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
       return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
     });
-  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: false };
+  const noArgs: OrchestrateArgs = { configPath: null, plan: false, fresh: false, purgeCache: false, ui: null, rescanBranches: [], help: false };
   const twoOwnerConfig = (root: string) => ({ ...testConfig(root, 25), organizations: ["org-a", "org-b"], concurrency: { organizations: 2, repositories: 2, branches: 1 } });
   const runStatus = (db: AuditDb): string | undefined => (db.read(`SELECT status FROM runs`).get() as { status: string } | null)?.status ?? undefined;
   const scannedOrgs = (db: AuditDb): string[] =>

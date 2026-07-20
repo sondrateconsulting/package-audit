@@ -7,6 +7,7 @@
 import { isCanonicalIdentity, type GithubClient } from "./github.ts";
 import type { Config } from "./config.ts";
 import { FETCH_TIMEOUT_MS } from "./apiSurface.ts";
+import { emitProgress, hasProgressSink, nextProgressId } from "./progress.ts";
 
 export class PreflightError extends Error {
   constructor(message: string) {
@@ -172,10 +173,19 @@ export async function runPreflight(client: GithubClient, config: Config, deps: P
     return { ok: res.ok, status: res.status };
   });
   for (const registryUrl of new Set(config.packages.map((p) => p.registryUrl))) {
+    // The §2.5 reachability probe is the ONE registry call outside apiSurface — it gets the same
+    // fetch span (PROMPT-TUI §U3.5). Label: never the URL (the registry may be private).
+    let spanId = 0;
+    if (hasProgressSink()) {
+      spanId = nextProgressId();
+      emitProgress({ type: "fetch-start", id: spanId, kind: "registry-probe", label: "registry probe" });
+    }
     try {
       await fetchImpl(registryUrl);
     } catch (e) {
       throw new PreflightError(`registry ${registryUrl} unreachable (DNS/TLS/connect): ${(e as Error).message}`);
+    } finally {
+      if (spanId !== 0 && hasProgressSink()) emitProgress({ type: "fetch-end", id: spanId });
     }
   }
 

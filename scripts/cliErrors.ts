@@ -11,6 +11,7 @@
 // rendered message-only.
 export const KNOWN_OPERATOR_ERRORS: ReadonlySet<string> = new Set([
   "ArgsError", // args.ts
+  "TuiActivationError", // tui/activation.ts — --ui demanded in an ineligible environment (PROMPT-TUI §U1)
   "ConfigError", // config.ts
   "JsoncError", // jsonc.ts (config/bun.lock parsing)
   "YamlLiteError", // yamlLite.ts (pnpm-workspace/lockfile parsing)

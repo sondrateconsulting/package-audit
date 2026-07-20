@@ -11,7 +11,7 @@ package-audit is an operator-run instrument that measures org-wide coupling of t
 ```sh
 git clone https://github.com/sondrateconsulting/package-audit.git
 cd package-audit
-bun install   # required: `typescript` powers the .d.ts/source scanners at runtime; dev-only `@types/bun` + `zod` (report-schema tests)
+bun install   # runtime: `typescript` (the scanners) + `ink`/`react` (the opt-outable dashboard); dev-only `@types/bun`, `zod`, `@types/react`, `ink-testing-library`
 ```
 
 1. **Edit [config.json](config.json)** — set the packages you track. Your editor validates it against [config.schema.json](config.schema.json) via the `$schema` key, and unknown keys are rejected at startup (close typos get a did-you-mean hint). One *owner*-scoping decision matters up front: `"organizations": null` (the default) is discovery mode — the tool enumerates *every* organization your gh token is a member of and scans all of them. Right for "audit everything I can see"; wrong for a client engagement run under a token with memberships outside the engagement. For engagements, set an explicit allowlist: `"organizations": ["client-org"]`. Branch scope is a separate lever — see [Branch policy](#branch-policy).
@@ -202,6 +202,23 @@ The presentation commands emit their own events: `report --html` writes one `dos
 
 **Mid-run `"action":"error"`, `"event":"discovery"`, and `"event":"introspection"` lines are fail-soft**: the failure (a branch scan, a repo/branch listing for one owner, or a registry packument/tarball/bin-discovery step for one package version) is recorded in the report's `errors` array and the run continues — one unreachable repo or registry hiccup never kills an org-wide audit. Org-scoped `discovery` lines (a whole owner's repo listing failed) carry no `repo` field; branch-scoped ones do. `introspection` lines are package-scoped (`packageName`, plus `version` when the failure is version-specific). The human-readable end-of-run summary prints to **stderr**.
 
+### Interactive dashboard
+
+Run `bun run audit` in a plain terminal and a live dashboard renders on **stderr**: current phase, REST/GraphQL rate limits and reset countdowns, throttle pauses (with a sticky notice if the cumulative pause budget is exhausted), subprocess-cap occupancy, active owners/repos/branch-units/introspections, session counters and findings, in-flight `gh`/`git`/`tar` and registry requests, and the last few errors/warnings. It is display-only in v1 — no keybindings — and **the JSONL contract is unchanged**: the vocabulary above, one event per line, exactly as before. Only the interactive *destination* moves.
+
+Activation (`--ui` forces it on and fails fast if the terminal can't host it; `--no-ui` restores today's exact behavior; default is auto):
+
+| stderr | stdout | environment | dashboard | JSONL destination |
+|--------|--------|-------------|-----------|-------------------|
+| terminal | terminal | interactive | on | **diverted to a log file** |
+| terminal | piped/redirected | interactive | on | stdout, byte-identical |
+| any | any | CI (ink's is-in-ci: `CI`/`CONTINUOUS_INTEGRATION`, with `0`/`false` = unset), `TERM=dumb`, or under 40x5 | off (auto) / fail fast (`--ui`) | stdout, byte-identical |
+| piped | any | any | off (auto) / fail fast (`--ui`) | stdout, byte-identical |
+
+The divert exists for exactly one reason: with both streams on the same terminal, raw JSONL would interleave with the dashboard frame. When it fires, the identical bytes stream to `<outputDir>/logs/audit-log-<UTC-stamp>-p<pid>.jsonl` (a `-2`, `-3`… suffix if the name collides; the write rides the same `./output` containment as every other artifact), and the run ends with a `JSONL log: <path>` line naming the file actually used. If the dashboard degrades mid-run — a divert write failure reroutes the stream back to stdout without losing an event; any other dashboard failure disables the display with one warning and the audit continues bare — that exit line reads `JSONL log (partial — …)` so an incomplete file is never announced as the complete record. A hard crash (power loss, SIGKILL) can truncate the file's final line mid-write; consumers should tolerate a partial last line. `--plan` never mounts the dashboard and never diverts.
+
+Ctrl+C keeps its exact semantics — the process dies, the run stays resumable, and the next invocation picks up where it left off; the dashboard installs no signal handlers of its own. The last frame stays on your terminal after an interrupt (cosmetic; the cursor is restored). `NO_COLOR` strips styling without affecting routing; `TERM=dumb` and CI environments never get the dashboard, so agents and pipelines see today's stdout exactly.
+
 ## Report anatomy
 
 `output/latest.json` / `output/run-<id>.json` — the shape's authoritative, field-by-field reference is the Zod schema in [scripts/reportSchema.ts](scripts/reportSchema.ts) (fields carry inline descriptions; schema-validation tests cover emitted reports). The semantics people trip on:
@@ -212,9 +229,15 @@ The presentation commands emit their own events: `report --html` writes one `dos
 - `report --run-id <id>` pins each unit to the commit that run scanned (findings join through a per-run head snapshot), so later runs advancing branch heads never change it. One caveat: a forced same-commit `--rescan-branch` can add or refresh the shared finding rows that older run ids read through — newly detected findings, plus updated row details (timestamps, snippets).
 - Reports are deterministic and byte-reproducible: same database, same run, same bytes.
 
-## Exactly one runtime dependency
+## Runtime dependencies
 
-The audit path has exactly one runtime npm dependency: `typescript` — the scanner parses target code with the TS compiler API. The report path imports zero npm packages (the export/dossier surfaces are built to the same rule). And the tool never invokes a package manager at runtime: registry tarballs arrive via plain `fetch` and are only parsed statically, so nothing in a scanned repo or fetched package can run a lifecycle script. `bun install` fetches that one dependency plus dev tooling (`@types/bun`; `zod`, which backs the report-schema tests) — and that is the last time a package manager runs.
+The audit's **analysis path** has exactly one runtime npm dependency: `typescript` — the scanner parses target code with the TS compiler API. The report path imports zero npm packages (the export/dossier surfaces are built to the same rule). The **opt-outable interactive dashboard** adds two more: `ink` + `react`, exact-pinned in `package.json` and locked in `bun.lock`. They are display-layer only, and that boundary is enforced, not asserted:
+
+- They load **only** via a dynamic import when the dashboard actually mounts — `--no-ui`, `--plan`, CI, and non-interactive runs (stderr not a terminal) never evaluate a byte of them. (An interactive run with only *stdout* piped does mount the dashboard, per the matrix above — stdout still receives pure JSONL.)
+- A grep-enforced test ([scripts/tuiPurity.test.ts](scripts/tuiPurity.test.ts)) pins the display layer away from the machine stdout stream, the filesystem write APIs (one audited exception: the contained divert-log writer), the spawn surface, and the DB/GitHub modules; the repo-wide single-chokepoint scan walks the dashboard sources too. Those scans cover **this repo's code**; one dependency edge is worth naming: ink's bundled `terminal-size` helper can shell out (`tput`) as a *fallback* when the render stream reports no dimensions — and ink's **own internal layout** consults it, not just the optional size hook this tool already avoids. The dashboard closes that route by construction: the stderr proxy ink renders through never reports a non-renderable dimension (real positive integers pass through; anything else pins to the last usable geometry the terminal reported — ink's 80×24 defaults before any — a behavior pinned by tests), while the layout planner reads the true values through a separate raw channel and renders an empty frame when they're absent. It is still ink's code inside the mounted process — the pin makes its spawn fallback unreachable rather than pretending it doesn't exist.
+- **Lifecycle scripts: verified none.** At the pinned resolution (ink 7.1.1 + react 19.2.7 and their transitive closure), no package in `node_modules` declares a `preinstall`/`install`/`postinstall` script — verified against the installed tree (`bun pm untrusted` agrees), not assumed from Bun's default script-blocking. Re-verify when bumping pins.
+
+The tool still never invokes a package manager at runtime: registry tarballs arrive via plain `fetch` and are only parsed statically, so nothing in a scanned repo or fetched package can run a lifecycle script. `bun install` fetches those runtime dependencies plus dev tooling (`@types/bun`; `zod`, which backs the report-schema tests; `@types/react` + `ink-testing-library` for the dashboard's own tests) — and that is the last time a package manager runs.
 
 ## Trust: why it cannot write to your org
 

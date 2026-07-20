@@ -2,6 +2,7 @@
 // into a validated options object, failing fast with actionable messages on any malformed/unknown
 // input. Entrypoint grammars (§8):
 //   bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] \
+//                                  [--ui | --no-ui] \
 //                                  [--rescan-branch <org>/<repo>@<branch>]...   # repeatable
 //   bun run scripts/report.ts      [--config <path>] [--run-id <id>] [--html]
 // `--help`/`-h` on either entrypoint wins over every other argument (even invalid ones), so a
@@ -35,7 +36,7 @@ export function assertRunId(value: string): string {
 const CONFIG_PRECEDENCE = "Config path precedence: --config <path> > CONFIG_PATH env > ./config.json";
 
 export const ORCHESTRATE_USAGE =
-  "Usage: bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] [--rescan-branch <org>/<repo>@<branch>]... [--help]";
+  "Usage: bun run scripts/orchestrate.ts [--config <path>] [--plan] [--fresh [--purge-cache]] [--ui | --no-ui] [--rescan-branch <org>/<repo>@<branch>]... [--help]";
 
 export const ORCHESTRATE_HELP = `package-audit — READ-ONLY npm-package-usage audit over GitHub orgs (gh CLI + Bun + SQLite)
 
@@ -52,6 +53,12 @@ Flags:
   --purge-cache       Only valid with --fresh: ALSO drop the caches (the real full wipe).
   --rescan-branch <org>/<repo>@<branch>
                       Force one branch unit back to pending (repeatable).
+  --ui                Require the live stderr dashboard (fails fast if the terminal is not
+                      interactive: stderr TTY, TERM not 'dumb', not CI, at least 40x5).
+                      Default (neither flag): auto — the dashboard turns on when eligible.
+                      When it is on and stdout is ALSO a terminal, the stdout JSONL stream is
+                      diverted byte-identically to <outputDir>/logs/ (announced at exit).
+  --no-ui             Never show the dashboard (today's exact stdout/stderr behavior).
   --help, -h          Show this help and exit.
 
 The audit writes <outputDir>/run-<run_id>.json and <outputDir>/latest.json when it completes;
@@ -89,6 +96,7 @@ export interface OrchestrateArgs {
   readonly plan: boolean; // preview scope, no DB / no writes (§8 --plan)
   readonly fresh: boolean;
   readonly purgeCache: boolean;
+  readonly ui: boolean | null; // --ui true / --no-ui false / null = auto (PROMPT-TUI §U1)
   readonly rescanBranches: readonly RescanTarget[]; // de-duplicated, order-stable
   readonly help: boolean; // --help/-h seen anywhere: print help, do nothing else
 }
@@ -115,7 +123,7 @@ const isHelpFlag = (a: string): boolean => a === "--help" || a === "-h";
 
 // A flag that consumes the following token as its value (or the `--flag=value` attached form).
 const VALUE_FLAGS = new Set(["--config", "--rescan-branch"]);
-const BOOL_FLAGS = new Set(["--fresh", "--purge-cache", "--plan"]);
+const BOOL_FLAGS = new Set(["--fresh", "--purge-cache", "--plan", "--ui", "--no-ui"]);
 
 // Normalize `--flag=value` into flag + attached value (shared by both parsers).
 function splitFlag(arg: string): { flag: string; attached: string | null } {
@@ -134,12 +142,14 @@ function requireValue(flag: string, attached: string | null, next: string | unde
 }
 
 export function parseArgs(argv: string[]): OrchestrateArgs {
-  if (argv.some(isHelpFlag)) return { configPath: null, plan: false, fresh: false, purgeCache: false, rescanBranches: [], help: true };
+  if (argv.some(isHelpFlag)) return { configPath: null, plan: false, fresh: false, purgeCache: false, ui: null, rescanBranches: [], help: true };
 
   let configPath: string | null = null;
   let plan = false;
   let fresh = false;
   let purgeCache = false;
+  let uiOn = false;
+  let uiOff = false;
   const rescanBranches: RescanTarget[] = [];
   const seen = new Set<string>(); // dedup rescan targets by org\0repo\0branch
 
@@ -151,6 +161,8 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
       if (attached !== null) fail(`${flag} takes no value`);
       if (flag === "--fresh") fresh = true;
       else if (flag === "--plan") plan = true;
+      else if (flag === "--ui") uiOn = true;
+      else if (flag === "--no-ui") uiOff = true;
       else purgeCache = true;
       continue;
     }
@@ -173,6 +185,11 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
     fail(`unknown argument '${arg}'`);
   }
 
+  // The two UI flags are contradictory demands, not a last-one-wins pair (PROMPT-TUI §U1).
+  if (uiOn && uiOff) fail("--ui and --no-ui are mutually exclusive");
+  // Plan mode never mounts a dashboard (PROMPT-TUI §U1): an explicit --ui demand there is a
+  // contradiction, rejected. `--no-ui --plan` stays allowed (a harmless explicit no-op).
+  if (uiOn && plan) fail("plan mode has no dashboard; run --plan without --ui");
   // --plan opens no database, so the DB/cache mutation flags are meaningless with it; reject the
   // combination rather than silently ignoring a requested mutation. Checked FIRST so
   // `--plan --purge-cache` names the actual conflict rather than the purge/fresh coupling.
@@ -182,7 +199,7 @@ export function parseArgs(argv: string[]): OrchestrateArgs {
   // reject the misleading combination rather than silently ignoring it (§3 CLI flags).
   if (purgeCache && !fresh) fail("--purge-cache requires --fresh (it only purges caches during a --fresh rebuild)");
 
-  return { configPath, plan, fresh, purgeCache, rescanBranches, help: false };
+  return { configPath, plan, fresh, purgeCache, ui: uiOn ? true : uiOff ? false : null, rescanBranches, help: false };
 }
 
 // ---- report arguments -----------------------------------------------------------------------

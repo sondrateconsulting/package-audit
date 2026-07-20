@@ -15,6 +15,7 @@ import { IntrospectionError } from "./apiSurface.ts";
 import { ArtifactWriteError } from "./artifactWrite.ts";
 import { PolicyMatchError } from "./branchPolicy.ts";
 import { RepoPolicyMatchError } from "./repositoryPolicy.ts";
+import { TuiActivationError } from "./tui/activation.ts";
 
 const OPTS = { command: "orchestrate", usage: ORCHESTRATE_USAGE };
 
@@ -46,6 +47,7 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       new IntrospectionError("x"), new ReadOnlyViolation("READ-ONLY VIOLATION: x"),
       new ArtifactWriteError("x"), new PolicyMatchError("excludeBranches", "dep*", "main", new Error("z")),
       new RepoPolicyMatchError("acme/*", "acme/repo", new Error("z")),
+      new TuiActivationError("--ui requires an interactive stderr terminal"),
     ];
     expect(new Set(instances.map((e) => e.name))).toEqual(new Set(KNOWN_OPERATOR_ERRORS));
     for (const e of instances) expect(isKnownOperatorError(e)).toBe(true);
@@ -69,8 +71,10 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       "RepositoryPolicyError",
     ]);
     const declared = new Set<string>();
-    for (const file of readdirSync(import.meta.dir)) {
-      if (!file.endsWith(".ts") || file.endsWith(".test.ts")) continue;
+    // recursive: scripts/tui/ declares operator-facing classes too (TuiActivationError)
+    for (const file of readdirSync(import.meta.dir, { recursive: true }) as string[]) {
+      if (!file.endsWith(".ts") && !file.endsWith(".tsx")) continue;
+      if (file.includes(".test.")) continue;
       const src = readFileSync(join(import.meta.dir, file), "utf8");
       for (const m of src.matchAll(/export class (\w+) extends \w*Error\b/g)) declared.add(m[1]!);
     }

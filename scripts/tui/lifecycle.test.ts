@@ -1,0 +1,1520 @@
+// lifecycle.test.ts — §U8.4 (divert opener), §U8.12 (routing equivalence), §U8.13 (runWithTui
+// with injected deps: mounts, io, streams, TIMERS), §U8.13a (sealable proxy). Deterministic:
+// every impure edge is a scripted fake; the bounded-exit wait runs on injected fake timers.
+import { expect, test, describe, afterEach, spyOn } from "bun:test";
+import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync, readFileSync, symlinkSync, mkdirSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { logLine, setLogSink, setLogTap } from "../log.ts";
+import { setProgressSink, hasProgressSink, emitProgress, reportTuiFailure, resetTuiFailure, tuiFailure, type ProgressEvent } from "../progress.ts";
+import { ReadOnlyViolation } from "../readOnlyGuard.ts";
+import { createTuiStore, type TuiStore } from "./store.ts";
+import {
+  logPathFor, utcLogStamp, makeDivertPathFor, realDivertIo, makeSealableStderr, runWithTui,
+  DIVERT_OPEN_ATTEMPTS, type DivertIo, type TuiDeps,
+} from "./lifecycle.ts";
+import type { TuiHandle, MountableStore, MountTuiOptions } from "./mount.tsx";
+
+const SHOW_CURSOR = "\u001B[?25h";
+
+afterEach(() => {
+  // §U8 hygiene: module-global seams must never leak across the suite
+  setLogSink(null);
+  setLogTap(null);
+  setProgressSink(null);
+  resetTuiFailure();
+});
+
+// ---- fakes -----------------------------------------------------------------------------------
+class FakeStream extends EventEmitter {
+  writes: string[] = [];
+  isTTY = true;
+  columns = 100;
+  rows = 30;
+  throwOnWrite: Error | null = null;
+  write = (chunk: unknown, encodingOrCb?: unknown, maybeCb?: unknown): boolean => {
+    const cb = typeof encodingOrCb === "function" ? (encodingOrCb as (e?: Error | null) => void) : typeof maybeCb === "function" ? (maybeCb as (e?: Error | null) => void) : undefined;
+    if (this.throwOnWrite !== null) throw this.throwOnWrite;
+    this.writes.push(String(chunk));
+    cb?.();
+    return true;
+  };
+  all(): string {
+    return this.writes.join("");
+  }
+}
+
+interface FakeHandle extends TuiHandle {
+  calls: string[];
+  resolveExit: () => void;
+}
+function makeFakeHandle(opts: { exitMode?: "immediate" | "manual" | "never"; onDispose?: () => void; onUnmount?: () => void } = {}): FakeHandle {
+  const calls: string[] = [];
+  let resolveExit: () => void = () => {};
+  const exitPromise = new Promise<void>((r) => {
+    resolveExit = r;
+  });
+  if ((opts.exitMode ?? "immediate") === "immediate") resolveExit();
+  return {
+    calls,
+    resolveExit,
+    requestUnmount(): void {
+      calls.push("requestUnmount");
+      opts.onUnmount?.();
+      if (opts.exitMode === "manual") resolveExit();
+    },
+    waitUntilExit(): Promise<void> {
+      calls.push("waitUntilExit");
+      return exitPromise;
+    },
+    dispose(): void {
+      calls.push("dispose");
+      opts.onDispose?.();
+    },
+  };
+}
+
+interface MountCapture {
+  store: MountableStore | null;
+  opts: MountTuiOptions | null;
+}
+function makeFakeMount(handle: TuiHandle, capture: MountCapture, hooks: { beforeReturn?: (opts: MountTuiOptions) => void } = {}) {
+  return async () => ({
+    mountTui: (store: MountableStore, opts: MountTuiOptions): TuiHandle => {
+      capture.store = store;
+      capture.opts = opts;
+      hooks.beforeReturn?.(opts);
+      return handle;
+    },
+  });
+}
+
+interface FakeIo extends DivertIo {
+  opened: string[];
+  written: Array<{ fd: number; line: string }>;
+  closed: number[];
+}
+function makeFakeIo(script: { openErrors?: Array<Error | null>; writeError?: (call: number) => Error | null; closeError?: Error | null } = {}): FakeIo {
+  const opened: string[] = [];
+  const written: Array<{ fd: number; line: string }> = [];
+  const closed: number[] = [];
+  let writeCalls = 0;
+  return {
+    opened,
+    written,
+    closed,
+    open(path: string): number {
+      const idx = opened.length;
+      opened.push(path);
+      const err = script.openErrors?.[idx] ?? null;
+      if (err !== null && err !== undefined) throw err;
+      return 100 + idx;
+    },
+    write(fd: number, line: string): void {
+      const err = script.writeError?.(writeCalls++) ?? null;
+      if (err !== null) throw err;
+      written.push({ fd, line });
+    },
+    close(fd: number): void {
+      if (script.closeError) throw script.closeError;
+      closed.push(fd);
+    },
+  };
+}
+
+interface FakeTimers {
+  timers: { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout };
+  pending: Array<{ id: number; fn: () => void }>;
+  cleared: number[];
+  fireAll(): void;
+}
+function makeFakeTimers(): FakeTimers {
+  const pending: Array<{ id: number; fn: () => void }> = [];
+  const cleared: number[] = [];
+  let nextId = 1;
+  return {
+    pending,
+    cleared,
+    timers: {
+      setTimeout: ((fn: () => void) => {
+        const id = nextId++;
+        pending.push({ id, fn });
+        return id as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout,
+      clearTimeout: ((id: unknown) => {
+        cleared.push(id as number);
+        const i = pending.findIndex((p) => p.id === (id as number));
+        if (i >= 0) pending.splice(i, 1);
+      }) as typeof clearTimeout,
+    },
+    fireAll(): void {
+      for (const p of pending.splice(0)) p.fn();
+    },
+  };
+}
+
+function spyStdout(fn: () => void | Promise<void>): { calls: string[]; done: Promise<void> } {
+  const calls: string[] = [];
+  const so = spyOn(process.stdout, "write").mockImplementation(((c: unknown) => {
+    calls.push(String(c));
+    return true;
+  }) as typeof process.stdout.write);
+  const done = Promise.resolve()
+    .then(() => fn())
+    .finally(() => so.mockRestore());
+  return { calls, done };
+}
+
+const codeErr = (code: string, msg = code): Error => Object.assign(new Error(msg), { code });
+
+const until = async (cond: () => boolean, ms = 2000): Promise<boolean> => {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return cond();
+};
+
+const makeStore = (): TuiStore => createTuiStore(() => 1_000);
+
+// deps builder: everything faked; individual tests override
+function makeDeps(over: Partial<TuiDeps> & { divert?: boolean } = {}): { deps: TuiDeps; stderr: FakeStream; io: FakeIo; timers: FakeTimers; capture: MountCapture; handle: FakeHandle } {
+  const stderr = new FakeStream();
+  const io = makeFakeIo();
+  const timers = makeFakeTimers();
+  const capture: MountCapture = { store: null, opts: null };
+  const handle = makeFakeHandle();
+  const deps: TuiDeps = {
+    decision: { mode: "on", divert: over.divert ?? false },
+    mountImpl: makeFakeMount(handle, capture),
+    divertIo: io,
+    logPathFor: (attempt) => `/fake/logs/audit-log-STAMP-p1${attempt === 0 ? "" : `-${attempt + 1}`}.jsonl`,
+    timers: timers.timers,
+    streams: { stderr: stderr as unknown as NodeJS.WriteStream },
+    nowMs: () => 1_000,
+    storeImpl: () => makeStore(),
+    ...over,
+  };
+  return { deps, stderr, io, timers, capture, handle };
+}
+
+// ---- §U8.4 divert opener ---------------------------------------------------------------------
+describe("divert opener (§U8.4)", () => {
+  test("logPathFor grammar: base name for attempt 0, -2/-3… suffixes for retries", () => {
+    expect(logPathFor("/out", "20260718T211530Z", 4242, 0)).toBe("/out/logs/audit-log-20260718T211530Z-p4242.jsonl");
+    expect(logPathFor("/out", "20260718T211530Z", 4242, 1)).toBe("/out/logs/audit-log-20260718T211530Z-p4242-2.jsonl");
+    expect(logPathFor("/out", "20260718T211530Z", 4242, 9)).toBe("/out/logs/audit-log-20260718T211530Z-p4242-10.jsonl");
+  });
+
+  test("utcLogStamp: compact UTC, no separators, second precision", () => {
+    expect(utcLogStamp(new Date("2026-07-18T21:15:30.123Z"))).toBe("20260718T211530Z");
+    expect(utcLogStamp(new Date("2026-01-02T03:04:05.000Z"))).toBe("20260102T030405Z");
+  });
+
+  test("EEXIST retries select the suffixed candidate; the ACTUAL path reaches the divert event and exit line", async () => {
+    const { deps, stderr, capture } = makeDeps({ divert: true });
+    const scripted = makeFakeIo({ openErrors: [codeErr("EEXIST"), codeErr("EEXIST"), null] });
+    deps.divertIo = scripted;
+    const divertEvents: string[] = [];
+    deps.storeImpl = () => {
+      const s = makeStore();
+      const orig = s.dispatch.bind(s);
+      s.dispatch = (e) => {
+        if (e.type === "divert") divertEvents.push(e.path);
+        orig(e);
+      };
+      return s;
+    };
+    await runWithTui(deps, async () => {});
+    expect(scripted.opened.length).toBe(3);
+    const actual = "/fake/logs/audit-log-STAMP-p1-3.jsonl"; // the THIRD candidate (attempt 2)
+    expect(scripted.opened[2]).toBe(actual);
+    expect(divertEvents).toEqual([actual]); // the footer sees the ACTUAL suffixed path
+    expect(stderr.all()).toContain(`JSONL log: ${actual}`); // so does the exit line
+    void capture;
+  });
+
+  test("bounded exhaustion (all EEXIST) degrades — body still runs bare with JSONL on stdout, never fatal", async () => {
+    const scripted = makeFakeIo({ openErrors: Array.from({ length: DIVERT_OPEN_ATTEMPTS }, () => codeErr("EEXIST")) });
+    const { deps, stderr, handle } = makeDeps({ divert: true });
+    deps.divertIo = scripted;
+    let bodyRan = false;
+    const { calls, done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {
+        bodyRan = true;
+        logLine({ event: "done" });
+      });
+    });
+    await done;
+    expect(bodyRan).toBe(true);
+    expect(scripted.opened.length).toBe(DIVERT_OPEN_ATTEMPTS);
+    expect(calls).toContain(`{"event":"done"}\n`); // JSONL on stdout, not lost
+    expect(stderr.all()).toContain("dashboard disabled"); // warned once
+    expect(handle.calls).toContain("requestUnmount"); // the just-mounted dashboard was torn down
+  });
+
+  test("a non-EEXIST open failure degrades immediately without exhausting the attempts", async () => {
+    const scripted = makeFakeIo({ openErrors: [codeErr("EACCES", "permission denied")] });
+    const { deps, stderr } = makeDeps({ divert: true });
+    deps.divertIo = scripted;
+    const { done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {});
+    });
+    await done;
+    expect(scripted.opened.length).toBe(1); // no pointless retries of a non-collision failure
+    expect(stderr.all()).toContain("permission denied");
+  });
+
+  test("realDivertIo.write delivers whole lines through short writes and rejects a <=0 count", () => {
+    // exercised against a REAL fd so the loop's writeSync contract stays honest
+    const dir = mkdtempSync(join(tmpdir(), "tui-divert-"));
+    try {
+      const path = join(dir, "log.jsonl");
+      const fd = realDivertIo.open(path);
+      realDivertIo.write(fd, '{"event":"a"}\n');
+      realDivertIo.write(fd, '{"event":"b"}\n');
+      realDivertIo.close(fd);
+      expect(readFileSync(path, "utf8")).toBe('{"event":"a"}\n{"event":"b"}\n');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("realDivertIo.open creates the logs dir and refuses to clobber (wx: EEXIST on collision)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tui-divert-"));
+    try {
+      const path = join(dir, "logs", "x.jsonl"); // logs/ does not exist yet
+      const fd = realDivertIo.open(path);
+      realDivertIo.close(fd);
+      expect(() => realDivertIo.open(path)).toThrow(); // exclusive create
+      try {
+        realDivertIo.open(path);
+      } catch (e) {
+        expect((e as { code?: string }).code).toBe("EEXIST");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("makeDivertPathFor returns the CANONICAL contained path and rejects traversal/symlink escapes", () => {
+    const root = mkdtempSync(join(tmpdir(), "tui-contain-"));
+    try {
+      const outDir = join(root, "out");
+      mkdirSync(outDir, { recursive: true });
+      const ok = makeDivertPathFor(outDir, "20260718T000000Z", 7)(0);
+      // CANONICAL: symlinked parents (macOS /var → /private/var) resolve — the opened path is
+      // the one that actually passed containment, not the lexical join
+      expect(ok).toBe(join(realpathSync(outDir), "logs", "audit-log-20260718T000000Z-p7.jsonl"));
+      // a symlinked logs dir pointing OUTSIDE the outputDir is followed and rejected — the
+      // classic symlink+containment escape assertContained exists to close
+      const evil = join(root, "elsewhere");
+      mkdirSync(evil, { recursive: true });
+      symlinkSync(evil, join(outDir, "logs"));
+      expect(() => makeDivertPathFor(outDir, "S", 7)(0)).toThrow(ReadOnlyViolation);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a containment failure inside the open loop degrades (open failure), never fatal", async () => {
+    const { deps, stderr } = makeDeps({ divert: true });
+    deps.logPathFor = () => {
+      throw new ReadOnlyViolation("READ-ONLY VIOLATION: escape");
+    };
+    let bodyRan = false;
+    const { done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {
+        bodyRan = true;
+      });
+    });
+    await done;
+    expect(bodyRan).toBe(true);
+    expect(stderr.all()).toContain("dashboard disabled");
+  });
+
+  test("close failure at teardown warns, nothing more", async () => {
+    const scripted = makeFakeIo({ closeError: codeErr("EBADF", "bad fd") });
+    const { deps, stderr } = makeDeps({ divert: true });
+    deps.divertIo = scripted;
+    await runWithTui(deps, async () => {});
+    expect(stderr.all()).toContain("teardown warnings");
+    expect(stderr.all()).toContain("bad fd");
+    expect(stderr.all()).toContain("JSONL log: "); // the exit line still printed
+  });
+});
+
+// ---- §U8.13a sealable proxy ------------------------------------------------------------------
+describe("sealable stderr proxy (§U8.13a)", () => {
+  test("transparent delegation: isTTY/columns/rows and resize listeners reach the real stream, live AND sealed", () => {
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    const s = proxy.stream as unknown as FakeStream;
+    expect(s.isTTY).toBe(true);
+    expect(s.columns).toBe(100);
+    expect(s.rows).toBe(30);
+    let resizes = 0;
+    s.on("resize", () => resizes++);
+    real.emit("resize");
+    expect(resizes).toBe(1); // registered on the REAL stream
+    proxy.seal();
+    expect(s.isTTY).toBe(true); // delegated properties keep answering after seal
+    expect(s.columns).toBe(100);
+    real.emit("resize");
+    expect(resizes).toBe(2);
+    real.columns = 55;
+    expect(s.columns).toBe(55); // live value, not a snapshot
+    proxy.detach();
+  });
+
+  test("live writes pass through; sealed writes are counted-and-dropped with callbacks still acknowledged", () => {
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    const s = proxy.stream as unknown as { write: (c: string, cb?: () => void) => boolean };
+    s.write("frame-1");
+    expect(real.all()).toBe("frame-1");
+    proxy.seal();
+    let acked = 0;
+    expect(s.write("frame-2", () => acked++)).toBe(true);
+    s.write("frame-3");
+    expect(real.all()).toBe("frame-1"); // nothing reached the real stream
+    expect(proxy.sealedDrops).toBe(2);
+    expect(acked).toBe(1); // Ink's flush-sync callback must complete or waitUntilExit hangs
+  });
+
+  test("absorbing: a synchronous write throw is consumed, latched via the failure channel, callback acknowledged", () => {
+    const real = new FakeStream();
+    real.throwOnWrite = new Error("EIO");
+    const causes: string[] = [];
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, (c) => causes.push(c));
+    const s = proxy.stream as unknown as { write: (c: string, cb?: () => void) => boolean };
+    let acked = 0;
+    expect(() => s.write("frame", () => acked++)).not.toThrow(); // nothing escapes into Ink/React
+    expect(acked).toBe(1);
+    expect(causes.length).toBe(1);
+    expect(causes[0]).toContain("EIO");
+    proxy.detach();
+  });
+
+  test("absorbing: a write-callback error is consumed and Ink's own callback still completes without it", () => {
+    const real = new FakeStream();
+    // a real stream reporting failure via the callback
+    real.write = ((c: unknown, cb?: (e?: Error | null) => void): boolean => {
+      cb?.(new Error("backpressure fail"));
+      return true;
+    }) as FakeStream["write"];
+    const causes: string[] = [];
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, (c) => causes.push(c));
+    const s = proxy.stream as unknown as { write: (c: string, cb?: (e?: Error | null) => void) => boolean };
+    const seen: Array<Error | null | undefined> = [];
+    s.write("frame", (e) => seen.push(e));
+    expect(seen).toEqual([undefined]); // acknowledged COMPLETE — the error never reaches Ink
+    expect(causes[0]).toContain("backpressure fail");
+    proxy.detach();
+  });
+
+  test("absorbing: a stream 'error' event is consumed (latched, no crash)", () => {
+    const real = new FakeStream();
+    const causes: string[] = [];
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, (c) => causes.push(c));
+    expect(() => real.emit("error", new Error("stream died"))).not.toThrow(); // absorbed by our listener
+    expect(causes[0]).toContain("stream died");
+    proxy.detach();
+    // after detach the absorber is gone (the emitter would now throw on an unhandled 'error')
+    expect(real.listenerCount("error")).toBe(0);
+  });
+
+  test("seal is idempotent; sealEarly seals AND writes the cursor-show escape ONCE to the real stream", () => {
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    proxy.sealEarly();
+    expect(proxy.sealed).toBe(true);
+    expect(proxy.cursorCompensated).toBe(true);
+    expect(real.all()).toBe(SHOW_CURSOR); // compensation in the SAME synchronous step
+    proxy.sealEarly(); // idempotent: no second escape
+    proxy.seal();
+    expect(real.all()).toBe(SHOW_CURSOR);
+    proxy.detach();
+  });
+
+  test("plain seal() does NOT write the cursor escape (unmount already restored it)", () => {
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    proxy.seal();
+    expect(proxy.cursorCompensated).toBe(false);
+    expect(real.all()).toBe("");
+    proxy.detach();
+  });
+
+  test("ink-facing dimension pin: positive integers delegate; non-renderable values pin to the LAST KNOWN GOOD geometry; getRawDims reports the truth", () => {
+    // A RECORDED DEVIATION from the §U1 delegation letter, grounded in §U0: ink's internal
+    // layout consults a helper that can shell out when `columns && rows` is falsy — the proxy
+    // never hands ink a non-renderable dimension, while getRawDims() keeps the App honest. The
+    // pin is the LAST usable geometry (ink's erase/viewport math stays coherent with what is
+    // actually on screen when the terminal stops reporting), 80x24 only before any usable read.
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    const s = proxy.stream; // typed DimsAwareStream — columns/rows (pinned) + getRawDims() (raw), no re-declared shape
+    expect(s.columns).toBe(100); // real positive integers delegate untouched (live, per test above)
+    expect(s.rows).toBe(30);
+    for (const v of [undefined, 0, -1, 3.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      (real as unknown as { columns: unknown }).columns = v;
+      (real as unknown as { rows: unknown }).rows = v;
+      expect({ v, columns: s.columns, rows: s.rows }).toEqual({ v, columns: 100, rows: 30 }); // ink keeps the last real geometry
+      const expectedRaw = typeof v === "number" ? v : undefined;
+      expect({ v, raw: s.getRawDims() }).toEqual({ v, raw: { columns: expectedRaw, rows: expectedRaw } });
+    }
+    // a NEW usable geometry updates the pin...
+    (real as unknown as { columns: unknown }).columns = 55;
+    (real as unknown as { rows: unknown }).rows = 20;
+    expect({ c: s.columns, r: s.rows }).toEqual({ c: 55, r: 20 });
+    (real as unknown as { columns: unknown }).columns = Number.NaN;
+    (real as unknown as { rows: unknown }).rows = 0;
+    expect({ c: s.columns, r: s.rows }).toEqual({ c: 55, r: 20 }); // ...and survives the next loss
+    proxy.detach();
+  });
+
+  test("a proxy that NEVER saw usable dimensions pins to ink's 80x24 defaults", () => {
+    const real = new FakeStream();
+    (real as unknown as { columns: unknown }).columns = undefined;
+    (real as unknown as { rows: unknown }).rows = undefined;
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    const s = proxy.stream as unknown as { columns: number; rows: number };
+    expect({ c: s.columns, r: s.rows }).toEqual({ c: 80, r: 24 });
+    proxy.detach();
+  });
+
+  test("seal() then sealEarly(): the late sealEarly STILL compensates, exactly once (the contract is seal+show)", () => {
+    // A teardown's plain step-3 seal can race ahead of a mount-failure path's sealEarly — the
+    // late caller still owes the cursor show; compensateCursor's once-flag carries the
+    // idempotence (a redundant show when the cursor is visible is a terminal no-op).
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    proxy.seal();
+    expect(real.all()).toBe(""); // plain seal alone writes nothing
+    proxy.sealEarly();
+    expect(proxy.cursorCompensated).toBe(true);
+    expect(real.all()).toBe(SHOW_CURSOR);
+    proxy.sealEarly(); // still once
+    expect(real.all()).toBe(SHOW_CURSOR);
+    proxy.detach();
+  });
+
+  test("a THROWING ink callback through a synchronously-acknowledging stream is invoked exactly once, absorbed, never re-thrown", () => {
+    // FakeStream acknowledges synchronously — the shape that let the old ack path double-fire:
+    // the callback's throw propagated up through real.write into the proxy's catch, which
+    // re-invoked the callback and let the SECOND throw escape into the caller (Ink internals).
+    const causes: string[] = [];
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, (c) => causes.push(c));
+    const s = proxy.stream as unknown as { write: (c: string, cb?: () => void) => boolean };
+    let invocations = 0;
+    expect(() =>
+      s.write("frame", () => {
+        invocations++;
+        throw new Error("ink callback exploded");
+      }),
+    ).not.toThrow();
+    expect(invocations).toBe(1); // exactly once — never the double-invoke
+    expect(real.all()).toBe("frame"); // the write itself still landed
+    expect(causes.some((c) => c.includes("ink write callback threw") && c.includes("ink callback exploded"))).toBe(true);
+    proxy.detach();
+  });
+
+  test("a THROWING ink callback on the SEALED branch is absorbed too — the drop still counts", () => {
+    const causes: string[] = [];
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, (c) => causes.push(c));
+    const s = proxy.stream as unknown as { write: (c: string, cb?: () => void) => boolean };
+    proxy.seal();
+    let invocations = 0;
+    expect(() =>
+      s.write("late-frame", () => {
+        invocations++;
+        throw new Error("sealed cb throw");
+      }),
+    ).not.toThrow();
+    expect(invocations).toBe(1);
+    expect(proxy.sealedDrops).toBe(1);
+    expect(real.all()).toBe(""); // dropped, as sealed writes must be
+    expect(causes.some((c) => c.includes("sealed cb throw"))).toBe(true);
+    proxy.detach();
+  });
+
+  test("a stream that THROWS on write still acknowledges ink's callback exactly once (no ack, no flush-sync resolution — a hang)", () => {
+    const real = new FakeStream();
+    real.throwOnWrite = new Error("EIO");
+    const causes: string[] = [];
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, (c) => causes.push(c));
+    const s = proxy.stream as unknown as { write: (c: string, cb?: () => void) => boolean };
+    let acks = 0;
+    expect(s.write("frame", () => acks++)).toBe(true);
+    expect(acks).toBe(1);
+    expect(causes.some((c) => c.includes("stderr write threw") && c.includes("EIO"))).toBe(true);
+    proxy.detach();
+  });
+
+  test("compensateCursor clears its once-flag when the failure arrives through the CALLBACK — a later site retries", () => {
+    // A write can return normally and still fail: the stream reports the error via the
+    // callback. A sync-success-only flag would have recorded a compensation that never landed.
+    const real = new FakeStream();
+    const failure: { err: Error | null } = { err: new Error("EIO reported via callback") };
+    real.write = ((chunk: unknown, encodingOrCb?: unknown, maybeCb?: unknown): boolean => {
+      const cb =
+        typeof encodingOrCb === "function"
+          ? (encodingOrCb as (e?: Error | null) => void)
+          : typeof maybeCb === "function"
+            ? (maybeCb as (e?: Error | null) => void)
+            : undefined;
+      if (failure.err !== null) {
+        cb?.(failure.err); // reported through the callback, not a throw
+        return true;
+      }
+      real.writes.push(String(chunk));
+      cb?.();
+      return true;
+    }) as typeof real.write;
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    proxy.compensateCursor();
+    expect(proxy.cursorCompensated).toBe(false); // the callback said it never landed
+    expect(real.all()).toBe("");
+    failure.err = null; // the stream recovers
+    proxy.compensateCursor();
+    expect(proxy.cursorCompensated).toBe(true);
+    expect(real.all()).toBe(SHOW_CURSOR);
+    proxy.detach();
+  });
+});
+
+// ---- §U8.13 lifecycle ------------------------------------------------------------------------
+describe("runWithTui lifecycle (§U8.13)", () => {
+  test("decision off is a pure passthrough: no proxy, no seams, body result returned", async () => {
+    const { deps, stderr } = makeDeps();
+    deps.decision = { mode: "off" };
+    const { calls, done } = spyStdout(async () => {
+      const r = await runWithTui(deps, async () => {
+        logLine({ event: "done" });
+        return 42;
+      });
+      expect(r).toBe(42);
+    });
+    await done;
+    expect(calls).toEqual([`{"event":"done"}\n`]);
+    expect(stderr.writes).toEqual([]);
+    expect(hasProgressSink()).toBe(false);
+  });
+
+  test("clean mounted run: sink+tap installed, teardown ordering, THEN return (§U6 sequence)", async () => {
+    const order: string[] = [];
+    const handle = makeFakeHandle({ exitMode: "manual" });
+    const origDispose = handle.dispose.bind(handle);
+    handle.dispose = () => {
+      order.push("dispose");
+      origDispose();
+    };
+    const origUnmount = handle.requestUnmount.bind(handle);
+    handle.requestUnmount = () => {
+      order.push("unmount");
+      origUnmount();
+    };
+    const capture: MountCapture = { store: null, opts: null };
+    const io = makeFakeIo();
+    const scriptedIo: DivertIo = {
+      open: (p) => io.open(p),
+      write: (fd, line) => io.write(fd, line),
+      close: (fd) => {
+        order.push("close");
+        io.close(fd);
+      },
+    };
+    const { deps, stderr } = makeDeps({ divert: true });
+    deps.mountImpl = makeFakeMount(handle, capture);
+    deps.divertIo = scriptedIo;
+    const { calls, done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {
+        expect(hasProgressSink()).toBe(true); // guarded sink installed
+        logLine({ event: "unit", action: "scanned" }); // → divert file, tapped into the store
+        emitProgress({ type: "phase", phase: "scan" });
+        order.push("body");
+      });
+      order.push("returned");
+    });
+    await done;
+    expect(calls).toEqual([]); // NOTHING on stdout in the diverted run
+    expect(io.written.map((w) => w.line)).toEqual([`{"event":"unit","action":"scanned"}\n`]);
+    expect(order).toEqual(["body", "dispose", "unmount", "close", "returned"]);
+    expect(stderr.all()).toContain("JSONL log: "); // complete-file wording
+    expect(stderr.all()).not.toContain("partial");
+    expect(hasProgressSink()).toBe(false); // seams cleared
+    expect(tuiFailure()).toBeNull(); // no warning in a clean run
+    expect(stderr.all()).not.toContain("dashboard disabled");
+  });
+
+  test("mount failure (import rejects): body still runs, JSONL on stdout, ONE warning", async () => {
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = async () => {
+      throw new Error("ink is broken");
+    };
+    let bodyRan = false;
+    const { calls, done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {
+        bodyRan = true;
+        logLine({ event: "done" });
+        expect(hasProgressSink()).toBe(false); // nothing installed after a mount failure
+      });
+    });
+    await done;
+    expect(bodyRan).toBe(true);
+    expect(calls).toContain(`{"event":"done"}\n`);
+    const warnings = stderr.writes.filter((w) => w.includes("dashboard disabled"));
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("ink is broken");
+  });
+
+  test("mountTui throwing synchronously is the same mount-failure path", async () => {
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = async () => ({
+      mountTui: () => {
+        throw new Error("render exploded");
+      },
+    });
+    let bodyRan = false;
+    await runWithTui(deps, async () => {
+      bodyRan = true;
+    });
+    expect(bodyRan).toBe(true);
+    expect(stderr.all()).toContain("render exploded");
+  });
+
+  test("divert open failure: teardown AWAITED before the body proceeds (no live-frame/stdout overlap)", async () => {
+    const scripted = makeFakeIo({ openErrors: [codeErr("EACCES", "nope")] });
+    const order: string[] = [];
+    const handle = makeFakeHandle({ exitMode: "manual", onUnmount: () => order.push("unmount") });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps } = makeDeps({ divert: true });
+    deps.divertIo = scripted;
+    deps.mountImpl = makeFakeMount(handle, capture);
+    const { done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {
+        order.push("body");
+      });
+    });
+    await done;
+    expect(order).toEqual(["unmount", "body"]); // the frame came down BEFORE the body started
+  });
+
+  test("divert write failure mid-body: seal-before-re-emit, no loss, immediate teardown, partial wording, cursor escape", async () => {
+    const scripted = makeFakeIo({ writeError: (call) => (call === 1 ? codeErr("ENOSPC", "disk full") : null) });
+    const handle = makeFakeHandle({ exitMode: "manual" });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps({ divert: true });
+    deps.divertIo = scripted;
+    deps.mountImpl = makeFakeMount(handle, capture);
+    const { calls, done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {
+        logLine({ event: "unit", action: "a" }); // write 0: lands in the file
+        const framesBefore = stderr.writes.length;
+        logLine({ event: "unit", action: "b" }); // write 1: ENOSPC → the whole transition
+        // the transition was SYNCHRONOUS within that logLine call:
+        expect(hasProgressSink()).toBe(true); // progress sink untouched by a DIVERT failure
+        // ... the proxy sealed BEFORE the re-emit — a frame write after the failure is dropped:
+        capture.opts!.out.write("late-frame");
+        expect(stderr.writes.length).toBe(framesBefore + 1); // ONLY the cursor escape landed
+        expect(stderr.writes[framesBefore]).toBe(SHOW_CURSOR); // sealEarly compensation
+        expect(handle.calls).toContain("requestUnmount"); // teardown started immediately
+        logLine({ event: "unit", action: "c" }); // post-failure events flow to stdout
+      });
+    });
+    await done;
+    // no event lost: a→file, b→stdout (re-emitted), c→stdout
+    expect(scripted.written.map((w) => w.line)).toEqual([`{"event":"unit","action":"a"}\n`]);
+    expect(calls).toEqual([`{"event":"unit","action":"b"}\n`, `{"event":"unit","action":"c"}\n`]);
+    const exitLine = stderr.writes.find((w) => w.includes("JSONL log"));
+    expect(exitLine).toContain("partial — divert failed mid-run");
+    expect(exitLine).toContain("/fake/logs/audit-log-STAMP-p1.jsonl"); // the ACTUAL path
+    expect(stderr.all()).toContain("dashboard disabled — "); // the ONE latched warning
+    expect(stderr.all()).toContain("disk full");
+  });
+
+  test("a NON-divert degrade mid-body (throwing store.dispatch) clears the sink synchronously and yields the closed-early partial wording", async () => {
+    const handle = makeFakeHandle({ exitMode: "manual" });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps({ divert: true });
+    deps.mountImpl = makeFakeMount(handle, capture);
+    let dispatches = 0;
+    deps.storeImpl = () => {
+      const s = makeStore();
+      return {
+        get version() {
+          return s.version;
+        },
+        snapshot: () => s.snapshot(),
+        dispatch(e: ProgressEvent): void {
+          dispatches++;
+          if (e.type === "phase") throw new Error("fold bug");
+          s.dispatch(e);
+        },
+      };
+    };
+    const { done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {
+        emitProgress({ type: "phase", phase: "scan" }); // → dispatch throws
+        expect(hasProgressSink()).toBe(false); // cleared SYNCHRONOUSLY in the guarded closure
+        emitProgress({ type: "phase", phase: "report" }); // no-op: zero further dispatches
+        expect(handle.calls).toContain("requestUnmount"); // degraded immediately, no tick involved
+      });
+    });
+    await done;
+    expect(dispatches).toBe(2); // the divert event + the throwing phase — nothing after the clear
+    expect(tuiFailure()?.firstCause).toBe("fold bug");
+    expect(tuiFailure()?.divertFailedMidRun).toBe(false); // NOT a divert failure…
+    const exitLine = stderr.writes.find((w) => w.includes("JSONL log"));
+    expect(exitLine).toContain("partial — dashboard ended mid-run"); // …but the file is still partial
+  });
+
+  test("bounded-exit timeout is DETERMINISTIC via injected timers; the sealed proxy drops and COUNTS a wedged mount's late writes into the warning", async () => {
+    const handle = makeFakeHandle({ exitMode: "never" }); // waitUntilExit NEVER settles (wedged Ink)
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps({ divert: true });
+    // a "late Ink write" arriving DURING teardown (after the seal, before the warning): the
+    // close step stands in for it — anything through the proxy at that point must be dropped
+    // and COUNTED into the step-6 warning.
+    deps.divertIo = {
+      open: () => 7,
+      write: () => {},
+      close: () => {
+        capture.opts!.out.write("late-frame-during-teardown");
+      },
+    };
+    deps.mountImpl = makeFakeMount(handle, capture);
+    let resolved = false;
+    const p = runWithTui(deps, async () => {
+      reportTuiFailure("wedged ink"); // latch a cause so the step-6 warning prints
+    }).then(() => {
+      resolved = true;
+    });
+    // teardown is now waiting on waitUntilExit, which never settles — ONLY the injected timer
+    // can free it, making the timeout path fully deterministic
+    await until(() => timers.pending.length > 0);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(resolved).toBe(false); // provably blocked on the injected timer
+    timers.fireAll();
+    await until(() => resolved);
+    await p;
+    expect(stderr.all()).not.toContain("late-frame-during-teardown"); // sealed off, never reached the stream
+    expect(stderr.all()).toContain("dashboard disabled — wedged ink (1 suppressed frame write)"); // …and counted
+  });
+
+  test("exit wait clears the loser timer when the unmount settles first", async () => {
+    const handle = makeFakeHandle({ exitMode: "manual" });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, timers } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    await runWithTui(deps, async () => {});
+    expect(timers.cleared.length).toBeGreaterThanOrEqual(1); // the loser timer was cleared
+    expect(timers.pending.length).toBe(0); // nothing leaked
+  });
+
+  test("teardown re-entry: a SYNCHRONOUSLY-reentrant handle (dispose/unmount call degradeNow) runs the sequence ONCE", async () => {
+    let degradeRef: (() => void) | null = null;
+    const handle = makeFakeHandle({
+      exitMode: "manual",
+      onDispose: () => degradeRef?.(),
+      onUnmount: () => degradeRef?.(),
+    });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps } = makeDeps({ divert: true });
+    const io = deps.divertIo as FakeIo;
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        degradeRef = opts.onDegrade; // the fake handle re-enters teardown from INSIDE its steps
+      },
+    });
+    const { done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {});
+    });
+    await done;
+    expect(handle.calls.filter((c) => c === "dispose").length).toBe(1);
+    expect(handle.calls.filter((c) => c === "requestUnmount").length).toBe(1);
+    expect(io.closed.length).toBe(1); // the fd closed exactly once
+  });
+
+  test("mount-time degrade before the handle exists: null-handle teardown + FULL unwind of the late handle, nothing installed", async () => {
+    const handle = makeFakeHandle({ exitMode: "manual" });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps } = makeDeps({ divert: true });
+    const io = deps.divertIo as FakeIo;
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.onDegrade(); // an error boundary firing before mountTui returns its handle
+      },
+    });
+    const seen = { sinkDuringBody: null as boolean | null };
+    const { calls, done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {
+        seen.sinkDuringBody = hasProgressSink();
+        logLine({ event: "done" });
+      });
+    });
+    await done;
+    expect(seen.sinkDuringBody).toBe(false); // no sink/tap ever installed into the dead lifecycle
+    expect(io.opened.length).toBe(0); // the divert was never opened
+    expect(calls).toContain(`{"event":"done"}\n`); // JSONL stayed on stdout
+    // the LATE-ARRIVING handle was fully unwound: dispose AND requestUnmount (+ bounded wait)
+    expect(handle.calls).toContain("dispose");
+    expect(handle.calls).toContain("requestUnmount");
+  });
+
+  test("setup-final state check: a synchronous setup-time degrade (divert event trips a throwing sink) means body() starts only after the awaited teardown", async () => {
+    const order: string[] = [];
+    const handle = makeFakeHandle({ exitMode: "manual", onUnmount: () => order.push("unmount") });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps } = makeDeps({ divert: true });
+    deps.mountImpl = makeFakeMount(handle, capture);
+    deps.storeImpl = () => {
+      const s = makeStore();
+      s.dispatch = (e: ProgressEvent): void => {
+        if (e.type === "divert") throw new Error("setup-time fold bug"); // trips DURING setup
+      };
+      return s;
+    };
+    const { done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {
+        order.push("body");
+      });
+    });
+    await done;
+    expect(order).toEqual(["unmount", "body"]); // never mid-collapse: teardown finished first
+    expect(tuiFailure()?.firstCause).toBe("setup-time fold bug");
+  });
+
+  test("a throwing teardown step defers to a warning and never masks a propagating body error", async () => {
+    const handle = makeFakeHandle({ exitMode: "manual" });
+    handle.dispose = () => {
+      handle.calls.push("dispose");
+      throw new Error("dispose exploded");
+    };
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    await expect(
+      runWithTui(deps, async () => {
+        throw new Error("payload error");
+      }),
+    ).rejects.toThrow("payload error"); // the body error survives teardown
+    expect(stderr.all()).toContain("teardown warnings");
+    expect(stderr.all()).toContain("dispose exploded");
+  });
+
+  test("a CLEAN wedged unmount (no prior latch) is NOT silent success: the timeout surfaces as a teardown warning and the cursor is restored", async () => {
+    const handle = makeFakeHandle({ exitMode: "never" }); // wedged: waitUntilExit never settles
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    let resolved = false;
+    const p = runWithTui(deps, async () => {}).then(() => {
+      resolved = true;
+    });
+    await until(() => timers.pending.length > 0);
+    timers.fireAll(); // the bounded wait times out
+    await until(() => resolved);
+    await p;
+    // NOTHING latched — yet the incomplete unmount must still be one visible line, not silence
+    expect(stderr.all()).toContain("teardown warnings");
+    expect(stderr.all()).toContain("unmount did not complete cleanly (timeout)");
+    expect(stderr.all()).not.toContain("dashboard disabled"); // no latch → no failure warning
+    // ...and the wedged Ink never restored the cursor; the seal would drop its late attempt —
+    // teardown compensates on its behalf
+    expect(stderr.all()).toContain(SHOW_CURSOR);
+  });
+
+  test("a REJECTING waitUntilExit at teardown surfaces as a warning too", async () => {
+    const handle = makeFakeHandle({ exitMode: "never" });
+    handle.waitUntilExit = () => {
+      handle.calls.push("waitUntilExit");
+      return Promise.reject(new Error("exit machinery broke"));
+    };
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    await runWithTui(deps, async () => {});
+    expect(stderr.all()).toContain("unmount did not complete cleanly (wait-rejected)");
+    expect(stderr.all()).toContain("unmount wait rejected: exit machinery broke"); // the REASON, not just the label
+    expect(stderr.all()).toContain(SHOW_CURSOR); // rejection = no clean restore either
+  });
+
+  test("a SYNCHRONOUSLY-throwing waitUntilExit at teardown surfaces outcome AND cause", async () => {
+    const handle = makeFakeHandle({ exitMode: "never" });
+    handle.waitUntilExit = () => {
+      throw new Error("wait plumbing exploded");
+    };
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    const r = await runWithTui(deps, async () => 3);
+    expect(r).toBe(3);
+    expect(stderr.all()).toContain("unmount did not complete cleanly (wait-threw)");
+    expect(stderr.all()).toContain("unmount wait threw: wait plumbing exploded");
+    expect(stderr.all()).toContain(SHOW_CURSOR);
+  });
+
+  test("compensateCursor does NOT consume its once-flag on a throwing write — a later site retries successfully", () => {
+    const real = new FakeStream();
+    const proxy = makeSealableStderr(real as unknown as NodeJS.WriteStream, () => {});
+    real.throwOnWrite = new Error("transient EIO");
+    proxy.compensateCursor(); // best-effort attempt against a broken stream
+    expect(proxy.cursorCompensated).toBe(false); // the attempt did not count
+    expect(real.all()).toBe("");
+    real.throwOnWrite = null; // the stream recovers
+    proxy.compensateCursor(); // e.g. step 5a's belt-and-braces net
+    expect(proxy.cursorCompensated).toBe(true);
+    expect(real.all()).toBe(SHOW_CURSOR); // one hide can never end with zero successful shows
+    proxy.compensateCursor();
+    expect(real.all()).toBe(SHOW_CURSOR); // still exactly once on success
+    proxy.detach();
+  });
+
+  test("writeAllSync delivers whole lines through SHORT writes and fails on nonpositive, non-integer, and OVERSHOOTING counts", async () => {
+    const { writeAllSync } = await import("./lifecycle.ts");
+    // short-write sequence: deliver 3 bytes, then 1, then the rest
+    const chunks: Array<{ offset: number; wrote: number }> = [];
+    const script = [3, 1, 100];
+    let call = 0;
+    writeAllSync(
+      (fd, buf, offset) => {
+        const n = Math.min(script[call++] ?? 100, buf.length - offset);
+        chunks.push({ offset, wrote: n });
+        return n;
+      },
+      7,
+      '{"event":"x"}\n',
+    );
+    expect(chunks.map((c) => c.offset)).toEqual([0, 3, 4]); // resumed exactly where it left off
+    expect(chunks.reduce((s, c) => s + c.wrote, 0)).toBe(14); // the WHOLE line delivered
+    // nonpositive, non-integer, and OVERSHOOTING counts are WRITE FAILURES — no-progress
+    // retries would hang, and a count above the remaining bytes claims a delivery the writer
+    // cannot have performed ("line\n" is 5 bytes; 6 overshoots from the first call)
+    for (const bad of [0, -1, 0.5, NaN, Infinity, 6]) {
+      expect(() => writeAllSync(() => bad, 7, "line\n")).toThrow(/invalid count/);
+    }
+    // an overshoot on a LATER call — after honest progress — fails identically (99 > 2 remaining)
+    let laterCalls = 0;
+    expect(() => writeAllSync(() => (laterCalls++ === 0 ? 3 : 99), 7, "line\n")).toThrow(/invalid count/);
+  });
+
+  test("TOTAL teardown under a THROWING injected timer: the audit still completes, never hangs — and the warning names outcome AND cause", async () => {
+    // §U0 has no exceptions: a broken timer dep must not leave the cached teardown promise
+    // pending (the finally would await forever — a hang is a kill).
+    const handle = makeFakeHandle({ exitMode: "never" }); // exit never settles either — worst case
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    deps.timers = {
+      setTimeout: (() => {
+        throw new Error("timer subsystem broken");
+      }) as unknown as typeof setTimeout,
+      clearTimeout: (() => {
+        throw new Error("clear broken");
+      }) as unknown as typeof clearTimeout,
+    };
+    const r = await runWithTui(deps, async () => 7); // must resolve, not hang
+    expect(r).toBe(7);
+    // §U6 observability: the deferred warning carries BOTH the explicit ExitOutcome string and
+    // the underlying cause delivered through the warn collector (the outcome alone predates it)
+    expect(stderr.all()).toContain("unmount did not complete cleanly (timer-failed)");
+    expect(stderr.all()).toContain("timer create failed: timer subsystem broken");
+    // and a handle that never exited cleanly gets its cursor compensated (step 5a)
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1);
+  });
+
+  test("a THROWING clearTimeout surfaces as a deferred warning (sanitized); the wait still exits cleanly; the leaked one-shot is inert", async () => {
+    const handle = makeFakeHandle({ exitMode: "manual" }); // unmount resolves the exit — the timer is the loser
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    const leaked: Array<() => void> = [];
+    deps.timers = {
+      setTimeout: ((fn: () => void) => {
+        leaked.push(fn);
+        return leaked.length as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout,
+      clearTimeout: (() => {
+        throw new Error("clear \u001B[31mboom\u001B[0m"); // hostile bytes through the new warn channel
+      }) as unknown as typeof clearTimeout,
+    };
+    const r = await runWithTui(deps, async () => 5);
+    expect(r).toBe(5);
+    expect(stderr.all()).toContain("timer clear failed: clear boom"); // errText stripped the CSI bytes
+    expect(stderr.all()).not.toContain("\u001B[31m"); // no raw control bytes reached the terminal
+    expect(stderr.all()).not.toContain("did not complete cleanly"); // the wait itself exited cleanly
+    const before = stderr.writes.length;
+    for (const fn of leaked.splice(0)) fn(); // the leaked ≤2s one-shot fires later: the settled guard makes it a no-op
+    expect(stderr.writes.length).toBe(before);
+  });
+
+  test("mountTui throwing AFTER a renderer could exist: the proxy is SEALED so a leaked Ink cannot smear the bare run", async () => {
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    const handle = makeFakeHandle();
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: () => {
+        throw new Error("post-render mount explosion"); // opts captured, then the throw
+      },
+    });
+    await runWithTui(deps, async () => {
+      // a leaked renderer writing through the proxy during the bare body must be dropped
+      capture.opts!.out.write("leaked-frame");
+    });
+    expect(stderr.all()).not.toContain("leaked-frame"); // sealed at the mount-failure catch
+    expect(stderr.all()).toContain("dashboard disabled");
+    expect(stderr.all()).toContain("post-render mount explosion");
+  });
+
+  test("a BROKEN stderr cannot turn a mount-failure warn into a kill: body still runs", async () => {
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = async () => {
+      throw new Error("no ink");
+    };
+    stderr.throwOnWrite = new Error("EBADF: stderr is gone");
+    let bodyRan = false;
+    const r = await runWithTui(deps, async () => {
+      bodyRan = true;
+      return "ok";
+    });
+    expect(bodyRan).toBe(true);
+    expect(r).toBe("ok"); // the warn had nowhere to go; the audit did not care (§U0)
+  });
+
+  test("late-handle unwind failures surface as a best-effort warning, never silently", async () => {
+    const handle = makeFakeHandle({ exitMode: "manual" });
+    handle.dispose = () => {
+      handle.calls.push("dispose");
+      throw new Error("dispose kaboom");
+    };
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.onDegrade(); // teardown starts null-handle; the returned handle must be unwound
+      },
+    });
+    await runWithTui(deps, async () => {});
+    expect(stderr.all()).toContain("unwind warnings");
+    expect(stderr.all()).toContain("dispose kaboom");
+    expect(handle.calls).toContain("requestUnmount"); // the unwind still completed the other steps
+  });
+
+  test("latch reset at lifecycle start: a stale pre-existing latch does not poison a fresh run", async () => {
+    reportTuiFailure("stale from a previous lifecycle");
+    const { deps, stderr } = makeDeps();
+    let latchDuringBody: unknown = "unset";
+    await runWithTui(deps, async () => {
+      latchDuringBody = tuiFailure();
+    });
+    expect(latchDuringBody).toBeNull();
+    expect(stderr.all()).not.toContain("stale from a previous lifecycle");
+  });
+
+  test("undiverted mounted run: stdout receives ONLY JSONL; the frame goes to the (fake) stderr", async () => {
+    const { deps } = makeDeps({ divert: false });
+    const { calls, done } = spyStdout(async () => {
+      await runWithTui(deps, async () => {
+        logLine({ event: "config" });
+        logLine({ event: "done" });
+      });
+    });
+    await done;
+    expect(calls).toEqual([`{"event":"config"}\n`, `{"event":"done"}\n`]);
+  });
+
+  test("compound mount failure: a synchronous degrade DURING mountTui + a post-render throw still shows the cursor exactly once", async () => {
+    // The teardown that onDegrade starts runs its null-handle path synchronously to the plain
+    // step-3 seal; the mount-failure catch's sealEarly then arrives against an already-sealed
+    // proxy — and must STILL compensate (the always-compensate contract), or this compound
+    // fault strands a hidden cursor.
+    const { deps, stderr } = makeDeps();
+    deps.mountImpl = async () => ({
+      mountTui: (_store: MountableStore, opts: MountTuiOptions): TuiHandle => {
+        opts.onDegrade(); // an error boundary crashing during the initial render pass
+        throw new Error("post-render tail broke"); // and the tail then throws (compound fault)
+      },
+    });
+    const r = await runWithTui(deps, async () => 41);
+    expect(r).toBe(41); // §U0: the audit ran regardless
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1);
+  });
+
+  test("a THROWING requestUnmount seals+shows the cursor BEFORE the bounded wait; late frames are dropped; the warning names the step", async () => {
+    const handle = makeFakeHandle({
+      exitMode: "never",
+      onUnmount: () => {
+        throw new Error("unmount exploded");
+      },
+    });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture);
+    let resolved = false;
+    const run = runWithTui(deps, async () => 7).then((v) => {
+      resolved = true;
+      return v;
+    });
+    await until(() => timers.pending.length > 0); // teardown parked on the bounded exit wait
+    expect(resolved).toBe(false); // provably parked
+    // sealEarly already ran AT the throw site: the cursor-show is on the real stream NOW,
+    // before the wait releases — a SIGINT in this window no longer exits cursorless
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1);
+    // and the seal half holds: a late wedge write through the mount-captured proxy stream
+    // produces NO bytes on the real stream (proven by absence)
+    const before = stderr.writes.length;
+    capture.opts!.out.write("late wedge frame");
+    expect(stderr.writes.length).toBe(before);
+    timers.fireAll();
+    expect(await run).toBe(7);
+    expect(stderr.all()).toContain("unmount: unmount exploded"); // the deferred warning names the step
+    expect(stderr.all()).toContain("unmount did not complete cleanly (timeout)");
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1); // still exactly once
+  });
+
+  test("hostile bytes latched as a failure CAUSE are sanitized at the step-6 write site (§U0 end-to-end)", async () => {
+    const { deps, stderr } = makeDeps();
+    await runWithTui(deps, async () => {
+      // Latch RAW hostile text directly — the WRITE SITE's sanitizeLine must strip it. (A
+      // storeImpl-thrown shape would be pre-sanitized by errText at the latch site and could
+      // not catch a write-site regression.)
+      reportTuiFailure("evil \u001B]0;title\u0007 \u001B[2J \u009B31m red\nnext\rline");
+    });
+    const warning = stderr.writes.find((w) => w.includes("dashboard disabled"));
+    expect(warning).toBeDefined();
+    expect(warning!).toContain("evil");
+    expect(warning!).not.toContain("\u001B"); // no ESC byte reaches the terminal
+    expect(warning!).not.toContain("\u009B"); // no raw C1 CSI either
+    expect(warning!).not.toContain("\u0007"); // no BEL
+    expect(warning!.endsWith("\n")).toBe(true);
+    expect(warning!.slice(0, -1)).not.toContain("\n"); // ONE display line + terminator
+    expect(warning!.slice(0, -1)).not.toContain("\r");
+  });
+
+  test("a hostile divert path is sanitized in the JSONL exit line (operator-config bytes flow into 'our' path)", async () => {
+    const { deps, stderr } = makeDeps({ divert: true });
+    deps.logPathFor = () => "/fake/logs/evil-\u001B[31mpath\u001B[0m.jsonl";
+    await runWithTui(deps, async () => {});
+    const exitLine = stderr.writes.find((w) => w.startsWith("JSONL log"));
+    expect(exitLine).toBeDefined();
+    expect(exitLine!).toContain("evil-path.jsonl"); // the CSI sequences stripped, the text intact
+    expect(exitLine!).not.toContain("\u001B");
+  });
+
+  test("post-teardown: the stderr 'error' absorber STAYS attached and consumes a delayed write error (no crash)", async () => {
+    const { deps, stderr } = makeDeps();
+    await runWithTui(deps, async () => {});
+    // An EventEmitter 'error' with ZERO listeners THROWS — the retained absorber (teardown
+    // step 7) is exactly what makes a dying-pipe EIO delivered after teardown inert instead of
+    // fatal (§U0). This test fails if step 7 ever goes back to detaching.
+    expect(stderr.listenerCount("error")).toBeGreaterThanOrEqual(1);
+    expect(() => stderr.emit("error", new Error("EIO delivered late"))).not.toThrow();
+  });
+
+  test("the late-handle unwind compensates the cursor BEFORE its bounded wait releases", async () => {
+    const handle = makeFakeHandle({ exitMode: "never" });
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => opts.onDegrade(), // teardown races ahead of the returning handle
+    });
+    let resolved = false;
+    const run = runWithTui(deps, async () => 9).then((v) => {
+      resolved = true;
+      return v;
+    });
+    await until(() => timers.pending.length > 0); // the UNWIND parked on its bounded wait
+    expect(resolved).toBe(false);
+    // compensation happened before the wait — not after it releases
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1);
+    timers.fireAll();
+    expect(await run).toBe(9);
+  });
+
+  test("a proxy construction failure (throwing listener registration) degrades to a BARE run — body still runs, one warning", async () => {
+    // §U0 kill-guard: makeSealableStderr registers the stderr 'error' absorber BEFORE the setup
+    // try — a hostile injected stream must degrade to the mode-off shape (no proxy, no seams,
+    // no teardown), never reject runWithTui before body().
+    const { deps, stderr, capture } = makeDeps();
+    stderr.on = (() => {
+      throw new Error("listener registration refused");
+    }) as unknown as typeof stderr.on;
+    const r = await runWithTui(deps, async () => 41);
+    expect(r).toBe(41);
+    expect(capture.opts).toBeNull(); // the mount was never reached
+    expect(hasProgressSink()).toBe(false); // no seam was installed
+    expect(stderr.all()).toContain("dashboard disabled — listener registration refused");
+  });
+
+  test("proxy construction failure with a DEAD stderr still runs the audit — the warn is best-effort", async () => {
+    const { deps, stderr, capture } = makeDeps();
+    stderr.on = (() => {
+      throw new Error("no listeners");
+    }) as unknown as typeof stderr.on;
+    stderr.throwOnWrite = new Error("stderr dead too");
+    const r = await runWithTui(deps, async () => "ok");
+    expect(r).toBe("ok");
+    expect(capture.opts).toBeNull();
+    expect(stderr.all()).toBe(""); // nothing landed anywhere — and nothing threw
+  });
+
+  test("a clean-looking exit whose unmount window ABSORBED a failed write still gets cursor compensation (step 5a's absorb delta)", async () => {
+    // Ink's own cursor-restore write can be eaten by a dying stderr while waitUntilExit still
+    // resolves "exited" — the absorb-channel delta across the unmount window is the tell. A
+    // redundant show would be a no-op; skipping it here would strand a hidden cursor.
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    const handle = makeFakeHandle({
+      exitMode: "manual",
+      onUnmount: () => {
+        // ink's restore attempt, refused by the stream — then the stream recovers
+        stderr.throwOnWrite = new Error("EIO at restore time");
+        (capture.opts!.out as unknown as { write: (c: string) => boolean }).write(SHOW_CURSOR);
+        stderr.throwOnWrite = null;
+      },
+    });
+    deps.mountImpl = makeFakeMount(handle, capture);
+    await runWithTui(deps, async () => {});
+    // the failed restore was absorbed (and latched); step 5a compensated after recovery
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1);
+    expect(stderr.all()).toContain("dashboard disabled — stderr write threw: EIO at restore time");
+  });
+
+  test("a WEDGED unmount's residual resize listeners are STRIPPED by teardown after the non-exited outcome", async () => {
+    // dispose removes only the ADAPTER's wake hook (deliberately — see mount.test.ts); Ink's
+    // own subscription is Ink's to remove at unmount, which wedged. Post-seal nothing
+    // legitimate listens for resize, and a later terminal resize must not re-enter damaged
+    // Ink state from an event context — teardown step 3a strips every remaining listener.
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    const handle = makeFakeHandle({ exitMode: "never" });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.out.on("resize", () => {}); // "ink's" subscription, via the proxy's delegation
+      },
+    });
+    let resolved = false;
+    const run = runWithTui(deps, async () => 5).then((v) => {
+      resolved = true;
+      return v;
+    });
+    await until(() => timers.pending.length > 0); // teardown parked on the bounded exit wait
+    expect(resolved).toBe(false);
+    expect(stderr.listenerCount("resize")).toBe(1); // still attached while the wait runs
+    timers.fireAll(); // → timeout outcome
+    expect(await run).toBe(5);
+    expect(stderr.listenerCount("resize")).toBe(0); // the residual was stripped
+    expect(stderr.listenerCount("error")).toBe(1); // the retained absorber survives — different event
+    expect(stderr.all()).toContain("unmount did not complete cleanly (timeout)");
+  });
+
+  test("a WEDGED late-handle unwind strips residual resize listeners too", async () => {
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    const handle = makeFakeHandle({ exitMode: "never" });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.onDegrade(); // teardown races ahead → the unwind owns this renderer
+        opts.out.on("resize", () => {}); // "ink's" subscription arriving with the late render
+      },
+    });
+    const run = runWithTui(deps, async () => 1);
+    await until(() => timers.pending.length > 0); // the unwind parked on its bounded wait
+    timers.fireAll(); // → non-exited unwind outcome
+    expect(await run).toBe(1);
+    expect(stderr.listenerCount("resize")).toBe(0); // stripped by the unwind's own net
+    expect(stderr.all()).toContain("dashboard unwind warnings");
+  });
+
+  test("a THROWING requestUnmount strips resize listeners IMMEDIATELY — inside the wait window, not after it", async () => {
+    // The renderer PROVED itself damaged at the throw; a terminal resize landing inside the
+    // ≤2s bounded wait would re-enter it from an event context and throw uncaught (a kill).
+    // The strip must therefore happen in the same synchronous catch as sealEarly — the
+    // post-wait step 3a alone would leave the listener callable for the whole grace window.
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    const handle = makeFakeHandle({
+      exitMode: "never",
+      onUnmount: () => {
+        throw new Error("unmount exploded");
+      },
+    });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.out.on("resize", () => {}); // "ink's" subscription, via the proxy's delegation
+      },
+    });
+    let resolved = false;
+    const run = runWithTui(deps, async () => 2).then((v) => {
+      resolved = true;
+      return v;
+    });
+    await until(() => timers.pending.length > 0); // teardown parked on the bounded wait
+    expect(resolved).toBe(false);
+    expect(stderr.listenerCount("resize")).toBe(0); // ALREADY stripped, inside the window
+    timers.fireAll();
+    expect(await run).toBe(2);
+    expect(stderr.all()).toContain("unmount: unmount exploded");
+    expect(stderr.all()).toContain(SHOW_CURSOR); // sealEarly compensated in the same catch
+  });
+
+  test("a THROWING requestUnmount in the late-handle unwind strips immediately too", async () => {
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr, timers } = makeDeps();
+    const handle = makeFakeHandle({
+      exitMode: "never",
+      onUnmount: () => {
+        throw new Error("late unmount exploded");
+      },
+    });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.onDegrade(); // teardown races ahead → the unwind owns this renderer
+        opts.out.on("resize", () => {}); // "ink's" subscription arriving with the late render
+      },
+    });
+    const run = runWithTui(deps, async () => 3);
+    await until(() => timers.pending.length > 0); // the unwind parked on its bounded wait
+    expect(stderr.listenerCount("resize")).toBe(0); // stripped in the unwind's catch, pre-wait
+    timers.fireAll();
+    expect(await run).toBe(3);
+    expect(stderr.all()).toContain("late unmount exploded");
+  });
+
+  test("a CLEAN unmount leaves resize listeners to ink's own cleanup — no strip on the exited path", async () => {
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    const handle = makeFakeHandle({ exitMode: "manual" });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.out.on("resize", () => {});
+      },
+    });
+    await runWithTui(deps, async () => {});
+    // the fake renderer never removed its listener and teardown must not have either: on a
+    // clean exit the subscription is the renderer's property (real ink detaches it inside
+    // unmount) — the strip is scoped to the damaged-Ink outcomes only
+    expect(stderr.listenerCount("resize")).toBe(1);
+    stderr.removeAllListeners("resize");
+  });
+
+  test("the late-handle unwind RETRIES a refused pre-wait compensation after its bounded wait", async () => {
+    // The unwind compensates BEFORE its bounded wait; a transiently broken stderr refuses that
+    // first attempt (the callback-aware flag stays unset) — the post-wait retry must land it.
+    const capture: MountCapture = { store: null, opts: null };
+    const { deps, stderr } = makeDeps();
+    const handle = makeFakeHandle({
+      exitMode: "immediate",
+      onDispose: () => {
+        stderr.throwOnWrite = null; // the stream recovers right after the pre-wait attempt
+      },
+    });
+    deps.mountImpl = makeFakeMount(handle, capture, {
+      beforeReturn: (opts) => {
+        opts.onDegrade(); // teardown races ahead — the returning handle takes the unwind path
+        stderr.throwOnWrite = new Error("EIO during unwind");
+      },
+    });
+    const r = await runWithTui(deps, async () => 7);
+    expect(r).toBe(7);
+    expect(stderr.writes.filter((w) => w === SHOW_CURSOR).length).toBe(1); // the RETRY landed it
+  });
+});
+
+// ---- §U8.12 routing equivalence --------------------------------------------------------------
+describe("routing equivalence (§U8.12)", () => {
+  // Two full live runs can never byte-match (randomUUID run ids, wall-clock timestamps) — so
+  // replay ONE fixture event sequence through logLine under both sinks and compare the bytes.
+  const FIXTURE: Array<Record<string, unknown>> = [
+    { event: "config", packages: ["expo"], cutoffDate: "2024-01-01" },
+    { event: "concurrency", organizations: 2, branches: 4, repositories: 6 },
+    { event: "preflight", login: "u", coreRemaining: 4999 },
+    { event: "unit", org: "o", repo: "r", branch: "main", commit: "c", action: "scanned", deps: 3, usage: 9, cli: 1 },
+    { event: "warning", reason: "clone-cleanup-failed", target: "/tmp/x", message: "EBUSY: \u001B[31mhostile\u001B[0m\nline2" },
+    { event: "done", runId: "fixed-run-id", errors: 0 },
+  ];
+
+  test("the stdout sink and a REAL divert fd receive byte-identical streams", () => {
+    const stdoutBytes: string[] = [];
+    const so = spyOn(process.stdout, "write").mockImplementation(((c: unknown) => {
+      stdoutBytes.push(String(c));
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      for (const ev of FIXTURE) logLine(ev);
+    } finally {
+      so.mockRestore();
+    }
+
+    const dir = mkdtempSync(join(tmpdir(), "tui-routing-"));
+    try {
+      const path = join(dir, "divert.jsonl");
+      const fd = realDivertIo.open(path);
+      setLogSink((line) => realDivertIo.write(fd, line));
+      try {
+        for (const ev of FIXTURE) logLine(ev);
+      } finally {
+        setLogSink(null);
+        realDivertIo.close(fd);
+      }
+      const divertBytes = readFileSync(path, "utf8");
+      expect(divertBytes).toBe(stdoutBytes.join("")); // IDENTICAL bytes, different destination
+      expect(divertBytes.split("\n").filter(Boolean).length).toBe(FIXTURE.length); // every line parses
+      for (const line of divertBytes.split("\n").filter(Boolean)) JSON.parse(line);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a scripted run with the REAL mount against capture streams: stdout gets ONLY JSONL (undiverted) / NOTHING (diverted)", async () => {
+    // undiverted
+    {
+      const stderr = new FakeStream();
+      const { calls, done } = spyStdout(async () => {
+        await runWithTui(
+          {
+            decision: { mode: "on", divert: false },
+            streams: { stderr: stderr as unknown as NodeJS.WriteStream },
+            timers: { setTimeout, clearTimeout },
+          },
+          async () => {
+            for (const ev of FIXTURE) logLine(ev);
+            await new Promise((r) => setTimeout(r, 30)); // let the real Ink commit a frame
+          },
+        );
+      });
+      await done;
+      expect(calls.length).toBe(FIXTURE.length);
+      for (const c of calls) JSON.parse(c.slice(0, -1)); // every stdout write is one JSONL line
+    }
+    // diverted
+    {
+      const stderr = new FakeStream();
+      const io = makeFakeIo();
+      const { calls, done } = spyStdout(async () => {
+        await runWithTui(
+          {
+            decision: { mode: "on", divert: true },
+            streams: { stderr: stderr as unknown as NodeJS.WriteStream },
+            divertIo: io,
+            logPathFor: (a) => `/fake/l-${a}.jsonl`,
+            timers: { setTimeout, clearTimeout },
+          },
+          async () => {
+            for (const ev of FIXTURE) logLine(ev);
+            await new Promise((r) => setTimeout(r, 30));
+          },
+        );
+      });
+      await done;
+      expect(calls).toEqual([]); // process.stdout received NOTHING
+      expect(io.written.length).toBe(FIXTURE.length); // the file got every line
+    }
+  });
+});
