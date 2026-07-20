@@ -297,8 +297,10 @@ export type ProgressEvent =
       remaining: number | null; limit: number | null; resetEpochSec: number | null }
   | { type: "rate-limit-seed"; resource: "core" | "graphql"; remaining: number | null }
   | { type: "throttle"; bucket: "core" | "graphql";
-      state: "armed" | "waiting" | "exhausted";
-      reason?: "budget" | "retries";                 // exhausted only
+      state: "armed" | "waiting"; reason?: never;       // reason forbidden off "exhausted"
+      untilMs: number | null; budgetSpentMs: number }
+  | { type: "throttle"; bucket: "core" | "graphql";
+      state: "exhausted"; reason: "budget" | "retries"; // reason REQUIRED for "exhausted"
       untilMs: number | null; budgetSpentMs: number }
   | { type: "owner-start"; owner: string } | { type: "owner-end"; owner: string }
   | { type: "repo-start"; owner: string; repo: string }

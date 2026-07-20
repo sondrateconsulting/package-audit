@@ -17,7 +17,16 @@ export type ProgressEvent =
   | { type: "fetch-end"; id: number }
   | { type: "rate-limit"; resource: "core" | "graphql"; remaining: number | null; limit: number | null; resetEpochSec: number | null }
   | { type: "rate-limit-seed"; resource: "core" | "graphql"; remaining: number | null }
-  | { type: "throttle"; bucket: "core" | "graphql"; state: "armed" | "waiting" | "exhausted"; reason?: "budget" | "retries"; untilMs: number | null; budgetSpentMs: number }
+  // Split by `state`: `reason` is REQUIRED for "exhausted" and rejected for "armed"/"waiting" (§U4).
+  // The producer-side guarantee is emitThrottle's fixed-arity overloads (github.ts): no call site can
+  // attach a reason off "exhausted". On the type itself, `reason?: never` rejects any concrete reason VALUE
+  // ("budget"/"retries") on armed/waiting, including non-fresh objects. (A present `reason: undefined`
+  // is still accepted — the project's tsconfig omits exactOptionalPropertyTypes — but it is
+  // semantically absent and the fold reads `reason` only for "exhausted".) Net: the store fold can
+  // never route a forgotten/future exhaustion reason into the transient retry counter instead of the
+  // sticky budget flag without a compile error.
+  | { type: "throttle"; bucket: "core" | "graphql"; state: "armed" | "waiting"; reason?: never; untilMs: number | null; budgetSpentMs: number }
+  | { type: "throttle"; bucket: "core" | "graphql"; state: "exhausted"; reason: "budget" | "retries"; untilMs: number | null; budgetSpentMs: number }
   | { type: "owner-start"; owner: string }
   | { type: "owner-end"; owner: string }
   | { type: "repo-start"; owner: string; repo: string }
@@ -45,8 +54,10 @@ export function hasProgressSink(): boolean {
 }
 
 // TOTAL error rendering: even a hostile thrown value (a throwing toString/message getter) must
-// not make the never-throws functions below throw.
-function causeText(e: unknown): string {
+// not make the never-throws functions below throw. Exported as the ONE cause→string primitive:
+// mount.tsx uses it as-is, lifecycle.ts wraps it in sanitizeLine. progress.ts stays a dependency-
+// free leaf — this is an EXPORT, not a new import.
+export function causeText(e: unknown): string {
   try {
     if (e instanceof Error && typeof e.message === "string") return e.message;
     return String(e);

@@ -14,17 +14,20 @@ export const PROBLEM_RING_CAP = 50;
 export type SpawnTool = "gh" | "git" | "tar";
 export type FetchKind = "packument" | "tarball" | "registry-probe";
 export type LimitResource = "core" | "graphql";
+// The closed set of pipeline phases (mirrors ProgressEvent's "phase" member) — narrower than a bare
+// string, so a future phase-keyed lookup gets exhaustiveness instead of a silent fall-through.
+export type Phase = Extract<ProgressEvent, { type: "phase" }>["phase"];
 
 export interface RateSnapshot {
-  remaining: number | null;
-  limit: number | null;
-  resetEpochSec: number | null;
-  asOfMs: number;
+  readonly remaining: number | null;
+  readonly limit: number | null;
+  readonly resetEpochSec: number | null;
+  readonly asOfMs: number;
 }
 
 export interface ThrottleSnapshot {
-  horizonMs: number; // PAUSED is DERIVED at render: horizonMs > nowMs() — time, not events, clears it
-  budgetSpentMs: number;
+  readonly horizonMs: number; // PAUSED is DERIVED at render: horizonMs > nowMs() — time, not events, clears it
+  readonly budgetSpentMs: number;
 }
 
 // There is deliberately NO "cleared" event (§U2): with concurrent callers the pause horizon can
@@ -34,11 +37,11 @@ export function isPaused(t: ThrottleSnapshot | null, nowMs: number): boolean {
 }
 
 export interface Problem {
-  atMs: number;
-  kind: "error" | "warning";
-  scope: string;
-  target: string;
-  message: string;
+  readonly atMs: number;
+  readonly kind: "error" | "warning";
+  readonly scope: string;
+  readonly target: string;
+  readonly message: string;
 }
 
 export interface SessionCounters {
@@ -52,7 +55,7 @@ export interface SessionCounters {
 }
 
 export interface TuiSnapshot {
-  readonly phase: string | null;
+  readonly phase: Phase | null;
   readonly runId: string | null; // header shows run <id8> (resumed)/(fresh) — NOTHING from counts
   readonly resumed: boolean | null;
   readonly logPath: string | null; // the ACTUAL divert path, once known
@@ -66,7 +69,7 @@ export interface TuiSnapshot {
   readonly unitWorkers: ReadonlyArray<{ key: string; sinceMs: number }>; // dispatch→settle occupancy
   readonly scanning: ReadonlyArray<{ key: string; sinceMs: number }>; // start→settle real scans
   readonly ownerCap: number | null;
-  readonly branchCap: number | null; // PER-REPO — render "≤B per repo", never a global fraction
+  readonly branchCap: number | null; // PER-REPO — render "≤B/repo", never a global fraction
   readonly limits: Readonly<Record<LimitResource, RateSnapshot | null>>;
   readonly throttle: Readonly<Record<LimitResource, ThrottleSnapshot | null>>;
   readonly budgetExhausted: boolean; // sticky — it cannot un-happen within a run
@@ -92,9 +95,23 @@ const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
 const bool = (v: unknown): boolean | null => (typeof v === "boolean" ? v : null);
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
 
+// snapshot() deep-copies these bounded value objects so a returned snapshot is fully independent of
+// live state. The store already REPLACES them by reference (never mutates in place), so this guards
+// the OTHER direction: a consumer mutating a returned snapshot must not reach back into the store.
+// Fields are readonly (compile-time); these clones make it hold at runtime too. Cost is trivial and
+// bounded — 2 rate + 2 throttle + at most PROBLEM_RING_CAP problems, each a flat object.
+const copyRate = (r: RateSnapshot | null): RateSnapshot | null => (r === null ? null : { ...r });
+const copyThrottle = (t: ThrottleSnapshot | null): ThrottleSnapshot | null => (t === null ? null : { ...t });
+
+// Active-map keys: repos by owner/repo, branch units by owner/repo@branch. One place so the
+// dispatch cases that correlate start↔end (repo) and dispatch↔settle (unit, §U2) never drift on
+// the key grammar.
+const repoKey = (owner: string, repo: string): string => `${owner}/${repo}`;
+const unitKey = (owner: string, repo: string, branch: string): string => `${owner}/${repo}@${branch}`;
+
 export function createTuiStore(nowMs: () => number): TuiStore {
   let version = 0;
-  let phase: string | null = null;
+  let phase: Phase | null = null;
   let runId: string | null = null;
   let resumed: boolean | null = null;
   let logPath: string | null = null;
@@ -260,8 +277,16 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         break;
       case "throttle": {
         if (e.state === "exhausted") {
-          if (e.reason === "budget") budgetExhausted = true; // sticky — cannot un-happen this run
-          else retryExhaustions++;
+          // Exhaustive over the reason union: a future reason added to ProgressEvent that is not
+          // mapped here is a BUILD error (assertNever), never a silent miscount. Were one to slip
+          // through at runtime, the throw unwinds the fold into the guarded progress-sink path — the
+          // lifecycle sink closure degrades the dashboard (emitProgress's own catch is the backstop),
+          // never the audit.
+          switch (e.reason) {
+            case "budget": budgetExhausted = true; break; // sticky — cannot un-happen this run
+            case "retries": retryExhaustions++; break; // transient per-call exhaustion, a count
+            default: assertNever(e, "throttle exhausted reason"); // a new reason → build error here
+          }
         }
         const prev = throttle[e.bucket];
         const horizonMs = Math.max(prev?.horizonMs ?? 0, e.untilMs ?? 0);
@@ -276,29 +301,29 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         changed = activeOwners.delete(e.owner);
         break;
       case "repo-start": {
-        const repoKey = `${e.owner}/${e.repo}`;
-        changed = !activeRepos.has(repoKey);
-        activeRepos.add(repoKey);
+        const key = repoKey(e.owner, e.repo);
+        changed = !activeRepos.has(key);
+        activeRepos.add(key);
         break;
       }
       case "repo-end":
-        changed = activeRepos.delete(`${e.owner}/${e.repo}`);
+        changed = activeRepos.delete(repoKey(e.owner, e.repo));
         break;
       case "unit-dispatch":
-        unitWorkers.set(`${e.owner}/${e.repo}@${e.branch}`, { sinceMs: nowMs() });
+        unitWorkers.set(unitKey(e.owner, e.repo, e.branch), { sinceMs: nowMs() });
         break;
       case "unit-settle": {
         // settle is the ONLY reliable end (§U2): it clears BOTH the worker slot and any active
         // scan — tapped JSONL events never clear active state (the `scanned` line fires before
         // cleanup finishes, and fatal escapes emit no terminal unit line at all).
-        const key = `${e.owner}/${e.repo}@${e.branch}`;
+        const key = unitKey(e.owner, e.repo, e.branch);
         const workerGone = unitWorkers.delete(key);
         const scanGone = scanningUnits.delete(key);
         changed = workerGone || scanGone;
         break;
       }
       case "unit-start":
-        scanningUnits.set(`${e.owner}/${e.repo}@${e.branch}`, { sinceMs: nowMs() });
+        scanningUnits.set(unitKey(e.owner, e.repo, e.branch), { sinceMs: nowMs() });
         break;
       case "introspect-start":
         introspections.set(e.id, { packageName: e.packageName, version: e.version, sinceMs: nowMs() });
@@ -340,13 +365,13 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         scanning: [...scanningUnits.entries()].map(([key, u]) => ({ key, ...u })),
         ownerCap,
         branchCap,
-        limits: { ...limits },
-        throttle: { ...throttle },
+        limits: { core: copyRate(limits.core), graphql: copyRate(limits.graphql) },
+        throttle: { core: copyThrottle(throttle.core), graphql: copyThrottle(throttle.graphql) },
         budgetExhausted,
         retryExhaustions,
         counters: { ...counters },
         findings: { ...findings },
-        problems: [...problems],
+        problems: problems.map((p) => ({ ...p })),
       };
     },
   };

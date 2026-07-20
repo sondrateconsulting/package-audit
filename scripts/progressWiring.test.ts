@@ -203,6 +203,22 @@ describe("rate-limit snapshots via the analyze-return channel (§U8.7)", () => {
     expect(rl).toEqual([{ type: "rate-limit", resource: "core", remaining: 4750, limit: 5000, resetEpochSec: 1700000000 }]);
   });
 
+  test("present-but-malformed rate-limit headers fold to null, never NaN/Infinity/a coerced number", async () => {
+    const seen = captureProgress();
+    // regex-rejected forms: negative, decimal, exponent, comma-grouped.
+    await makeClient([ok(http(200, { "X-RateLimit-Remaining": "-5", "X-RateLimit-Limit": "4750.5", "X-RateLimit-Reset": "1e3" }, `{"a":1}`))]).restGet("user");
+    await makeClient([ok(http(200, { "X-RateLimit-Remaining": "4,750" }, `{"a":1}`))]).restGet("user");
+    // digits-only but astronomically large: passes /^\d+$/ yet Number() overflows to Infinity — the
+    // finite/safe-integer guard must still fold it to the honest null (a display count, not Infinity).
+    await makeClient([ok(http(200, { "X-RateLimit-Remaining": "9".repeat(400) }, `{"a":1}`))]).restGet("user");
+    const rl = seen.filter((e) => e.type === "rate-limit");
+    expect(rl).toEqual([
+      { type: "rate-limit", resource: "core", remaining: null, limit: null, resetEpochSec: null },
+      { type: "rate-limit", resource: "core", remaining: null, limit: null, resetEpochSec: null },
+      { type: "rate-limit", resource: "core", remaining: null, limit: null, resetEpochSec: null },
+    ]);
+  });
+
   test("emitted on a 304 revalidation (a live response) but NOT on the zero-network immutable-cache return", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     try {
@@ -550,6 +566,38 @@ describe("orchestrate unit lifecycle events (§U8.9)", () => {
     const cfg = { ...testConfig("/tmp/x"), githubHost: "ghe.example.com" };
     (cfg.concurrency as { repositories: number }).repositories = 11;
     expect(preflightClientOptions(cfg)).toEqual({ githubHost: "ghe.example.com", concurrency: 11 });
+  });
+
+  test("activationInputFrom maps streams + env into the ActivationInput (TUI routing correctness)", async () => {
+    // main()'s TUI-activation glue is this exported seam (mirrors preflightClientOptions): pinning
+    // the field mapping guards a transposed columns/rows, a copy-paste stdoutIsTTY read off stderr,
+    // or a naive CI check that loses is-in-ci's "0"/"false"/CONTINUOUS_INTEGRATION semantics —
+    // none of which the compiler or the pure decideTuiActivation table would catch.
+    const { activationInputFrom } = await import("./orchestrate.ts");
+    const streams = { stderr: { isTTY: true, columns: 120, rows: 40 }, stdout: { isTTY: false } };
+    expect(activationInputFrom({ plan: false, ui: null }, streams, { TERM: "xterm-256color" })).toEqual({
+      plan: false,
+      uiFlag: null,
+      stderrIsTTY: true, // from stderr
+      stdoutIsTTY: false, // from stdout, NOT stderr
+      columns: 120, // from stderr
+      rows: 40, // from stderr
+      term: "xterm-256color",
+      ci: false,
+    });
+    // is-in-ci parity: the seam must use isInkCiEnv, never a bare CI presence check.
+    expect(activationInputFrom({ plan: false, ui: null }, streams, { CI: "0" }).ci).toBe(false); // "0" ⇒ unset
+    expect(activationInputFrom({ plan: false, ui: null }, streams, { CI: "" }).ci).toBe(true); // present (empty) ⇒ set
+    expect(activationInputFrom({ plan: false, ui: null }, streams, { CONTINUOUS_INTEGRATION: "yes" }).ci).toBe(true);
+    // plan/uiFlag flow through verbatim
+    const planned = activationInputFrom({ plan: true, ui: false }, streams, {});
+    expect(planned.plan).toBe(true);
+    expect(planned.uiFlag).toBe(false);
+    // a non-TTY stderr reports undefined dims (never coerced to 0) and stderrIsTTY === true coercion
+    const noDims = activationInputFrom({ plan: false, ui: null }, { stderr: {}, stdout: {} }, {});
+    expect(noDims.columns).toBeUndefined();
+    expect(noDims.rows).toBeUndefined();
+    expect(noDims.stderrIsTTY).toBe(false);
   });
 });
 

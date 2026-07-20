@@ -986,10 +986,14 @@ function whichIn(env: Env, bin: string): string {
   return (path !== undefined ? Bun.which(bin, { PATH: path }) : Bun.which(bin)) ?? bin;
 }
 
-// Rate-limit header → integer for the display snapshot; absent/non-numeric folds to null.
+// Rate-limit header → integer for the display snapshot; absent/non-numeric folds to null. The
+// /^\d+$/ gate rejects signs/decimals/exponents/separators, but a digits-only value large enough to
+// overflow Number() would still yield Infinity — so require a safe integer, keeping the contract an
+// honest "finite nonnegative integer or null" (a display count, never Infinity).
 function headerInt(value: string | undefined): number | null {
   if (value === undefined || value === "" || !/^\d+$/.test(value.trim())) return null;
-  return Number(value.trim());
+  const n = Number(value.trim());
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 const RAW_ACCEPT = "application/vnd.github.raw+json";
@@ -1389,18 +1393,22 @@ export class GithubClient {
   }
 
   // Throttle-state display events (PROMPT-TUI §U3.4): synchronous, no-throw, fully gated — a run
-  // with no sink pays one boolean. The event carries the PUBLISHED horizon and the CURRENT
-  // (post-funding, for the armed emit) budget.
+  // with no sink pays ONE boolean and constructs NOTHING (§U0). Overloads (NOT a rest parameter,
+  // which allocates a rest array at every call BEFORE the sink gate runs) keep the call-site
+  // contract exact: `reason` is REQUIRED for "exhausted" and REJECTED for "armed"/"waiting". The
+  // event carries the PUBLISHED horizon and the CURRENT (post-funding, for the armed emit) budget.
+  private emitThrottle(bucket: Bucket, state: "armed" | "waiting"): void;
+  private emitThrottle(bucket: Bucket, state: "exhausted", reason: "budget" | "retries"): void;
   private emitThrottle(bucket: Bucket, state: "armed" | "waiting" | "exhausted", reason?: "budget" | "retries"): void {
-    if (!hasProgressSink()) return;
-    emitProgress({
-      type: "throttle",
-      bucket: bucket.label,
-      state,
-      ...(reason !== undefined ? { reason } : {}),
-      untilMs: bucket.pausedUntilMs > 0 ? bucket.pausedUntilMs : null,
-      budgetSpentMs: bucket.budgetSpentMs,
-    });
+    if (!hasProgressSink()) return; // gate FIRST — no derivation or event object on a no-sink run
+    const untilMs = bucket.pausedUntilMs > 0 ? bucket.pausedUntilMs : null;
+    const budgetSpentMs = bucket.budgetSpentMs;
+    emitProgress(
+      state === "exhausted"
+        // reason is guaranteed present by the "exhausted" overload; the impl signature can't see it.
+        ? { type: "throttle", bucket: bucket.label, state, reason: reason as "budget" | "retries", untilMs, budgetSpentMs }
+        : { type: "throttle", bucket: bucket.label, state, untilMs, budgetSpentMs },
+    );
   }
 
   // Acquire a slot with the pause re-checked AFTER acquisition: a caller queued on the

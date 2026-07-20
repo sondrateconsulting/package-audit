@@ -2,6 +2,7 @@
 // Ink-free so orchestrate.ts can import it on every run; the function IS the §U1 matrix,
 // unit-tested row by row. Activation is CLI flags + runtime environment only — NO config.json
 // keys (config_hash is untouchable).
+import { isPositiveIntegerDim } from "./dims.ts";
 
 // Operator-facing: `--ui` demanded in an ineligible environment. Registered in
 // KNOWN_OPERATOR_ERRORS so the entrypoint renders the message without a stack.
@@ -56,7 +57,7 @@ export const MIN_ROWS = 5;
 // Infinity/fractions) through eligibility — mounting a dashboard that renders the EMPTY frame
 // while the divert reroutes JSONL with nothing visible. Same positive-integer predicate as the
 // render layer (planLayout) and the proxy's ink-facing pin.
-const usableDim = (v: number | undefined, min: number): boolean => v !== undefined && Number.isInteger(v) && v >= min;
+const usableDim = (v: number | undefined, min: number): boolean => isPositiveIntegerDim(v) && v >= min;
 
 function eligibility(i: ActivationInput): { eligible: boolean; blockers: string[] } {
   const blockers: string[] = [];

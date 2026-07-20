@@ -1,16 +1,21 @@
 // format.ts — pure display helpers for the TUI (§U5 of PROMPT-TUI.md): durations, countdowns,
 // thousands separators, the sanitizeLine defense, and the pure frame-layout planner. No React,
 // no I/O; everything here is table-tested.
+import { isPositiveIntegerDim } from "./dims.ts";
 
 // ---- sanitization (§U0) ----------------------------------------------------------------------
 // EVERY dynamic string the dashboard displays — spawn labels, error messages (which can embed
 // child-process stderr), branch/repo names — passes through here before Ink truncation: C0/C1
 // controls and ANSI escape sequences stripped, newlines collapsed, ONE display line forced.
-// Child output must never be able to inject terminal control through the dashboard.
+// Child output must never be able to inject terminal control through the dashboard. Unicode
+// bidi/isolate formatting controls are ALSO stripped — defense-in-depth BEYOND §U0's stated
+// C0/C1+ANSI boundary (display spoofing, not control-byte injection): a hostile branch name could
+// otherwise carry RIGHT-TO-LEFT OVERRIDE etc. to visually reorder a row (Trojan Source).
 const OSC_RE = /(?:\u001B\]|\u009D)[^\u0007\u001B\u009C]*(?:\u0007|\u001B\\|\u009C)?/g; // OSC ... BEL/ST
 const CSI_RE = /(?:\u001B\[|\u009B)[0-?]*[ -\/]*[@-~]?/g; // CSI params intermediates final
 const ESC_OTHER_RE = /\u001B[@-_]?/g; // remaining two-char escapes and a stray ESC
 const CONTROLS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g; // C0 (less newline/CR/tab) + DEL + C1
+const BIDI_RE = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g; // ALM, LRM/RLM, LRE..RLO/PDF, LRI..PDI
 
 export function sanitizeLine(input: string): string {
   return input
@@ -18,7 +23,8 @@ export function sanitizeLine(input: string): string {
     .replace(OSC_RE, "")
     .replace(CSI_RE, "")
     .replace(ESC_OTHER_RE, "")
-    .replace(CONTROLS_RE, "");
+    .replace(CONTROLS_RE, "")
+    .replace(BIDI_RE, "");
 }
 
 // ---- numbers & time --------------------------------------------------------------------------
@@ -66,6 +72,22 @@ export function formatReset(resetEpochSec: number | null, nowMs: number): string
   return formatClock(resetEpochSec * 1000 - nowMs);
 }
 
+// Graded headroom color for a rate-limit remaining count (M1): red under 10% of the limit,
+// yellow under 25%, uncolored otherwise — so a crisis like `core 100/5,000` no longer looks
+// identical to a healthy `core 4,812/5,000` in the otherwise-monochrome healthy frame. Returns
+// undefined (no color, the honest neutral) unless BOTH values are finite and the limit is a
+// positive number: a seeded remaining without a known limit, or any non-finite/degenerate input,
+// stays uncolored. Same totality posture as thousands()/formatReset — never trusts a masquerading
+// value into a comparison.
+export function limitTone(remaining: number | null, limit: number | null): "red" | "yellow" | undefined {
+  if (remaining === null || limit === null) return undefined;
+  if (!Number.isFinite(remaining) || !Number.isFinite(limit) || limit <= 0) return undefined;
+  const ratio = remaining / limit;
+  if (ratio < 0.1) return "red";
+  if (ratio < 0.25) return "yellow";
+  return undefined;
+}
+
 // ---- the pure frame-layout planner (§U5 terminal-size discipline) ----------------------------
 // A frame taller than the viewport cannot be fully erased on redraw and smears scrollback, so
 // the frame is hard-capped at rows-1 by degrading in priority order: shrink NET_ROWS → shrink
@@ -97,9 +119,8 @@ export type Layout =
 // rows than ink's own viewport). NaN passes every `<` guard below, and fractions/Infinity would
 // corrupt the row budget — all of them render the EMPTY frame, exactly like undefined (§U5: a
 // fixed line cannot be guaranteed one physical row in an unknowable viewport).
-const usableDim = (v: number | undefined): v is number => v !== undefined && Number.isInteger(v) && v > 0;
 export function planLayout(columns: number | undefined, rows: number | undefined, demand: LayoutDemand): Layout {
-  if (!usableDim(columns) || !usableDim(rows) || rows < 2 || columns < 20) return { mode: "empty" };
+  if (!isPositiveIntegerDim(columns) || !isPositiveIntegerDim(rows) || rows < 2 || columns < 20) return { mode: "empty" };
   if (rows < 5 || columns < 40) return { mode: "single-line" };
   if (columns < 60 || rows < 12) return { mode: "compact" };
 

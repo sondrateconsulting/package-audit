@@ -2,7 +2,7 @@
 // the pure layout planner: budgets, degradation order, compact/single-line/empty modes).
 // Control bytes in fixtures are spelled as \u escapes so the SOURCE stays pure ASCII.
 import { expect, test, describe } from "bun:test";
-import { sanitizeLine, thousands, formatSpan, formatClock, formatCountdown, formatReset, planLayout, WORK_ROWS_MAX, NET_ROWS_MAX, type LayoutDemand } from "./format.ts";
+import { sanitizeLine, thousands, formatSpan, formatClock, formatCountdown, formatReset, limitTone, planLayout, WORK_ROWS_MAX, NET_ROWS_MAX, type LayoutDemand } from "./format.ts";
 
 const ESC = "\u001B";
 const BEL = "\u0007";
@@ -27,6 +27,15 @@ describe("sanitizeLine (§U0 — hostile bytes render inert)", () => {
     expect(sanitizeLine("a\u009B31mb")).toBe("ab"); // raw C1 CSI + params + final consumed
     expect(sanitizeLine("x\u0085y\u0090z")).toBe("xyz");
     expect(sanitizeLine(`o\u009D0;title${BEL}k`)).toBe("ok"); // C1 OSC introducer
+  });
+  test("strips Unicode bidi/isolate formatting controls (Trojan-Source display spoofing)", () => {
+    // Beyond \u00A7U0's C0/C1+ANSI minimum: a hostile branch/repo name could embed RIGHT-TO-LEFT
+    // OVERRIDE etc. to visually reorder a dashboard row without any control-byte injection. These
+    // display-only formatting chars are stripped as defense-in-depth so the frame reads as authored.
+    expect(sanitizeLine("git\u202Ekcatta\u202Cbranch")).toBe("gitkcattabranch"); // RLO + PDF
+    expect(sanitizeLine("\u2066a\u2069\u2067b\u2069")).toBe("ab"); // LRI/RLI/PDI isolates
+    expect(sanitizeLine("safe\u200E\u200F\u061Cname")).toBe("safename"); // LRM/RLM/ALM marks
+    expect(sanitizeLine("\u202A\u202B\u202Dembedded\u202C")).toBe("embedded"); // LRE/RLE/LRO
   });
   test("collapses newlines and CR to ONE display line (CR cannot overwrite)", () => {
     expect(sanitizeLine("line1\nline2\r\nline3\rline4")).toBe("line1 line2 line3 line4");
@@ -81,6 +90,37 @@ describe("formatters (§U8.11)", () => {
   test("formatReset from an epoch, or an em-dash when unknown", () => {
     expect(formatReset(1_000, 246_000)).toBe("12:34");
     expect(formatReset(null, 0)).toBe("—");
+  });
+});
+
+describe("limitTone (M1 — graded rate-limit headroom color)", () => {
+  test("red below 10% of the limit, yellow below 25%, uncolored otherwise", () => {
+    expect(limitTone(0, 5000)).toBe("red"); // fully exhausted
+    expect(limitTone(-100, 5000)).toBe("red"); // a negative remaining is worse than empty → red, not uncolored
+    expect(limitTone(120, 5000)).toBe("red"); // 2.4%
+    expect(limitTone(499, 5000)).toBe("red"); // 9.98%
+    expect(limitTone(500, 5000)).toBe("yellow"); // exactly 10% → not red, still low
+    expect(limitTone(1249, 5000)).toBe("yellow"); // 24.98%
+    expect(limitTone(1250, 5000)).toBeUndefined(); // exactly 25% → healthy
+    expect(limitTone(4812, 5000)).toBeUndefined(); // healthy
+  });
+  test("uncolored unless BOTH remaining and limit are finite and the limit is positive", () => {
+    expect(limitTone(null, 5000)).toBeUndefined(); // remaining unknown
+    expect(limitTone(1998, null)).toBeUndefined(); // seeded remaining, no limit → no ratio
+    expect(limitTone(Number.NaN, 5000)).toBeUndefined();
+    expect(limitTone(100, Number.POSITIVE_INFINITY)).toBeUndefined();
+    expect(limitTone(100, 0)).toBeUndefined(); // degenerate limit — no divide
+    expect(limitTone(100, -5)).toBeUndefined();
+  });
+  test("TOTAL against undefined and masquerading runtime values (§U0 — never enter a ratio)", () => {
+    // The quota seed's number-typed fields originate in an unvalidated external JSON body; the store's
+    // folds null non-finite values, but limitTone must ALSO be total on its own — a future emitter must
+    // never be able to render color from a string (or drive a NaN ratio) if it forgets to validate.
+    expect(limitTone(undefined as unknown as number, 5000)).toBeUndefined(); // absent value
+    expect(limitTone(100, undefined as unknown as number)).toBeUndefined();
+    expect(limitTone("120" as unknown as number, 5000)).toBeUndefined(); // Number.isFinite("120") is false — no coercion
+    expect(limitTone(120, "5000" as unknown as number)).toBeUndefined();
+    expect(limitTone(`${String.fromCharCode(0x9d)}0;pwn${String.fromCharCode(0x9c)}` as unknown as number, 5000)).toBeUndefined(); // hostile C1 string
   });
 });
 

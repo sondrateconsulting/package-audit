@@ -10,13 +10,22 @@
 // via <Text color/dimColor>; NO_COLOR is honored by Ink's chalk.
 import { Box, Text } from "ink";
 import type { ReactNode } from "react";
+import { assertNever } from "../assertNever.ts";
 import type { TuiSnapshot } from "./store.ts";
 import { isPaused } from "./store.ts";
-import { sanitizeLine, thousands, formatSpan, formatClock, formatCountdown, formatReset, PROBLEM_ROWS, type Layout } from "./format.ts";
+import { sanitizeLine, thousands, formatSpan, formatClock, formatCountdown, formatReset, limitTone, PROBLEM_ROWS, type Layout } from "./format.ts";
 
 const GUTTER = 9; // label column width
+// The cumulative pause-budget cap in minutes — the "/<N>m" denominator the operator reads. Mirrors
+// github.ts's MAX_TOTAL_PAUSE_MS (8h = 480m). The TUI must NOT import github.ts (tui-purity), so the
+// value is duplicated here; a drift-detect test (panels.test.ts, which MAY import github.ts) pins
+// the two equal, so changing the source cap without updating this display trips CI.
+export const PAUSE_BUDGET_CAP_MINUTES = 480;
 
-function Row({ children }: { children: ReactNode }) {
+// Exported (like LimitSegment) so the M1 wiring test can execute it and resolve the `<Text
+// wrap="truncate-end">` it wraps around every row — making the test's effective-color model account
+// for a tone inherited through that wrapper. Pure and hookless.
+export function Row({ children }: { children: ReactNode }) {
   return (
     <Box width="100%" overflow="hidden">
       <Text wrap="truncate-end">{children}</Text>
@@ -26,23 +35,47 @@ function Row({ children }: { children: ReactNode }) {
 
 export function Header({ snap, nowMs, mountedAtMs }: { snap: TuiSnapshot; nowMs: number; mountedAtMs: number }) {
   const run = snap.runId === null ? "starting…" : `run ${sanitizeLine(snap.runId).slice(0, 8)}… ${snap.resumed === true ? "(resumed)" : "(fresh)"}`;
-  const phase = snap.phase === null ? "" : `   phase: ${sanitizeLine(snap.phase)}`;
+  const phase = snap.phase === null ? "" : ` · phase: ${sanitizeLine(snap.phase)}`;
   return (
     <Row>
       <Text bold>package-audit</Text> ▸ {run}
       {phase}
-      {`   elapsed ${formatClock(nowMs - mountedAtMs)}`}
+      {` · elapsed ${formatClock(nowMs - mountedAtMs)}`}
     </Row>
   );
 }
 
-function limitText(snap: TuiSnapshot, resource: "core" | "graphql", nowMs: number): string {
+// One rate-limit segment ("core 4,812/5,000 resets in 12:34"). The REMAINING count carries a graded
+// headroom color (limitTone, finding M1) so a low quota stands out in the otherwise-monochrome
+// healthy frame; the label and denominator stay neutral. Text content matches the prior string form
+// EXCEPT the intentional M3 "resets" → "resets in" wording (the panel tests assert it verbatim);
+// color is stripped before those text assertions. Exported so a unit test can walk the returned
+// element tree and assert the remaining count is wrapped in a tone-colored Text — a rendered-ANSI
+// assertion is not CI-stable (ink/chalk caches its color level at module load, shared across bun's
+// test process).
+export function LimitSegment({ snap, resource, nowMs }: { snap: TuiSnapshot; resource: "core" | "graphql"; nowMs: number }) {
   const l = snap.limits[resource];
-  if (l === null) return `${resource} —`;
+  if (l === null) return <>{`${resource} —`}</>;
   const remaining = l.remaining === null ? "?" : thousands(l.remaining);
-  const limit = l.limit === null ? "" : `/${thousands(l.limit)}`;
-  const reset = l.resetEpochSec === null ? "" : ` resets ${formatReset(l.resetEpochSec, nowMs)}`;
-  return `${resource} ${remaining}${limit}${reset}`;
+  const rest = `${l.limit === null ? "" : `/${thousands(l.limit)}`}${l.resetEpochSec === null ? "" : ` resets in ${formatReset(l.resetEpochSec, nowMs)}`}`;
+  return (
+    <>
+      {`${resource} `}
+      <Text color={limitTone(l.remaining, l.limit)}>{remaining}</Text>
+      {rest}
+    </>
+  );
+}
+
+// The rate-limit strip: label + the core/graphql segments. Shared by the full LimitsPanel and by
+// CompactFrame so the two can never drift out of sync (one edit updates both).
+export function LimitsRow({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number }) {
+  return (
+    <Row>
+      <Text dimColor>{"limits".padEnd(GUTTER)}</Text>
+      <LimitSegment snap={snap} resource="core" nowMs={nowMs} /> · <LimitSegment snap={snap} resource="graphql" nowMs={nowMs} />
+    </Row>
+  );
 }
 
 export function LimitsPanel({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number }) {
@@ -53,50 +86,66 @@ export function LimitsPanel({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number 
   const spentMs = Math.max(snap.throttle.core?.budgetSpentMs ?? 0, snap.throttle.graphql?.budgetSpentMs ?? 0);
   return (
     <Box flexDirection="column">
-      <Row>
-        <Text dimColor>{"limits".padEnd(GUTTER)}</Text>
-        {limitText(snap, "core", nowMs)} · {limitText(snap, "graphql", nowMs)}
-      </Row>
+      <LimitsRow snap={snap} nowMs={nowMs} />
       <Row>
         <Text dimColor>{"".padEnd(GUTTER)}</Text>
-        {`subprocs ${spawnsLive}/${cap}${queued} · pause budget ${budgetMinutes(spentMs)}/480m`}
+        {`subprocs ${spawnsLive}/${cap}${queued} · pause budget ${budgetMinutes(spentMs)}/${PAUSE_BUDGET_CAP_MINUTES}m`}
       </Row>
     </Box>
   );
 }
 
-// The throttle banner: PAUSED is DERIVED (horizon vs now — §U4); the budget-exhausted notice is
-// sticky, never conflated with per-call retry exhaustion (surfaced as a count).
-export function ThrottleBanner({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number }) {
-  const lines: ReactNode[] = [];
+// The throttle banner's active reasons, in render order (§U5): PAUSED is DERIVED (horizon vs now —
+// §U4); the budget-exhausted notice is sticky, never conflated with per-call retry exhaustion. This
+// is the ONE source of truth — both ThrottleBanner (below) AND the layout planner's reserved row
+// count (bannerLineCount) derive from it, so the rendered banner and the reserved §U5 row budget
+// can never drift: a new banner dimension added here updates the render and the count together.
+type BannerReason =
+  | { kind: "paused"; resource: "core" | "graphql"; horizonMs: number }
+  | { kind: "budget-exhausted" };
+
+export function activeBannerReasons(snap: TuiSnapshot, nowMs: number): ReadonlyArray<BannerReason> {
+  const reasons: BannerReason[] = [];
   for (const resource of ["core", "graphql"] as const) {
     const t = snap.throttle[resource];
-    if (t !== null && isPaused(t, nowMs)) {
-      lines.push(
-        <Row key={resource}>
-          <Text color="yellow">{`⏸ ${resource} PAUSED — resumes in ${formatCountdown(t.horizonMs, nowMs)}`}</Text>
-        </Row>,
-      );
-    }
+    if (t !== null && isPaused(t, nowMs)) reasons.push({ kind: "paused", resource, horizonMs: t.horizonMs });
   }
-  if (snap.budgetExhausted) {
-    lines.push(
-      <Row key="budget">
-        <Text color="red">✖ pause budget exhausted — remaining throttled work defers to the next run</Text>
-      </Row>,
-    );
-  }
-  if (lines.length === 0) return null;
-  return <Box flexDirection="column">{lines}</Box>;
+  if (snap.budgetExhausted) reasons.push({ kind: "budget-exhausted" });
+  return reasons;
 }
 
-// How many banner lines the layout planner must reserve — mirrors ThrottleBanner exactly.
+// One row per active reason, EXHAUSTIVE over BannerReason: a future kind that is not rendered here
+// is a build error (assertNever), never a silently-wrong row — the same discipline the store fold
+// applies to the reason union.
+function bannerRow(r: BannerReason, nowMs: number): ReactNode {
+  switch (r.kind) {
+    case "paused":
+      return (
+        <Row key={r.resource}>
+          <Text color="yellow">{`⏸ ${r.resource} PAUSED — resumes in ${formatCountdown(r.horizonMs, nowMs)}`}</Text>
+        </Row>
+      );
+    case "budget-exhausted":
+      return (
+        <Row key="budget">
+          <Text color="red">✖ pause budget exhausted — remaining throttled work defers to the next run</Text>
+        </Row>
+      );
+    default:
+      return assertNever(r, "banner reason");
+  }
+}
+
+export function ThrottleBanner({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number }) {
+  const reasons = activeBannerReasons(snap, nowMs);
+  if (reasons.length === 0) return null;
+  return <Box flexDirection="column">{reasons.map((r) => bannerRow(r, nowMs))}</Box>;
+}
+
+// How many banner rows the layout planner must reserve — the SAME list ThrottleBanner renders, so
+// the reserved §U5 row budget and the rendered banner can never disagree.
 export function bannerLineCount(snap: TuiSnapshot, nowMs: number): number {
-  let n = 0;
-  if (isPaused(snap.throttle.core, nowMs)) n++;
-  if (isPaused(snap.throttle.graphql, nowMs)) n++;
-  if (snap.budgetExhausted) n++;
-  return n;
+  return activeBannerReasons(snap, nowMs).length;
 }
 
 export function WorkPanel({ snap, nowMs, workRows, showFindings }: { snap: TuiSnapshot; nowMs: number; workRows: number; showFindings: boolean }) {
@@ -115,7 +164,7 @@ export function WorkPanel({ snap, nowMs, workRows, showFindings }: { snap: TuiSn
     <Box flexDirection="column">
       <Row>
         <Text dimColor>{"work".padEnd(GUTTER)}</Text>
-        {`owners ${snap.owners.length}/${ownerCap}${owners} · repos ${snap.repoCount} · unit workers ${snap.unitWorkers.length} (≤${branchCap}/repo) · scanning ${snap.scanning.length}`}
+        {`owners ${snap.owners.length} (≤${ownerCap} concurrent)${owners} · repos ${snap.repoCount} · unit workers ${snap.unitWorkers.length} (≤${branchCap}/repo) · scanning ${snap.scanning.length}`}
       </Row>
       {shownUnits.map((u) => (
         <Row key={u.key}>
@@ -138,7 +187,7 @@ export function WorkPanel({ snap, nowMs, workRows, showFindings }: { snap: TuiSn
       ) : null}
       <Row>
         <Text dimColor>{"".padEnd(GUTTER)}</Text>
-        {`session: scanned ${thousands(c.scanned)} · current ${thousands(c.skipCurrent)} · skipped ${thousands(skipped)} · past-cap ${thousands(c.pastCap)} · errored ${thousands(c.errored)}${c.requeued > 0 ? ` · requeued ${thousands(c.requeued)}` : ""}${snap.retryExhaustions > 0 ? ` · retry-exhausted ${thousands(snap.retryExhaustions)}` : ""}`}
+        {`session: scanned ${thousands(c.scanned)} · errored ${thousands(c.errored)}${snap.retryExhaustions > 0 ? ` · retry-exhausted ${thousands(snap.retryExhaustions)}` : ""}${c.requeued > 0 ? ` · requeued ${thousands(c.requeued)}` : ""} · current ${thousands(c.skipCurrent)} · skipped ${thousands(skipped)} · past-cap ${thousands(c.pastCap)}`}
       </Row>
       {showFindings ? (
         <Row>
@@ -220,10 +269,7 @@ export function CompactFrame({ snap, nowMs, mountedAtMs }: { snap: TuiSnapshot; 
   return (
     <Box flexDirection="column">
       <Header snap={snap} nowMs={nowMs} mountedAtMs={mountedAtMs} />
-      <Row>
-        <Text dimColor>{"limits".padEnd(GUTTER)}</Text>
-        {limitText(snap, "core", nowMs)} · {limitText(snap, "graphql", nowMs)}
-      </Row>
+      <LimitsRow snap={snap} nowMs={nowMs} />
       <Row>
         <Text dimColor>{"".padEnd(GUTTER)}</Text>
         {`scanned ${thousands(c.scanned)} · errored ${thousands(c.errored)} · workers ${snap.unitWorkers.length}`}

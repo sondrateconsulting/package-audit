@@ -116,3 +116,31 @@ describe("the jsonl tap gate (§U1/§U0)", () => {
     expect(seen[0]!.type).toBe("jsonl");
   });
 });
+
+describe("throttle event type: reason is coupled to state (§U4)", () => {
+  test("armed/waiting carry no reason; exhausted REQUIRES one (compile-time guard)", () => {
+    // Positive: armed and waiting are valid WITHOUT a reason.
+    const armed: ProgressEvent = { type: "throttle", bucket: "core", state: "armed", untilMs: null, budgetSpentMs: 0 };
+    const waiting: ProgressEvent = { type: "throttle", bucket: "graphql", state: "waiting", untilMs: 1_000, budgetSpentMs: 0 };
+    // Positive: exhausted WITH a reason is valid.
+    const exhausted: ProgressEvent = { type: "throttle", bucket: "core", state: "exhausted", reason: "budget", untilMs: null, budgetSpentMs: 10 };
+    expect([armed.type, waiting.type, exhausted.type]).toEqual(["throttle", "throttle", "throttle"]);
+
+    // Negative (enforced by `tsc`, not by the runtime): an exhausted event with NO reason must be a
+    // TYPE error, so the store fold can never silently route a future/forgotten exhaustion reason
+    // into the transient retry counter instead of the sticky budget flag. The literal is annotated
+    // as ProgressEvent so this exercises the union constraint, not excess-property inference.
+    // @ts-expect-error exhausted throttle events require a `reason`
+    const missingReason: ProgressEvent = { type: "throttle", bucket: "core", state: "exhausted", untilMs: null, budgetSpentMs: 0 };
+    void missingReason;
+
+    // Negative: armed/waiting must EXACTLY forbid a reason — including on a NON-FRESH object, where
+    // structural assignability (not the fresh-literal excess-property check) governs. `reason?: never`
+    // is what rejects it: without that, `nonFresh` carries all armed fields plus an extra reason and
+    // would be assignable, silently defeating the state↔reason coupling.
+    const nonFresh = { type: "throttle" as const, bucket: "core" as const, state: "armed" as const, reason: "budget" as const, untilMs: null, budgetSpentMs: 0 };
+    // @ts-expect-error armed/waiting throttle events must not carry a reason
+    const armedWithReason: ProgressEvent = nonFresh;
+    void armedWithReason;
+  });
+});

@@ -2,7 +2,7 @@
 // from horizon vs injected now; sticky budget-exhausted vs retryExhaustions; seed-vs-live
 // precedence; unknown tapped events ignored; version bumps. Deterministic injected clock.
 import { expect, test, describe } from "bun:test";
-import { createTuiStore, isPaused, PROBLEM_RING_CAP, type TuiStore } from "./store.ts";
+import { createTuiStore, isPaused, PROBLEM_RING_CAP, type TuiStore, type TuiSnapshot } from "./store.ts";
 import type { ProgressEvent } from "../progress.ts";
 
 function makeClock(startMs = 1_000): { store: TuiStore; tick: (ms: number) => void; now: () => number } {
@@ -280,13 +280,45 @@ describe("totality + version (§U4)", () => {
     expect(store.version).toBe(v0 + 2);
   });
 
-  test("the snapshot is a copy — mutating it cannot corrupt the store", () => {
+  test("the snapshot is a copy — mutating it (incl. nested limits/throttle/problems) cannot corrupt the store", () => {
     const { store } = makeClock();
     store.dispatch({ type: "spawn-start", id: 1, tool: "gh", label: "x" });
+    store.dispatch({ type: "rate-limit", resource: "core", remaining: 4000, limit: 5000, resetEpochSec: 111 });
+    store.dispatch({ type: "throttle", bucket: "core", state: "waiting", untilMs: 9_000, budgetSpentMs: 1_000 });
+    store.dispatch(jsonl({ event: "warning", reason: "r", target: "t", message: "m" }));
     const snap = store.snapshot();
     (snap.spawns as Array<unknown>).length = 0;
     (snap.counters as { scanned: number }).scanned = 99;
-    expect(store.snapshot().spawns.length).toBe(1);
-    expect(store.snapshot().counters.scanned).toBe(0);
+    // Nested value objects are deep-copied in snapshot() AND their fields are readonly, so a
+    // consumer cannot reach through the snapshot into live store state. The @ts-expect-error lines
+    // prove the readonly types reject the writes at compile time; at runtime they mutate only the
+    // (independent) copy, which the assertions below confirm never touches the store.
+    // @ts-expect-error remaining is readonly
+    snap.limits.core!.remaining = -1;
+    // @ts-expect-error horizonMs is readonly
+    snap.throttle.core!.horizonMs = -1;
+    // @ts-expect-error message is readonly
+    snap.problems[0]!.message = "tampered";
+    const after = store.snapshot();
+    expect(after.spawns.length).toBe(1);
+    expect(after.counters.scanned).toBe(0);
+    expect(after.limits.core!.remaining).toBe(4000);
+    expect(after.throttle.core!.horizonMs).toBe(9_000);
+    expect(after.problems[0]!.message).toBe("m");
+  });
+});
+
+describe("TuiSnapshot.phase is the closed Phase union, not a bare string (§U4)", () => {
+  test("an arbitrary string is NOT assignable to the phase slot (compile-time guard for the narrowing)", () => {
+    // Real pipeline phases and null are assignable.
+    const scan: TuiSnapshot["phase"] = "scan";
+    const nul: TuiSnapshot["phase"] = null;
+    expect([scan, nul]).toEqual(["scan", null]);
+    // "scanning" is a DISPLAY fallback string (App.tsx's `snap.phase ?? "scanning"`), NOT a pipeline
+    // phase — assigning it to the phase slot must be a TYPE error. This would silently pass if phase
+    // were widened back to a bare `string`, so it is the regression guard for the Phase narrowing.
+    // @ts-expect-error "scanning" is not a member of the closed Phase union
+    const bad: TuiSnapshot["phase"] = "scanning";
+    void bad;
   });
 });
