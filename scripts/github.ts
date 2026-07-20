@@ -986,10 +986,14 @@ function whichIn(env: Env, bin: string): string {
   return (path !== undefined ? Bun.which(bin, { PATH: path }) : Bun.which(bin)) ?? bin;
 }
 
-// Rate-limit header → integer for the display snapshot; absent/non-numeric folds to null.
+// Rate-limit header → integer for the display snapshot; absent/non-numeric folds to null. The
+// /^\d+$/ gate rejects signs/decimals/exponents/separators, but a digits-only value large enough to
+// overflow Number() would still yield Infinity — so require a safe integer, keeping the contract an
+// honest "finite nonnegative integer or null" (a display count, never Infinity).
 function headerInt(value: string | undefined): number | null {
   if (value === undefined || value === "" || !/^\d+$/.test(value.trim())) return null;
-  return Number(value.trim());
+  const n = Number(value.trim());
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 const RAW_ACCEPT = "application/vnd.github.raw+json";

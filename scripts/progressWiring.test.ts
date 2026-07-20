@@ -203,6 +203,22 @@ describe("rate-limit snapshots via the analyze-return channel (§U8.7)", () => {
     expect(rl).toEqual([{ type: "rate-limit", resource: "core", remaining: 4750, limit: 5000, resetEpochSec: 1700000000 }]);
   });
 
+  test("present-but-malformed rate-limit headers fold to null, never NaN/Infinity/a coerced number", async () => {
+    const seen = captureProgress();
+    // regex-rejected forms: negative, decimal, exponent, comma-grouped.
+    await makeClient([ok(http(200, { "X-RateLimit-Remaining": "-5", "X-RateLimit-Limit": "4750.5", "X-RateLimit-Reset": "1e3" }, `{"a":1}`))]).restGet("user");
+    await makeClient([ok(http(200, { "X-RateLimit-Remaining": "4,750" }, `{"a":1}`))]).restGet("user");
+    // digits-only but astronomically large: passes /^\d+$/ yet Number() overflows to Infinity — the
+    // finite/safe-integer guard must still fold it to the honest null (a display count, not Infinity).
+    await makeClient([ok(http(200, { "X-RateLimit-Remaining": "9".repeat(400) }, `{"a":1}`))]).restGet("user");
+    const rl = seen.filter((e) => e.type === "rate-limit");
+    expect(rl).toEqual([
+      { type: "rate-limit", resource: "core", remaining: null, limit: null, resetEpochSec: null },
+      { type: "rate-limit", resource: "core", remaining: null, limit: null, resetEpochSec: null },
+      { type: "rate-limit", resource: "core", remaining: null, limit: null, resetEpochSec: null },
+    ]);
+  });
+
   test("emitted on a 304 revalidation (a live response) but NOT on the zero-network immutable-cache return", async () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     try {
