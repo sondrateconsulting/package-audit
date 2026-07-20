@@ -17,10 +17,12 @@ export type ProgressEvent =
   | { type: "fetch-end"; id: number }
   | { type: "rate-limit"; resource: "core" | "graphql"; remaining: number | null; limit: number | null; resetEpochSec: number | null }
   | { type: "rate-limit-seed"; resource: "core" | "graphql"; remaining: number | null }
-  // Split by `state` so `reason` is REQUIRED exactly for "exhausted" and forbidden otherwise (§U4):
-  // the store fold can never route a forgotten/future exhaustion reason into the transient retry
-  // counter instead of the sticky budget flag without a compile error.
-  | { type: "throttle"; bucket: "core" | "graphql"; state: "armed" | "waiting"; untilMs: number | null; budgetSpentMs: number }
+  // Split by `state` so `reason` is REQUIRED for "exhausted" and forbidden for "armed"/"waiting"
+  // (§U4). `reason?: never` on the non-exhausted arm makes "forbidden" EXACT — a stray reason is
+  // rejected even on a non-fresh object (structural assignability, not just a fresh-literal excess-
+  // property check) — so the store fold can never route a forgotten/future exhaustion reason into
+  // the transient retry counter instead of the sticky budget flag without a compile error.
+  | { type: "throttle"; bucket: "core" | "graphql"; state: "armed" | "waiting"; reason?: never; untilMs: number | null; budgetSpentMs: number }
   | { type: "throttle"; bucket: "core" | "graphql"; state: "exhausted"; reason: "budget" | "retries"; untilMs: number | null; budgetSpentMs: number }
   | { type: "owner-start"; owner: string }
   | { type: "owner-end"; owner: string }

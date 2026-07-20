@@ -278,12 +278,14 @@ export function createTuiStore(nowMs: () => number): TuiStore {
       case "throttle": {
         if (e.state === "exhausted") {
           // Exhaustive over the reason union: a future reason added to ProgressEvent that is not
-          // mapped here is a BUILD error (assertNever), never a silent miscount. A stray reason at
-          // runtime throws into emitProgress's guard, which degrades the dashboard, not the audit.
+          // mapped here is a BUILD error (assertNever), never a silent miscount. Were one to slip
+          // through at runtime, the throw unwinds the fold into the guarded progress-sink path — the
+          // lifecycle sink closure degrades the dashboard (emitProgress's own catch is the backstop),
+          // never the audit.
           switch (e.reason) {
             case "budget": budgetExhausted = true; break; // sticky — cannot un-happen this run
             case "retries": retryExhaustions++; break; // transient per-call exhaustion, a count
-            default: assertNever(e.reason, "throttle reason");
+            default: assertNever(e, "throttle reason"); // a new exhausted reason → build error here
           }
         }
         const prev = throttle[e.bucket];

@@ -133,5 +133,14 @@ describe("throttle event type: reason is coupled to state (§U4)", () => {
     // @ts-expect-error exhausted throttle events require a `reason`
     const missingReason: ProgressEvent = { type: "throttle", bucket: "core", state: "exhausted", untilMs: null, budgetSpentMs: 0 };
     void missingReason;
+
+    // Negative: armed/waiting must EXACTLY forbid a reason — including on a NON-FRESH object, where
+    // structural assignability (not the fresh-literal excess-property check) governs. `reason?: never`
+    // is what rejects it: without that, `nonFresh` carries all armed fields plus an extra reason and
+    // would be assignable, silently defeating the state↔reason coupling.
+    const nonFresh = { type: "throttle" as const, bucket: "core" as const, state: "armed" as const, reason: "budget" as const, untilMs: null, budgetSpentMs: 0 };
+    // @ts-expect-error armed/waiting throttle events must not carry a reason
+    const armedWithReason: ProgressEvent = nonFresh;
+    void armedWithReason;
   });
 });

@@ -103,7 +103,7 @@ type BannerReason =
   | { kind: "paused"; resource: "core" | "graphql"; horizonMs: number }
   | { kind: "budget-exhausted" };
 
-export function activeBannerReasons(snap: TuiSnapshot, nowMs: number): BannerReason[] {
+export function activeBannerReasons(snap: TuiSnapshot, nowMs: number): ReadonlyArray<BannerReason> {
   const reasons: BannerReason[] = [];
   for (const resource of ["core", "graphql"] as const) {
     const t = snap.throttle[resource];
