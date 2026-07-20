@@ -9,7 +9,7 @@ import { EventEmitter } from "node:events";
 import { createElement, isValidElement } from "react";
 import { Text } from "ink";
 import { mountTui } from "./mount.tsx";
-import { CompactFrame, LimitSegment, LimitsPanel, Row, bannerLineCount, ThrottleBanner, activeBannerReasons } from "./panels.tsx";
+import { CompactFrame, LimitSegment, LimitsPanel, LimitsRow, Row, bannerLineCount, ThrottleBanner, activeBannerReasons } from "./panels.tsx";
 import { createTuiStore, type TuiStore, type TuiSnapshot } from "./store.ts";
 import { sanitizeLine } from "./format.ts";
 import { PAUSE_BUDGET_CAP_MINUTES } from "./panels.tsx";
@@ -17,6 +17,7 @@ import { MAX_TOTAL_PAUSE_MS } from "../github.ts";
 import { resetTuiFailure, type ProgressEvent } from "../progress.ts";
 
 type LimitSegmentProps = Parameters<typeof LimitSegment>[0];
+type LimitsRowProps = Parameters<typeof LimitsRow>[0];
 type RowProps = Parameters<typeof Row>[0];
 
 // Flatten an element subtree to plain text. LimitSegment and Row are pure, hookless render helpers,
@@ -26,6 +27,7 @@ function textOf(node: unknown): string {
   if (Array.isArray(node)) return node.map(textOf).join("");
   if (isValidElement(node)) {
     if (node.type === LimitSegment) return textOf(LimitSegment(node.props as LimitSegmentProps));
+    if (node.type === LimitsRow) return textOf(LimitsRow(node.props as LimitsRowProps));
     if (node.type === Row) return textOf(Row(node.props as RowProps));
     return textOf((node.props as { children?: unknown }).children);
   }
@@ -56,6 +58,7 @@ function countColor(node: unknown, needle: string, viaSegment = false, ancestorC
   }
   if (!isValidElement(node)) return undefined;
   if (node.type === LimitSegment) return countColor(LimitSegment(node.props as LimitSegmentProps), needle, true, ancestorColored);
+  if (node.type === LimitsRow) return countColor(LimitsRow(node.props as LimitsRowProps), needle, viaSegment, ancestorColored);
   if (node.type === Row) return countColor(Row(node.props as RowProps), needle, viaSegment, ancestorColored);
   const props = node.props as { color?: unknown; children?: unknown };
   if (viaSegment && node.type === Text && textOf(props.children) === needle) return { own: props.color, ancestorColored };

@@ -66,6 +66,17 @@ export function LimitSegment({ snap, resource, nowMs }: { snap: TuiSnapshot; res
   );
 }
 
+// The rate-limit strip: label + the core/graphql segments. Shared by the full LimitsPanel and by
+// CompactFrame so the two can never drift out of sync (one edit updates both).
+export function LimitsRow({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number }) {
+  return (
+    <Row>
+      <Text dimColor>{"limits".padEnd(GUTTER)}</Text>
+      <LimitSegment snap={snap} resource="core" nowMs={nowMs} /> · <LimitSegment snap={snap} resource="graphql" nowMs={nowMs} />
+    </Row>
+  );
+}
+
 export function LimitsPanel({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number }) {
   const spawnsLive = snap.spawns.length;
   const cap = snap.spawnCap === null ? "?" : String(snap.spawnCap);
@@ -74,10 +85,7 @@ export function LimitsPanel({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number 
   const spentMs = Math.max(snap.throttle.core?.budgetSpentMs ?? 0, snap.throttle.graphql?.budgetSpentMs ?? 0);
   return (
     <Box flexDirection="column">
-      <Row>
-        <Text dimColor>{"limits".padEnd(GUTTER)}</Text>
-        <LimitSegment snap={snap} resource="core" nowMs={nowMs} /> · <LimitSegment snap={snap} resource="graphql" nowMs={nowMs} />
-      </Row>
+      <LimitsRow snap={snap} nowMs={nowMs} />
       <Row>
         <Text dimColor>{"".padEnd(GUTTER)}</Text>
         {`subprocs ${spawnsLive}/${cap}${queued} · pause budget ${budgetMinutes(spentMs)}/${PAUSE_BUDGET_CAP_MINUTES}m`}
@@ -252,10 +260,7 @@ export function CompactFrame({ snap, nowMs, mountedAtMs }: { snap: TuiSnapshot; 
   return (
     <Box flexDirection="column">
       <Header snap={snap} nowMs={nowMs} mountedAtMs={mountedAtMs} />
-      <Row>
-        <Text dimColor>{"limits".padEnd(GUTTER)}</Text>
-        <LimitSegment snap={snap} resource="core" nowMs={nowMs} /> · <LimitSegment snap={snap} resource="graphql" nowMs={nowMs} />
-      </Row>
+      <LimitsRow snap={snap} nowMs={nowMs} />
       <Row>
         <Text dimColor>{"".padEnd(GUTTER)}</Text>
         {`scanned ${thousands(c.scanned)} · errored ${thousands(c.errored)} · workers ${snap.unitWorkers.length}`}
