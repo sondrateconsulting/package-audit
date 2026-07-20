@@ -108,8 +108,10 @@ export function decideTuiActivation(i: ActivationInput): ActivationDecision;
 ```
 Rules (normative; the function IS the matrix, unit-tested row by row):
 - eligibility = `stderrIsTTY && term !== "dumb" && !ci && (columns ?? 0) >= 40 &&
-  (rows ?? 0) >= 5`. CI is `CI` set and non-empty (Ink itself degrades under CI, and CI
-  consumers expect stdout JSONL — auto mode must never divert there). Undefined
+  (rows ?? 0) >= 5`. CI is detected by `isInkCiEnv()`, mirroring ink's pinned `is-in-ci` —
+  `CI` OR `CONTINUOUS_INTEGRATION` present, with `'0'`/`'false'` treated as unset (Ink itself
+  degrades under CI, and CI consumers expect stdout JSONL — auto mode must never divert there;
+  this refines the original "CI set and non-empty" letter — see the recorded deviations). Undefined
   dimensions are ineligible. A terminal that SHRINKS below the floor mid-run is a render
   concern (§U5), not an activation concern.
 - `plan` → off (the `--ui`+`--plan` combination never reaches here — args.ts rejected it).
@@ -164,13 +166,18 @@ synchronous trio:
   case.
 - Close: `closeSync(fd)` during teardown; a close failure warns, nothing more. No
   fsync — the DB, not the log, is the durable state.
-- Mid-run write failure (disk full, fd revoked, nonpositive write count): logLine's
-  sink wrapper, IN THE SAME CALL and in THIS order: (1) `sealEarly()` the render proxy
-  — synchronous seal + immediate cursor-show compensation (§U1 proxy contract), so the
+- Mid-run write failure (disk full, fd revoked, nonpositive write count): the sink
+  closure, IN THE SAME CALL and in THIS order: (1) `sealEarly()` the render proxy —
+  synchronous seal + immediate cursor-show compensation (§U1 proxy contract), so the
   frame stops writing BEFORE any JSONL reaches a same-terminal stdout (no interleaving
   window, not even one tick) and a SIGINT during the unmount wait cannot strand a
-  hidden cursor; (2) restore the stdout sink and re-emit the failing line (no event is
-  lost); (3) `reportDivertFailure`; (4) `degradeNow`. The exit line then reads
+  hidden cursor; (2) `reportDivertFailure`; (3) `degradeNow`; (4) rethrow — and then
+  `logLine` (downstream, in log.ts) restores the stdout sink and re-emits the failing
+  line (no event is lost). The re-emit lives in log.ts, downstream of the closure's
+  rethrow; this refines the original draft's seal→restore→report→degrade order (recorded
+  deviation 1) — every invariant holds: seal precedes any stdout byte, the failing line is
+  re-emitted in the same call, and the latch is set before teardown reads it. The exit
+  line then reads
   `JSONL log (partial — divert failed mid-run, remainder went to stdout): <path>`.
 
 ### log.ts seam (dependency-free, injected — log.ts imports nothing new)
@@ -181,18 +188,19 @@ export function setLogTap(tap: ((event: Readonly<Record<string, unknown>>) => vo
 ```
 `logLine` builds the ONE line exactly as today, hands it to the active sink (default
 `process.stdout.write`), THEN calls the tap (the durable line can never be lost to a tap
-crash). A throwing SINK triggers the divert-failure transition above (logLine catches,
-reroutes to stdout re-emitting the line, and the sink CLOSURE — built by main, so log.ts
-stays dependency-free — reports to the §U2 latch). A throwing TAP self-clears and
-reports likewise. Neither ever escapes `logLine`.
+crash). A throwing SINK triggers the divert-failure transition above: the sink CLOSURE — built by
+main, so log.ts stays dependency-free — seals, reports to the §U2 latch, and degrades
+before rethrowing, and logLine then catches that, reroutes to stdout, and re-emits the
+line. A throwing TAP self-clears and reports likewise. Neither ever escapes `logLine`.
 
 ### main() sequencing (normative — one lifecycle owner, one composition seam)
 The TUI lifecycle is owned by an extracted, testable wrapper:
 ```ts
 // scripts/tui/lifecycle.ts (React-free; dynamic-imports mount.tsx)
 export interface TuiDeps {   // every impure edge injectable; production defaults provided
-  decision: ActivationDecision;
+  decision: Exclude<ActivationDecision, { mode: "error" }>;   // off/on only — the "error" arm is resolved BEFORE the lifecycle (orchestrate throws)
   mountImpl?: () => Promise<{ mountTui: typeof mountTui }>;   // default: import("./mount.tsx")
+  storeImpl?: (nowMs: () => number) => TuiStore;             // additive test seam (deviation 2): fault-inject store.dispatch
   divertIo?: { open(path: string): number;                     // openSync "wx"; throws EEXIST
                write(fd: number, line: string): void;          // short-write loop inside
                close(fd: number): void };
@@ -239,10 +247,15 @@ exit 1) is unchanged and stays covered by the existing entrypoint tests.
 
 ### The sealable stderr proxy (owned by lifecycle.ts — Ink's whole world)
 A minimal WriteStream facade with exactly three jobs, all load-bearing:
-1. **Transparent while live**: forwards `write()` to the real stderr and DELEGATES
-   `isTTY`, `columns`, `rows`, and `resize` listener registration (getter/passthrough)
-   to the real stream — Ink must see a real interactive TTY (size tracking, §U5) and
-   chalk must detect color exactly as before. Anything Ink reads that the proxy does
+1. **Transparent while live**: forwards `write()` to the real stderr and delegates
+   `isTTY` and `resize` listener registration (getter/passthrough) to the real stream —
+   Ink must see a real interactive TTY and chalk must detect color exactly as before.
+   `columns`/`rows` are the ONE non-delegation (recorded deviation 7): real positive
+   integers pass through (and are remembered), but a non-positive/undefined read pins to
+   the LAST KNOWN GOOD geometry (ink's 80×24 default only before any usable read), so ink's
+   own layout never reaches its spawn-capable `terminal-size` fallback (§U0); the App reads
+   the TRUE stream dimensions through a separate raw channel (`getRawDims`) for §U5 layout.
+   Anything Ink reads that the proxy does
    not implement falls through to the real stream's value.
 2. **Absorbing**: an underlying write's synchronous throw, callback error, or 'error'
    event is CONSUMED — latch (`reportTuiFailure`) + `degradeNow` + count it, always
@@ -613,11 +626,13 @@ Two race contracts make that real:
 - **Divert open failure** (mkdir/openSync/retry exhausted): degrade — tear down the
   just-mounted dashboard (full teardown below), warn once naming the underlying error,
   run bare with JSONL on stdout. Never fatal (§U0), never JSONL-into-the-frame.
-- **Divert write failure mid-run**: handled inside logLine's sink closure (§U1): stdout
-  sink restored and the failing line re-emitted in the same call (no loss),
-  `reportDivertFailure`, then `degradeNow` — teardown starts immediately. Exit line
-  labels the file partial (from the structured latch's `divertFailedMidRun`, which is
-  tracked independently of whichever failure latched FIRST).
+- **Divert write failure mid-run**: the sink closure seals the render proxy, calls
+  `reportDivertFailure` then `degradeNow`, and rethrows; `logLine` (downstream, in log.ts)
+  restores the stdout sink and re-emits the failing line in the same call (no loss) — the
+  re-emit lives in log.ts, downstream of the closure's rethrow (recorded deviation 1;
+  matches the §U1 note above). Teardown starts immediately. Exit line labels the file
+  partial (from the structured latch's `divertFailedMidRun`, which is tracked independently
+  of whichever failure latched FIRST).
 - **Emit/tap/render/tick/exit-rejection failure**: every site both latches AND calls
   `degradeNow` directly where it can (§U1/§U5); the tick's latch check and the finally
   are the safety nets for anything that could only latch. The audit never observes any
@@ -628,7 +643,10 @@ Two race contracts make that real:
   1. `handle.dispose()` — stops the tick interval and App-side hooks (idempotent; the
      App may already have stopped itself; skipped when the handle never arrived);
   2. `requestUnmount()`; `await race(waitUntilExit(), timer)` using the INJECTED
-     `deps.timers` (2s production default) — ALWAYS clearTimeout the loser;
+     `deps.timers` (2s production default) — ALWAYS clearTimeout the loser. If
+     `requestUnmount()` THROWS, `sealEarly()` and strip the resize listeners immediately,
+     BEFORE the bounded wait (recorded deviation 9), so a SIGINT in the wait can't exit
+     cursorless and a terminal resize can't re-enter damaged ink;
   3. `seal()` the stderr proxy (idempotent — the divert-failure path seals earlier) —
      from here, NOTHING (including a wedged Ink, its queued renders, or its console
      patch) can reach the real stderr; sealed-off write attempts are counted and
@@ -642,10 +660,11 @@ Two race contracts make that real:
      lifecycle sets this flag by comparing teardown start against body completion; a
      tick/render/emit degrade also strands the file mid-stream, and announcing it as
      the complete log would be a lie);
-  5a. if the seal preceded unmount and `sealEarly()`'s compensation did not run (a
-     defensive impossibility — every pre-unmount seal site uses `sealEarly()`), write
-     the cursor-show escape (ESC `[?25h`) once to the REAL stderr; best-effort,
-     guarded, idempotent;
+  5a. write the cursor-show escape (ESC `[?25h`) once to the REAL stderr whenever the
+     unmount window may have left the cursor hidden (recorded deviation 9): a seal that
+     preceded unmount, a bounded-exit failure, or absorbed stderr failures recorded during
+     the unmount — the compensation is guarded by a `cursorCompensated` flag (idempotent),
+     and best-effort;
   6. print the ONE latched-failure warning (first cause + any sealed-write count), if
      the latch is non-null.
   Steps 5–6 write to the REAL stderr (the proxy is sealed; teardown holds the real
@@ -711,8 +730,9 @@ existing suite (log.test.ts runs against real stdout).
    `--flag=value` rejection, help text names both.
 3. **log.ts seam**: sink receives the ONE whole line per event (extend log.test.ts's
    write-counting harness to a custom sink); `setLogSink(null)` restores stdout; tap
-   fires after the write; tap throw self-clears, reports, never escapes; SINK throw
-   reroutes to stdout re-emitting the same line (no loss) and reports.
+   fires after the write; tap throw self-clears, reports, never escapes; SINK throw: the
+   installed sink closure reports/degrades and rethrows, then `logLine` reroutes to stdout
+   re-emitting the same line (no loss).
 4. **Divert opener**: pure `logPathFor` (timestamp/pid/suffix grammar); EEXIST retry
    selects the suffixed candidate and the ACTUAL path propagates to the divert event
    and exit line; bounded exhaustion → degrade (not fatal); short-write loop delivers
@@ -762,13 +782,14 @@ existing suite (log.test.ts runs against real stdout).
 13. **Lifecycle (`runWithTui` with injected deps — mounts, io, streams, TIMERS)**:
     mount failure → body still runs, JSONL on stdout, one warning; divert open failure
     → teardown AWAITED before the body proceeds (no live-frame/stdout overlap); divert
-    write failure mid-body → proxy sealed SYNCHRONOUSLY before the re-emit (assert no
-    frame write lands after the rerouted JSONL line), stdout rerouted, line re-emitted,
-    `degradeNow` starts teardown immediately, partial wording + actual path in exit
-    line, cursor-show escape written on the early-seal path; a NON-divert degrade
+    write failure mid-body → proxy sealed SYNCHRONOUSLY and `degradeNow` starts teardown
+    inside the sink closure, then stdout rerouted and the line re-emitted (assert no frame
+    write lands after the rerouted JSONL line, and no event lost), partial wording + actual
+    path in exit line, cursor-show escape written on the early-seal path; a NON-divert degrade
     (tick/render/emit) mid-body also yields the partial-file wording
-    (`divertClosedEarly`); teardown ordering (dispose → unmount → seal → seams cleared
-    → close → log line → latched warning → THEN summary/fatal); bounded-exit timeout
+    (`divertClosedEarly`); teardown ordering on the CLEAN path (dispose → unmount → seal
+    → seams cleared → close → log line → latched warning → THEN summary/fatal; a THROWN
+    unmount seals + strips resize BEFORE the bounded wait — deviation 9); bounded-exit timeout
     path is DETERMINISTIC via injected timers, clears the loser, and the sealed proxy
     drops and COUNTS a wedged mount's late writes (assert none reach the real stream
     and the count reaches the warning); teardown re-entry runs the sequence ONCE —
@@ -784,8 +805,9 @@ existing suite (log.test.ts runs against real stdout).
     CLEARS the sink synchronously (subsequent emits are no-ops, zero further
     throws/allocations), latches, and degrades immediately (no tick dependence); latch
     reset at lifecycle start.
-13a. **Sealable proxy**: transparent delegation (isTTY/columns/rows/resize reach the
-    real stream's values and listeners, live AND sealed); absorbing (underlying sync
+13a. **Sealable proxy**: transparent delegation (isTTY + resize reach the real stream,
+    live AND sealed; `columns`/`rows` pass through when positive, else pin to last-known-good
+    — deviation 7 — with the true dims exposed via `getRawDims`); absorbing (underlying sync
     throw, callback error, and 'error' event are consumed, latched, degrade, callback
     acknowledged — nothing escapes into the caller); sealed counting; seal idempotence.
 14. **Enforcement scans**: logVocab.test.ts walk becomes recursive
@@ -939,7 +961,9 @@ Review record (outside voice: codex CLI, gpt-5.6-sol @ ultra reasoning)
   starts mid-collapse (covers synchronous setup-time degrades); cursor compensation
   moved INTO `sealEarly()` (seal + cursor-show in one synchronous step — the SIGINT
   window between early seal and unmount can no longer strand a hidden cursor; step 5a
-  demoted to a defensive no-op).
+  demoted to a defensive fallback at that round — later re-broadened to also fire on a
+  bounded-exit failure or absorbed stderr failures during unmount; see §U6 step 5a and
+  recorded deviation 9).
 - R6 2026-07-18: 0 findings — VERDICT: APPROVE ("No unresolved or new
   implementation-changing findings."). Converged in 6 of the allotted 7 rounds
   (38 → 23 → 13 → 8 → 4 → 0).
