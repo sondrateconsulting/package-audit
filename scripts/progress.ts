@@ -18,8 +18,8 @@ export type ProgressEvent =
   | { type: "rate-limit"; resource: "core" | "graphql"; remaining: number | null; limit: number | null; resetEpochSec: number | null }
   | { type: "rate-limit-seed"; resource: "core" | "graphql"; remaining: number | null }
   // Split by `state`: `reason` is REQUIRED for "exhausted" and rejected for "armed"/"waiting" (§U4).
-  // The producer-side guarantee is the rest-tuple emitThrottle (github.ts): no call site can attach a
-  // reason off "exhausted". On the type itself, `reason?: never` rejects any concrete reason VALUE
+  // The producer-side guarantee is emitThrottle's fixed-arity overloads (github.ts): no call site can
+  // attach a reason off "exhausted". On the type itself, `reason?: never` rejects any concrete reason VALUE
   // ("budget"/"retries") on armed/waiting, including non-fresh objects. (A present `reason: undefined`
   // is still accepted — the project's tsconfig omits exactOptionalPropertyTypes — but it is
   // semantically absent and the fold reads `reason` only for "exhausted".) Net: the store fold can
