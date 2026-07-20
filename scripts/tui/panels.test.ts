@@ -32,30 +32,37 @@ function textOf(node: unknown): string {
   return "";
 }
 
-// The EFFECTIVE color of every Ink Text whose flattened content is EXACTLY `text` AND which is
-// reached THROUGH a LimitSegment execution. Two subtleties, both raised in review:
-//  - effective color = the Text's OWN `color` if set, else the nearest ancestor Text's color (Ink
-//    inheritance). To make that complete, the walker EXECUTES the custom components on the count's
-//    path that hide a Text behind a component boundary — LimitSegment (the tone-colored Text) and
-//    Row (its `<Text wrap="truncate-end">` wrapper) — so a tone on EITHER is reflected in the
-//    effective color; these panels place no other colored-Text ancestor above the count. Ink Box/Text
-//    are read via props (Box carries no color; Text's color is read directly). A healthy count
-//    reports undefined only if nothing above it colors it.
-//  - `viaSegment` gates collection to counts reached via LimitSegment, so inlining an identical
-//    colored Text WITHOUT LimitSegment fails (→ []). The helper wiring, not just the color, is proven.
-// LimitSegment and Row are pure and hookless, so executing them directly is safe. Guards with
-// isValidElement / Array.isArray before any property access. (A rendered-ANSI assertion is not
-// CI-stable here: ink/chalk fixes its color level at module load, shared across bun's single test
-// process — a color SGR appears when a file runs alone but is suppressed once another has imported ink.)
-function textColorsOf(node: unknown, text: string, viaSegment = false, inherited: unknown = undefined): unknown[] {
-  if (Array.isArray(node)) return node.flatMap((child) => textColorsOf(child, text, viaSegment, inherited));
-  if (!isValidElement(node)) return [];
-  if (node.type === LimitSegment) return textColorsOf(LimitSegment(node.props as LimitSegmentProps), text, true, inherited);
-  if (node.type === Row) return textColorsOf(Row(node.props as RowProps), text, viaSegment, inherited);
+// Locate the count — the Ink Text whose flattened content is EXACTLY `needle`, reached THROUGH a
+// LimitSegment execution — and report BOTH its OWN `color` and whether ANY ancestor Text on its path
+// is colored. The design intent is count-ONLY toning: the count Text itself carries the tone and
+// NOTHING above it does. So M1 is proven by requiring { own: <tone>, ancestorColored: false }, which
+// fails on every realistic break:
+//   • color dropped        → own undefined (≠ the tone)
+//   • LimitSegment un-wired → count not reached via a segment → no match → undefined
+//   • wrong own tone        → own ≠ the tone
+//   • whole-segment / ancestor recolor that would tint the count via Ink inheritance → ancestorColored true
+// The wrappers that hide a Text behind a component boundary (LimitSegment, Row's <Text wrap>) are
+// executed so the full Text ancestry is resolved; Ink Box/Text are read via props. `viaSegment` gates
+// the match to a count reached via LimitSegment. Guards with isValidElement / Array.isArray before any
+// property access. (A rendered-ANSI assertion is not CI-stable here: ink/chalk caches its color level
+// at module load, shared across bun's single test process.)
+function countColor(node: unknown, needle: string, viaSegment = false, ancestorColored = false): { own: unknown; ancestorColored: boolean } | undefined {
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = countColor(child, needle, viaSegment, ancestorColored);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  if (!isValidElement(node)) return undefined;
+  if (node.type === LimitSegment) return countColor(LimitSegment(node.props as LimitSegmentProps), needle, true, ancestorColored);
+  if (node.type === Row) return countColor(Row(node.props as RowProps), needle, viaSegment, ancestorColored);
   const props = node.props as { color?: unknown; children?: unknown };
-  const effective = node.type === Text && props.color !== undefined ? props.color : inherited; // Ink: own color wins, else inherit
-  const here = viaSegment && node.type === Text && textOf(props.children) === text ? [effective] : [];
-  return [...here, ...textColorsOf(props.children, text, viaSegment, effective)];
+  if (viaSegment && node.type === Text && textOf(props.children) === needle) return { own: props.color, ancestorColored };
+  // a Text with its own color becomes a colored ancestor for its subtree (checked AFTER the count test,
+  // so the count's own color is never mistaken for an ancestor's)
+  const nextAncestorColored = node.type === Text && props.color !== undefined ? true : ancestorColored;
+  return countColor(props.children, needle, viaSegment, nextAncestorColored);
 }
 
 afterEach(() => {
@@ -179,7 +186,7 @@ describe("panel frames over canned store states (§U8.11)", () => {
     expect(text).toContain("JSONL → /out/logs/audit-log-20260718T211530Z-p4242.jsonl");
   });
 
-  test("M1 wiring: each panel routes the count through LimitSegment into an Ink Text of the exact EFFECTIVE tone; healthy is uncolored; core & graphql carry independent tones", () => {
+  test("M1 wiring: each panel routes the count through LimitSegment into an Ink Text that carries the tone ITSELF with no colored ancestor (count-only toning); healthy uncolored; core & graphql independent", () => {
     const snapWith = (coreRemaining: number, graphqlRemaining?: number): ReturnType<TuiStore["snapshot"]> => {
       const store: TuiStore = createTuiStore(() => NOW);
       store.dispatch({ type: "rate-limit", resource: "core", remaining: coreRemaining, limit: 5000, resetEpochSec: null });
@@ -190,34 +197,35 @@ describe("panel frames over canned store states (§U8.11)", () => {
     const yellow = snapWith(1000); // core 20% → yellow
     const ok = snapWith(4800); // core 96% → uncolored
     const mixed = snapWith(100, 1000); // core red + graphql yellow in the same frame
-    // Assert against BOTH modes: full (LimitsPanel) and compact (CompactFrame). A mode that stops
-    // routing the count through LimitSegment yields [] (not the tone), a dropped color yields
-    // [undefined], a stray/ancestor tone yields that tone, and a non-Text remaining yields [].
+    // Assert against BOTH modes. The count Text carries the tone ITSELF (own) with NO colored ancestor
+    // (count-only toning). Fails on: un-wired LimitSegment (no match → undefined), dropped color (own
+    // undefined ≠ tone), wrong own tone, or a whole-segment/ancestor recolor (ancestorColored true).
     const panels: Array<(s: ReturnType<TuiStore["snapshot"]>) => unknown> = [
       (s) => LimitsPanel({ snap: s, nowMs: NOW }),
       (s) => CompactFrame({ snap: s, nowMs: NOW, mountedAtMs: NOW }),
     ];
     for (const panel of panels) {
-      expect(textColorsOf(panel(red), "100")).toEqual(["red"]);
-      expect(textColorsOf(panel(yellow), "1,000")).toEqual(["yellow"]);
-      expect(textColorsOf(panel(ok), "4,800")).toEqual([undefined]);
-      expect(textColorsOf(panel(mixed), "100")).toEqual(["red"]);
-      expect(textColorsOf(panel(mixed), "1,000")).toEqual(["yellow"]);
+      expect(countColor(panel(red), "100")).toEqual({ own: "red", ancestorColored: false });
+      expect(countColor(panel(yellow), "1,000")).toEqual({ own: "yellow", ancestorColored: false });
+      expect(countColor(panel(ok), "4,800")).toEqual({ own: undefined, ancestorColored: false });
+      expect(countColor(panel(mixed), "100")).toEqual({ own: "red", ancestorColored: false });
+      expect(countColor(panel(mixed), "1,000")).toEqual({ own: "yellow", ancestorColored: false });
     }
   });
 
-  test("M1 wiring: an ancestor Text tone tints an otherwise-uncolored count via Ink inheritance, and textColorsOf reflects it (proves the effective-color model resolves wrapper Texts)", () => {
+  test("M1 wiring: count-only toning is enforced — a whole-segment/ancestor recolor is REJECTED (ancestorColored true), never accepted as the count's own tone", () => {
     const store: TuiStore = createTuiStore(() => NOW);
     store.dispatch({ type: "rate-limit", resource: "core", remaining: 4800, limit: 5000, resetEpochSec: null }); // healthy → the count's OWN color is undefined
     const snap = store.snapshot();
-    // Row wraps every row's content in a <Text wrap="truncate-end">; were a tone ever added there, the
-    // healthy count would inherit it in Ink. Simulate that ancestor Text and confirm the walker's
-    // effective-color model reports the INHERITED tone (not undefined) — it resolves such wrappers now,
-    // rather than reading the count's own color in isolation.
-    const tinted = createElement(Text, { color: "magenta" }, createElement(LimitSegment, { snap, resource: "core" as const, nowMs: NOW }));
-    expect(textColorsOf(tinted, "4,800")).toEqual(["magenta"]); // inherited from the ancestor Text
-    // control: with no ancestor tone, the same healthy count is uncolored
-    expect(textColorsOf(createElement(LimitSegment, { snap, resource: "core" as const, nowMs: NOW }), "4,800")).toEqual([undefined]);
+    // A whole-segment recolor: wrap the segment in a colored ancestor Text, leaving the inner count
+    // uncolored. Ink would tint the count via inheritance — but that is NOT count-only toning, so
+    // countColor surfaces the colored ancestor (ancestorColored: true), which makes the real
+    // assertions (ancestorColored: false) fail. This also covers the earlier concern that an ancestor
+    // tone could visibly color an otherwise-uncolored count: it is detected, not silently accepted.
+    const wholeSegmentTinted = createElement(Text, { color: "magenta" }, createElement(LimitSegment, { snap, resource: "core" as const, nowMs: NOW }));
+    expect(countColor(wholeSegmentTinted, "4,800")).toEqual({ own: undefined, ancestorColored: true });
+    // control: the real segment carries the tone on the count ITSELF with nothing colored above it
+    expect(countColor(createElement(LimitSegment, { snap, resource: "core" as const, nowMs: NOW }), "4,800")).toEqual({ own: undefined, ancestorColored: false });
   });
 
   test("session counters front-load the danger fields so end-truncation drops the least important first (M2)", async () => {
