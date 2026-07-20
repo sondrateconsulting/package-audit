@@ -274,8 +274,14 @@ export function createTuiStore(nowMs: () => number): TuiStore {
         break;
       case "throttle": {
         if (e.state === "exhausted") {
-          if (e.reason === "budget") budgetExhausted = true; // sticky — cannot un-happen this run
-          else retryExhaustions++;
+          // Exhaustive over the reason union: a future reason added to ProgressEvent that is not
+          // mapped here is a BUILD error (assertNever), never a silent miscount. A stray reason at
+          // runtime throws into emitProgress's guard, which degrades the dashboard, not the audit.
+          switch (e.reason) {
+            case "budget": budgetExhausted = true; break; // sticky — cannot un-happen this run
+            case "retries": retryExhaustions++; break; // transient per-call exhaustion, a count
+            default: assertNever(e.reason, "throttle reason");
+          }
         }
         const prev = throttle[e.bucket];
         const horizonMs = Math.max(prev?.horizonMs ?? 0, e.untilMs ?? 0);

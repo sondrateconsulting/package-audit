@@ -1391,16 +1391,18 @@ export class GithubClient {
   // Throttle-state display events (PROMPT-TUI §U3.4): synchronous, no-throw, fully gated — a run
   // with no sink pays one boolean. The event carries the PUBLISHED horizon and the CURRENT
   // (post-funding, for the armed emit) budget.
-  private emitThrottle(bucket: Bucket, state: "armed" | "waiting" | "exhausted", reason?: "budget" | "retries"): void {
+  // Discriminated rest-tuple so a `reason` is REQUIRED for "exhausted" and REJECTED for
+  // "armed"/"waiting" at the call site (mirrors the split ProgressEvent union) — no cast, no
+  // silently-droppable optional. `rest[0] === "exhausted"` narrows `rest[1]` to the reason.
+  private emitThrottle(bucket: Bucket, ...rest: ["armed" | "waiting"] | ["exhausted", "budget" | "retries"]): void {
     if (!hasProgressSink()) return;
-    emitProgress({
-      type: "throttle",
-      bucket: bucket.label,
-      state,
-      ...(reason !== undefined ? { reason } : {}),
-      untilMs: bucket.pausedUntilMs > 0 ? bucket.pausedUntilMs : null,
-      budgetSpentMs: bucket.budgetSpentMs,
-    });
+    const untilMs = bucket.pausedUntilMs > 0 ? bucket.pausedUntilMs : null;
+    const budgetSpentMs = bucket.budgetSpentMs;
+    emitProgress(
+      rest[0] === "exhausted"
+        ? { type: "throttle", bucket: bucket.label, state: rest[0], reason: rest[1], untilMs, budgetSpentMs }
+        : { type: "throttle", bucket: bucket.label, state: rest[0], untilMs, budgetSpentMs },
+    );
   }
 
   // Acquire a slot with the pause re-checked AFTER acquisition: a caller queued on the

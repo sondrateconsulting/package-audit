@@ -17,7 +17,11 @@ export type ProgressEvent =
   | { type: "fetch-end"; id: number }
   | { type: "rate-limit"; resource: "core" | "graphql"; remaining: number | null; limit: number | null; resetEpochSec: number | null }
   | { type: "rate-limit-seed"; resource: "core" | "graphql"; remaining: number | null }
-  | { type: "throttle"; bucket: "core" | "graphql"; state: "armed" | "waiting" | "exhausted"; reason?: "budget" | "retries"; untilMs: number | null; budgetSpentMs: number }
+  // Split by `state` so `reason` is REQUIRED exactly for "exhausted" and forbidden otherwise (§U4):
+  // the store fold can never route a forgotten/future exhaustion reason into the transient retry
+  // counter instead of the sticky budget flag without a compile error.
+  | { type: "throttle"; bucket: "core" | "graphql"; state: "armed" | "waiting"; untilMs: number | null; budgetSpentMs: number }
+  | { type: "throttle"; bucket: "core" | "graphql"; state: "exhausted"; reason: "budget" | "retries"; untilMs: number | null; budgetSpentMs: number }
   | { type: "owner-start"; owner: string }
   | { type: "owner-end"; owner: string }
   | { type: "repo-start"; owner: string; repo: string }
