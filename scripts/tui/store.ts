@@ -285,7 +285,7 @@ export function createTuiStore(nowMs: () => number): TuiStore {
           switch (e.reason) {
             case "budget": budgetExhausted = true; break; // sticky — cannot un-happen this run
             case "retries": retryExhaustions++; break; // transient per-call exhaustion, a count
-            default: assertNever(e, "throttle reason"); // a new exhausted reason → build error here
+            default: assertNever(e, "throttle exhausted reason"); // a new reason → build error here
           }
         }
         const prev = throttle[e.bucket];

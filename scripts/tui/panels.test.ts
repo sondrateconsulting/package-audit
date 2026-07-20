@@ -443,12 +443,17 @@ describe("throttle banner: count and render stay in lockstep (§U5)", () => {
     return store.snapshot();
   }
 
-  // The number of <Row> elements ThrottleBanner actually emits (null frame → 0).
+  // The number of <Row> elements ThrottleBanner actually renders (null frame → 0). Counts REAL Row
+  // elements by walking the tree — a null slot, a non-Row child, or a multi-Row Fragment cannot let
+  // the parity check pass on the wrong count (it counts elements, not raw child-array slots).
+  function countRows(node: unknown): number {
+    if (Array.isArray(node)) return node.reduce((n: number, c) => n + countRows(c), 0);
+    if (!isValidElement(node)) return 0;
+    if (node.type === Row) return 1; // banner rows are leaves — do not descend into a Row
+    return countRows((node.props as { children?: unknown }).children);
+  }
   function renderedRows(snap: TuiSnapshot, nowMs: number): number {
-    const el = ThrottleBanner({ snap, nowMs });
-    if (el === null) return 0;
-    const kids = (el.props as { children: unknown }).children;
-    return Array.isArray(kids) ? kids.length : 1;
+    return countRows(ThrottleBanner({ snap, nowMs }));
   }
 
   test("count, reasons list, and rendered rows agree across all 8 banner states", () => {

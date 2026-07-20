@@ -10,6 +10,7 @@
 // via <Text color/dimColor>; NO_COLOR is honored by Ink's chalk.
 import { Box, Text } from "ink";
 import type { ReactNode } from "react";
+import { assertNever } from "../assertNever.ts";
 import type { TuiSnapshot } from "./store.ts";
 import { isPaused } from "./store.ts";
 import { sanitizeLine, thousands, formatSpan, formatClock, formatCountdown, formatReset, limitTone, PROBLEM_ROWS, type Layout } from "./format.ts";
@@ -113,24 +114,32 @@ export function activeBannerReasons(snap: TuiSnapshot, nowMs: number): ReadonlyA
   return reasons;
 }
 
+// One row per active reason, EXHAUSTIVE over BannerReason: a future kind that is not rendered here
+// is a build error (assertNever), never a silently-wrong row — the same discipline the store fold
+// applies to the reason union.
+function bannerRow(r: BannerReason, nowMs: number): ReactNode {
+  switch (r.kind) {
+    case "paused":
+      return (
+        <Row key={r.resource}>
+          <Text color="yellow">{`⏸ ${r.resource} PAUSED — resumes in ${formatCountdown(r.horizonMs, nowMs)}`}</Text>
+        </Row>
+      );
+    case "budget-exhausted":
+      return (
+        <Row key="budget">
+          <Text color="red">✖ pause budget exhausted — remaining throttled work defers to the next run</Text>
+        </Row>
+      );
+    default:
+      return assertNever(r, "banner reason");
+  }
+}
+
 export function ThrottleBanner({ snap, nowMs }: { snap: TuiSnapshot; nowMs: number }) {
   const reasons = activeBannerReasons(snap, nowMs);
   if (reasons.length === 0) return null;
-  return (
-    <Box flexDirection="column">
-      {reasons.map((r) =>
-        r.kind === "paused" ? (
-          <Row key={r.resource}>
-            <Text color="yellow">{`⏸ ${r.resource} PAUSED — resumes in ${formatCountdown(r.horizonMs, nowMs)}`}</Text>
-          </Row>
-        ) : (
-          <Row key="budget">
-            <Text color="red">✖ pause budget exhausted — remaining throttled work defers to the next run</Text>
-          </Row>
-        ),
-      )}
-    </Box>
-  );
+  return <Box flexDirection="column">{reasons.map((r) => bannerRow(r, nowMs))}</Box>;
 }
 
 // How many banner rows the layout planner must reserve — the SAME list ThrottleBanner renders, so

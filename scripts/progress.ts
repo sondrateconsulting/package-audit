@@ -17,11 +17,14 @@ export type ProgressEvent =
   | { type: "fetch-end"; id: number }
   | { type: "rate-limit"; resource: "core" | "graphql"; remaining: number | null; limit: number | null; resetEpochSec: number | null }
   | { type: "rate-limit-seed"; resource: "core" | "graphql"; remaining: number | null }
-  // Split by `state` so `reason` is REQUIRED for "exhausted" and forbidden for "armed"/"waiting"
-  // (§U4). `reason?: never` on the non-exhausted arm makes "forbidden" EXACT — a stray reason is
-  // rejected even on a non-fresh object (structural assignability, not just a fresh-literal excess-
-  // property check) — so the store fold can never route a forgotten/future exhaustion reason into
-  // the transient retry counter instead of the sticky budget flag without a compile error.
+  // Split by `state`: `reason` is REQUIRED for "exhausted" and rejected for "armed"/"waiting" (§U4).
+  // The producer-side guarantee is the rest-tuple emitThrottle (github.ts): no call site can attach a
+  // reason off "exhausted". On the type itself, `reason?: never` rejects any concrete reason VALUE
+  // ("budget"/"retries") on armed/waiting, including non-fresh objects. (A present `reason: undefined`
+  // is still accepted — the project's tsconfig omits exactOptionalPropertyTypes — but it is
+  // semantically absent and the fold reads `reason` only for "exhausted".) Net: the store fold can
+  // never route a forgotten/future exhaustion reason into the transient retry counter instead of the
+  // sticky budget flag without a compile error.
   | { type: "throttle"; bucket: "core" | "graphql"; state: "armed" | "waiting"; reason?: never; untilMs: number | null; budgetSpentMs: number }
   | { type: "throttle"; bucket: "core" | "graphql"; state: "exhausted"; reason: "budget" | "retries"; untilMs: number | null; budgetSpentMs: number }
   | { type: "owner-start"; owner: string }
