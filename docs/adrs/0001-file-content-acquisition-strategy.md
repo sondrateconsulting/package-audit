@@ -164,6 +164,7 @@ returns. **A symlink policy must be chosen explicitly by whichever option wins.*
   truncated trees
 * **Option 2a — Promote the existing per-unit shallow clone** to the default content path
 * **Option 2b — Shared partial/sparse/multi-ref repository per repo**
+* **Option 2c — Per-unit clone without checkout, canonical-object reads via guarded `git cat-file`**
 * **Option 3 — Content-addressed blob cache** keyed on blob OID
 
 ## Decision Outcome
@@ -196,10 +197,19 @@ configuration. Reading canonical objects from a clone instead needs `git cat-fil
 `readOnlyGuard` currently excludes ([readOnlyGuard.ts:201](../../scripts/readOnlyGuard.ts#L201)). That
 exclusion is not an absolute barrier — plain `git cat-file --batch` returns raw object contents, and
 `--textconv`/`--filters` are separate opt-in flags the guard's exact-argv grammars could exclude, as
-they already do for `show`. It is a real *cost*: a new guarded verb, a validated-OID stdin protocol,
-and binary framing that the current UTF-8 spawn decode cannot provide. That cost, stacked on the disk,
-sweep, symlink, and routing problems below, is what decides against the clone options — not
-impossibility.
+they already do for `show`. It is a real *cost*: new guarded verbs, a validated-OID stdin protocol,
+and binary framing that the current UTF-8 spawn decode cannot provide.
+
+That checkout critique decides against **Option 2a specifically** — it does not decide the clone
+question. Option 2c below pays the `cat-file` cost deliberately and never checks out, dissolving the
+byte-fidelity, symlink, and size-gate objections at once; it is the **strongest challenger** to this
+recommendation. What keeps Option 1 recommended over 2c, provisionally, is a surface asymmetry, not a
+knockout: Option 1's new machinery is in-process and exercisable through the existing injected-spawn
+tests, while 2c's crosses a subprocess protocol boundary — a stdin trust surface the argv guard cannot
+see, a long-lived child lifecycle where every subprocess today is one-shot, and disk on the common
+path. The pre-acceptance benchmark (Confirmation) compares them under a symmetric pre-registered rule
+with no incumbency margin; the surface asymmetry is the decision-maker's ledger, not a numeric
+handicap.
 
 **This is not a drop-in transport swap.** Its cost, stated plainly:
 
@@ -207,7 +217,9 @@ impossibility.
    ([unitPipeline.ts:46](../../scripts/unitPipeline.ts#L46)), so a reader cannot accumulate requests.
    The seam becomes `prefetch(paths)`/`readFiles(paths)`, or `scanUnit` splits into planning and
    consumption phases — unavoidable, because source relevance is decided inside `scanUnit`
-   ([unitPipeline.ts:190](../../scripts/unitPipeline.ts#L190)).
+   ([unitPipeline.ts:190](../../scripts/unitPipeline.ts#L190)). This cost is **Option 1's own**, not
+   generic to alternatives: Option 2c's reads are local and on-demand, and leave the one-path seam
+   intact.
 2. **Tree mode preserved *and validated*.** The parser keeps only the object type and drops mode
    ([github.ts:746](../../scripts/github.ts#L746)). Mode must be carried on `TreeEntry` and validated
    against the closed mapping `100644`/`100755`/`120000` → blob, `040000` → tree, `160000` → commit.
@@ -290,12 +302,24 @@ pretended away.
 ### Confirmation
 
 **Pre-acceptance gate (decision evidence, not implementation verification).** This ADR stays
-`proposed` until a checked-in benchmark over a pinned public corpus — fixed SHAs and paths, repeated
-cold runs, p50/p95, reporting requests, transferred bytes, peak disk, and wall time — has compared the
-status quo, Option 1, Option 2a, and Option 3 on identical *selected-path* workloads, with a
-predeclared margin under which a different option wins. The corpus must include repeated same-repo
-branches, a truncated-tree repository, path-heavy trees, and a repository with checkout-affecting
-`.gitattributes`. Every number in the table above is single-sample and is superseded by it.
+`proposed` until the benchmark specified to execution level in the
+[resolution plan](../plans/adr-0001-disagreements-resolution.md) has run and its Step-D decision is
+recorded. The gate, summarised — the plan is normative: a checked-in harness over a six-slot pinned
+public corpus (multi-branch tree sharing, mid-size, path-heavy, truncated-tree, checkout-affecting
+`.gitattributes`, and a symlink/non-UTF-8 fidelity battery) drives pinned selected-path workloads
+through four drivers — status quo, Option 1, Option 2a, and **Option 2c** — under preregistered
+constants, ordering, and worst-case budget reservation. Option 3 is evaluated compositionally
+(offline duplicate-OID analysis plus a warm-run scenario), not as a competing transport. Global
+eligibility gates cover route-scoped byte determinism (with a checkout-config probe), completeness,
+stability, and resource envelope; eligible drivers are compared per scenario on
+budget-normalised serial throughput inside a **calibrated noise band** (`max(1.25, pilot spread)`),
+and a driver is recommended only if it dominates — at least one scenario win and no losses against
+every other eligible driver. **The rule is symmetric: no incumbency margin protects Option 1**;
+design-surface judgment stays with the decision-maker, and every Step-D outcome — confirmation,
+challenger win, no-dominator judgment, or remain-proposed-with-remediation — passes one further
+adversarial review round before this ADR changes state. An override of the rule's recommendation
+requires written rationale recorded in the Review history; an ineligible driver can never be
+chosen. Every number in the table above is single-sample and is superseded by the benchmark.
 
 Post-implementation checks:
 
@@ -361,7 +385,9 @@ size-based escape to `apiReader`, and enumerate locally with `walkClone` instead
   `.gitattributes` transformations, so `cloneReader` bytes and `walkClone` sizes are attribute- and
   platform-dependent — which also perturbs the 2 MiB gate. Canonical reads need `cat-file`, excluded
   from the guard *by design* ([readOnlyGuard.ts:201](../../scripts/readOnlyGuard.ts#L201)). Accepting
-  checkout bytes means accepting environment-dependent findings.
+  checkout bytes means accepting environment-dependent findings. (The *size-gate* half of this is
+  fixable — canonical sizes via the same guarded `ls-tree` Option 2c introduces, at the cost of that
+  verb; the checkout-read *bytes* are not fixable without becoming 2c.)
 * Bad, because **the size router has no route for the oversized-and-truncated intersection**. Above the
   threshold it sends work to `apiReader`, which only reads paths it is handed
   ([orchestrate.ts:111](../../scripts/orchestrate.ts#L111)), while a truncated tree discards every path
@@ -383,7 +409,9 @@ size-based escape to `apiReader`, and enumerate locally with `walkClone` instead
   traversal root ([orchestrate.ts:148](../../scripts/orchestrate.ts#L148)); GitHub dereferences only
   targets that are normal in-repository files; and on `core.symlinks=false` platforms links become
   ordinary text files that `lstat` cannot identify. A correct policy needs index/tree modes, lexical
-  resolution through tracked entries, a tracked-regular-blob requirement, and gitlink exclusion.
+  resolution through tracked entries, a tracked-regular-blob requirement, and gitlink exclusion — in
+  practice the same guarded `ls-tree` mode source Option 2c needs, so a *faithful* 2a already pays
+  part of 2c's verb cost.
 * Bad, because **clone failures are not retried**: `cloneShallow` makes one attempt and converts any
   nonzero exit to `GithubApiError` ([github.ts:2031](../../scripts/github.ts#L2031)), and `processRepo`
   requeues only `ThrottleExhausted` ([orchestrate.ts:698](../../scripts/orchestrate.ts#L698)), so a
@@ -416,6 +444,55 @@ fetched into the same store.
   `--filter`/`--sparse`/`--no-checkout` outside the clone option allowlist
   ([readOnlyGuard.ts:218](../../scripts/readOnlyGuard.ts#L218)).
 * Bad, because it is strictly more work than 2a for an unmeasured benefit.
+
+### Option 2c — Per-unit clone without checkout, canonical-object reads via guarded `git cat-file`
+
+Clone exactly as 2a but with `--no-checkout`, so no working tree ever exists. Enumerate with a
+guarded `git ls-tree -r -z -l --full-tree HEAD` — mode, type, OID, canonical object size, and path
+for every entry. Read content through **one unit-lived `git cat-file --batch` child** (spawned with
+`GIT_NO_REPLACE_OBJECTS=1`) serving the existing pull-style `ReadFile` seam: each read writes one
+format-validated OID to stdin and reads exactly one framed reply. Added to this ADR after its
+initial review rounds; full evaluation detail, including the benchmark driver specification, lives
+in the [resolution plan](../plans/adr-0001-disagreements-resolution.md).
+
+* Good, because reads are **the committed objects themselves** — self-verifying against the tree OID
+  before any seam decode, the same guarantee Option 1's hash-validated path offers under M9's
+  standard, with `.gitattributes` never executing at all.
+* Good, because git transport consumes no REST budget (M6) **and** local `ls-tree` eliminates the
+  per-unit REST tree request — the one term Option 1 leaves standing — with no 100,000-entry / 7 MB
+  truncation cliff.
+* Good, because the `ReadFile` seam survives unchanged: reads are local and on-demand, so Option 1's
+  two-phase planning/consumption refactor does not exist here.
+* Good, because symlink policy is mode-routed exactly like Option 1's (modes are explicit in
+  ls-tree; no filesystem links exist to traverse), the 2 MiB gate reads canonical sizes rather than
+  transformed `lstat` sizes, and binary bytes survive the transport natively — the seam's UTF-8
+  decode becomes a deliberate parity choice instead of a transport loss.
+* Neutral, because head coherence (`git rev-parse HEAD` against the discovery-pinned OID) is already
+  allowlisted ([readOnlyGuard.ts:236](../../scripts/readOnlyGuard.ts#L236)) — the force-push guard
+  costs no new verb.
+* Bad, because `readOnlyGuard` grows three grammars: a **second exact clone shape** (every clone
+  option is mandatory-exactly-once, [readOnlyGuard.ts:287](../../scripts/readOnlyGuard.ts#L287), so
+  `--no-checkout` cannot join the shared set), an `ls-tree` tuple, and a `cat-file --batch` tuple
+  with `--textconv`/`--filters` structurally absent — reopening a surface excluded by name today
+  ([readOnlyGuard.ts:206](../../scripts/readOnlyGuard.ts#L206)).
+* Bad, because `--batch` resolves arbitrary revs from stdin, which the argv guard cannot see:
+  containment moves to a caller that must emit only format-validated OIDs (40-hex SHA-1 / 64-hex
+  SHA-256, per the repository's object format). A genuinely new trust boundary — 2c's weakest point.
+* Bad, because it needs a framed binary spawn seam — stdin piping, streamed length-prefixed frames
+  bounded by the ls-tree-declared size under the existing spawn cap, bounded headers, capped stderr —
+  where today's spawn is stdin-ignored and irreversibly UTF-8-decoded
+  ([github.ts:168](../../scripts/github.ts#L168), [github.ts:180](../../scripts/github.ts#L180));
+  and `buildGitEnv`'s allowlist drops `GIT_NO_REPLACE_OBJECTS` today, so the env addition is
+  explicit new surface too.
+* Bad, because a unit-lived child is a **new lifecycle class**: it cannot share the one-shot
+  subprocess semaphore (holding a permit while the unit's symlink fallback awaits a REST permit
+  deadlocks; sizing a per-unit pool instead composes to thousands of children at maximum fan-out),
+  so it needs its own small fixed permit pool, lazy spawn, ordered teardown before clone deletion,
+  per-read deadlines, and a respawn policy — every production subprocess today is one-shot.
+* Bad, because 2a's operational inheritance stands: disk on every unit (pack-only — smaller than
+  2a, but the common path now touches disk where Option 1's does not), the unowned `pkg-audit-*`
+  sweep hazard ([github.ts:2096](../../scripts/github.ts#L2096)), single-attempt clone, whole-branch
+  transfer however few files are selected, and 15 ops/s/repo pacing with no headroom header.
 
 ### Option 3 — Content-addressed blob cache keyed on blob OID
 
@@ -541,25 +618,44 @@ claims — chiefly that "canonical committed bytes" overstated a guarantee the d
 qualifies for symlinks, binary blobs, and truncated trees. Those corrections are applied above; the
 guarantee is now scoped to hash-validated regular blobs with its exceptions named.
 
-Two disagreements are recorded rather than resolved. The reviewer would have the option-selecting
-benchmark run **before** acceptance; that is why this ADR stays `proposed` behind a pre-acceptance
-gate rather than claiming a settled decision. And the reviewer holds that a canonical-object clone
-variant deserves its own evaluation; it is listed under Follow-on work rather than dismissed.
+Two disagreements were recorded rather than resolved at the close of round five. The reviewer would
+have the option-selecting benchmark run **before** acceptance; that is why this ADR stays `proposed`
+behind a pre-acceptance gate rather than claiming a settled decision. And the reviewer holds that a
+canonical-object clone variant deserves its own evaluation; it was initially listed under Follow-on
+work rather than dismissed.
+
+**Both disagreements have since been converted into committed, evidence-gated work** (2026-07-28,
+a further adversarial review loop over the
+[resolution plan](../plans/adr-0001-disagreements-resolution.md), same reviewer). The benchmark is
+now specified to execution level with a pre-registered *symmetric* decision rule — an early draft's
+2.0× incumbent-displacement margin was withdrawn under review as exactly the thumb on the scale the
+resolution must not contain — and the canonical-object clone variant is evaluated in this ADR as
+Option 2c and benchmarked as a first-class driver. Along the way the review overturned two of this
+ADR's own framings: the batching seam refactor is Option 1's distinct cost, not a shared one (2c's
+interactive child serves the existing one-path seam), and a faithful Option 2a already needs the
+`ls-tree` mode source once its symlink policy is taken seriously. Closure is evidence-based, not
+declarative: the clone-variant disagreement discharges when Option 2c's benchmark row has actually
+run, and the benchmark disagreement discharges when the evidence-based decision is recorded — until
+then this ADR remains `proposed`, which is the reviewer's position honoured.
 
 ### Follow-on work
 
-**The tree-request term.** Option 1 leaves one REST tree request per distinct uncached tree. Closing it
-needs either local enumeration (which implies a clone, with the byte-fidelity consequences above) or a
-budgeting strategy for listing pages. Its own ADR.
+**The tree-request term.** Option 1 leaves one REST tree request per distinct uncached tree.
+**Option 2c eliminates this term entirely** (local `ls-tree` enumeration); it needs its own ADR only
+if Option 1 is confirmed, in which case closing it means either local enumeration (a clone, with the
+consequences above) or a budgeting strategy for listing pages.
 
 **Option 3** should be scheduled on evidence: measure the estate's duplicate-OID ratio from trees
-already fetched — a cheap offline analysis — before committing. Its symlink exclusion is a hard
-requirement.
+already fetched — a cheap offline analysis — before committing. The benchmark plan carries the
+concrete vehicle: that offline analysis over the corpus trees plus a warm-run scenario on the
+recommended driver(s), which also has to state honestly what git's native object reuse already
+provides on clone paths. Its symlink exclusion is a hard requirement.
 
-**Option 2a** is not dead. If the pre-acceptance benchmark shows Option 1's fallback rate or scheduler
-overhead dominating, 2a becomes viable *provided* the byte-fidelity question is settled explicitly —
-either by accepting environment-dependent findings as a documented semantic change, or by a narrowly
-guarded canonical-object read path that does not reopen `--textconv`/`--filters`.
+**Option 2a** is not dead, but its canonical-read escape hatch is no longer follow-on work — that
+path *is* Option 2c, evaluated above and benchmarked as a first-class driver. What remains open for
+2a specifically: if the benchmark shows Option 1's fallback rate or scheduler overhead dominating
+*and* 2c's child lifecycle proves unacceptable, 2a becomes viable only by accepting
+environment-dependent findings as a documented semantic change.
 
 **Revisit this decision if:** the pre-acceptance benchmark fails its declared margin; GitHub's GraphQL
 point formula, per-query timeout, or partial-result behaviour changes materially; or GitHub ships a
