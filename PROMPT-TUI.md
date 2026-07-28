@@ -25,8 +25,9 @@ Operator decisions already made (do not relitigate):
 ================================================================================
 U0. NON-NEGOTIABLES (inherited invariants + this feature's own)
 ================================================================================
-- **stdout JSONL purity (§6/§8).** stdout carries exclusively one-line JSON events via
-  `logLine` (scripts/log.ts). The TUI writes NOTHING to stdout, ever. In every mode where
+- **stdout JSONL purity (§6/§8).** stdout carries exclusively one-line JSON events, nearly all
+  of them via `logLine` (scripts/log.ts) — the exception is `export-summary`, which export.ts
+  hand-serializes and its `main()` writes. The TUI writes NOTHING to stdout, ever. In every mode where
   stdout JSONL flows today, it continues to flow with IDENTICAL bytes: no new event
   types, no field changes, no reordering beyond what already varies run-to-run. The
   vocabulary freeze is enforced by scripts/logVocab.test.ts; this feature must not add,

@@ -19,9 +19,10 @@ import ts from "typescript";
 // reportSchema↔db.ts).
 //
 // Scope note: the scan is SYNTACTIC, not textual. It parses each non-test source and collects
-// `event:`/`action:` object-literal properties. A direct string literal counts ANYWHERE —
-// export.ts's RAW_EXPORT_WARNING holds `event: "warning"` in a plain const object that is only
-// later spread into logLine, so a scan restricted to logLine payloads would miss it.
+// `event:`/`action:` object-literal properties. A direct string literal counts ANYWHERE, because
+// not every stdout token passes through logLine at all: `export-summary` is built as a plain
+// object at export.ts:451, hand-serialized, and written by main() at export.ts:518. A scan
+// restricted to logLine payloads would never see it.
 //
 // Inside a `logLine()` payload the scan tries harder, because that is where a missed token
 // becomes an undocumented public emission. There it also reads shorthand (`logLine({ event })`),
@@ -266,8 +267,8 @@ function scanSourceVocabulary(source: string, fileName = "scan.ts"): ScanResult 
   }
 
   // `inLogLine` decides how hard the scan tries. A direct string literal is a token anywhere —
-  // export.ts's RAW_EXPORT_WARNING holds `event: "warning"` in a plain const object that is
-  // later spread into logLine, so restricting collection to logLine payloads would lose it.
+  // `export-summary` is built as a plain object and hand-serialized to stdout without ever
+  // reaching logLine, so restricting collection to logLine payloads would lose it.
   // An IDENTIFIER, though, only counts inside a logLine payload: elsewhere a non-literal
   // `event:` is display plumbing (tui/lifecycle.ts passes one to emitProgress) that emits no
   // stdout token, and resolving those would invent contract tokens out of UI state.
@@ -312,7 +313,8 @@ function scanSourceVocabulary(source: string, fileName = "scan.ts"): ScanResult 
         else blind(prop, key);
       } else if (ts.isSpreadAssignment(prop)) {
         // A readable spread is expanded so it cannot hide a rename. An unreadable one is a
-        // documented limit, not blindness: three real call sites spread a runtime value.
+        // documented limit, not blindness: orchestrate.ts:269 spreads a for-of binding, and
+        // failing on it would reject valid code.
         const body = ts.isIdentifier(prop.expression) ? constObjects.get(prop.expression.text) : undefined;
         if (body) visitObject(body, inLogLine, seen);
       } else if (inLogLine && !ts.isMethodDeclaration(prop) && !ts.isSetAccessorDeclaration(prop)) {
@@ -539,6 +541,10 @@ test("a computed key backed by a const resolves to that key", () => {
 
 test("a non-null assertion does not hide a literal", () => {
   expect(scanSourceVocabulary('logLine({ event: "unit"! });').tokens.event).toEqual(["unit"]);
+});
+
+test("a `satisfies` wrapper does not hide a literal", () => {
+  expect(scanSourceVocabulary('logLine({ event: "unit" satisfies string });').tokens.event).toEqual(["unit"]);
 });
 
 test("an import-equals binding poisons a same-named const", () => {
