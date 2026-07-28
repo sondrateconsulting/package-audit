@@ -1144,7 +1144,9 @@ genuinely non-deterministic sub-tasks.
   sets `GH_HOST=<githubHost>` on every invocation so no call site can drift.
 - Minimize deps: default to ZERO npm deps. Add one only with a documented
   justification; never for something Bun provides natively. Two are currently
-  justified: `typescript` (robust .d.ts AST parsing, §5.E/§5.F) and `zod`
+  justified: `typescript` (robust .d.ts AST parsing, §5.E/§5.F — pinned to the 6.x line,
+  the last one shipping the IN-PROCESS JS compiler API; TypeScript 7 is the native port and
+  exposes no string→AST parser, so a major bump is a port, not an upgrade) and `zod`
   (a devDependency — scripts/reportSchema.ts, the §7 report contract as schema-as-docs, `.strict()`
   + per-field descriptions, validated in TESTS only, never in the emit path).
 - DRY, small pure modules under `./scripts/`:

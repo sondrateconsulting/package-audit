@@ -32,6 +32,18 @@ updates:
     commit-message:
       prefix: deps
     directory: /
+    ignore:
+      # `typescript` is a RUNTIME dependency of the analysis path, not build tooling: the scanners
+      # parse target code and .d.ts surfaces in-process with the JS compiler API (createSourceFile
+      # + forEachChild + the SyntaxKind/ScriptKind/ScriptTarget enums). TypeScript 7 is the native
+      # (Go) port and its npm root entry exports only { version, versionMajorMinor } — the JS
+      # compiler API is gone, and nothing it ships replaces it (typescript/unstable/ast has no
+      # parser; typescript/unstable/sync is an IPC Program API). A major bump therefore cannot
+      # work here; it is a port, not an upgrade. Minor/patch updates within 6.x still flow.
+      # Revisit only if a supported in-process JS parser returns. See scripts/tsCompilerApi.ts.
+      - dependency-name: typescript
+        update-types:
+          - version-update:semver-major
 
     labels:
       - bot
