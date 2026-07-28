@@ -10,7 +10,7 @@ informed: operators running `bun run audit` against large estates
 
 ## Context and Problem Statement
 
-`package-audit` fetches file content one HTTP request at a time. For each branch unit the
+`package-audit` fetches file content one HTTP request per file — concurrently across branch units, but never batched within one. For each branch unit the
 orchestrator fetches the recursive tree once
 ([orchestrate.ts:807](../../scripts/orchestrate.ts#L807)), then hands `scanUnit` an `apiReader`
 ([orchestrate.ts:111](../../scripts/orchestrate.ts#L111)) whose every cache-missing invocation is a
@@ -43,7 +43,9 @@ variant)`** — `cacheKey` composes host and endpoint
 ([db.ts:386](../../scripts/db.ts#L386)). Against that identity, three effects reduce requests:
 
 * A SHA-pinned repeat is served with **zero network** ([github.ts:1508](../../scripts/github.ts#L1508)).
-* Unchanged branches never reach `processUnit` ([orchestrate.ts:675](../../scripts/orchestrate.ts#L675)).
+* A branch skips `processUnit` when its unit is already `done` for this config *and* its stored head
+  equals the live head — not merely because the branch is unchanged
+  ([orchestrate.ts:675](../../scripts/orchestrate.ts#L675)).
 * Branches on the *same* commit share rows.
 
 And three push them back up:
@@ -64,7 +66,9 @@ So **requests ≈ distinct cold content identities + repeated non-cacheable resp
 duplicate misses + retries**. On a cold estate the first term dominates and approaches the number of
 selected files — approaches, not equals, because same-commit branches still share rows.
 
-GitHub's primary REST limit for a user-to-server token is **5,000 requests per hour**. A modest
+GitHub's primary REST limit for ordinary, non-qualifying user authentication is **5,000 requests per
+hour** (qualifying GHEC-owned App/OAuth calls get 15,000 — see the table in
+[More Information](#more-information)). A modest
 engagement — 20 repos × 4 branches × 300 selected files ≈ 24,000 requests — needs four bucket
 replenishments beyond the first full bucket; the resulting wall time depends on reset alignment and
 on scan time, and is on the order of hours rather than minutes.
@@ -95,7 +99,7 @@ credentials: no repetition, no p50/p95, no pinned corpus, workloads deliberately
 
 | # | What | Workload | Requests | Cost | Wall time |
 |---|---|---|---|---|---|
-| M1 | REST `contents` per file (status quo, **derived not run**) | 481 whole-tree files | one request per *selected* file | ≤481 of 5,000/hour | not measured |
+| M1 | REST `contents` per file (status quo, **derived not run**) | 481 whole-tree files | one request per *selected* file | 481 nominal successful-path requests, excluding retries and repeated non-cacheable reads | not measured |
 | M2 | Aliased GraphQL blob batch | 250 selected blobs, 633 KB | 1 GraphQL | **1 point**, `nodeCount: 0` | 8.1 s |
 | M3 | Aliased GraphQL blob batch | 400 selected blobs, 941 KB | 1 GraphQL | **1 point** | 9.2 s |
 | M4 | Aliased GraphQL blob batch | 462 selected blobs (~72 KB query) | 1 GraphQL (failed) | — | **HTTP 502** |
@@ -116,7 +120,7 @@ M2/M3 are **client wall time**, not server processing time; against the document
 they show roughly **1.9 s and 0.8 s of client-observed headroom**. M4 is **one failed request** —
 consistent with a timeout, but one sample cannot establish that a size-induced 502 is deterministic.
 
-**M5 vs M3 refutes byte count as a sufficient sizing predictor.** M5 moved 3.0 MB across 125 aliases
+**M5 vs M3 shows byte count alone is not a sufficient sizing predictor.** M5 moved 3.0 MB across 125 aliases
 in 4.7 s; M3 moved 941 KB across 400 aliases in 9.2 s.
 
 **M9, in full, because it decides the transport question.** Path
@@ -145,7 +149,11 @@ returns. **A symlink policy must be chosen explicitly by whichever option wins.*
 * **Preserve the evidence guarantees, and make any change to findings explicit and tested.**
   Commit-pinned attribution, the fail-closed rule at
   [orchestrate.ts:111-121](../../scripts/orchestrate.ts#L111), the read-only guarantee in
-  [readOnlyGuard.ts](../../scripts/readOnlyGuard.ts), and byte fidelity to the committed object.
+  [readOnlyGuard.ts](../../scripts/readOnlyGuard.ts), and — the property this decision turns on —
+  **deterministic, per-entry control over which byte semantics a path resolves to**, verifiable from
+  inside the tool. Note this is *control*, not "always the canonical object": today's `apiReader`
+  deliberately returns REST's dereferenced bytes for a symlink, and preserving that is a legitimate
+  choice. What matters is that the tool decides, and can prove which semantics it got.
 * **Bounded resource envelope**, owned by the chosen option rather than used only to reject others.
 * **Proportionate and containable change.** Prefer new surface that is in-process and testable over
   surface that touches the filesystem, other processes, or platform-dependent behaviour.
@@ -161,21 +169,37 @@ returns. **A symlink policy must be chosen explicitly by whichever option wins.*
 ## Decision Outcome
 
 Chosen option: **"Option 1 — Batched blob reads over the GraphQL API, retaining the existing
-per-branch clone for truncated trees"**, because it is the only option that reduces the cold-run
-request count while returning **the canonical committed bytes**, and because its substantial new
+per-branch clone for truncated trees"**, because it reduces the cold-run request count while giving
+the tool **verifiable, per-entry control over byte semantics**, and because its substantial new
 surface is entirely in-process, whereas the clone options' surface reaches into the filesystem,
 concurrent processes, and platform-dependent behaviour.
 
-The deciding evidence is M9's hash check. GraphQL's blob bytes hash to exactly the tree OID, so the
-transport demonstrably yields the committed object. A checkout demonstrably may not: `git checkout`
-applies committed `.gitattributes` transformations (`eol`, `ident`, `working-tree-encoding`), which
-change both the bytes `cloneReader` reads ([orchestrate.ts:128](../../scripts/orchestrate.ts#L128))
-and the working-tree size `walkClone` records ([orchestrate.ts:140](../../scripts/orchestrate.ts#L140))
-— and therefore whether the 2 MiB gate fires. Reading canonical objects from a clone instead would
-require `git cat-file`, which `readOnlyGuard` excludes **deliberately**, because it "accept[s]
---output/--textconv/--filters, which would breach read-only"
-([readOnlyGuard.ts:201](../../scripts/readOnlyGuard.ts#L201)). That is not a grammar tweak; it is
-reopening a closed hole in the tool's central guarantee.
+The deciding evidence is M9's hash check, and it must be stated with its scope. For a **regular blob
+whose `text` is non-null and whose hash validates**, GraphQL demonstrably yields the committed object:
+the 17 returned bytes hash to exactly the tree OID. That makes the read *self-verifying* — the tool
+can prove which bytes it got. The chosen design then deliberately routes three categories away from
+that guarantee, and they are exceptions, not oversights:
+
+* **symlinks** (by validated mode) go to `fetchFileRaw`, which returns REST's *dereferenced*
+  non-canonical bytes — chosen to preserve today's findings;
+* **binary and indeterminate blobs** go to `fetchFileRaw` too, and that path is itself lossy: spawn
+  output is decoded with `Buffer.concat(chunks).toString("utf8")`
+  ([github.ts:168](../../scripts/github.ts#L168)), so binary bytes do not survive intact today either;
+* **truncated trees** keep the existing clone, with the checkout-transformation caveat below.
+
+By contrast, a checkout gives the tool **no control and no way to detect what it got**. `git checkout`
+applies committed `.gitattributes` transformations (`eol`, `ident`, `working-tree-encoding`), changing
+both the bytes `cloneReader` reads ([orchestrate.ts:128](../../scripts/orchestrate.ts#L128)) and the
+working-tree size `walkClone` records ([orchestrate.ts:140](../../scripts/orchestrate.ts#L140)) — and
+therefore whether the 2 MiB gate fires — with the result varying by platform and repository
+configuration. Reading canonical objects from a clone instead needs `git cat-file`, which
+`readOnlyGuard` currently excludes ([readOnlyGuard.ts:201](../../scripts/readOnlyGuard.ts#L201)). That
+exclusion is not an absolute barrier — plain `git cat-file --batch` returns raw object contents, and
+`--textconv`/`--filters` are separate opt-in flags the guard's exact-argv grammars could exclude, as
+they already do for `show`. It is a real *cost*: a new guarded verb, a validated-OID stdin protocol,
+and binary framing that the current UTF-8 spawn decode cannot provide. That cost, stacked on the disk,
+sweep, symlink, and routing problems below, is what decides against the clone options — not
+impossibility.
 
 **This is not a drop-in transport swap.** Its cost, stated plainly:
 
@@ -190,9 +214,11 @@ reopening a closed hole in the tool's central guarantee.
    An unvalidated or missing mode fails open straight back into M9.
 3. **A batch-specific client method.** The generic `graphql()` retries the identical query
    ([github.ts:1673](../../scripts/github.ts#L1673)), discards status behind `ThrottleExhausted`, and
-   treats any `errors[]` as fatal while dropping `errors[].path`
-   ([github.ts:678](../../scripts/github.ts#L678)), so partial `data` can never reach a per-alias
-   handler — and GitHub documents partial results under resource exhaustion.
+   and — the real defect — **discards partial `data` on every error-classified path** while dropping
+   `errors[].path` ([github.ts:678](../../scripts/github.ts#L678)), so a per-alias handler can never
+   see it. (Rate-limit body errors *are* classified and retried rather than treated as fatal,
+   [github.ts:595](../../scripts/github.ts#L595); the problem is the lost partial data, not blanket
+   fatality.) GitHub documents partial results under resource exhaustion.
 4. **An API-wide admission scheduler.** The CPU limit is 90 s per 60 s **shared** across REST and
    GraphQL with a 60 s GraphQL sub-cap, while the client today has only a count semaphore and reactive
    per-bucket pausing ([github.ts:1049](../../scripts/github.ts#L1049)). A GraphQL-only scheduler
@@ -236,8 +262,9 @@ pretended away.
   per request for one point each, against one request per file today.
 * Good, because the bytes are **the committed object's bytes**, verified by M9's hash check — the
   property no checkout-based option can offer without reopening `cat-file`.
-* Good, because it needs **no new `readOnlyGuard` verb**, and no disk, no interprocess coordination,
-  and no platform-dependent filesystem semantics on the batch path.
+* Good, because it needs **no new `readOnlyGuard` verb**, no working tree, no interprocess
+  coordination, and no platform-dependent filesystem semantics on the batch path. (The SQLite cache
+  still uses disk; what the batch path avoids is materialising repository contents.)
 * Good, because every piece of new surface is in-process and exercisable through the existing
   injected-`spawn` seam.
 * Bad, because the ceiling reduction is **expected-case, not structural**: an unfavourable selected
@@ -280,12 +307,15 @@ Post-implementation checks:
    equal 2,513 bytes), a binary blob, an `isTruncated` blob, a path containing a quote/backslash/newline,
    a path the tree lists but `contents` 404s, and a tree entry with missing or unknown mode (must be
    fatal, not treated as a regular blob).
-3. **Request-budget assertion.** GraphQL requests equal the sum over dispatched post-cache batches plus
-   split descendants, retries, and discovery — not `ceil(bytes / budget)`. REST attempts equal
-   cache-missing fallbacks plus retries.
+3. **Request-budget assertion**, stated content-only so the two sides are comparable. GraphQL
+   *content* requests equal dispatched post-cache batches plus split descendants plus retries — not
+   `ceil(bytes / budget)`. REST *content* attempts equal cache-missing per-alias fallbacks plus
+   retries. Tree fetches, repository/owner discovery, and GraphQL branch discovery are counted
+   separately and must not be folded into either side.
 4. **Admission and failure tests.** A batch exceeding any cap (aliases, query bytes, content bytes,
-   argv bytes) splits before dispatch; a simulated 5xx takes bounded transient retry and does **not**
-   fall through `classifyGraphql`'s `transient` branch ([github.ts:614](../../scripts/github.ts#L614));
+   argv bytes) splits before dispatch; a simulated 5xx takes the bounded transient retry that
+   `classifyGraphql`'s `transient` branch already provides
+   ([github.ts:614](../../scripts/github.ts#L614)) and is **not** split on the first failure;
    split descendants are capped; a partial response with `errors[].path` resolves per alias with no
    whole-batch fatal; the fallback budget trips and terminates as defined.
 5. **Scheduler test.** Aggregate in-flight response time across REST *and* GraphQL stays under the
@@ -355,7 +385,7 @@ size-based escape to `apiReader`, and enumerate locally with `walkClone` instead
   ordinary text files that `lstat` cannot identify. A correct policy needs index/tree modes, lexical
   resolution through tracked entries, a tracked-regular-blob requirement, and gitlink exclusion.
 * Bad, because **clone failures are not retried**: `cloneShallow` makes one attempt and converts any
-  nonzero exit to `GithubApiError` ([github.ts:2028](../../scripts/github.ts#L2028)), and `processRepo`
+  nonzero exit to `GithubApiError` ([github.ts:2031](../../scripts/github.ts#L2031)), and `processRepo`
   requeues only `ThrottleExhausted` ([orchestrate.ts:698](../../scripts/orchestrate.ts#L698)), so a
   transient network failure becomes a unit error. Git also offers no `x-ratelimit-remaining` analogue,
   only a recommended 15 reads/s/repository.
@@ -437,7 +467,7 @@ Actions-issued token follows its own. Response headers are authoritative, not th
 | GraphQL node limit | ≤500,000 nodes per query |
 | GraphQL resource limits | Termination and **partial responses** under resource exhaustion are documented; the thresholds are not. Additional primary-point penalties may follow timeouts |
 | Git read operations | Recommended maximum **15 operations/second/repository**; a recommendation, not an enforced limit with a headroom header |
-| Recursive tree API | 100,000 entries or 7 MB, then `truncated: true` (no paths returned) |
+| Recursive tree API | 100,000 entries or 7 MB, then `truncated: true`. GitHub still returns a *partial* `tree` array; **this client** deliberately discards it and surfaces only `{truncated: true}` ([github.ts:744](../../scripts/github.ts#L744)) |
 
 GitHub's REST guidance is to issue requests **serially rather than concurrently** to avoid secondary
 limits. Wider risks the secondary limits; narrower makes the hourly primary bind on wall time. Every
@@ -492,16 +522,29 @@ gh api graphql -f query='{ repository(owner:"nodejs", name:"node") { object(expr
 
 ### Review history
 
-This ADR was revised across successive adversarial review rounds with Codex (gpt-5.6-sol), and the
-recommendation moved twice under evidence before settling. It began as clone-first; moved to GraphQL
-batching when the shared-clone design's unstated cost was exposed; moved to promoting the *existing*
-per-unit clone when review showed only the elaborate shared variant had ever been evaluated; and
-returned to GraphQL batching when `.gitattributes` checkout transformations were shown to break byte
-fidelity for clone-based reading, with the canonical-object fix blocked by a deliberate `readOnlyGuard`
-exclusion. M9 was measured in response to a review challenge and overturned an explicit earlier claim
-that findings could not change. The residual disagreement at the close of review concerned whether the
-option-selecting benchmark should precede acceptance; it is recorded above as a pre-acceptance gate,
-which is why this ADR remains `proposed`.
+This ADR was revised across five adversarial review rounds with Codex (gpt-5.6-sol), and the
+recommendation moved three times under evidence before settling. It began as clone-first; moved to
+GraphQL batching when the shared-clone design's unstated cost was exposed; moved to promoting the
+*existing* per-unit clone when review showed only the elaborate shared variant had ever been
+evaluated; and returned to GraphQL batching when `.gitattributes` checkout transformations were shown
+to break byte determinism for clone-based reading.
+
+Two measurements were taken in response to review challenges and each overturned a claim in the
+then-current draft. M9 disproved an explicit statement that the transport could not change findings.
+M3/M4 established that GraphQL batch sizing is bound by the 10-second query timeout rather than by
+point cost. A third challenge corrected an overstatement in the reverse direction: excluding
+`git cat-file` is a real cost, not a security impossibility, and the ADR now says so.
+
+At the close of round five the reviewer's position was that MADR conformance is satisfied and the
+recommendation is defensible as a benchmark-gated proposal, conditional on correcting specific factual
+claims — chiefly that "canonical committed bytes" overstated a guarantee the design deliberately
+qualifies for symlinks, binary blobs, and truncated trees. Those corrections are applied above; the
+guarantee is now scoped to hash-validated regular blobs with its exceptions named.
+
+Two disagreements are recorded rather than resolved. The reviewer would have the option-selecting
+benchmark run **before** acceptance; that is why this ADR stays `proposed` behind a pre-acceptance
+gate rather than claiming a settled decision. And the reviewer holds that a canonical-object clone
+variant deserves its own evaluation; it is listed under Follow-on work rather than dismissed.
 
 ### Follow-on work
 
