@@ -123,7 +123,9 @@ consistent with a timeout, but one sample cannot establish that a size-induced 5
 **M5 vs M3 shows byte count alone is not a sufficient sizing predictor.** M5 moved 3.0 MB across 125 aliases
 in 4.7 s; M3 moved 941 KB across 400 aliases in 9.2 s.
 
-**M9, in full, because it decides the transport question.** Path
+**M9, in full, because it fixes the byte-semantics requirement every option is measured against**
+(it decided this ADR against checkout-based reading — Options 2a/2b; Option 2c reads canonical
+objects and passes the same standard). Path
 `deps/v8/third_party/ittapi/ittapi-rs/CMakeLists.txt` in `nodejs/node` at
 `b2a024b1ad3373d405ca55af23f59dd4cd696c2f`; tree entry `mode=120000 type=blob size=17
 sha=de0cf227139ff67dd6d0493c03533e48d6ea8634`.
@@ -175,11 +177,14 @@ the tool **verifiable, per-entry control over byte semantics**, and because its 
 surface is entirely in-process, whereas the clone options' surface reaches into the filesystem,
 concurrent processes, and platform-dependent behaviour.
 
-The deciding evidence is M9's hash check, and it must be stated with its scope. For a **regular blob
-whose `text` is non-null and whose hash validates**, GraphQL demonstrably yields the committed object:
-the 17 returned bytes hash to exactly the tree OID. That makes the read *self-verifying* — the tool
-can prove which bytes it got. The chosen design then deliberately routes three categories away from
-that guarantee, and they are exceptions, not oversights:
+The evidence that fixes the fidelity requirement is M9's hash check, and it must be stated with its
+scope. For a **blob whose `text` is non-null and whose hash validates** — M9's mode-`120000` link
+blob is itself the demonstration, not a regular file — GraphQL demonstrably yields the committed
+object: the 17 returned bytes hash to exactly the tree OID. That makes the read *self-verifying* —
+the tool can prove which bytes it got. (M9 alone no longer decides the whole transport question:
+Option 2c meets the same canonical-bytes standard by construction; between 1 and 2c the decision is
+the surface asymmetry below plus the benchmark.) The chosen design then deliberately routes three
+categories away from that guarantee, and they are exceptions, not oversights:
 
 * **symlinks** (by validated mode) go to `fetchFileRaw`, which returns REST's *dereferenced*
   non-canonical bytes — chosen to preserve today's findings;
@@ -272,8 +277,10 @@ pretended away.
 
 * Good, because the cold-run content ceiling rises substantially — M2/M3 resolved 250 and 400 blobs
   per request for one point each, against one request per file today.
-* Good, because the bytes are **the committed object's bytes**, verified by M9's hash check — the
-  property no checkout-based option can offer without reopening `cat-file`.
+* Good, because on the **hash-validated primary path** the bytes are the committed object's bytes
+  (M9's standard) — with the symlink, binary/indeterminate, and truncated-tree exceptions routed
+  and documented rather than folded into the claim. Checkout-based reading cannot offer this
+  without reopening `cat-file` — which Option 2c now does, paying that cost explicitly.
 * Good, because it needs **no new `readOnlyGuard` verb**, no working tree, no interprocess
   coordination, and no platform-dependent filesystem semantics on the batch path. (The SQLite cache
   still uses disk; what the batch path avoids is materialising repository contents.)
@@ -313,8 +320,12 @@ constants, ordering, and worst-case budget reservation. Option 3 is evaluated co
 eligibility gates cover route-scoped byte determinism (with a checkout-config probe), completeness,
 stability, and resource envelope; eligible drivers are compared per scenario on
 budget-normalised serial throughput inside a **calibrated noise band** (`max(1.25, pilot spread)`),
-and a driver is recommended only if it dominates — at least one scenario win and no losses against
-every other eligible driver. **The rule is symmetric: no incumbency margin protects Option 1**;
+and a driver is recommended if it dominates — at least one scenario win and no losses against
+every other eligible driver — or if it is the sole eligible driver (with every rival's
+disqualifying evidence attached); with no dominator the full table escalates to the
+decision-maker, and with **zero eligible drivers there is no path to `accepted` on this
+benchmark** (remain-`proposed` with a remediation plan). **The rule is symmetric: no incumbency
+margin protects Option 1**;
 design-surface judgment stays with the decision-maker, and every Step-D outcome — confirmation,
 challenger win, no-dominator judgment, or remain-proposed-with-remediation — passes one further
 adversarial review round before this ADR changes state. An override of the rule's recommendation
@@ -356,7 +367,8 @@ One request resolves many blobs, each a variable-bound `object(expression: "<sha
 returning `... on Blob { oid byteSize isBinary isTruncated text }` plus `__typename`.
 
 * Good, because the request reduction is measured (M2, M3) at one point per batch.
-* Good, because it returns **canonical committed bytes** (M9 hash check).
+* Good, because its hash-validated primary path returns **canonical committed bytes** (M9), with
+  the symlink/binary/truncated exceptions explicitly routed to fallbacks.
 * Good, because it reads only selected files — no whole-tree transfer, no working tree, no disk on the
   batch path.
 * Good, because it requires no new `readOnlyGuard` verb.
@@ -371,6 +383,11 @@ returning `... on Blob { oid byteSize isBinary isTruncated text }` plus `__typen
 
 Flip the routing at [orchestrate.ts:823](../../scripts/orchestrate.ts#L823) so every unit clones, add a
 size-based escape to `apiReader`, and enumerate locally with `walkClone` instead of fetching the tree.
+**The faithful form of this option — the one the pre-acceptance benchmark evaluates as driver T2a —
+replaces `walkClone`'s `lstat` enumeration with the same guarded `ls-tree` mode/size source Option 2c
+introduces, mode-routes symlinks to the REST fallback, and enforces head coherence** (the bullets
+below establish why nothing less is correct); what still distinguishes it from 2c is that the content
+*reads* are checkout bytes.
 
 * Good, because git transport consumes **no REST budget** (M6), and local enumeration would drop the
   per-unit tree request too — the one term Option 1 leaves standing.
@@ -489,6 +506,11 @@ in the [resolution plan](../plans/adr-0001-disagreements-resolution.md).
   deadlocks; sizing a per-unit pool instead composes to thousands of children at maximum fan-out),
   so it needs its own small fixed permit pool, lazy spawn, ordered teardown before clone deletion,
   per-read deadlines, and a respawn policy — every production subprocess today is one-shot.
+* Bad, because `ls-tree -z` output is itself new parsing surface with a closed validation set:
+  first-TAB record splitting (legal paths may contain TAB or LF), exact mode→type coherence over
+  the closed mode set, object-format-length OIDs, bounded sizes, canonical unique valid-UTF-8
+  paths failing closed, and bounded record/entry/stderr limits — none of which today's UTF-8
+  line-splitting spawn consumers provide.
 * Bad, because 2a's operational inheritance stands: disk on every unit (pack-only — smaller than
   2a, but the common path now touches disk where Option 1's does not), the unowned `pkg-audit-*`
   sweep hazard ([github.ts:2096](../../scripts/github.ts#L2096)), single-attempt clone, whole-branch
@@ -608,9 +630,11 @@ to break byte determinism for clone-based reading.
 
 Two measurements were taken in response to review challenges and each overturned a claim in the
 then-current draft. M9 disproved an explicit statement that the transport could not change findings.
-M3/M4 established that GraphQL batch sizing is bound by the 10-second query timeout rather than by
-point cost. A third challenge corrected an overstatement in the reverse direction: excluding
-`git cat-file` is a real cost, not a security impossibility, and the ADR now says so.
+M3/M4 indicated that GraphQL batch sizing is bound by the 10-second query timeout rather than by
+point cost — one failed sample, so whether that boundary is deterministic is exactly what the
+benchmark's boundary probe tests. A third challenge corrected an overstatement in the reverse
+direction: excluding `git cat-file` is a real cost, not a security impossibility, and the ADR now
+says so.
 
 At the close of round five the reviewer's position was that MADR conformance is satisfied and the
 recommendation is defensible as a benchmark-gated proposal, conditional on correcting specific factual
@@ -657,7 +681,8 @@ path *is* Option 2c, evaluated above and benchmarked as a first-class driver. Wh
 *and* 2c's child lifecycle proves unacceptable, 2a becomes viable only by accepting
 environment-dependent findings as a documented semantic change.
 
-**Revisit this decision if:** the pre-acceptance benchmark fails its declared margin; GitHub's GraphQL
+**Revisit this decision if:** the pre-acceptance benchmark fails to confirm the recommendation
+under its pre-registered rule; GitHub's GraphQL
 point formula, per-query timeout, or partial-result behaviour changes materially; or GitHub ships a
 first-class bulk content endpoint on REST.
 
