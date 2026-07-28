@@ -5,6 +5,13 @@
 # .github/zizmor.yml, auto-discovered). zizmor also flags template injection, excessive permissions,
 # cache poisoning, dangerous triggers, and known-vulnerable actions.
 #
+# The two pins below move together. The action resolves `version:` against a version→image-digest
+# allowlist baked into its own release (`support/versions`) and fails with "Unknown version" for
+# anything newer, so the newest CLI a given action tag can run is that tag's own default. Action
+# v0.6.0 is skipped deliberately: its ceiling is zizmor 1.27.0, the one release that prints available
+# GitHub credentials into cleartext logs (GHSA-f42p-wjw5-97qh, medium, fixed in 1.28.0) — and this job
+# hands the action a token for zizmor's online audits. Bump the action first, then the CLI to match.
+#
 # `advanced-security: false` because this repo is PRIVATE without GitHub Advanced Security. With the default
 # (advanced-security: true) the action uploads SARIF to code scanning — which errors here without GHAS — and
 # SARIF mode always exits 0, so findings would never fail the job. With it off, the action runs zizmor in
@@ -37,11 +44,11 @@ jobs:
     name: workflow audit + pin enforcement
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
+      - uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
         with:
-          version: 1.26.1          # pin the zizmor CLI (the action defaults to "latest"); 1.26.1 is the action v0.5.7 default
+          version: 1.28.0          # pin the zizmor CLI (the action defaults to "latest"); 1.28.0 is the action v0.6.1 default
           advanced-security: false # private repo w/o GHAS: fail the job on findings instead of uploading SARIF
           annotations: true        # surface findings as inline GitHub annotations
