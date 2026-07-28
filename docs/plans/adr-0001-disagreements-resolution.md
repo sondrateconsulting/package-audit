@@ -78,14 +78,27 @@ For each branch unit on the default path (the benchmark's acquisition variants a
    line to stdin, and reads exactly one frame. `scanUnit` awaits each read, so there is exactly one
    request in flight — no pipe-deadlock geometry, no batch planning. Child lifecycle: per-read
    deadline; at most one respawn per unit (a second child death fails the unit); kill-escalation on
-   unit end or abort; the subprocess permit is held for the child's lifetime, which reduces
-   permit availability for concurrent units and is priced in §3.2's ledger.
+   unit end or abort.
+
+   **Children draw from their own permit pool, not the subprocess semaphore.** Every REST call in
+   this tool is itself a `gh` subprocess taking the global permit
+   ([github.ts:1184](../../scripts/github.ts#L1184)), so a unit-lived child *holding* that permit
+   while its unit's symlink read awaits a REST permit is a deadlock — certain at permit capacity 1,
+   and reachable whenever every permit is held by the child of a unit that is itself blocked on a
+   fallback. 2c therefore adds a **separate child-permit pool sized to the unit-concurrency bound**
+   (at most one child per in-flight unit, so the pool can always satisfy it), leaving the
+   subprocess semaphore to one-shot spawns only. The two-pool design and its deadlock-avoidance
+   test (capacity 1, symlink fallback while a child is live) are priced in §3.2's ledger.
 
    Size-gate semantics follow production exactly: source/CLI reads are gated at 2 MiB using the
    ls-tree size; **manifests and lockfiles are read ungated, as production reads them ungated**
    ([unitPipeline.ts:113](../../scripts/unitPipeline.ts#L113) — no size check precedes those
-   reads). The per-frame bound is therefore not a constant but *the ls-tree size of the requested
-   OID, exactly* — a frame exceeding its declared size is a protocol violation and fatal.
+   reads). The per-frame bound is therefore *the ls-tree size of the requested OID, exactly* — a
+   frame exceeding its declared size is a protocol violation and fatal — under an absolute
+   per-frame ceiling equal to production's existing spawn-output cap, so an ungated manifest can
+   never allocate more than today's REST path could return before the cap kill
+   ([github.ts:153](../../scripts/github.ts#L153)); an OID whose declared size exceeds that
+   ceiling is refused before request and the read fails exactly as a cap-killed spawn fails today.
 
 **Object-format awareness.** OID validation, ls-tree parsing, and frame verification are keyed to
 the repository's object format: 40-hex SHA-1 or 64-hex SHA-256, matching the dual format
@@ -148,17 +161,20 @@ common path does not.
   arbitrary revs from stdin. Containment moves to the caller: a writer that emits only
   format-validated OIDs, tested exhaustively. A genuinely new trust boundary — 2c's weakest point.
 - A long-lived interactive child as a first-class lifecycle: per-read deadlines, single-respawn
-  policy, abort integration, permit held for the child's lifetime (a real reduction in
-  subprocess-permit availability under unit fan-out), and stderr draining throughout — where every
-  production subprocess today is one-shot.
+  policy, abort integration, stderr draining throughout, and a **second permit pool** with its
+  deadlock-avoidance obligation (§3.1) — where every production subprocess today is one-shot under
+  a single semaphore.
 - A binary framed-spawn seam: the production spawn is `stdin: "ignore"` and irreversibly
   UTF-8-decodes stdout under a single aggregate byte cap
   ([github.ts:168](../../scripts/github.ts#L168),
   [github.ts:180](../../scripts/github.ts#L180)). The new seam must pipe stdin, parse `--batch`
   framing — `<oid> SP <type> SP <size> LF`, `<size>` raw body bytes, LF trailer, plus
   `<oid> missing LF` records — validating OID echo, type, size (against the ls-tree-declared size,
-  exactly), and one-request/one-frame correspondence, streaming frame consumption so memory stays
-  O(one frame), draining stderr, and preserving kill-escalation and deadline behaviour.
+  exactly, under the absolute frame ceiling), and one-request/one-frame correspondence, streaming
+  frame consumption so memory stays O(one frame), draining stderr, and preserving kill-escalation
+  and deadline behaviour. The same raw-byte seam serves `ls-tree` — its stdout is consumed as
+  bytes (unframed, capped) and validated before any UTF-8 interpretation, since the current spawn
+  path's irreversible decode would destroy the very evidence the parser must fail closed on.
 - An `ls-tree -z` parser with a closed, byte-exact validation set: NUL-delimited records split at
   the **first TAB** (metadata left, path bytes right — a legal git path may itself contain TAB or
   LF, which then flow into path validation, not record framing); mode in the closed set
@@ -225,10 +241,15 @@ forced.
 C1–C5 form the **performance corpus** (repeated timed runs). C6 is a **fidelity battery**: untimed,
 but fully gate-relevant — **global eligibility (§4.7) spans the performance corpus *and* the
 fidelity battery**, so a C6 fidelity or completeness failure disqualifies a driver exactly as a
-performance-unit failure does. Invalid *path* bytes (as opposed to content) are covered by the
-parser's CI unit tests with synthetic fixtures — committed non-UTF-8 paths in stable public
-repositories are not reliably available, and the failure mode is a parser property, not a network
-property.
+performance-unit failure does. Its protocol is explicit: each fixture entry runs **once per
+applicable driver** (K = 1 — a deterministic byte check gains nothing from repetition). The
+`nodejs/node` M9 fixture applies to T0 and T1 only (it exercises REST/GraphQL symlink routes; no
+one clones node for it); the clone-feasible fixture repo applies to all four drivers. §4.5's
+objective-external rerun predicate applies once per (fixture, driver); a fidelity mismatch is
+never rerunnable; a skipped applicable fixture is a G2 failure. Invalid *path* bytes (as opposed
+to content) are covered by the parser's CI unit tests with synthetic fixtures — committed
+non-UTF-8 paths in stable public repositories are not reliably available, and the failure mode is
+a parser property, not a network property.
 
 **Workloads are never truncated.** A prefix cap would structurally favour API drivers (it caps
 their per-file requests while clone drivers still transfer the whole branch) and can break the
@@ -259,16 +280,26 @@ At pinning time, once per corpus unit (repo × branch):
 2. Run the production selection logic (manifest location → lockfile election → source/CLI gates)
    against the pinned SHA via the status-quo path, recording the final selected set: `{path, mode,
    blobOid, size, class}` per entry, committed under `selected/`.
-3. Record ground truth per entry as a **route-expectation matrix**: for each driver, the declared
-   route (primary | symlink-fallback | binary-lockfile-skip | truncated-fallback) and the expected
-   *seam-level string* (sha256 of the UTF-8-decoded bytes that route delivers — REST-dereferenced
-   bytes for symlink fallbacks, decoded blob bytes elsewhere), plus the canonical blob-bytes hash
-   for raw-capable verification (T1 hash-validated text; T2c pre-decode frames). Routes are
-   additionally marked **primary** or **declared-caveat** (§4.7's G1 treats them differently; the
-   only caveat route in this matrix is the truncated-tree checkout fallback T0/T1 retain by
-   documented design). Symlink REST expectations are deterministic because the dereference target
-   is pinned by the same commit. Pinning tooling is unconstrained (full local clone, plain git;
-   not a measured activity).
+3. Record ground truth per entry as a **route-expectation matrix** over the **complete route
+   vocabulary**: `primary`, `symlink-fallback`, `binary-fallback` (a GraphQL blob flagged
+   `isBinary`/null-`text`), `truncated-blob-fallback`, `content-cap-singleton` (T1),
+   `missing-alias-fallback` (T1), `batch-error-fallback` (T1), `binary-lockfile-skip`,
+   `size-gate-skip` (source/CLI above 2 MiB — never read by any driver), and
+   `truncated-tree-checkout` (the C4 fallback). For each (entry, driver): the **expected primary
+   route**, the
+   **permitted fallback set** (pinned — a delivered route outside it is a G2 failure, so no
+   post-hoc relabeling is possible), and the expected *seam-level string* per permitted route
+   (sha256 of the UTF-8-decoded bytes that route delivers — REST-dereferenced bytes for symlink
+   fallbacks, decoded blob bytes elsewhere), plus the canonical blob-bytes hash for raw-capable
+   verification (T1 hash-validated text; T2c pre-decode frames). Routes are additionally marked
+   **primary** or **declared-caveat** (§4.7's G1 treats them differently; the only caveat route
+   in this matrix is `truncated-tree-checkout` for T0/T1, retained by documented design — for
+   T2a checkout reads are the primary route and get no such shelter). Symlink REST expectations
+   are deterministic because the dereference target is pinned by the same commit. **Every driver
+   carries the same REST fallback budget** — max(20, 10% of selected), exceeded → unit failure —
+   not just T1; symlink-heavy units spend it fastest and the pinning-time mode census makes the
+   expected spend known in advance. Pinning tooling is unconstrained (full local clone, plain
+   git; not a measured activity).
 
 ### 4.4 Drivers
 
@@ -305,25 +336,31 @@ abort the unit (a G2 event); per-unit REST fallback budget — max(20, 10% of se
 unit failure; partial responses — per-alias resolution via `data` + `errors[].path`, an alias
 absent from both retried once at batch level then routed to fallback (counted).
 
-**Clone acquisition: production argv by default, SHA-pinned scaffolding as the drift fallback.**
-`git clone --branch` takes a ref name, not a SHA, so a branch that advances after pinning would
-silently shift the workload. Immediately before each clone-driver run — outside the timed window —
-the harness asserts the live head still equals the pinned SHA (`git ls-remote origin <branch>`,
-bench scaffolding). If it matches: the timed run uses the **production `cloneShallow` argv**
-(T2a/T0/T1-on-C4 with checkout; T2c with `--no-checkout`), i.e. the exact form under evaluation.
-If it has drifted: the timed run uses the SHA-pinned scaffolding —
-`git init --template= <dir>` → `git remote add origin <url>` →
+**Clone acquisition: production argv by default, SHA-pinned scaffolding as the drift fallback —
+never mixed within a unit.** `git clone --branch` takes a ref name, not a SHA, so a branch that
+advances after pinning would silently shift the workload. Before a unit's **first** clone-driver
+run — outside the timed window — the harness probes the live head with
+`git ls-remote <corpus-url> refs/heads/<branch>` (the exact-ref form against the corpus URL — at
+probe time no clone exists, so there is no `origin` to name — requiring exactly one result line).
+Head equal to the pinned SHA → **all** of that unit's timed clone-driver runs use the production
+`cloneShallow` argv (T2a/T0/T1-on-C4 with checkout; T2c with `--no-checkout`), with the probe
+re-run before every rep; a mid-unit drift **discards the unit's collected reps and restarts the
+whole unit on the scaffolding form** (a freeze-sanctioned restart, recorded — medians never mix
+acquisition forms). Head already drifted → all reps use the SHA-pinned scaffolding:
+`git init --template= --object-format=<format> <dir>` (the object format recorded in
+`corpus.json` at pinning — a plain `init` would default to SHA-1 and be unable to fetch from a
+SHA-256 repository) → `git remote add origin <url>` →
 `git fetch --depth 1 --no-tags --no-recurse-submodules origin <sha>` →
 `git checkout --detach FETCH_HEAD` for any driver materialising a working tree (T2a everywhere;
 T0/T1 on C4), while T2c addresses objects by the pinned SHA directly (`ls-tree … <sha>`;
 `rev-parse FETCH_HEAD` asserted equal to `<sha>`, since a bare fetch leaves no `HEAD`). Every run
-records which acquisition form it used. At pinning time, both forms run once per clone driver as
-**non-decision diagnostics**: identical tip and tree OIDs and an identical object set are asserted
-(`git rev-list --objects <sha>`, sorted and hashed — pinning tooling is unconstrained), and the
-wall-time delta between forms is recorded (median of 3); any delta > 10% is flagged so
-mixed-acquisition units are interpreted with that bound in hand rather than folded silently into a
-1.25× comparison. If a pinned SHA becomes unreachable entirely (force-push), the fetch fails
-loudly and the slot is re-pinned — under §8's freeze, a re-pin restarts that unit's matrix.
+records which form it used. At pinning time, both forms run **three times each** per clone driver
+as **non-decision diagnostics**: identical tip and tree OIDs and an identical object set are
+asserted (`git rev-list --objects <sha>`, sorted and hashed — pinning tooling is unconstrained),
+and the medians' wall-time delta is recorded; any delta > 10% is flagged so scaffolding-form units
+are interpreted with that bound in hand rather than folded silently into a noise-band comparison.
+If a pinned SHA becomes unreachable entirely (force-push), the fetch fails loudly and the slot is
+re-pinned — under §8's freeze, a re-pin restarts that unit's matrix.
 
 **Option 3 is not a driver.** It is evaluated the way the ADR already recommends: an offline
 duplicate-OID analysis over the corpus trees (cheap, no network), reported alongside — plus one
@@ -355,6 +392,11 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   acquisition must not systematically precede its sibling's.
 - **Cold** means: no `api_cache` rows, no reused clones, no HTTP cache. DNS/TLS warmth is ambient
   and shared.
+- **Washout:** at least 60 seconds of API idle separate consecutive runs. GitHub's secondary
+  limits are rolling per-minute windows (900 REST points/min, 2,000 GraphQL points/min), so
+  without a washout one driver's burst could push its *successor* over a rolling threshold and
+  ordering would decide eligibility; the idle gap drains the window so a secondary-limit signal
+  lands on the driver that caused it.
 - **Completion discipline:** eligibility requires all K runs complete (G3). One rerun per
   (unit, driver) is permitted only for an **objectively external** failure: a network-layer error
   outside any HTTP response (DNS/TLS/connect/reset), or an HTTP 5xx on a request that was within
@@ -384,8 +426,14 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
 
 1. Wall time (workload start → last entry resolved; for §4.8 segmented runs, the sum of segment
    walls, with inter-segment sleeps excluded and the segment count reported).
-2. HTTP requests by class: REST content, REST tree, REST fallback, GraphQL requests; GraphQL
-   points as the *measured* `rateLimit { cost }` sum, never the formula.
+2. HTTP requests by class: REST content, REST tree, REST fallback, GraphQL requests. **Bucket
+   consumption is the authoritative figure**: the before/after `rate_limit` delta per bucket
+   (the PAT is dedicated to the bench and idle otherwise, declared in §4.8, so the delta is the
+   run's own). Per-request `rateLimit { cost }` sums are the explanatory breakdown, with **1 point
+   imputed** per GraphQL attempt that returned no readable cost (502s, timeouts, non-JSON bodies —
+   GitHub's documented minimum, and timeout penalties land in the header delta regardless); if the
+   header delta exceeds the reconstructed sum, the delta governs. Consumption can be
+   under-reported by neither path.
 3. Transfer, reported as two explicitly non-comparable kinds: HTTP body bytes (API drivers) and
    on-disk object-store bytes after acquisition (clone drivers — labelled on-disk, since git
    reports no clean transfer-byte figure without packet tracing).
@@ -422,12 +470,14 @@ scenarios quietly vanish from the comparison. The gates:
 - **G1 Determinism/fidelity, route-scoped:** on **primary routes**, delivered strings must match
   the route-expectation matrix for every entry in all reps, raw-capable verification must pass
   where declared, and no divergence may appear under the checkout-config probe — any violation
-  disqualifies. On **declared-caveat routes** (only the truncated-tree checkout fallback T0/T1
-  retain by documented design), probe divergence is recorded as a first-class finding for the
-  decision-maker — the route's config-dependence is a documented, accepted property of the option
-  as designed, so it informs the ledger rather than auto-disqualifying; T2a gets no such shelter
-  because checkout reads are its *primary* route. Disqualification is by observed divergence, not
-  by suspicion.
+  disqualifies. On **declared-caveat routes** (only `truncated-tree-checkout` for T0/T1, retained
+  by documented design), the waiver is *exactly the config delta and nothing more*: all baseline
+  (`autocrlf=false`) repetitions must still byte-match each other **and** the pinned
+  baseline-config expectation — corruption, truncation, or rep-to-rep instability on a caveat
+  route disqualifies like any primary route — while divergence between the baseline and the
+  `autocrlf=true` probe rep is recorded as a first-class finding for the decision-maker rather
+  than auto-disqualifying. T2a gets no such shelter because checkout reads are its *primary*
+  route. Disqualification is by observed divergence, not by suspicion.
 - **G2 Completeness:** every workload entry resolves via its declared route; a whole-batch failure
   surfacing as silent per-entry absence is a G2 failure, not a fallback; fallback-budget
   exhaustion and circuit-breaker aborts are G2 failures.
@@ -476,18 +526,27 @@ path out of Step D skips review, in either direction.
 
 ### 4.8 Budget, feasibility, and safety
 
-- **Projected spend is computed by preregistered formulas**, conservatively: REST — selected files
-  (T0) or the fallback-budget bound (T1/T2a/T2c) plus tree requests plus a fixed per-run overhead
-  constant; GraphQL — planned batch count from the fixed caps × (1 + descendant cap) points.
-  The harness prints the projection before running. It is **bucket-aware and resumable**: before
-  each run it reads `rate_limit` and proceeds only if `projected-spend × 1.5 ≤ headroom` for every
-  bucket the run touches — otherwise it sleeps to the reset epoch. Sleeps happen *between* runs,
-  never inside one; partial results persist and resume.
-- **Feasibility gate:** if a single run's `projected-spend × 1.5` exceeds a bucket's *full
-  capacity* (5,000), no reset can ever satisfy the guard. Such runs (realistically: T0 on
-  C3/C4-scale units) execute in **segmented mode**: the workload splits into pinned contiguous
-  segments each satisfying the guard, segments run in successive bucket windows, the clock pauses
-  between segments, and the segmentation is reported; scoring per §4.7's segmented-run rule.
+- **Reserved spend is a worst-case bound, not an estimate.** Every consuming loop in every driver
+  is capped — attempts ≤ 6, REST fallbacks ≤ the budget, splits ≤ 4 descendants per batch,
+  reruns ≤ 1 — so each run's worst-case bucket consumption `WC` is *computable exactly* from the
+  pinned workload and constants: REST — (per-file requests + tree requests + fallback budget) ×
+  attempt cap + the fixed per-run overhead; GraphQL — planned batches × (1 + descendant cap)
+  points × attempt cap, every attempt imputed ≥ 1 point. The harness prints `WC` per bucket
+  before each run and proceeds only if `WC × 1.1 ≤ headroom` — reserving the worst case up front
+  is what makes "sleeps happen *between* runs, never inside one" actually hold; an expected-value
+  guess with a 1.5 fudge factor could exhaust a bucket mid-run and force the very mid-run stall
+  the protocol forbids. A run that somehow exceeds its `WC` is a harness defect: the run aborts,
+  the data is discarded, and §8's freeze treats the fix as a harness change (matrix restart). The
+  harness is **bucket-aware and resumable**: below the reserve it sleeps to the reset epoch;
+  partial results persist and resume.
+- **Feasibility gate:** if a single run's `WC × 1.1` exceeds a bucket's *full capacity* (5,000),
+  no reset can ever satisfy the guard. Such runs (realistically: T0 on C3/C4-scale units) execute
+  in **segmented mode**: the workload splits into pinned contiguous segments each satisfying the
+  guard, segments run in successive bucket windows, the clock pauses between segments, and the
+  segmentation is reported; scoring per §4.7's segmented-run rule.
+- **The bench credential is dedicated**: a PAT used by nothing else for the duration of the
+  matrix, so before/after `rate_limit` deltas attribute cleanly (§4.6) and no foreign consumption
+  can trip the reserve.
 - Git pacing: well under 15 ops/s/repo by construction (≤ a handful of transport subprocesses per
   run); asserted in the report.
 - The bench runs against github.com with an ordinary PAT on public repos only, so every artifact is
@@ -517,10 +576,13 @@ path out of Step D skips review, in either direction.
    exhaustive case mapping, and the universal one-round re-review of every Step-D outcome. The
    "predeclared margin" promise becomes an actual predeclared rule.
 6. **Review history:** annotate the two disagreements with their resolution state, without erasing
-   the original record: **D2 is closed by this PR** (the variant is now evaluated in-ADR as Option
-   2c and benchmarked as T2c on a symmetric rule); **D1's resolution is committed by this PR and
-   discharged at Step D** (spec now exists and is binding; the benchmark itself has not yet run,
-   so the ADR remains `proposed` — which is the reviewer's position honoured).
+   the original record — and with matching closure semantics: **each disagreement's resolution is
+   committed by this PR and discharged by evidence.** D2's commitment is the in-ADR Option 2c
+   evaluation plus its benchmark row; it discharges at Step C, when T2c's row has actually run —
+   claiming it closed before the variant is measured would repeat the original sin of deciding by
+   scheduling. D1's commitment is the binding benchmark spec; it discharges at Step D, when the
+   evidence-based decision is recorded. Until then the ADR remains `proposed` — which is the
+   reviewer's position honoured.
 7. **Follow-on work:** the canonical-object clone variant entry is superseded (now in-ADR); the
    tree-request-term entry gains "Option 2c eliminates this term; if Option 1 wins, the term
    survives and keeps its own ADR"; Option 3's entry gains the concrete measurement vehicle
@@ -530,9 +592,9 @@ path out of Step D skips review, in either direction.
 
 | Step | Vehicle | Content | Closure state after step |
 |---|---|---|---|
-| A | PR #27 (this branch) | This plan + the §5 ADR edits. ADR stays `proposed`. | D2 closed; D1 committed, open until D |
+| A | PR #27 (this branch) | This plan + the §5 ADR edits. ADR stays `proposed`. | D1 and D2 committed; D2 discharges at C, D1 at D |
 | B | Follow-up PR | Harness, proposed-grammar module, framed-reader prototype, chokepoint-test allowlist entry, corpus pinning + verification, `bench-config.json` (caps, failure policy, schedule table, scaffolding argv, spend formulas), workload/ground-truth artifacts, diagnostic pilot, planner unit tests. **Ratification (§8) happens here, before any timed matrix run.** | D1 executable |
-| C | Follow-up PR | The matrix: `runs.jsonl`, `report.md`, boundary probe, concurrency probe, Option-3 analysis, rule output. | D1 evidence complete |
+| C | Follow-up PR | The matrix: `runs.jsonl`, `report.md`, boundary probe, concurrency probe, Option-3 analysis, rule output. | D2 discharged (T2c measured); D1 evidence complete |
 | D | Follow-up PR | Decision per §4.7's case mapping — accept, rewrite-for-winner, no-dominator judgment, or remain-proposed-with-remediation — then **one adversarial review round on the decided ADR text, every outcome, every direction**, then the state change (if any). | D1 discharged |
 
 Steps B–D have no calendar deadline — the gate is evidentiary, not temporal.
@@ -564,10 +626,14 @@ timed matrix run**:
 **Freeze semantics — the frozen set is everything the result depends on:** corpus SHAs and
 branches, selected sets, route-expectation matrices and ground-truth hashes, every
 `bench-config.json` constant (gates, caps, failure policy, noise band, dominance definition,
-schedule table, scaffolding argv, spend formulas), and **the harness source revision** — each
-`runs.jsonl` record carries the harness commit SHA, and timing data is valid only from the
-ratified revision. After ratification, any change to any frozen artifact — including a re-pin
-after upstream force-push or any harness code change — invalidates the affected timing data (that
-unit's matrix restarts; a harness change restarts the whole matrix) and requires amending this
-plan plus one adversarial review round on the amendment before new timing data is collected.
+schedule table, scaffolding argv, spend formulas), **the harness source revision**, and **the
+execution environment** — one machine for all timed data, with an environment manifest (OS and
+version, hardware identifier hash, git/Bun/gh versions, network location description, credential
+type) recorded once and stamped into every `runs.jsonl` record alongside the harness commit SHA.
+Local-subprocess wall times and remote-API wall times are only comparable when both were measured
+from the same box over the same network. After ratification, any change to any frozen artifact —
+a re-pin after upstream force-push, a mid-unit acquisition-form switch (§4.4: the unit restarts),
+any harness code change, or an environment change — invalidates the affected timing data (the
+unit restarts; a harness or environment change restarts the whole matrix) and requires amending
+this plan plus one adversarial review round on the amendment before new timing data is collected.
 Pre-registration that can be edited mid-run is not pre-registration.
