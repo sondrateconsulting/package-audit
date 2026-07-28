@@ -30,6 +30,42 @@ import ts from "typescript";
 const SCRIPTS_DIR = import.meta.dir;
 const README = readFileSync(join(SCRIPTS_DIR, "..", "README.md"), "utf8");
 
+const VOCAB_SECTION_HEADING = "## Reading a run";
+
+// The vocabulary is documented in one README section, and the check reads only that section.
+// Searching the whole file would let unrelated prose satisfy it: `export` is also a CLI
+// subcommand, headed "### Data exports (`export`)", so the export EVENT could disappear from
+// the documented vocabulary while the test stayed green on the subcommand's heading.
+function vocabularySection(readme: string): string {
+  const start = readme.search(new RegExp(`^${VOCAB_SECTION_HEADING}$`, "m"));
+  if (start === -1) return "";
+  const body = readme.slice(start + VOCAB_SECTION_HEADING.length);
+  const end = body.search(/^## /m);
+  return end === -1 ? body : body.slice(0, end);
+}
+
+test("the README vocabulary section excludes prose from the rest of the file", () => {
+  const section = vocabularySection(
+    ["# Title", "### Data exports (`export`)", "", `${VOCAB_SECTION_HEADING}`, "Vocabulary: `done`.", "", "## Report anatomy", "`not-vocabulary`"].join("\n"),
+  );
+  expect(section, "the documented vocabulary must come from the vocabulary section").toContain("`done`");
+  expect(section, "a backticked token elsewhere in the README does not document it").not.toContain("Data exports");
+  expect(section).not.toContain("not-vocabulary");
+});
+
+test("a renamed README vocabulary section yields nothing rather than silently matching", () => {
+  expect(vocabularySection("# Title\n\n## Something else\n\n`done`\n")).toBe("");
+});
+
+const README_VOCAB = vocabularySection(README);
+
+test(`the README keeps its "${VOCAB_SECTION_HEADING}" section`, () => {
+  expect(
+    README_VOCAB.trim().length,
+    `the vocabulary check reads the "${VOCAB_SECTION_HEADING}" section — renaming it would silently document nothing`,
+  ).toBeGreaterThan(0);
+});
+
 // The loop below iterates VOCAB_KEYS and VocabKey is derived from it, so the two can never
 // drift: adding a third discriminant grows the type, the Records, AND the test loop together.
 const VOCAB_KEYS = ["event", "action"] as const;
@@ -252,7 +288,7 @@ const PINNED_VOCAB: Record<VocabKey, readonly string[]> = {
 
 interface RetiredToken {
   readonly token: string;
-  /** Why the token left the contract — the permanent retirement record consumers can consult. */
+  /** Why the token left the contract — the retirement record kept for reviewers and maintainers. */
   readonly rationale: string;
 }
 
@@ -480,9 +516,11 @@ for (const key of VOCAB_KEYS) {
   });
 
   test(`every pinned ${key} token is documented in the README vocabulary`, () => {
-    for (const token of pinned) {
-      expect(README, `README must document the \`${token}\` ${key} (stdout JSONL is a contract)`).toContain(`\`${token}\``);
-    }
+    const undocumented = pinned.filter((token) => !README_VOCAB.includes(`\`${token}\``));
+    expect(
+      undocumented,
+      `these ${key} tokens are missing from the README's "${VOCAB_SECTION_HEADING}" vocabulary (stdout JSONL is a contract)`,
+    ).toEqual([]);
   });
 
   test(`retired ${key} tokens carry a rationale and are gone from the pin and the sources`, () => {
