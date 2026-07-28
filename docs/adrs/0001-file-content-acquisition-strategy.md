@@ -385,9 +385,10 @@ Flip the routing at [orchestrate.ts:823](../../scripts/orchestrate.ts#L823) so e
 size-based escape to `apiReader`, and enumerate locally with `walkClone` instead of fetching the tree.
 **The faithful form of this option — the one the pre-acceptance benchmark evaluates as driver T2a —
 replaces `walkClone`'s `lstat` enumeration with the same guarded `ls-tree` mode/size source Option 2c
-introduces, mode-routes symlinks to the REST fallback, and enforces head coherence** (the bullets
-below establish why nothing less is correct); what still distinguishes it from 2c is that the content
-*reads* are checkout bytes.
+introduces, mode-routes symlinks to the REST fallback, enforces head coherence, and keeps the
+size-based `apiReader` escape under a preregistered threshold — with its oversized-and-truncated
+hole exhibited by the benchmark rather than patched** (the bullets below establish why nothing less
+is correct); what still distinguishes it from 2c is that the content *reads* are checkout bytes.
 
 * Good, because git transport consumes **no REST budget** (M6), and local enumeration would drop the
   per-unit tree request too — the one term Option 1 leaves standing.

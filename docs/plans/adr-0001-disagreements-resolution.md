@@ -1,6 +1,11 @@
 # Plan: resolve ADR-0001's two recorded disagreements
 
-- **Status:** draft, under adversarial review (Codex gpt-5.6-sol)
+- **Status:** reviewed — seven adversarial rounds with Codex (gpt-5.6-sol @ ultra), 2026-07-28.
+  Rounds 1–6 produced 106 findings, all applied with per-round commits; the final round returned
+  three residual [P1] consistency findings (T2a's size escape, two unregistered route names, the
+  SHA-form drift classifier), applied immediately after — the loop's cap terminated iteration, so
+  no formal CONVERGED verdict was recorded. Step-B ratification (§8) reviews this plan again
+  before anything runs.
 - **Date:** 2026-07-28
 - **Owner:** rvo
 - **Subject:** [ADR-0001](../adrs/0001-file-content-acquisition-strategy.md), shipped as PR #27, status `proposed`
@@ -302,10 +307,12 @@ At pinning time, once per corpus unit (repo × branch):
 3. Record ground truth per entry as a **route-expectation matrix** over the **complete route
    vocabulary**: `primary`, `symlink-fallback`, `binary-fallback` (a GraphQL blob flagged
    `isBinary`/null-`text`), `truncated-blob-fallback`, `content-cap-singleton` (T1),
-   `missing-alias-fallback` (T1), `batch-error-fallback` (T1), `binary-lockfile-skip`,
-   `size-gate-skip` (source/CLI above 2 MiB — never read by any driver), and
-   `truncated-tree-checkout` (the C4 fallback). For each (entry, driver): the **expected primary
-   route**, the
+   `missing-alias-fallback` (T1), `batch-error-fallback` (T1), `validation-fallback` (T1 — a
+   response failing typename/OID/byteSize/hash validation), `timeout-singleton` (T1 — an
+   unsplittable single-alias timeout), `api-escape` (T2a — §4.4's size-based routing, resolved
+   with T0 semantics), `binary-lockfile-skip`, `size-gate-skip` (source/CLI above 2 MiB — never
+   read by any driver), and `truncated-tree-checkout` (the C4 fallback). For each (entry, driver):
+   the **expected primary route**, the
    **permitted fallback set** (pinned — a delivered route outside it is a G2 failure, so no
    post-hoc relabeling is possible), and the expected *seam-level string* per permitted route
    (sha256 of the UTF-8-decoded bytes that route delivers — REST-dereferenced bytes for symlink
@@ -344,7 +351,14 @@ correct symlink policy "needs index/tree modes", `lstat` cannot identify links u
 `core.symlinks=false`, and reading modes from committed fixture metadata would be circular. That
 prices the `ls-tree` verb and parser into **both** clone options' ledgers, and §5's ADR edits
 rescope 2a's size-gate and symlink objections accordingly — they are fixable at the cost of the
-verb; the byte-fidelity objection to checkout *reads* stands untouched.
+verb; the byte-fidelity objection to checkout *reads* stands untouched. **T2a also keeps Option
+2a's size-based API escape**, because the considered option has one: a unit whose REST-reported
+repository size exceeds a preregistered threshold (bench-config; aligned so a predicted
+clone+checkout would breach G4's disk gate) routes to per-file REST with T0 semantics
+(`api-escape` in the route matrix) — *except* on truncated trees, which must clone anyway; the
+ADR's oversized-and-truncated hole is exhibited as evidence, not patched by the surrogate.
+Expected escape trips per corpus unit are recorded at pinning, so G1/G4 judge the option as
+designed rather than a clone-everywhere strawman.
 
 **T1's failure policy is fixed before the matrix, not improvised during it.** Declared in
 `bench-config.json`: caps — alias 250 (M2's measured point), query-document 48 KiB, per-batch
@@ -372,8 +386,8 @@ per alias: valid `data` → validate and use; `data` failing validation (typenam
 → whole-batch backoff retry (same attempt budget); type `TIMEOUT` → split trigger, and an
 **unsplittable singleton timeout** → that alias to REST fallback (counted, cause
 `timeout-singleton`); a tree-listed expression reported absent → `missing-alias-fallback` via
-REST, and a REST 404 on top of that is resolved by the same upstream re-probe as §4.4's drift
-rule — head moved → drift restart; head unmoved → unexpected-absence unit failure. Alias in
+REST, and a REST 404 on top of that is classified by §4.4's SHA-form probe — pinned object gone
+→ re-pin (freeze amendment); object served → unexpected-absence unit failure. Alias in
 neither `data` nor `errors[]` → one batch-level retry, then `missing-alias-fallback` (counted);
 an alias appearing in *both* `data` and `errors[]` is treated as errored (the conflict recorded).
 **Default clause:** any response condition not matched above — pathless or batch-global errors of
@@ -392,12 +406,17 @@ one line, whose ref field equals the requested full ref and whose OID matches th
 format. The probe is advisory, not load-bearing — it is inherently TOCTOU, so **every clone
 acquisition by every driver and form ends with a coherence assertion inside the acquired store**
 (production form: `rev-parse HEAD`; scaffolding: `rev-parse FETCH_HEAD`; T0/T1's C4 fallback
-clones included) against the pinned SHA. **Classification on coherence failure is decided by an
-immediate upstream re-probe, not assumed:** live head no longer equal to the pinned SHA →
-confirmed drift → the drift restart below (not a driver failure, not a §4.5 rerun); live head
-still equal → the acquisition itself misbehaved → a genuine driver/harness failure under §4.5's
-ordinary rules. The same re-probe disambiguates every "upstream looks wrong" event, including
-T1's tree-listed-but-404 case.
+clones included) against the pinned SHA. **Classification on failure is decided by a form-aware
+upstream re-probe, not assumed — branch movement can only explain branch-form failures:**
+*Production (branch) form* — coherence mismatch → re-probe the live head: moved → confirmed drift
+→ the R6 branch arm (unit restart on scaffolding; not a driver failure, not a §4.5 rerun);
+unmoved → the acquisition itself misbehaved → driver/harness failure. *SHA-pinned contexts* —
+the scaffolding form and T0/T1's SHA-pinned reads — cannot drift with the branch, so their
+classifier probes **the pinned object itself** (REST commit lookup for the pinned SHA): object no
+longer served → the slot is invalid → **re-pin, which is a §8 freeze amendment** (terminating —
+never a restart onto the same dead SHA); object still served → driver failure (for a scaffolding
+coherence mismatch, which git semantics make a harness bug) or unexpected-absence unit failure
+(for T1's tree-listed-but-404 after its one batch-level retry).
 Head equal to the pinned SHA → **all** of that unit's timed clone-driver runs use the production
 `cloneShallow` argv (T2a/T0/T1-on-C4 with checkout; T2c with `--no-checkout`), with the probe
 re-run before every rep; a mid-unit drift **discards the unit's collected reps and restarts the
@@ -481,9 +500,12 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   allowance (a harness scheduling defect; twice on the same unit → halt for freeze repair).
   **R5, frozen-assumption breach** (`P_max` or `WC` exceeded by the bench's own traffic): halt
   the matrix for freeze repair — never replayed under the current constants. **R6, confirmed
-  upstream drift** (§4.4's re-probe): unit restart on the scaffolding form via the preregistered
-  epilogue. Everything else — a cap-exceeding batch's 5xx, a guard rejection, a parse failure, a
-  coherence failure with upstream still at the pinned SHA — is a driver failure, no rerun.
+  upstream change** (§4.4's form-aware probe), two terminating arms: *branch arm* (live head
+  moved off the pinned SHA) → unit restart on the scaffolding form via the preregistered
+  epilogue; *SHA arm* (the pinned object itself no longer served) → re-pin, a §8 freeze
+  amendment — never a restart onto the same SHA. Everything else — a cap-exceeding batch's 5xx,
+  a guard rejection, a parse failure, a coherence failure with upstream unchanged — is a driver
+  failure, no rerun.
   Secondary-limit signals are **not** replayable under any category; their consequences are G4's
   alone. Failed and invalidated attempts always stay in `runs.jsonl`, count in the failure
   metrics, and their API consumption counts in budget accounting; a replaced attempt's timing is
@@ -531,8 +553,8 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
    the run directory's usage at 1 Hz and takes the maximum, supplemented by post-acquisition and
    post-run point measurements; declared as sampled-peak-at-1 Hz, an approximation by nature.
 5. Failures: 5xx, timeouts, retries (attempt-counted), fallback count by cause (symlink, binary,
-   truncated, content-cap-singleton, batch-error), incomplete entries, secondary-limit signals by
-   kind, rerun usage with recorded cause.
+   truncated, content-cap-singleton, batch-error, validation, timeout-singleton, missing-alias),
+   incomplete entries, secondary-limit signals by kind, rerun usage with recorded cause.
 6. Fidelity: every delivered entry checked against the §4.3 route-expectation matrix at the string
    seam; raw-capable drivers additionally verify pre-decode bytes against the canonical blob hash.
 
@@ -744,6 +766,7 @@ that can be edited mid-run is not pre-registration.
 
 **Carve-out — preregistered protocols are not amendments.** Responses this plan itself
 preregisters execute without amendment, because they *are* frozen rules: the R1–R4 in-slot
-replays, and the R6 drift restart onto the scaffolding form via the epilogue (same pinned SHA,
-still fetchable — no artifact changed). Amendment + review is required exactly when a frozen
-artifact changes, including the repairs that R4 recurrence and R5 force.
+replays, and R6's *branch arm* — the drift restart onto the scaffolding form via the epilogue
+(same pinned SHA, still fetchable — no artifact changed). Amendment + review is required exactly
+when a frozen artifact changes: R6's *SHA arm* (a re-pin), and the repairs that R4 recurrence and
+R5 force.
