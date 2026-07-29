@@ -59,9 +59,26 @@ const log = (line: string): void => {
 };
 
 // §4.2 candidates, in preference order — a failing candidate is SWAPPED, never forced.
+// C1 was swapped off the plan's fastify/fastify at pinning: its major lines share ≤14.2% of
+// blob oids (measured), nowhere near the ≥80% the slot requires — repos that keep parallel
+// MAINTENANCE branches do satisfy it, so C1 candidates discover main + the top release lines
+// live (branch names cannot be pinned offline) and verify the sharing pair as usual.
+const C1_CANDIDATES: Array<{ owner: string; repo: string; main: string; releaseRe: RegExp; key: (m: RegExpExecArray) => number }> = [
+  { owner: "prometheus", repo: "prometheus", main: "main", releaseRe: /^release-(\d+)\.(\d+)$/, key: (m) => Number(m[1]) * 1000 + Number(m[2]) },
+  { owner: "go-gitea", repo: "gitea", main: "main", releaseRe: /^release\/v(\d+)\.(\d+)$/, key: (m) => Number(m[1]) * 1000 + Number(m[2]) },
+  { owner: "electron", repo: "electron", main: "main", releaseRe: /^(\d+)-x-y$/, key: (m) => Number(m[1]) },
+];
 const SLOT_CANDIDATES: Record<string, Array<{ owner: string; repo: string; branches: string[] }>> = {
-  C1: [{ owner: "fastify", repo: "fastify", branches: ["main", "4.x", "3.x", "2.x", "1.x"] }],
-  C2: [{ owner: "nodejs", repo: "undici", branches: ["main"] }],
+  // C2's planned candidate nodejs/undici FAILED verification at pinning (791 files < the
+  // 1000..3000 window — the repo shrank); the fallbacks are mid-size JS/TS repos with real
+  // manifest structure, tried in order (§4.2 swap-not-force).
+  C2: [
+    { owner: "nodejs", repo: "undici", branches: ["main"] },
+    { owner: "nestjs", repo: "nest", branches: ["master"] },
+    { owner: "vuejs", repo: "core", branches: ["main"] },
+    { owner: "TanStack", repo: "query", branches: ["main"] },
+    { owner: "pnpm", repo: "pnpm", branches: ["main"] },
+  ],
   C3: [
     { owner: "NixOS", repo: "nixpkgs", branches: ["master"] },
     { owner: "home-assistant", repo: "core", branches: ["dev"] },
@@ -288,8 +305,39 @@ interface PinnedSlotBundle {
   cloneDirs: Map<string, string>;
 }
 
+// live branch discovery for C1 (pinning lane): parse `ls-remote --heads` into branch names.
+async function discoverHeads(rt: PinRuntime, owner: string, repo: string): Promise<string[]> {
+  const url = `https://${rt.cfg.githubHost}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}.git`;
+  const out = text(await pinGit(rt, ["ls-remote", "--heads", url], { maxStdoutBytes: 64 * 1024 * 1024 }));
+  return out.split("\n").filter(Boolean).map((l) => l.split("\t")[1] ?? "").filter((r) => r.startsWith("refs/heads/")).map((r) => r.slice("refs/heads/".length));
+}
+
+async function c1CandidateBranches(rt: PinRuntime): Promise<Array<{ owner: string; repo: string; branches: string[] }>> {
+  const out: Array<{ owner: string; repo: string; branches: string[] }> = [];
+  for (const cand of C1_CANDIDATES) {
+    try {
+      const heads = await discoverHeads(rt, cand.owner, cand.repo);
+      const releases = heads
+        .map((name) => ({ name, m: cand.releaseRe.exec(name) }))
+        .filter((x): x is { name: string; m: RegExpExecArray } => x.m !== null)
+        .sort((a, b) => cand.key(b.m) - cand.key(a.m))
+        .slice(0, 3)
+        .map((x) => x.name);
+      if (!heads.includes(cand.main) || releases.length < 3) {
+        log(`C1 candidate ${cand.owner}/${cand.repo}: needs main + ≥3 release lines, found ${releases.length}`);
+        continue;
+      }
+      out.push({ owner: cand.owner, repo: cand.repo, branches: [cand.main, ...releases] });
+    } catch (e) {
+      log(`C1 candidate ${cand.owner}/${cand.repo} discovery failed: ${e instanceof Error ? e.message.slice(0, 120) : String(e)}`);
+    }
+  }
+  return out;
+}
+
 async function pinPerformanceSlot(rt: PinRuntime, slotId: "C1" | "C2" | "C3" | "C4" | "C5"): Promise<PinnedSlotBundle> {
-  for (const candidate of SLOT_CANDIDATES[slotId]!) {
+  const candidates = slotId === "C1" ? await c1CandidateBranches(rt) : SLOT_CANDIDATES[slotId]!;
+  for (const candidate of candidates) {
     log(`${slotId}: candidate ${candidate.owner}/${candidate.repo}`);
     try {
       const sizeKb = await repoSizeKb(rt, candidate.owner, candidate.repo);
