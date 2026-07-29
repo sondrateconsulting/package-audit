@@ -7,9 +7,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadBenchConfig, restFallbackBudgetFor } from "./benchConfig.ts";
 import {
-  BenchProtocolError, RunsLog, WallClock, bucketDelta, computeWorstCase, isRerunnableEvidence,
-  makeChildPool, planSegments, reconstructMatrixState, verifyDeliveries, washoutMs,
-  type EnvManifest,
+  BenchProtocolError, RunsLog, WallClock, applyPendingTransition, bucketDelta, computeWorstCase,
+  isRerunnableEvidence, makeChildPool, planSegments, reconstructMatrixState, verifyDeliveries,
+  washoutMs, type EnvManifest,
 } from "./benchProtocol.ts";
 import { buildUnitWorkload, seamStringSha256, type WorkloadEntry } from "./benchWorkload.ts";
 import type { EntryDelivery } from "./benchDrivers.ts";
@@ -171,7 +171,8 @@ const row = (over: Record<string, unknown>): string =>
     probe: false, phase: "matrix", epilogue: false, acquisitionForm: null,
     startedAtIso: "2026-07-29T00:00:00Z", wallMs: 1000, segments: 1, outcome: "complete",
     failureCause: null, failureEvidence: null, requests: { "rest-content": 5 },
-    attempts: { fivexx: 0, retries: 0, secondaryByKind: {} }, secondarySignals: 0,
+    requestClassSuccesses: { "rest-content": 5 },
+    attempts: { fivexx: 0, retries: 0, noResponse: 0, secondaryByKind: {} }, straddledReset: false, secondarySignals: 0,
     points: { measuredCostSum: 0, imputed: 0 },
     bucketDeltas: { core: { valid: true, used: 5 }, graphql: { valid: true, used: 0 } },
     bucketSnapshots: [], expectedConsumption: { core: 5, graphql: 0 },
@@ -287,6 +288,56 @@ describe("reconstructMatrixState — attempt-keyed terminalization (Step-C resid
       row({ pos: 8, attemptId: "a-c", outcome: "invalidated-control-plane" }), marker("a-c", 8),
     ], IDENTITY);
     expect(controlPlane.pendingReplays.get(8)).toBe("r3r4");
+  });
+});
+
+describe("reconstructMatrixState — codex C0-R1 remediations", () => {
+  test("an unmarked non-rerunnable failure becomes a pending TRANSITION, never a silent re-run (f.1)", () => {
+    const state = reconstructMatrixState([
+      row({ pos: 4, attemptId: "a-f", outcome: "unit-failure", failureEvidence: { kind: "unit" } }),
+    ], IDENTITY);
+    expect(state.terminalPos.has(4)).toBe(false); // not yet — the marker is owed first
+    expect(state.pendingTransitions.map((t) => t.pos)).toEqual([4]);
+    applyPendingTransition(state, state.pendingTransitions[0]!);
+    expect(state.terminalPos.has(4)).toBe(true); // the recorded failure STANDS
+    expect(state.pendingReplays.has(4)).toBe(false);
+    expect(state.rerunUsed.size).toBe(0);
+  });
+  test("an unmarked RERUNNABLE failure transitions into the charged replay it was owed (f.1)", () => {
+    const state = reconstructMatrixState([
+      row({ pos: 4, attemptId: "a-f", outcome: "unit-failure", failureEvidence: { kind: "http", code: "no-response", lastClassification: "no-response", requestClass: "rest-content" } }),
+    ], IDENTITY);
+    applyPendingTransition(state, state.pendingTransitions[0]!);
+    expect(state.terminalPos.has(4)).toBe(false);
+    expect(state.pendingReplays.get(4)).toBe("r1r2");
+    expect(state.rerunUsed.has("U1|T0")).toBe(true);
+  });
+  test("an unmarked complete row transitions to terminal and feeds the ledger (f.1)", () => {
+    const state = reconstructMatrixState([row({ pos: 4, attemptId: "a-c" })], IDENTITY);
+    applyPendingTransition(state, state.pendingTransitions[0]!);
+    expect(state.terminalPos.has(4)).toBe(true);
+    expect(state.successLedger.has("U1|T0|rest-content")).toBe(true);
+  });
+  test("the ledger admits SUCCESSES, never mere attempts (f.2)", () => {
+    const state = reconstructMatrixState([
+      row({ pos: 1, attemptId: "a-1", requests: { "rest-content": 5, "graphql-batch": 3 }, requestClassSuccesses: { "rest-content": 5 } }),
+      marker("a-1", 1),
+    ], IDENTITY);
+    expect(state.successLedger.has("U1|T0|rest-content")).toBe(true);
+    expect(state.successLedger.has("U1|T0|graphql-batch")).toBe(false); // attempted, never succeeded
+  });
+  test("control-plane invalidations count durably per pos (f.3)", () => {
+    const state = reconstructMatrixState([
+      row({ pos: 7, attemptId: "a-1", outcome: "invalidated-control-plane" }), marker("a-1", 7),
+      row({ pos: 7, attemptId: "a-2", outcome: "invalidated-control-plane" }), marker("a-2", 7),
+    ], IDENTITY);
+    expect(state.controlPlaneCounts.get(7)).toBe(2);
+    expect(state.pendingReplays.get(7)).toBe("r3r4");
+  });
+  test("a malformed INTERIOR line refuses reconstruction; a torn final line is tolerated (f.13)", () => {
+    expect(() => reconstructMatrixState(["{corrupt", row({ pos: 1, attemptId: "a-1" })], IDENTITY)).toThrow(/malformed interior/);
+    const torn = reconstructMatrixState([row({ pos: 1, attemptId: "a-1" }), '{"type":"run","pos":2,"trunc'], IDENTITY);
+    expect(torn.matrixRowsSeen).toBe(1);
   });
 });
 

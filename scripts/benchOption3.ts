@@ -10,7 +10,7 @@
 
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { BenchConfig } from "./benchConfig.ts";
+import { restFallbackBudgetFor, type BenchConfig } from "./benchConfig.ts";
 import type { Corpus, CorpusUnit, PerformanceSlot } from "./benchCorpus.ts";
 import type { DriverId } from "./benchSchedule.ts";
 import type { AuditDb } from "./db.ts";
@@ -139,7 +139,7 @@ const text = (b: Uint8Array): string => new TextDecoder().decode(b);
 
 // derive the BASE side's workload with the production selection rules, reading from a
 // SHA-pinned local store (scenario preparation, pinning-lane tooling — not a measured leg)
-async function deriveBaseWorkload(deps: Option3ScenarioDeps, slot: PerformanceSlot, baseUnit: CorpusUnit, gh: BenchGhContext): Promise<UnitWorkload> {
+async function deriveBaseWorkload(deps: Option3ScenarioDeps, slot: PerformanceSlot, baseUnit: CorpusUnit, gh: BenchGhContext): Promise<{ workload: UnitWorkload; treeOid: string }> {
   const runDir = join(deps.benchRoot, "option3-base-derive");
   mkdirSync(runDir, { recursive: true });
   try {
@@ -149,6 +149,15 @@ async function deriveBaseWorkload(deps: Option3ScenarioDeps, slot: PerformanceSl
       acquisitionForm: "scaffolding", fallbackBudget: 0,
     };
     const { dir } = await acquireStore(ctx, { checkout: false });
+    // the REST trees endpoint takes a TREE oid; handing it the commit SHA would fail the
+    // parser's root-oid echo check on every T1 leg (codex C0-R1 finding 15)
+    const treeOut = await runBenchGit({
+      argv: ["rev-parse", `${baseUnit.sha}^{tree}`], lane: { lane: "pinning" }, env: deps.gitEnv,
+      benchRoot: deps.benchRoot, cwd: dir,
+      limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: deps.cfg.spawn.timeoutMs },
+    });
+    if (treeOut.exitCode !== 0) throw new BenchOption3Error(`base tree resolution failed: ${text(treeOut.stderr).slice(0, 200)}`);
+    const treeOid = text(treeOut.stdout).trim();
     const lsOut = await runBenchGit({
       argv: ["ls-tree", "-r", "-z", "-l", "--full-tree", baseUnit.sha],
       lane: { lane: "transport", objectFormat: slot.objectFormat }, env: deps.gitEnv,
@@ -196,10 +205,13 @@ async function deriveBaseWorkload(deps: Option3ScenarioDeps, slot: PerformanceSl
       });
     }
     return {
-      unit: `option3-base:${slot.owner}/${slot.repo}@${baseUnit.sha.slice(0, 12)}`,
-      sha: baseUnit.sha, treeOid: baseUnit.treeOid, objectFormat: slot.objectFormat,
-      generatedAtIso: new Date(deps.now()).toISOString(), truncatedTree: false, escapeTripped: false,
-      batchContentBytesCap: deps.cfg.t1.batchContentBytesCap, entries: workloadEntries, routes: {},
+      workload: {
+        unit: `option3-base:${slot.owner}/${slot.repo}@${baseUnit.sha.slice(0, 12)}`,
+        sha: baseUnit.sha, treeOid, objectFormat: slot.objectFormat,
+        generatedAtIso: new Date(deps.now()).toISOString(), truncatedTree: false, escapeTripped: false,
+        batchContentBytesCap: deps.cfg.t1.batchContentBytesCap, entries: workloadEntries, routes: {},
+      },
+      treeOid,
     };
   } finally {
     rmSync(runDir, { recursive: true, force: true });
@@ -221,31 +233,43 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
   if (deps.advancedWorkload.sha !== scenario.advancedSha)
     throw new BenchOption3Error(`advanced workload sha ${deps.advancedWorkload.sha.slice(0, 12)} is not the frozen advanced sha`);
   const c1main = slot.units[0]!;
-  const baseUnit: CorpusUnit = { unitId: "option3-base", branch: c1main.branch, sha: scenario.baseSha, treeOid: scenario.baseSha };
   const buckets = makeBuckets();
   const meta: BenchGhContext = {
     client: deps.client, db: null, cfg: deps.cfg, core: buckets.core, graphql: buckets.graphql,
     record: () => {}, now: deps.now, sleep: deps.sleep,
   };
-  const baseWorkload = await deriveBaseWorkload(deps, slot, baseUnit, meta);
+  const baseUnitSeed: CorpusUnit = { unitId: "option3-base", branch: c1main.branch, sha: scenario.baseSha, treeOid: scenario.baseSha };
+  const derived = await deriveBaseWorkload(deps, slot, baseUnitSeed, meta);
+  const baseWorkload = derived.workload;
+  const baseUnit: CorpusUnit = { ...baseUnitSeed, treeOid: derived.treeOid };
   const baseReads = baseWorkload.entries.filter((e) => e.read);
-  deps.log(`option3 base side: ${baseReads.length} reads + ${baseWorkload.entries.length - baseReads.length} no-reads at ${scenario.baseSha.slice(0, 12)}`);
-  const baseOids = new Set(baseReads.map((e) => e.blobOid));
+  deps.log(`option3 base side: ${baseReads.length} reads + ${baseWorkload.entries.length - baseReads.length} no-reads at ${scenario.baseSha.slice(0, 12)} (tree ${derived.treeOid.slice(0, 12)})`);
+  const oidByPath = new Map(baseWorkload.entries.map((e) => [e.path, e.blobOid]));
 
   const scenarios: Option3DriverScenario[] = [];
   for (const driver of deps.drivers) {
     if (driver !== "T1" && driver !== "T2c" && driver !== "T0" && driver !== "T2a")
       throw new BenchOption3Error(`unknown driver ${String(driver)}`);
     const legs: Option3LegResult[] = [];
-    const legPlans: Array<{ leg: Option3LegResult["leg"]; workload: UnitWorkload; unit: CorpusUnit; hits: number }> = [
-      { leg: "base-cold", workload: baseWorkload, unit: baseUnit, hits: 0 },
-      { leg: "advanced-cold", workload: deps.advancedWorkload, unit: c1main, hits: 0 },
-      ((): { leg: Option3LegResult["leg"]; workload: UnitWorkload; unit: CorpusUnit; hits: number } => {
-        const { reduced, hits } = applyOidCache(deps.advancedWorkload, baseOids);
-        return { leg: "advanced-warm", workload: reduced, unit: c1main, hits };
-      })(),
+    // the warm cache arms from THIS driver's own base leg — and only from oids whose content
+    // was actually DELIVERED on a primary route (a planned-but-failed read, or a symlink
+    // dereference whose bytes are the target's, must never pre-warm the cache; codex C0-R1
+    // finding 15)
+    const baseDeliveredOids = new Set<string>();
+    const legPlans: Array<{ leg: Option3LegResult["leg"]; unit: CorpusUnit; makeWorkload: () => { workload: UnitWorkload; hits: number } }> = [
+      { leg: "base-cold", unit: baseUnit, makeWorkload: () => ({ workload: baseWorkload, hits: 0 }) },
+      { leg: "advanced-cold", unit: c1main, makeWorkload: () => ({ workload: deps.advancedWorkload, hits: 0 }) },
+      {
+        leg: "advanced-warm", unit: c1main,
+        makeWorkload: () => {
+          const { reduced, hits } = applyOidCache(deps.advancedWorkload, baseDeliveredOids);
+          return { workload: reduced, hits };
+        },
+      },
     ];
-    for (const plan of legPlans) {
+    for (const legPlan of legPlans) {
+      const { workload: legWorkload, hits } = legPlan.makeWorkload();
+      const plan = { leg: legPlan.leg, workload: legWorkload, unit: legPlan.unit, hits };
       const records: BenchHttpAttemptRecord[] = [];
       const dbName = `option3-${driver}-${plan.leg}`;
       const db = deps.makeDb(dbName);
@@ -260,7 +284,7 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
         cfg: deps.cfg, slot, unit: plan.unit, workload: plan.workload, gh,
         benchRoot: deps.benchRoot, runDir, gitEnv: deps.gitEnv, spawnObserver: () => {},
         acquisitionForm: "scaffolding", // both shas are pinned objects; the branch head has moved on
-        fallbackBudget: Math.max(deps.cfg.restFallbackBudget.floor, Math.ceil(deps.cfg.restFallbackBudget.fractionOfSelected * plan.workload.entries.length)),
+        fallbackBudget: restFallbackBudgetFor(deps.cfg, plan.workload.entries.length),
         liveState,
       };
       const startedAt = deps.now();
@@ -269,6 +293,13 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
       try {
         const res = await runDriver(driver, ctx, makeChildPool(deps.cfg.frame.childPoolSize));
         deliveries = res.deliveries.length;
+        if (plan.leg === "base-cold") {
+          for (const d of res.deliveries) {
+            if (d.route !== "primary" || d.delivered === null) continue;
+            const oid = oidByPath.get(d.path);
+            if (oid !== undefined) baseDeliveredOids.add(oid);
+          }
+        }
       } catch (e) {
         failureCause = e instanceof Error ? `${e.name}: ${e.message.slice(0, 300)}` : String(e);
       } finally {
@@ -289,6 +320,8 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
         leg: plan.leg, wallMs, requests, graphqlPointsSum: points, httpBodyBytes: bodyBytes,
         fallbackSpend: liveState.fallbackSpend, deliveries, cacheHits: plan.hits, failureCause,
       });
+      if (plan.leg === "base-cold" && failureCause !== null)
+        deps.log(`option3 ${driver}: base leg failed — the warm leg arms an EMPTY cache (hits will be 0)`);
       deps.log(`option3 ${driver} ${plan.leg}: wall ${wallMs}ms, ${deliveries} deliveries, ${plan.hits} cache hits${failureCause === null ? "" : `, FAILED: ${failureCause}`}`);
       const wash = washoutMs(deps.cfg, outstandingHorizonMs(meta), deps.now());
       await deps.sleep(wash);

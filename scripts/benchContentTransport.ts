@@ -40,11 +40,11 @@ import {
 import { classifyFile } from "./cliScanner.ts";
 import { parseLsTreeZ, type LsTreeEntry } from "./benchFrame.ts";
 import { BatchChild, runBenchGit, type BenchSpawnRecord } from "./benchSpawn.ts";
-import { benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuckets, readRateLimit, type BenchGhContext } from "./benchGh.ts";
+import { BenchHttpError, benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuckets, readRateLimit, type BenchGhContext } from "./benchGh.ts";
 import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts";
 import {
-  BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, isRerunnableEvidence, planSegments,
-  reconstructMatrixState,
+  BenchEngine, RunsLog, applyPendingTransition, buildEnvManifest, computeWorstCase,
+  isRerunnableEvidence, planSegments, reconstructMatrixState,
 } from "./benchProtocol.ts";
 import { RePinRequired, acquireStore, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
 import { noiseBandFrom } from "./benchConfig.ts";
@@ -157,7 +157,32 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
   const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && !APPEND_ONLY.some((a) => f.startsWith(a)));
   if (dirty.length > 0)
     throw new Error(`REFUSING: dirty tracked files outside the append-only outputs: ${dirty.slice(0, 5).join(", ")} — the frozen surface must be committed (§8)`);
+  // append-only means APPEND-only: the committed prefix of each evidence log must survive
+  // byte-identical in the working copy — a path exemption alone would let recorded failures
+  // be deleted or rewritten while the gate still passes (codex C0-R1 finding 13)
+  for (const logRel of ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl"]) {
+    const committed = await runBenchGit({
+      argv: ["show", `HEAD:${logRel}`], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
+      benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 256 * 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 },
+    });
+    if (committed.exitCode !== 0) continue; // not tracked at HEAD yet — nothing to protect
+    const workingPath = join(REPO_ROOT, logRel);
+    const working = existsSync(workingPath) ? readFileSync(workingPath) : Buffer.alloc(0);
+    const prefix = Buffer.from(committed.stdout);
+    if (working.byteLength < prefix.byteLength || !prefix.equals(working.subarray(0, prefix.byteLength)))
+      throw new Error(`REFUSING: ${logRel} is not an append of its committed content — the evidence log's history was edited (§8; codex C0-R1 finding 13)`);
+  }
   return { rat, digest };
+}
+
+// §8: pinning-family commands REWRITE preregistered artifacts (corpus.json, selected/*,
+// pilot.json, acquisition-diagnostics.json, the schedule) — after ratification that is
+// amendment territory, and the mutation must not happen even though the next gate would
+// detect it (codex C0-R1 finding 17). Removing/re-recording ratification.json is the explicit
+// amendment act that reopens them.
+function assertNotRatified(command: string): void {
+  if (existsSync(RATIFICATION_PATH))
+    throw new Error(`REFUSING: ratification.json exists — \`${command}\` would mutate frozen preregistered artifacts; a §8 amendment (deliberately re-recording ratification.json, with its review round) must precede it`);
 }
 
 // §4.2 candidates, in preference order — a failing candidate is SWAPPED, never forced.
@@ -705,8 +730,10 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
     networkDescription: process.env["BENCH_NETWORK_DESC"] ?? "operator workstation (BENCH_NETWORK_DESC unset)",
     credentialType: "PAT (gh auth)",
   });
+  // NOTE: the manifest line is NOT appended here — callers append it via engine.writeManifest()
+  // only after any identity reconstruction has ACCEPTED the existing log, so a rejected resume
+  // cannot first contaminate runs.jsonl with a foreign manifest (codex C0-R1 finding 18)
   const runsLog = new RunsLog(join(ARTIFACTS, "runs.jsonl"), manifest);
-  runsLog.writeManifestOnce();
   const engine = new BenchEngine({
     cfg, corpus, workloads, benchRoot, artifactsDir: ARTIFACTS,
     runCacheDir: join(REPO_ROOT, "data", "bench-run-caches"),
@@ -735,6 +762,7 @@ const workloadFileName = (unitId: string): string => `${unitId.replace(/[^A-Za-z
 
 // ---- subcommands -----------------------------------------------------------------------------
 async function cmdPinCorpus(): Promise<void> {
+  assertNotRatified("pin-corpus");
   const cfg = loadBenchConfig(CONFIG_PATH);
   const rt = makePinRuntime(cfg);
   log(`bench root: ${rt.benchRoot}`);
@@ -817,9 +845,11 @@ function findUnitIn(corpus: Corpus, unitId: string): { slot: PerformanceSlot } {
 }
 
 async function cmdPilot(): Promise<void> {
+  assertNotRatified("pilot");
   const { cfg, corpus, workloads } = loadPinned();
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
   try {
+    engine.writeManifest();
     const { walls, spread } = await engine.runPilot(0);
     const band = noiseBandFrom(cfg, spread);
     const pilot = {
@@ -838,6 +868,7 @@ async function cmdPilot(): Promise<void> {
 }
 
 async function cmdDiagnostics(): Promise<void> {
+  assertNotRatified("diagnostics");
   const { cfg, corpus, workloads } = loadPinned();
   const rt = makePinRuntime(cfg);
   try {
@@ -857,10 +888,19 @@ async function cmdDiagnostics(): Promise<void> {
 // acquired store + BatchChild frame. Cross-invocation discipline lives in benchFidelity's
 // typed ledger (Step-C residual 4): ONE objective-external rerun per (fixture, driver),
 // mismatches never re-run, and the verdict aggregates over the whole ledger.
+// disposition semantics (codex C0-R1 finding 7 — the frozen external predicate, §4.5):
+// "delivered"       — bytes arrived; the hash comparison decides match/mismatch.
+// "external"        — a network-layer condition in the FROZEN objective-external shapes only
+//                     (no HTTP response, or transient-5xx/throttle exhaustion) prevented the
+//                     comparison; the ledger may permit one rerun.
+// "content-failure" — a deterministic content-shaped or response-shaped defect (absent path,
+//                     unverifiable frame, persistent default-clause responses): permanent, so
+//                     a retry can never hide a nondeterministically-reproducing defect.
 interface FidelityCellDelivery {
   route: string;
   delivered: string | null;
   rawVerified: boolean | null;
+  disposition: "delivered" | "external" | "content-failure";
 }
 
 async function runFidelityCell(rt: PinRuntime, cfg: BenchConfig, fixture: C6Fixture, driver: string, entry: C6Fixture["entries"][number]): Promise<FidelityCellDelivery> {
@@ -869,14 +909,19 @@ async function runFidelityCell(rt: PinRuntime, cfg: BenchConfig, fixture: C6Fixt
     // T1's mode source is the tree it fetched — the fixture pin stands in for it here; the
     // REST dereference is the matrix's route
     const res = await benchRestGet(rt.gh, { endpoint: contentsEndpoint, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
-    return { route: "symlink-fallback", delivered: res.body, rawVerified: null };
+    return { route: "symlink-fallback", delivered: res.body, rawVerified: null, disposition: "delivered" };
   }
   if (driver === "T0") {
     const res = await benchRestGet(rt.gh, { endpoint: contentsEndpoint, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-content" });
-    return { route: "primary", delivered: res.body, rawVerified: null };
+    return { route: "primary", delivered: res.body, rawVerified: null, disposition: "delivered" };
   }
   if (driver === "T1") {
-    // ONE real aliased dispatch through the T1 seam, validated per-alias
+    // the single-alias dispatch follows the DRIVER's own transition semantics (§4.4) under
+    // the shared attempt cap: transient/throttle conditions retry in-loop exactly as the
+    // matrix's dispatch chain would, a singleton timeout or missing alias takes the driver's
+    // own REST fallback, and only frozen objective-external shapes exhaust to "external" —
+    // a persistent default-clause response is a deterministic defect, permanent (codex
+    // C0-R1 finding 7)
     const workloadEntry: WorkloadEntry = {
       path: entry.path, mode: entry.mode, blobOid: entry.oid, size: entry.size, class: "cli",
       read: true, noReadReason: null, canonicalSeamSha256: null, rawSha256: null,
@@ -886,18 +931,43 @@ async function runFidelityCell(rt: PinRuntime, cfg: BenchConfig, fixture: C6Fixt
       owner: fixture.owner, repo: fixture.repo, sha: fixture.sha,
       aliasSelection: cfg.t1.aliasSelection, rateLimitRider: cfg.t1.rateLimitRider, label: `fid-${fixture.kind}`,
     });
-    const d = await benchGraphqlDispatch(rt.gh, batch.query, batch.fields, batch.label);
-    const analysis = analyzeBatchResponse(d, batch, fixture.objectFormat, cfg);
-    if (analysis.kind === "per-alias" && analysis.outcomes[0]?.kind === "resolved") {
-      return { route: "primary", delivered: analysis.outcomes[0].text, rawVerified: true };
-    }
-    if (analysis.kind === "per-alias" && (analysis.outcomes[0]?.kind === "binary-fallback" || analysis.outcomes[0]?.kind === "truncated-blob-fallback" || analysis.outcomes[0]?.kind === "validation-fallback")) {
+    const restFallback = async (route: string): Promise<FidelityCellDelivery> => {
       const res = await benchRestGet(rt.gh, { endpoint: contentsEndpoint, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
-      return { route: analysis.outcomes[0].kind, delivered: res.body, rawVerified: null };
+      return { route, delivered: res.body, rawVerified: null, disposition: "delivered" };
+    };
+    let lastKind = "";
+    for (let attempt = 1; attempt <= cfg.rest.attemptCap; attempt++) {
+      const d = await benchGraphqlDispatch(rt.gh, batch.query, batch.fields, batch.label, attempt);
+      const analysis = analyzeBatchResponse(d, batch, fixture.objectFormat, cfg);
+      lastKind = analysis.kind;
+      if (analysis.kind === "per-alias") {
+        const outcome = analysis.outcomes[0];
+        if (outcome?.kind === "resolved") return { route: "primary", delivered: outcome.text, rawVerified: true, disposition: "delivered" };
+        if (outcome?.kind === "binary-fallback" || outcome?.kind === "truncated-blob-fallback" || outcome?.kind === "validation-fallback")
+          return restFallback(outcome.kind);
+        if (outcome?.kind === "timeout") return restFallback("timeout-singleton");
+        if (outcome?.kind === "missing") return restFallback("missing-alias-fallback");
+        // an unattributed alias gets the driver's one batch-level retry, then the fallback
+        if (outcome?.kind === "unattributed") {
+          if (attempt < cfg.rest.attemptCap) continue;
+          return restFallback("missing-alias-fallback");
+        }
+        return { route: "unresolved:per-alias", delivered: null, rawVerified: null, disposition: "content-failure" };
+      }
+      if (analysis.kind === "batch-timeout") return restFallback("timeout-singleton"); // an unsplittable singleton
+      if (analysis.kind === "http-failure" || analysis.kind === "throttle-retry") {
+        if (attempt < cfg.rest.attemptCap) {
+          await rt.gh.sleep(cfg.rest.transientBaseWaitMs * 2 ** Math.min(attempt, 5));
+          continue;
+        }
+        // exhausted in the frozen objective-external shapes → the ledger may permit one rerun
+        return { route: `unresolved:${analysis.kind}`, delivered: null, rawVerified: null, disposition: "external" };
+      }
+      // default-failure: retried like the driver retries it; exhaustion is deterministic
+      if (attempt >= cfg.rest.attemptCap)
+        return { route: `unresolved:${analysis.kind}`, delivered: null, rawVerified: null, disposition: "content-failure" };
     }
-    // batch-level non-answers (http-failure / throttle / timeout / default / unattributed
-    // aliases) prevented any comparison — the ledger classifies these objective-external
-    return { route: `unresolved:${analysis.kind}`, delivered: null, rawVerified: null };
+    return { route: `unresolved:${lastKind}`, delivered: null, rawVerified: null, disposition: "content-failure" };
   }
   // clone drivers acquire through the REAL acquisition machinery + seams
   const runDir = join(rt.benchRoot, `fid-${fixture.kind}-${driver}`);
@@ -924,14 +994,14 @@ async function runFidelityCell(rt: PinRuntime, cfg: BenchConfig, fixture: C6Fixt
     if (liveEntry === undefined) {
       // the pinned path is absent from the live enumeration at the pinned SHA — deterministic,
       // content-shaped, never objective-external
-      return { route: "missing-from-live-enumeration", delivered: null, rawVerified: null };
+      return { route: "missing-from-live-enumeration", delivered: null, rawVerified: null, disposition: "content-failure" };
     }
     if (liveEntry.mode === "120000") {
       const res = await benchRestGet(rt.gh, { endpoint: contentsEndpoint, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
-      return { route: "symlink-fallback", delivered: res.body, rawVerified: null };
+      return { route: "symlink-fallback", delivered: res.body, rawVerified: null, disposition: "delivered" };
     }
     if (driver === "T2a") {
-      return { route: "primary", delivered: seamDecode(readFileSync(join(dir, entry.path))), rawVerified: null };
+      return { route: "primary", delivered: seamDecode(readFileSync(join(dir, entry.path))), rawVerified: null, disposition: "delivered" };
     }
     const child = new BatchChild({
       objectFormat: fixture.objectFormat, env: rt.gitEnv, cwd: dir, benchRoot: rt.benchRoot,
@@ -941,9 +1011,9 @@ async function runFidelityCell(rt: PinRuntime, cfg: BenchConfig, fixture: C6Fixt
     try {
       const frame = await child.readObject({ oid: entry.oid, size: entry.size });
       if (frame.kind === "content" && gitBlobOid(frame.body, fixture.objectFormat) === entry.oid) {
-        return { route: "primary", delivered: seamDecode(frame.body), rawVerified: true };
+        return { route: "primary", delivered: seamDecode(frame.body), rawVerified: true, disposition: "delivered" };
       }
-      return { route: "missing-or-unverified-frame", delivered: null, rawVerified: null };
+      return { route: "missing-or-unverified-frame", delivered: null, rawVerified: null, disposition: "content-failure" };
     } finally {
       await child.dispose();
     }
@@ -977,10 +1047,11 @@ async function cmdFidelity(): Promise<void> {
             const d = await runFidelityCell(rt, cfg, fixture, driver, entry);
             const expected = d.route === "symlink-fallback" || entry.mode === "120000" || typeof expectCanonical !== "string" ? expectDeref : expectCanonical;
             if (d.delivered === null) {
-              // no comparison happened: batch-level non-answers are objective-external (one
-              // rerun permitted); deterministic content-shaped absences are mismatches
-              outcome = d.route.startsWith("unresolved:") ? "attempt-error" : "mismatch";
-              detail = { route: d.route, pass: false, rawVerified: d.rawVerified, gotHash: null, expected };
+              // no comparison happened: only the frozen objective-external shapes earn the
+              // single rerun; everything else is a permanent content/completeness failure
+              // (codex C0-R1 finding 7)
+              outcome = d.disposition === "external" ? "attempt-error" : "mismatch";
+              detail = { route: d.route, pass: false, rawVerified: d.rawVerified, gotHash: null, expected, errorClass: d.disposition };
             } else {
               const gotHash = sha256Hex(Buffer.from(d.delivered, "utf8"));
               const pass = typeof expected === "string" && gotHash === expected;
@@ -989,8 +1060,14 @@ async function cmdFidelity(): Promise<void> {
             }
           } catch (e) {
             if (e instanceof RePinRequired) throw e; // the frozen object is gone — §8 amendment territory, halt
-            outcome = "attempt-error";
-            detail = { route: "attempt-error", pass: false, rawVerified: null, gotHash: null, expected: null, error: e instanceof Error ? `${e.name}: ${e.message.slice(0, 300)}` : String(e) };
+            // the FROZEN typed predicate decides rerunnability (never a message regex): a
+            // network-layer no-response or a transient exhaustion is external; every other
+            // exception — guard rejections, parse failures, harness defects — is permanent,
+            // so a retry can never hide a nondeterministic defect (codex C0-R1 finding 7)
+            const external = e instanceof BenchHttpError &&
+              (e.code === "no-response" || ((e.code === "attempts-exhausted" || e.code === "http-failure") && e.lastClassification === "transient"));
+            outcome = external ? "attempt-error" : "mismatch";
+            detail = { route: external ? "attempt-error" : "harness-or-content-failure", pass: false, rawVerified: null, gotHash: null, expected: null, errorClass: external ? "external" : "content-failure", error: e instanceof Error ? `${e.name}: ${e.message.slice(0, 300)}` : String(e) };
           }
           // append-only, per cell: an exception later cannot erase earlier evidence, and a
           // re-invocation APPENDS beside a recorded mismatch instead of overwriting it
@@ -1036,12 +1113,22 @@ async function cmdMatrix(): Promise<void> {
     );
     const { terminalPos, rerunUsed, straddleCounts, driftedUnits, successLedger, pendingReplays } = state;
     if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
+    engine.writeManifest(); // only after reconstruction ACCEPTED the log's identity (codex C0-R1 f.18)
     engine.restoreUnitForms(state.resumeForms);
     // an interrupted washout owes its REMAINING horizon before anything re-runs (residual 2)
     const owedMs = state.pendingWashoutUntilMs - Date.now();
     if (owedMs > 0) {
       log(`restoring an interrupted washout: sleeping ${Math.ceil(owedMs / 1000)}s to the recorded horizon`);
       await new Promise((r) => setTimeout(r, owedMs));
+    }
+    // a recorded attempt whose marker never landed is EVIDENCE owed its transition, not a
+    // do-over: append the missing marker, then terminalize or replay it under the frozen
+    // rules — a crash mid-washout must not launder a non-rerunnable failure into a retry
+    // (codex C0-R1 finding 1)
+    for (const transition of state.pendingTransitions) {
+      engine.appendPendingWashoutMarker(transition.row);
+      applyPendingTransition(state, transition);
+      log(`restored the interrupted washout transition at pos ${transition.pos} (${String(transition.row["outcome"])}${state.pendingReplays.has(transition.pos) ? " → R1/R2 replay owed" : " → terminal"})`);
     }
     // the frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7), shared with the
     // reconstruction: R1 = a network-layer failure outside any HTTP response, rerunnable
@@ -1061,12 +1148,15 @@ async function cmdMatrix(): Promise<void> {
           engine.setReplayOf(row.pos, owed);
           pendingReplays.delete(row.pos);
         }
-        let controlPlaneReplays = 0;
+        // the control-plane replay cap is DURABLE across invocations: recorded invalidations
+        // seed the counter, so restarting the process cannot reset it (codex C0-R1 finding 3)
+        let controlPlaneReplays = state.controlPlaneCounts.get(row.pos) ?? 0;
         for (;;) {
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
           if (handle.record.outcome === "complete") {
-            for (const cls of Object.keys(handle.record.requests)) successLedger.add(`${key}|${cls}`);
+            // the R2 ledger admits SUCCESSES, never mere attempts (codex C0-R1 finding 2)
+            for (const cls of Object.keys(handle.record.requestClassSuccesses)) successLedger.add(`${key}|${cls}`);
             break;
           }
           if (handle.record.outcome === "invalidated-straddle") {
@@ -1116,7 +1206,12 @@ async function cmdMatrix(): Promise<void> {
     await executeRows(cfg.schedule.rows, "main");
     if (driftedUnits.size > 0) {
       log(`epilogue: restarting ${driftedUnits.size} drifted unit(s) on the scaffolding form (R6 branch arm)`);
-      const epilogue = cfg.schedule.rows.filter((r) => driftedUnits.has(r.unit) && !terminalPos.has(r.pos));
+      // R6 re-executes the unit's WHOLE block (§4.5): positions that were terminal at resume
+      // and only later saw the unit drift are re-run too — only positions already terminal AS
+      // EPILOGUE rows (a prior invocation's completed restart) are skipped (codex C0-R1 f.5)
+      const epilogue = cfg.schedule.rows.filter((r) =>
+        driftedUnits.has(r.unit) &&
+        !(terminalPos.has(r.pos) && state.terminalRowByPos.get(r.pos)?.["epilogue"] === true));
       engine.setEpilogueMode(true);
       try {
         await executeRows(epilogue, "epilogue");
@@ -1135,6 +1230,7 @@ async function cmdMatrix(): Promise<void> {
 // single-repo attempt (does the symlink fixture repo also carry a selected non-UTF-8 file?),
 // and the Option-3 warm-scenario pair for an already-pinned corpus (codex R1 f.21/23 + f.1).
 async function cmdRefreshEvidence(): Promise<void> {
+  assertNotRatified("refresh-evidence");
   const { cfg, corpus } = loadPinned();
   const rt = makePinRuntime(cfg);
   try {
@@ -1233,8 +1329,18 @@ function loadScoreBundle(): { bundle: ScoreBundle; rat: Record<string, unknown> 
   const rat = JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>;
   const noiseBand = rat["noiseBand"];
   if (typeof noiseBand !== "number") throw new Error("ratification.json carries no numeric noiseBand");
+  // the band is not taken on faith (codex C0-R1 finding 12): it must equal pilot.json's
+  // calibrated value AND re-derive from the pilot spread under the frozen §4.7 formula
+  const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number; pilotSpread?: number };
+  if (noiseBand !== pilot.noiseBand)
+    throw new Error(`ratification.json noiseBand (${noiseBand}) != pilot.json's calibrated band (${String(pilot.noiseBand)})`);
+  if (typeof pilot.pilotSpread !== "number" || noiseBandFrom(cfg, pilot.pilotSpread) !== noiseBand)
+    throw new Error(`the ratified band ${noiseBand} does not re-derive from the pilot spread ${String(pilot.pilotSpread)} under the frozen formula`);
+  const ratifiedDigest = rat["frozenSurfaceDigest"];
+  if (typeof ratifiedDigest !== "string" || ratifiedDigest.length === 0)
+    throw new Error("ratification.json carries no frozenSurfaceDigest — scoring cannot scope the fidelity ledger");
   return {
-    bundle: { cfg, corpus, workloads, runsLines: readArtifactLines("runs.jsonl"), fidelityLines: readArtifactLines("fidelity.jsonl"), noiseBand },
+    bundle: { cfg, corpus, workloads, runsLines: readArtifactLines("runs.jsonl"), fidelityLines: readArtifactLines("fidelity.jsonl"), noiseBand, ratifiedDigest },
     rat,
   };
 }
@@ -1294,11 +1400,18 @@ async function cmdReport(): Promise<void> {
       continue;
     }
   }
+  const ratified = String(rat["frozenSurfaceDigest"] ?? "");
   const readJson = (name: string): Record<string, unknown> | null => {
     const p = join(ARTIFACTS, name);
-    return existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>) : null;
+    if (!existsSync(p)) return null;
+    const artifact = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+    // every informational artifact must carry the SAME ratified stamp as the matrix evidence —
+    // a report must never present artifacts from different freezes under one digest (codex
+    // C0-R1 finding 16)
+    if (artifact["frozenSurfaceDigest"] !== ratified)
+      throw new Error(`${name} is stamped ${String(artifact["frozenSurfaceDigest"]).slice(0, 12)}… but the ratified digest is ${ratified.slice(0, 12)}… — regenerate it under the current freeze or leave it out`);
+    return artifact;
   };
-  const ratified = String(rat["frozenSurfaceDigest"] ?? "");
   const live = frozenSurfaceDigest();
   // the report is a pure reader (§8's carve-out) so a changed tree only WARNS — but the stamp
   // is always the ratified digest the evidence actually bound to, never the live tree's
@@ -1330,11 +1443,11 @@ async function cmdBoundaryProbe(): Promise<void> {
     if (tree.truncated) throw new Error("C2's REST tree is truncated — the boundary probe's planning source is gone");
     const blobs = tree.paths.filter((e) => e.type === "blob" && typeof e.size === "number").map((e) => ({ path: e.path, oid: e.sha, size: e.size as number }));
     const cells = planBoundaryCells(blobs);
-    const results = await runBoundaryProbe(
+    const probeRun = await runBoundaryProbe(
       { gh: rt.gh, cfg, owner: c2.owner, repo: c2.repo, sha: unit.sha, log, now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
       cells,
     );
-    writeFileSync(join(ARTIFACTS, "boundary-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, repo: `${c2.owner}/${c2.repo}`, sha: unit.sha, cells: results }, null, 2)}\n`);
+    writeFileSync(join(ARTIFACTS, "boundary-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, repo: `${c2.owner}/${c2.repo}`, sha: unit.sha, bucketBefore: probeRun.before, bucketAfter: probeRun.after, finalWashoutMs: probeRun.finalWashoutMs, cells: probeRun.cells }, null, 2)}\n`);
     log("boundary-probe.json written — informational, not scored (§4.4)");
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
