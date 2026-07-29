@@ -159,6 +159,7 @@ export async function runBoundaryProbe(deps: BoundaryProbeDeps, cells: readonly 
   }
   const before = await readRateLimit(deps.gh);
   const results: BoundaryCellResult[] = [];
+  let finalWashoutSleptMs = 0;
   try {
     for (const [cellIndex, cell] of cells.entries()) {
     if (cellIndex > 0) await deps.sleep(CELL_GAP_MS);
@@ -214,12 +215,12 @@ export async function runBoundaryProbe(deps: BoundaryProbeDeps, cells: readonly 
   } finally {
     // the sweep ALWAYS ends with a full washout of its own throttle horizon — even on a thrown
     // dispatch — so an above-cap burst cannot bleed into the next executor's window (codex
-    // C0-R1/R2 finding 14)
-    const finalWashoutMs = washoutMs(deps.cfg, outstandingHorizonMs(deps.gh), deps.now());
-    deps.log(`boundary probe winding down — final washout ${Math.ceil(finalWashoutMs / 1000)}s`);
-    await deps.sleep(finalWashoutMs);
+    // C0-R1/R2 finding 14); the duration actually slept is what the artifact reports (C0-R3
+    // finding 9)
+    finalWashoutSleptMs = washoutMs(deps.cfg, outstandingHorizonMs(deps.gh), deps.now());
+    deps.log(`boundary probe winding down — final washout ${Math.ceil(finalWashoutSleptMs / 1000)}s`);
+    await deps.sleep(finalWashoutSleptMs);
   }
   const after = await readRateLimit(deps.gh);
-  const finalWashoutMs = washoutMs(deps.cfg, 0, deps.now());
-  return { before, after, finalWashoutMs, cells: results };
+  return { before, after, finalWashoutMs: finalWashoutSleptMs, cells: results };
 }

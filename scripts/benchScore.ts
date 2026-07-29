@@ -286,6 +286,14 @@ export function scoreMatrix(bundle: ScoreBundle): ScoreOutput {
         g.g1 = "fail";
         g.reasons.push(`G1: ${g1f} delivery-fidelity failure(s) at pos ${pos} (${rstr(row, "unit")} rep ${rnum(row, "rep")}, outcome ${String(row["outcome"])})`);
       }
+      const g2p = typeof row["g2PositiveFailures"] === "number" ? (row["g2PositiveFailures"] as number) : 0;
+      if (g2p > 0) {
+        // positive-kind G2 (duplicates, forbidden routes, foreign paths) is delivered
+        // misbehaviour and survives invalidation/replacement, exactly like G1 byte divergence
+        // (codex C0-R3 finding 4)
+        g.g2 = "fail";
+        g.reasons.push(`G2: ${g2p} positive completeness failure(s) at pos ${pos} (${rstr(row, "unit")} rep ${rnum(row, "rep")}, outcome ${String(row["outcome"])})`);
+      }
       const div = rnum(row, "probeDivergences");
       if (div > 0) g.probeDivergenceFindings.push({ unit: rstr(row, "unit"), pos, divergences: div });
       if (rnum(row, "diskSampledPeakBytes") > cfg.protocol.diskGateBytes) {
@@ -409,8 +417,10 @@ export function scoreMatrix(bundle: ScoreBundle): ScoreOutput {
   const taxonomy: TaxonomyEvents = {
     r1r2RerunsUsed: state.rerunUsed.size,
     r3Foreign: allRows.filter((r) => r["outcome"] === "invalidated-foreign").length,
-    r4Straddles: allRows.filter((r) => r["outcome"] === "invalidated-straddle").length,
-    controlPlaneInvalidations: allRows.filter((r) => r["outcome"] === "invalidated-control-plane").length,
+    // fact fields, with an outcome fallback for rows predating them — precedence collisions
+    // (a straddle during a drift or control-plane row) must reach the census (codex C0-R3 f.5)
+    r4Straddles: allRows.filter((r) => r["straddledReset"] === true || (r["straddledReset"] === undefined && r["outcome"] === "invalidated-straddle")).length,
+    controlPlaneInvalidations: allRows.filter((r) => r["controlPlaneFailed"] === true || (r["controlPlaneFailed"] === undefined && r["outcome"] === "invalidated-control-plane")).length,
     r6DriftRestarts: state.driftedUnits.size,
     epilogueRows: allRows.filter((r) => r["epilogue"] === true).length,
     segmentedRuns: allRows.filter((r) => typeof r["segments"] === "number" && (r["segments"] as number) > 1).length,

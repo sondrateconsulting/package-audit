@@ -21,7 +21,7 @@ import { parseLsTreeZ, type LsTreeEntry } from "./benchFrame.ts";
 import { runBenchGit } from "./benchSpawn.ts";
 import { gitBlobOid, makeBuckets, outstandingHorizonMs, readRateLimit, type BenchGhContext, type BenchHttpAttemptRecord, type RateLimitSnapshot } from "./benchGh.ts";
 import { acquireStore, runDriver, type DriverRunContext } from "./benchDrivers.ts";
-import { makeChildPool, washoutMs } from "./benchProtocol.ts";
+import { bucketDelta, computeWorstCase, makeChildPool, washoutMs } from "./benchProtocol.ts";
 import { BenchProbeError } from "./benchConcurrencyProbe.ts";
 import { classifyFile } from "./cliScanner.ts";
 
@@ -119,6 +119,9 @@ export interface Option3LegResult {
   cacheHits: number;
   bucketBefore: RateLimitSnapshot;
   bucketAfter: RateLimitSnapshot;
+  // a reset epoch moved under a consumed bucket during the leg — its wall may contain a
+  // window boundary; the leg is flagged rather than silently reported (codex C0-R3 finding 8)
+  straddledReset: boolean;
   failureCause: string | null;
 }
 export interface Option3DriverScenario {
@@ -226,7 +229,9 @@ async function deriveBaseWorkload(deps: Option3ScenarioDeps, slot: PerformanceSl
 // a leg's workload under the OID cache: read entries whose blob oid is already cached are
 // SERVED BY THE CACHE (removed from the leg — that is what an OID-keyed layer does), counted
 const applyOidCache = (workload: UnitWorkload, cache: ReadonlySet<string>): { reduced: UnitWorkload; hits: number } => {
-  const kept = workload.entries.filter((e) => !e.read || !cache.has(e.blobOid));
+  // symlink entries never participate: their delivery is the REST dereference (target bytes),
+  // not the link blob the cache would key on — the same predicate as arming/serving (C0-R3 f.11)
+  const kept = workload.entries.filter((e) => !e.read || e.mode === "120000" || !cache.has(e.blobOid));
   return { reduced: { ...workload, entries: kept }, hits: workload.entries.length - kept.length };
 };
 
@@ -299,16 +304,19 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
         fallbackBudget: restFallbackBudgetFor(deps.cfg, plan.leg === "base-cold" ? baseWorkload.entries.length : deps.advancedWorkload.entries.length),
         liveState,
       };
-      // §4.8-style admission before the timer: a reset wait or primary pause must never land
-      // inside the measured wall (codex C0-R2 finding 8) — expected-spend based, like the
-      // other informational probes
-      const needCore = Math.ceil((reads + 25) * 1.2);
-      const needGraphql = driver === "T1" ? Math.ceil((Math.ceil(reads / 50) + 4) * deps.cfg.budget.pMaxPointsPerGraphqlAttempt * 1.2) : 10;
+      // §4.8 admission before the timer, at the EXACT driver worst case under the frozen
+      // headroom factor — heuristic under-reservation could let a legal retry/split sleep
+      // across a reset inside the measured wall (codex C0-R2 finding 8; C0-R3 finding 8).
+      // Only buckets the driver can consume from gate admission.
+      void reads;
+      const wc = computeWorstCase(driver, plan.workload, deps.cfg, { owner: slot.owner, repo: slot.repo });
+      const needCore = Math.ceil(wc.core * deps.cfg.budget.headroomFactor);
+      const needGraphql = Math.ceil(wc.graphql * deps.cfg.budget.headroomFactor);
       for (;;) {
         const snap = await readRateLimit(meta);
-        if (snap.core.remaining >= needCore && snap.graphql.remaining >= needGraphql) break;
+        if ((wc.core === 0 || snap.core.remaining >= needCore) && (wc.graphql === 0 || snap.graphql.remaining >= needGraphql)) break;
         const wait = Math.max(Math.max(snap.core.reset, snap.graphql.reset) * 1000 + 5000 - deps.now(), 30_000);
-        deps.log(`option3 ${driver} ${plan.leg}: headroom short (need core ${needCore}/graphql ${needGraphql}) — sleeping ${Math.ceil(wait / 1000)}s`);
+        deps.log(`option3 ${driver} ${plan.leg}: headroom short (WC core ${wc.core}/graphql ${wc.graphql}) — sleeping ${Math.ceil(wait / 1000)}s`);
         await deps.sleep(wait);
       }
       const bucketBefore = await readRateLimit(meta);
@@ -320,7 +328,7 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
         if (plan.leg === "advanced-warm") {
           // the cache SERVICE is part of the timed wall: look up and hash-verify every hit
           for (const entry of deps.advancedWorkload.entries) {
-            if (!entry.read) continue;
+            if (!entry.read || entry.mode === "120000") continue;
             const cached = baseDeliveredContent.get(entry.blobOid);
             if (cached === undefined) continue;
             if (gitBlobOid(Buffer.from(cached, "utf8"), slot.objectFormat) !== entry.blobOid)
@@ -350,6 +358,8 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
       }
       const wallMs = deps.now() - startedAt;
       const bucketAfter = await readRateLimit(meta);
+      const legStraddled = !bucketDelta(bucketBefore.core, bucketAfter.core).valid || !bucketDelta(bucketBefore.graphql, bucketAfter.graphql).valid;
+      if (legStraddled) deps.log(`option3 ${driver} ${plan.leg}: a reset window moved under the leg — flagged (wall may span a boundary)`);
       const requests: Record<string, number> = {};
       let points = 0;
       let bodyBytes = 0;
@@ -362,7 +372,7 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
       legs.push({
         leg: plan.leg, wallMs, requests, graphqlPointsSum: points, httpBodyBytes: bodyBytes,
         fallbackSpend: liveState.fallbackSpend, deliveries, cacheHits: servedFromCache,
-        bucketBefore, bucketAfter, failureCause,
+        bucketBefore, bucketAfter, straddledReset: legStraddled, failureCause,
       });
       if (plan.leg === "base-cold" && failureCause !== null)
         deps.log(`option3 ${driver}: base leg failed — the warm leg arms an EMPTY cache (hits will be 0)`);
