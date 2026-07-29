@@ -1,16 +1,17 @@
 // benchProtocol.test.ts — CI tests for the engine's pure decision pieces: WC formulas,
 // segmentation, washout, bucket-delta/straddle, delivery verification, the active-wall clock,
-// and the fixed-size child pool.
+// the fixed-size child pool, and the shared resume/terminalization reconstruction.
 import { describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadBenchConfig, restFallbackBudgetFor } from "./benchConfig.ts";
 import {
-  BenchProtocolError, WallClock, bucketDelta, computeWorstCase, finishMeasuredRun, makeChildPool,
-  planSegments, reclaimRunResources, requireToolVersion, summarizeSpawns, summarizeTraffic,
-  sweepUnopenedRunDebris, describeUnopenedSweep, assertRunPathsFresh, runResiduePaths,
-  verifyDeliveries, washoutMs,
+  BenchProtocolError, RunsLog, WallClock, bucketDelta, computeWorstCase, finishMeasuredRun,
+  isRerunnableEvidence, makeChildPool, planSegments, reclaimRunResources, reconstructMatrixState,
+  requireToolVersion, summarizeSpawns, summarizeTraffic, sweepUnopenedRunDebris,
+  describeUnopenedSweep, assertRunPathsFresh, runResiduePaths, verifyDeliveries, washoutMs,
+  type EnvManifest,
 } from "./benchProtocol.ts";
 import { InlineDiskSampler, WorkerDiskSampler, parseDiskWalkReply } from "./benchDiskSampler.ts";
 import { parseDiskWalkRequest } from "./benchDiskWorker.ts";
@@ -827,5 +828,170 @@ describe("extraBytesStrict — an absent sidecar is skipped and a readable one i
     writeFileSync(p, "x".repeat(64));
     expect(extraBytesStrict([p])).toBe(64);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ---- reconstructMatrixState: the ONE terminalization rule (resume ∩ scoring) ----------------
+const IDENTITY = { harnessCommit: "H".repeat(40), envManifestHash: "E1" };
+const row = (over: Record<string, unknown>): string =>
+  JSON.stringify({
+    type: "run", schemaVersion: 1, pos: 1, attemptId: "a-1", unit: "U1", driver: "T0", rep: 1,
+    probe: false, phase: "matrix", epilogue: false, acquisitionForm: null,
+    startedAtIso: "2026-07-29T00:00:00Z", wallMs: 1000, segments: 1, outcome: "complete",
+    failureCause: null, failureEvidence: null, requests: { "rest-content": 5 },
+    attempts: { fivexx: 0, retries: 0, secondaryByKind: {} }, secondarySignals: 0,
+    points: { measuredCostSum: 0, imputed: 0 },
+    bucketDeltas: { core: { valid: true, used: 5 }, graphql: { valid: true, used: 0 } },
+    bucketSnapshots: [], expectedConsumption: { core: 5, graphql: 0 },
+    replayOfPos: null, replayKind: null, diskReclaimFailed: false, probeDivergences: 0,
+    httpBodyBytes: 0, cloneObjectStoreBytes: null, diskSampledPeakBytes: 0, diskSamples: 0,
+    fallbackSpend: 0, routesDelivered: {}, g1Failures: 0, g2Failures: 0,
+    washoutAppliedMs: 60_000, washoutUntilEpochMs: 0,
+    envManifestHash: IDENTITY.envManifestHash, harnessCommit: IDENTITY.harnessCommit,
+    ...over,
+  });
+const marker = (forAttemptId: string, pos: number): string =>
+  JSON.stringify({ type: "washout-done", forAttemptId, pos, rep: 1, probe: false, phase: "matrix", unit: "U1", driver: "T0" });
+
+describe("reconstructMatrixState — attempt-keyed terminalization (Step-C residual 1)", () => {
+  test("a marked complete row terminalizes; an unmarked one re-runs and owes its washout horizon", () => {
+    const state = reconstructMatrixState([
+      row({ pos: 1, attemptId: "a-1" }), marker("a-1", 1),
+      row({ pos: 2, attemptId: "a-2", washoutUntilEpochMs: 12_345 }),
+    ], IDENTITY);
+    expect(state.terminalPos.has(1)).toBe(true);
+    expect(state.terminalPos.has(2)).toBe(false);
+    expect(state.pendingWashoutUntilMs).toBe(12_345); // residual 2: the horizon survives the crash
+    expect(state.successLedger.has("U1|T0|rest-content")).toBe(true); // only the MARKED completion
+  });
+  test("an old main-phase marker at the same pos cannot terminalize a later epilogue attempt", () => {
+    const state = reconstructMatrixState([
+      row({ pos: 5, attemptId: "a-main" }), marker("a-main", 5),
+      row({ pos: 9, attemptId: "a-drift", outcome: "drift-restart", acquisitionForm: "production" }),
+      // the epilogue re-ran pos 5 but crashed before ITS washout marker landed
+      row({ pos: 5, attemptId: "a-epi", epilogue: true, acquisitionForm: "scaffolding" }),
+    ], IDENTITY);
+    expect(state.driftedUnits.has("U1")).toBe(true);
+    expect(state.resumeForms.get("U1")).toBe("scaffolding");
+    expect(state.terminalPos.has(5)).toBe(false); // pos-keyed markers would have said true
+  });
+  test("markers without attempt identity bind nothing (legacy shape)", () => {
+    const state = reconstructMatrixState([
+      row({ pos: 1, attemptId: "a-1" }),
+      JSON.stringify({ type: "washout-done", pos: 1, phase: "matrix" }),
+    ], IDENTITY);
+    expect(state.terminalPos.has(1)).toBe(false);
+  });
+  test("two recorded straddles on one unit refuse reconstruction (residual 7)", () => {
+    const one = reconstructMatrixState([row({ pos: 1, attemptId: "a-1", outcome: "invalidated-straddle" })], IDENTITY);
+    expect(one.straddleCounts.get("U1")).toBe(1);
+    expect(() => reconstructMatrixState([
+      row({ pos: 1, attemptId: "a-1", outcome: "invalidated-straddle" }),
+      row({ pos: 7, attemptId: "a-2", outcome: "invalidated-straddle" }),
+    ], IDENTITY)).toThrow(/R4 straddles/);
+  });
+  test("halt/re-pin rows and foreign identities refuse reconstruction", () => {
+    expect(() => reconstructMatrixState([row({ outcome: "halt-r5-breach" })], IDENTITY)).toThrow(/freeze-repair/);
+    expect(() => reconstructMatrixState([row({ outcome: "re-pin-required" })], IDENTITY)).toThrow(/freeze-repair/);
+    expect(() => reconstructMatrixState([row({ harnessCommit: "other" })], IDENTITY)).toThrow(/harness/);
+    expect(() => reconstructMatrixState([row({ envManifestHash: "other" })], IDENTITY)).toThrow(/environment/);
+    // scoring mode (expect null): a single identity is derived; two identities refuse
+    expect(reconstructMatrixState([row({ pos: 1, attemptId: "a-1" })], null).matrixRowsSeen).toBe(1);
+    expect(() => reconstructMatrixState([
+      row({ pos: 1, attemptId: "a-1" }),
+      row({ pos: 2, attemptId: "a-2", envManifestHash: "E2" }),
+    ], null)).toThrow(/identities/);
+  });
+  test("a marked rerunnable unit-failure is superseded: the rerun survives the crash and is charged", () => {
+    const failure = {
+      outcome: "unit-failure",
+      failureEvidence: { kind: "http", code: "no-response", lastClassification: "no-response", requestClass: "rest-content" },
+    };
+    const state = reconstructMatrixState([
+      row({ pos: 3, attemptId: "a-f", ...failure }), marker("a-f", 3),
+    ], IDENTITY);
+    expect(state.terminalPos.has(3)).toBe(false); // the live process would have replayed it
+    expect(state.rerunUsed.has("U1|T0")).toBe(true); // ...and charged the allowance
+    expect(state.pendingReplays.get(3)).toBe("r1r2"); // ...with the predecessor linkage owed
+    // allowance already consumed by an earlier recorded r1r2 replay → the failure stands
+    const spent = reconstructMatrixState([
+      row({ pos: 2, attemptId: "a-r", replayKind: "r1r2" }), marker("a-r", 2),
+      row({ pos: 3, attemptId: "a-f", ...failure }), marker("a-f", 3),
+    ], IDENTITY);
+    expect(spent.terminalPos.has(3)).toBe(true);
+  });
+  test("R2 rerunnability is evaluated against the ledger AS OF the failure, in stream order", () => {
+    const transientFailure = {
+      outcome: "unit-failure",
+      failureEvidence: { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-content" },
+    };
+    // the class succeeded EARLIER (marked) → R2 applies
+    const before = reconstructMatrixState([
+      row({ pos: 1, attemptId: "a-ok" }), marker("a-ok", 1),
+      row({ pos: 2, attemptId: "a-f", ...transientFailure }), marker("a-f", 2),
+    ], IDENTITY);
+    expect(before.terminalPos.has(2)).toBe(false);
+    expect(before.pendingReplays.get(2)).toBe("r1r2");
+    // the only success arrives LATER in the stream → at failure time there was no evidence
+    const after = reconstructMatrixState([
+      row({ pos: 2, attemptId: "a-f", ...transientFailure }), marker("a-f", 2),
+      row({ pos: 4, attemptId: "a-ok" }), marker("a-ok", 4),
+    ], IDENTITY);
+    expect(after.terminalPos.has(2)).toBe(true); // the failure stands, exactly as it did live
+    expect(after.rerunUsed.has("U1|T0")).toBe(false);
+  });
+  test("a last invalidated attempt owes an in-slot replay linkage; a later terminal attempt clears it", () => {
+    const state = reconstructMatrixState([
+      row({ pos: 6, attemptId: "a-s", outcome: "invalidated-straddle" }), marker("a-s", 6),
+    ], IDENTITY);
+    expect(state.pendingReplays.get(6)).toBe("r3r4");
+    const replayed = reconstructMatrixState([
+      row({ pos: 6, attemptId: "a-s", outcome: "invalidated-straddle" }), marker("a-s", 6),
+      row({ pos: 6, attemptId: "a-r", replayOfPos: 6, replayKind: "r3r4" }), marker("a-r", 6),
+    ], IDENTITY);
+    expect(replayed.pendingReplays.has(6)).toBe(false);
+    expect(replayed.terminalPos.has(6)).toBe(true);
+    const controlPlane = reconstructMatrixState([
+      row({ pos: 8, attemptId: "a-c", outcome: "invalidated-control-plane" }), marker("a-c", 8),
+    ], IDENTITY);
+    expect(controlPlane.pendingReplays.get(8)).toBe("r3r4");
+  });
+});
+
+describe("isRerunnableEvidence — the frozen R1/R2 predicate", () => {
+  const ledger = new Set(["U|D|rest-content"]);
+  test("R1 no-response is unconditional; R2 transient needs prior same-class success; nothing else", () => {
+    expect(isRerunnableEvidence({ kind: "http", code: "no-response", lastClassification: null, requestClass: null }, "U", "D", ledger)).toBe(true);
+    expect(isRerunnableEvidence({ kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-content" }, "U", "D", ledger)).toBe(true);
+    expect(isRerunnableEvidence({ kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-tree" }, "U", "D", ledger)).toBe(false);
+    expect(isRerunnableEvidence({ kind: "http", code: "attempts-exhausted", lastClassification: "secondary", requestClass: "rest-content" }, "U", "D", ledger)).toBe(false);
+    expect(isRerunnableEvidence({ kind: "unit" }, "U", "D", ledger)).toBe(false);
+    expect(isRerunnableEvidence(null, "U", "D", ledger)).toBe(false);
+  });
+});
+
+describe("RunsLog.writeManifestOnce — identical manifests appear once (residual 6)", () => {
+  const manifest: EnvManifest = {
+    os: "darwin", osVersion: "25.0.0", archName: "arm64", hardwareIdHash: "h", gitVersion: "g",
+    ghVersion: "gh", bunVersion: "b", networkDescription: "test", credentialType: "PAT",
+    login: "x", harnessCommit: "H",
+  };
+  test("re-invocations dedup by hash; a different environment still appends", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pa-bench-test-"));
+    try {
+      const path = join(dir, "runs.jsonl");
+      const log1 = new RunsLog(path, manifest);
+      log1.writeManifestOnce();
+      log1.writeManifestOnce();
+      new RunsLog(path, manifest).writeManifestOnce(); // a fresh invocation, same environment
+      const other = new RunsLog(path, { ...manifest, networkDescription: "elsewhere" });
+      other.writeManifestOnce();
+      const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
+      expect(lines.length).toBe(2);
+      const hashes = lines.map((l) => (JSON.parse(l) as { hash: string }).hash);
+      expect(new Set(hashes).size).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

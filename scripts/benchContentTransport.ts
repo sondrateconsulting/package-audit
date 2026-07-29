@@ -55,10 +55,20 @@ import { BatchChild, BenchSpawnError, runBenchGit, type BatchChildDisposal, type
 import { BenchHttpError, benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuckets, readRateLimit, type BenchGhContext } from "./benchGh.ts";
 import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts";
 import {
-  BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, planSegments,
+  BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, isRerunnableEvidence, planSegments,
+  reconstructMatrixState,
 } from "./benchProtocol.ts";
 import { RePinRequired, UnitFailure, acquireStore, describeDisposal, disposalIsClean, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
 import { noiseBandFrom } from "./benchConfig.ts";
+import {
+  judgeFidelity, reconstructFidelityLedger, shouldAttemptCell, type FidelityOutcome,
+} from "./benchFidelity.ts";
+import { scoreMatrix, type ScoreBundle, type ScoreOutput } from "./benchScore.ts";
+import { buildReport } from "./benchReport.ts";
+import { planBoundaryCells, runBoundaryProbe } from "./benchBoundary.ts";
+import { runConcurrencyProbe } from "./benchConcurrencyProbe.ts";
+import { CLONE_COMPOSITION_STATEMENT, analyzeOidDuplication, runOption3WarmScenario } from "./benchOption3.ts";
+import type { DriverId } from "./benchSchedule.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const ARTIFACTS = join(REPO_ROOT, "docs", "adrs", "0001-benchmark");
@@ -144,7 +154,9 @@ function frozenSurfaceDigest(): string {
   // calibrated band), so leaving it out let its walls, spread, reps, driver, or slot be edited
   // freely as long as noiseBand still matched. ratification.json is still deliberately excluded —
   // it must be COMMITTED, and binding a file to a digest recorded inside it is unsatisfiable.
-  files.push(CONFIG_PATH, CORPUS_PATH, join(ARTIFACTS, "pilot.json"));
+  // Step-C amendment: acquisition-diagnostics.json joins for the same reason — it bounds the
+  // scaffolding-form interpretation, so it must be tamper-evident under the freeze too.
+  files.push(CONFIG_PATH, CORPUS_PATH, join(ARTIFACTS, "pilot.json"), join(ARTIFACTS, "acquisition-diagnostics.json"));
   for (const tool of ["package.json", "tsconfig.json", "bun.lock", "bun.lockb"]) {
     const tp = join(REPO_ROOT, tool);
     if (existsSync(tp)) files.push(tp);
@@ -207,7 +219,7 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
     lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
     benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
   });
-  assertFreezeGitState(statusOut, lsFiles, APPEND_ONLY);
+  assertFreezeGitState(statusOut, lsFiles, [...APPEND_ONLY, ...REGENERATED_OUTPUTS]);
   // Verify the append-only CLAIM for each tracked evidence log: committed bytes must be a
   // byte-exact prefix of the working copy. Presence-in-HEAD is probed with `ls-tree HEAD --`,
   // whose contract is exit 0 with empty output for an absent path — so a NON-ZERO exit from
@@ -254,6 +266,14 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
 }
 
 const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl", "data/"];
+// Step-C executor outputs: whole-file artifacts an executor REWRITES and then commits as
+// evidence — exempt from the clean-tree refusal (results, not measurement surface), but never
+// prefix-checked: a regenerated report is not an append, and holding it to the append-only
+// claim would refuse exactly the legitimate rewrite the executors exist to produce.
+const REGENERATED_OUTPUTS = [
+  "docs/adrs/0001-benchmark/boundary-probe.json", "docs/adrs/0001-benchmark/concurrency-probe.json",
+  "docs/adrs/0001-benchmark/option3.json", "docs/adrs/0001-benchmark/report.md",
+];
 
 // The traversal is SERIAL by §4.5 and the evidence logs are append-only files with no internal
 // framing protection — two concurrent matrix/fidelity invocations would interleave rows and
@@ -1916,60 +1936,44 @@ async function cmdMatrix(): Promise<void> {
   const { digest } = await assertRatifiedAndFrozen();
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads, digest);
   try {
+    // ---- resumability: reconstruct terminal state from runs.jsonl via the SHARED rule ------
+    // (benchProtocol.reconstructMatrixState — the same function the scoring reader uses, so
+    // resume and scoring can never disagree; codex R1 f.17 / R2 f.21 / R3 f.2-f.4 semantics
+    // live inside it, plus the Step-C residual repairs: attempt-keyed markers, the persisted
+    // washout horizon, straddle COUNTS, and interrupted-rerun recovery)
     const runsPath = join(ARTIFACTS, "runs.jsonl");
-    let terminalPos = new Set<number>();
-    let rerunUsed = new Set<string>();
-    let straddled = new Set<string>();
-    let successLedger = new Set<string>();
-    let driftedUnits = new Set<string>();
-    let owedReplays = new Map<number, string>();
-    let owedInSlotReplays = new Set<number>();
-    if (existsSync(runsPath)) {
-      const scheduleByPos = new Map(cfg.schedule.rows.map((r) => [r.pos, { unit: r.unit, driver: r.driver, rep: r.rep, probe: r.probe }]));
-      const state = reconstructResumeState(
-        readFileSync(runsPath, "utf8").split("\n"),
-        digest,
-        engine.envManifestHashValue(),
-        scheduleByPos,
-      );
-      ({ terminalPos, rerunUsed, straddled, successLedger, driftedUnits, owedReplays, owedInSlotReplays } = state);
-      if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
-      if (owedReplays.size > 0) log(`resuming: ${owedReplays.size} owed R1/R2 replay(s) reconstructed from the log`);
-      engine.restoreUnitForms(state.resumeForms);
-      if (state.owedWashout !== null) {
-        // the last recorded run's washout was interrupted: complete the owed IDLE period and
-        // append its marker — never re-run a transport attempt that already measured (§4.5's
-        // separation is about idle time, not repetition)
-        const sched = scheduleByPos.get(state.owedWashout.pos)!;
-        const ms = Math.max(cfg.protocol.washoutFloorMs, state.owedWashout.ms);
-        log(`completing the interrupted washout for pos ${state.owedWashout.pos} (${Math.ceil(ms / 1000)}s) before resuming (§4.5)`);
-        await new Promise((r) => setTimeout(r, ms));
-        engine.appendLogMarker({ type: "washout-done", pos: state.owedWashout.pos, rep: sched.rep, probe: sched.probe, phase: "matrix", unit: sched.unit, driver: sched.driver });
-      }
+    const state = reconstructMatrixState(
+      existsSync(runsPath) ? readFileSync(runsPath, "utf8").split("\n") : [],
+      { harnessCommit: engine.harnessCommit(), envManifestHash: engine.envManifestHashValue() },
+    );
+    const { terminalPos, rerunUsed, straddleCounts, driftedUnits, successLedger, pendingReplays } = state;
+    if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
+    engine.restoreUnitForms(state.resumeForms);
+    // an interrupted washout owes its REMAINING horizon before anything re-runs (residual 2)
+    const owedMs = state.pendingWashoutUntilMs - Date.now();
+    if (owedMs > 0) {
+      log(`restoring an interrupted washout: sleeping ${Math.ceil(owedMs / 1000)}s to the recorded horizon`);
+      await new Promise((r) => setTimeout(r, owedMs));
     }
+    // the frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7), shared with the
+    // reconstruction: R1 = a network-layer failure outside any HTTP response, rerunnable
+    // unconditionally (≤1); R2 = a transient-5xx exhaustion within caps whose request class
+    // SUCCEEDED in at least one other completed repetition of this unit × driver.
+    // Secondary-shaped failures are NEVER rerunnable.
     const isRerunnable = (record: import("./benchProtocol.ts").RunRecord): boolean =>
-      evidenceIsRerunnable(record.failureEvidence, `${record.unit}|${record.driver}`, successLedger);
+      isRerunnableEvidence(record.failureEvidence, record.unit, record.driver, successLedger);
     const executeRows = async (rows: NonNullable<typeof cfg.schedule>["rows"], phaseNote: string): Promise<void> => {
       for (const row of rows) {
         if (terminalPos.has(row.pos) && phaseNote === "main") continue;
         if (driftedUnits.has(row.unit) && phaseNote === "main") continue; // discarded reps; the epilogue re-runs the whole unit
-        if (owedInSlotReplays.has(row.pos)) {
-          // the pre-interrupt traversal's R3/R4 in-slot replay: dispatch it WITH its replay
-          // bookkeeping so the record names its physical predecessor (§4.5)
-          owedInSlotReplays.delete(row.pos);
-          engine.setReplayOf(row.pos, "r3r4");
-          log(`resuming the owed in-slot (R3/R4) replay at pos ${row.pos}`);
+        // a crash-interrupted replay decision resumes AS the replay it owed, with its physical
+        // predecessor linkage restored (§4.5's recorded-predecessor rule survives the crash)
+        const owed = pendingReplays.get(row.pos);
+        if (owed !== undefined) {
+          engine.setReplayOf(row.pos, owed);
+          pendingReplays.delete(row.pos);
         }
-        const owedKey = owedReplays.get(row.pos);
-        if (owedKey !== undefined) {
-          // the pre-interrupt traversal decided this R1/R2 replay (§4.5's evaluated-at-failure-
-          // time predicate, reconstructed identically by reconstructResumeState) — execute it
-          // with the same bookkeeping the live decision would have used
-          owedReplays.delete(row.pos);
-          rerunUsed.add(owedKey);
-          engine.setReplayOf(row.pos, "r1r2");
-          log(`resuming the owed R1/R2 replay for ${owedKey} at pos ${row.pos}`);
-        }
+        let controlPlaneReplays = 0;
         for (;;) {
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
@@ -1979,8 +1983,9 @@ async function cmdMatrix(): Promise<void> {
             break;
           }
           if (handle.record.outcome === "invalidated-straddle") {
-            if (straddled.has(row.unit)) throw new Error(`R4 recurred on ${row.unit} — halt for freeze repair (plan §4.5)`);
-            straddled.add(row.unit);
+            const count = (straddleCounts.get(row.unit) ?? 0) + 1;
+            straddleCounts.set(row.unit, count);
+            if (count >= 2) throw new Error(`R4 recurred on ${row.unit} (${count} straddles) — halt for freeze repair (plan §4.5)`);
             log(`R4 straddle on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
             engine.setReplayOf(row.pos, "r3r4");
             continue;
@@ -1988,6 +1993,17 @@ async function cmdMatrix(): Promise<void> {
           if (handle.record.outcome === "invalidated-foreign") {
             // R3: verified external interference — replay in slot, never charged to the driver
             log(`R3 foreign consumption on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
+            engine.setReplayOf(row.pos, "r3r4");
+            continue;
+          }
+          if (handle.record.outcome === "invalidated-control-plane") {
+            // a rate_limit snapshot failed (residual 3): run invalid, replay in slot, never
+            // charged to the driver — bounded, because each replay is a full physical run and
+            // a persistently dead control plane needs the operator, not a loop
+            controlPlaneReplays++;
+            if (controlPlaneReplays > 2)
+              throw new Error(`control-plane failure persisted through ${controlPlaneReplays} attempts at pos ${row.pos} (${handle.record.failureCause ?? ""}) — fix connectivity and resume`);
+            log(`control-plane invalidation on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
             engine.setReplayOf(row.pos, "r3r4");
             continue;
           }
@@ -2151,6 +2167,186 @@ async function cmdRefreshEvidence(): Promise<void> {
   }
 }
 
+// ---- Step-C executors (scoring reader, report, and the informational evidence probes) --------
+function readArtifactLines(name: string): string[] {
+  const p = join(ARTIFACTS, name);
+  return existsSync(p) ? readFileSync(p, "utf8").split("\n") : [];
+}
+
+function loadScoreBundle(): { bundle: ScoreBundle; rat: Record<string, unknown> } {
+  const { cfg, corpus, workloads } = loadPinned();
+  const rat = JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>;
+  const noiseBand = rat["noiseBand"];
+  if (typeof noiseBand !== "number") throw new Error("ratification.json carries no numeric noiseBand");
+  return {
+    bundle: { cfg, corpus, workloads, runsLines: readArtifactLines("runs.jsonl"), fidelityLines: readArtifactLines("fidelity.jsonl"), noiseBand },
+    rat,
+  };
+}
+
+// per-stream/leg cold cache DBs for the probes — same containment rules as the engine's run
+// caches (a §0-permitted ./data root; never the production sqlite path; removed on dispose)
+function makeProbeDbFactory(): { makeDb: (name: string) => AuditDb; disposeDb: (db: AuditDb, name: string) => void } {
+  const cacheDir = join(REPO_ROOT, "data", "bench-run-caches");
+  mkdirSync(cacheDir, { recursive: true });
+  const paths = new Map<string, string>();
+  return {
+    makeDb: (name) => {
+      const p = join(cacheDir, `probe-${name}-${process.pid}-${Date.now()}.sqlite`);
+      paths.set(name, p);
+      return AuditDb.open({ sqlitePath: p, fresh: true, purgeCache: true });
+    },
+    disposeDb: (db, name) => {
+      try {
+        db.close();
+      } catch {
+        // a close failure must not mask the probe outcome; the removal below still runs
+      }
+      const p = paths.get(name);
+      if (p !== undefined) for (const sfx of ["", "-wal", "-shm"]) rmSync(`${p}${sfx}`, { force: true });
+    },
+  };
+}
+
+function renderScoreToLog(out: ScoreOutput): void {
+  log(`identity: harness ${out.identity.harnessCommit.slice(0, 12)}, env ${out.identity.envManifestHash}, band ${out.noiseBand}`);
+  for (const g of out.gates) {
+    log(`${g.driver}: G1 ${g.g1}, G2 ${g.g2}, G3 ${g.g3}, G4 ${g.g4} (${g.g4AttributableSignals} attributable signals) → ${g.eligible ? "ELIGIBLE" : "ineligible"}`);
+    for (const r of g.reasons.slice(0, 6)) log(`    ${r}`);
+  }
+  for (const cell of out.cells) {
+    if (cell.medianT === null) continue;
+    log(`  ${cell.unit} ${cell.driver}: median T ${cell.medianT.toFixed(1)} files/h (worst ${(cell.worstT ?? 0).toFixed(1)}, @15k ${(cell.medianT15k ?? 0).toFixed(1)})`);
+  }
+  log(`§4.7 case: ${out.caseMapping.kind}${out.caseMapping.recommendation !== null ? ` → recommend ${out.caseMapping.recommendation}` : ""}`);
+}
+
+async function cmdScore(): Promise<void> {
+  const { bundle } = loadScoreBundle();
+  renderScoreToLog(scoreMatrix(bundle));
+}
+
+async function cmdReport(): Promise<void> {
+  const { bundle, rat } = loadScoreBundle();
+  const score = scoreMatrix(bundle);
+  const envManifests: Array<Record<string, unknown>> = [];
+  for (const line of bundle.runsLines) {
+    if (line.trim() === "") continue;
+    try {
+      const rec = JSON.parse(line) as Record<string, unknown>;
+      if (rec["type"] === "env-manifest") envManifests.push(rec);
+    } catch {
+      continue;
+    }
+  }
+  const readJson = (name: string): Record<string, unknown> | null => {
+    const p = join(ARTIFACTS, name);
+    return existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>) : null;
+  };
+  const ratified = String(rat["frozenSurfaceDigest"] ?? "");
+  const live = frozenSurfaceDigest();
+  // the report is a pure reader (§8's carve-out) so a changed tree only WARNS — but the stamp
+  // is always the ratified digest the evidence actually bound to, never the live tree's
+  if (live !== ratified) log(`WARNING: live tree digest ${live.slice(0, 12)}… != ratified ${ratified.slice(0, 12)}… — report stamps the ratified digest`);
+  const md = buildReport({
+    score, cfg: bundle.cfg, corpus: bundle.corpus, ratification: rat, envManifests,
+    frozenSurfaceDigest: ratified,
+    boundary: readJson("boundary-probe.json"),
+    concurrency: readJson("concurrency-probe.json"),
+    option3: readJson("option3.json"),
+    generatedAtIso: new Date().toISOString(),
+  });
+  writeFileSync(join(ARTIFACTS, "report.md"), md);
+  log(`report.md written — §4.7 output: ${score.caseMapping.kind}${score.caseMapping.recommendation !== null ? ` → ${score.caseMapping.recommendation}` : ""}`);
+}
+
+async function cmdBoundaryProbe(): Promise<void> {
+  const { cfg, corpus } = loadPinned();
+  const { digest } = await assertRatifiedAndFrozen();
+  const rt = makePinRuntime(cfg);
+  try {
+    const c2 = corpus.performance.find((s) => s.slot === "C2") ?? ((): never => {
+      throw new Error("no pinned C2 slot");
+    })();
+    const unit = c2.units[0]!;
+    log(`boundary probe on ${c2.owner}/${c2.repo}@${unit.sha.slice(0, 12)} (the pinned mid-size C2 unit, §4.4)`);
+    const json = await rt.client.restGetJson(`repos/${encodeURIComponent(c2.owner)}/${encodeURIComponent(c2.repo)}/git/trees/${unit.treeOid}?recursive=1`, { immutable: true });
+    const tree = parseTreeResponse(json, "boundary-tree", unit.treeOid);
+    if (tree.truncated) throw new Error("C2's REST tree is truncated — the boundary probe's planning source is gone");
+    const blobs = tree.paths.filter((e) => e.type === "blob" && typeof e.size === "number").map((e) => ({ path: e.path, oid: e.sha, size: e.size as number }));
+    const cells = planBoundaryCells(blobs);
+    const results = await runBoundaryProbe(
+      { gh: rt.gh, cfg, owner: c2.owner, repo: c2.repo, sha: unit.sha, log, now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
+      cells,
+    );
+    writeFileSync(join(ARTIFACTS, "boundary-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, repo: `${c2.owner}/${c2.repo}`, sha: unit.sha, cells: results }, null, 2)}\n`);
+    log("boundary-probe.json written — informational, not scored (§4.4)");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+}
+
+async function cmdConcurrencyProbe(): Promise<void> {
+  const { cfg, corpus, workloads } = loadPinned();
+  const { digest } = await assertRatifiedAndFrozen();
+  const rt = makePinRuntime(cfg);
+  const { makeDb, disposeDb } = makeProbeDbFactory();
+  try {
+    const blocks = await runConcurrencyProbe({
+      cfg, corpus, workloads, client: rt.client, makeDb, disposeDb,
+      benchRoot: rt.benchRoot, gitEnv: rt.gitEnv, log, now: Date.now,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
+    writeFileSync(join(ARTIFACTS, "concurrency-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, streams: 4, drivers: blocks }, null, 2)}\n`);
+    log("concurrency-probe.json written — reported, not scored (§4.5)");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+}
+
+async function cmdOption3(): Promise<void> {
+  const { cfg, corpus, workloads } = loadPinned();
+  const { digest } = await assertRatifiedAndFrozen();
+  const duplication = analyzeOidDuplication(corpus, workloads);
+  // the warm scenario runs on the §4.7 rule's recommended driver when one exists, else on both
+  // finalists (plan §4.4) — scoring is a pure reader over runs.jsonl, so consult it
+  let drivers: DriverId[] = ["T1", "T2c"];
+  let driversRationale = "no §4.7 recommendation — both finalists (plan §4.4)";
+  try {
+    const { bundle } = loadScoreBundle();
+    const score = scoreMatrix(bundle);
+    if (score.caseMapping.recommendation !== null) {
+      drivers = [score.caseMapping.recommendation];
+      driversRationale = `§4.7 rule output ${score.caseMapping.kind} → ${score.caseMapping.recommendation}`;
+    }
+  } catch (e) {
+    log(`scoring unavailable (${e instanceof Error ? e.message.slice(0, 120) : String(e)}) — running both finalists`);
+  }
+  log(`option3 warm-scenario drivers: ${drivers.join(", ")} (${driversRationale})`);
+  const c1 = corpus.performance.find((s) => s.slot === "C1") ?? ((): never => {
+    throw new Error("no pinned C1 slot");
+  })();
+  const advanced = workloads.get(c1.units[0]!.unitId) ?? ((): never => {
+    throw new Error("no pinned C1-main workload");
+  })();
+  const rt = makePinRuntime(cfg);
+  const { makeDb, disposeDb } = makeProbeDbFactory();
+  try {
+    const warm = await runOption3WarmScenario({
+      cfg, corpus, advancedWorkload: advanced, client: rt.client, makeDb, disposeDb,
+      benchRoot: rt.benchRoot, gitEnv: rt.gitEnv, drivers, log, now: Date.now,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
+    writeFileSync(join(ARTIFACTS, "option3.json"), `${JSON.stringify({
+      generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, driversRationale,
+      duplication, warmScenario: warm, cloneCompositionStatement: CLONE_COMPOSITION_STATEMENT,
+    }, null, 2)}\n`);
+    log("option3.json written — the compositional analysis, reported alongside the matrix (§4.4)");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+}
+
 async function cmdVerifyCorpus(): Promise<void> {
   const { corpus, workloads } = loadPinned();
   log(`corpus pinned ${corpus.pinnedAtIso} by ${corpus.pinnedByLogin}`);
@@ -2175,13 +2371,18 @@ async function main(): Promise<void> {
     case "fidelity": return cmdFidelity();
     case "refresh-evidence": return cmdRefreshEvidence();
     case "matrix": return cmdMatrix();
+    case "score": return cmdScore();
+    case "report": return cmdReport();
+    case "boundary-probe": return cmdBoundaryProbe();
+    case "concurrency-probe": return cmdConcurrencyProbe();
+    case "option3": return cmdOption3();
     case "verify-corpus": return cmdVerifyCorpus();
     case "digest": {
       log(frozenSurfaceDigest()); // the §8 freeze binding ratification.json records
       return;
     }
     default:
-      log("usage: bun run bench:content <pin-corpus | refresh-evidence | diagnostics | verify-corpus | digest | budget | pilot | fidelity | matrix>");
+      log("usage: bun run bench:content <pin-corpus | refresh-evidence | diagnostics | verify-corpus | digest | budget | pilot | matrix | fidelity | boundary-probe | concurrency-probe | option3 | score | report>");
       process.exitCode = 2;
   }
 }
