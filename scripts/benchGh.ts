@@ -19,11 +19,17 @@ import type { BenchConfig } from "./benchConfig.ts";
 export class BenchHttpError extends Error {
   readonly code: string;
   readonly status: number;
-  constructor(code: string, message: string, status = 0) {
+  // typed R1/R2 evidence (§4.5): the terminal attempt's classification + request class, so the
+  // rerun predicate never regexes a message (codex R1 finding 7)
+  readonly lastClassification: string | null;
+  readonly requestClass: string | null;
+  constructor(code: string, message: string, status = 0, evidence: { lastClassification?: string; requestClass?: string } = {}) {
     super(`BENCH HTTP: ${message}`);
     this.name = "BenchHttpError";
     this.code = code;
     this.status = status;
+    this.lastClassification = evidence.lastClassification ?? null;
+    this.requestClass = evidence.requestClass ?? null;
   }
 }
 
@@ -47,6 +53,7 @@ export interface BenchHttpAttemptRecord {
   remaining: number | null;
   resetEpochSec: number | null;
   servedFromCache: boolean;
+  bodyBytes: number;
 }
 export type BenchHttpRecorder = (rec: BenchHttpAttemptRecord) => void;
 
@@ -136,6 +143,7 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
       type: "http-attempt", atMs: ctx.now(), wallMs: 0, kind: "rest", requestClass: opts.requestClass,
       label: opts.endpoint, attempt: 0, status: 200, exitCode: 0, classification: "cache",
       secondarySignal: null, pointsCost: null, remaining: null, resetEpochSec: null, servedFromCache: true,
+      bodyBytes: 0,
     });
     return { status: 200, headers: {}, body: cached.responseBody };
   }
@@ -143,6 +151,7 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
   if (accept !== "") args.push("-H", `Accept: ${accept}`);
   if (cached?.etag != null && cached.responseBody !== null) args.push("-H", `If-None-Match: ${cached.etag}`);
 
+  let lastClass = "unknown";
   for (let attempt = 0; attempt < ctx.cfg.rest.attemptCap; attempt++) {
     await waitBucket(ctx, ctx.core);
     const startedAt = ctx.now();
@@ -158,6 +167,7 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
         remaining: headerInt(parsed.headers["x-ratelimit-remaining"]),
         resetEpochSec: headerInt(parsed.headers["x-ratelimit-reset"]),
         servedFromCache: false,
+        bodyBytes: Buffer.byteLength(parsed.body, "utf8"),
       });
     };
     if (parsed.status === 0) {
@@ -166,7 +176,7 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
         await ctx.sleep(backoffWait(ctx.cfg, "transient", attempt, null));
         continue;
       }
-      throw new BenchHttpError("no-response", `gh api produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`);
+      throw new BenchHttpError("no-response", `gh api produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`, 0, { lastClassification: "no-response", requestClass: opts.requestClass });
     }
     if (parsed.status === 304 && cached !== null && cached.responseBody !== null) {
       emit("not-modified", null);
@@ -181,6 +191,7 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
       throw new BenchHttpError("truncated-transfer", `gh exited ${res.exitCode} with an HTTP 200 response`);
     }
     const cls = classifyRest(parsed.status, parsed.headers, parsed.body, now);
+    lastClass = cls.kind;
     const signal = detectRestSecondarySignal(parsed.status, parsed.headers, parsed.body);
     if (cls.kind === "ok") {
       emit("ok", signal);
@@ -201,9 +212,12 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
       continue; // the next attempt's waitBucket sleeps the window
     }
     emit(cls.kind, signal); // secondary | transient
-    await ctx.sleep(backoffWait(ctx.cfg, cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null));
+    const waitMs = backoffWait(ctx.cfg, cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
+    // a secondary horizon is bucket-global evidence the washout must see (codex R1 finding 13)
+    if (cls.kind === "secondary") ctx.core.pausedUntilMs = Math.max(ctx.core.pausedUntilMs, now + waitMs);
+    await ctx.sleep(waitMs);
   }
-  throw new BenchHttpError("attempts-exhausted", `REST attempts exhausted for ${opts.endpoint}`);
+  throw new BenchHttpError("attempts-exhausted", `REST attempts exhausted for ${opts.endpoint}`, 0, { lastClassification: lastClass, requestClass: opts.requestClass });
 }
 
 export async function benchRestJson(ctx: BenchGhContext, opts: BenchRestOptions): Promise<unknown> {
@@ -230,6 +244,7 @@ export interface BenchGraphqlDispatch {
   bodyText: string;
   data: Record<string, unknown> | null;
   errors: BenchGraphqlErrorEntry[];
+  malformedErrorEntries: number; // errors[] members with no readable shape — closed-default input
   jsonParseable: boolean;
   classification: string; // classifyGraphql's verdict on status/header/error-type semantics
   secondaryLike: boolean; // RATE_LIMITED body or secondary classification (G4 + backoff input)
@@ -237,35 +252,43 @@ export interface BenchGraphqlDispatch {
   pointsCost: number | null; // rateLimit.cost when the rider was readable
 }
 
-export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, unknown> | null; errors: BenchGraphqlErrorEntry[]; jsonParseable: boolean } {
+export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, unknown> | null; errors: BenchGraphqlErrorEntry[]; malformedErrorEntries: number; jsonParseable: boolean } {
   let root: unknown;
   try {
     root = JSON.parse(bodyText);
   } catch {
-    return { data: null, errors: [], jsonParseable: false };
+    return { data: null, errors: [], malformedErrorEntries: 0, jsonParseable: false };
   }
-  if (typeof root !== "object" || root === null || Array.isArray(root)) return { data: null, errors: [], jsonParseable: false };
+  if (typeof root !== "object" || root === null || Array.isArray(root)) return { data: null, errors: [], malformedErrorEntries: 0, jsonParseable: false };
   const o = root as Record<string, unknown>;
   const dataRaw = o["data"];
   const data = typeof dataRaw === "object" && dataRaw !== null && !Array.isArray(dataRaw) ? (dataRaw as Record<string, unknown>) : null;
   const errors: BenchGraphqlErrorEntry[] = [];
+  let malformedErrorEntries = 0;
   const errRaw = o["errors"];
   if (Array.isArray(errRaw)) {
     for (const e of errRaw) {
-      if (typeof e !== "object" || e === null || Array.isArray(e)) continue;
+      // a member with no readable shape is EVIDENCE, never a silent drop (codex R1 finding 5):
+      // the transition table's closed default fails the whole batch on it
+      if (typeof e !== "object" || e === null || Array.isArray(e)) {
+        malformedErrorEntries++;
+        continue;
+      }
       const eo = e as Record<string, unknown>;
       const pathRaw = eo["path"];
-      const path = Array.isArray(pathRaw) && pathRaw.every((p) => typeof p === "string" || typeof p === "number")
-        ? (pathRaw as Array<string | number>)
-        : null;
-      errors.push({
-        type: typeof eo["type"] === "string" ? (eo["type"] as string) : null,
-        message: typeof eo["message"] === "string" ? (eo["message"] as string) : null,
-        path,
-      });
+      const pathWellFormed = Array.isArray(pathRaw) && pathRaw.every((p) => typeof p === "string" || typeof p === "number");
+      if (pathRaw !== undefined && !pathWellFormed) malformedErrorEntries++;
+      const path = pathWellFormed ? (pathRaw as Array<string | number>) : null;
+      const type = typeof eo["type"] === "string" ? (eo["type"] as string) : null;
+      const message = typeof eo["message"] === "string" ? (eo["message"] as string) : null;
+      if (type === null && message === null && path === null) {
+        malformedErrorEntries++;
+        continue;
+      }
+      errors.push({ type, message, path });
     }
   }
-  return { data, errors, jsonParseable: true };
+  return { data, errors, malformedErrorEntries, jsonParseable: true };
 }
 
 export async function benchGraphqlDispatch(
@@ -305,11 +328,18 @@ export async function benchGraphqlDispatch(
     remaining: headerInt(parsed.headers["x-ratelimit-remaining"]),
     resetEpochSec: headerInt(parsed.headers["x-ratelimit-reset"]),
     servedFromCache: false,
+    bodyBytes: Buffer.byteLength(parsed.body, "utf8"),
   });
   if (cls.kind === "primary") ctx.graphql.pausedUntilMs = Math.max(ctx.graphql.pausedUntilMs, cls.untilMs);
+  // a SECONDARY throttle's horizon (Retry-After or the production backoff base) is armed on the
+  // bucket too — the next dispatch waits it out and the washout reads it (codex R1 finding 13)
+  if (cls.kind === "secondary") {
+    const waitMs = cls.waitMs ?? ctx.cfg.rest.secondaryBaseWaitMs;
+    ctx.graphql.pausedUntilMs = Math.max(ctx.graphql.pausedUntilMs, now + waitMs);
+  }
   return {
     status: parsed.status, exitCode: res.exitCode, headers: parsed.headers, bodyText: parsed.body,
-    data: full.data, errors: full.errors, jsonParseable: full.jsonParseable,
+    data: full.data, errors: full.errors, malformedErrorEntries: full.malformedErrorEntries, jsonParseable: full.jsonParseable,
     classification: cls.kind, secondaryLike,
     primaryUntilMs: cls.kind === "primary" ? cls.untilMs : null,
     pointsCost,

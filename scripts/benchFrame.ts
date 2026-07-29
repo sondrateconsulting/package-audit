@@ -146,7 +146,15 @@ export class BatchFrameParser {
           this.fail("header-unterminated", `header exceeds the ${this.limits.maxHeaderBytes}-byte bound`);
         const headerBytes = this.pending.slice(0, lfAt);
         this.pending = this.pending.slice(lfAt + 1);
-        const header = asciiField(headerBytes, "batch header");
+        let header: string;
+        try {
+          header = asciiField(headerBytes, "batch header");
+        } catch (e) {
+          // the decode failure must POISON the parser like every other grammar violation — a
+          // caught throw must not leave an armed parser accepting later frames (codex R1
+          // finding 30)
+          this.fail("meta-nonascii", e instanceof BenchFrameError ? e.message : String(e));
+        }
         const expected: BatchExpectation = this.state.expected;
         const parts = header.split(" ");
         if (parts.length === 2 && parts[1] === "missing") {

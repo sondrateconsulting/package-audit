@@ -37,13 +37,16 @@ export function planRounds(workload: UnitWorkload): T1Plan {
   const preRouted: Array<{ entry: WorkloadEntry; route: string }> = [];
   for (const entry of workload.entries) {
     if (!entry.read) continue; // no-read routes acquire nothing, by expectation
-    const t1 = workload.routes[entry.path]?.T1 ?? ((): never => {
-      throw new BenchT1Error(`no T1 route for ${entry.path}`);
-    })();
-    if (t1.primary === "primary") {
-      (entry.class === "manifest" || entry.class === "cli" ? round1 : round2).push(entry);
+    // pre-route ONLY what the TREE alone knows (§4.4): symlinks by mode, content-cap
+    // singletons by ls-tree size. Binary/truncated states are DISCOVERED in the timed GraphQL
+    // response (isBinary/isTruncated/text) — the pinned gql facts are EXPECTATIONS for the
+    // matrix, never a runtime oracle (codex R1 finding 4).
+    if (entry.mode === "120000") {
+      preRouted.push({ entry, route: "symlink-fallback" });
+    } else if (entry.size > workload.batchContentBytesCap) {
+      preRouted.push({ entry, route: "content-cap-singleton" });
     } else {
-      preRouted.push({ entry, route: t1.primary });
+      (entry.class === "manifest" || entry.class === "cli" ? round1 : round2).push(entry);
     }
   }
   return { round1, round2, preRouted };
@@ -123,9 +126,11 @@ export function packBatches(
 // ---- the exhaustive transition table ---------------------------------------------------------
 export type AliasOutcome =
   | { kind: "resolved"; index: number; text: string }
+  | { kind: "binary-fallback"; index: number } // observed isBinary/text:null — routed, counted
+  | { kind: "truncated-blob-fallback"; index: number } // observed isTruncated — routed, counted
   | { kind: "validation-fallback"; index: number; reason: string }
   | { kind: "timeout"; index: number } // alias-attributed TIMEOUT — feeds the split decision
-  | { kind: "missing"; index: number } // a tree-listed expression reported absent
+  | { kind: "missing"; index: number } // a tree-listed expression reported absent (NOT_FOUND)
   | { kind: "unattributed"; index: number }; // in neither data nor errors[]
 
 export type BatchAnalysis =
@@ -161,6 +166,9 @@ export function analyzeBatchResponse(
   const isTimeoutError = (e: { type: string | null; message: string | null }): boolean =>
     e.type === cfg.t1.splitTriggers.graphqlErrorType ||
     (e.message !== null && cfg.t1.splitTriggers.timeoutMessageRe.test(e.message));
+  // malformed errors[] members carry no attributable signal — the closed default, never a drop
+  if (d.malformedErrorEntries > 0 && d.status === 200 && d.jsonParseable)
+    return { kind: "default-failure", rawCondition: `${d.malformedErrorEntries} malformed errors[] member(s)` };
   // HTTP-level failure first: 5xx / no response / a 200 whose body is not JSON.
   if (d.status === 0 || d.status >= 500 || (d.status === 200 && !d.jsonParseable)) {
     const bodyEmptyOrNonJson = d.bodyText.trim() === "" || !d.jsonParseable;
@@ -209,8 +217,15 @@ export function analyzeBatchResponse(
       continue;
     }
     if (errs !== undefined) {
-      if (errs.some(isTimeoutError)) outcomes.push({ kind: "timeout", index: i });
-      else outcomes.push({ kind: "missing", index: i }); // NOT_FOUND-shaped: tree-listed but reported absent
+      if (errs.some(isTimeoutError)) {
+        outcomes.push({ kind: "timeout", index: i });
+      } else if (errs.every((e) => e.type === "NOT_FOUND")) {
+        outcomes.push({ kind: "missing", index: i }); // tree-listed but reported absent
+      } else {
+        // an attributed error of any OTHER type is the closed default — a whole-batch attempt
+        // failure, never a permitted absence (codex R1 finding 5)
+        return { kind: "default-failure", rawCondition: `alias a${i} errored ${errs.map((e) => e.type ?? "?").join(",")}` };
+      }
       continue;
     }
     // aliasRaw === null with no error: the expression resolved to nothing — reported absent
@@ -232,9 +247,11 @@ function validateAlias(index: number, raw: unknown, entry: WorkloadEntry, format
   if (o["__typename"] !== "Blob") return { kind: "validation-fallback", index, reason: `typename ${String(o["__typename"])}` };
   if (o["oid"] !== entry.blobOid) return { kind: "validation-fallback", index, reason: "oid mismatch" };
   if (o["byteSize"] !== entry.size) return { kind: "validation-fallback", index, reason: "byteSize mismatch" };
-  if (o["isTruncated"] === true) return { kind: "validation-fallback", index, reason: "isTruncated" };
+  // OBSERVED routing states, in the §4.3 vocabulary's own routes (never pre-routed from pins):
+  if (o["isTruncated"] === true) return { kind: "truncated-blob-fallback", index };
   const text = o["text"];
-  if (typeof text !== "string") return { kind: "validation-fallback", index, reason: "text null/non-string" };
+  if (o["isBinary"] === true || text === null) return { kind: "binary-fallback", index };
+  if (typeof text !== "string") return { kind: "validation-fallback", index, reason: "text non-string" };
   const bytes = Buffer.from(text, "utf8");
   if (bytes.byteLength !== entry.size) return { kind: "validation-fallback", index, reason: "utf8 length != byteSize" };
   if (gitBlobOid(bytes, format) !== entry.blobOid) return { kind: "validation-fallback", index, reason: "blob hash mismatch" };

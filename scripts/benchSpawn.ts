@@ -251,10 +251,30 @@ export async function runBenchGit(req: BenchGitRequest): Promise<BenchGitResult>
         }
         return new Uint8Array(0);
       });
-    const [stdout, stderr, exitCode] = await Promise.all([capture(outP), capture(errP), child.exited]);
+    // the exit join is BOUNDED once the deadline fires: a wedged exit promise must not hang
+    // the caller, and a SIGTERM race must never surface as a clean {exitCode:0, timedOut:true}
+    // outcome (codex R1 finding 15) — after a timeout the result is ALWAYS the synthetic 124.
+    const joined = Promise.all([capture(outP), capture(errP), child.exited]);
+    let gaveUpTimer: ReturnType<typeof setTimeout> | undefined;
+    const bounded = await Promise.race([
+      joined,
+      new Promise<null>((resolve) => {
+        gaveUpTimer = setTimeout(() => resolve(null), req.limits.deadlineMs + SPAWN_KILL_GRACE_MS + 2_000);
+      }),
+    ]);
+    clearTimeout(gaveUpTimer);
+    if (bounded === null) {
+      record(null, 0, 0);
+      throw new BenchSpawnError("exit-wedged", `child never settled within deadline+grace: git ${req.argv[0]}`);
+    }
+    const [stdout, stderr, exitCode] = bounded;
     if (failed) {
       record(exitCode, stdout.byteLength, stderr.byteLength);
       throw firstErr;
+    }
+    if (timedOut) {
+      record(124, stdout.byteLength, stderr.byteLength);
+      return { exitCode: 124, stdout: new Uint8Array(0), stderr, timedOut: true, wallMs: Date.now() - startedAtMs };
     }
     record(exitCode, stdout.byteLength, stderr.byteLength);
     return { exitCode, stdout, stderr, timedOut, wallMs: Date.now() - startedAtMs };
@@ -393,8 +413,13 @@ export class BatchChild {
       let value: Uint8Array | undefined;
       try {
         ({ done, value } = await this.errReader.read());
-      } catch {
-        return; // stderr loss is never fatal on its own; the ring just stops growing
+      } catch (e) {
+        // an undrained stderr pipe can wedge the child BEFORE its next frame and surface as a
+        // misleading read timeout — a reader failure is fatal and escalates, with the captured
+        // ring retained (codex R1 finding 28)
+        this.poison(`stderr drain failed: ${e instanceof Error ? e.message : String(e)}`);
+        killWithEscalation(this.child, [this.outReader, this.errReader]);
+        return;
       }
       if (value !== undefined) {
         this.stderrBytes += value.byteLength;
@@ -402,6 +427,14 @@ export class BatchChild {
       }
       if (done === true) return;
     }
+  }
+
+  // Run-scoped abort (§3.1's ordered abort teardown): poison any pending read NOW, start the
+  // kill escalation, and let dispose() own the ordered wait — callers still must await
+  // dispose() before deleting the store (codex R1 finding 27).
+  abort(reason: string): void {
+    this.poison(`aborted: ${reason}`);
+    killWithEscalation(this.child, [this.outReader, this.errReader]);
   }
 
   // Write one oid line, await exactly one frame. The expectation's size is the EXACT per-frame
