@@ -306,6 +306,9 @@ async function pinPerformanceSlot(rt: PinRuntime, slotId: "C1" | "C2" | "C3" | "
         }
       }
       if (branches.length === 0) continue;
+      if (slotId === "C1" && branches.length > 4) {
+        for (const extra of branches.splice(4)) rmSync(extra.dir, { recursive: true, force: true });
+      }
       const format = branches[0]!.objectFormat;
       const units: CorpusUnit[] = branches.map((b) => ({
         unitId: `${slotId}:${candidate.owner}/${candidate.repo}@${b.branch}`, branch: b.branch, sha: b.sha, treeOid: b.treeOid,
@@ -377,11 +380,8 @@ async function pinPerformanceSlot(rt: PinRuntime, slotId: "C1" | "C2" | "C3" | "
 
 async function pinFidelity(rt: PinRuntime): Promise<C6Fixture[]> {
   const fixtures: C6Fixture[] = [];
-  // 1) the M9 API-only symlink fixture — verify GitHub still serves the pinned facts
-  const meta = (await rt.client.restGetJson(
-    `repos/${M9.owner}/${M9.repo}/git/trees/${M9.sha}?recursive=1`,
-  ).catch(() => null)) as { truncated?: boolean } | null;
-  void meta; // node's tree is truncated; the entry facts are pinned from the ADR's M9 record
+  // 1) the M9 API-only symlink fixture — the entry facts are the ADR's pinned M9 record; the
+  // live REST dereference is the verification evidence
   const deref = await rt.client.fetchFileRaw(M9.owner, M9.repo, M9.path, M9.sha);
   fixtures.push({
     kind: "api-only-symlink", owner: M9.owner, repo: M9.repo, branch: null, sha: M9.sha,
@@ -590,10 +590,7 @@ async function cmdPinCorpus(): Promise<void> {
     writeFileSync(CONFIG_PATH, `${JSON.stringify(raw, null, 2)}\n`);
     loadBenchConfig(CONFIG_PATH); // strict re-validation of the written artifact
     log(`pinned: corpus.json, ${workloads.size} selected/*.json, schedule (${schedule.rows.length} rows)`);
-    // §4.4 acquisition diagnostics ride the same pinning session
-    const diagnostics = await acquisitionDiagnostics(rt, corpus, workloads);
-    writeFileSync(join(ARTIFACTS, "acquisition-diagnostics.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), results: diagnostics }, null, 2)}\n`);
-    log("acquisition-diagnostics.json written");
+    log(`next: bun run bench:content diagnostics (§4.4 acquisition diagnostics, separately restartable)`);
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
   }
@@ -640,12 +637,133 @@ async function cmdPilot(): Promise<void> {
   }
 }
 
+async function cmdDiagnostics(): Promise<void> {
+  const { cfg, corpus, workloads } = loadPinned();
+  const rt = makePinRuntime(cfg);
+  try {
+    const diagnostics = await acquisitionDiagnostics(rt, corpus, workloads);
+    writeFileSync(join(ARTIFACTS, "acquisition-diagnostics.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), results: diagnostics }, null, 2)}\n`);
+    log("acquisition-diagnostics.json written");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+}
+
+// The C6 fidelity battery (§4.2): untimed, once per (fixture, driver), gate-relevant — a
+// mismatch is a G1 event for that driver; a skipped applicable fixture is a G2 event.
+async function cmdFidelity(): Promise<void> {
+  const { cfg, corpus, workloads } = loadPinned();
+  const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
+  void engine;
+  const rt = makePinRuntime(cfg);
+  const results: unknown[] = [];
+  try {
+    for (const fixture of corpus.fidelity) {
+      for (const driver of fixture.appliesTo) {
+        for (const entry of fixture.entries) {
+          const expectDeref = fixture.verification["restDerefSeamSha256"];
+          const expectCanonical = fixture.verification["canonicalSeamSha256"];
+          let delivered: string | null = null;
+          let route = "";
+          if (driver === "T0") {
+            delivered = await rt.client.fetchFileRaw(fixture.owner, fixture.repo, entry.path, fixture.sha);
+            route = "primary";
+          } else if (driver === "T1") {
+            // mode-routed: a 120000 entry goes to the REST fallback exactly like the matrix
+            delivered = await rt.client.fetchFileRaw(fixture.owner, fixture.repo, entry.path, fixture.sha);
+            route = entry.mode === "120000" ? "symlink-fallback" : "primary";
+          } else {
+            const c = await pinClone(rt, fixture.owner, fixture.repo, fixture.branch ?? "HEAD", `fid-${fixture.kind}-${driver}`);
+            if (c.sha !== fixture.sha) {
+              results.push({ fixture: fixture.kind, driver, entry: entry.path, outcome: "drifted-head", got: c.sha });
+              rmSync(c.dir, { recursive: true, force: true });
+              continue;
+            }
+            if (entry.mode === "120000") {
+              delivered = await rt.client.fetchFileRaw(fixture.owner, fixture.repo, entry.path, fixture.sha);
+              route = "symlink-fallback";
+            } else if (driver === "T2a") {
+              delivered = new TextDecoder("utf-8", { fatal: false }).decode(readFileSync(join(c.dir, entry.path)));
+              route = "primary";
+            } else {
+              const bytes = await catBlob(rt, c.dir, entry.oid);
+              delivered = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+              route = "primary";
+            }
+            rmSync(c.dir, { recursive: true, force: true });
+          }
+          const gotHash = delivered === null ? null : sha256Hex(Buffer.from(delivered, "utf8"));
+          const expected = entry.mode === "120000" || typeof expectCanonical !== "string" ? expectDeref : expectCanonical;
+          const pass = typeof expected === "string" && gotHash === expected;
+          results.push({ fixture: fixture.kind, driver, entry: entry.path, route, pass, gotHash, expected });
+          log(`fidelity ${fixture.kind} ${driver} ${entry.path} [${route}]: ${pass ? "PASS" : "FAIL"}`);
+        }
+      }
+    }
+    writeFileSync(join(ARTIFACTS, "fidelity.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), results }, null, 2)}\n`);
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+    rmSync(benchRoot, { recursive: true, force: true });
+  }
+}
+
 async function cmdMatrix(): Promise<void> {
-  const { cfg } = loadPinned();
+  const { cfg, corpus, workloads } = loadPinned();
   if (!existsSync(RATIFICATION_PATH))
     throw new Error(`REFUSING: ${RATIFICATION_PATH} does not exist — §8 ratification (the four sign-off points) must be recorded before any timed matrix run (Step C)`);
   if (cfg.schedule === null) throw new Error("REFUSING: bench-config.json carries no pinned schedule (run pin-corpus first)");
-  throw new Error("the timed matrix is Step C — this build stops at ratification (plan §6 row B); the traversal executor runs engine.runOne over cfg.schedule.rows with the R1–R6 taxonomy and is exercised by `pilot` until then");
+  const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
+  try {
+    const rerunUsed = new Set<string>(); // R1/R2: ≤1 per (unit × driver)
+    const straddled = new Set<string>(); // R4 recurrence per unit → halt for freeze repair
+    const driftedUnits = new Set<string>(); // R6 branch arm: restart via the preregistered epilogue
+    const isRerunnable = (cause: string | null): boolean =>
+      cause !== null && /no HTTP response|no-response|attempts exhausted|ECONNRESET|ETIMEDOUT|EAI_AGAIN|TLS|connect/i.test(cause);
+    const executeRows = async (rows: typeof cfg.schedule extends null ? never : NonNullable<typeof cfg.schedule>["rows"], phaseNote: string): Promise<void> => {
+      for (const row of rows) {
+        if (driftedUnits.has(row.unit) && phaseNote === "main") continue; // discarded reps; the epilogue re-runs the whole unit
+        for (;;) {
+          const handle = await engine.runOne(row, "matrix");
+          const key = `${row.unit}|${row.driver}`;
+          if (handle.record.outcome === "complete") break;
+          if (handle.record.outcome === "invalidated-straddle") {
+            // R4: replay in its own slot, not charged to the driver allowance; twice on the
+            // same unit → halt for freeze repair
+            if (straddled.has(row.unit)) throw new Error(`R4 recurred on ${row.unit} — halt for freeze repair (plan §4.5)`);
+            straddled.add(row.unit);
+            log(`R4 straddle on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
+            continue;
+          }
+          if (handle.record.outcome === "drift-restart") {
+            log(`R6 branch arm: ${row.unit} drifted — unit restarts on the scaffolding form in the epilogue`);
+            driftedUnits.add(row.unit);
+            break;
+          }
+          if (handle.record.outcome === "re-pin-required")
+            throw new Error(`R6 SHA arm on ${row.unit}: ${handle.record.failureCause ?? ""} — re-pin is a §8 freeze amendment; halting`);
+          // unit-failure: R1/R2's network-shape failures get the ≤1 rerun; everything else is a
+          // recorded driver failure (no rerun — §4.5 "everything else")
+          if (isRerunnable(handle.record.failureCause) && !rerunUsed.has(key)) {
+            rerunUsed.add(key);
+            log(`R1/R2 rerun for ${key} rep${row.rep}: ${handle.record.failureCause ?? ""}`);
+            continue;
+          }
+          log(`recorded failure (no rerun) for ${key} rep${row.rep}: ${handle.record.failureCause ?? ""}`);
+          break;
+        }
+      }
+    };
+    await executeRows(cfg.schedule.rows, "main");
+    if (driftedUnits.size > 0) {
+      log(`epilogue: restarting ${driftedUnits.size} drifted unit(s) on the scaffolding form (R6 branch arm)`);
+      const epilogue = cfg.schedule.rows.filter((r) => driftedUnits.has(r.unit));
+      driftedUnits.clear();
+      await executeRows(epilogue, "epilogue");
+    }
+    log("matrix complete — runs.jsonl carries every record (report generation is Step C's remaining work)");
+  } finally {
+    rmSync(benchRoot, { recursive: true, force: true });
+  }
 }
 
 async function cmdVerifyCorpus(): Promise<void> {
@@ -666,12 +784,14 @@ async function main(): Promise<void> {
   const sub = Bun.argv[2] ?? "";
   switch (sub) {
     case "pin-corpus": return cmdPinCorpus();
+    case "diagnostics": return cmdDiagnostics();
     case "budget": return cmdBudget();
     case "pilot": return cmdPilot();
+    case "fidelity": return cmdFidelity();
     case "matrix": return cmdMatrix();
     case "verify-corpus": return cmdVerifyCorpus();
     default:
-      log("usage: bun run bench:content <pin-corpus | verify-corpus | budget | pilot | matrix>");
+      log("usage: bun run bench:content <pin-corpus | diagnostics | verify-corpus | budget | pilot | fidelity | matrix>");
       process.exitCode = 2;
   }
 }
