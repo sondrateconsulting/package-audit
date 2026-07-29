@@ -358,8 +358,14 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
       }
       const wallMs = deps.now() - startedAt;
       const bucketAfter = await readRateLimit(meta);
-      const legStraddled = !bucketDelta(bucketBefore.core, bucketAfter.core).valid || !bucketDelta(bucketBefore.graphql, bucketAfter.graphql).valid;
-      if (legStraddled) deps.log(`option3 ${driver} ${plan.leg}: a reset window moved under the leg — flagged (wall may span a boundary)`);
+      // a leg is flagged only for buckets it actually CONSUMED from — an unconsumed bucket's
+      // epoch rolling over during the leg is not evidence about the leg (codex C0-R4 finding 3)
+      const consumedCore = records.some((r) => !r.servedFromCache && r.kind === "rest" && r.requestClass !== "rest-meta");
+      const consumedGraphql = records.some((r) => !r.servedFromCache && r.kind === "graphql");
+      const legStraddled =
+        (consumedCore && !bucketDelta(bucketBefore.core, bucketAfter.core).valid) ||
+        (consumedGraphql && !bucketDelta(bucketBefore.graphql, bucketAfter.graphql).valid);
+      if (legStraddled) deps.log(`option3 ${driver} ${plan.leg}: a reset window moved under a consumed bucket — flagged (wall may span a boundary)`);
       const requests: Record<string, number> = {};
       let points = 0;
       let bodyBytes = 0;

@@ -2030,13 +2030,14 @@ async function cmdMatrix(): Promise<void> {
           engine.setReplayOf(row.pos, owed);
           pendingReplays.delete(row.pos);
         }
-        // the control-plane replay cap is DURABLE across invocations: recorded failures seed
-        // the counter, and the guard runs BEFORE another physical attempt — a restart must not
-        // buy one extra run per invocation (codex C0-R1 finding 3; C0-R2 verdict)
-        let controlPlaneReplays = state.controlPlaneCounts.get(row.pos) ?? 0;
+        // the control-plane replay cap is DURABLE and SINGLE-SOURCED: the reconstructed map
+        // is the only counter, live facts advance IT, and the guard runs BEFORE another
+        // physical attempt — neither a process restart nor a same-invocation R6 epilogue
+        // re-entry can reset it (codex C0-R1 finding 3; C0-R4 finding 2)
         for (;;) {
-          if (controlPlaneReplays > 2)
-            throw new Error(`control-plane failure recorded ${controlPlaneReplays}× at pos ${row.pos} — fix connectivity, then resume (the recorded rows stay; §4.5's in-slot replay discipline)`);
+          const controlPlaneCount = state.controlPlaneCounts.get(row.pos) ?? 0;
+          if (controlPlaneCount > 2)
+            throw new Error(`control-plane failure recorded ${controlPlaneCount}× at pos ${row.pos} — fix connectivity, then resume (the recorded rows stay; §4.5's in-slot replay discipline)`);
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
           // live counters advance from the recorded FACTS, unconditionally, before any
@@ -2047,7 +2048,7 @@ async function cmdMatrix(): Promise<void> {
             straddleCounts.set(row.unit, count);
             if (count >= 2) throw new Error(`R4 recurred on ${row.unit} (${count} straddles) — halt for freeze repair (plan §4.5)`);
           }
-          if (handle.record.controlPlaneFailed) controlPlaneReplays++;
+          if (handle.record.controlPlaneFailed) state.controlPlaneCounts.set(row.pos, (state.controlPlaneCounts.get(row.pos) ?? 0) + 1);
           if (handle.record.outcome === "complete") {
             for (const cls of handle.record.okRequestClasses) successLedger.add(`${key}|${cls}`); // §4.5 R2: SUCCESSFUL classes only
             successLedger.add(`${key}|rest-meta`); // implied: a completed run's accounting read rate_limit successfully
@@ -2375,10 +2376,13 @@ async function cmdReport(): Promise<void> {
     }
   }
   const ratified = String(rat["frozenSurfaceDigest"] ?? "");
-  const readJson = (name: string): Record<string, unknown> | null => {
-    const p = join(ARTIFACTS, name);
-    if (!existsSync(p)) return null;
-    const artifact = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+  const readJson = async (name: string): Promise<Record<string, unknown> | null> => {
+    // informational artifacts are read as COMMITTED HEAD blobs, exactly like the evidence
+    // logs — the report says "committed as <artifact>", so a worktree-only or edited copy
+    // must never be presented as committed evidence (codex C0-R4 finding 1)
+    const content = await gitObjectText("HEAD", `docs/adrs/0001-benchmark/${name}`);
+    if (content === null) return null;
+    const artifact = JSON.parse(content) as Record<string, unknown>;
     // every informational artifact must carry the SAME ratified stamp as the matrix evidence —
     // a report must never present artifacts from different freezes under one digest (codex
     // C0-R1 finding 16)
@@ -2393,9 +2397,9 @@ async function cmdReport(): Promise<void> {
   const md = buildReport({
     score, cfg: bundle.cfg, corpus: bundle.corpus, ratification: rat, envManifests,
     frozenSurfaceDigest: ratified,
-    boundary: readJson("boundary-probe.json"),
-    concurrency: readJson("concurrency-probe.json"),
-    option3: readJson("option3.json"),
+    boundary: await readJson("boundary-probe.json"),
+    concurrency: await readJson("concurrency-probe.json"),
+    option3: await readJson("option3.json"),
     generatedAtIso: new Date().toISOString(),
   });
   writeFileSync(join(ARTIFACTS, "report.md"), md);
