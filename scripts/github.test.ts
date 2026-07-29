@@ -2914,6 +2914,13 @@ describe("single chokepoint (grep-enforced)", () => {
       if (f.endsWith("scripts/github.ts")) {
         // the single realSpawn site; zero on every other surface
         expect({ file: f, ...counts }).toEqual({ file: f, ...zero, bun: 1 });
+      } else if (f.endsWith("scripts/benchSpawn.ts")) {
+        // ADR-0001 Step B (resolution plan §4.1): the benchmark's framed binary seam. Its ONE
+        // launch site drives the evaluated-transport / scaffolding / pinning git children,
+        // gated by benchGrammar's proposed grammars and the config-pinned scaffolding tuples.
+        // This allowlist entry is the plan's single sanctioned test-list change — production
+        // code (github.ts, readOnlyGuard.ts) is untouched by Step B.
+        expect({ file: f, ...counts }).toEqual({ file: f, ...zero, bun: 1 });
       } else if (f.endsWith("scripts/github.test.ts") || f.endsWith("scripts/tuiPurity.test.ts")) {
         // these SCANNER test files name the patterns in their own assertions — exempt them
         // (tuiPurity.test.ts is the display-layer purity scan; it must spell the same tokens)
