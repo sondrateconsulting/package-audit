@@ -283,6 +283,36 @@ to content) are covered by the parser's CI unit tests with synthetic fixtures �
 non-UTF-8 paths in stable public repositories are not reliably available, and the failure mode is
 a parser property, not a network property.
 
+**Step-B pinning amendments (recorded here so ratification binds unambiguous text; the swaps
+themselves are the table's own swap-not-force rule in action).** (i) *C1's sharing measure is
+DEFINED as blob-oid sharing*: shared = |A∩B| / min(|A|,|B|) over the two units' recursive blob
+oid sets. Rationale: content-bearing objects are what the transports under evaluation move and
+what Option 3's duplicate-oid analysis counts; directory *tree objects* churn on any nested
+edit and measure organisational, not transport, similarity. Measured at pinning: the plan's
+candidate fastify/fastify tops out at 14.2% blob sharing between its major lines (released
+MAJOR lines diverge; the slot's premise holds for parallel MAINTENANCE lines), and the pinned
+prometheus/prometheus corpus shares 88.6% of blobs between release-3.13 and release-3.12 —
+while their directory-tree-object sharing is ~72.6%, which is precisely why the measure must be
+declared. C1 candidates therefore discover main + the top release lines live (branch names are
+not knowable offline). (ii) *C2*: nodejs/undici measured 791 files, under the slot's 1k–3k
+window — swapped to nestjs/nest (2,128 files, 51 manifests, untruncated). (iii) *C3's
+operationalisation*: a fixed share-of-payload threshold is unreachable against the real REST
+wire format (each entry's `url` member alone carries ~100+ bytes and a second oid hex), so the
+predicate is absolute path-heaviness — ≥20,000 entries, mean path ≥ 55 bytes, ≥5,000 entries at
+DIRECTORY depth ≥ 6 (path segments − 1) — computed from the REST recursive tree the slot
+description cites. NixOS/nixpkgs measured REST-truncated (a C4 shape) and home-assistant/core's
+mean path is ~47 B; kubernetes/kubernetes (~37k tree entries, mean ~64 B, deep staging/
+nesting) verifies and is pinned. (iv) *C6's clone fixture*: a single small repo supplying BOTH
+the selected-symlink and the selected-non-UTF-8 file is preferred; when the candidate search
+finds none (git/git has no symlink at a SELECTED path — measured via REST-tree mode probes —
+while ansible/ansible does at `.azure-pipelines/commands/*.sh`), the battery may pin the two
+properties on two repos, with the search evidence recorded in `corpus.json`. (v) *the
+tracked-package set* is a pre-freeze pinned input chosen against the corpus: `[react, pino]` —
+react resolves in prometheus's web/ui (a genuine source class across all four C1 units);
+typescript/eslint were deliberately excluded because nest declares them, which made every `.ts`
+file source-selected (1,785 reads measured) and would have defeated this section's own C2
+≤~500 preference.
+
 **Workloads are never truncated.** A prefix cap would structurally favour API drivers (it caps
 their per-file requests while clone drivers still transfer the whole branch) and can break the
 manifest→source/lockfile dependency shape. *Corpus selection* prefers repos whose natural
@@ -755,6 +785,17 @@ timed matrix run**:
    sizes and their budget cost.
 4. The symlink policy all drivers declare (REST-deref parity with today) — a findings-visible
    choice.
+
+**Freeze scoping (amended at Step B).** The frozen harness surface is everything that can
+influence a timed measurement or its consumption accounting: the spawn/framing seams, drivers,
+protocol engine, configuration loaders, and the preregistered constants and schedule. Code that
+only READS committed `runs.jsonl` and artifacts after the fact — scoring/report generation and
+the §4.7 rule evaluation — plus the post-matrix informational executors (§4.4's boundary probe,
+§4.5's concurrency probe, §4.4's Option-3 offline analysis and warm scenario, whose commit pair
+IS frozen at Step B in `corpus.json`) may be added at Step C without invalidating timing data:
+they run after every timed row and cannot affect measurement. Their addition still passes
+review as part of Step C's own PR; any change to the frozen surface itself keeps the full
+amendment + restart rule below.
 
 **Freeze semantics — the frozen set is everything the result depends on:** corpus SHAs and
 branches, selected sets, route-expectation matrices and ground-truth hashes, every
