@@ -45,8 +45,14 @@ export function computeWorstCase(driver: DriverId, workload: UnitWorkload, cfg: 
   const budget = restFallbackBudgetFor(cfg, workload.entries.length);
   const cap = cfg.rest.attemptCap;
   const fixed = cfg.budget.fixedPerRunOverheadRequests;
-  if (driver === "T0" || (driver === "T2a" && workload.escapeTripped && !workload.truncatedTree)) {
+  if (driver === "T0") {
+    // a truncated tree routes T0 to the production checkout-clone fallback: the tree request
+    // plus REST fallbacks only — content reads are local (§4.2 C4)
+    if (workload.truncatedTree) return { core: (1 + budget) * cap + fixed, graphql: 0, plannedBatches: 0 };
     // per-file REST + the tree request + the fallback budget, all under the attempt cap
+    return { core: (reads + 1 + budget) * cap + fixed, graphql: 0, plannedBatches: 0 };
+  }
+  if (driver === "T2a" && workload.escapeTripped && !workload.truncatedTree) {
     return { core: (reads + 1 + budget) * cap + fixed, graphql: 0, plannedBatches: 0 };
   }
   if (driver === "T1") {
@@ -71,7 +77,8 @@ export function planSegments(driver: DriverId, workload: UnitWorkload, cfg: Benc
   const wc = computeWorstCase(driver, workload, cfg, slot);
   const capacity = cfg.budget.bucketCapacityPerHour;
   if (wc.core * cfg.budget.headroomFactor <= capacity) return [workload.entries.filter((e) => e.read).length];
-  if (driver !== "T0" && !(driver === "T2a" && workload.escapeTripped)) {
+  const perFileRestShape = (driver === "T0" || (driver === "T2a" && workload.escapeTripped)) && !workload.truncatedTree;
+  if (!perFileRestShape) {
     throw new BenchProtocolError(`WC exceeds bucket capacity for ${driver} — only the per-file REST shape segments`);
   }
   const reads = workload.entries.filter((e) => e.read).length;

@@ -96,10 +96,15 @@ const SLOT_CANDIDATES: Record<string, Array<{ owner: string; repo: string; branc
     { owner: "dotnet", repo: "runtime", branches: ["main"] },
   ],
 };
+// Measured at pinning: the plan's git/git has NO selected symlink (its symlinks sit at
+// non-classified paths) but DOES carry a selected non-UTF-8 .sh; ansible's
+// .azure-pipelines/commands/*.sh are real mode-120000 entries at SELECTED paths (REST-tree mode
+// probe, 2026-07-28); kubernetes' root Makefile is a symlink too (and k8s is already C3, so the
+// matrix exercises the symlink route there naturally — the fixture isolates byte fidelity).
 const C6_CLONE_CANDIDATES: Array<{ owner: string; repo: string; branch: string }> = [
+  { owner: "ansible", repo: "ansible", branch: "devel" },
   { owner: "git", repo: "git", branch: "master" },
-  { owner: "PowerShell", repo: "PowerShell", branch: "master" },
-  { owner: "fastify", repo: "fastify", branch: "main" },
+  { owner: "kubernetes", repo: "kubernetes", branch: "master" },
 ];
 // M9, fully specified in the ADR — the API-only symlink fixture (T0/T1).
 const M9 = {
