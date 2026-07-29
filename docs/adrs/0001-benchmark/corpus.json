@@ -1,0 +1,235 @@
+{
+  "pinnedAtIso": "2026-07-29T03:27:01.991Z",
+  "pinnedByLogin": "sondrateconsulting-ryan",
+  "performance": [
+    {
+      "slot": "C1",
+      "owner": "prometheus",
+      "repo": "prometheus",
+      "objectFormat": "sha1",
+      "repoSizeKb": 286015,
+      "units": [
+        {
+          "unitId": "C1:prometheus/prometheus@main",
+          "branch": "main",
+          "sha": "40ea54d0b1d265b8dc830c88ef96b0b65f3ba0be",
+          "treeOid": "cc01c1c5983bcc40829abc5654d75d66f4d41b03"
+        },
+        {
+          "unitId": "C1:prometheus/prometheus@release-3.13",
+          "branch": "release-3.13",
+          "sha": "73ff57ce2b8161059ac7fe5188f03f1c3d22b29a",
+          "treeOid": "5f41d5beebb774c30d7a8b5ca67b45296c6a6ad1"
+        },
+        {
+          "unitId": "C1:prometheus/prometheus@release-3.12",
+          "branch": "release-3.12",
+          "sha": "9f27dffc1f93ca23287972f632025879f2d1c658",
+          "treeOid": "6d09c791814f440086529766365336f45ec5c88e"
+        },
+        {
+          "unitId": "C1:prometheus/prometheus@release-3.11",
+          "branch": "release-3.11",
+          "sha": "eb173f5256d4022afba1e9bc3d19740a76859fae",
+          "treeOid": "00a41e47c2c3661065ab3979656fcfc40f409e23"
+        }
+      ],
+      "verification": {
+        "measure": "shared = |A∩B| / min(|A|,|B|) over blob oid sets",
+        "units": 4,
+        "bestPair": {
+          "a": "release-3.13",
+          "b": "release-3.12",
+          "ratio": 0.8856
+        },
+        "truncatedAtPin": false
+      }
+    },
+    {
+      "slot": "C2",
+      "owner": "nestjs",
+      "repo": "nest",
+      "objectFormat": "sha1",
+      "repoSizeKb": 486063,
+      "units": [
+        {
+          "unitId": "C2:nestjs/nest@master",
+          "branch": "master",
+          "sha": "fafe503bd8ca073f2fdd41ed7138081af84c478e",
+          "treeOid": "389e928dc19666d41295fb22d48736827e6ca2b0"
+        }
+      ],
+      "verification": {
+        "fileCount": 2128,
+        "truncated": false,
+        "manifestCount": 51,
+        "truncatedAtPin": false
+      }
+    },
+    {
+      "slot": "C3",
+      "owner": "kubernetes",
+      "repo": "kubernetes",
+      "objectFormat": "sha1",
+      "repoSizeKb": 1510222,
+      "units": [
+        {
+          "unitId": "C3:kubernetes/kubernetes@master",
+          "branch": "master",
+          "sha": "7c2b6c32644a2cc24029ec77576940b63ecca7e7",
+          "treeOid": "d344ce0f3b059cf13b6ee655075416187cb10724"
+        }
+      ],
+      "verification": {
+        "truncated": false,
+        "entryCount": 31300,
+        "pathByteSum": 2110614,
+        "oidHexLength": 40,
+        "deepEntryCount": 23210,
+        "meanPathBytes": 67.4,
+        "truncatedAtPin": false
+      }
+    },
+    {
+      "slot": "C4",
+      "owner": "llvm",
+      "repo": "llvm-project",
+      "objectFormat": "sha1",
+      "repoSizeKb": 4221837,
+      "units": [
+        {
+          "unitId": "C4:llvm/llvm-project@main",
+          "branch": "main",
+          "sha": "1d4e04f7a7c2669dd652861e7dccc22f67ab3355",
+          "treeOid": "8211bd77388927dc95cbf01ee78dc421a82f3b1e"
+        }
+      ],
+      "verification": {
+        "truncated": true,
+        "truncatedAtPin": true
+      }
+    },
+    {
+      "slot": "C5",
+      "owner": "PowerShell",
+      "repo": "PowerShell",
+      "objectFormat": "sha1",
+      "repoSizeKb": 105052,
+      "units": [
+        {
+          "unitId": "C5:PowerShell/PowerShell@master",
+          "branch": "master",
+          "sha": "f3648da945a3289d37214601368205b1af2b8354",
+          "treeOid": "90fd99013e097af5dced2bd1e6cbcb65137ef77b"
+        }
+      ],
+      "verification": {
+        "comparedSelectedFiles": 26,
+        "divergingPaths": [
+          ".devcontainer/Dockerfile",
+          ".github/workflows/analyze-reusable.yml",
+          ".github/workflows/copilot-setup-steps.yml",
+          ".github/workflows/dependency-review.yml",
+          ".github/workflows/labels.yml",
+          ".github/workflows/linux-ci.yml",
+          ".github/workflows/macos-ci.yml",
+          ".github/workflows/scorecards.yml",
+          ".github/workflows/verify-markdown-links.yml",
+          ".github/workflows/windows-ci.yml",
+          ".github/workflows/windows-packaging-reusable.yml",
+          ".github/workflows/xunit-tests.yml",
+          "tools/AttackSurfaceAnalyzer/docker/Dockerfile"
+        ],
+        "divergingCount": 13,
+        "truncatedAtPin": false
+      }
+    }
+  ],
+  "fidelity": [
+    {
+      "kind": "api-only-symlink",
+      "owner": "nodejs",
+      "repo": "node",
+      "branch": null,
+      "sha": "b2a024b1ad3373d405ca55af23f59dd4cd696c2f",
+      "objectFormat": "sha1",
+      "appliesTo": [
+        "T0",
+        "T1"
+      ],
+      "entries": [
+        {
+          "path": "deps/v8/third_party/ittapi/ittapi-rs/CMakeLists.txt",
+          "mode": "120000",
+          "oid": "de0cf227139ff67dd6d0493c03533e48d6ea8634",
+          "size": 17
+        }
+      ],
+      "verification": {
+        "restDerefBytes": 2513,
+        "restDerefSeamSha256": "ec46d073ad6f60d9b16d7250d3e9f944d637ab2b5f52d725870748a0d79c7dc6"
+      }
+    },
+    {
+      "kind": "clone-symlink",
+      "owner": "ansible",
+      "repo": "ansible",
+      "branch": "devel",
+      "sha": "e8264c418ad2e87f92fa48f75cacfaa451cb38e4",
+      "objectFormat": "sha1",
+      "appliesTo": [
+        "T0",
+        "T1",
+        "T2a",
+        "T2c"
+      ],
+      "entries": [
+        {
+          "path": ".azure-pipelines/commands/alpine.sh",
+          "mode": "120000",
+          "oid": "6ddb77685452b41e26a1a4aeafd20688342eec77",
+          "size": 9
+        }
+      ],
+      "verification": {
+        "symlinkSelectedPaths": [
+          ".azure-pipelines/commands/alpine.sh",
+          ".azure-pipelines/commands/fedora.sh",
+          ".azure-pipelines/commands/freebsd.sh",
+          ".azure-pipelines/commands/galaxy.sh",
+          ".azure-pipelines/commands/macos.sh",
+          ".azure-pipelines/commands/rhel.sh",
+          ".azure-pipelines/commands/ubuntu.sh"
+        ],
+        "restDerefSeamSha256": "93dc0ce64ee5fdda9d674378187f3b415ec02ec530038b9edf40a2c84b930a3d"
+      }
+    },
+    {
+      "kind": "non-utf8-content",
+      "owner": "git",
+      "repo": "git",
+      "branch": "master",
+      "sha": "13c7afec212fc97ce257d15601659314c6673d6c",
+      "objectFormat": "sha1",
+      "appliesTo": [
+        "T0",
+        "T1",
+        "T2a",
+        "T2c"
+      ],
+      "entries": [
+        {
+          "path": "t/t4201-shortlog.sh",
+          "mode": "100755",
+          "oid": "023fbff546b87f8b68c0bbf2d431066a11cf5c95",
+          "size": 11480
+        }
+      ],
+      "verification": {
+        "path": "t/t4201-shortlog.sh",
+        "replacementCount": 32,
+        "canonicalSeamSha256": "c9820488fb64aeaa0b2c1cd07d1917b93d9d8a1b5b25ae68af9bbfd4725a9726"
+      }
+    }
+  ]
+}
