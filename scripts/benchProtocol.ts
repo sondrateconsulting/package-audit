@@ -116,6 +116,9 @@ export interface BucketDelta {
 // else — a consumed bucket whose epoch changed under the run — is the straddle R4 invalidates.
 export function bucketDelta(before: { remaining: number; reset: number; used: number }, after: { remaining: number; reset: number; used: number }): BucketDelta {
   if (before.reset === after.reset) return { valid: true, used: Math.max(0, before.remaining - after.remaining) };
+  // NOTE: if a SECOND reset lands mid-run, after.used undercounts — conservative for R3 (an
+  // undercount can never flag foreign consumption falsely) and irrelevant to R5, which runs on
+  // live harness-side counts, not deltas.
   if (before.used === 0) return { valid: true, used: after.used };
   return { valid: false, used: null };
 }
@@ -829,16 +832,30 @@ export class BenchEngine {
     const unit = slot.units[0]!;
     const walls: number[] = [];
     for (let rep = 1; rep <= cfg.pilot.reps; rep++) {
-      const handle = await this.runOne(
-        { pos: schedulePositions + rep, unit: unit.unitId, driver: cfg.pilot.driver, rep, probe: false },
-        "pilot",
-      );
-      if (handle.record.outcome !== "complete")
-        throw new BenchProtocolError(`pilot rep ${rep} did not complete: ${handle.record.outcome} (${handle.record.failureCause ?? ""})`);
-      if ((handle.verification?.g1Failures.length ?? 0) > 0 || (handle.verification?.g2Failures.length ?? 0) > 0)
-        throw new BenchProtocolError(`pilot rep ${rep} failed verification`);
-      walls.push(handle.record.wallMs);
-      this.o.log(`pilot rep ${rep}/${cfg.pilot.reps}: wall ${handle.record.wallMs}ms`);
+      let replays = 0;
+      for (;;) {
+        const handle = await this.runOne(
+          { pos: schedulePositions + rep, unit: unit.unitId, driver: cfg.pilot.driver, rep, probe: false },
+          "pilot",
+        );
+        // R3/R4 invalidations REPLAY in their own slot (§4.5) — the pilot honours the same
+        // frozen semantics as the matrix (measured live: a single foreign GraphQL point from a
+        // background consumer invalidated a rep on 2026-07-29)
+        if (handle.record.outcome === "invalidated-straddle" || handle.record.outcome === "invalidated-foreign") {
+          replays++;
+          if (replays > 2) throw new BenchProtocolError(`pilot rep ${rep} invalidated ${replays} times (${handle.record.outcome}) — quiesce the account's other consumers and re-run`);
+          this.o.log(`pilot rep ${rep} ${handle.record.outcome} — replaying in its own slot`);
+          this.setReplayOf(schedulePositions + rep, "r3r4");
+          continue;
+        }
+        if (handle.record.outcome !== "complete")
+          throw new BenchProtocolError(`pilot rep ${rep} did not complete: ${handle.record.outcome} (${handle.record.failureCause ?? ""})`);
+        if ((handle.verification?.g1Failures.length ?? 0) > 0 || (handle.verification?.g2Failures.length ?? 0) > 0)
+          throw new BenchProtocolError(`pilot rep ${rep} failed verification`);
+        walls.push(handle.record.wallMs);
+        this.o.log(`pilot rep ${rep}/${cfg.pilot.reps}: wall ${handle.record.wallMs}ms`);
+        break;
+      }
     }
     const spread = Math.max(...walls) / Math.min(...walls);
     return { walls, spread };
