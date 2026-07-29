@@ -1,0 +1,122 @@
+{
+  "$comment": "ADR-0001 content-transport benchmark — the preregistered constants (resolution plan §4.3 step 1, §4.4, §4.5, §4.8). Every value is LITERAL by design: the workload is a function of (config, repo, SHA) and all three are pinned. Values marked 'production literal' mirror module-local constants in scripts/*.ts and are cross-checked by benchConfig.test.ts where the production symbol is exported. After §8 ratification this file is FROZEN — any change invalidates affected timing data and requires a plan amendment plus one adversarial review round.",
+  "benchmark": "adr-0001-content-transport",
+  "planRef": "docs/plans/adr-0001-disagreements-resolution.md",
+  "githubHost": "github.com",
+  "reps": 5,
+  "drivers": ["T0", "T1", "T2a", "T2c"],
+  "selection": {
+    "$comment": "The production selection function's pinned inputs (§4.3): scanUnit/locateManifests/classifyFile are reused directly, so the classifier terms are the production code itself; these are the config-shaped inputs it takes. trackedPackages is finalised at corpus pinning (pre-freeze) so C1/C2 workloads carry a non-trivial source class; the committed value here is what every selected/*.json was generated from.",
+    "trackedPackages": ["typescript", "semver", "pino", "undici", "react", "eslint"],
+    "excludeDirGlobs": ["**/node_modules/**", "**/dist/**", "**/build/**", "**/vendor/**"],
+    "maxScanBytes": 2097152
+  },
+  "rest": {
+    "rawAccept": "application/vnd.github.raw+json",
+    "attemptCap": 6,
+    "secondaryBaseWaitMs": 60000,
+    "transientBaseWaitMs": 2000
+  },
+  "restFallbackBudget": {
+    "$comment": "Per-unit REST fallback budget, EVERY driver (§4.4): max(floor, ceil(fractionOfSelected × selected)). Exhaustion is a unit failure (G2).",
+    "floor": 20,
+    "fractionOfSelected": 0.1,
+    "rounding": "ceil"
+  },
+  "t1": {
+    "aliasCap": 250,
+    "queryDocBytesCap": 49152,
+    "batchContentBytesCap": 1572864,
+    "argvBytesCap": 131072,
+    "aliasSelection": "object(expression: $EXPR) { __typename ... on Blob { oid byteSize isBinary isTruncated text } }",
+    "rateLimitRider": "rateLimit { cost remaining resetAt }",
+    "splitTriggers": {
+      "graphqlErrorType": "TIMEOUT",
+      "timeoutMessageRegex": "\\btimed?[ -]?out\\b",
+      "timeoutMessageRegexFlags": "i",
+      "consecutive5xx": {
+        "count": 2,
+        "statuses": [502, 503, 504],
+        "bodies": "empty-or-non-json",
+        "capUtilisationFloor": 0.8
+      }
+    },
+    "split": {
+      "maxDepth": 2,
+      "maxDescendantsPerOriginal": 4
+    },
+    "circuitBreakerConsecutiveFailedDispatches": 3
+  },
+  "t2a": {
+    "$comment": "Size-based api-escape (§4.4): a unit whose PINNED REST repository size (KB, recorded in corpus.json at pinning — size rides discovery, which the benchmark excludes as identical across drivers) exceeds this threshold routes to per-file REST with T0 semantics — EXCEPT truncated trees, which must clone anyway (the oversized-and-truncated hole is exhibited, not patched). Derivation: predicted clone+checkout disk ≈ 2 × size, so the escape aligns with the 2 GiB G4 gate at size > 1 GiB = 1048576 KB.",
+    "apiEscapeRepoSizeKb": 1048576
+  },
+  "spawn": {
+    "$comment": "production literals: SPAWN_TIMEOUT_MS / SPAWN_KILL_GRACE_MS are exported and cross-checked; outputCapBytes mirrors github.ts's module-local MAX_SPAWN_OUTPUT_BYTES (110 MiB).",
+    "timeoutMs": 900000,
+    "killGraceMs": 2000,
+    "outputCapBytes": 115343360
+  },
+  "frame": {
+    "$comment": "Framed seam limits (§3.1/§3.2). frameCeilingBytes = production's spawn-output cap, the absolute per-frame ceiling; the per-frame bound is the ls-tree-declared size exactly. childPoolSize = the subprocess semaphore's production default (§3.1 — a small fixed pool, never one-per-unit).",
+    "maxHeaderBytes": 256,
+    "frameCeilingBytes": 115343360,
+    "stderrRingBytes": 65536,
+    "readDeadlineMs": 60000,
+    "disposeDeadlineMs": 10000,
+    "childPoolSize": 8
+  },
+  "lsTree": {
+    "maxEntries": 1000000,
+    "maxRecordBytes": 65536,
+    "maxOutputBytes": 115343360
+  },
+  "protocol": {
+    "$comment": "§4.5. Cold = no api_cache rows, no reused clones, no HTTP cache; DNS/TLS warmth is ambient. Washout = max(floorMs, longest outstanding throttle horizon from the previous run). Temp prefix pa-bench-* — NOT pkg-audit-*, which production's startup sweep deletes unconditionally (github.ts:2096).",
+    "tempPrefix": "pa-bench-",
+    "washoutFloorMs": 60000,
+    "diskGateBytes": 2147483648,
+    "diskSamplerHz": 1,
+    "g4AttributableSecondarySignals": { "pass": 0, "warnAtMost": 1, "failAt": 2 },
+    "rerunAllowancePerUnitDriver": 1,
+    "fidelityBattery": { "when": "after-matrix", "repsPerFixtureDriver": 1 }
+  },
+  "budget": {
+    "$comment": "§4.8 worst-case reservation. P_max is a FROZEN ASSUMPTION: any measured per-request cost above it, or any run overrunning its own WC, halts the matrix (R5 freeze repair). rate_limit reads are excluded (documented as not counting against the REST primary limit). Formulas (evaluated in benchBudget.ts): REST WC_core = (contentRequests + treeRequests + fallbackBudget) × attemptCap + fixedPerRunOverheadRequests; GraphQL WC_graphql = plannedBatches × (1 + maxDescendantsPerOriginal) × attemptCap × pMax.",
+    "pMaxPointsPerGraphqlAttempt": 10,
+    "headroomFactor": 1.1,
+    "bucketCapacityPerHour": 5000,
+    "fixedPerRunOverheadRequests": 0
+  },
+  "noiseBand": {
+    "$comment": "§4.7: band = max(floor, pilot max/min wall ratio rounded UP to the next roundUpTo).",
+    "floor": 1.25,
+    "roundUpTo": 0.05
+  },
+  "pilot": {
+    "driver": "T0",
+    "slot": "C2",
+    "reps": 5
+  },
+  "williamsRows": [
+    ["T0", "T1", "T2c", "T2a"],
+    ["T1", "T2a", "T0", "T2c"],
+    ["T2a", "T2c", "T1", "T0"],
+    ["T2c", "T0", "T2a", "T1"],
+    ["T0", "T2a", "T1", "T2c"]
+  ],
+  "williamsFifthRowNote": "Rows 1-4 are a digram-balanced 4×4 Williams square (each driver once per position; each ordered predecessor pair exactly once). Row 5 is the declared fifth order: its three digrams (T0→T2a, T2a→T1, T1→T2c) each already occur exactly once in rows 1-4, so no ordered pair reaches three occurrences — the minimum any fifth row can achieve.",
+  "scaffolding": {
+    "$comment": "SHA-pinned acquisition scaffolding (§4.4) — bench scaffolding, NOT proposed production grammar. Slots in {braces} are substituted before the spawn module compares argv verbatim. The gitconfig is the bench's pinned generated config (mirroring production's ensureGitConfig approach: credential helper delegating to gh, https-only protocol) plus the ONE probe-varied knob, core.autocrlf (baseline false; the checkout-config probe rep runs true).",
+    "tuples": {
+      "init": ["init", "--template=", "--object-format={objectFormat}", "{dest}"],
+      "remoteAdd": ["remote", "add", "origin", "{url}"],
+      "fetch": ["fetch", "--depth", "1", "--no-tags", "--no-recurse-submodules", "origin", "{sha}"],
+      "checkoutDetach": ["checkout", "--detach", "FETCH_HEAD"],
+      "lsRemoteProbe": ["ls-remote", "{url}", "refs/heads/{branch}"]
+    },
+    "gitconfigBaseline": "[credential]\n\thelper = !{ghBin} auth git-credential\n[protocol]\n\tallow = never\n[protocol \"https\"]\n\tallow = always\n[core]\n\tautocrlf = false\n",
+    "gitconfigProbeAutocrlfTrue": "[credential]\n\thelper = !{ghBin} auth git-credential\n[protocol]\n\tallow = never\n[protocol \"https\"]\n\tallow = always\n[core]\n\tautocrlf = true\n"
+  },
+  "schedule": null
+}
