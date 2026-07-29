@@ -2914,7 +2914,9 @@ describe("single chokepoint (grep-enforced)", () => {
       if (f.endsWith("scripts/github.ts")) {
         // the single realSpawn site; zero on every other surface
         expect({ file: f, ...counts }).toEqual({ file: f, ...zero, bun: 1 });
-      } else if (f.endsWith("scripts/benchSpawn.ts")) {
+      } else if (f === "scripts/benchSpawn.ts" || f === join("scripts", "benchSpawn.ts")) {
+        // EXACT repo-relative path (never a suffix match — a nested evil/scripts/benchSpawn.ts
+        // must not inherit the allowlist entry).
         // ADR-0001 Step B (resolution plan §4.1): the benchmark's framed binary seam. Its ONE
         // launch site drives the evaluated-transport / scaffolding / pinning git children,
         // gated by benchGrammar's proposed grammars and the config-pinned scaffolding tuples.

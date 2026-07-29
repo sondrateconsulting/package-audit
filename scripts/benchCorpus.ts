@@ -59,11 +59,21 @@ export interface C6Fixture {
   verification: Record<string, unknown>;
 }
 
+export interface Option3WarmScenario {
+  owner: string;
+  repo: string;
+  baseSha: string; // the parent commit of C1-main's pinned SHA (plan §4.4)
+  advancedSha: string; // C1-main's pinned SHA itself
+}
+
 export interface Corpus {
   pinnedAtIso: string;
   pinnedByLogin: string; // the gh identity's non-secret fingerprint (§4.8)
   performance: PerformanceSlot[];
   fidelity: C6Fixture[];
+  // Option 3's warm-run scenario commit pair, frozen at Step B (plan §4.4) — consumed by
+  // Step C's compositional analysis, never a driver.
+  option3WarmScenario: Option3WarmScenario | null;
 }
 
 // ---- strict parse ----------------------------------------------------------------------------
@@ -192,11 +202,26 @@ export function parseCorpus(jsonText: string): Corpus {
   for (const required of ["api-only-symlink", "clone-symlink", "non-utf8-content"] as const) {
     if (!kinds.includes(required)) fail(`missing fidelity fixture kind ${required}`);
   }
+  let option3: Option3WarmScenario | null = null;
+  const o3 = o["option3WarmScenario"];
+  if (o3 !== undefined && o3 !== null) {
+    if (!isObject(o3)) fail("option3WarmScenario must be an object or null");
+    const oo = o3 as Record<string, unknown>;
+    option3 = {
+      owner: str(oo, "option3WarmScenario", "owner"),
+      repo: str(oo, "option3WarmScenario", "repo"),
+      baseSha: str(oo, "option3WarmScenario", "baseSha"),
+      advancedSha: str(oo, "option3WarmScenario", "advancedSha"),
+    };
+    if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(option3.baseSha) || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(option3.advancedSha))
+      fail("option3WarmScenario shas must be full lowercase object ids");
+  }
   return {
     pinnedAtIso: str(o, "", "pinnedAtIso"),
     pinnedByLogin: str(o, "", "pinnedByLogin"),
     performance,
     fidelity,
+    option3WarmScenario: option3,
   };
 }
 

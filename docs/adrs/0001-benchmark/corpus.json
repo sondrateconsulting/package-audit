@@ -82,11 +82,12 @@
       ],
       "verification": {
         "truncated": false,
-        "entryCount": 31300,
-        "pathByteSum": 2110614,
+        "entryCount": 37393,
+        "pathByteSum": 2400096,
         "oidHexLength": 40,
-        "deepEntryCount": 23210,
-        "meanPathBytes": 67.4,
+        "deepEntryCount": 21461,
+        "meanPathBytes": 64.2,
+        "source": "REST recursive tree at the pinned treeOid; depth = path segments - 1",
         "truncatedAtPin": false
       }
     },
@@ -231,5 +232,11 @@
         "canonicalSeamSha256": "c9820488fb64aeaa0b2c1cd07d1917b93d9d8a1b5b25ae68af9bbfd4725a9726"
       }
     }
-  ]
+  ],
+  "option3WarmScenario": {
+    "owner": "prometheus",
+    "repo": "prometheus",
+    "baseSha": "e3534207c1b5434ad47052c25a6bd338502b821c",
+    "advancedSha": "40ea54d0b1d265b8dc830c88ef96b0b65f3ba0be"
+  }
 }

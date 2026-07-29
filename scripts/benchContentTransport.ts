@@ -33,14 +33,14 @@ import {
 } from "./benchCorpus.ts";
 import { buildSchedule } from "./benchSchedule.ts";
 import {
-  buildUnitWorkload, countReplacementChars, parseUnitWorkload, recordSelection, seamSha256, sha256Hex,
+  buildUnitWorkload, countReplacementChars, parseUnitWorkload, recordSelection, seamDecode, seamSha256, sha256Hex,
   type UnitWorkload, type WorkloadEntry,
 } from "./benchWorkload.ts";
 import { classifyFile } from "./cliScanner.ts";
 import { parseLsTreeZ, type LsTreeEntry } from "./benchFrame.ts";
-import { runBenchGit, type BenchSpawnRecord } from "./benchSpawn.ts";
-import { makeBuckets, benchGraphqlDispatch, readRateLimit, type BenchGhContext } from "./benchGh.ts";
-import { packBatches } from "./benchT1.ts";
+import { BatchChild, runBenchGit, type BenchSpawnRecord } from "./benchSpawn.ts";
+import { benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuckets, readRateLimit, type BenchGhContext } from "./benchGh.ts";
+import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts";
 import {
   BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, planSegments,
 } from "./benchProtocol.ts";
@@ -637,9 +637,17 @@ async function cmdPinCorpus(): Promise<void> {
     }
     const fidelity = await pinFidelity(rt);
     const login = ((await rt.client.restGetJson("user")) as { login?: string }).login ?? "unknown";
+    // Option 3's warm-run scenario pair, frozen at Step B (plan §4.4): base = the parent of
+    // C1-main's pinned SHA, advanced = the pinned SHA itself.
+    const c1 = bundles[0]!.slot;
+    const c1main = c1.units[0]!;
+    const commitJson = (await rt.client.restGetJson(`repos/${encodeURIComponent(c1.owner)}/${encodeURIComponent(c1.repo)}/commits/${c1main.sha}`)) as { parents?: Array<{ sha?: string }> };
+    const parentSha = commitJson.parents?.[0]?.sha;
+    if (typeof parentSha !== "string") throw new Error("C1-main's pinned commit has no readable parent for the Option-3 pair");
     const corpus: Corpus = {
       pinnedAtIso: new Date().toISOString(), pinnedByLogin: login,
       performance: bundles.map((b) => b.slot), fidelity,
+      option3WarmScenario: { owner: c1.owner, repo: c1.repo, baseSha: parentSha.toLowerCase(), advancedSha: c1main.sha },
     };
     loadCorpus(JSON.stringify(corpus)); // strict self-check before anything is written
     mkdirSync(SELECTED_DIR, { recursive: true });
@@ -666,8 +674,6 @@ async function cmdPinCorpus(): Promise<void> {
 
 async function cmdBudget(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
-  let totalCore = 0;
-  let totalGraphql = 0;
   for (const slot of corpus.performance) {
     for (const unit of slot.units) {
       const w = workloads.get(unit.unitId)!;
@@ -675,13 +681,29 @@ async function cmdBudget(): Promise<void> {
         const wc = computeWorstCase(driver, w, cfg, { owner: slot.owner, repo: slot.repo });
         const segments = planSegments(driver, w, cfg, { owner: slot.owner, repo: slot.repo });
         log(`${unit.unitId} ${driver}: WC core ${wc.core}, graphql ${wc.graphql}${segments.length > 1 ? ` (${segments.length} segments)` : ""}`);
-        totalCore += wc.core * cfg.reps;
-        totalGraphql += wc.graphql * cfg.reps;
       }
     }
   }
-  log(`matrix worst-case total (× K=${cfg.reps}): core ${totalCore}, graphql ${totalGraphql} P_max-points`);
+  // the total sums over EVERY scheduled row — probe-epilogue rows included (codex R1 finding 25)
+  if (cfg.schedule !== null) {
+    let totalCore = 0;
+    let totalGraphql = 0;
+    for (const row of cfg.schedule.rows) {
+      const { slot } = findUnitIn(corpus, row.unit);
+      const wc = computeWorstCase(row.driver, workloads.get(row.unit)!, cfg, { owner: slot.owner, repo: slot.repo });
+      totalCore += wc.core;
+      totalGraphql += wc.graphql;
+    }
+    log(`schedule worst-case total over ${cfg.schedule.rows.length} rows (probe epilogue included): core ${totalCore}, graphql ${totalGraphql} P_max-points`);
+  }
   log(`note: WORST-case reservation, not an estimate — actual spend is far lower (§4.8)`);
+}
+
+function findUnitIn(corpus: Corpus, unitId: string): { slot: PerformanceSlot } {
+  for (const slot of corpus.performance) {
+    for (const unit of slot.units) if (unit.unitId === unitId) return { slot };
+  }
+  throw new Error(`unknown unit ${unitId}`);
 }
 
 async function cmdPilot(): Promise<void> {
@@ -718,13 +740,18 @@ async function cmdDiagnostics(): Promise<void> {
 }
 
 // The C6 fidelity battery (§4.2): untimed, once per (fixture, driver), gate-relevant — a
-// mismatch is a G1 event for that driver; a skipped applicable fixture is a G2 event.
+// mismatch is a G1 event for that driver and FAILS this command; a skipped applicable fixture
+// is a G2 event. Each driver resolves through its REAL seam (codex R1 finding 6): T0 via the
+// recorded REST layer, T1 via a real single-alias GraphQL dispatch + per-alias validation,
+// T2a via an acquired checkout read, T2c via an acquired store + BatchChild frame.
 async function cmdFidelity(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
   void engine;
   const rt = makePinRuntime(cfg);
-  const results: unknown[] = [];
+  const results: Array<Record<string, unknown>> = [];
+  let failures = 0;
+  const seamHash = (bytes: Uint8Array): string => sha256Hex(Buffer.from(seamDecode(bytes), "utf8"));
   try {
     for (const fixture of corpus.fidelity) {
       for (const driver of fixture.appliesTo) {
@@ -732,43 +759,89 @@ async function cmdFidelity(): Promise<void> {
           const expectDeref = fixture.verification["restDerefSeamSha256"];
           const expectCanonical = fixture.verification["canonicalSeamSha256"];
           let delivered: string | null = null;
+          let rawVerified: boolean | null = null;
           let route = "";
-          if (driver === "T0") {
-            delivered = await rt.client.fetchFileRaw(fixture.owner, fixture.repo, entry.path, fixture.sha);
+          if (entry.mode === "120000" && driver !== "T0") {
+            // mode-routed exactly as the matrix routes: the REST dereference fallback
+            const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
+            delivered = res.body;
+            route = "symlink-fallback";
+          } else if (driver === "T0") {
+            const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-content" });
+            delivered = res.body;
             route = "primary";
           } else if (driver === "T1") {
-            // mode-routed: a 120000 entry goes to the REST fallback exactly like the matrix
-            delivered = await rt.client.fetchFileRaw(fixture.owner, fixture.repo, entry.path, fixture.sha);
-            route = entry.mode === "120000" ? "symlink-fallback" : "primary";
-          } else {
-            const c = await pinClone(rt, fixture.owner, fixture.repo, fixture.branch ?? "HEAD", `fid-${fixture.kind}-${driver}`);
-            if (c.sha !== fixture.sha) {
-              results.push({ fixture: fixture.kind, driver, entry: entry.path, outcome: "drifted-head", got: c.sha });
-              rmSync(c.dir, { recursive: true, force: true });
-              continue;
+            // ONE real aliased dispatch through the T1 seam, validated per-alias
+            const workloadEntry: WorkloadEntry = {
+              path: entry.path, mode: entry.mode, blobOid: entry.oid, size: entry.size, class: "cli",
+              read: true, noReadReason: null, canonicalSeamSha256: null, rawSha256: null,
+              restDerefSeamSha256: null, checkoutSeamSha256: null, gql: null,
+            };
+            const batch = buildBatchQuery([workloadEntry], {
+              owner: fixture.owner, repo: fixture.repo, sha: fixture.sha,
+              aliasSelection: cfg.t1.aliasSelection, rateLimitRider: cfg.t1.rateLimitRider, label: `fid-${fixture.kind}`,
+            });
+            const d = await benchGraphqlDispatch(rt.gh, batch.query, batch.fields, batch.label);
+            const analysis = analyzeBatchResponse(d, batch, fixture.objectFormat, cfg);
+            if (analysis.kind === "per-alias" && analysis.outcomes[0]?.kind === "resolved") {
+              delivered = analysis.outcomes[0].text;
+              rawVerified = true;
+              route = "primary";
+            } else if (analysis.kind === "per-alias" && (analysis.outcomes[0]?.kind === "binary-fallback" || analysis.outcomes[0]?.kind === "truncated-blob-fallback")) {
+              const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
+              delivered = res.body;
+              route = analysis.outcomes[0].kind;
+            } else {
+              route = `unresolved:${analysis.kind}`;
             }
-            if (entry.mode === "120000") {
-              delivered = await rt.client.fetchFileRaw(fixture.owner, fixture.repo, entry.path, fixture.sha);
-              route = "symlink-fallback";
-            } else if (driver === "T2a") {
-              delivered = new TextDecoder("utf-8", { fatal: false }).decode(readFileSync(join(c.dir, entry.path)));
+          } else {
+            // clone drivers acquire through the REAL acquisition machinery + seams
+            const runDir = join(rt.benchRoot, `fid-${fixture.kind}-${driver}`);
+            mkdirSync(runDir, { recursive: true });
+            const slotLike = { slot: "C5", owner: fixture.owner, repo: fixture.repo, objectFormat: fixture.objectFormat, repoSizeKb: 0, units: [], verification: {} } as unknown as PerformanceSlot;
+            const unitLike = { unitId: `fid:${fixture.owner}/${fixture.repo}@${fixture.branch ?? "sha"}`, branch: fixture.branch ?? "", sha: fixture.sha, treeOid: fixture.sha } as CorpusUnit;
+            const ctx = {
+              cfg, slot: slotLike, unit: unitLike, workload: null as never, gh: rt.gh,
+              benchRoot: rt.benchRoot, runDir, gitEnv: rt.gitEnv, spawnObserver: rt.spawnObs,
+              acquisitionForm: "scaffolding", fallbackBudget: 20,
+            } as unknown as DriverRunContext;
+            const { dir } = await acquireStore(ctx, { checkout: driver === "T2a" });
+            if (driver === "T2a") {
+              delivered = seamDecode(readFileSync(join(dir, entry.path)));
               route = "primary";
             } else {
-              const bytes = await catBlob(rt, c.dir, entry.oid);
-              delivered = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-              route = "primary";
+              const child = new BatchChild({
+                objectFormat: fixture.objectFormat, env: rt.gitEnv, cwd: dir, benchRoot: rt.benchRoot,
+                limits: { maxHeaderBytes: cfg.frame.maxHeaderBytes, frameCeiling: cfg.frame.frameCeilingBytes, stderrRingBytes: cfg.frame.stderrRingBytes, readDeadlineMs: cfg.frame.readDeadlineMs, disposeDeadlineMs: cfg.frame.disposeDeadlineMs },
+                onRecord: rt.spawnObs,
+              });
+              try {
+                const frame = await child.readObject({ oid: entry.oid, size: entry.size });
+                if (frame.kind === "content" && gitBlobOid(frame.body, fixture.objectFormat) === entry.oid) {
+                  delivered = seamDecode(frame.body);
+                  rawVerified = true;
+                  route = "primary";
+                } else {
+                  route = "missing-or-unverified-frame";
+                }
+              } finally {
+                await child.dispose();
+              }
             }
-            rmSync(c.dir, { recursive: true, force: true });
+            rmSync(runDir, { recursive: true, force: true });
           }
           const gotHash = delivered === null ? null : sha256Hex(Buffer.from(delivered, "utf8"));
-          const expected = entry.mode === "120000" || typeof expectCanonical !== "string" ? expectDeref : expectCanonical;
+          const expected = route === "symlink-fallback" || entry.mode === "120000" || typeof expectCanonical !== "string" ? expectDeref : expectCanonical;
           const pass = typeof expected === "string" && gotHash === expected;
-          results.push({ fixture: fixture.kind, driver, entry: entry.path, route, pass, gotHash, expected });
+          if (!pass) failures++;
+          results.push({ fixture: fixture.kind, driver, entry: entry.path, route, pass, rawVerified, gotHash, expected });
           log(`fidelity ${fixture.kind} ${driver} ${entry.path} [${route}]: ${pass ? "PASS" : "FAIL"}`);
         }
       }
     }
-    writeFileSync(join(ARTIFACTS, "fidelity.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), results }, null, 2)}\n`);
+    void seamHash;
+    writeFileSync(join(ARTIFACTS, "fidelity.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), failures, results }, null, 2)}\n`);
+    if (failures > 0) throw new Error(`fidelity battery FAILED: ${failures} mismatch(es) — a G1 event for the affected driver (global eligibility spans the fidelity battery, §4.2)`);
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
     rmSync(benchRoot, { recursive: true, force: true });
@@ -777,29 +850,100 @@ async function cmdFidelity(): Promise<void> {
 
 async function cmdMatrix(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
+  if (cfg.schedule === null) throw new Error("REFUSING: bench-config.json carries no pinned schedule (run pin-corpus first)");
+  // ---- the §8 ratification gate: schema-validated, band-bound, source-bound (codex R1 f.2) --
   if (!existsSync(RATIFICATION_PATH))
     throw new Error(`REFUSING: ${RATIFICATION_PATH} does not exist — §8 ratification (the four sign-off points) must be recorded before any timed matrix run (Step C)`);
-  if (cfg.schedule === null) throw new Error("REFUSING: bench-config.json carries no pinned schedule (run pin-corpus first)");
+  const rat = JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>;
+  const answers = rat["answers"];
+  if (typeof answers !== "object" || answers === null) throw new Error("REFUSING: ratification.json carries no answers object");
+  for (const key of ["noiseBandAndDominance", "protocolConstants", "corpusPinning", "symlinkPolicy"]) {
+    const a = (answers as Record<string, unknown>)[key];
+    if (typeof a !== "string" || a.length === 0) throw new Error(`REFUSING: ratification.json answers.${key} is missing/empty — all four §8 sign-off points must carry explicit answers`);
+  }
+  const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number };
+  if (rat["noiseBand"] !== pilot.noiseBand)
+    throw new Error(`REFUSING: ratification.json noiseBand (${String(rat["noiseBand"])}) != pilot.json's calibrated band (${String(pilot.noiseBand)})`);
+  const repoRoot = realpathSync(REPO_ROOT);
+  const headOut = await runBenchGit({
+    argv: ["rev-parse", "HEAD"], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
+    benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  const head = text(headOut.stdout).trim();
+  if (rat["harnessCommit"] !== head)
+    throw new Error(`REFUSING: ratification.json harnessCommit (${String(rat["harnessCommit"]).slice(0, 12)}) != HEAD (${head.slice(0, 12)}) — the frozen harness revision must be the one ratified (§8)`);
+  const statusOut = await runBenchGit({
+    argv: ["status", "--porcelain"], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
+    benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  if (text(statusOut.stdout).trim() !== "")
+    throw new Error("REFUSING: the working tree is dirty — a dirty harness defeats the harnessCommit freeze binding (§8)");
+
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
   try {
-    const rerunUsed = new Set<string>(); // R1/R2: ≤1 per (unit × driver)
-    const straddled = new Set<string>(); // R4 recurrence per unit → halt for freeze repair
-    const driftedUnits = new Set<string>(); // R6 branch arm: restart via the preregistered epilogue
-    const isRerunnable = (cause: string | null): boolean =>
-      cause !== null && /no HTTP response|no-response|attempts exhausted|ECONNRESET|ETIMEDOUT|EAI_AGAIN|TLS|connect/i.test(cause);
-    const executeRows = async (rows: typeof cfg.schedule extends null ? never : NonNullable<typeof cfg.schedule>["rows"], phaseNote: string): Promise<void> => {
+    // ---- resumability (codex R1 f.17): reconstruct terminal state from runs.jsonl ----------
+    const runsPath = join(ARTIFACTS, "runs.jsonl");
+    const terminalPos = new Set<number>();
+    const rerunUsed = new Set<string>();
+    const straddled = new Set<string>();
+    const successLedger = new Set<string>(); // unit|driver|requestClass with an ok in a COMPLETED rep
+    if (existsSync(runsPath)) {
+      for (const line of readFileSync(runsPath, "utf8").split("\n")) {
+        if (line.trim() === "") continue;
+        let rec: Record<string, unknown>;
+        try {
+          rec = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (rec["type"] !== "run" || rec["phase"] !== "matrix") continue;
+        const pos = rec["pos"] as number;
+        const outcome = rec["outcome"] as string;
+        if (outcome === "complete" || outcome === "unit-failure") terminalPos.add(pos);
+        if (outcome === "invalidated-straddle") straddled.add(rec["unit"] as string);
+        if (outcome === "complete") {
+          for (const cls of Object.keys((rec["requests"] as Record<string, number> | undefined) ?? {}))
+            successLedger.add(`${rec["unit"] as string}|${rec["driver"] as string}|${cls}`);
+        }
+        if (rec["replayOfPos"] !== null && rec["replayOfPos"] !== undefined) rerunUsed.add(`${rec["unit"] as string}|${rec["driver"] as string}`);
+      }
+      if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
+    }
+    const driftedUnits = new Set<string>();
+    // the frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7): R1 = a network-layer
+    // failure outside any HTTP response, rerunnable unconditionally (≤1); R2 = a transient-5xx
+    // exhaustion within caps whose request class SUCCEEDED in at least one other completed
+    // repetition of this unit × driver. Secondary-shaped failures are NEVER rerunnable.
+    const isRerunnable = (record: import("./benchProtocol.ts").RunRecord): boolean => {
+      const ev = record.failureEvidence;
+      if (ev === null || ev.kind !== "http") return false;
+      if (ev.code === "no-response") return true; // R1
+      if (ev.code === "attempts-exhausted" && ev.lastClassification === "transient")
+        return successLedger.has(`${record.unit}|${record.driver}|${ev.requestClass ?? ""}`); // R2
+      return false;
+    };
+    const executeRows = async (rows: NonNullable<typeof cfg.schedule>["rows"], phaseNote: string): Promise<void> => {
       for (const row of rows) {
+        if (terminalPos.has(row.pos) && phaseNote === "main") continue;
         if (driftedUnits.has(row.unit) && phaseNote === "main") continue; // discarded reps; the epilogue re-runs the whole unit
         for (;;) {
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
-          if (handle.record.outcome === "complete") break;
+          if (handle.record.outcome === "complete") {
+            for (const cls of Object.keys(handle.record.requests)) successLedger.add(`${key}|${cls}`);
+            break;
+          }
           if (handle.record.outcome === "invalidated-straddle") {
-            // R4: replay in its own slot, not charged to the driver allowance; twice on the
-            // same unit → halt for freeze repair
             if (straddled.has(row.unit)) throw new Error(`R4 recurred on ${row.unit} — halt for freeze repair (plan §4.5)`);
             straddled.add(row.unit);
             log(`R4 straddle on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
+            engine.setReplayOf(row.pos);
+            continue;
+          }
+          if (handle.record.outcome === "invalidated-foreign") {
+            // R3: verified external interference — replay in slot, never charged to the driver
+            log(`R3 foreign consumption on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
+            engine.setReplayOf(row.pos);
             continue;
           }
           if (handle.record.outcome === "drift-restart") {
@@ -809,11 +953,11 @@ async function cmdMatrix(): Promise<void> {
           }
           if (handle.record.outcome === "re-pin-required")
             throw new Error(`R6 SHA arm on ${row.unit}: ${handle.record.failureCause ?? ""} — re-pin is a §8 freeze amendment; halting`);
-          // unit-failure: R1/R2's network-shape failures get the ≤1 rerun; everything else is a
-          // recorded driver failure (no rerun — §4.5 "everything else")
-          if (isRerunnable(handle.record.failureCause) && !rerunUsed.has(key)) {
+          // unit-failure: the frozen typed predicate decides the ≤1 rerun (never a message regex)
+          if (isRerunnable(handle.record) && !rerunUsed.has(key)) {
             rerunUsed.add(key);
             log(`R1/R2 rerun for ${key} rep${row.rep}: ${handle.record.failureCause ?? ""}`);
+            engine.setReplayOf(row.pos);
             continue;
           }
           log(`recorded failure (no rerun) for ${key} rep${row.rep}: ${handle.record.failureCause ?? ""}`);
@@ -828,9 +972,84 @@ async function cmdMatrix(): Promise<void> {
       driftedUnits.clear();
       await executeRows(epilogue, "epilogue");
     }
-    log("matrix complete — runs.jsonl carries every record (report generation is Step C's remaining work)");
+    log("matrix complete — runs.jsonl carries every record (scoring/report generation reads it downstream, plan §8's read-only-analysis carve-out)");
   } finally {
     rmSync(benchRoot, { recursive: true, force: true });
+  }
+}
+
+// refresh-evidence: recompute committed EVIDENCE without moving any pinned SHA — the C3 stats
+// from the REST recursive tree it cites (directory depth = path segments − 1), the C6
+// single-repo attempt (does the symlink fixture repo also carry a selected non-UTF-8 file?),
+// and the Option-3 warm-scenario pair for an already-pinned corpus (codex R1 f.21/23 + f.1).
+async function cmdRefreshEvidence(): Promise<void> {
+  const { cfg, corpus } = loadPinned();
+  const rt = makePinRuntime(cfg);
+  try {
+    const c3 = corpus.performance.find((s) => s.slot === "C3")!;
+    const c3unit = c3.units[0]!;
+    const json = await rt.client.restGetJson(`repos/${encodeURIComponent(c3.owner)}/${encodeURIComponent(c3.repo)}/git/trees/${c3unit.treeOid}?recursive=1`, { immutable: true });
+    const tree = parseTreeResponse(json, "refresh-c3", c3unit.treeOid);
+    if (tree.truncated) throw new Error("C3's REST tree is now truncated?!");
+    const entries = tree.paths; // ALL entry kinds — the payload the slot description cites
+    const pathByteSum = entries.reduce((n, e) => n + Buffer.byteLength(e.path, "utf8"), 0);
+    const deepEntryCount = entries.filter((e) => e.path.split("/").length - 1 >= 6).length; // DIRECTORY depth
+    const verdict = verifyC3({ truncated: false, entryCount: entries.length, pathByteSum, oidHexLength: c3.objectFormat === "sha1" ? 40 : 64, deepEntryCount });
+    log(`C3 evidence (REST tree, directory depth): ${JSON.stringify(verdict.evidence)} ok=${verdict.ok}`);
+    if (!verdict.ok) throw new Error(`C3 re-verification failed on REST-tree evidence: ${verdict.reasons.join("; ")}`);
+    c3.verification = { ...verdict.evidence, source: "REST recursive tree at the pinned treeOid; depth = path segments - 1", truncatedAtPin: false };
+
+    // Option-3 pair for the already-pinned corpus
+    if (corpus.option3WarmScenario === null) {
+      const c1 = corpus.performance.find((s) => s.slot === "C1")!;
+      const c1main = c1.units[0]!;
+      const commitJson = (await rt.client.restGetJson(`repos/${encodeURIComponent(c1.owner)}/${encodeURIComponent(c1.repo)}/commits/${c1main.sha}`)) as { parents?: Array<{ sha?: string }> };
+      const parentSha = commitJson.parents?.[0]?.sha;
+      if (typeof parentSha !== "string") throw new Error("no readable parent for the Option-3 pair");
+      corpus.option3WarmScenario = { owner: c1.owner, repo: c1.repo, baseSha: parentSha.toLowerCase(), advancedSha: c1main.sha };
+      log(`Option-3 warm pair pinned: base ${parentSha.slice(0, 12)} → advanced ${c1main.sha.slice(0, 12)}`);
+    }
+
+    // C6 single-repo attempt: does the clone-symlink repo also carry a selected non-UTF-8 file?
+    const symFix = corpus.fidelity.find((f) => f.kind === "clone-symlink")!;
+    const nonFix = corpus.fidelity.find((f) => f.kind === "non-utf8-content")!;
+    if (symFix.owner !== nonFix.owner || symFix.repo !== nonFix.repo) {
+      const c = await pinClone(rt, symFix.owner, symFix.repo, symFix.branch ?? "HEAD", "c6-unify");
+      if (c.sha === symFix.sha) {
+        const ls = await lsTreeIndex(rt, c.dir, c.objectFormat);
+        const excluder = makeExcluder(cfg.selection.excludeDirGlobs);
+        const selectedLike = (e: LsTreeEntry): boolean => {
+          if (excluder(e.path) || /(^|\/)node_modules\//.test(e.path)) return false;
+          const base = e.path.slice(e.path.lastIndexOf("/") + 1);
+          return classifyFile(e.path) !== "other" || base === "package.json";
+        };
+        let unified = false;
+        for (const e of ls) {
+          if (e.type !== "blob" || e.size === null || e.size > 512 * 1024 || e.mode === "120000" || !selectedLike(e)) continue;
+          const bytes = await catBlob(rt, c.dir, e.oid);
+          const replacements = countReplacementChars(bytes);
+          if (replacements > 0) {
+            corpus.fidelity = corpus.fidelity.map((f) => f.kind !== "non-utf8-content" ? f : {
+              ...f, owner: symFix.owner, repo: symFix.repo, branch: symFix.branch, sha: symFix.sha, objectFormat: symFix.objectFormat,
+              entries: [{ path: e.path, mode: e.mode, oid: e.oid, size: e.size ?? 0 }],
+              verification: { ...verifyC6NonUtf8({ path: e.path, replacementCount: replacements }).evidence, canonicalSeamSha256: seamSha256(bytes) },
+            });
+            log(`C6 unified: ${symFix.owner}/${symFix.repo} supplies BOTH fixtures (non-utf8: ${e.path}, ${replacements} replacement chars)`);
+            unified = true;
+            break;
+          }
+        }
+        if (!unified) log(`C6 stays split: ${symFix.owner}/${symFix.repo} has no selected non-UTF-8 file (recorded; plan §4.2 amendment covers the split)`);
+      } else {
+        log(`C6 unify skipped: ${symFix.owner}/${symFix.repo} head drifted off the fixture pin`);
+      }
+      rmSync(join(rt.benchRoot, "c6-unify"), { recursive: true, force: true });
+    }
+    loadCorpus(JSON.stringify(corpus)); // strict self-check before writing
+    writeFileSync(CORPUS_PATH, `${JSON.stringify(corpus, null, 2)}\n`);
+    log("corpus.json evidence refreshed (no pinned SHA moved)");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
   }
 }
 
@@ -856,10 +1075,11 @@ async function main(): Promise<void> {
     case "budget": return cmdBudget();
     case "pilot": return cmdPilot();
     case "fidelity": return cmdFidelity();
+    case "refresh-evidence": return cmdRefreshEvidence();
     case "matrix": return cmdMatrix();
     case "verify-corpus": return cmdVerifyCorpus();
     default:
-      log("usage: bun run bench:content <pin-corpus | diagnostics | verify-corpus | budget | pilot | fidelity | matrix>");
+      log("usage: bun run bench:content <pin-corpus | refresh-evidence | diagnostics | verify-corpus | budget | pilot | fidelity | matrix>");
       process.exitCode = 2;
   }
 }
