@@ -233,17 +233,32 @@ export class DiskSampler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private peak = 0;
   private samples = 0;
+  private extras: string[] = [];
+  extraFiles(paths: string[]): void {
+    this.extras = paths;
+  }
+  private extraBytes(): number {
+    let total = 0;
+    for (const p of this.extras) {
+      try {
+        total += lstatSync(p).size;
+      } catch {
+        // absent sidecar
+      }
+    }
+    return total;
+  }
   start(dir: string, hz: number): void {
     this.stopTimer();
     this.timer = setInterval(() => {
       this.samples++;
-      const b = duBytes(dir);
+      const b = duBytes(dir) + this.extraBytes();
       if (b > this.peak) this.peak = b;
     }, Math.max(1, Math.round(1000 / hz)));
     this.timer.unref?.();
   }
   point(dir: string): void {
-    const b = duBytes(dir);
+    const b = duBytes(dir) + this.extraBytes();
     this.samples++;
     if (b > this.peak) this.peak = b;
   }
@@ -313,8 +328,11 @@ export interface RunRecord {
   secondarySignals: number; // attributable (driver-own matrix traffic) — G4's classifier input
   points: { measuredCostSum: number; imputed: number };
   bucketDeltas: { core: BucketDelta; graphql: BucketDelta };
+  // the raw before/after snapshots per segment — R3/R4 classifications stay auditable (R2 f.28)
+  bucketSnapshots: Array<{ before: RateLimitSnapshot; after: RateLimitSnapshot }>;
   expectedConsumption: { core: number; graphql: number }; // harness-owned accounting (R3's input)
   replayOfPos: number | null; // in-slot replays record their physical predecessor (§4.5)
+  replayKind: "r1r2" | "r3r4" | null; // only r1r2 charges the driver allowance (codex R2 f.23)
   diskReclaimFailed: boolean;
   probeDivergences: number;
   httpBodyBytes: number;
@@ -421,8 +439,18 @@ export class BenchEngine {
   // (codex R1 finding 10)
   private readonly unitForms = new Map<string, AcquisitionForm>();
   private replayOfPos: number | null = null;
-  setReplayOf(pos: number | null): void {
+  private replayKind: "r1r2" | "r3r4" | null = null;
+  setReplayOf(pos: number | null, kind: "r1r2" | "r3r4" | null = null): void {
     this.replayOfPos = pos;
+    this.replayKind = pos === null ? null : kind;
+  }
+  harnessCommit(): string {
+    return this.o.runsLog.manifest.harnessCommit;
+  }
+  // resume support: restore the per-unit frozen acquisition forms reconstructed from durable
+  // records (codex R2 f.20)
+  restoreUnitForms(forms: ReadonlyMap<string, AcquisitionForm>): void {
+    for (const [unit, form] of forms) this.unitForms.set(unit, form);
   }
   constructor(o: EngineOptions) {
     this.o = o;
@@ -462,8 +490,11 @@ export class BenchEngine {
     const runDir = join(this.o.benchRoot, `run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-a${this.runCounter}`);
     mkdirSync(runDir, { recursive: true });
     mkdirSync(this.o.runCacheDir, { recursive: true });
-    const dbPath = join(this.o.runCacheDir, `bench-run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-${this.runCounter}.sqlite`);
-    const db = AuditDb.open({ sqlitePath: dbPath, fresh: true, purgeCache: false });
+    // collision-resistant durable attempt identity (pid + wall clock): a crashed process's
+    // counter can never resurrect a warm cache; purgeCache drops api_cache rows outright
+    // (production --fresh preserves them by design) (codex R2 f.24)
+    const dbPath = join(this.o.runCacheDir, `bench-run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-${process.pid}-${this.now()}-${this.runCounter}.sqlite`);
+    const db = AuditDb.open({ sqlitePath: dbPath, fresh: true, purgeCache: true });
     const client = this.o.makeClient(db);
     const httpRecords: BenchHttpAttemptRecord[] = [];
     const spawnRecords: BenchSpawnRecord[] = [];
@@ -478,11 +509,12 @@ export class BenchEngine {
         if (r.servedFromCache) return;
         // R5's frozen assumptions are enforced AT THE REQUEST, not post-run (codex R1 finding
         // 9): one over-P_max cost or a WC overrun halts before another dispatch can go out.
+        if (r.requestClass === "rest-meta") return; // control-plane probes never count as driver traffic (codex R2 f.17)
         if (r.kind === "graphql") {
           liveGraphqlPoints += r.pointsCost ?? 1;
           if (r.pointsCost !== null && r.pointsCost > cfg.budget.pMaxPointsPerGraphqlAttempt)
             throw new BenchProtocolError(`R5 frozen-assumption breach: measured cost ${r.pointsCost} exceeds P_max ${cfg.budget.pMaxPointsPerGraphqlAttempt} — halt for freeze repair`);
-          if (liveGraphqlPoints > Math.max(wcRef.graphql, 1))
+          if (liveGraphqlPoints > wcRef.graphql)
             throw new BenchProtocolError(`R5 frozen-assumption breach: live graphql consumption ${liveGraphqlPoints} overran WC ${wcRef.graphql} — halt for freeze repair`);
         } else if (r.status > 0 && r.status !== 304) {
           liveCoreAttempts++;
@@ -515,9 +547,27 @@ export class BenchEngine {
           if (form === "scaffolding") this.o.log(`${row.unit}: live head drifted — all reps use the SHA-pinned scaffolding form`);
         } else if (live !== unit.sha) {
           // mid-unit drift under the frozen PRODUCTION form: discard reps, restart on the
-          // scaffolding form via the preregistered epilogue (§4.4/§4.5 R6 branch arm)
+          // scaffolding form via the preregistered epilogue (§4.4/§4.5 R6 branch arm). This is
+          // part of the RECORDED lifecycle — a drift-restart record lands in runs.jsonl and the
+          // caller's loop routes it to the epilogue (codex R2 f.19).
           this.unitForms.set(row.unit, "scaffolding");
-          throw new DriftSignal(live);
+          const driftRecord: RunRecord = {
+            type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+            probe: row.probe, phase, acquisitionForm: "production", startedAtIso: new Date(this.now()).toISOString(),
+            wallMs: 0, segments: 1, outcome: "drift-restart", failureCause: `live head ${live.slice(0, 12)} moved off the pinned SHA at the pre-rep probe`,
+            failureEvidence: null, requests: {}, attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
+            secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
+            bucketDeltas: { core: { valid: true, used: 0 }, graphql: { valid: true, used: 0 } },
+            bucketSnapshots: [],
+            expectedConsumption: { core: 0, graphql: 0 }, replayOfPos: null, replayKind: null, diskReclaimFailed: false,
+            probeDivergences: 0, httpBodyBytes: 0, cloneObjectStoreBytes: null,
+            diskSampledPeakBytes: 0, diskSamples: 0, fallbackSpend: 0, routesDelivered: {},
+            g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
+            envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
+          };
+          this.o.runsLog.append(driftRecord);
+          rmSync(runDir, { recursive: true, force: true });
+          return { outcome: null, verification: null, record: driftRecord };
         } else {
           form = "production";
         }
@@ -534,6 +584,7 @@ export class BenchEngine {
     const segmented = segmentSizes.length > 1;
     const wall = new WallClock(() => this.now());
     const segmentDeltas: Array<{ core: BucketDelta; graphql: BucketDelta }> = [];
+    const bucketSnapshots: Array<{ before: RateLimitSnapshot; after: RateLimitSnapshot }> = [];
     let segBefore: RateLimitSnapshot;
     const segmentWc = (sizes: readonly number[], i: number): WorstCase => {
       const budget = restFallbackBudgetFor(cfg, workload.entries.length);
@@ -549,6 +600,7 @@ export class BenchEngine {
     segBefore = before;
     const sampler = new DiskSampler();
     sampler.start(runDir, cfg.protocol.diskSamplerHz);
+    sampler.extraFiles([dbPath, `${dbPath}-wal`, `${dbPath}-shm`]); // the run's FULL footprint incl. cache sidecars (R2 f.29)
 
     if (this.childPool.pool === null) this.childPool.pool = makeChildPool(cfg.frame.childPoolSize);
     const ctx: DriverRunContext = {
@@ -565,6 +617,7 @@ export class BenchEngine {
               gate: async (nextSegmentIndex: number): Promise<void> => {
                 wall.pause(); // the clock pauses between segments (§4.8)
                 const segAfter = await readRateLimit(ghMeta);
+                bucketSnapshots.push({ before: segBefore, after: segAfter });
                 segmentDeltas.push({ core: bucketDelta(segBefore.core, segAfter.core), graphql: bucketDelta(segBefore.graphql, segAfter.graphql) });
                 await this.reserve(ghMeta, segmentWc(segmentSizes, nextSegmentIndex));
                 segBefore = await readRateLimit(ghMeta);
@@ -631,12 +684,34 @@ export class BenchEngine {
     }
     if (existsSync(runDir)) diskReclaimFailed = true; // verified reclaim, never assumed (finding 18)
     const wallMs = wall.stop();
+    if (r5 !== null) {
+      // the minimal terminal R5 record lands BEFORE any fallible post-run work (codex R2 f.18)
+      const r5record: RunRecord = {
+        type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+        probe: row.probe, phase, acquisitionForm: needsClonePath ? form : null,
+        startedAtIso, wallMs, segments: segmentSizes.length, outcome: "halt-r5-breach",
+        failureCause, failureEvidence: null, requests: {}, attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
+        secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
+        bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
+        bucketSnapshots,
+        expectedConsumption: { core: liveCoreAttempts, graphql: liveGraphqlPoints },
+        replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed, probeDivergences: 0,
+        httpBodyBytes: httpRecords.reduce((n, r) => n + (r.servedFromCache ? 0 : r.bodyBytes), 0),
+        cloneObjectStoreBytes, diskSampledPeakBytes: sampler.stop().peakBytes, diskSamples: 0,
+        fallbackSpend: 0, routesDelivered: {}, g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
+        envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
+      };
+      this.o.runsLog.append(r5record);
+      this.replayOfPos = null;
+      throw r5;
+    }
     const after = await readRateLimit(ghMeta);
     const disk = sampler.stop();
     if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
 
     // per-segment same-window deltas, summed by construction (§4.6.2); the final (or only)
     // segment closes against the post-run snapshot. Any straddled segment invalidates the run.
+    bucketSnapshots.push({ before: segBefore, after });
     segmentDeltas.push({ core: bucketDelta(segBefore.core, after.core), graphql: bucketDelta(segBefore.graphql, after.graphql) });
     const sumDelta = (pick: (d: { core: BucketDelta; graphql: BucketDelta }) => BucketDelta): BucketDelta => {
       let used = 0;
@@ -654,7 +729,9 @@ export class BenchEngine {
     // its own slot, never charged to the driver allowance (codex R1 finding 8). Conditional
     // 304s and rate_limit reads consume nothing; every other live response consumes one.
     const expectedCore = httpRecords.filter((r) => !r.servedFromCache && r.kind === "rest" && r.status > 0 && r.status !== 304 && r.requestClass !== "rest-meta").length;
-    const expectedGraphql = httpRecords.filter((r) => !r.servedFromCache && r.kind === "graphql").reduce((n, r) => n + (r.pointsCost ?? 1), 0);
+    // unknown costs reconcile at their UPPER bound (1..P_max) — an owned-but-unreadable cost
+    // must never be labeled foreign (codex R2 f.15); overruns of the frozen bound are R5's job
+    const expectedGraphql = httpRecords.filter((r) => !r.servedFromCache && r.kind === "graphql").reduce((n, r) => n + (r.pointsCost ?? cfg.budget.pMaxPointsPerGraphqlAttempt), 0);
     if (runOutcome === "complete") {
       if ((deltas.core.valid && deltas.core.used !== null && deltas.core.used > expectedCore) ||
           (deltas.graphql.valid && deltas.graphql.used !== null && deltas.graphql.used > expectedGraphql)) {
@@ -688,14 +765,17 @@ export class BenchEngine {
 
     const record: RunRecord = {
       type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
-      probe: row.probe, phase, acquisitionForm: outcome?.acquisitionForm ?? (needsClonePath ? form : null),
+      probe: row.probe, phase,
+      acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
       startedAtIso, wallMs, segments: segmentSizes.length, outcome: runOutcome, failureCause,
       failureEvidence,
       requests, attempts, secondarySignals,
       points: { measuredCostSum, imputed },
       bucketDeltas: deltas,
+      bucketSnapshots,
       expectedConsumption: { core: expectedCore, graphql: expectedGraphql },
       replayOfPos: this.replayOfPos,
+      replayKind: this.replayKind,
       diskReclaimFailed,
       probeDivergences: verification?.probeDivergences.length ?? 0,
       // body bytes derive from the RECORDS so a thrown driver still reports its real transfer
@@ -712,7 +792,7 @@ export class BenchEngine {
     };
     this.o.runsLog.append(record);
     this.replayOfPos = null;
-    if (r5 !== null) throw r5; // the halt propagates AFTER the terminal record landed (finding 9)
+    this.replayKind = null;
     if (verification !== null && (verification.g1Failures.length > 0 || verification.g2Failures.length > 0)) {
       this.o.log(`${row.unit} ${row.driver} rep${row.rep}: G1=${verification.g1Failures.length} G2=${verification.g2Failures.length}`);
       for (const f of [...verification.g1Failures.slice(0, 5)]) this.o.log(`  G1 ${f.path} [${f.route}]: ${f.reason}`);

@@ -15,7 +15,8 @@
 // Artifacts land in docs/adrs/0001-benchmark/. The pinning cache lives under ./data (a §0
 // write root, git-ignored) so re-runs are cheap; bench run dirs live under a pa-bench-* root.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,6 +58,60 @@ const RATIFICATION_PATH = join(ARTIFACTS, "ratification.json");
 const log = (line: string): void => {
   process.stderr.write(`${line}\n`);
 };
+
+// The frozen MEASUREMENT surface's content digest (§8 as amended): every bench module + the
+// preregistered artifacts. Binding ratification to THIS (not to HEAD) keeps the gate
+// satisfiable — committing ratification.json or appending runs.jsonl changes neither the
+// digest nor the frozen surface (codex R2 finding 1).
+function frozenSurfaceDigest(): string {
+  const files: string[] = [];
+  for (const name of readdirSync(join(REPO_ROOT, "scripts"))) {
+    if (/^bench[A-Z][A-Za-z]*\.ts$/.test(name) && !name.includes(".test.")) files.push(join(REPO_ROOT, "scripts", name));
+  }
+  files.push(join(REPO_ROOT, "scripts", "benchContentTransport.ts"));
+  files.push(CONFIG_PATH, CORPUS_PATH);
+  for (const name of readdirSync(SELECTED_DIR)) files.push(join(SELECTED_DIR, name));
+  const uniq = [...new Set(files)].sort();
+  const h = createHash("sha256");
+  for (const f of uniq) {
+    h.update(f.slice(REPO_ROOT.length));
+    h.update("\0");
+    h.update(readFileSync(f));
+    h.update("\0");
+  }
+  return h.digest("hex");
+}
+
+// The §8 freeze gate shared by every gate-relevant executor (matrix, fidelity): ratification
+// present with all four answers, the band bound to the pilot, the frozen-surface digest bound,
+// and a clean tree EXCLUDING the append-only outputs and ratification.json itself.
+async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>; digest: string }> {
+  if (!existsSync(RATIFICATION_PATH))
+    throw new Error(`REFUSING: ${RATIFICATION_PATH} does not exist — §8 ratification (the four sign-off points) must be recorded before any gate-relevant run (Step C)`);
+  const rat = JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>;
+  const answers = rat["answers"];
+  if (typeof answers !== "object" || answers === null) throw new Error("REFUSING: ratification.json carries no answers object");
+  for (const key of ["noiseBandAndDominance", "protocolConstants", "corpusPinning", "symlinkPolicy"]) {
+    const a = (answers as Record<string, unknown>)[key];
+    if (typeof a !== "string" || a.length === 0) throw new Error(`REFUSING: ratification.json answers.${key} is missing/empty — all four §8 sign-off points must carry explicit answers`);
+  }
+  const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number };
+  if (rat["noiseBand"] !== pilot.noiseBand)
+    throw new Error(`REFUSING: ratification.json noiseBand (${String(rat["noiseBand"])}) != pilot.json's calibrated band (${String(pilot.noiseBand)})`);
+  const digest = frozenSurfaceDigest();
+  if (rat["frozenSurfaceDigest"] !== digest)
+    throw new Error(`REFUSING: the frozen measurement surface changed since ratification (digest ${digest.slice(0, 12)}… != ratified ${String(rat["frozenSurfaceDigest"]).slice(0, 12)}…) — a §8 amendment + review round is required`);
+  const repoRoot = realpathSync(REPO_ROOT);
+  const statusOut = await runBenchGit({
+    argv: ["status", "--porcelain"], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
+    benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.json", "docs/adrs/0001-benchmark/ratification.json", "data/"];
+  const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && !APPEND_ONLY.some((a) => f.startsWith(a)));
+  if (dirty.length > 0)
+    throw new Error(`REFUSING: dirty tracked files outside the append-only outputs: ${dirty.slice(0, 5).join(", ")} — the frozen surface must be committed (§8)`);
+  return { rat, digest };
+}
 
 // §4.2 candidates, in preference order — a failing candidate is SWAPPED, never forced.
 // C1 was swapped off the plan's fastify/fastify at pinning: its major lines share ≤14.2% of
@@ -380,13 +435,21 @@ async function pinPerformanceSlot(rt: PinRuntime, slotId: "C1" | "C2" | "C3" | "
         const { manifests } = locateManifests(blobs.map((e) => e.path), makeExcluder(rt.cfg.selection.excludeDirGlobs));
         verdict = verifyC2({ fileCount: blobs.length, truncated, manifestCount: manifests.length });
       } else if (slotId === "C3") {
-        const blobs = first.ls.filter((e) => e.type === "blob");
-        verdict = verifyC3({
-          truncated, entryCount: blobs.length,
-          pathByteSum: blobs.reduce((n, e) => n + Buffer.byteLength(e.path, "utf8"), 0),
-          oidHexLength: format === "sha1" ? 40 : 64,
-          deepEntryCount: blobs.filter((e) => e.path.split("/").length >= 6).length,
-        });
+        // the SAME REST recursive-tree computation refresh-evidence uses (codex R2 f.5): all
+        // entry kinds, directory depth = path segments − 1
+        if (truncated) {
+          verdict = { ok: false, reasons: ["REST recursive tree is truncated — this candidate is a C4, not a C3"], evidence: { truncated } };
+        } else {
+          const restJson = await rt.client.restGetJson(`repos/${encodeURIComponent(candidate.owner)}/${encodeURIComponent(candidate.repo)}/git/trees/${first.treeOid}?recursive=1`, { immutable: true });
+          const restTree = parseTreeResponse(restJson, "pin-c3", first.treeOid);
+          const entries = restTree.truncated ? [] : restTree.paths;
+          verdict = verifyC3({
+            truncated: restTree.truncated, entryCount: entries.length,
+            pathByteSum: entries.reduce((n, e) => n + Buffer.byteLength(e.path, "utf8"), 0),
+            oidHexLength: format === "sha1" ? 40 : 64,
+            deepEntryCount: entries.filter((e) => e.path.split("/").length - 1 >= 6).length,
+          });
+        }
       } else if (slotId === "C4") {
         verdict = verifyC4({ truncated });
       } else {
@@ -746,6 +809,8 @@ async function cmdDiagnostics(): Promise<void> {
 // T2a via an acquired checkout read, T2c via an acquired store + BatchChild frame.
 async function cmdFidelity(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
+  // gate-relevant evidence rides the SAME §8 freeze gate as the matrix (codex R2 f.8)
+  const { digest } = await assertRatifiedAndFrozen();
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
   void engine;
   const rt = makePinRuntime(cfg);
@@ -761,8 +826,9 @@ async function cmdFidelity(): Promise<void> {
           let delivered: string | null = null;
           let rawVerified: boolean | null = null;
           let route = "";
-          if (entry.mode === "120000" && driver !== "T0") {
-            // mode-routed exactly as the matrix routes: the REST dereference fallback
+          if (entry.mode === "120000" && driver === "T1") {
+            // T1's mode source is the tree it fetched — the fixture pin stands in for it here;
+            // the REST dereference is the matrix's route
             const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
             delivered = res.body;
             route = "symlink-fallback";
@@ -787,10 +853,10 @@ async function cmdFidelity(): Promise<void> {
               delivered = analysis.outcomes[0].text;
               rawVerified = true;
               route = "primary";
-            } else if (analysis.kind === "per-alias" && (analysis.outcomes[0]?.kind === "binary-fallback" || analysis.outcomes[0]?.kind === "truncated-blob-fallback")) {
+            } else if (analysis.kind === "per-alias" && (analysis.outcomes[0]?.kind === "binary-fallback" || analysis.outcomes[0]?.kind === "truncated-blob-fallback" || analysis.outcomes[0]?.kind === "validation-fallback")) {
               const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
               delivered = res.body;
-              route = analysis.outcomes[0].kind;
+              route = analysis.outcomes[0].kind === "validation-fallback" ? "validation-fallback" : analysis.outcomes[0].kind;
             } else {
               route = `unresolved:${analysis.kind}`;
             }
@@ -805,8 +871,24 @@ async function cmdFidelity(): Promise<void> {
               benchRoot: rt.benchRoot, runDir, gitEnv: rt.gitEnv, spawnObserver: rt.spawnObs,
               acquisitionForm: "scaffolding", fallbackBudget: 20,
             } as unknown as DriverRunContext;
-            const { dir } = await acquireStore(ctx, { checkout: driver === "T2a" });
-            if (driver === "T2a") {
+            const { dir, headRev } = await acquireStore(ctx, { checkout: driver === "T2a" });
+            // route on the LIVE enumeration's observed mode, never the fixture pin (codex R2 f.9)
+            const lsOut = await runBenchGit({
+              argv: ["ls-tree", "-r", "-z", "-l", "--full-tree", headRev === "HEAD" ? "HEAD" : fixture.sha],
+              lane: { lane: "transport", objectFormat: fixture.objectFormat },
+              env: rt.gitEnv, benchRoot: rt.benchRoot, cwd: dir,
+              limits: { maxStdoutBytes: cfg.lsTree.maxOutputBytes, maxStderrBytes: 1024 * 1024, deadlineMs: cfg.spawn.timeoutMs },
+              onRecord: rt.spawnObs,
+            });
+            const lsEntries = parseLsTreeZ(lsOut.stdout, fixture.objectFormat, { maxEntries: cfg.lsTree.maxEntries, maxRecordBytes: cfg.lsTree.maxRecordBytes });
+            const liveEntry = lsEntries.find((e) => e.path === entry.path);
+            if (liveEntry === undefined) {
+              route = "missing-from-live-enumeration";
+            } else if (liveEntry.mode === "120000") {
+              const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
+              delivered = res.body;
+              route = "symlink-fallback";
+            } else if (driver === "T2a") {
               delivered = seamDecode(readFileSync(join(dir, entry.path)));
               route = "primary";
             } else {
@@ -829,6 +911,7 @@ async function cmdFidelity(): Promise<void> {
               }
             }
             rmSync(runDir, { recursive: true, force: true });
+            void liveEntry;
           }
           const gotHash = delivered === null ? null : sha256Hex(Buffer.from(delivered, "utf8"));
           const expected = route === "symlink-fallback" || entry.mode === "120000" || typeof expectCanonical !== "string" ? expectDeref : expectCanonical;
@@ -840,7 +923,7 @@ async function cmdFidelity(): Promise<void> {
       }
     }
     void seamHash;
-    writeFileSync(join(ARTIFACTS, "fidelity.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), failures, results }, null, 2)}\n`);
+    writeFileSync(join(ARTIFACTS, "fidelity.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, failures, results }, null, 2)}\n`);
     if (failures > 0) throw new Error(`fidelity battery FAILED: ${failures} mismatch(es) — a G1 event for the affected driver (global eligibility spans the fidelity battery, §4.2)`);
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
@@ -851,34 +934,7 @@ async function cmdFidelity(): Promise<void> {
 async function cmdMatrix(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
   if (cfg.schedule === null) throw new Error("REFUSING: bench-config.json carries no pinned schedule (run pin-corpus first)");
-  // ---- the §8 ratification gate: schema-validated, band-bound, source-bound (codex R1 f.2) --
-  if (!existsSync(RATIFICATION_PATH))
-    throw new Error(`REFUSING: ${RATIFICATION_PATH} does not exist — §8 ratification (the four sign-off points) must be recorded before any timed matrix run (Step C)`);
-  const rat = JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>;
-  const answers = rat["answers"];
-  if (typeof answers !== "object" || answers === null) throw new Error("REFUSING: ratification.json carries no answers object");
-  for (const key of ["noiseBandAndDominance", "protocolConstants", "corpusPinning", "symlinkPolicy"]) {
-    const a = (answers as Record<string, unknown>)[key];
-    if (typeof a !== "string" || a.length === 0) throw new Error(`REFUSING: ratification.json answers.${key} is missing/empty — all four §8 sign-off points must carry explicit answers`);
-  }
-  const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number };
-  if (rat["noiseBand"] !== pilot.noiseBand)
-    throw new Error(`REFUSING: ratification.json noiseBand (${String(rat["noiseBand"])}) != pilot.json's calibrated band (${String(pilot.noiseBand)})`);
-  const repoRoot = realpathSync(REPO_ROOT);
-  const headOut = await runBenchGit({
-    argv: ["rev-parse", "HEAD"], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
-    benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
-  });
-  const head = text(headOut.stdout).trim();
-  if (rat["harnessCommit"] !== head)
-    throw new Error(`REFUSING: ratification.json harnessCommit (${String(rat["harnessCommit"]).slice(0, 12)}) != HEAD (${head.slice(0, 12)}) — the frozen harness revision must be the one ratified (§8)`);
-  const statusOut = await runBenchGit({
-    argv: ["status", "--porcelain"], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
-    benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 },
-  });
-  if (text(statusOut.stdout).trim() !== "")
-    throw new Error("REFUSING: the working tree is dirty — a dirty harness defeats the harnessCommit freeze binding (§8)");
-
+  await assertRatifiedAndFrozen();
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
   try {
     // ---- resumability (codex R1 f.17): reconstruct terminal state from runs.jsonl ----------
@@ -887,7 +943,10 @@ async function cmdMatrix(): Promise<void> {
     const rerunUsed = new Set<string>();
     const straddled = new Set<string>();
     const successLedger = new Set<string>(); // unit|driver|requestClass with an ok in a COMPLETED rep
+    const driftedUnits = new Set<string>();
+    const resumeForms = new Map<string, "production" | "scaffolding">();
     if (existsSync(runsPath)) {
+      const currentCommit = engine.harnessCommit();
       for (const line of readFileSync(runsPath, "utf8").split("\n")) {
         if (line.trim() === "") continue;
         let rec: Record<string, unknown>;
@@ -897,19 +956,28 @@ async function cmdMatrix(): Promise<void> {
           continue;
         }
         if (rec["type"] !== "run" || rec["phase"] !== "matrix") continue;
+        // resume only trusts records from THIS frozen harness revision — rows from another
+        // revision/machine must not silently mix into one traversal (codex R2 f.21)
+        if (rec["harnessCommit"] !== currentCommit)
+          throw new Error(`REFUSING to resume: runs.jsonl carries matrix rows from harness ${String(rec["harnessCommit"]).slice(0, 12)} != current ${currentCommit.slice(0, 12)} — a re-ratified matrix starts a fresh log`);
         const pos = rec["pos"] as number;
         const outcome = rec["outcome"] as string;
         if (outcome === "complete" || outcome === "unit-failure") terminalPos.add(pos);
         if (outcome === "invalidated-straddle") straddled.add(rec["unit"] as string);
+        if (outcome === "drift-restart") driftedUnits.add(rec["unit"] as string); // pending R6 epilogue survives interruption (f.20)
         if (outcome === "complete") {
           for (const cls of Object.keys((rec["requests"] as Record<string, number> | undefined) ?? {}))
             successLedger.add(`${rec["unit"] as string}|${rec["driver"] as string}|${cls}`);
         }
-        if (rec["replayOfPos"] !== null && rec["replayOfPos"] !== undefined) rerunUsed.add(`${rec["unit"] as string}|${rec["driver"] as string}`);
+        const form = rec["acquisitionForm"];
+        if (form === "scaffolding") resumeForms.set(rec["unit"] as string, "scaffolding");
+        else if (form === "production" && !resumeForms.has(rec["unit"] as string)) resumeForms.set(rec["unit"] as string, "production");
+        // only R1/R2 replays charge the driver allowance; R3/R4 in-slot replays do not (f.23)
+        if (rec["replayKind"] === "r1r2") rerunUsed.add(`${rec["unit"] as string}|${rec["driver"] as string}`);
       }
       if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
+      engine.restoreUnitForms(resumeForms);
     }
-    const driftedUnits = new Set<string>();
     // the frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7): R1 = a network-layer
     // failure outside any HTTP response, rerunnable unconditionally (≤1); R2 = a transient-5xx
     // exhaustion within caps whose request class SUCCEEDED in at least one other completed
@@ -937,13 +1005,13 @@ async function cmdMatrix(): Promise<void> {
             if (straddled.has(row.unit)) throw new Error(`R4 recurred on ${row.unit} — halt for freeze repair (plan §4.5)`);
             straddled.add(row.unit);
             log(`R4 straddle on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
-            engine.setReplayOf(row.pos);
+            engine.setReplayOf(row.pos, "r3r4");
             continue;
           }
           if (handle.record.outcome === "invalidated-foreign") {
             // R3: verified external interference — replay in slot, never charged to the driver
             log(`R3 foreign consumption on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
-            engine.setReplayOf(row.pos);
+            engine.setReplayOf(row.pos, "r3r4");
             continue;
           }
           if (handle.record.outcome === "drift-restart") {
@@ -957,7 +1025,7 @@ async function cmdMatrix(): Promise<void> {
           if (isRerunnable(handle.record) && !rerunUsed.has(key)) {
             rerunUsed.add(key);
             log(`R1/R2 rerun for ${key} rep${row.rep}: ${handle.record.failureCause ?? ""}`);
-            engine.setReplayOf(row.pos);
+            engine.setReplayOf(row.pos, "r1r2");
             continue;
           }
           log(`recorded failure (no rerun) for ${key} rep${row.rep}: ${handle.record.failureCause ?? ""}`);
@@ -1014,36 +1082,53 @@ async function cmdRefreshEvidence(): Promise<void> {
     const symFix = corpus.fidelity.find((f) => f.kind === "clone-symlink")!;
     const nonFix = corpus.fidelity.find((f) => f.kind === "non-utf8-content")!;
     if (symFix.owner !== nonFix.owner || symFix.repo !== nonFix.repo) {
-      const c = await pinClone(rt, symFix.owner, symFix.repo, symFix.branch ?? "HEAD", "c6-unify");
-      if (c.sha === symFix.sha) {
-        const ls = await lsTreeIndex(rt, c.dir, c.objectFormat);
-        const excluder = makeExcluder(cfg.selection.excludeDirGlobs);
-        const selectedLike = (e: LsTreeEntry): boolean => {
-          if (excluder(e.path) || /(^|\/)node_modules\//.test(e.path)) return false;
-          const base = e.path.slice(e.path.lastIndexOf("/") + 1);
-          return classifyFile(e.path) !== "other" || base === "package.json";
-        };
-        let unified = false;
-        for (const e of ls) {
-          if (e.type !== "blob" || e.size === null || e.size > 512 * 1024 || e.mode === "120000" || !selectedLike(e)) continue;
-          const bytes = await catBlob(rt, c.dir, e.oid);
-          const replacements = countReplacementChars(bytes);
-          if (replacements > 0) {
-            corpus.fidelity = corpus.fidelity.map((f) => f.kind !== "non-utf8-content" ? f : {
-              ...f, owner: symFix.owner, repo: symFix.repo, branch: symFix.branch, sha: symFix.sha, objectFormat: symFix.objectFormat,
-              entries: [{ path: e.path, mode: e.mode, oid: e.oid, size: e.size ?? 0 }],
-              verification: { ...verifyC6NonUtf8({ path: e.path, replacementCount: replacements }).evidence, canonicalSeamSha256: seamSha256(bytes) },
-            });
-            log(`C6 unified: ${symFix.owner}/${symFix.repo} supplies BOTH fixtures (non-utf8: ${e.path}, ${replacements} replacement chars)`);
-            unified = true;
-            break;
+      // EXHAUST the candidate set hunting a single repo with BOTH properties, recording
+      // per-candidate evidence either way (codex R2 f.6)
+      const searchEvidence: Array<Record<string, unknown>> = [];
+      let unified = false;
+      for (const cand of C6_CLONE_CANDIDATES) {
+        if (unified) break;
+        try {
+          const c = await pinClone(rt, cand.owner, cand.repo, cand.branch, `c6-unify-${cand.repo}`);
+          const ls = await lsTreeIndex(rt, c.dir, c.objectFormat);
+          const excluder = makeExcluder(cfg.selection.excludeDirGlobs);
+          const selectedLike = (e: LsTreeEntry): boolean => {
+            if (excluder(e.path) || /(^|\/)node_modules\//.test(e.path)) return false;
+            const base = e.path.slice(e.path.lastIndexOf("/") + 1);
+            return classifyFile(e.path) !== "other" || base === "package.json";
+          };
+          const symlinks = ls.filter((e) => e.mode === "120000" && selectedLike(e));
+          let nonUtf8: { entry: LsTreeEntry; replacements: number; bytes: Uint8Array } | null = null;
+          for (const e of ls) {
+            if (e.type !== "blob" || e.size === null || e.size > 512 * 1024 || e.mode === "120000" || !selectedLike(e)) continue;
+            const bytes = await catBlob(rt, c.dir, e.oid);
+            const replacements = countReplacementChars(bytes);
+            if (replacements > 0) {
+              nonUtf8 = { entry: e, replacements, bytes };
+              break;
+            }
           }
+          searchEvidence.push({ candidate: `${cand.owner}/${cand.repo}`, sha: c.sha, selectedSymlinks: symlinks.length, selectedNonUtf8: nonUtf8?.entry.path ?? null });
+          if (symlinks.length > 0 && nonUtf8 !== null) {
+            const pickSym = symlinks[0]!;
+            const derefBytes = await rt.client.fetchFileRaw(cand.owner, cand.repo, pickSym.path, c.sha);
+            corpus.fidelity = corpus.fidelity.map((f) => {
+              if (f.kind === "clone-symlink") return { ...f, owner: cand.owner, repo: cand.repo, branch: cand.branch, sha: c.sha, objectFormat: c.objectFormat, entries: [{ path: pickSym.path, mode: pickSym.mode, oid: pickSym.oid, size: pickSym.size ?? 0 }], verification: { restDerefSeamSha256: seamSha256(Buffer.from(derefBytes, "utf8")), unifiedSearch: searchEvidence } };
+              if (f.kind === "non-utf8-content") return { ...f, owner: cand.owner, repo: cand.repo, branch: cand.branch, sha: c.sha, objectFormat: c.objectFormat, entries: [{ path: nonUtf8!.entry.path, mode: nonUtf8!.entry.mode, oid: nonUtf8!.entry.oid, size: nonUtf8!.entry.size ?? 0 }], verification: { ...verifyC6NonUtf8({ path: nonUtf8!.entry.path, replacementCount: nonUtf8!.replacements }).evidence, canonicalSeamSha256: seamSha256(nonUtf8!.bytes), unifiedSearch: searchEvidence } };
+              return f;
+            });
+            log(`C6 UNIFIED on ${cand.owner}/${cand.repo}: symlink ${pickSym.path} + non-utf8 ${nonUtf8.entry.path}`);
+            unified = true;
+          }
+          rmSync(c.dir, { recursive: true, force: true });
+        } catch (e) {
+          searchEvidence.push({ candidate: `${cand.owner}/${cand.repo}`, error: e instanceof Error ? e.message.slice(0, 160) : String(e) });
         }
-        if (!unified) log(`C6 stays split: ${symFix.owner}/${symFix.repo} has no selected non-UTF-8 file (recorded; plan §4.2 amendment covers the split)`);
-      } else {
-        log(`C6 unify skipped: ${symFix.owner}/${symFix.repo} head drifted off the fixture pin`);
       }
-      rmSync(join(rt.benchRoot, "c6-unify"), { recursive: true, force: true });
+      if (!unified) {
+        log(`C6 stays split after exhausting ${C6_CLONE_CANDIDATES.length} candidates (evidence recorded; plan §4.2 contingency)`);
+        corpus.fidelity = corpus.fidelity.map((f) => f.kind === "clone-symlink" || f.kind === "non-utf8-content" ? { ...f, verification: { ...f.verification, unifiedSearch: searchEvidence } } : f);
+      }
     }
     loadCorpus(JSON.stringify(corpus)); // strict self-check before writing
     writeFileSync(CORPUS_PATH, `${JSON.stringify(corpus, null, 2)}\n`);

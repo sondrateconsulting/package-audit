@@ -268,13 +268,15 @@ export async function runBenchGit(req: BenchGitRequest): Promise<BenchGitResult>
       throw new BenchSpawnError("exit-wedged", `child never settled within deadline+grace: git ${req.argv[0]}`);
     }
     const [stdout, stderr, exitCode] = bounded;
-    if (failed) {
-      record(exitCode, stdout.byteLength, stderr.byteLength);
-      throw firstErr;
-    }
+    // deadline first: an escalation-induced reader cancellation must surface as the promised
+    // terminal 124, never as a reader error (codex R2 finding 30)
     if (timedOut) {
       record(124, stdout.byteLength, stderr.byteLength);
       return { exitCode: 124, stdout: new Uint8Array(0), stderr, timedOut: true, wallMs: Date.now() - startedAtMs };
+    }
+    if (failed) {
+      record(exitCode, stdout.byteLength, stderr.byteLength);
+      throw firstErr;
     }
     record(exitCode, stdout.byteLength, stderr.byteLength);
     return { exitCode, stdout, stderr, timedOut, wallMs: Date.now() - startedAtMs };
@@ -498,8 +500,16 @@ export class BatchChild {
         killWithEscalation(this.child, [this.outReader, this.errReader]);
         exit = await timedWait(SPAWN_KILL_GRACE_MS + 1_000);
       }
-      // the pumps end when the streams close or their readers are cancelled by the escalation
-      await this.pumpsDone;
+      // the pumps end when the streams close or their readers are cancelled by the escalation;
+      // the join is BOUNDED so a wedged stream cannot hang disposal (codex R2 f.32)
+      let pumpTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        this.pumpsDone,
+        new Promise<void>((resolve) => {
+          pumpTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 2_000);
+        }),
+      ]);
+      clearTimeout(pumpTimer);
       const snap = this.ring.snapshot();
       this.opts.onRecord?.({
         lane: "transport", argv: ["cat-file", "--batch"], cwd: this.opts.cwd,

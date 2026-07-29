@@ -217,13 +217,15 @@ export function analyzeBatchResponse(
       continue;
     }
     if (errs !== undefined) {
-      if (errs.some(isTimeoutError)) {
+      // the COMPLETE attributed error set must belong to one permitted class — a recognized
+      // member must not mask a forbidden sibling (codex R2 finding 12)
+      if (errs.every(isTimeoutError)) {
         outcomes.push({ kind: "timeout", index: i });
       } else if (errs.every((e) => e.type === "NOT_FOUND")) {
         outcomes.push({ kind: "missing", index: i }); // tree-listed but reported absent
       } else {
-        // an attributed error of any OTHER type is the closed default — a whole-batch attempt
-        // failure, never a permitted absence (codex R1 finding 5)
+        // any OTHER type — or a MIX of classes — is the closed default: a whole-batch attempt
+        // failure, never a permitted absence (codex R1 finding 5, R2 finding 12)
         return { kind: "default-failure", rawCondition: `alias a${i} errored ${errs.map((e) => e.type ?? "?").join(",")}` };
       }
       continue;

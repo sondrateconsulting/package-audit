@@ -27,10 +27,14 @@ import type { DriverId } from "./benchSchedule.ts";
 // A unit failure with cause (G2 territory) — recorded, never silently absorbed.
 export class UnitFailure extends Error {
   readonly cause2: string;
-  constructor(cause: string) {
+  // when the terminal condition was HTTP-shaped (e.g. the circuit breaker tripped on repeated
+  // no-response dispatches), the typed R1/R2 evidence survives the breaker (codex R2 f.14)
+  readonly httpEvidence: { code: string; lastClassification: string | null; requestClass: string | null } | null;
+  constructor(cause: string, httpEvidence: { code: string; lastClassification: string | null; requestClass: string | null } | null = null) {
     super(`UNIT FAILURE: ${cause}`);
     this.name = "UnitFailure";
     this.cause2 = cause;
+    this.httpEvidence = httpEvidence;
   }
 }
 // Confirmed upstream drift (R6 branch arm): the live head moved off the pinned SHA. The engine
@@ -368,13 +372,16 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
         label: `${original.label}@d${item.depth}`,
       });
       attempts++;
-      const d = await benchGraphqlDispatch(ctx.gh, batch.query, batch.fields, batch.label);
+      const d = await benchGraphqlDispatch(ctx.gh, batch.query, batch.fields, batch.label, attempts);
       st.httpBodyBytes += Buffer.byteLength(d.bodyText, "utf8");
       const analysis = analyzeBatchResponse(d, batch, ctx.slot.objectFormat, ctx.cfg);
-      const failedDispatch = (): void => {
+      const failedDispatch = (evidence: { code: string; lastClassification: string | null } | null = null): void => {
         consecutiveFailedDispatches++;
         if (consecutiveFailedDispatches >= ctx.cfg.t1.circuitBreakerConsecutiveFailedDispatches)
-          throw new UnitFailure(`circuit breaker: ${consecutiveFailedDispatches} consecutive failed dispatches`);
+          throw new UnitFailure(
+            `circuit breaker: ${consecutiveFailedDispatches} consecutive failed dispatches`,
+            evidence === null ? null : { ...evidence, requestClass: "graphql-batch" },
+          );
       };
       const canSplit = (q: QueueItem): boolean =>
         q.entries.length >= 2 && q.depth < ctx.cfg.t1.split.maxDepth &&
@@ -386,7 +393,7 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
         queue.unshift({ entries: a, depth: q.depth + 1 });
       };
       if (analysis.kind === "http-failure") {
-        failedDispatch();
+        failedDispatch({ code: d.status === 0 ? "no-response" : "http-failure", lastClassification: d.status === 0 ? "no-response" : "transient" });
         consecutive5xx = analysis.fivexxSplitCandidate ? consecutive5xx + 1 : 0;
         if (fivexxSplitConditionMet(batch, consecutive5xx, ctx.cfg) && canSplit(item)) enqueueSplit(item);
         else {
@@ -548,9 +555,13 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
       st.deliveries.push({ path: entry.path, route: "primary", delivered: seamDecode(frame.body), rawVerified: true });
     }
   } finally {
-    // ordered teardown BEFORE the engine may delete the clone dir (§3.1)
-    if (holder.child !== null) await holder.child.dispose();
-    holder.release?.();
+    // ordered teardown BEFORE the engine may delete the clone dir (§3.1); the pool permit is
+    // released in its OWN finally so a rejected dispose can never leak it (codex R2 f.32)
+    try {
+      if (holder.child !== null) await holder.child.dispose();
+    } finally {
+      holder.release?.();
+    }
   }
   return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, acquiredPaths: st.acquiredPaths, cloneDir: dir, acquisitionForm: ctx.acquisitionForm };
 }
