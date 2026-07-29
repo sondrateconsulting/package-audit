@@ -202,7 +202,27 @@
           ".azure-pipelines/commands/rhel.sh",
           ".azure-pipelines/commands/ubuntu.sh"
         ],
-        "restDerefSeamSha256": "93dc0ce64ee5fdda9d674378187f3b415ec02ec530038b9edf40a2c84b930a3d"
+        "restDerefSeamSha256": "93dc0ce64ee5fdda9d674378187f3b415ec02ec530038b9edf40a2c84b930a3d",
+        "unifiedSearch": [
+          {
+            "candidate": "ansible/ansible",
+            "sha": "e8264c418ad2e87f92fa48f75cacfaa451cb38e4",
+            "selectedSymlinks": 7,
+            "selectedNonUtf8": null
+          },
+          {
+            "candidate": "git/git",
+            "sha": "13c7afec212fc97ce257d15601659314c6673d6c",
+            "selectedSymlinks": 0,
+            "selectedNonUtf8": "t/t4201-shortlog.sh"
+          },
+          {
+            "candidate": "kubernetes/kubernetes",
+            "sha": "7c2b6c32644a2cc24029ec77576940b63ecca7e7",
+            "selectedSymlinks": 1,
+            "selectedNonUtf8": null
+          }
+        ]
       }
     },
     {
@@ -229,7 +249,27 @@
       "verification": {
         "path": "t/t4201-shortlog.sh",
         "replacementCount": 32,
-        "canonicalSeamSha256": "c9820488fb64aeaa0b2c1cd07d1917b93d9d8a1b5b25ae68af9bbfd4725a9726"
+        "canonicalSeamSha256": "c9820488fb64aeaa0b2c1cd07d1917b93d9d8a1b5b25ae68af9bbfd4725a9726",
+        "unifiedSearch": [
+          {
+            "candidate": "ansible/ansible",
+            "sha": "e8264c418ad2e87f92fa48f75cacfaa451cb38e4",
+            "selectedSymlinks": 7,
+            "selectedNonUtf8": null
+          },
+          {
+            "candidate": "git/git",
+            "sha": "13c7afec212fc97ce257d15601659314c6673d6c",
+            "selectedSymlinks": 0,
+            "selectedNonUtf8": "t/t4201-shortlog.sh"
+          },
+          {
+            "candidate": "kubernetes/kubernetes",
+            "sha": "7c2b6c32644a2cc24029ec77576940b63ecca7e7",
+            "selectedSymlinks": 1,
+            "selectedNonUtf8": null
+          }
+        ]
       }
     }
   ],
