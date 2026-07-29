@@ -142,6 +142,7 @@ export interface UnitDriverCell {
   medianT: number | null;
   worstT: number | null;
   medianT15k: number | null;
+  worstT15k: number | null; // §4.6: every bucket-size readoff reports median WITH worst-of-K (codex C0-R1 finding 19)
 }
 
 export interface UnitComparison {
@@ -185,7 +186,11 @@ export interface ScoreBundle {
   workloads: Map<string, UnitWorkload>;
   runsLines: readonly string[];
   fidelityLines: readonly string[];
-  noiseBand: number; // the RATIFIED band (ratification.json; §4.7's calibrated formula output)
+  noiseBand: number; // the RATIFIED band (validated against pilot.json + the frozen formula by the loader)
+  // the ratified frozen-surface digest: the fidelity ledger admits exactly this digest's
+  // records — discovering the digest from the evidence itself would let a stale-only log pass
+  // as current (codex C0-R1 finding 8)
+  ratifiedDigest: string;
 }
 
 export function scoreMatrix(bundle: ScoreBundle): ScoreOutput {
@@ -212,19 +217,8 @@ export function scoreMatrix(bundle: ScoreBundle): ScoreOutput {
   if (firstRow === undefined) fail("no matrix rows carry an identity");
   const identity: ScoreOutput["identity"] = { harnessCommit: rstr(firstRow!, "harnessCommit"), envManifestHash: rstr(firstRow!, "envManifestHash") };
 
-  // the ledger admits only one frozen-surface digest's records; the digest is discovered from
-  // the records themselves, and evidence spanning two freezes is refused rather than merged
-  const digests = new Set<string>();
-  for (const line of bundle.fidelityLines) {
-    try {
-      const rec = JSON.parse(line) as Record<string, unknown>;
-      if (rec["type"] === "fidelity" && typeof rec["frozenSurfaceDigest"] === "string") digests.add(rec["frozenSurfaceDigest"] as string);
-    } catch {
-      continue;
-    }
-  }
-  if (digests.size > 1) fail(`fidelity.jsonl spans ${digests.size} frozen-surface digests — evidence from different freezes must not mix`);
-  const fidelity = judgeFidelity(corpus.fidelity, reconstructFidelityLedger(bundle.fidelityLines, [...digests][0] ?? ""));
+  if (bundle.ratifiedDigest.length === 0) fail("scoring requires the ratified frozen-surface digest (codex C0-R1 finding 8)");
+  const fidelity = judgeFidelity(corpus.fidelity, reconstructFidelityLedger(bundle.fidelityLines, bundle.ratifiedDigest));
 
   // ---- per-(unit × driver) cells over terminal rows ------------------------------------------
   const performanceUnits = corpus.performance.flatMap((slot) => slot.units.map((u) => u.unitId));
@@ -232,7 +226,7 @@ export function scoreMatrix(bundle: ScoreBundle): ScoreOutput {
   const cellIndex = new Map<string, UnitDriverCell>();
   for (const unit of performanceUnits) {
     for (const driver of DRIVERS) {
-      const cell: UnitDriverCell = { unit, driver, runs: [], failures: [], missingReps: [], medianT: null, worstT: null, medianT15k: null };
+      const cell: UnitDriverCell = { unit, driver, runs: [], failures: [], missingReps: [], medianT: null, worstT: null, medianT15k: null, worstT15k: null };
       cells.push(cell);
       cellIndex.set(`${unit}|${driver}`, cell);
     }
@@ -259,6 +253,7 @@ export function scoreMatrix(bundle: ScoreBundle): ScoreOutput {
       cell.medianT = medianOf(cell.runs.map((r) => r.tScore));
       cell.worstT = Math.min(...cell.runs.map((r) => r.tScore));
       cell.medianT15k = medianOf(cell.runs.map((r) => r.tScore15k));
+      cell.worstT15k = Math.min(...cell.runs.map((r) => r.tScore15k));
     }
   }
 
@@ -269,25 +264,42 @@ export function scoreMatrix(bundle: ScoreBundle): ScoreOutput {
       driver, eligible: false, g1: "pass", g2: "pass", g3: "pass", g4: "pass",
       g4AttributableSignals: 0, reasons: [], probeDivergenceFindings: [],
     };
-    // G1 route-scoped fidelity over every terminal row (main + probe): verifyDeliveries already
-    // separated caveat-route probe divergences (findings) from primary-route failures
-    for (const [pos, row] of state.terminalRowByPos) {
+    // POSITIVE misbehaviour evidence — observed byte divergence (g1Failures) and disk-envelope
+    // breaches — is read over EVERY physical attempt, terminal or not: an invalidated or
+    // replaced attempt's wrong bytes were still delivered by this driver, and invalidation
+    // reasons (foreign consumption, straddles, snapshot failures) do not un-deliver them
+    // (codex C0-R1 finding 10). ABSENCE-shaped evidence (g2Failures, unit failures) follows
+    // the terminal/rerun discipline below — §4.5's R1/R2 rerun exists precisely to excuse a
+    // network-caused incomplete attempt, so counting a replaced attempt's absences would
+    // defeat the sanctioned rerun.
+    for (const row of allRows) {
       if (rstr(row, "driver") !== driver) continue;
+      const pos = rnum(row, "pos");
       const g1f = rnum(row, "g1Failures");
       if (g1f > 0) {
         g.g1 = "fail";
-        g.reasons.push(`G1: ${g1f} delivery-fidelity failure(s) at pos ${pos} (${rstr(row, "unit")} rep ${rnum(row, "rep")})`);
-      }
-      const g2f = rnum(row, "g2Failures");
-      if (g2f > 0) {
-        g.g2 = "fail";
-        g.reasons.push(`G2: ${g2f} completeness failure(s) at pos ${pos} (${rstr(row, "unit")} rep ${rnum(row, "rep")})`);
+        g.reasons.push(`G1: ${g1f} delivery-fidelity failure(s) at pos ${pos} (${rstr(row, "unit")} rep ${rnum(row, "rep")}, outcome ${String(row["outcome"])})`);
       }
       const div = rnum(row, "probeDivergences");
       if (div > 0) g.probeDivergenceFindings.push({ unit: rstr(row, "unit"), pos, divergences: div });
       if (rnum(row, "diskSampledPeakBytes") > cfg.protocol.diskGateBytes) {
         g.g4 = "fail";
-        g.reasons.push(`G4: sampled-peak disk ${rnum(row, "diskSampledPeakBytes")} B exceeds the ${cfg.protocol.diskGateBytes} B gate at pos ${pos}`);
+        g.reasons.push(`G4: sampled-peak disk ${rnum(row, "diskSampledPeakBytes")} B exceeds the ${cfg.protocol.diskGateBytes} B gate at pos ${pos} (outcome ${String(row["outcome"])})`);
+      }
+    }
+    for (const [pos, row] of state.terminalRowByPos) {
+      if (rstr(row, "driver") !== driver) continue;
+      const g2f = rnum(row, "g2Failures");
+      if (g2f > 0) {
+        g.g2 = "fail";
+        g.reasons.push(`G2: ${g2f} completeness failure(s) at pos ${pos} (${rstr(row, "unit")} rep ${rnum(row, "rep")})`);
+      }
+      // a terminal unit failure IS a completeness failure: the unit did not resolve its
+      // workload — fallback-budget exhaustion and circuit-breaker aborts are the plan's own
+      // named G2 examples (§4.7; codex C0-R1 finding 9)
+      if (String(row["outcome"]) === "unit-failure") {
+        g.g2 = "fail";
+        g.reasons.push(`G2: terminal unit failure at pos ${pos} (${rstr(row, "unit")} rep ${rnum(row, "rep")}): ${String(row["failureCause"] ?? "?").slice(0, 160)}`);
       }
     }
     // every applicable checkout-config probe rep is completion-gated — missing evidence is
@@ -300,15 +312,17 @@ export function scoreMatrix(bundle: ScoreBundle): ScoreOutput {
         g.reasons.push(`G1: checkout-config probe rep at pos ${schedRow.pos} (${schedRow.unit}) is ${cs} — missing probe evidence disqualifies`);
       }
     }
-    // the fidelity battery is gate-relevant and global (§4.2): mismatches are G1, skipped or
-    // unresolved applicable fixtures are G2
-    if (fidelity.failedDrivers.has(driver)) {
+    // the fidelity battery is gate-relevant and global (§4.2): observed mismatches are G1;
+    // exhausted, pending, or skipped applicable cells are incomplete evidence — G2 (codex
+    // C0-R1 finding 9's split)
+    if (fidelity.mismatchDrivers.has(driver)) {
       g.g1 = "fail";
-      for (const c of fidelity.failures.filter((c) => c.driver === driver)) g.reasons.push(`G1: fidelity battery ${c.final} on ${c.kind} ${c.path}`);
+      for (const c of fidelity.failures.filter((c) => c.driver === driver && c.final === "fail-mismatch"))
+        g.reasons.push(`G1: fidelity battery ${c.final} on ${c.kind} ${c.path}`);
     }
     if (fidelity.incompleteDrivers.has(driver)) {
       g.g2 = "fail";
-      for (const c of [...fidelity.pendingRetry, ...fidelity.neverAttempted].filter((c) => c.driver === driver))
+      for (const c of [...fidelity.failures.filter((c) => c.final === "fail-exhausted"), ...fidelity.pendingRetry, ...fidelity.neverAttempted].filter((c) => c.driver === driver))
         g.reasons.push(`G2: fidelity battery cell ${c.kind} ${c.path} is ${c.final}`);
     }
     // G3 stability: all K reps of every performance unit complete under the rerun discipline

@@ -73,7 +73,8 @@ const rowLines = (spec: RowSpec): string[] => {
     rep: spec.rep, probe: spec.probe === true, phase: "matrix", epilogue: false, acquisitionForm: null,
     startedAtIso: "2026-07-29T00:00:00Z", wallMs: spec.wallMs ?? 1000, segments: 1, outcome: "complete",
     failureCause: null, failureEvidence: null, requests: { "rest-content": 1 },
-    attempts: { fivexx: 0, retries: 0, secondaryByKind: {} }, secondarySignals: 0,
+    requestClassSuccesses: { "rest-content": 1 },
+    attempts: { fivexx: 0, retries: 0, noResponse: 0, secondaryByKind: {} }, straddledReset: false, secondarySignals: 0,
     points: { measuredCostSum: 0, imputed: 0 },
     bucketDeltas: { core: { valid: true, used: 0 }, graphql: { valid: true, used: 0 } },
     bucketSnapshots: [], expectedConsumption: { core: 0, graphql: 0 },
@@ -115,7 +116,7 @@ function synthBundle(
     pos++;
   }
   const cfg: BenchConfig = { ...CFG, schedule: { unitOrder: [...UNITS], rows } };
-  return { cfg, corpus: CORPUS, workloads: WORKLOADS, runsLines: lines, fidelityLines: [...fidelityLines], noiseBand: 1.25 };
+  return { cfg, corpus: CORPUS, workloads: WORKLOADS, runsLines: lines, fidelityLines: [...fidelityLines], noiseBand: 1.25, ratifiedDigest: DIGEST };
 }
 
 describe("scoreRun — §4.6's paired formula", () => {
@@ -242,5 +243,45 @@ describe("scoreMatrix — gates and the §4.7 rule", () => {
     expect(out.gates.find((g) => g.driver === "T1")!.g1).toBe("fail");
     expect(out.gates.find((g) => g.driver === "T2c")!.g2).toBe("fail");
     expect(out.eligible).toEqual(["T0", "T2a"]);
+  });
+  test("an exhausted fidelity cell is G2 (incomplete evidence), not G1 (codex C0-R1 f.9)", () => {
+    const out = scoreMatrix(synthBundle(() => 1500, (s) => s, [
+      ...DRIVERS.filter((d) => d !== "T1").map((d) => fidelityMatch(d)),
+      fidelityMatch("T1", { outcome: "attempt-error", pass: false }),
+      fidelityMatch("T1", { outcome: "attempt-error", pass: false }),
+    ]));
+    const t1 = out.gates.find((g) => g.driver === "T1")!;
+    expect(t1.g1).toBe("pass");
+    expect(t1.g2).toBe("fail");
+  });
+  test("a terminal unit failure is a G2 completeness failure, not only a G3 gap (codex C0-R1 f.9)", () => {
+    const out = scoreMatrix(synthBundle(() => 1500, (spec) =>
+      spec.driver === "T1" && spec.pos === 2
+        ? { ...spec, over: { outcome: "unit-failure", failureCause: "circuit breaker: 3 consecutive failed dispatches", failureEvidence: { kind: "unit" } } }
+        : spec));
+    const t1 = out.gates.find((g) => g.driver === "T1")!;
+    expect(t1.g2).toBe("fail");
+    expect(t1.g3).toBe("fail");
+    expect(t1.reasons.some((r) => r.includes("circuit breaker"))).toBe(true);
+  });
+  test("G1 byte divergence and disk breaches on INVALIDATED attempts still disqualify (codex C0-R1 f.10)", () => {
+    // an invalidated-foreign attempt with observed wrong bytes at pos 3, later replayed clean:
+    // the wrong bytes were delivered by the driver and must not vanish with the invalidation
+    const bundle = synthBundle(() => 1500);
+    const invalidated = rowLines({
+      pos: 3, unit: UNITS[0]!, driver: "T2a", rep: 1, wallMs: 1500,
+      over: { attemptId: "a-3-bad", outcome: "invalidated-foreign", g1Failures: 2 },
+    });
+    const out = scoreMatrix({ ...bundle, runsLines: [...invalidated, ...bundle.runsLines] });
+    const t2a = out.gates.find((g) => g.driver === "T2a")!;
+    expect(t2a.g1).toBe("fail");
+    expect(t2a.reasons.some((r) => r.includes("invalidated-foreign"))).toBe(true);
+    // same for a disk breach on a replaced attempt
+    const diskRow = rowLines({
+      pos: 3, unit: UNITS[0]!, driver: "T2a", rep: 1, wallMs: 1500,
+      over: { attemptId: "a-3-disk", outcome: "invalidated-foreign", diskSampledPeakBytes: CFG.protocol.diskGateBytes + 1 },
+    });
+    const diskOut = scoreMatrix({ ...bundle, runsLines: [...diskRow, ...bundle.runsLines] });
+    expect(diskOut.gates.find((g) => g.driver === "T2a")!.g4).toBe("fail");
   });
 });

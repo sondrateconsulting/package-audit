@@ -16,7 +16,7 @@
 
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { BenchConfig } from "./benchConfig.ts";
+import { restFallbackBudgetFor, type BenchConfig } from "./benchConfig.ts";
 import type { Corpus, CorpusUnit, PerformanceSlot } from "./benchCorpus.ts";
 import type { UnitWorkload } from "./benchWorkload.ts";
 import type { DriverId } from "./benchSchedule.ts";
@@ -139,7 +139,7 @@ export async function runConcurrencyProbe(deps: ConcurrencyProbeDeps): Promise<C
       const ctx: DriverRunContext = {
         cfg: deps.cfg, slot, unit, workload, gh, benchRoot: deps.benchRoot, runDir,
         gitEnv: deps.gitEnv, spawnObserver: () => {}, acquisitionForm: "production",
-        fallbackBudget: Math.max(deps.cfg.restFallbackBudget.floor, Math.ceil(deps.cfg.restFallbackBudget.fractionOfSelected * workload.entries.length)),
+        fallbackBudget: restFallbackBudgetFor(deps.cfg, workload.entries.length),
       };
       const startedAt = deps.now();
       let outcome: ConcurrencyStreamResult["outcome"] = "complete";

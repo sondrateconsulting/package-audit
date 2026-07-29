@@ -47,12 +47,21 @@ export interface FidelityLedger {
 // re-frozen battery legitimately starts over.
 export function reconstructFidelityLedger(lines: readonly string[], digest: string): FidelityLedger {
   const ledger: FidelityLedger = { cells: new Map(), groupAttemptErrors: new Map() };
-  for (const line of lines) {
+  const lastNonEmpty = ((): number => {
+    for (let i = lines.length - 1; i >= 0; i--) if (lines[i]!.trim() !== "") return i;
+    return -1;
+  })();
+  for (const [lineIndex, line] of lines.entries()) {
     if (line.trim() === "") continue;
     let rec: Record<string, unknown>;
     try {
       rec = JSON.parse(line) as Record<string, unknown>;
     } catch {
+      // only the final line may be torn by a crash mid-append; a malformed interior line means
+      // the append-only ledger was edited or corrupted — refuse rather than silently dropping
+      // recorded evidence (codex C0-R1 finding 13)
+      if (lineIndex < lastNonEmpty)
+        throw new BenchFidelityError(`fidelity.jsonl carries a malformed interior line (${lineIndex + 1}) — the append-only ledger must not be edited; only a torn final append is tolerated`);
       continue;
     }
     if (rec["type"] !== "fidelity") continue;
@@ -98,8 +107,11 @@ export interface FidelityVerdict {
   failures: FidelityCellVerdict[]; // fail-mismatch + fail-exhausted
   pendingRetry: FidelityCellVerdict[]; // one attempt-error recorded, the single rerun still open
   neverAttempted: FidelityCellVerdict[]; // a skipped applicable fixture is a G2 event (§4.2)
-  failedDrivers: Set<string>; // drivers with ≥1 failure — G1-ineligible via the battery
-  incompleteDrivers: Set<string>; // drivers with pending/never-run cells — missing evidence is ineligibility
+  // the §4.7 mapping keeps G1 for OBSERVED byte divergence and G2 for completeness (codex
+  // C0-R1 finding 9): a mismatch is G1; an exhausted, pending, or never-run cell means the
+  // battery's evidence is incomplete — G2 — and either way the driver is ineligible.
+  mismatchDrivers: Set<string>; // ≥1 fail-mismatch — a G1 event via the battery
+  incompleteDrivers: Set<string>; // exhausted/pending/never-run cells — a G2 event
 }
 
 // Judge the WHOLE battery from the ledger: every applicable (fixture × driver × entry) cell
@@ -125,7 +137,7 @@ export function shouldAttemptCell(ledger: FidelityLedger, kind: string, driver: 
 export function judgeFidelity(fixtures: readonly C6Fixture[], ledger: FidelityLedger): FidelityVerdict {
   const verdict: FidelityVerdict = {
     cells: [], failures: [], pendingRetry: [], neverAttempted: [],
-    failedDrivers: new Set(), incompleteDrivers: new Set(),
+    mismatchDrivers: new Set(), incompleteDrivers: new Set(),
   };
   for (const fixture of fixtures) {
     for (const driver of fixture.appliesTo) {
@@ -133,9 +145,12 @@ export function judgeFidelity(fixtures: readonly C6Fixture[], ledger: FidelityLe
         const final = cellFinalState(ledger, fixture.kind, driver, entry.path);
         const cell: FidelityCellVerdict = { kind: fixture.kind, driver, path: entry.path, final };
         verdict.cells.push(cell);
-        if (final === "fail-mismatch" || final === "fail-exhausted") {
+        if (final === "fail-mismatch") {
           verdict.failures.push(cell);
-          verdict.failedDrivers.add(driver);
+          verdict.mismatchDrivers.add(driver);
+        } else if (final === "fail-exhausted") {
+          verdict.failures.push(cell);
+          verdict.incompleteDrivers.add(driver);
         } else if (final === "pending-retry") {
           verdict.pendingRetry.push(cell);
           verdict.incompleteDrivers.add(driver);

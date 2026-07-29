@@ -80,7 +80,7 @@ describe("judgeFidelity — the whole-ledger battery verdict", () => {
     const verdict = judgeFidelity(FIXTURES, ledger);
     expect(verdict.cells.length).toBe(2);
     expect(verdict.failures.map((c) => c.driver)).toEqual(["T2c"]);
-    expect(verdict.failedDrivers.has("T2c")).toBe(true);
+    expect(verdict.mismatchDrivers.has("T2c")).toBe(true);
     expect(verdict.neverAttempted.map((c) => c.driver)).toEqual(["T2a"]);
     expect(verdict.incompleteDrivers.has("T2a")).toBe(true);
   });
@@ -90,7 +90,7 @@ describe("judgeFidelity — the whole-ledger battery verdict", () => {
     expect(verdict.failures).toEqual([]);
     expect(verdict.pendingRetry).toEqual([]);
     expect(verdict.neverAttempted).toEqual([]);
-    expect(verdict.failedDrivers.size).toBe(0);
+    expect(verdict.mismatchDrivers.size).toBe(0);
     expect(verdict.incompleteDrivers.size).toBe(0);
   });
 });

@@ -55,8 +55,8 @@ import { BatchChild, BenchSpawnError, runBenchGit, type BatchChildDisposal, type
 import { BenchHttpError, benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuckets, readRateLimit, type BenchGhContext } from "./benchGh.ts";
 import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts";
 import {
-  BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, isRerunnableEvidence, planSegments,
-  reconstructMatrixState,
+  BenchEngine, RunsLog, applyPendingTransition, buildEnvManifest, computeWorstCase,
+  isRerunnableEvidence, planSegments, reconstructMatrixState,
 } from "./benchProtocol.ts";
 import { RePinRequired, UnitFailure, acquireStore, describeDisposal, disposalIsClean, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
 import { noiseBandFrom } from "./benchConfig.ts";
@@ -374,6 +374,16 @@ export function classifyFidelityEnumeration(
   if (res.exitCode !== 0)
     throw new BenchOperationalError(`${gitFailure("fidelity ls-tree", res)} — a local enumeration failure is a harness fault, not a transport divergence; re-run the battery`);
   return parseLsTreeZ(res.stdout, format, limits);
+}
+
+// §8: pinning-family commands REWRITE preregistered artifacts (corpus.json, selected/*,
+// pilot.json, acquisition-diagnostics.json, the schedule) — after ratification that is
+// amendment territory, and the mutation must not happen even though the next gate would
+// detect it (codex C0-R1 finding 17). Removing/re-recording ratification.json is the explicit
+// amendment act that reopens them.
+function assertNotRatified(command: string): void {
+  if (existsSync(RATIFICATION_PATH))
+    throw new Error(`REFUSING: ratification.json exists — \`${command}\` would mutate frozen preregistered artifacts; a §8 amendment (deliberately re-recording ratification.json, with its review round) must precede it`);
 }
 
 // §4.2 candidates, in preference order — a failing candidate is SWAPPED, never forced.
@@ -991,8 +1001,10 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
     networkDescription: process.env["BENCH_NETWORK_DESC"] ?? "operator workstation (BENCH_NETWORK_DESC unset)",
     credentialType: "PAT (gh auth)",
   });
+  // NOTE: the manifest line is NOT appended here — callers append it via engine.writeManifest()
+  // only after any identity reconstruction has ACCEPTED the existing log, so a rejected resume
+  // cannot first contaminate runs.jsonl with a foreign manifest (codex C0-R1 finding 18)
   const runsLog = new RunsLog(join(ARTIFACTS, "runs.jsonl"), manifest);
-  runsLog.writeManifestOnce();
   const engine = new BenchEngine({
     cfg, corpus, workloads, benchRoot, artifactsDir: ARTIFACTS,
     runCacheDir: join(REPO_ROOT, "data", "bench-run-caches"),
@@ -1031,6 +1043,7 @@ const workloadFileName = (unitId: string): string => `${unitId.replace(/[^A-Za-z
 async function cmdPinCorpus(): Promise<void> {
   const releaseLock = acquireSingleWriterLock("pin-corpus");
   try {
+  assertNotRatified("pin-corpus");
   const cfg = loadBenchConfig(CONFIG_PATH);
   const rt = makePinRuntime(cfg);
   try {
@@ -1118,10 +1131,12 @@ function findUnitIn(corpus: Corpus, unitId: string): { slot: PerformanceSlot } {
 async function cmdPilot(): Promise<void> {
   const releaseLock = acquireSingleWriterLock("pilot");
   try {
+  assertNotRatified("pilot");
   const { cfg, corpus, workloads } = loadPinned();
   // the pilot runs BEFORE ratification exists, so its rows carry no frozen-surface digest
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads, null);
   try {
+    engine.writeManifest();
     const { walls, spread } = await engine.runPilot(0);
     const band = noiseBandFrom(cfg, spread);
     const pilot = {
@@ -1145,6 +1160,7 @@ async function cmdPilot(): Promise<void> {
 async function cmdDiagnostics(): Promise<void> {
   const releaseLock = acquireSingleWriterLock("diagnostics");
   try {
+  assertNotRatified("diagnostics");
   const { cfg, corpus, workloads } = loadPinned();
   const rt = makePinRuntime(cfg);
   try {
@@ -1948,12 +1964,22 @@ async function cmdMatrix(): Promise<void> {
     );
     const { terminalPos, rerunUsed, straddleCounts, driftedUnits, successLedger, pendingReplays } = state;
     if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
+    engine.writeManifest(); // only after reconstruction ACCEPTED the log's identity (codex C0-R1 f.18)
     engine.restoreUnitForms(state.resumeForms);
     // an interrupted washout owes its REMAINING horizon before anything re-runs (residual 2)
     const owedMs = state.pendingWashoutUntilMs - Date.now();
     if (owedMs > 0) {
       log(`restoring an interrupted washout: sleeping ${Math.ceil(owedMs / 1000)}s to the recorded horizon`);
       await new Promise((r) => setTimeout(r, owedMs));
+    }
+    // a recorded attempt whose marker never landed is EVIDENCE owed its transition, not a
+    // do-over: append the missing marker, then terminalize or replay it under the frozen
+    // rules — a crash mid-washout must not launder a non-rerunnable failure into a retry
+    // (codex C0-R1 finding 1)
+    for (const transition of state.pendingTransitions) {
+      engine.appendPendingWashoutMarker(transition.row);
+      applyPendingTransition(state, transition);
+      log(`restored the interrupted washout transition at pos ${transition.pos} (${String(transition.row["outcome"])}${state.pendingReplays.has(transition.pos) ? " → R1/R2 replay owed" : " → terminal"})`);
     }
     // the frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7), shared with the
     // reconstruction: R1 = a network-layer failure outside any HTTP response, rerunnable
@@ -1973,7 +1999,9 @@ async function cmdMatrix(): Promise<void> {
           engine.setReplayOf(row.pos, owed);
           pendingReplays.delete(row.pos);
         }
-        let controlPlaneReplays = 0;
+        // the control-plane replay cap is DURABLE across invocations: recorded invalidations
+        // seed the counter, so restarting the process cannot reset it (codex C0-R1 finding 3)
+        let controlPlaneReplays = state.controlPlaneCounts.get(row.pos) ?? 0;
         for (;;) {
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
@@ -2074,6 +2102,7 @@ async function cmdMatrix(): Promise<void> {
 async function cmdRefreshEvidence(): Promise<void> {
   const releaseLock = acquireSingleWriterLock("refresh-evidence");
   try {
+  assertNotRatified("refresh-evidence");
   const { cfg, corpus } = loadPinned();
   const rt = makePinRuntime(cfg);
   try {
@@ -2178,8 +2207,18 @@ function loadScoreBundle(): { bundle: ScoreBundle; rat: Record<string, unknown> 
   const rat = JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>;
   const noiseBand = rat["noiseBand"];
   if (typeof noiseBand !== "number") throw new Error("ratification.json carries no numeric noiseBand");
+  // the band is not taken on faith (codex C0-R1 finding 12): it must equal pilot.json's
+  // calibrated value AND re-derive from the pilot spread under the frozen §4.7 formula
+  const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number; pilotSpread?: number };
+  if (noiseBand !== pilot.noiseBand)
+    throw new Error(`ratification.json noiseBand (${noiseBand}) != pilot.json's calibrated band (${String(pilot.noiseBand)})`);
+  if (typeof pilot.pilotSpread !== "number" || noiseBandFrom(cfg, pilot.pilotSpread) !== noiseBand)
+    throw new Error(`the ratified band ${noiseBand} does not re-derive from the pilot spread ${String(pilot.pilotSpread)} under the frozen formula`);
+  const ratifiedDigest = rat["frozenSurfaceDigest"];
+  if (typeof ratifiedDigest !== "string" || ratifiedDigest.length === 0)
+    throw new Error("ratification.json carries no frozenSurfaceDigest — scoring cannot scope the fidelity ledger");
   return {
-    bundle: { cfg, corpus, workloads, runsLines: readArtifactLines("runs.jsonl"), fidelityLines: readArtifactLines("fidelity.jsonl"), noiseBand },
+    bundle: { cfg, corpus, workloads, runsLines: readArtifactLines("runs.jsonl"), fidelityLines: readArtifactLines("fidelity.jsonl"), noiseBand, ratifiedDigest },
     rat,
   };
 }
@@ -2239,11 +2278,18 @@ async function cmdReport(): Promise<void> {
       continue;
     }
   }
+  const ratified = String(rat["frozenSurfaceDigest"] ?? "");
   const readJson = (name: string): Record<string, unknown> | null => {
     const p = join(ARTIFACTS, name);
-    return existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>) : null;
+    if (!existsSync(p)) return null;
+    const artifact = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
+    // every informational artifact must carry the SAME ratified stamp as the matrix evidence —
+    // a report must never present artifacts from different freezes under one digest (codex
+    // C0-R1 finding 16)
+    if (artifact["frozenSurfaceDigest"] !== ratified)
+      throw new Error(`${name} is stamped ${String(artifact["frozenSurfaceDigest"]).slice(0, 12)}… but the ratified digest is ${ratified.slice(0, 12)}… — regenerate it under the current freeze or leave it out`);
+    return artifact;
   };
-  const ratified = String(rat["frozenSurfaceDigest"] ?? "");
   const live = frozenSurfaceDigest();
   // the report is a pure reader (§8's carve-out) so a changed tree only WARNS — but the stamp
   // is always the ratified digest the evidence actually bound to, never the live tree's
@@ -2275,11 +2321,11 @@ async function cmdBoundaryProbe(): Promise<void> {
     if (tree.truncated) throw new Error("C2's REST tree is truncated — the boundary probe's planning source is gone");
     const blobs = tree.paths.filter((e) => e.type === "blob" && typeof e.size === "number").map((e) => ({ path: e.path, oid: e.sha, size: e.size as number }));
     const cells = planBoundaryCells(blobs);
-    const results = await runBoundaryProbe(
+    const probeRun = await runBoundaryProbe(
       { gh: rt.gh, cfg, owner: c2.owner, repo: c2.repo, sha: unit.sha, log, now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
       cells,
     );
-    writeFileSync(join(ARTIFACTS, "boundary-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, repo: `${c2.owner}/${c2.repo}`, sha: unit.sha, cells: results }, null, 2)}\n`);
+    writeFileSync(join(ARTIFACTS, "boundary-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, repo: `${c2.owner}/${c2.repo}`, sha: unit.sha, bucketBefore: probeRun.before, bucketAfter: probeRun.after, finalWashoutMs: probeRun.finalWashoutMs, cells: probeRun.cells }, null, 2)}\n`);
     log("boundary-probe.json written — informational, not scored (§4.4)");
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });

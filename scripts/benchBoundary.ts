@@ -9,7 +9,8 @@
 // requires; runs under the §8 freeze gate like every evidence-generating executor.
 
 import type { BenchConfig } from "./benchConfig.ts";
-import { benchGraphqlDispatch, type BenchGhContext } from "./benchGh.ts";
+import { benchGraphqlDispatch, outstandingHorizonMs, readRateLimit, type BenchGhContext, type RateLimitSnapshot } from "./benchGh.ts";
+import { washoutMs } from "./benchProtocol.ts";
 import { buildBatchQuery } from "./benchT1.ts";
 import type { WorkloadEntry } from "./benchWorkload.ts";
 
@@ -93,7 +94,11 @@ export interface BoundaryTryResult {
   jsonParseable: boolean;
   errorTypes: string[]; // distinct errors[].type values observed
   malformedErrorEntries: number;
-  resolvedAliases: number; // aliases that came back as readable objects in data.repository
+  // an alias counts as RESOLVED only when its payload validates (oid echo + string text) — a
+  // bare object count would launder error-shaped or null-content aliases into successes
+  // (codex C0-R1 finding 14)
+  resolvedAliases: number;
+  objectAliases: number; // any non-null object came back (the raw shape count, for contrast)
   pointsCost: number | null;
   wallMs: number;
   bodyBytes: number;
@@ -120,13 +125,34 @@ export interface BoundaryProbeDeps {
   sleep: (ms: number) => Promise<void>;
 }
 
+export interface BoundaryProbeRun {
+  before: RateLimitSnapshot;
+  after: RateLimitSnapshot;
+  finalWashoutMs: number;
+  cells: BoundaryCellResult[];
+}
+
 const toEntry = (b: BoundaryBlob): WorkloadEntry => ({
   path: b.path, mode: "100644", blobOid: b.oid, size: b.size, class: "source",
   read: true, noReadReason: null, canonicalSeamSha256: null, rawSha256: null,
   restDerefSeamSha256: null, checkoutSeamSha256: null, gql: null,
 });
 
-export async function runBoundaryProbe(deps: BoundaryProbeDeps, cells: readonly BoundaryCellPlan[]): Promise<BoundaryCellResult[]> {
+export async function runBoundaryProbe(deps: BoundaryProbeDeps, cells: readonly BoundaryCellPlan[]): Promise<BoundaryProbeRun> {
+  // admission before the sweep (codex C0-R1 finding 14): reserve the worst plausible spend —
+  // every dispatch at the frozen P_max bound — and sleep to the reset epoch when short, so an
+  // above-cap sweep cannot start into a bucket another consumer needs
+  const dispatches = cells.length * BOUNDARY_TRIES_PER_CELL;
+  const needGraphql = Math.ceil(dispatches * deps.cfg.budget.pMaxPointsPerGraphqlAttempt * deps.cfg.budget.headroomFactor);
+  for (;;) {
+    const snap = await readRateLimit(deps.gh);
+    deps.log(`boundary admission: need graphql ${needGraphql} (have ${snap.graphql.remaining})`);
+    if (snap.graphql.remaining >= needGraphql) break;
+    const wait = Math.max(snap.graphql.reset * 1000 + 5000 - deps.now(), 30_000);
+    deps.log(`boundary admission: headroom short — sleeping ${Math.ceil(wait / 1000)}s to the reset epoch`);
+    await deps.sleep(wait);
+  }
+  const before = await readRateLimit(deps.gh);
   const results: BoundaryCellResult[] = [];
   for (const [cellIndex, cell] of cells.entries()) {
     if (cellIndex > 0) await deps.sleep(CELL_GAP_MS);
@@ -147,7 +173,7 @@ export async function runBoundaryProbe(deps: BoundaryProbeDeps, cells: readonly 
         result.tries.push({
           tryOrdinal: t, dispatched: false, status: 0, classification: "undispatchable",
           jsonParseable: false, errorTypes: [], malformedErrorEntries: 0, resolvedAliases: 0,
-          pointsCost: null, wallMs: 0, bodyBytes: 0, secondaryLike: false,
+          objectAliases: 0, pointsCost: null, wallMs: 0, bodyBytes: 0, secondaryLike: false,
         });
         continue;
       }
@@ -156,22 +182,32 @@ export async function runBoundaryProbe(deps: BoundaryProbeDeps, cells: readonly 
       const repo = d.data?.["repository"];
       const repoObj = typeof repo === "object" && repo !== null && !Array.isArray(repo) ? (repo as Record<string, unknown>) : null;
       let resolved = 0;
+      let objects = 0;
       for (let i = 0; i < cell.aliasCount; i++) {
         const alias = repoObj?.[`a${i}`];
-        if (typeof alias === "object" && alias !== null) resolved++;
+        if (typeof alias !== "object" || alias === null) continue;
+        objects++;
+        const o = alias as Record<string, unknown>;
+        if (o["oid"] === cell.blobs[i]!.oid && typeof o["text"] === "string") resolved++;
       }
       result.tries.push({
         tryOrdinal: t, dispatched: true, status: d.status, classification: d.classification,
         jsonParseable: d.jsonParseable,
         errorTypes: [...new Set(d.errors.map((e) => e.type ?? "?"))],
         malformedErrorEntries: d.malformedErrorEntries,
-        resolvedAliases: resolved, pointsCost: d.pointsCost,
+        resolvedAliases: resolved, objectAliases: objects, pointsCost: d.pointsCost,
         wallMs: deps.now() - startedAt, bodyBytes: Buffer.byteLength(d.bodyText, "utf8"),
         secondaryLike: d.secondaryLike,
       });
-      deps.log(`  try ${t}: HTTP ${d.status} (${d.classification}), ${resolved}/${cell.aliasCount} aliases resolved, cost ${d.pointsCost ?? "?"}`);
+      deps.log(`  try ${t}: HTTP ${d.status} (${d.classification}), ${resolved}/${cell.aliasCount} aliases validated (${objects} objects), cost ${d.pointsCost ?? "?"}`);
     }
     results.push(result);
   }
-  return results;
+  const after = await readRateLimit(deps.gh);
+  // the sweep ends with a full washout of its own throttle horizon so an above-cap burst
+  // cannot bleed into the next executor's window (codex C0-R1 finding 14)
+  const finalWashoutMs = washoutMs(deps.cfg, outstandingHorizonMs(deps.gh), deps.now());
+  deps.log(`boundary probe done — final washout ${Math.ceil(finalWashoutMs / 1000)}s`);
+  await deps.sleep(finalWashoutMs);
+  return { before, after, finalWashoutMs, cells: results };
 }
