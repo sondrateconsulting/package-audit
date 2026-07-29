@@ -1,0 +1,346 @@
+// benchGh.ts — the benchmark's REST/GraphQL attempt layer (resolution plan §4.4/§4.6). Spawns
+// ride the PRODUCTION chokepoint (GithubClient.gh — guard, sanitized env, semaphore, spawn
+// deadline all production), while the attempt loop is a faithful transcription of restGet's
+// semantics using the EXPORTED production classifiers (classifyRest / classifyGraphql /
+// parseGhApiOutput) — reused, never reimplemented — because the drivers must OBSERVE what
+// production hides: per-attempt status/headers/bodies, secondary-limit signals classified as
+// production classifies them (github.ts:541), per-request GraphQL point costs, and
+// errors[].path attribution (the production graphql() drops partial data by design, ADR §3).
+// Every attempt is recorded; the recorder feeds runs.jsonl and the G4 signal classifier.
+
+import { createHash } from "node:crypto";
+import {
+  GithubClient, GithubApiError, classifyRest, classifyGraphql, parseGhApiOutput,
+  type HttpResponse,
+} from "./github.ts";
+import type { AuditDb } from "./db.ts";
+import type { BenchConfig } from "./benchConfig.ts";
+
+export class BenchHttpError extends Error {
+  readonly code: string;
+  readonly status: number;
+  constructor(code: string, message: string, status = 0) {
+    super(`BENCH HTTP: ${message}`);
+    this.name = "BenchHttpError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+// ---- recording -------------------------------------------------------------------------------
+export type SecondarySignalKind = "status-429" | "retry-after-403" | "body-secondary" | "graphql-rate-limited";
+export type RequestClass = "rest-content" | "rest-tree" | "rest-fallback" | "rest-meta" | "graphql-batch";
+
+export interface BenchHttpAttemptRecord {
+  type: "http-attempt";
+  atMs: number;
+  wallMs: number;
+  kind: "rest" | "graphql";
+  requestClass: RequestClass;
+  label: string; // endpoint or batch label, never a token-bearing string
+  attempt: number; // 1-based within this call
+  status: number;
+  exitCode: number;
+  classification: string; // ok | primary | secondary | transient | fatal | no-response | truncated
+  secondarySignal: SecondarySignalKind | null;
+  pointsCost: number | null; // graphql rateLimit.cost when readable; 1 imputed by the caller's accounting
+  remaining: number | null;
+  resetEpochSec: number | null;
+  servedFromCache: boolean;
+}
+export type BenchHttpRecorder = (rec: BenchHttpAttemptRecord) => void;
+
+// production-shape secondary-signal detection (github.ts:541's classes, made visible):
+// header-signalled 429/retry-after, body-signalled 403 secondary responses, and GraphQL
+// RATE_LIMITED error codes.
+const SECONDARY_BODY_RE = /secondary rate limit|abuse detection|abuse rate limit/i;
+export function detectRestSecondarySignal(status: number, headers: Record<string, string>, body: string): SecondarySignalKind | null {
+  if (status !== 403 && status !== 429) return null;
+  if (headers["x-ratelimit-remaining"] === "0") return null; // PRIMARY exhaustion, not a secondary signal
+  if (status === 429) return "status-429";
+  if (headers["retry-after"] !== undefined) return "retry-after-403";
+  if (SECONDARY_BODY_RE.test(body)) return "body-secondary";
+  return null;
+}
+
+const headerInt = (v: string | undefined): number | null => {
+  if (v === undefined || !/^\d+$/.test(v.trim())) return null;
+  const n = Number(v.trim());
+  return Number.isSafeInteger(n) ? n : null;
+};
+
+// ---- bucket state (serial protocol — one run at a time, plan §4.5) ---------------------------
+export interface BenchBucket {
+  label: "core" | "graphql";
+  pausedUntilMs: number; // the outstanding throttle horizon — washout reads it after the run
+}
+
+export interface BenchGhContext {
+  client: GithubClient;
+  db: AuditDb | null; // the run's fresh cache DB (null for probe/meta traffic)
+  cfg: BenchConfig;
+  core: BenchBucket;
+  graphql: BenchBucket;
+  record: BenchHttpRecorder;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+export function makeBuckets(): { core: BenchBucket; graphql: BenchBucket } {
+  return { core: { label: "core", pausedUntilMs: 0 }, graphql: { label: "graphql", pausedUntilMs: 0 } };
+}
+
+// the outstanding throttle horizon across both buckets — §4.5's washout term
+export function outstandingHorizonMs(ctx: BenchGhContext): number {
+  return Math.max(ctx.core.pausedUntilMs, ctx.graphql.pausedUntilMs);
+}
+
+// mirror of production's endpointIsShaPinned gate (github.ts keeps it private): only a
+// SHA-pinned endpoint may serve the zero-network immutable cache hit.
+const HEX_OBJECT_ID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
+export function endpointIsShaPinned(endpoint: string): boolean {
+  const [path, query = ""] = endpoint.split("?");
+  if (/\/git\/(blobs|trees)\/[0-9a-f]{40}([0-9a-f]{24})?(\/|$)/i.test(path ?? "")) return true;
+  const ref = new URLSearchParams(query).get("ref") ?? "";
+  return HEX_OBJECT_ID_RE.test(ref);
+}
+
+const cacheKey = (host: string, endpoint: string): string => `bench1:${host}:${endpoint}`;
+
+async function waitBucket(ctx: BenchGhContext, bucket: BenchBucket): Promise<void> {
+  const wait = bucket.pausedUntilMs - ctx.now();
+  if (wait > 0) await ctx.sleep(wait);
+}
+
+const backoffWait = (cfg: BenchConfig, kind: "secondary" | "transient", attempt: number, waitMs: number | null): number => {
+  if (waitMs !== null) return waitMs;
+  const base = kind === "secondary" ? cfg.rest.secondaryBaseWaitMs : cfg.rest.transientBaseWaitMs;
+  return base * 2 ** attempt;
+};
+
+// ---- REST GET (restGet transcription, recorded) ----------------------------------------------
+export interface BenchRestOptions {
+  endpoint: string;
+  accept?: string;
+  immutable?: boolean;
+  requestClass: RequestClass;
+}
+
+export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions): Promise<HttpResponse> {
+  const accept = opts.accept ?? "";
+  const immutable = opts.immutable === true && endpointIsShaPinned(opts.endpoint);
+  const key = cacheKey(ctx.cfg.githubHost, opts.endpoint);
+  const cached = ctx.db?.getApiCache("GET", key, accept) ?? null;
+  if (immutable && cached !== null && cached.responseBody !== null) {
+    ctx.record({
+      type: "http-attempt", atMs: ctx.now(), wallMs: 0, kind: "rest", requestClass: opts.requestClass,
+      label: opts.endpoint, attempt: 0, status: 200, exitCode: 0, classification: "cache",
+      secondarySignal: null, pointsCost: null, remaining: null, resetEpochSec: null, servedFromCache: true,
+    });
+    return { status: 200, headers: {}, body: cached.responseBody };
+  }
+  const args = ["api", "-i", opts.endpoint];
+  if (accept !== "") args.push("-H", `Accept: ${accept}`);
+  if (cached?.etag != null && cached.responseBody !== null) args.push("-H", `If-None-Match: ${cached.etag}`);
+
+  for (let attempt = 0; attempt < ctx.cfg.rest.attemptCap; attempt++) {
+    await waitBucket(ctx, ctx.core);
+    const startedAt = ctx.now();
+    const res = await ctx.client.gh(args);
+    const now = ctx.now();
+    const parsed = parseGhApiOutput(res.stdout);
+    const emit = (classification: string, signal: SecondarySignalKind | null): void => {
+      ctx.record({
+        type: "http-attempt", atMs: startedAt, wallMs: now - startedAt, kind: "rest",
+        requestClass: opts.requestClass, label: opts.endpoint, attempt: attempt + 1,
+        status: parsed.status, exitCode: res.exitCode, classification,
+        secondarySignal: signal, pointsCost: null,
+        remaining: headerInt(parsed.headers["x-ratelimit-remaining"]),
+        resetEpochSec: headerInt(parsed.headers["x-ratelimit-reset"]),
+        servedFromCache: false,
+      });
+    };
+    if (parsed.status === 0) {
+      emit("no-response", null);
+      if (attempt < ctx.cfg.rest.attemptCap - 1) {
+        await ctx.sleep(backoffWait(ctx.cfg, "transient", attempt, null));
+        continue;
+      }
+      throw new BenchHttpError("no-response", `gh api produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`);
+    }
+    if (parsed.status === 304 && cached !== null && cached.responseBody !== null) {
+      emit("not-modified", null);
+      return { status: 200, headers: parsed.headers, body: cached.responseBody };
+    }
+    if (parsed.status === 200 && res.exitCode !== 0) {
+      emit("truncated", null);
+      if (attempt < ctx.cfg.rest.attemptCap - 1) {
+        await ctx.sleep(backoffWait(ctx.cfg, "transient", attempt, null));
+        continue;
+      }
+      throw new BenchHttpError("truncated-transfer", `gh exited ${res.exitCode} with an HTTP 200 response`);
+    }
+    const cls = classifyRest(parsed.status, parsed.headers, parsed.body, now);
+    const signal = detectRestSecondarySignal(parsed.status, parsed.headers, parsed.body);
+    if (cls.kind === "ok") {
+      emit("ok", signal);
+      if (parsed.status === 200 && ctx.db !== null) {
+        const entry = { method: "GET" as const, url: key, variantHash: accept, etag: parsed.headers["etag"] ?? null, responseBody: parsed.body };
+        if (immutable) ctx.db.putApiCacheImmutable(entry);
+        else ctx.db.putApiCache(entry);
+      }
+      return parsed;
+    }
+    if (cls.kind === "fatal") {
+      emit("fatal", signal);
+      throw new BenchHttpError("fatal", `${cls.message} (${opts.endpoint})`, cls.status);
+    }
+    if (cls.kind === "primary") {
+      emit("primary", signal);
+      ctx.core.pausedUntilMs = Math.max(ctx.core.pausedUntilMs, cls.untilMs);
+      continue; // the next attempt's waitBucket sleeps the window
+    }
+    emit(cls.kind, signal); // secondary | transient
+    await ctx.sleep(backoffWait(ctx.cfg, cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null));
+  }
+  throw new BenchHttpError("attempts-exhausted", `REST attempts exhausted for ${opts.endpoint}`);
+}
+
+export async function benchRestJson(ctx: BenchGhContext, opts: BenchRestOptions): Promise<unknown> {
+  const res = await benchRestGet(ctx, opts);
+  try {
+    return JSON.parse(res.body);
+  } catch {
+    throw new BenchHttpError("invalid-json", `invalid JSON from ${opts.endpoint}`, res.status);
+  }
+}
+
+// ---- GraphQL dispatch (full-visibility envelope, single attempt) -----------------------------
+// One PHYSICAL dispatch — the T1 driver owns the attempt loop, splits, and the transition
+// table; this layer parses the envelope with errors[].path preserved and reads rateLimit.cost.
+export interface BenchGraphqlErrorEntry {
+  type: string | null;
+  message: string | null;
+  path: ReadonlyArray<string | number> | null;
+}
+export interface BenchGraphqlDispatch {
+  status: number;
+  exitCode: number;
+  headers: Record<string, string>;
+  bodyText: string;
+  data: Record<string, unknown> | null;
+  errors: BenchGraphqlErrorEntry[];
+  jsonParseable: boolean;
+  classification: string; // classifyGraphql's verdict on status/header/error-type semantics
+  secondaryLike: boolean; // RATE_LIMITED body or secondary classification (G4 + backoff input)
+  primaryUntilMs: number | null;
+  pointsCost: number | null; // rateLimit.cost when the rider was readable
+}
+
+export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, unknown> | null; errors: BenchGraphqlErrorEntry[]; jsonParseable: boolean } {
+  let root: unknown;
+  try {
+    root = JSON.parse(bodyText);
+  } catch {
+    return { data: null, errors: [], jsonParseable: false };
+  }
+  if (typeof root !== "object" || root === null || Array.isArray(root)) return { data: null, errors: [], jsonParseable: false };
+  const o = root as Record<string, unknown>;
+  const dataRaw = o["data"];
+  const data = typeof dataRaw === "object" && dataRaw !== null && !Array.isArray(dataRaw) ? (dataRaw as Record<string, unknown>) : null;
+  const errors: BenchGraphqlErrorEntry[] = [];
+  const errRaw = o["errors"];
+  if (Array.isArray(errRaw)) {
+    for (const e of errRaw) {
+      if (typeof e !== "object" || e === null || Array.isArray(e)) continue;
+      const eo = e as Record<string, unknown>;
+      const pathRaw = eo["path"];
+      const path = Array.isArray(pathRaw) && pathRaw.every((p) => typeof p === "string" || typeof p === "number")
+        ? (pathRaw as Array<string | number>)
+        : null;
+      errors.push({
+        type: typeof eo["type"] === "string" ? (eo["type"] as string) : null,
+        message: typeof eo["message"] === "string" ? (eo["message"] as string) : null,
+        path,
+      });
+    }
+  }
+  return { data, errors, jsonParseable: true };
+}
+
+export async function benchGraphqlDispatch(
+  ctx: BenchGhContext,
+  query: string,
+  fields: Record<string, string>,
+  label: string,
+): Promise<BenchGraphqlDispatch> {
+  await waitBucket(ctx, ctx.graphql);
+  const args = ["api", "-i", "graphql", "-f", `query=${query}`];
+  for (const [k, v] of Object.entries(fields)) args.push("-f", `${k}=${v}`);
+  const startedAt = ctx.now();
+  const res = await ctx.client.gh(args);
+  const now = ctx.now();
+  const parsed = parseGhApiOutput(res.stdout);
+  const full = parseGraphqlBodyFull(parsed.body);
+  const cls = classifyGraphql(
+    parsed.status, parsed.headers,
+    full.errors.map((e) => ({ ...(e.type === null ? {} : { type: e.type }), ...(e.message === null ? {} : { message: e.message }) })),
+    now,
+  );
+  const rateLimited = full.errors.some((e) => e.type === "RATE_LIMITED");
+  const secondaryLike = cls.kind === "secondary" || (rateLimited && cls.kind !== "primary");
+  let pointsCost: number | null = null;
+  const rl = full.data?.["rateLimit"];
+  if (typeof rl === "object" && rl !== null && !Array.isArray(rl)) {
+    const cost = (rl as Record<string, unknown>)["cost"];
+    if (typeof cost === "number" && Number.isSafeInteger(cost) && cost >= 0) pointsCost = cost;
+  }
+  const signal: SecondarySignalKind | null = rateLimited
+    ? "graphql-rate-limited"
+    : detectRestSecondarySignal(parsed.status, parsed.headers, parsed.body);
+  ctx.record({
+    type: "http-attempt", atMs: startedAt, wallMs: now - startedAt, kind: "graphql",
+    requestClass: "graphql-batch", label, attempt: 1, status: parsed.status, exitCode: res.exitCode,
+    classification: cls.kind, secondarySignal: signal, pointsCost,
+    remaining: headerInt(parsed.headers["x-ratelimit-remaining"]),
+    resetEpochSec: headerInt(parsed.headers["x-ratelimit-reset"]),
+    servedFromCache: false,
+  });
+  if (cls.kind === "primary") ctx.graphql.pausedUntilMs = Math.max(ctx.graphql.pausedUntilMs, cls.untilMs);
+  return {
+    status: parsed.status, exitCode: res.exitCode, headers: parsed.headers, bodyText: parsed.body,
+    data: full.data, errors: full.errors, jsonParseable: full.jsonParseable,
+    classification: cls.kind, secondaryLike,
+    primaryUntilMs: cls.kind === "primary" ? cls.untilMs : null,
+    pointsCost,
+  };
+}
+
+// ---- blob-hash validation (T1's per-alias check; T2c's frame check shares the helper) --------
+export function gitBlobOid(bytes: Uint8Array, algo: "sha1" | "sha256"): string {
+  const h = createHash(algo === "sha1" ? "sha1" : "sha256");
+  h.update(`blob ${bytes.byteLength}\0`);
+  h.update(bytes);
+  return h.digest("hex");
+}
+
+// ---- rate_limit snapshots (bucket-delta accounting, §4.6) ------------------------------------
+export interface RateLimitSnapshot {
+  core: { remaining: number; reset: number; used: number };
+  graphql: { remaining: number; reset: number; used: number };
+  atMs: number;
+}
+export async function readRateLimit(ctx: BenchGhContext): Promise<RateLimitSnapshot> {
+  // rate_limit is documented as not counting against the REST primary limit; it is still a
+  // recorded spawn (requestClass rest-meta) so accounting can prove zero unexplained traffic.
+  const json = (await benchRestJson(ctx, { endpoint: "rate_limit", requestClass: "rest-meta" })) as {
+    resources?: Record<string, { remaining?: number; reset?: number; used?: number }>;
+  };
+  const read = (name: string): { remaining: number; reset: number; used: number } => {
+    const r = json.resources?.[name];
+    if (r === undefined || typeof r.remaining !== "number" || typeof r.reset !== "number" || typeof r.used !== "number")
+      throw new BenchHttpError("rate-limit-shape", `rate_limit response missing resources.${name}`);
+    return { remaining: r.remaining, reset: r.reset, used: r.used };
+  };
+  return { core: read("core"), graphql: read("graphql"), atMs: ctx.now() };
+}

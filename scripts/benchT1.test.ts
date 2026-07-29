@@ -1,0 +1,180 @@
+// benchT1.test.ts — CI tests for T1's pure planning + the §4.4 exhaustive transition table.
+import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import { loadBenchConfig } from "./benchConfig.ts";
+import { gitBlobOid, type BenchGraphqlDispatch } from "./benchGh.ts";
+import {
+  BenchT1Error, analyzeBatchResponse, buildBatchQuery, fivexxSplitConditionMet,
+  packBatches, planRounds, splitEntries,
+} from "./benchT1.ts";
+import { buildUnitWorkload, seamStringSha256, type WorkloadEntry } from "./benchWorkload.ts";
+
+const CFG = loadBenchConfig(join(import.meta.dir, "..", "docs", "adrs", "0001-benchmark", "bench-config.json"));
+const sha = (c: string): string => c.repeat(40);
+
+const entry = (path: string, over: Partial<WorkloadEntry> = {}): WorkloadEntry => ({
+  path, mode: "100644", blobOid: sha("c"), size: 10, class: "source", read: true, noReadReason: null,
+  canonicalSeamSha256: seamStringSha256("x"), rawSha256: seamStringSha256("x"),
+  restDerefSeamSha256: null, checkoutSeamSha256: seamStringSha256("co"),
+  gql: { isBinary: false, isTruncated: false, textNull: false },
+  ...over,
+});
+
+describe("planRounds", () => {
+  const workload = buildUnitWorkload({
+    unit: "C2:o/r@main", sha: sha("0"), treeOid: sha("f"), objectFormat: "sha1",
+    generatedAtIso: "2026-07-28T00:00:00Z", truncatedTree: false, escapeTripped: false,
+    batchContentBytesCap: CFG.t1.batchContentBytesCap,
+    entries: [
+      entry("package.json", { class: "manifest" }),
+      entry("run.sh", { class: "cli" }),
+      entry("src/a.ts", { class: "source" }),
+      entry("package-lock.json", { class: "lockfile" }),
+      entry("link", { mode: "120000", restDerefSeamSha256: seamStringSha256("deref"), gql: null }),
+      entry("img.png", { gql: { isBinary: true, isTruncated: false, textNull: true } }),
+      entry("pkg/bun.lockb", { class: "lockfile", read: false, noReadReason: "binary-lockfile-skip", canonicalSeamSha256: null, rawSha256: null, checkoutSeamSha256: null, gql: null }),
+    ],
+  });
+  test("two-round shape as the production design forces; pre-routed entries never batch", () => {
+    const plan = planRounds(workload);
+    expect(plan.round1.map((e) => e.path)).toEqual(["package.json", "run.sh"]);
+    expect(plan.round2.map((e) => e.path)).toEqual(["src/a.ts", "package-lock.json"]);
+    expect(plan.preRouted.map((p) => [p.entry.path, p.route])).toEqual([
+      ["link", "symlink-fallback"],
+      ["img.png", "binary-fallback"],
+    ]);
+  });
+});
+
+describe("query construction + packing", () => {
+  test("paths ride VARIABLES, never the query document (quotes/newlines cannot inject)", () => {
+    const hostile = entry('a"b\\c\nnewline.ts');
+    const batch = buildBatchQuery([hostile], {
+      owner: "o", repo: "r", sha: sha("0"),
+      aliasSelection: CFG.t1.aliasSelection, rateLimitRider: CFG.t1.rateLimitRider, label: "t.b0",
+    });
+    expect(batch.query).not.toContain("newline");
+    expect(batch.query).toContain("a0:object(expression: $v0)");
+    expect(batch.query).toContain(CFG.t1.rateLimitRider);
+    expect(batch.fields["v0"]).toBe(`${sha("0")}:${hostile.path}`);
+  });
+  test("packing respects the alias cap and the per-batch content estimate", () => {
+    const many = Array.from({ length: 600 }, (_, i) => entry(`f${i}.ts`));
+    const batches = packBatches(many, CFG, { owner: "o", repo: "r", sha: sha("0"), roundLabel: "r2" });
+    expect(batches.length).toBeGreaterThanOrEqual(3); // 600 / 250 cap
+    for (const b of batches) {
+      expect(b.entries.length).toBeLessThanOrEqual(CFG.t1.aliasCap);
+      expect(b.queryBytes).toBeLessThanOrEqual(CFG.t1.queryDocBytesCap);
+      expect(b.argvBytes).toBeLessThanOrEqual(CFG.t1.argvBytesCap);
+    }
+    expect(batches.flatMap((b) => b.entries.map((e) => e.path))).toEqual(many.map((e) => e.path)); // contiguous, complete
+    const big = [entry("big1", { size: 1_000_000 }), entry("big2", { size: 1_000_000 }), entry("big3", { size: 1_000_000 })];
+    const byContent = packBatches(big, CFG, { owner: "o", repo: "r", sha: sha("0"), roundLabel: "r2" });
+    expect(byContent.length).toBeGreaterThanOrEqual(2); // 3 MB does not fit the 1.5 MiB estimate cap
+  });
+});
+
+// ---- the transition table --------------------------------------------------------------------
+const TEXT = "hello t1\n";
+const goodEntry = entry("good.ts", { blobOid: gitBlobOid(Buffer.from(TEXT, "utf8"), "sha1"), size: Buffer.byteLength(TEXT) });
+const BATCH = buildBatchQuery([goodEntry, entry("other.ts")], {
+  owner: "o", repo: "r", sha: sha("0"),
+  aliasSelection: CFG.t1.aliasSelection, rateLimitRider: CFG.t1.rateLimitRider, label: "t.b0",
+});
+const dispatch = (over: Partial<BenchGraphqlDispatch>): BenchGraphqlDispatch => ({
+  status: 200, exitCode: 0, headers: {}, bodyText: "{}", data: {}, errors: [], jsonParseable: true,
+  classification: "ok", secondaryLike: false, primaryUntilMs: null, pointsCost: 1,
+  ...over,
+});
+const aliasPayload = (text: string | null, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  __typename: "Blob", oid: goodEntry.blobOid, byteSize: goodEntry.size,
+  isBinary: false, isTruncated: false, text, ...over,
+});
+
+describe("analyzeBatchResponse — exhaustive, closed-default", () => {
+  test("HTTP-level failures: 5xx with empty/non-JSON body is the pinned split candidate", () => {
+    const a = analyzeBatchResponse(dispatch({ status: 502, bodyText: "", jsonParseable: false, classification: "transient" }), BATCH, "sha1", CFG);
+    expect(a).toMatchObject({ kind: "http-failure", fivexxSplitCandidate: true });
+    const b = analyzeBatchResponse(dispatch({ status: 500, bodyText: "oops", jsonParseable: false, classification: "transient" }), BATCH, "sha1", CFG);
+    expect(b).toMatchObject({ kind: "http-failure", fivexxSplitCandidate: false }); // 500 is not in the pinned {502,503,504}
+    const c = analyzeBatchResponse(dispatch({ status: 200, bodyText: "<html>", jsonParseable: false }), BATCH, "sha1", CFG);
+    expect(c).toMatchObject({ kind: "http-failure", fivexxSplitCandidate: false });
+  });
+  test("throttle semantics: primary pause, RATE_LIMITED body, secondary classification", () => {
+    expect(analyzeBatchResponse(dispatch({ classification: "primary", primaryUntilMs: 99 }), BATCH, "sha1", CFG)).toEqual({ kind: "throttle-retry", cause: "primary" });
+    expect(analyzeBatchResponse(dispatch({ errors: [{ type: "RATE_LIMITED", message: "slow down", path: null }] }), BATCH, "sha1", CFG)).toEqual({ kind: "throttle-retry", cause: "rate-limited-body" });
+    expect(analyzeBatchResponse(dispatch({ classification: "secondary" }), BATCH, "sha1", CFG)).toEqual({ kind: "throttle-retry", cause: "secondary" });
+  });
+  test("pathless TIMEOUT (type or pinned message) → split path; pathless anything-else → closed default", () => {
+    expect(analyzeBatchResponse(dispatch({ errors: [{ type: "TIMEOUT", message: null, path: null }] }), BATCH, "sha1", CFG)).toEqual({ kind: "batch-timeout" });
+    expect(analyzeBatchResponse(dispatch({ errors: [{ type: null, message: "This may be the result of a timeout", path: null }] }), BATCH, "sha1", CFG)).toEqual({ kind: "batch-timeout" });
+    expect(analyzeBatchResponse(dispatch({ errors: [{ type: "SOME_NEW_TYPE", message: "??", path: null }] }), BATCH, "sha1", CFG)).toMatchObject({ kind: "default-failure" });
+  });
+  test("per-alias resolution: valid data, validation failures, timeouts, absences, conflicts", () => {
+    const d = dispatch({
+      data: {
+        repository: {
+          a0: aliasPayload(TEXT),
+          a1: null, // reported absent with no error → missing-alias
+        },
+      },
+      errors: [],
+    });
+    const a = analyzeBatchResponse(d, BATCH, "sha1", CFG);
+    if (a.kind !== "per-alias") throw new Error(`expected per-alias, got ${a.kind}`);
+    expect(a.outcomes[0]).toEqual({ kind: "resolved", index: 0, text: TEXT });
+    expect(a.outcomes[1]).toEqual({ kind: "missing", index: 1 });
+
+    const bad = analyzeBatchResponse(
+      dispatch({ data: { repository: { a0: aliasPayload(TEXT, { byteSize: 999 }), a1: aliasPayload(null, { oid: sha("c"), byteSize: 10 }) } } }),
+      BATCH, "sha1", CFG,
+    );
+    if (bad.kind !== "per-alias") throw new Error("expected per-alias");
+    expect(bad.outcomes[0]).toMatchObject({ kind: "validation-fallback", reason: "byteSize mismatch" });
+    expect(bad.outcomes[1]).toMatchObject({ kind: "validation-fallback", reason: "text null/non-string" });
+
+    const mixed = analyzeBatchResponse(
+      dispatch({
+        data: { repository: { a0: aliasPayload(TEXT) } },
+        errors: [
+          { type: "TIMEOUT", message: null, path: ["repository", "a1"] },
+          { type: "NOT_FOUND", message: "could not resolve", path: ["repository", "a0"] }, // conflict with data
+        ],
+      }),
+      BATCH, "sha1", CFG,
+    );
+    if (mixed.kind !== "per-alias") throw new Error("expected per-alias");
+    expect(mixed.conflicts).toEqual([0]); // treated as errored, conflict recorded
+    expect(mixed.outcomes[0]!.kind).toBe("missing"); // the error side wins
+    expect(mixed.outcomes[1]).toEqual({ kind: "timeout", index: 1 });
+
+    const nothing = analyzeBatchResponse(dispatch({ data: { repository: {} } }), BATCH, "sha1", CFG);
+    if (nothing.kind !== "per-alias") throw new Error("expected per-alias");
+    expect(nothing.outcomes.map((o) => o.kind)).toEqual(["unattributed", "unattributed"]);
+  });
+  test("hash validation is real: a text whose blob hash mismatches the tree oid falls back", () => {
+    const tampered = analyzeBatchResponse(
+      dispatch({ data: { repository: { a0: aliasPayload("hello T1\n"), a1: aliasPayload(null) } } }),
+      BATCH, "sha1", CFG,
+    );
+    if (tampered.kind !== "per-alias") throw new Error("expected per-alias");
+    expect(tampered.outcomes[0]).toMatchObject({ kind: "validation-fallback", reason: "blob hash mismatch" });
+  });
+});
+
+describe("split machinery", () => {
+  test("splitEntries halves contiguously; singletons cannot split", () => {
+    const five = [entry("a"), entry("b"), entry("c"), entry("d"), entry("e")];
+    const [l, r] = splitEntries(five);
+    expect(l.map((e) => e.path)).toEqual(["a", "b", "c"]);
+    expect(r.map((e) => e.path)).toEqual(["d", "e"]);
+    expect(() => splitEntries([entry("a")])).toThrow(BenchT1Error);
+  });
+  test("the pinned 5xx split condition needs BOTH the streak and ≥80% cap utilisation", () => {
+    const smallBatch = buildBatchQuery([entry("a")], { owner: "o", repo: "r", sha: sha("0"), aliasSelection: CFG.t1.aliasSelection, rateLimitRider: CFG.t1.rateLimitRider, label: "s" });
+    expect(fivexxSplitConditionMet(smallBatch, 2, CFG)).toBe(false); // tiny batch — never split on 5xx
+    const bigBatch = buildBatchQuery(Array.from({ length: 200 }, (_, i) => entry(`f${i}`)), { owner: "o", repo: "r", sha: sha("0"), aliasSelection: CFG.t1.aliasSelection, rateLimitRider: CFG.t1.rateLimitRider, label: "b" });
+    expect(fivexxSplitConditionMet(bigBatch, 1, CFG)).toBe(false); // streak not reached
+    expect(fivexxSplitConditionMet(bigBatch, 2, CFG)).toBe(true); // 200 ≥ 0.8 × 250
+  });
+});
