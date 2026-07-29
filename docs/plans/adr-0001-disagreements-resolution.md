@@ -531,7 +531,11 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   else; no section defines its own): eligibility requires all K runs complete (G3).
   **R1/R2, the driver rerun allowance (≤1 per unit × driver):** a network-layer error outside any
   HTTP response (DNS/TLS/connect/reset), or an HTTP 5xx on a request within all declared caps
-  whose request class succeeded in at least one other repetition. **R3, foreign consumption:** an
+  whose request class succeeded in at least one other repetition — *evaluated at failure time
+  against repetitions already completed* (amended at Step B): replays execute in-slot, so a
+  qualifying 5xx that precedes any completed repetition of its class is a recorded failure, not
+  a rerun — conservative and order-stable, since the first repetition of every unit × driver
+  has no prior evidence by construction. **R3, foreign consumption:** an
   observed bucket delta the harness's own accounting cannot explain — run invalid, replayed in
   its own slot, *not* charged to the driver allowance (verified external interference).
   **R4, reset-window straddle:** run invalid, replayed in its own slot, not charged to the driver
