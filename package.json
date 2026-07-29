@@ -10,7 +10,8 @@
     "export": "bun run scripts/export.ts",
     "compare": "bun run scripts/compare.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "bench:content": "bun run scripts/benchContentTransport.ts"
   },
   "dependencies": {
     "ink": "7.1.1",
