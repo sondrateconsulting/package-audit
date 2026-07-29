@@ -230,11 +230,19 @@ judged by the decision-maker, and no numeric handicap converts one into the othe
 production database, temp prefix, or production source files. The bench builds its own bench-local
 seams, including the **framed binary spawn reader, a declared deliverable prototype** of §3.2's
 seam (its parser is a pure function with CI unit tests, including synthetic invalid-UTF-8-path,
-TAB/LF-in-path, and malformed-frame fixtures). One test-only accommodation is required and
-declared here: `github.test.ts` enforces a repo-wide single-spawn chokepoint, and its allowlist
-gains the bench spawn module — a test-list change, not a production-code change; without it Step B
-is unimplementable. The bench is not a CI network job; its pure planning functions (batch packing,
-corpus validation, frame parser, schedule table) get ordinary unit tests that do run in CI.
+TAB/LF-in-path, and malformed-frame fixtures). Two test-only accommodations are required and
+declared here — test-list changes, not production-code changes; without them Step B is
+unimplementable. **(Amended at Step B; the original text declared only the first.)** (i)
+`github.test.ts` enforces a repo-wide single-spawn chokepoint, and its allowlist gains the bench
+spawn module. (ii) `cliErrors.test.ts` enforces a repo-wide registry over every exported `Error`
+subclass (operator-facing errors must join `KNOWN_OPERATOR_ERRORS`; everything else must be
+explicitly excluded); the bench's error classes are harness-internal — they surface only through
+`bench:content`'s own top-level catch, never through the production CLIs' `renderFatal` — and
+they must stay exported for cross-module `instanceof` handling (the engine catches the drivers'
+`UnitFailure`/`DriftSignal`/`RePinRequired` terminal signals), so they join the test's exclusion
+list with that rationale recorded in place. The bench is not a CI network job; its pure planning
+functions (batch packing, corpus validation, frame parser, schedule table) get ordinary unit
+tests that do run in CI.
 Results land in `docs/adrs/0001-benchmark/` as committed artifacts: `corpus.json`,
 `bench-config.json`, per-repo `selected/*.json`, `runs.jsonl`, `report.md`.
 
@@ -728,9 +736,9 @@ Steps B–D have no calendar deadline — the gate is evidentiary, not temporal.
 
 - No production implementation of any option (no seam refactor in production code, no scheduler,
   no guard changes to `readOnlyGuard.ts` — the proposed grammars and the framed-reader prototype
-  live beside the bench until an ADR adopts them). The single declared exception: the
-  spawn-chokepoint test's allowlist gains the bench module (§4.1) — a test change, without which
-  the bench cannot exist.
+  live beside the bench until an ADR adopts them). The declared exceptions are the two §4.1
+  test-list accommodations — the spawn-chokepoint allowlist entry and the operator-error-registry
+  exclusion entries — test changes without which the bench cannot exist.
 - No CI job that talks to the network.
 - No re-litigation of settled ADR content (the M-series measurements, the limits table, the
   fail-closed rules) beyond the §5 edits.
