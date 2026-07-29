@@ -355,8 +355,16 @@ export interface RunRecord {
   attempts: { fivexx: number; retries: number; noResponse: number; secondaryByKind: Record<string, number> };
   // a reset epoch was OBSERVED to move under a consumed bucket mid-run — recorded even when a
   // driver failure or control-plane invalidation would otherwise claim the outcome, because
-  // R4 recurrence counting must see every real straddle (codex C0-R1 finding 4)
+  // R4 recurrence counting must see every real straddle (codex C0-R1 finding 4). Recurrence
+  // counts read THIS FACT, not the outcome, so precedence collisions cannot hide it (C0-R2).
   straddledReset: boolean;
+  // a control-plane snapshot failed during this attempt (segment gate or post-run) — again a
+  // FACT independent of which outcome won precedence, so the durable per-pos cap counts every
+  // occurrence (codex C0-R2 finding 3)
+  controlPlaneFailed: boolean;
+  // the frozen-surface digest the attempt ran under: rows bind to their freeze, so evidence
+  // from different freezes can never be presented as one matrix (codex C0-R2 finding 2)
+  frozenSurfaceDigest: string;
   secondarySignals: number; // attributable (driver-own matrix traffic) — G4's classifier input
   points: { measuredCostSum: number; imputed: number };
   bucketDeltas: { core: BucketDelta; graphql: BucketDelta };
@@ -465,7 +473,7 @@ export function isRerunnableEvidence(
 
 export function reconstructMatrixState(
   lines: readonly string[],
-  expect: { harnessCommit: string; envManifestHash: string } | null,
+  expect: { harnessCommit: string; envManifestHash: string; frozenSurfaceDigest?: string } | null,
 ): MatrixResumeState {
   const state: MatrixResumeState = {
     terminalPos: new Set(), terminalRowByPos: new Map(), rerunUsed: new Set(),
@@ -533,6 +541,8 @@ export function reconstructMatrixState(
         throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from harness ${String(rec["harnessCommit"]).slice(0, 12)} != current ${expect.harnessCommit.slice(0, 12)} — a re-ratified matrix starts a fresh log`);
       if (rec["envManifestHash"] !== expect.envManifestHash)
         throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from environment ${String(rec["envManifestHash"])} != current ${expect.envManifestHash}`);
+      if (expect.frozenSurfaceDigest !== undefined && rec["frozenSurfaceDigest"] !== expect.frozenSurfaceDigest)
+        throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from frozen surface ${String(rec["frozenSurfaceDigest"]).slice(0, 12)} != current ${expect.frozenSurfaceDigest.slice(0, 12)} — a re-frozen matrix starts a fresh log (§8)`);
     } else {
       identities.add(`${String(rec["harnessCommit"])}|${String(rec["envManifestHash"])}`);
       if (identities.size > 1)
@@ -545,8 +555,13 @@ export function reconstructMatrixState(
     const attemptId = typeof rec["attemptId"] === "string" ? (rec["attemptId"] as string) : "";
     if (outcome === "halt-r5-breach" || outcome === "re-pin-required")
       throw new BenchProtocolError(`REFUSING: runs.jsonl carries a terminal ${outcome} row — that is freeze-repair/amendment territory (§4.5 R5/R6), never a silent retry`);
-    if (outcome === "invalidated-straddle") state.straddleCounts.set(unit, (state.straddleCounts.get(unit) ?? 0) + 1);
-    if (outcome === "invalidated-control-plane") state.controlPlaneCounts.set(pos, (state.controlPlaneCounts.get(pos) ?? 0) + 1);
+    // recurrence counts read the recorded FACTS, never the outcome — precedence collisions
+    // (straddle over drift, straddle over control-plane) must not hide either event (C0-R2
+    // findings 1/3); rows predating the fact fields fall back to their outcome
+    if (rec["straddledReset"] === true || (rec["straddledReset"] === undefined && outcome === "invalidated-straddle"))
+      state.straddleCounts.set(unit, (state.straddleCounts.get(unit) ?? 0) + 1);
+    if (rec["controlPlaneFailed"] === true || (rec["controlPlaneFailed"] === undefined && outcome === "invalidated-control-plane"))
+      state.controlPlaneCounts.set(pos, (state.controlPlaneCounts.get(pos) ?? 0) + 1);
     if (outcome === "drift-restart") state.driftedUnits.add(unit);
     const form = rec["acquisitionForm"];
     if (form === "scaffolding") state.resumeForms.set(unit, "scaffolding");
@@ -657,6 +672,7 @@ export interface EngineOptions {
   workloads: Map<string, UnitWorkload>; // unitId → pinned workload
   benchRoot: string;
   artifactsDir: string;
+  frozenSurfaceDigest: string; // stamped into every row (codex C0-R2 finding 2)
   // per-run cache DBs live here — inside the repo's §0-permitted ./data root (AuditDb's write
   // containment demands it; the bench temp root is NOT a permitted sqlite home), one file per
   // run, deleted at teardown. NEVER the production sqlite path.
@@ -848,7 +864,8 @@ export class BenchEngine {
             probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: "production", startedAtIso: new Date(this.now()).toISOString(),
             wallMs: 0, segments: 1, outcome: "drift-restart", failureCause: `live head ${live.slice(0, 12)} moved off the pinned SHA at the pre-rep probe`,
             failureEvidence: null, requests: {}, requestClassSuccesses: {},
-            attempts: { fivexx: 0, retries: 0, noResponse: 0, secondaryByKind: {} }, straddledReset: false,
+            attempts: { fivexx: 0, retries: 0, noResponse: 0, secondaryByKind: {} }, straddledReset: false, controlPlaneFailed: false,
+            frozenSurfaceDigest: this.o.frozenSurfaceDigest,
             secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
             bucketDeltas: { core: { valid: true, used: 0 }, graphql: { valid: true, used: 0 } },
             bucketSnapshots: [],
@@ -864,7 +881,13 @@ export class BenchEngine {
           this.o.runsLog.append(driftRecord);
           this.replayOfPos = null;
           this.replayKind = null;
+          try {
+            db.close();
+          } catch {
+            // the file removal below still runs (codex C0-R2 finding 9)
+          }
           rmSync(runDir, { recursive: true, force: true });
+          for (const suffix of ["", "-wal", "-shm"]) rmSync(`${dbPath}${suffix}`, { force: true });
           return { outcome: null, verification: null, record: driftRecord };
         } else {
           form = "production";
@@ -901,7 +924,7 @@ export class BenchEngine {
     sampler.extraFiles([dbPath, `${dbPath}-wal`, `${dbPath}-shm`]); // the run's FULL footprint incl. cache sidecars (R2 f.29)
 
     if (this.childPool.pool === null) this.childPool.pool = makeChildPool(cfg.frame.childPoolSize);
-    const liveState = { fallbackSpend: 0, routesDelivered: {} as Record<string, number> };
+    const liveState: NonNullable<DriverRunContext["liveState"]> = { fallbackSpend: 0, routesDelivered: {} };
     const ctx: DriverRunContext = {
       cfg, slot, unit, workload, gh, benchRoot: this.o.benchRoot, runDir,
       gitEnv: this.gitEnvFor(row.probe),
@@ -942,6 +965,7 @@ export class BenchEngine {
     let outcome: DriverRunOutcome | null = null;
     let verification: VerificationReport | null = null;
     let runOutcome: RunRecord["outcome"] = "complete";
+    let controlPlaneFailed = false;
     let failureCause: string | null = null;
     let failureEvidence: RunRecord["failureEvidence"] = null;
     let r5: BenchProtocolError | null = null;
@@ -964,6 +988,7 @@ export class BenchEngine {
         // driver failure and never charged to the driver allowance (Step-C residual 3)
         runOutcome = "invalidated-control-plane";
         failureCause = e.message;
+        controlPlaneFailed = true;
       } else if (e instanceof UnitFailure) {
         runOutcome = "unit-failure";
         failureCause = e.cause2;
@@ -1018,7 +1043,9 @@ export class BenchEngine {
       if (r.classification === "ok" || r.classification === "not-modified")
         requestClassSuccesses[r.requestClass] = (requestClassSuccesses[r.requestClass] ?? 0) + 1;
       if (r.status >= 500) attempts.fivexx++;
-      if (r.classification === "no-response") attempts.noResponse++;
+      // a status-0 graphql dispatch is classified "fatal" by the production classifier but IS
+      // a no-response at the transport level (codex C0-R2 re f.11)
+      if (r.classification === "no-response" || r.status === 0) attempts.noResponse++;
       if (r.attempt > 1) attempts.retries++;
       if (r.kind === "graphql") {
         if (r.pointsCost !== null) measuredCostSum += r.pointsCost;
@@ -1029,6 +1056,15 @@ export class BenchEngine {
         attempts.secondaryByKind[r.secondarySignal] = (attempts.secondaryByKind[r.secondarySignal] ?? 0) + 1;
       }
     }
+    // graphql-batch "success" must be SEMANTIC, not transport-level (codex C0-R2 re f.2): a
+    // 200-ok envelope whose aliases all failed validation delivered nothing through the
+    // graphql route, and must not seed the R2 ledger for it. ≥1 alias resolved through the
+    // primary route is the demonstration the class actually works.
+    if (requestClassSuccesses["graphql-batch"] !== undefined) {
+      const live = liveState.deliveries ?? outcome?.deliveries ?? [];
+      const resolvedViaGraphql = row.driver === "T1" && live.some((d) => d.route === "primary" && d.delivered !== null && d.rawVerified === true);
+      if (!resolvedViaGraphql) delete requestClassSuccesses["graphql-batch"];
+    }
     if (r5 !== null) {
       // the minimal terminal R5 record lands BEFORE any fallible post-run work (codex R2 f.18)
       const r5disk = sampler.stop();
@@ -1037,6 +1073,7 @@ export class BenchEngine {
         probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: needsClonePath ? form : null,
         startedAtIso, wallMs, segments: segmentSizes.length, outcome: "halt-r5-breach",
         failureCause, failureEvidence: null, requests, requestClassSuccesses, attempts, straddledReset: false,
+        controlPlaneFailed, frozenSurfaceDigest: this.o.frozenSurfaceDigest,
         secondarySignals, points: { measuredCostSum, imputed },
         bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
         bucketSnapshots,
@@ -1064,6 +1101,7 @@ export class BenchEngine {
       after = await readRateLimit(ghMeta);
     } catch (e) {
       if (!(e instanceof BenchHttpError)) throw e;
+      controlPlaneFailed = true;
       if (runOutcome === "complete") {
         runOutcome = "invalidated-control-plane";
         failureCause = `post-run rate_limit snapshot failed: ${e.code}: ${e.message}`;
@@ -1072,13 +1110,33 @@ export class BenchEngine {
       }
     }
     const disk = sampler.stop();
-    if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
+    if (outcome !== null) {
+      verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
+    } else if ((liveState.deliveries ?? []).length > 0) {
+      // a thrown driver's PARTIAL deliveries still carry POSITIVE evidence — wrong bytes
+      // delivered before the failure must reach G1 (codex C0-R2 re f.10). Absence-shaped g2
+      // noise from an interrupted set is discarded here: the terminal/rerun discipline owns
+      // absences, and a partial attempt is by definition full of them.
+      const partial = verifyDeliveries(workload, liveState.deliveries ?? [], row.driver, {
+        probeRep: row.probe,
+        ...(liveState.acquiredPaths === undefined ? {} : { acquiredPaths: liveState.acquiredPaths }),
+      });
+      verification = { ...partial, g2Failures: [] };
+    }
 
     // per-segment same-window deltas, summed by construction (§4.6.2); the final (or only)
     // segment closes against the post-run snapshot. Any straddled segment invalidates the run.
+    // A straddle is an OBSERVATION over a real before/after pair — a MISSING final snapshot is
+    // a control-plane fact, not a straddle, and must neither create nor suppress one (codex
+    // C0-R2 re f.4: an earlier gate-recorded straddle survives a failed final snapshot).
+    const observedStraddle = (pairs: ReadonlyArray<{ core: BucketDelta; graphql: BucketDelta }>): boolean =>
+      pairs.some((d) => !d.core.valid || !d.graphql.valid);
+    let straddledReset = observedStraddle(segmentDeltas);
     if (after !== null) {
       bucketSnapshots.push({ before: segBefore, after });
-      segmentDeltas.push({ core: bucketDelta(segBefore.core, after.core), graphql: bucketDelta(segBefore.graphql, after.graphql) });
+      const finalPair = { core: bucketDelta(segBefore.core, after.core), graphql: bucketDelta(segBefore.graphql, after.graphql) };
+      segmentDeltas.push(finalPair);
+      straddledReset = straddledReset || observedStraddle([finalPair]);
     } else {
       segmentDeltas.push({ core: { valid: false, used: null }, graphql: { valid: false, used: null } });
     }
@@ -1092,13 +1150,13 @@ export class BenchEngine {
       return { valid: true, used };
     };
     const deltas = { core: sumDelta((d) => d.core), graphql: sumDelta((d) => d.graphql) };
-    // R4 detection is decoupled from missing snapshots and takes PRECEDENCE over driver and
-    // control-plane outcomes (codex C0-R1 finding 4): an observed reset-epoch move under a
-    // consumed bucket is a real straddle whatever else happened in the run, and hiding it
-    // behind a coincident failure would let R4 recurrence escape its two-strikes halt. Only
-    // the amendment-level re-pin outranks it (drift returns early; R5 throws before this).
-    const straddledReset = after !== null && (!deltas.core.valid || !deltas.graphql.valid);
-    if (straddledReset && runOutcome !== "re-pin-required") {
+    // R4 outranks ordinary driver/control-plane outcomes (codex C0-R1 finding 4) but NEVER the
+    // terminating classifications: a re-pin is amendment territory, and a MID-RUN DriftSignal
+    // must keep its drift-restart outcome or the unit would replay in slot on the silently
+    // switched scaffolding form and mix acquisition forms in one median — exactly what R6's
+    // epilogue exists to prevent (codex C0-R2 finding 1). The straddle FACT is recorded on the
+    // row either way, and recurrence counting reads the fact.
+    if (straddledReset && runOutcome !== "re-pin-required" && runOutcome !== "drift-restart") {
       failureCause = failureCause === null ? null : `R4 straddle superseded: ${failureCause}`;
       runOutcome = "invalidated-straddle";
     }
@@ -1127,7 +1185,8 @@ export class BenchEngine {
       acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
       startedAtIso, wallMs, segments: segmentSizes.length, outcome: runOutcome, failureCause,
       failureEvidence,
-      requests, requestClassSuccesses, attempts, straddledReset, secondarySignals,
+      requests, requestClassSuccesses, attempts, straddledReset, controlPlaneFailed,
+      frozenSurfaceDigest: this.o.frozenSurfaceDigest, secondarySignals,
       points: { measuredCostSum, imputed },
       bucketDeltas: deltas,
       bucketSnapshots,

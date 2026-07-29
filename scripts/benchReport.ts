@@ -92,14 +92,14 @@ export function buildReport(ctx: ReportContext): string {
     push(`| ${unit} | ${row.join(" | ")} |`);
   }
   push();
-  push(`### The same runs read off at a 15,000-point credential`);
+  push(`### The same runs read off at a 15,000-point credential (median, worst-of-K beside it)`);
   push();
   push(`| Unit | ${DRIVERS.join(" | ")} |`);
   push(`|---|${DRIVERS.map(() => "---:").join("|")}|`);
   for (const unit of units) {
     push(`| ${unit} | ${DRIVERS.map((d) => {
       const cell = cellFor(score, unit, d);
-      return cell.medianT15k === null ? "—" : fmt(cell.medianT15k);
+      return cell.medianT15k === null ? "—" : `${fmt(cell.medianT15k)} (worst ${fmt(cell.worstT15k ?? Number.NaN)})`;
     }).join(" | ")} |`);
   }
   push();

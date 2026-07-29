@@ -84,9 +84,11 @@ export interface DriverRunContext {
   acquisitionForm: AcquisitionForm;
   fallbackBudget: number;
   onCloneDirReady?: (dir: string) => void; // the disk sampler attaches the moment bytes can land
-  // live progress mirror the ENGINE reads when the driver throws — fallback spend and delivered
-  // routes survive a unit failure instead of flattening to zero (codex R3 f.9)
-  liveState?: { fallbackSpend: number; routesDelivered: Record<string, number> };
+  // live progress mirror the ENGINE reads when the driver throws — fallback spend, delivered
+  // routes, and the deliveries/acquisitions themselves survive a unit failure instead of
+  // flattening to zero (codex R3 f.9; C0-R2: a thrown driver's PARTIAL deliveries still carry
+  // G1 evidence — wrong bytes delivered before the failure must not vanish with it)
+  liveState?: { fallbackSpend: number; routesDelivered: Record<string, number>; deliveries?: EntryDelivery[]; acquiredPaths?: ReadonlySet<string> };
   // §4.8 segmented mode (per-file REST shapes only): the read loop is chunked into the pinned
   // segment sizes and the engine's gate runs BETWEEN segments (clock paused, bucket re-reserved,
   // per-segment deltas summed). Absent = single-segment run.
@@ -315,6 +317,10 @@ async function runTruncatedCheckout(ctx: DriverRunContext, st: RunState): Promis
 // ---- T0 --------------------------------------------------------------------------------------
 export async function runT0(ctx: DriverRunContext): Promise<DriverRunOutcome> {
   const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set(), live: ctx.liveState };
+  if (ctx.liveState !== undefined) {
+    ctx.liveState.deliveries = st.deliveries; // shared reference — the engine's partial-evidence view
+    ctx.liveState.acquiredPaths = st.acquiredPaths;
+  }
   pushNoReads(ctx, st);
   let cloneDir: string | null = null;
   const tree = await fetchRestTree(ctx, st);
@@ -345,6 +351,10 @@ async function segmentedRestReads(ctx: DriverRunContext, st: RunState, route: Ro
 // ---- T1 --------------------------------------------------------------------------------------
 export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
   const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set(), live: ctx.liveState };
+  if (ctx.liveState !== undefined) {
+    ctx.liveState.deliveries = st.deliveries; // shared reference — the engine's partial-evidence view
+    ctx.liveState.acquiredPaths = st.acquiredPaths;
+  }
   pushNoReads(ctx, st);
   let cloneDir: string | null = null;
   const tree = await fetchRestTree(ctx, st);
@@ -489,6 +499,10 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
 // ---- T2a -------------------------------------------------------------------------------------
 export async function runT2a(ctx: DriverRunContext): Promise<DriverRunOutcome> {
   const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set(), live: ctx.liveState };
+  if (ctx.liveState !== undefined) {
+    ctx.liveState.deliveries = st.deliveries; // shared reference — the engine's partial-evidence view
+    ctx.liveState.acquiredPaths = st.acquiredPaths;
+  }
   pushNoReads(ctx, st);
   if (ctx.workload.escapeTripped && !ctx.workload.truncatedTree) {
     // the size-based api-escape resolves with FULL T0 semantics (§4.4): the REST tree request
@@ -520,6 +534,10 @@ export async function runT2a(ctx: DriverRunContext): Promise<DriverRunOutcome> {
 // ---- T2c -------------------------------------------------------------------------------------
 export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Promise<() => void> }): Promise<DriverRunOutcome> {
   const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set(), live: ctx.liveState };
+  if (ctx.liveState !== undefined) {
+    ctx.liveState.deliveries = st.deliveries; // shared reference — the engine's partial-evidence view
+    ctx.liveState.acquiredPaths = st.acquiredPaths;
+  }
   pushNoReads(ctx, st);
   const { dir, headRev } = await acquireStore(ctx, { checkout: false });
   const lsIndex = await enumerateStore(ctx, dir, headRev);

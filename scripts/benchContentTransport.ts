@@ -15,7 +15,7 @@
 // Artifacts land in docs/adrs/0001-benchmark/. The pinning cache lives under ./data (a §0
 // write root, git-ignored) so re-runs are cheap; bench run dirs live under a pa-bench-* root.
 
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -157,22 +157,81 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
   const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && !APPEND_ONLY.some((a) => f.startsWith(a)));
   if (dirty.length > 0)
     throw new Error(`REFUSING: dirty tracked files outside the append-only outputs: ${dirty.slice(0, 5).join(", ")} — the frozen surface must be committed (§8)`);
-  // append-only means APPEND-only: the committed prefix of each evidence log must survive
-  // byte-identical in the working copy — a path exemption alone would let recorded failures
-  // be deleted or rewritten while the gate still passes (codex C0-R1 finding 13)
+  await assertAppendOnlyLogs({ repairTornTail: true });
+  return { rat, digest };
+}
+
+// append-only means APPEND-only (codex C0-R1 finding 13): the committed prefix of each
+// evidence log must survive byte-identical in the working copy. Trackedness is established
+// separately from readability so a git failure on a TRACKED blob refuses instead of silently
+// skipping protection (C0-R2 finding 10). Writers additionally REPAIR a torn tail — an
+// uncommitted final fragment without a newline — by truncating to the last complete line,
+// because blindly appending after it would weld two records into a malformed INTERIOR line
+// and make the log unreconstructable (C0-R2 finding 4); the torn region must lie entirely
+// beyond the committed prefix or it is corruption, not a crash artifact.
+async function assertAppendOnlyLogs(opts: { repairTornTail: boolean }): Promise<void> {
+  const repoRoot = realpathSync(REPO_ROOT);
+  const env = buildGitEnv(process.env, "/dev/null");
+  const gitRO = (argv: string[], maxStdoutBytes: number): ReturnType<typeof runBenchGit> => runBenchGit({
+    argv, lane: { lane: "pinning" }, env, benchRoot: repoRoot, cwd: repoRoot,
+    limits: { maxStdoutBytes, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
   for (const logRel of ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl"]) {
-    const committed = await runBenchGit({
-      argv: ["show", `HEAD:${logRel}`], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
-      benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 256 * 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 },
-    });
-    if (committed.exitCode !== 0) continue; // not tracked at HEAD yet — nothing to protect
+    const tracked = await gitRO(["ls-files", "--error-unmatch", logRel], 4096);
+    if (tracked.exitCode !== 0) continue; // genuinely untracked — nothing committed to protect
+    const committed = await gitRO(["show", `HEAD:${logRel}`], 256 * 1024 * 1024);
+    if (committed.exitCode !== 0) {
+      // tracked in the index but absent/unreadable at HEAD: newly staged-only files have no
+      // HEAD blob (nothing committed to protect); any OTHER failure is fail-closed
+      const stderrText = text(committed.stderr);
+      if (/does not exist|exists on disk, but not in/i.test(stderrText)) continue;
+      throw new Error(`REFUSING: cannot read HEAD:${logRel} to verify the append-only prefix (${stderrText.trim().slice(0, 160)}) — failing closed (codex C0-R2 finding 10)`);
+    }
     const workingPath = join(REPO_ROOT, logRel);
     const working = existsSync(workingPath) ? readFileSync(workingPath) : Buffer.alloc(0);
     const prefix = Buffer.from(committed.stdout);
     if (working.byteLength < prefix.byteLength || !prefix.equals(working.subarray(0, prefix.byteLength)))
       throw new Error(`REFUSING: ${logRel} is not an append of its committed content — the evidence log's history was edited (§8; codex C0-R1 finding 13)`);
+    if (opts.repairTornTail && working.byteLength > 0 && working[working.byteLength - 1] !== 0x0a) {
+      const lastNl = working.lastIndexOf(0x0a);
+      const keep = lastNl + 1; // 0 when no newline exists at all
+      if (keep < prefix.byteLength)
+        throw new Error(`REFUSING: ${logRel}'s torn tail overlaps the committed prefix — corruption, not a crash artifact`);
+      truncateSync(workingPath, keep);
+      log(`repaired ${logRel}: truncated a ${working.byteLength - keep}-byte torn uncommitted tail (crash mid-append)`);
+    }
   }
-  return { rat, digest };
+}
+
+// reader-side integrity for score/report (codex C0-R2 finding 2): the evidence INPUTS must be
+// committed and unedited. The full §8 gate's digest equality is deliberately NOT demanded —
+// the pure-reader carve-out lets scoring/report code change after collection — but the frozen
+// preregistered artifacts, the logs' committed prefixes, and (via per-row digest stamps,
+// checked in benchScore) the rows' own freeze binding all still hold.
+async function assertEvidenceReadable(): Promise<void> {
+  const repoRoot = realpathSync(REPO_ROOT);
+  const env = buildGitEnv(process.env, "/dev/null");
+  const lsFiles = await runBenchGit({
+    argv: ["ls-files", "--error-unmatch", "docs/adrs/0001-benchmark/ratification.json"],
+    lane: { lane: "pinning" }, env, benchRoot: repoRoot, cwd: repoRoot,
+    limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  if (lsFiles.exitCode !== 0)
+    throw new Error("REFUSING: ratification.json is not TRACKED — scoring reads only committed, signed answers (§8)");
+  const statusOut = await runBenchGit({
+    argv: ["status", "--porcelain"], lane: { lane: "pinning" }, env,
+    benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  const FROZEN_INPUTS = [
+    "docs/adrs/0001-benchmark/bench-config.json", "docs/adrs/0001-benchmark/corpus.json",
+    "docs/adrs/0001-benchmark/selected/", "docs/adrs/0001-benchmark/pilot.json",
+    "docs/adrs/0001-benchmark/acquisition-diagnostics.json", "docs/adrs/0001-benchmark/ratification.json",
+    "docs/plans/adr-0001-disagreements-resolution.md", "docs/adrs/0001-file-content-acquisition-strategy.md",
+  ];
+  const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && FROZEN_INPUTS.some((a) => f.startsWith(a)));
+  if (dirty.length > 0)
+    throw new Error(`REFUSING: frozen evidence inputs are edited on disk: ${dirty.slice(0, 5).join(", ")} — scoring reads only committed preregistration (codex C0-R2 finding 2)`);
+  await assertAppendOnlyLogs({ repairTornTail: false });
 }
 
 // §8: pinning-family commands REWRITE preregistered artifacts (corpus.json, selected/*,
@@ -736,6 +795,7 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
   const runsLog = new RunsLog(join(ARTIFACTS, "runs.jsonl"), manifest);
   const engine = new BenchEngine({
     cfg, corpus, workloads, benchRoot, artifactsDir: ARTIFACTS,
+    frozenSurfaceDigest: frozenSurfaceDigest(), // every row binds to its freeze (codex C0-R2 f.2)
     runCacheDir: join(REPO_ROOT, "data", "bench-run-caches"),
     runsLog,
     client: metaClient,
@@ -936,10 +996,14 @@ async function runFidelityCell(rt: PinRuntime, cfg: BenchConfig, fixture: C6Fixt
       return { route, delivered: res.body, rawVerified: null, disposition: "delivered" };
     };
     let lastKind = "";
+    let lastStatus = 0;
+    let retriedUnattributed = false;
+    let consecutiveFailedDispatches = 0;
     for (let attempt = 1; attempt <= cfg.rest.attemptCap; attempt++) {
       const d = await benchGraphqlDispatch(rt.gh, batch.query, batch.fields, batch.label, attempt);
       const analysis = analyzeBatchResponse(d, batch, fixture.objectFormat, cfg);
       lastKind = analysis.kind;
+      lastStatus = d.status;
       if (analysis.kind === "per-alias") {
         const outcome = analysis.outcomes[0];
         if (outcome?.kind === "resolved") return { route: "primary", delivered: outcome.text, rawVerified: true, disposition: "delivered" };
@@ -947,27 +1011,27 @@ async function runFidelityCell(rt: PinRuntime, cfg: BenchConfig, fixture: C6Fixt
           return restFallback(outcome.kind);
         if (outcome?.kind === "timeout") return restFallback("timeout-singleton");
         if (outcome?.kind === "missing") return restFallback("missing-alias-fallback");
-        // an unattributed alias gets the driver's one batch-level retry, then the fallback
+        // driver parity (§4.4): ONE batch-level retry for an unattributed alias, then the
+        // fallback — never the whole attempt budget (codex C0-R2 re f.7)
         if (outcome?.kind === "unattributed") {
-          if (attempt < cfg.rest.attemptCap) continue;
+          if (!retriedUnattributed && attempt < cfg.rest.attemptCap) {
+            retriedUnattributed = true;
+            continue;
+          }
           return restFallback("missing-alias-fallback");
         }
         return { route: "unresolved:per-alias", delivered: null, rawVerified: null, disposition: "content-failure" };
       }
       if (analysis.kind === "batch-timeout") return restFallback("timeout-singleton"); // an unsplittable singleton
-      if (analysis.kind === "http-failure" || analysis.kind === "throttle-retry") {
-        if (attempt < cfg.rest.attemptCap) {
-          await rt.gh.sleep(cfg.rest.transientBaseWaitMs * 2 ** Math.min(attempt, 5));
-          continue;
-        }
-        // exhausted in the frozen objective-external shapes → the ledger may permit one rerun
-        return { route: `unresolved:${analysis.kind}`, delivered: null, rawVerified: null, disposition: "external" };
-      }
-      // default-failure: retried like the driver retries it; exhaustion is deterministic
-      if (attempt >= cfg.rest.attemptCap)
-        return { route: `unresolved:${analysis.kind}`, delivered: null, rawVerified: null, disposition: "content-failure" };
+      // whole-batch failures below feed the driver's own circuit breaker (§4.4: 3 consecutive
+      // failed dispatches abort) — the battery honours the same bound (codex C0-R2 re f.7)
+      consecutiveFailedDispatches++;
+      const external = d.status === 0 || d.status >= 500; // the FROZEN objective-external shapes only
+      if (consecutiveFailedDispatches >= cfg.t1.circuitBreakerConsecutiveFailedDispatches || attempt >= cfg.rest.attemptCap)
+        return { route: `unresolved:${analysis.kind}`, delivered: null, rawVerified: null, disposition: external ? "external" : "content-failure" };
+      await rt.gh.sleep(cfg.rest.transientBaseWaitMs * 2 ** Math.min(attempt, 5));
     }
-    return { route: `unresolved:${lastKind}`, delivered: null, rawVerified: null, disposition: "content-failure" };
+    return { route: `unresolved:${lastKind}`, delivered: null, rawVerified: null, disposition: lastStatus === 0 || lastStatus >= 500 ? "external" : "content-failure" };
   }
   // clone drivers acquire through the REAL acquisition machinery + seams
   const runDir = join(rt.benchRoot, `fid-${fixture.kind}-${driver}`);
@@ -1031,6 +1095,11 @@ async function cmdFidelity(): Promise<void> {
     reconstructFidelityLedger(existsSync(fidelityPath) ? readFileSync(fidelityPath, "utf8").split("\n") : [], digest);
   let ledger = readLedger();
   const rt = makePinRuntime(cfg);
+  // the battery must EXERCISE the current freeze, never replay pre-amendment cached bodies:
+  // the persistent pin cache is swapped for a fresh per-invocation DB (codex C0-R2 finding 5)
+  const { makeDb: makeFidelityDb, disposeDb: disposeFidelityDb } = makeProbeDbFactory();
+  const fidelityCacheDb = makeFidelityDb("fidelity");
+  rt.gh = { ...rt.gh, db: fidelityCacheDb };
   try {
     for (const fixture of corpus.fidelity) {
       for (const driver of fixture.appliesTo) {
@@ -1048,9 +1117,9 @@ async function cmdFidelity(): Promise<void> {
             const expected = d.route === "symlink-fallback" || entry.mode === "120000" || typeof expectCanonical !== "string" ? expectDeref : expectCanonical;
             if (d.delivered === null) {
               // no comparison happened: only the frozen objective-external shapes earn the
-              // single rerun; everything else is a permanent content/completeness failure
-              // (codex C0-R1 finding 7)
-              outcome = d.disposition === "external" ? "attempt-error" : "mismatch";
+              // single rerun; everything else is a permanent content/completeness failure —
+              // typed as content-failure so it reaches G2, never G1 (codex C0-R1 f.7, C0-R2 f.9)
+              outcome = d.disposition === "external" ? "attempt-error" : "content-failure";
               detail = { route: d.route, pass: false, rawVerified: d.rawVerified, gotHash: null, expected, errorClass: d.disposition };
             } else {
               const gotHash = sha256Hex(Buffer.from(d.delivered, "utf8"));
@@ -1066,7 +1135,7 @@ async function cmdFidelity(): Promise<void> {
             // so a retry can never hide a nondeterministic defect (codex C0-R1 finding 7)
             const external = e instanceof BenchHttpError &&
               (e.code === "no-response" || ((e.code === "attempts-exhausted" || e.code === "http-failure") && e.lastClassification === "transient"));
-            outcome = external ? "attempt-error" : "mismatch";
+            outcome = external ? "attempt-error" : "content-failure";
             detail = { route: external ? "attempt-error" : "harness-or-content-failure", pass: false, rawVerified: null, gotHash: null, expected: null, errorClass: external ? "external" : "content-failure", error: e instanceof Error ? `${e.name}: ${e.message.slice(0, 300)}` : String(e) };
           }
           // append-only, per cell: an exception later cannot erase earlier evidence, and a
@@ -1091,6 +1160,7 @@ async function cmdFidelity(): Promise<void> {
       throw new Error(`fidelity battery INCOMPLETE: ${verdict.neverAttempted.length} applicable cell(s) never attempted — a skipped applicable fixture is a G2 event (§4.2)`);
     log(`fidelity battery: all ${verdict.cells.length} applicable cells PASS`);
   } finally {
+    disposeFidelityDb(fidelityCacheDb, "fidelity");
     rmSync(rt.benchRoot, { recursive: true, force: true });
   }
 }
@@ -1098,7 +1168,7 @@ async function cmdFidelity(): Promise<void> {
 async function cmdMatrix(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
   if (cfg.schedule === null) throw new Error("REFUSING: bench-config.json carries no pinned schedule (run pin-corpus first)");
-  await assertRatifiedAndFrozen();
+  const { digest } = await assertRatifiedAndFrozen();
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
   try {
     // ---- resumability: reconstruct terminal state from runs.jsonl via the SHARED rule ------
@@ -1109,7 +1179,7 @@ async function cmdMatrix(): Promise<void> {
     const runsPath = join(ARTIFACTS, "runs.jsonl");
     const state = reconstructMatrixState(
       existsSync(runsPath) ? readFileSync(runsPath, "utf8").split("\n") : [],
-      { harnessCommit: engine.harnessCommit(), envManifestHash: engine.envManifestHashValue() },
+      { harnessCommit: engine.harnessCommit(), envManifestHash: engine.envManifestHashValue(), frozenSurfaceDigest: digest },
     );
     const { terminalPos, rerunUsed, straddleCounts, driftedUnits, successLedger, pendingReplays } = state;
     if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
@@ -1148,10 +1218,13 @@ async function cmdMatrix(): Promise<void> {
           engine.setReplayOf(row.pos, owed);
           pendingReplays.delete(row.pos);
         }
-        // the control-plane replay cap is DURABLE across invocations: recorded invalidations
-        // seed the counter, so restarting the process cannot reset it (codex C0-R1 finding 3)
+        // the control-plane replay cap is DURABLE across invocations: recorded failures seed
+        // the counter, and the guard runs BEFORE another physical attempt — a restart must not
+        // buy one extra run per invocation (codex C0-R1 finding 3; C0-R2 verdict)
         let controlPlaneReplays = state.controlPlaneCounts.get(row.pos) ?? 0;
         for (;;) {
+          if (controlPlaneReplays > 2)
+            throw new Error(`control-plane failure recorded ${controlPlaneReplays}× at pos ${row.pos} — fix connectivity, then resume (the recorded rows stay; §4.5's in-slot replay discipline)`);
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
           if (handle.record.outcome === "complete") {
@@ -1175,11 +1248,8 @@ async function cmdMatrix(): Promise<void> {
           }
           if (handle.record.outcome === "invalidated-control-plane") {
             // a rate_limit snapshot failed (residual 3): run invalid, replay in slot, never
-            // charged to the driver — bounded, because each replay is a full physical run and
-            // a persistently dead control plane needs the operator, not a loop
+            // charged to the driver — the loop-top durable guard bounds the retries
             controlPlaneReplays++;
-            if (controlPlaneReplays > 2)
-              throw new Error(`control-plane failure persisted through ${controlPlaneReplays} attempts at pos ${row.pos} (${handle.record.failureCause ?? ""}) — fix connectivity and resume`);
             log(`control-plane invalidation on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
             engine.setReplayOf(row.pos, "r3r4");
             continue;
@@ -1331,11 +1401,19 @@ function loadScoreBundle(): { bundle: ScoreBundle; rat: Record<string, unknown> 
   if (typeof noiseBand !== "number") throw new Error("ratification.json carries no numeric noiseBand");
   // the band is not taken on faith (codex C0-R1 finding 12): it must equal pilot.json's
   // calibrated value AND re-derive from the pilot spread under the frozen §4.7 formula
-  const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number; pilotSpread?: number };
+  const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number; pilotSpread?: number; wallsMs?: number[] };
   if (noiseBand !== pilot.noiseBand)
     throw new Error(`ratification.json noiseBand (${noiseBand}) != pilot.json's calibrated band (${String(pilot.noiseBand)})`);
-  if (typeof pilot.pilotSpread !== "number" || noiseBandFrom(cfg, pilot.pilotSpread) !== noiseBand)
-    throw new Error(`the ratified band ${noiseBand} does not re-derive from the pilot spread ${String(pilot.pilotSpread)} under the frozen formula`);
+  // the spread is RECOMPUTED from the recorded walls, never trusted as declared (codex C0-R2
+  // re f.12) — pilot.json stores it at 4 decimal places, so the recomputation matches that
+  const walls = pilot.wallsMs;
+  if (!Array.isArray(walls) || walls.length === 0 || walls.some((w) => typeof w !== "number" || w <= 0))
+    throw new Error("pilot.json carries no usable wallsMs — the band cannot be re-derived");
+  const recomputedSpread = Number((Math.max(...walls) / Math.min(...walls)).toFixed(4));
+  if (recomputedSpread !== pilot.pilotSpread)
+    throw new Error(`pilot.json's declared spread ${String(pilot.pilotSpread)} != ${recomputedSpread} recomputed from its own walls`);
+  if (noiseBandFrom(cfg, recomputedSpread) !== noiseBand)
+    throw new Error(`the ratified band ${noiseBand} does not re-derive from the recomputed pilot spread ${recomputedSpread} under the frozen formula`);
   const ratifiedDigest = rat["frozenSurfaceDigest"];
   if (typeof ratifiedDigest !== "string" || ratifiedDigest.length === 0)
     throw new Error("ratification.json carries no frozenSurfaceDigest — scoring cannot scope the fidelity ledger");
@@ -1377,17 +1455,19 @@ function renderScoreToLog(out: ScoreOutput): void {
   }
   for (const cell of out.cells) {
     if (cell.medianT === null) continue;
-    log(`  ${cell.unit} ${cell.driver}: median T ${cell.medianT.toFixed(1)} files/h (worst ${(cell.worstT ?? 0).toFixed(1)}, @15k ${(cell.medianT15k ?? 0).toFixed(1)})`);
+    log(`  ${cell.unit} ${cell.driver}: median T ${cell.medianT.toFixed(1)} files/h (worst ${(cell.worstT ?? 0).toFixed(1)}); @15k median ${(cell.medianT15k ?? 0).toFixed(1)} (worst ${(cell.worstT15k ?? 0).toFixed(1)})`);
   }
   log(`§4.7 case: ${out.caseMapping.kind}${out.caseMapping.recommendation !== null ? ` → recommend ${out.caseMapping.recommendation}` : ""}`);
 }
 
 async function cmdScore(): Promise<void> {
+  await assertEvidenceReadable();
   const { bundle } = loadScoreBundle();
   renderScoreToLog(scoreMatrix(bundle));
 }
 
 async function cmdReport(): Promise<void> {
+  await assertEvidenceReadable();
   const { bundle, rat } = loadScoreBundle();
   const score = scoreMatrix(bundle);
   const envManifests: Array<Record<string, unknown>> = [];
@@ -1444,7 +1524,7 @@ async function cmdBoundaryProbe(): Promise<void> {
     const blobs = tree.paths.filter((e) => e.type === "blob" && typeof e.size === "number").map((e) => ({ path: e.path, oid: e.sha, size: e.size as number }));
     const cells = planBoundaryCells(blobs);
     const probeRun = await runBoundaryProbe(
-      { gh: rt.gh, cfg, owner: c2.owner, repo: c2.repo, sha: unit.sha, log, now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
+      { gh: rt.gh, cfg, owner: c2.owner, repo: c2.repo, sha: unit.sha, objectFormat: c2.objectFormat, log, now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
       cells,
     );
     writeFileSync(join(ARTIFACTS, "boundary-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, repo: `${c2.owner}/${c2.repo}`, sha: unit.sha, bucketBefore: probeRun.before, bucketAfter: probeRun.after, finalWashoutMs: probeRun.finalWashoutMs, cells: probeRun.cells }, null, 2)}\n`);

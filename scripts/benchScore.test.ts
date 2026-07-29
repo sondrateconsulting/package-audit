@@ -81,7 +81,8 @@ const rowLines = (spec: RowSpec): string[] => {
     replayOfPos: null, replayKind: null, diskReclaimFailed: false, probeDivergences: 0,
     httpBodyBytes: 100, cloneObjectStoreBytes: null, diskSampledPeakBytes: 1000, diskSamples: 3,
     fallbackSpend: 0, routesDelivered: {}, g1Failures: 0, g2Failures: 0,
-    washoutAppliedMs: 60_000, washoutUntilEpochMs: 0,
+    washoutAppliedMs: 60_000, washoutUntilEpochMs: 0, controlPlaneFailed: false,
+    frozenSurfaceDigest: DIGEST,
     envManifestHash: IDENTITY.envManifestHash, harnessCommit: IDENTITY.harnessCommit,
     ...(spec.over ?? {}),
   };

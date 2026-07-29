@@ -19,7 +19,7 @@ import type { TreeEntry } from "./unitPipeline.ts";
 import { recordSelection, type UnitWorkload, type WorkloadEntry } from "./benchWorkload.ts";
 import { parseLsTreeZ, type LsTreeEntry } from "./benchFrame.ts";
 import { runBenchGit } from "./benchSpawn.ts";
-import { makeBuckets, outstandingHorizonMs, readRateLimit, type BenchGhContext, type BenchHttpAttemptRecord } from "./benchGh.ts";
+import { gitBlobOid, makeBuckets, outstandingHorizonMs, readRateLimit, type BenchGhContext, type BenchHttpAttemptRecord, type RateLimitSnapshot } from "./benchGh.ts";
 import { acquireStore, runDriver, type DriverRunContext } from "./benchDrivers.ts";
 import { makeChildPool, washoutMs } from "./benchProtocol.ts";
 import { BenchProbeError } from "./benchConcurrencyProbe.ts";
@@ -113,7 +113,12 @@ export interface Option3LegResult {
   httpBodyBytes: number;
   fallbackSpend: number;
   deliveries: number;
-  cacheHits: number; // read entries served by the OID cache (removed from the leg's workload)
+  // read entries the OID cache SERVED inside the timed wall — each one a real lookup plus a
+  // hash re-verification of the stored bytes, so the warm wall carries the cache's true
+  // per-read service cost, never a zero-cost analytical shortcut (codex C0-R2 finding 6)
+  cacheHits: number;
+  bucketBefore: RateLimitSnapshot;
+  bucketAfter: RateLimitSnapshot;
   failureCause: string | null;
 }
 export interface Option3DriverScenario {
@@ -251,18 +256,21 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
     if (driver !== "T1" && driver !== "T2c" && driver !== "T0" && driver !== "T2a")
       throw new BenchOption3Error(`unknown driver ${String(driver)}`);
     const legs: Option3LegResult[] = [];
-    // the warm cache arms from THIS driver's own base leg — and only from oids whose content
-    // was actually DELIVERED on a primary route (a planned-but-failed read, or a symlink
-    // dereference whose bytes are the target's, must never pre-warm the cache; codex C0-R1
-    // finding 15)
-    const baseDeliveredOids = new Set<string>();
+    // the warm cache arms from THIS driver's own base leg — and only from oids whose CONTENT
+    // was actually DELIVERED on a primary route with a faithful byte round-trip (a planned-
+    // but-failed read, a symlink dereference — whose bytes are the TARGET's, keyed by the
+    // LINK's oid — or lossy non-UTF-8 content must never pre-warm the cache; codex C0-R1/R2
+    // finding 15). The cache stores CONTENT, not membership: the warm leg serves each hit
+    // inside its timed wall with a real lookup + hash re-verification (C0-R2 finding 6).
+    const modeByPath = new Map(baseWorkload.entries.map((e) => [e.path, e.mode]));
+    const baseDeliveredContent = new Map<string, string>();
     const legPlans: Array<{ leg: Option3LegResult["leg"]; unit: CorpusUnit; makeWorkload: () => { workload: UnitWorkload; hits: number } }> = [
       { leg: "base-cold", unit: baseUnit, makeWorkload: () => ({ workload: baseWorkload, hits: 0 }) },
       { leg: "advanced-cold", unit: c1main, makeWorkload: () => ({ workload: deps.advancedWorkload, hits: 0 }) },
       {
         leg: "advanced-warm", unit: c1main,
         makeWorkload: () => {
-          const { reduced, hits } = applyOidCache(deps.advancedWorkload, baseDeliveredOids);
+          const { reduced, hits } = applyOidCache(deps.advancedWorkload, new Set(baseDeliveredContent.keys()));
           return { workload: reduced, hits };
         },
       },
@@ -280,24 +288,58 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
         client: deps.client, db, cfg: deps.cfg, core: buckets.core, graphql: buckets.graphql,
         record: (r) => records.push(r), now: deps.now, sleep: deps.sleep,
       };
+      const reads = plan.workload.entries.filter((e) => e.read).length;
       const ctx: DriverRunContext = {
         cfg: deps.cfg, slot, unit: plan.unit, workload: plan.workload, gh,
         benchRoot: deps.benchRoot, runDir, gitEnv: deps.gitEnv, spawnObserver: () => {},
         acquisitionForm: "scaffolding", // both shas are pinned objects; the branch head has moved on
-        fallbackBudget: restFallbackBudgetFor(deps.cfg, plan.workload.entries.length),
+        // the fallback budget is a FROZEN function of the full selected set — deriving it from
+        // the cache-reduced workload would shrink the warm leg's allowance and fail it on a
+        // fallback pattern the cold legs tolerate (codex C0-R2 finding 7)
+        fallbackBudget: restFallbackBudgetFor(deps.cfg, plan.leg === "base-cold" ? baseWorkload.entries.length : deps.advancedWorkload.entries.length),
         liveState,
       };
+      // §4.8-style admission before the timer: a reset wait or primary pause must never land
+      // inside the measured wall (codex C0-R2 finding 8) — expected-spend based, like the
+      // other informational probes
+      const needCore = Math.ceil((reads + 25) * 1.2);
+      const needGraphql = driver === "T1" ? Math.ceil((Math.ceil(reads / 50) + 4) * deps.cfg.budget.pMaxPointsPerGraphqlAttempt * 1.2) : 10;
+      for (;;) {
+        const snap = await readRateLimit(meta);
+        if (snap.core.remaining >= needCore && snap.graphql.remaining >= needGraphql) break;
+        const wait = Math.max(Math.max(snap.core.reset, snap.graphql.reset) * 1000 + 5000 - deps.now(), 30_000);
+        deps.log(`option3 ${driver} ${plan.leg}: headroom short (need core ${needCore}/graphql ${needGraphql}) — sleeping ${Math.ceil(wait / 1000)}s`);
+        await deps.sleep(wait);
+      }
+      const bucketBefore = await readRateLimit(meta);
       const startedAt = deps.now();
       let deliveries = 0;
+      let servedFromCache = 0;
       let failureCause: string | null = null;
       try {
+        if (plan.leg === "advanced-warm") {
+          // the cache SERVICE is part of the timed wall: look up and hash-verify every hit
+          for (const entry of deps.advancedWorkload.entries) {
+            if (!entry.read) continue;
+            const cached = baseDeliveredContent.get(entry.blobOid);
+            if (cached === undefined) continue;
+            if (gitBlobOid(Buffer.from(cached, "utf8"), slot.objectFormat) !== entry.blobOid)
+              throw new BenchOption3Error(`cached content for ${entry.blobOid.slice(0, 12)} failed re-verification at serve time`);
+            servedFromCache++;
+          }
+        }
         const res = await runDriver(driver, ctx, makeChildPool(deps.cfg.frame.childPoolSize));
-        deliveries = res.deliveries.length;
+        deliveries = res.deliveries.length + servedFromCache;
         if (plan.leg === "base-cold") {
           for (const d of res.deliveries) {
             if (d.route !== "primary" || d.delivered === null) continue;
+            if (modeByPath.get(d.path) === "120000") continue; // dereference bytes, wrong key — never cached
             const oid = oidByPath.get(d.path);
-            if (oid !== undefined) baseDeliveredOids.add(oid);
+            // only faithfully round-trippable content is cache-eligible: the stored string
+            // must re-encode to bytes that hash to the oid, or serving it would deliver
+            // corrupted (replacement-charactered) bytes
+            if (oid !== undefined && gitBlobOid(Buffer.from(d.delivered, "utf8"), slot.objectFormat) === oid)
+              baseDeliveredContent.set(oid, d.delivered);
           }
         }
       } catch (e) {
@@ -307,6 +349,7 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
         rmSync(runDir, { recursive: true, force: true });
       }
       const wallMs = deps.now() - startedAt;
+      const bucketAfter = await readRateLimit(meta);
       const requests: Record<string, number> = {};
       let points = 0;
       let bodyBytes = 0;
@@ -318,7 +361,8 @@ export async function runOption3WarmScenario(deps: Option3ScenarioDeps): Promise
       }
       legs.push({
         leg: plan.leg, wallMs, requests, graphqlPointsSum: points, httpBodyBytes: bodyBytes,
-        fallbackSpend: liveState.fallbackSpend, deliveries, cacheHits: plan.hits, failureCause,
+        fallbackSpend: liveState.fallbackSpend, deliveries, cacheHits: servedFromCache,
+        bucketBefore, bucketAfter, failureCause,
       });
       if (plan.leg === "base-cold" && failureCause !== null)
         deps.log(`option3 ${driver}: base leg failed — the warm leg arms an EMPTY cache (hits will be 0)`);
