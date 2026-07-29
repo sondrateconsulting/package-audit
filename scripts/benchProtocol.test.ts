@@ -76,10 +76,15 @@ describe("washout + straddle", () => {
     expect(washoutMs(CFG, 0, 1000)).toBe(60_000);
     expect(washoutMs(CFG, 1000 + 90_000, 1000)).toBe(90_000);
   });
-  test("a bucket delta is valid only within one reset epoch (R4 otherwise)", () => {
-    expect(bucketDelta({ remaining: 100, reset: 5 }, { remaining: 40, reset: 5 })).toEqual({ valid: true, used: 60 });
-    expect(bucketDelta({ remaining: 100, reset: 5 }, { remaining: 4990, reset: 6 })).toEqual({ valid: false, used: null });
-    expect(bucketDelta({ remaining: 100, reset: 5 }, { remaining: 100, reset: 5 })).toEqual({ valid: true, used: 0 });
+  test("a bucket delta is valid within one reset epoch, or when the run itself opened the window (R4 otherwise)", () => {
+    expect(bucketDelta({ remaining: 100, reset: 5, used: 4900 }, { remaining: 40, reset: 5, used: 4960 })).toEqual({ valid: true, used: 60 });
+    // a consumed bucket whose epoch changed under the run: the straddle, invalid
+    expect(bucketDelta({ remaining: 100, reset: 5, used: 4900 }, { remaining: 4990, reset: 6, used: 10 })).toEqual({ valid: false, used: null });
+    expect(bucketDelta({ remaining: 100, reset: 5, used: 4900 }, { remaining: 100, reset: 5, used: 4900 })).toEqual({ valid: true, used: 0 });
+    // a FULL bucket floats its reset until first consumption — the run opened the window, so
+    // after.used is exactly the run's own spend (measured live: pilot rep 1, 2026-07-29)
+    expect(bucketDelta({ remaining: 5000, reset: 5, used: 0 }, { remaining: 4940, reset: 9, used: 60 })).toEqual({ valid: true, used: 60 });
+    expect(bucketDelta({ remaining: 5000, reset: 5, used: 0 }, { remaining: 5000, reset: 9, used: 0 })).toEqual({ valid: true, used: 0 });
   });
 });
 

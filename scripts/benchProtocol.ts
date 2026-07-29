@@ -103,9 +103,17 @@ export interface BucketDelta {
   valid: boolean; // false = the run straddled a reset window (R4: invalid, replay in slot)
   used: number | null;
 }
-export function bucketDelta(before: { remaining: number; reset: number }, after: { remaining: number; reset: number }): BucketDelta {
-  if (before.reset !== after.reset) return { valid: false, used: null };
-  return { valid: true, used: Math.max(0, before.remaining - after.remaining) };
+// §4.6.2 with GitHub's observed reset semantics: a PARTIALLY-consumed bucket's reset epoch is
+// fixed for the window, so equal epochs ⇒ a subtraction-valid delta. A FULL, untouched bucket
+// FLOATS its reset (now + window) until the first consumption opens the window — measured live:
+// epoch equality is unsatisfiable when a run starts on a full bucket. When before.used === 0
+// the run itself opened the window, so nothing prior can be misattributed and after.used IS the
+// run's own consumption (runs are minutes long, far inside the window they opened). Everything
+// else — a consumed bucket whose epoch changed under the run — is the straddle R4 invalidates.
+export function bucketDelta(before: { remaining: number; reset: number; used: number }, after: { remaining: number; reset: number; used: number }): BucketDelta {
+  if (before.reset === after.reset) return { valid: true, used: Math.max(0, before.remaining - after.remaining) };
+  if (before.used === 0) return { valid: true, used: after.used };
+  return { valid: false, used: null };
 }
 
 // ---- delivery verification (§4.6.6 fidelity + G2 completeness bookkeeping) -------------------
@@ -326,6 +334,10 @@ export interface EngineOptions {
   workloads: Map<string, UnitWorkload>; // unitId → pinned workload
   benchRoot: string;
   artifactsDir: string;
+  // per-run cache DBs live here — inside the repo's §0-permitted ./data root (AuditDb's write
+  // containment demands it; the bench temp root is NOT a permitted sqlite home), one file per
+  // run, deleted at teardown. NEVER the production sqlite path.
+  runCacheDir: string;
   runsLog: RunsLog;
   client: GithubClient; // meta traffic (rate_limit, env manifest probes); drivers get their own per-run client
   makeClient: (db: AuditDb | null) => GithubClient;
@@ -403,8 +415,9 @@ export class BenchEngine {
     this.runCounter++;
     const runDir = join(this.o.benchRoot, `run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}`);
     mkdirSync(runDir, { recursive: true });
-    const dbPath = join(runDir, "bench-cache.sqlite");
-    const db = AuditDb.open({ sqlitePath: dbPath, fresh: false, purgeCache: false });
+    mkdirSync(this.o.runCacheDir, { recursive: true });
+    const dbPath = join(this.o.runCacheDir, `bench-run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-${this.runCounter}.sqlite`);
+    const db = AuditDb.open({ sqlitePath: dbPath, fresh: true, purgeCache: false });
     const client = this.o.makeClient(db);
     const httpRecords: BenchHttpAttemptRecord[] = [];
     const spawnRecords: BenchSpawnRecord[] = [];
@@ -512,6 +525,7 @@ export class BenchEngine {
     }
     try {
       rmSync(runDir, { recursive: true, force: true });
+      for (const suffix of ["", "-wal", "-shm"]) rmSync(`${dbPath}${suffix}`, { force: true });
     } catch {
       // best-effort; the bench root sweep at exit reclaims stragglers
     }

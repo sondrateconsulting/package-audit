@@ -1,0 +1,392 @@
+{
+  "generatedAtIso": "2026-07-29T03:44:31.296Z",
+  "results": [
+    {
+      "unit": "C1:prometheus/prometheus@main",
+      "driftedAtDiagnostics": false,
+      "liveHeadAtDiagnostics": "40ea54d0b1d265b8dc830c88ef96b0b65f3ba0be",
+      "t2aArmsSkipped": false,
+      "forms": {
+        "production:T2a": {
+          "walls": [
+            1613,
+            1581,
+            1575
+          ],
+          "tip": "40ea54d0b1d265b8dc830c88ef96b0b65f3ba0be",
+          "tree": "cc01c1c5983bcc40829abc5654d75d66f4d41b03",
+          "closureSha256": "522e95267ac09e0422162880f40f3ceab6c1e736b08378d33dea0e90beb3e703",
+          "inventorySha256": "3672a7f3f68fb14a75248ac1fda14cf34a4e180401947d7996b4f93ef49b7b38"
+        },
+        "production:T2c": {
+          "walls": [
+            1489,
+            1432,
+            1460
+          ],
+          "tip": "40ea54d0b1d265b8dc830c88ef96b0b65f3ba0be",
+          "tree": "cc01c1c5983bcc40829abc5654d75d66f4d41b03",
+          "closureSha256": "522e95267ac09e0422162880f40f3ceab6c1e736b08378d33dea0e90beb3e703",
+          "inventorySha256": "3672a7f3f68fb14a75248ac1fda14cf34a4e180401947d7996b4f93ef49b7b38"
+        },
+        "scaffolding:T2a": {
+          "walls": [
+            1497,
+            1480,
+            1454
+          ],
+          "tip": "40ea54d0b1d265b8dc830c88ef96b0b65f3ba0be",
+          "tree": "cc01c1c5983bcc40829abc5654d75d66f4d41b03",
+          "closureSha256": "522e95267ac09e0422162880f40f3ceab6c1e736b08378d33dea0e90beb3e703",
+          "inventorySha256": "3672a7f3f68fb14a75248ac1fda14cf34a4e180401947d7996b4f93ef49b7b38"
+        },
+        "scaffolding:T2c": {
+          "walls": [
+            1196,
+            1980,
+            1597
+          ],
+          "tip": "40ea54d0b1d265b8dc830c88ef96b0b65f3ba0be",
+          "tree": "cc01c1c5983bcc40829abc5654d75d66f4d41b03",
+          "closureSha256": "522e95267ac09e0422162880f40f3ceab6c1e736b08378d33dea0e90beb3e703",
+          "inventorySha256": "3672a7f3f68fb14a75248ac1fda14cf34a4e180401947d7996b4f93ef49b7b38"
+        }
+      },
+      "flags": []
+    },
+    {
+      "unit": "C1:prometheus/prometheus@release-3.13",
+      "driftedAtDiagnostics": false,
+      "liveHeadAtDiagnostics": "73ff57ce2b8161059ac7fe5188f03f1c3d22b29a",
+      "t2aArmsSkipped": false,
+      "forms": {
+        "production:T2a": {
+          "walls": [
+            1563,
+            1498,
+            1498
+          ],
+          "tip": "73ff57ce2b8161059ac7fe5188f03f1c3d22b29a",
+          "tree": "5f41d5beebb774c30d7a8b5ca67b45296c6a6ad1",
+          "closureSha256": "b173ec8adb25714e8f004254f7744b32922c80624e7d3c6bda303a549ce9895d",
+          "inventorySha256": "88ba04d93b2ad3ae28d3dfbdaa90f8adc0eea8642fd27b0ba6fe78eafc20f84f"
+        },
+        "production:T2c": {
+          "walls": [
+            1290,
+            1477,
+            1323
+          ],
+          "tip": "73ff57ce2b8161059ac7fe5188f03f1c3d22b29a",
+          "tree": "5f41d5beebb774c30d7a8b5ca67b45296c6a6ad1",
+          "closureSha256": "b173ec8adb25714e8f004254f7744b32922c80624e7d3c6bda303a549ce9895d",
+          "inventorySha256": "88ba04d93b2ad3ae28d3dfbdaa90f8adc0eea8642fd27b0ba6fe78eafc20f84f"
+        },
+        "scaffolding:T2a": {
+          "walls": [
+            1431,
+            1386,
+            1300
+          ],
+          "tip": "73ff57ce2b8161059ac7fe5188f03f1c3d22b29a",
+          "tree": "5f41d5beebb774c30d7a8b5ca67b45296c6a6ad1",
+          "closureSha256": "b173ec8adb25714e8f004254f7744b32922c80624e7d3c6bda303a549ce9895d",
+          "inventorySha256": "70dad84fc89bd7f4bde11730e55d821b0f1193c81d49f7bfdafa2d8d7dc2fbf1"
+        },
+        "scaffolding:T2c": {
+          "walls": [
+            1174,
+            1570,
+            1193
+          ],
+          "tip": "73ff57ce2b8161059ac7fe5188f03f1c3d22b29a",
+          "tree": "5f41d5beebb774c30d7a8b5ca67b45296c6a6ad1",
+          "closureSha256": "b173ec8adb25714e8f004254f7744b32922c80624e7d3c6bda303a549ce9895d",
+          "inventorySha256": "70dad84fc89bd7f4bde11730e55d821b0f1193c81d49f7bfdafa2d8d7dc2fbf1"
+        }
+      },
+      "flags": [
+        "T2c: median wall delta 10.9% > 10% — interpret scaffolding-form units with this bound in hand"
+      ]
+    },
+    {
+      "unit": "C1:prometheus/prometheus@release-3.12",
+      "driftedAtDiagnostics": false,
+      "liveHeadAtDiagnostics": "9f27dffc1f93ca23287972f632025879f2d1c658",
+      "t2aArmsSkipped": false,
+      "forms": {
+        "production:T2a": {
+          "walls": [
+            1633,
+            1677,
+            1654
+          ],
+          "tip": "9f27dffc1f93ca23287972f632025879f2d1c658",
+          "tree": "6d09c791814f440086529766365336f45ec5c88e",
+          "closureSha256": "6a30f5262b689cbc8b564de0fdf1547fbad6b32d2353025811acde0871bdd577",
+          "inventorySha256": "fc9d033c9092b6f4f459bad2dcd4174a643cd6947776df56a14fee123ebb95e5"
+        },
+        "production:T2c": {
+          "walls": [
+            1459,
+            1460,
+            1506
+          ],
+          "tip": "9f27dffc1f93ca23287972f632025879f2d1c658",
+          "tree": "6d09c791814f440086529766365336f45ec5c88e",
+          "closureSha256": "6a30f5262b689cbc8b564de0fdf1547fbad6b32d2353025811acde0871bdd577",
+          "inventorySha256": "fc9d033c9092b6f4f459bad2dcd4174a643cd6947776df56a14fee123ebb95e5"
+        },
+        "scaffolding:T2a": {
+          "walls": [
+            1497,
+            1561,
+            1530
+          ],
+          "tip": "9f27dffc1f93ca23287972f632025879f2d1c658",
+          "tree": "6d09c791814f440086529766365336f45ec5c88e",
+          "closureSha256": "6a30f5262b689cbc8b564de0fdf1547fbad6b32d2353025811acde0871bdd577",
+          "inventorySha256": "3f7c10da5adf7b00de628ed63e77f52314806c4506bf893d1ce00e60c2de412c"
+        },
+        "scaffolding:T2c": {
+          "walls": [
+            1336,
+            1337,
+            1301
+          ],
+          "tip": "9f27dffc1f93ca23287972f632025879f2d1c658",
+          "tree": "6d09c791814f440086529766365336f45ec5c88e",
+          "closureSha256": "6a30f5262b689cbc8b564de0fdf1547fbad6b32d2353025811acde0871bdd577",
+          "inventorySha256": "3f7c10da5adf7b00de628ed63e77f52314806c4506bf893d1ce00e60c2de412c"
+        }
+      },
+      "flags": []
+    },
+    {
+      "unit": "C1:prometheus/prometheus@release-3.11",
+      "driftedAtDiagnostics": false,
+      "liveHeadAtDiagnostics": "eb173f5256d4022afba1e9bc3d19740a76859fae",
+      "t2aArmsSkipped": false,
+      "forms": {
+        "production:T2a": {
+          "walls": [
+            1623,
+            1631,
+            1700
+          ],
+          "tip": "eb173f5256d4022afba1e9bc3d19740a76859fae",
+          "tree": "00a41e47c2c3661065ab3979656fcfc40f409e23",
+          "closureSha256": "7b8f8eb15c7d68a5a302ef80fe58f0f8a3393f48eed9b2aeb2b145cd741ae9b0",
+          "inventorySha256": "1de8a8c7da860acd2911b9a6c4cb562eb4ba305cc8a965e6f27c72879a472db8"
+        },
+        "production:T2c": {
+          "walls": [
+            1446,
+            1349,
+            1479
+          ],
+          "tip": "eb173f5256d4022afba1e9bc3d19740a76859fae",
+          "tree": "00a41e47c2c3661065ab3979656fcfc40f409e23",
+          "closureSha256": "7b8f8eb15c7d68a5a302ef80fe58f0f8a3393f48eed9b2aeb2b145cd741ae9b0",
+          "inventorySha256": "1de8a8c7da860acd2911b9a6c4cb562eb4ba305cc8a965e6f27c72879a472db8"
+        },
+        "scaffolding:T2a": {
+          "walls": [
+            1439,
+            1490,
+            1460
+          ],
+          "tip": "eb173f5256d4022afba1e9bc3d19740a76859fae",
+          "tree": "00a41e47c2c3661065ab3979656fcfc40f409e23",
+          "closureSha256": "7b8f8eb15c7d68a5a302ef80fe58f0f8a3393f48eed9b2aeb2b145cd741ae9b0",
+          "inventorySha256": "a2b8845296b70f59c17d32339685b55583ecd0737e7f79dfd62a5dcc1a2124fe"
+        },
+        "scaffolding:T2c": {
+          "walls": [
+            1285,
+            1257,
+            1268
+          ],
+          "tip": "eb173f5256d4022afba1e9bc3d19740a76859fae",
+          "tree": "00a41e47c2c3661065ab3979656fcfc40f409e23",
+          "closureSha256": "7b8f8eb15c7d68a5a302ef80fe58f0f8a3393f48eed9b2aeb2b145cd741ae9b0",
+          "inventorySha256": "a2b8845296b70f59c17d32339685b55583ecd0737e7f79dfd62a5dcc1a2124fe"
+        }
+      },
+      "flags": [
+        "T2a: median wall delta 11.7% > 10% — interpret scaffolding-form units with this bound in hand",
+        "T2c: median wall delta 14.0% > 10% — interpret scaffolding-form units with this bound in hand"
+      ]
+    },
+    {
+      "unit": "C2:nestjs/nest@master",
+      "driftedAtDiagnostics": false,
+      "liveHeadAtDiagnostics": "fafe503bd8ca073f2fdd41ed7138081af84c478e",
+      "t2aArmsSkipped": false,
+      "forms": {
+        "production:T2a": {
+          "walls": [
+            1055,
+            1127,
+            1017
+          ],
+          "tip": "fafe503bd8ca073f2fdd41ed7138081af84c478e",
+          "tree": "389e928dc19666d41295fb22d48736827e6ca2b0",
+          "closureSha256": "4164fd2c18e6da1d614191c63d4dd345b1d39532831761e2ddd922de3a452bac",
+          "inventorySha256": "04d9c36960c170cc9bc4b70a36d87f18ccf14bde828d11725f86693f17595ecf"
+        },
+        "production:T2c": {
+          "walls": [
+            859,
+            892,
+            908
+          ],
+          "tip": "fafe503bd8ca073f2fdd41ed7138081af84c478e",
+          "tree": "389e928dc19666d41295fb22d48736827e6ca2b0",
+          "closureSha256": "4164fd2c18e6da1d614191c63d4dd345b1d39532831761e2ddd922de3a452bac",
+          "inventorySha256": "04d9c36960c170cc9bc4b70a36d87f18ccf14bde828d11725f86693f17595ecf"
+        },
+        "scaffolding:T2a": {
+          "walls": [
+            898,
+            1128,
+            978
+          ],
+          "tip": "fafe503bd8ca073f2fdd41ed7138081af84c478e",
+          "tree": "389e928dc19666d41295fb22d48736827e6ca2b0",
+          "closureSha256": "4164fd2c18e6da1d614191c63d4dd345b1d39532831761e2ddd922de3a452bac",
+          "inventorySha256": "04d9c36960c170cc9bc4b70a36d87f18ccf14bde828d11725f86693f17595ecf"
+        },
+        "scaffolding:T2c": {
+          "walls": [
+            656,
+            719,
+            769
+          ],
+          "tip": "fafe503bd8ca073f2fdd41ed7138081af84c478e",
+          "tree": "389e928dc19666d41295fb22d48736827e6ca2b0",
+          "closureSha256": "4164fd2c18e6da1d614191c63d4dd345b1d39532831761e2ddd922de3a452bac",
+          "inventorySha256": "04d9c36960c170cc9bc4b70a36d87f18ccf14bde828d11725f86693f17595ecf"
+        }
+      },
+      "flags": [
+        "T2c: median wall delta 24.1% > 10% — interpret scaffolding-form units with this bound in hand"
+      ]
+    },
+    {
+      "unit": "C3:kubernetes/kubernetes@master",
+      "driftedAtDiagnostics": false,
+      "liveHeadAtDiagnostics": "7c2b6c32644a2cc24029ec77576940b63ecca7e7",
+      "t2aArmsSkipped": true,
+      "forms": {
+        "production:T2c": {
+          "walls": [
+            8591,
+            8619,
+            8604
+          ],
+          "tip": "7c2b6c32644a2cc24029ec77576940b63ecca7e7",
+          "tree": "d344ce0f3b059cf13b6ee655075416187cb10724",
+          "closureSha256": "9df6e55b10c93b56daa19b41277bfb6e2022738a3cd28558932f7b3907a55382",
+          "inventorySha256": "7ce3300132c2f8a4cbcb843e3d2048baa4e784d53deeb290fe1a0cefa5a4745f"
+        },
+        "scaffolding:T2c": {
+          "walls": [
+            8743,
+            8422,
+            8482
+          ],
+          "tip": "7c2b6c32644a2cc24029ec77576940b63ecca7e7",
+          "tree": "d344ce0f3b059cf13b6ee655075416187cb10724",
+          "closureSha256": "9df6e55b10c93b56daa19b41277bfb6e2022738a3cd28558932f7b3907a55382",
+          "inventorySha256": "7ce3300132c2f8a4cbcb843e3d2048baa4e784d53deeb290fe1a0cefa5a4745f"
+        }
+      },
+      "flags": []
+    },
+    {
+      "unit": "C4:llvm/llvm-project@main",
+      "driftedAtDiagnostics": true,
+      "liveHeadAtDiagnostics": "78f84b6ded1f30703faa148ab2c9fd6d0c5a40b7",
+      "t2aArmsSkipped": false,
+      "forms": {
+        "scaffolding:T2a": {
+          "walls": [
+            71733,
+            61628,
+            60143
+          ],
+          "tip": "1d4e04f7a7c2669dd652861e7dccc22f67ab3355",
+          "tree": "8211bd77388927dc95cbf01ee78dc421a82f3b1e",
+          "closureSha256": "722e2068cd4d503c268f3721dbd0de45980b70148fdf2779f9c423858ecc5ad5",
+          "inventorySha256": "9dcde6f8afff136ed19ad274f127f1c54fa8e8f40ad82084d5bed50d8df8276c"
+        },
+        "scaffolding:T2c": {
+          "walls": [
+            40879,
+            53863,
+            49068
+          ],
+          "tip": "1d4e04f7a7c2669dd652861e7dccc22f67ab3355",
+          "tree": "8211bd77388927dc95cbf01ee78dc421a82f3b1e",
+          "closureSha256": "722e2068cd4d503c268f3721dbd0de45980b70148fdf2779f9c423858ecc5ad5",
+          "inventorySha256": "9dcde6f8afff136ed19ad274f127f1c54fa8e8f40ad82084d5bed50d8df8276c"
+        }
+      },
+      "flags": []
+    },
+    {
+      "unit": "C5:PowerShell/PowerShell@master",
+      "driftedAtDiagnostics": false,
+      "liveHeadAtDiagnostics": "f3648da945a3289d37214601368205b1af2b8354",
+      "t2aArmsSkipped": false,
+      "forms": {
+        "production:T2a": {
+          "walls": [
+            2866,
+            2916,
+            2873
+          ],
+          "tip": "f3648da945a3289d37214601368205b1af2b8354",
+          "tree": "90fd99013e097af5dced2bd1e6cbcb65137ef77b",
+          "closureSha256": "58fe59a1549593c5398b1db4f36b24f566010b2e975ccfb41024ef368bf2bb4d",
+          "inventorySha256": "3e6a0540a2f208f810b40f432c28b89a6c2950a5bc4e9a90e63227988b543d98"
+        },
+        "production:T2c": {
+          "walls": [
+            2600,
+            2570,
+            2640
+          ],
+          "tip": "f3648da945a3289d37214601368205b1af2b8354",
+          "tree": "90fd99013e097af5dced2bd1e6cbcb65137ef77b",
+          "closureSha256": "58fe59a1549593c5398b1db4f36b24f566010b2e975ccfb41024ef368bf2bb4d",
+          "inventorySha256": "3e6a0540a2f208f810b40f432c28b89a6c2950a5bc4e9a90e63227988b543d98"
+        },
+        "scaffolding:T2a": {
+          "walls": [
+            2739,
+            2714,
+            2690
+          ],
+          "tip": "f3648da945a3289d37214601368205b1af2b8354",
+          "tree": "90fd99013e097af5dced2bd1e6cbcb65137ef77b",
+          "closureSha256": "58fe59a1549593c5398b1db4f36b24f566010b2e975ccfb41024ef368bf2bb4d",
+          "inventorySha256": "3e6a0540a2f208f810b40f432c28b89a6c2950a5bc4e9a90e63227988b543d98"
+        },
+        "scaffolding:T2c": {
+          "walls": [
+            2431,
+            2548,
+            2486
+          ],
+          "tip": "f3648da945a3289d37214601368205b1af2b8354",
+          "tree": "90fd99013e097af5dced2bd1e6cbcb65137ef77b",
+          "closureSha256": "58fe59a1549593c5398b1db4f36b24f566010b2e975ccfb41024ef368bf2bb4d",
+          "inventorySha256": "3e6a0540a2f208f810b40f432c28b89a6c2950a5bc4e9a90e63227988b543d98"
+        }
+      },
+      "flags": []
+    }
+  ]
+}
