@@ -141,7 +141,11 @@ export function bucketDelta(before: { remaining: number; reset: number; used: nu
 export interface VerificationReport {
   resolved: number;
   g1Failures: Array<{ path: string; route: string; reason: string }>;
-  g2Failures: Array<{ path: string; reason: string }>;
+  // "absent" = the entry never arrived (an interrupted attempt is FULL of these — the
+  // terminal/rerun discipline owns them); "positive" = something WAS delivered wrongly
+  // (duplicates, forbidden routes, foreign paths) — positive evidence survives invalidation
+  // and partial attempts (codex C0-R3 finding 4)
+  g2Failures: Array<{ path: string; reason: string; kind: "absent" | "positive" }>;
   // checkout-config probe reps: a caveat-route divergence from the pinned baseline is a
   // FIRST-CLASS FINDING for the decision-maker, never an auto-disqualification (§4.7 G1);
   // primary-route divergence under the probe stays a G1 failure (T2a gets no shelter).
@@ -166,24 +170,24 @@ export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly En
   for (const entry of workload.entries) {
     const expectation = workload.routes[entry.path]?.[driver];
     if (expectation === undefined) {
-      report.g2Failures.push({ path: entry.path, reason: "no pinned expectation" });
+      report.g2Failures.push({ path: entry.path, reason: "no pinned expectation", kind: "positive" });
       continue;
     }
     const got = byPath.get(entry.path) ?? [];
     if (got.length !== 1) {
-      report.g2Failures.push({ path: entry.path, reason: `delivered ${got.length} times (expected exactly once)` });
+      report.g2Failures.push({ path: entry.path, reason: `delivered ${got.length} times (expected exactly once)`, kind: got.length === 0 ? "absent" : "positive" });
       continue;
     }
     const d = got[0]!;
     report.routesDelivered[d.route] = (report.routesDelivered[d.route] ?? 0) + 1;
     const permitted = new Set<string>([expectation.primary, ...expectation.permittedFallbacks]);
     if (!permitted.has(d.route)) {
-      report.g2Failures.push({ path: entry.path, reason: `delivered via ${d.route}, outside the pinned permitted set {${[...permitted].join(", ")}}` });
+      report.g2Failures.push({ path: entry.path, reason: `delivered via ${d.route}, outside the pinned permitted set {${[...permitted].join(", ")}}`, kind: "positive" });
       continue;
     }
     const expected = expectation.expected[d.route];
     if (expected === undefined) {
-      report.g2Failures.push({ path: entry.path, reason: `route ${d.route} carries no typed expectation` });
+      report.g2Failures.push({ path: entry.path, reason: `route ${d.route} carries no typed expectation`, kind: "positive" });
       continue;
     }
     if ("nonAcquisition" in expected) {
@@ -198,7 +202,7 @@ export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly En
       continue;
     }
     if (d.delivered === null) {
-      report.g2Failures.push({ path: entry.path, reason: `route ${d.route} delivered nothing` });
+      report.g2Failures.push({ path: entry.path, reason: `route ${d.route} delivered nothing`, kind: "positive" });
       continue;
     }
     const gotHash = seamStringSha256(d.delivered);
@@ -220,7 +224,7 @@ export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly En
   }
   for (const [path, list] of byPath) {
     if (workload.routes[path] === undefined)
-      report.g2Failures.push({ path, reason: `delivered ${list.length}× but absent from the pinned workload` });
+      report.g2Failures.push({ path, reason: `delivered ${list.length}× but absent from the pinned workload`, kind: "positive" });
   }
   return report;
 }
@@ -375,6 +379,10 @@ export interface RunRecord {
   replayKind: "r1r2" | "r3r4" | null; // only r1r2 charges the driver allowance (codex R2 f.23)
   diskReclaimFailed: boolean;
   probeDivergences: number;
+  // positive-kind G2 failures across THIS attempt (duplicates, forbidden routes, foreign
+  // paths) — scored over every physical attempt, unlike absence-shaped g2Failures which only
+  // terminal rows carry (codex C0-R3 finding 4)
+  g2PositiveFailures: number;
   httpBodyBytes: number;
   cloneObjectStoreBytes: number | null;
   diskSampledPeakBytes: number;
@@ -873,7 +881,7 @@ export class BenchEngine {
             // stale replayKind would double-charge the R1/R2 allowance at reconstruction
             // (codex C0-R1 finding 6)
             expectedConsumption: { core: 0, graphql: 0 }, replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed: false,
-            probeDivergences: 0, httpBodyBytes: 0, cloneObjectStoreBytes: null,
+            probeDivergences: 0, g2PositiveFailures: 0, httpBodyBytes: 0, cloneObjectStoreBytes: null,
             diskSampledPeakBytes: 0, diskSamples: 0, fallbackSpend: 0, routesDelivered: {},
             g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0, washoutUntilEpochMs: 0,
             envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
@@ -1056,14 +1064,17 @@ export class BenchEngine {
         attempts.secondaryByKind[r.secondarySignal] = (attempts.secondaryByKind[r.secondarySignal] ?? 0) + 1;
       }
     }
-    // graphql-batch "success" must be SEMANTIC, not transport-level (codex C0-R2 re f.2): a
-    // 200-ok envelope whose aliases all failed validation delivered nothing through the
-    // graphql route, and must not seed the R2 ledger for it. ≥1 alias resolved through the
-    // primary route is the demonstration the class actually works.
-    if (requestClassSuccesses["graphql-batch"] !== undefined) {
+    // graphql-batch "success" is SEMANTIC and AUTHORITATIVE from delivery evidence, in both
+    // directions (codex C0-R2 re f.2; C0-R3 finding 3): a transport-ok envelope whose aliases
+    // all failed validation must not seed R2 — and an envelope the transport classifier calls
+    // fatal (a 200 with permitted per-alias errors beside a valid alias) still DID resolve
+    // content through the graphql route, and denying that class its R2 evidence would be just
+    // as wrong. ≥1 raw-verified primary delivery is the demonstration the class works.
+    if (row.driver === "T1") {
       const live = liveState.deliveries ?? outcome?.deliveries ?? [];
-      const resolvedViaGraphql = row.driver === "T1" && live.some((d) => d.route === "primary" && d.delivered !== null && d.rawVerified === true);
-      if (!resolvedViaGraphql) delete requestClassSuccesses["graphql-batch"];
+      const resolvedViaGraphql = live.some((d) => d.route === "primary" && d.delivered !== null && d.rawVerified === true);
+      if (resolvedViaGraphql) requestClassSuccesses["graphql-batch"] = Math.max(1, requestClassSuccesses["graphql-batch"] ?? 0);
+      else delete requestClassSuccesses["graphql-batch"];
     }
     if (r5 !== null) {
       // the minimal terminal R5 record lands BEFORE any fallible post-run work (codex R2 f.18)
@@ -1079,6 +1090,7 @@ export class BenchEngine {
         bucketSnapshots,
         expectedConsumption: { core: liveCoreAttempts, graphql: liveGraphqlPoints },
         replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed, probeDivergences: 0,
+        g2PositiveFailures: 0,
         // rest-meta bytes are control-plane, excluded exactly as the normal record excludes
         // them; the live fallback/route mirrors survive instead of flattening to zero
         // (Step-C residual 5)
@@ -1113,15 +1125,15 @@ export class BenchEngine {
     if (outcome !== null) {
       verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
     } else if ((liveState.deliveries ?? []).length > 0) {
-      // a thrown driver's PARTIAL deliveries still carry POSITIVE evidence — wrong bytes
-      // delivered before the failure must reach G1 (codex C0-R2 re f.10). Absence-shaped g2
-      // noise from an interrupted set is discarded here: the terminal/rerun discipline owns
-      // absences, and a partial attempt is by definition full of them.
+      // a thrown driver's PARTIAL deliveries still carry POSITIVE evidence — wrong bytes,
+      // duplicates, forbidden routes delivered before the failure must reach the gates (codex
+      // C0-R2 re f.10; C0-R3 finding 4). Only ABSENCE-shaped g2 noise is discarded: an
+      // interrupted set is by definition full of it and the terminal/rerun discipline owns it.
       const partial = verifyDeliveries(workload, liveState.deliveries ?? [], row.driver, {
         probeRep: row.probe,
         ...(liveState.acquiredPaths === undefined ? {} : { acquiredPaths: liveState.acquiredPaths }),
       });
-      verification = { ...partial, g2Failures: [] };
+      verification = { ...partial, g2Failures: partial.g2Failures.filter((f) => f.kind === "positive") };
     }
 
     // per-segment same-window deltas, summed by construction (§4.6.2); the final (or only)
@@ -1195,6 +1207,7 @@ export class BenchEngine {
       replayKind: this.replayKind,
       diskReclaimFailed,
       probeDivergences: verification?.probeDivergences.length ?? 0,
+      g2PositiveFailures: verification?.g2Failures.filter((f) => f.kind === "positive").length ?? 0,
       // body bytes derive from the RECORDS so a thrown driver still reports its real transfer
       httpBodyBytes: httpRecords.reduce((n, r) => n + (r.servedFromCache || r.requestClass === "rest-meta" ? 0 : r.bodyBytes), 0),
       cloneObjectStoreBytes,

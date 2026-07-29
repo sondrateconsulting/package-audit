@@ -26,7 +26,7 @@ import { walkClone, cloneReader } from "./orchestrate.ts";
 import type { TreeEntry } from "./unitPipeline.ts";
 import { locateManifests, dirOf } from "./manifest.ts";
 import { makeExcluder } from "./unitPipeline.ts";
-import { loadBenchConfig, type BenchConfig } from "./benchConfig.ts";
+import { loadBenchConfig, parseBenchConfig, type BenchConfig } from "./benchConfig.ts";
 import {
   loadCorpus, scheduleUnitsFrom, verifyC1, verifyC2, verifyC3, verifyC4, verifyC5,
   verifyC6NonUtf8, verifyC6Symlink,
@@ -177,28 +177,49 @@ async function assertAppendOnlyLogs(opts: { repairTornTail: boolean }): Promise<
     limits: { maxStdoutBytes, maxStderrBytes: 4096, deadlineMs: 60_000 },
   });
   for (const logRel of ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl"]) {
-    const tracked = await gitRO(["ls-files", "--error-unmatch", logRel], 4096);
-    if (tracked.exitCode !== 0) continue; // genuinely untracked — nothing committed to protect
-    const committed = await gitRO(["show", `HEAD:${logRel}`], 256 * 1024 * 1024);
-    if (committed.exitCode !== 0) {
-      // tracked in the index but absent/unreadable at HEAD: newly staged-only files have no
-      // HEAD blob (nothing committed to protect); any OTHER failure is fail-closed
-      const stderrText = text(committed.stderr);
-      if (/does not exist|exists on disk, but not in/i.test(stderrText)) continue;
-      throw new Error(`REFUSING: cannot read HEAD:${logRel} to verify the append-only prefix (${stderrText.trim().slice(0, 160)}) — failing closed (codex C0-R2 finding 10)`);
+    // committed existence is decided from HEAD, never the index — a staged deletion would make
+    // ls-files call a HEAD-protected log "untracked" and bypass the prefix check entirely
+    // (codex C0-R3 finding 1); any OTHER git failure is fail-closed (C0-R2 finding 10)
+    let prefix = Buffer.alloc(0);
+    const exists = await gitRO(["cat-file", "-e", `HEAD:${logRel}`], 4096);
+    if (exists.exitCode === 0) {
+      const committed = await gitRO(["show", `HEAD:${logRel}`], 256 * 1024 * 1024);
+      if (committed.exitCode !== 0)
+        throw new Error(`REFUSING: cannot read HEAD:${logRel} to verify the append-only prefix (${text(committed.stderr).trim().slice(0, 160)}) — failing closed`);
+      prefix = Buffer.from(committed.stdout);
+    } else {
+      const err = text(exists.stderr);
+      if (!/does not exist|Not a valid object name|invalid object name|bad revision|path .* does not exist/i.test(err))
+        throw new Error(`REFUSING: cannot establish HEAD:${logRel}'s existence (${err.trim().slice(0, 160)}) — failing closed (codex C0-R3 finding 1)`);
+      // genuinely absent at HEAD — nothing committed to protect
     }
     const workingPath = join(REPO_ROOT, logRel);
     const working = existsSync(workingPath) ? readFileSync(workingPath) : Buffer.alloc(0);
-    const prefix = Buffer.from(committed.stdout);
     if (working.byteLength < prefix.byteLength || !prefix.equals(working.subarray(0, prefix.byteLength)))
       throw new Error(`REFUSING: ${logRel} is not an append of its committed content — the evidence log's history was edited (§8; codex C0-R1 finding 13)`);
+    // writers repair a torn tail — including on files not yet at HEAD (a first battery run's
+    // fidelity.jsonl, codex C0-R3 finding 7). A tail that parses as complete JSON lost only
+    // its newline to the crash: SEAL it (truncating would silently delete a recorded outcome);
+    // only genuinely malformed bytes are truncated, and only beyond the committed prefix.
     if (opts.repairTornTail && working.byteLength > 0 && working[working.byteLength - 1] !== 0x0a) {
-      const lastNl = working.lastIndexOf(0x0a);
-      const keep = lastNl + 1; // 0 when no newline exists at all
-      if (keep < prefix.byteLength)
+      const tailStart = working.lastIndexOf(0x0a) + 1;
+      if (tailStart < prefix.byteLength)
         throw new Error(`REFUSING: ${logRel}'s torn tail overlaps the committed prefix — corruption, not a crash artifact`);
-      truncateSync(workingPath, keep);
-      log(`repaired ${logRel}: truncated a ${working.byteLength - keep}-byte torn uncommitted tail (crash mid-append)`);
+      const tail = working.subarray(tailStart);
+      let sealable = false;
+      try {
+        JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(tail));
+        sealable = true;
+      } catch {
+        sealable = false;
+      }
+      if (sealable) {
+        appendFileSync(workingPath, "\n");
+        log(`repaired ${logRel}: sealed a complete final record that lost only its newline`);
+      } else {
+        truncateSync(workingPath, tailStart);
+        log(`repaired ${logRel}: truncated a ${tail.byteLength}-byte torn uncommitted tail (crash mid-append)`);
+      }
     }
   }
 }
@@ -228,7 +249,7 @@ async function assertEvidenceReadable(): Promise<void> {
     "docs/adrs/0001-benchmark/acquisition-diagnostics.json", "docs/adrs/0001-benchmark/ratification.json",
     "docs/plans/adr-0001-disagreements-resolution.md", "docs/adrs/0001-file-content-acquisition-strategy.md",
   ];
-  const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && FROZEN_INPUTS.some((a) => f.startsWith(a)));
+  const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && FROZEN_INPUTS.some((a) => (a.endsWith("/") ? f.startsWith(a) : f === a)));
   if (dirty.length > 0)
     throw new Error(`REFUSING: frozen evidence inputs are edited on disk: ${dirty.slice(0, 5).join(", ")} — scoring reads only committed preregistration (codex C0-R2 finding 2)`);
   await assertAppendOnlyLogs({ repairTornTail: false });
@@ -1005,6 +1026,7 @@ async function runFidelityCell(rt: PinRuntime, cfg: BenchConfig, fixture: C6Fixt
       lastKind = analysis.kind;
       lastStatus = d.status;
       if (analysis.kind === "per-alias") {
+        consecutiveFailedDispatches = 0; // driver parity: any per-alias response resets the breaker (codex C0-R3 finding 6)
         const outcome = analysis.outcomes[0];
         if (outcome?.kind === "resolved") return { route: "primary", delivered: outcome.text, rawVerified: true, disposition: "delivered" };
         if (outcome?.kind === "binary-fallback" || outcome?.kind === "truncated-blob-fallback" || outcome?.kind === "validation-fallback")
@@ -1227,15 +1249,21 @@ async function cmdMatrix(): Promise<void> {
             throw new Error(`control-plane failure recorded ${controlPlaneReplays}× at pos ${row.pos} — fix connectivity, then resume (the recorded rows stay; §4.5's in-slot replay discipline)`);
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
+          // live counters advance from the recorded FACTS, unconditionally, before any
+          // outcome branch — a straddle or control-plane failure that lost the outcome
+          // precedence still counts toward its cap (codex C0-R3 finding 5)
+          if (handle.record.straddledReset) {
+            const count = (straddleCounts.get(row.unit) ?? 0) + 1;
+            straddleCounts.set(row.unit, count);
+            if (count >= 2) throw new Error(`R4 recurred on ${row.unit} (${count} straddles) — halt for freeze repair (plan §4.5)`);
+          }
+          if (handle.record.controlPlaneFailed) controlPlaneReplays++;
           if (handle.record.outcome === "complete") {
             // the R2 ledger admits SUCCESSES, never mere attempts (codex C0-R1 finding 2)
             for (const cls of Object.keys(handle.record.requestClassSuccesses)) successLedger.add(`${key}|${cls}`);
             break;
           }
           if (handle.record.outcome === "invalidated-straddle") {
-            const count = (straddleCounts.get(row.unit) ?? 0) + 1;
-            straddleCounts.set(row.unit, count);
-            if (count >= 2) throw new Error(`R4 recurred on ${row.unit} (${count} straddles) — halt for freeze repair (plan §4.5)`);
             log(`R4 straddle on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
             engine.setReplayOf(row.pos, "r3r4");
             continue;
@@ -1248,8 +1276,8 @@ async function cmdMatrix(): Promise<void> {
           }
           if (handle.record.outcome === "invalidated-control-plane") {
             // a rate_limit snapshot failed (residual 3): run invalid, replay in slot, never
-            // charged to the driver — the loop-top durable guard bounds the retries
-            controlPlaneReplays++;
+            // charged to the driver — the loop-top durable guard bounds the retries (the
+            // counter advanced from the fact above)
             log(`control-plane invalidation on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
             engine.setReplayOf(row.pos, "r3r4");
             continue;
@@ -1389,23 +1417,72 @@ async function cmdRefreshEvidence(): Promise<void> {
 }
 
 // ---- Step-C executors (scoring reader, report, and the informational evidence probes) --------
-function readArtifactLines(name: string): string[] {
-  const p = join(ARTIFACTS, name);
-  return existsSync(p) ? readFileSync(p, "utf8").split("\n") : [];
+// git-object readers for the evidence loaders: existence decided via cat-file -e (never the
+// index), content via show, everything else fail-closed (codex C0-R3 findings 1/2).
+async function gitObjectText(rev: string, rel: string): Promise<string | null> {
+  const repoRoot = realpathSync(REPO_ROOT);
+  const env = buildGitEnv(process.env, "/dev/null");
+  const gitRO = (argv: string[], maxStdoutBytes: number): ReturnType<typeof runBenchGit> => runBenchGit({
+    argv, lane: { lane: "pinning" }, env, benchRoot: repoRoot, cwd: repoRoot,
+    limits: { maxStdoutBytes, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  const exists = await gitRO(["cat-file", "-e", `${rev}:${rel}`], 4096);
+  if (exists.exitCode !== 0) {
+    const err = text(exists.stderr);
+    if (/does not exist|Not a valid object name|invalid object name|bad revision|path .* does not exist/i.test(err)) return null;
+    throw new Error(`cannot establish ${rev}:${rel}'s existence (${err.trim().slice(0, 160)}) — failing closed`);
+  }
+  const shown = await gitRO(["show", `${rev}:${rel}`], 512 * 1024 * 1024);
+  if (shown.exitCode !== 0) throw new Error(`cannot read ${rev}:${rel} (${text(shown.stderr).trim().slice(0, 160)}) — failing closed`);
+  return text(shown.stdout);
 }
 
-function loadScoreBundle(): { bundle: ScoreBundle; rat: Record<string, unknown> } {
-  const { cfg, corpus, workloads } = loadPinned();
-  const rat = JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>;
+// The score bundle is loaded from COMMITTED evidence only (codex C0-R3 finding 2): the logs
+// are read as HEAD blobs — an uncommitted appended row is not evidence yet, and a fabricated
+// suffix can never reach the gates — and every frozen input (config, corpus, selected sets,
+// pilot, ratification) is read from the ROWS' OWN harness commit, so a post-hoc committed
+// edit to any of them cannot change what the recorded rows are scored against.
+async function loadScoreBundle(): Promise<{ bundle: ScoreBundle; rat: Record<string, unknown> }> {
+  const runsBlob = (await gitObjectText("HEAD", "docs/adrs/0001-benchmark/runs.jsonl")) ?? "";
+  const fidelityBlob = (await gitObjectText("HEAD", "docs/adrs/0001-benchmark/fidelity.jsonl")) ?? "";
+  const runsLines = runsBlob.split("\n");
+  let harnessCommit: string | null = null;
+  for (const line of runsLines) {
+    if (line.trim() === "") continue;
+    try {
+      const rec = JSON.parse(line) as Record<string, unknown>;
+      if (rec["type"] === "run" && rec["phase"] === "matrix" && typeof rec["harnessCommit"] === "string") {
+        harnessCommit = rec["harnessCommit"] as string;
+        break;
+      }
+    } catch {
+      continue;
+    }
+  }
+  if (harnessCommit === null)
+    throw new Error("no COMMITTED matrix rows in HEAD:runs.jsonl — commit the evidence log first (scoring reads committed blobs only; codex C0-R3 finding 2)");
+  const showAt = async (rel: string): Promise<string> => {
+    const content = await gitObjectText(harnessCommit, rel);
+    if (content === null) throw new Error(`${rel} is absent at the rows' harness commit ${harnessCommit.slice(0, 12)} — the frozen inputs must ride the same revision as the rows`);
+    return content;
+  };
+  const cfg = parseBenchConfig(await showAt("docs/adrs/0001-benchmark/bench-config.json"));
+  const corpus = loadCorpus(await showAt("docs/adrs/0001-benchmark/corpus.json"));
+  const workloads = new Map<string, UnitWorkload>();
+  for (const slot of corpus.performance) {
+    for (const unit of slot.units) {
+      workloads.set(unit.unitId, parseUnitWorkload(await showAt(`docs/adrs/0001-benchmark/selected/${workloadFileName(unit.unitId)}`)));
+    }
+  }
+  const rat = JSON.parse(await showAt("docs/adrs/0001-benchmark/ratification.json")) as Record<string, unknown>;
   const noiseBand = rat["noiseBand"];
   if (typeof noiseBand !== "number") throw new Error("ratification.json carries no numeric noiseBand");
   // the band is not taken on faith (codex C0-R1 finding 12): it must equal pilot.json's
-  // calibrated value AND re-derive from the pilot spread under the frozen §4.7 formula
-  const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number; pilotSpread?: number; wallsMs?: number[] };
+  // calibrated value AND re-derive, from the RECOMPUTED spread over the recorded walls,
+  // under the frozen §4.7 formula (codex C0-R2 re f.12)
+  const pilot = JSON.parse(await showAt("docs/adrs/0001-benchmark/pilot.json")) as { noiseBand?: number; pilotSpread?: number; wallsMs?: number[] };
   if (noiseBand !== pilot.noiseBand)
     throw new Error(`ratification.json noiseBand (${noiseBand}) != pilot.json's calibrated band (${String(pilot.noiseBand)})`);
-  // the spread is RECOMPUTED from the recorded walls, never trusted as declared (codex C0-R2
-  // re f.12) — pilot.json stores it at 4 decimal places, so the recomputation matches that
   const walls = pilot.wallsMs;
   if (!Array.isArray(walls) || walls.length === 0 || walls.some((w) => typeof w !== "number" || w <= 0))
     throw new Error("pilot.json carries no usable wallsMs — the band cannot be re-derived");
@@ -1418,7 +1495,7 @@ function loadScoreBundle(): { bundle: ScoreBundle; rat: Record<string, unknown> 
   if (typeof ratifiedDigest !== "string" || ratifiedDigest.length === 0)
     throw new Error("ratification.json carries no frozenSurfaceDigest — scoring cannot scope the fidelity ledger");
   return {
-    bundle: { cfg, corpus, workloads, runsLines: readArtifactLines("runs.jsonl"), fidelityLines: readArtifactLines("fidelity.jsonl"), noiseBand, ratifiedDigest },
+    bundle: { cfg, corpus, workloads, runsLines, fidelityLines: fidelityBlob.split("\n"), noiseBand, ratifiedDigest },
     rat,
   };
 }
@@ -1462,13 +1539,13 @@ function renderScoreToLog(out: ScoreOutput): void {
 
 async function cmdScore(): Promise<void> {
   await assertEvidenceReadable();
-  const { bundle } = loadScoreBundle();
+  const { bundle } = await loadScoreBundle();
   renderScoreToLog(scoreMatrix(bundle));
 }
 
 async function cmdReport(): Promise<void> {
   await assertEvidenceReadable();
-  const { bundle, rat } = loadScoreBundle();
+  const { bundle, rat } = await loadScoreBundle();
   const score = scoreMatrix(bundle);
   const envManifests: Array<Record<string, unknown>> = [];
   for (const line of bundle.runsLines) {
@@ -1561,7 +1638,7 @@ async function cmdOption3(): Promise<void> {
   let drivers: DriverId[] = ["T1", "T2c"];
   let driversRationale = "no §4.7 recommendation — both finalists (plan §4.4)";
   try {
-    const { bundle } = loadScoreBundle();
+    const { bundle } = await loadScoreBundle();
     const score = scoreMatrix(bundle);
     if (score.caseMapping.recommendation !== null) {
       drivers = [score.caseMapping.recommendation];
