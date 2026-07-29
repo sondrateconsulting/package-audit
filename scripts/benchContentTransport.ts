@@ -79,10 +79,13 @@ const SLOT_CANDIDATES: Record<string, Array<{ owner: string; repo: string; branc
     { owner: "TanStack", repo: "query", branches: ["main"] },
     { owner: "pnpm", repo: "pnpm", branches: ["main"] },
   ],
+  // C3 measured at pinning: nixpkgs's REST tree is TRUNCATED (a C4 shape — 53.6k entries) and
+  // home-assistant/core's paths are short (mean ~47 B); kubernetes (~31.3k entries, mean ~67 B,
+  // deep staging/ nesting) is the path-heavy candidate that verifies, so it leads.
   C3: [
+    { owner: "kubernetes", repo: "kubernetes", branches: ["master"] },
     { owner: "NixOS", repo: "nixpkgs", branches: ["master"] },
     { owner: "home-assistant", repo: "core", branches: ["dev"] },
-    { owner: "kubernetes", repo: "kubernetes", branches: ["master"] },
   ],
   C4: [
     { owner: "llvm", repo: "llvm-project", branches: ["main"] },
