@@ -30,10 +30,10 @@ const workloadOf = (n: number, over: Partial<Parameters<typeof buildUnitWorkload
   });
 
 describe("computeWorstCase — §4.8's exact reservation", () => {
-  test("T0: (reads + tree + fallback budget) × attemptCap", () => {
+  test("T0: (reads + tree + fallback budget) × attemptCap + the SHA-classifier allowance", () => {
     const w = workloadOf(100);
     const wc = computeWorstCase("T0", w, CFG, { owner: "o", repo: "r" });
-    expect(wc.core).toBe((100 + 1 + restFallbackBudgetFor(CFG, 100)) * 6);
+    expect(wc.core).toBe((100 + 1 + restFallbackBudgetFor(CFG, 100)) * 6 + 6);
     expect(wc.graphql).toBe(0);
   });
   test("T1: plannedBatches × (1+descendants) × attempts × P_max — never the 1-point floor", () => {
@@ -41,13 +41,13 @@ describe("computeWorstCase — §4.8's exact reservation", () => {
     const wc = computeWorstCase("T1", w, CFG, { owner: "o", repo: "r" });
     expect(wc.plannedBatches).toBe(2); // 300 aliases under the 250 cap
     expect(wc.graphql).toBe(2 * (1 + 4) * 6 * 10);
-    expect(wc.core).toBe((1 + restFallbackBudgetFor(CFG, 300)) * 6);
+    expect(wc.core).toBe((1 + restFallbackBudgetFor(CFG, 300)) * 6 + 6);
   });
   test("clone drivers reserve only the fallback budget; the pinned escape reserves the T0 shape", () => {
     const w = workloadOf(100);
-    expect(computeWorstCase("T2c", w, CFG, { owner: "o", repo: "r" }).core).toBe(restFallbackBudgetFor(CFG, 100) * 6);
+    expect(computeWorstCase("T2c", w, CFG, { owner: "o", repo: "r" }).core).toBe(restFallbackBudgetFor(CFG, 100) * 6 + 6);
     const escaped = workloadOf(100, { escapeTripped: true });
-    expect(computeWorstCase("T2a", escaped, CFG, { owner: "o", repo: "r" }).core).toBe((100 + 1 + restFallbackBudgetFor(CFG, 100)) * 6);
+    expect(computeWorstCase("T2a", escaped, CFG, { owner: "o", repo: "r" }).core).toBe((100 + 1 + restFallbackBudgetFor(CFG, 100)) * 6 + 6);
   });
 });
 
@@ -60,7 +60,7 @@ describe("planSegments — the feasibility gate", () => {
     expect(segments.reduce((a, b) => a + b, 0)).toBe(2000);
     const budget = restFallbackBudgetFor(CFG, 2000);
     for (const s of segments)
-      expect((s + 1 + budget) * CFG.rest.attemptCap * CFG.budget.headroomFactor).toBeLessThanOrEqual(CFG.budget.bucketCapacityPerHour);
+      expect(((s + 1 + budget) * CFG.rest.attemptCap + CFG.rest.attemptCap) * CFG.budget.headroomFactor).toBeLessThanOrEqual(CFG.budget.bucketCapacityPerHour);
   });
   test("a non-segmentable driver over capacity is a hard error, not a silent truncation", () => {
     const huge = workloadOf(2000);
@@ -104,6 +104,7 @@ describe("verifyDeliveries — G1/G2 bookkeeping against the pinned matrix", () 
     expect(r.resolved).toBe(2);
     expect(r.g1Failures).toEqual([]);
     expect(r.g2Failures).toEqual([]);
+    expect(r.probeDivergences).toEqual([]);
     expect(r.routesDelivered).toEqual({ primary: 1, "binary-lockfile-skip": 1 });
   });
   test("wrong bytes = G1; wrong route / missing / duplicate / acquisition-on-no-read = G2 or G1", () => {

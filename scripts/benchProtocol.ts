@@ -4,7 +4,7 @@
 // runs.jsonl record shape. The pure decision pieces (WC formulas, segmentation, washout,
 // straddle, verification) are exported for CI tests; the live engine composes them.
 
-import { appendFileSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, arch, cpus, platform, release } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -20,7 +20,7 @@ import {
   type AcquisitionForm, type DriverRunContext, type DriverRunOutcome, type EntryDelivery,
 } from "./benchDrivers.ts";
 import {
-  makeBuckets, outstandingHorizonMs, readRateLimit,
+  BenchHttpError, makeBuckets, outstandingHorizonMs, readRateLimit,
   type BenchGhContext, type BenchHttpAttemptRecord, type RateLimitSnapshot,
 } from "./benchGh.ts";
 import { seamStringSha256, type UnitWorkload } from "./benchWorkload.ts";
@@ -45,18 +45,22 @@ export function computeWorstCase(driver: DriverId, workload: UnitWorkload, cfg: 
   const budget = restFallbackBudgetFor(cfg, workload.entries.length);
   const cap = cfg.rest.attemptCap;
   const fixed = cfg.budget.fixedPerRunOverheadRequests;
+  // ONE SHA-classifier allowance (§4.4's pinned-object probe is its own attempt loop): a 404'd
+  // fallback plus its classifier can consume attemptCap extra requests beyond the fallback's own
+  // — reserve it or the true worst case trips a false R5 (codex R1 finding 24)
+  const classifier = cap;
   if (driver === "T0") {
     // a truncated tree routes T0 to the production checkout-clone fallback: the tree request
     // plus REST fallbacks only — content reads are local (§4.2 C4)
-    if (workload.truncatedTree) return { core: (1 + budget) * cap + fixed, graphql: 0, plannedBatches: 0 };
+    if (workload.truncatedTree) return { core: (1 + budget) * cap + classifier + fixed, graphql: 0, plannedBatches: 0 };
     // per-file REST + the tree request + the fallback budget, all under the attempt cap
-    return { core: (reads + 1 + budget) * cap + fixed, graphql: 0, plannedBatches: 0 };
+    return { core: (reads + 1 + budget) * cap + classifier + fixed, graphql: 0, plannedBatches: 0 };
   }
   if (driver === "T2a" && workload.escapeTripped && !workload.truncatedTree) {
-    return { core: (reads + 1 + budget) * cap + fixed, graphql: 0, plannedBatches: 0 };
+    return { core: (reads + 1 + budget) * cap + classifier + fixed, graphql: 0, plannedBatches: 0 };
   }
   if (driver === "T1") {
-    if (workload.truncatedTree) return { core: (1 + budget) * cap + fixed, graphql: 0, plannedBatches: 0 };
+    if (workload.truncatedTree) return { core: (1 + budget) * cap + classifier + fixed, graphql: 0, plannedBatches: 0 };
     const plan = planRounds(workload);
     let plannedBatches = 0;
     for (const round of [plan.round1, plan.round2]) {
@@ -64,11 +68,10 @@ export function computeWorstCase(driver: DriverId, workload: UnitWorkload, cfg: 
       plannedBatches += packBatches(round, cfg, { owner: slot.owner, repo: slot.repo, sha: workload.sha, roundLabel: "wc" }).length;
     }
     const graphql = plannedBatches * (1 + cfg.t1.split.maxDescendantsPerOriginal) * cap * cfg.budget.pMaxPointsPerGraphqlAttempt;
-    return { core: (1 + budget) * cap + fixed, graphql, plannedBatches };
+    return { core: (1 + budget) * cap + classifier + fixed, graphql, plannedBatches };
   }
-  // clone drivers: no REST content, no REST tree — only the fallback budget (and the pinned
-  // classifier probes ride inside it via the attempt cap slack)
-  return { core: budget * cap + fixed, graphql: 0, plannedBatches: 0 };
+  // clone drivers: no REST content, no REST tree — the fallback budget plus the classifier
+  return { core: budget * cap + classifier + fixed, graphql: 0, plannedBatches: 0 };
 }
 
 // §4.8 feasibility gate: segments of the T0-shaped workload, each satisfying
@@ -83,7 +86,8 @@ export function planSegments(driver: DriverId, workload: UnitWorkload, cfg: Benc
   }
   const reads = workload.entries.filter((e) => e.read).length;
   const budget = restFallbackBudgetFor(cfg, workload.entries.length);
-  const perSegment = Math.floor(capacity / (cfg.budget.headroomFactor * cfg.rest.attemptCap)) - 1 - budget;
+  // − tree − fallback budget − the SHA-classifier allowance (one attempt-loop equivalent)
+  const perSegment = Math.floor(capacity / (cfg.budget.headroomFactor * cfg.rest.attemptCap)) - 1 - budget - 1;
   if (perSegment < 1) throw new BenchProtocolError("segmentation cannot satisfy the reservation guard (per-segment allowance < 1)");
   const segments: number[] = [];
   let remaining = reads;
@@ -121,10 +125,21 @@ export interface VerificationReport {
   resolved: number;
   g1Failures: Array<{ path: string; route: string; reason: string }>;
   g2Failures: Array<{ path: string; reason: string }>;
+  // checkout-config probe reps: a caveat-route divergence from the pinned baseline is a
+  // FIRST-CLASS FINDING for the decision-maker, never an auto-disqualification (§4.7 G1);
+  // primary-route divergence under the probe stays a G1 failure (T2a gets no shelter).
+  probeDivergences: Array<{ path: string; route: string }>;
   routesDelivered: Record<string, number>;
 }
-export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly EntryDelivery[], driver: DriverId): VerificationReport {
-  const report: VerificationReport = { resolved: 0, g1Failures: [], g2Failures: [], routesDelivered: {} };
+export interface VerifyOptions {
+  probeRep?: boolean;
+  acquiredPaths?: ReadonlySet<string>; // content-acquisition events — no-read routes must show ZERO
+}
+export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly EntryDelivery[], driver: DriverId, opts: VerifyOptions = {}): VerificationReport {
+  const report: VerificationReport = { resolved: 0, g1Failures: [], g2Failures: [], probeDivergences: [], routesDelivered: {} };
+  // raw-capable primary routes (§4.3): T1's hash-validated text and T2c's pre-decode frames
+  // must carry rawVerified — a delivery claiming those routes without it fails G1
+  const rawCapablePrimary = driver === "T1" || driver === "T2c";
   const byPath = new Map<string, EntryDelivery[]>();
   for (const d of deliveries) {
     const list = byPath.get(d.path) ?? [];
@@ -155,8 +170,14 @@ export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly En
       continue;
     }
     if ("nonAcquisition" in expected) {
-      if (d.delivered !== null) report.g1Failures.push({ path: entry.path, route: d.route, reason: "content acquired on a no-read route" });
-      else report.resolved++;
+      if (d.delivered !== null) {
+        report.g1Failures.push({ path: entry.path, route: d.route, reason: "content acquired on a no-read route" });
+      } else if (opts.acquiredPaths !== undefined && opts.acquiredPaths.has(entry.path)) {
+        // instrumentation must PROVE zero acquisition (§4.3): a discarded body still fails
+        report.g1Failures.push({ path: entry.path, route: d.route, reason: "acquisition event observed for a no-read route" });
+      } else {
+        report.resolved++;
+      }
       continue;
     }
     if (d.delivered === null) {
@@ -165,7 +186,17 @@ export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly En
     }
     const gotHash = seamStringSha256(d.delivered);
     if (gotHash !== expected.seamSha256) {
-      report.g1Failures.push({ path: entry.path, route: d.route, reason: `seam-string sha256 mismatch (${gotHash.slice(0, 12)}… != ${expected.seamSha256.slice(0, 12)}…)` });
+      if (opts.probeRep === true && expectation.declaredCaveat) {
+        // the caveat waiver is EXACTLY the config delta (§4.7 G1): recorded, not disqualifying
+        report.probeDivergences.push({ path: entry.path, route: d.route });
+        report.resolved++;
+      } else {
+        report.g1Failures.push({ path: entry.path, route: d.route, reason: `seam-string sha256 mismatch (${gotHash.slice(0, 12)}… != ${expected.seamSha256.slice(0, 12)}…)` });
+      }
+      continue;
+    }
+    if (rawCapablePrimary && d.route === "primary" && d.rawVerified !== true) {
+      report.g1Failures.push({ path: entry.path, route: d.route, reason: "raw-capable primary route delivered without pre-decode verification" });
       continue;
     }
     report.resolved++;
@@ -273,12 +304,19 @@ export interface RunRecord {
   startedAtIso: string;
   wallMs: number; // workload start → unit slot release, teardown included (§4.6.1)
   segments: number;
-  outcome: "complete" | "unit-failure" | "invalidated-straddle" | "drift-restart" | "re-pin-required";
+  outcome: "complete" | "unit-failure" | "invalidated-straddle" | "invalidated-foreign" | "halt-r5-breach" | "drift-restart" | "re-pin-required";
   failureCause: string | null;
+  // typed R1/R2 evidence (§4.5): the rerun predicate reads THIS, never a message regex
+  failureEvidence: { kind: "http"; code: string; lastClassification: string | null; requestClass: string | null } | { kind: "unit" } | null;
   requests: Record<string, number>;
+  attempts: { fivexx: number; retries: number; secondaryByKind: Record<string, number> };
   secondarySignals: number; // attributable (driver-own matrix traffic) — G4's classifier input
   points: { measuredCostSum: number; imputed: number };
   bucketDeltas: { core: BucketDelta; graphql: BucketDelta };
+  expectedConsumption: { core: number; graphql: number }; // harness-owned accounting (R3's input)
+  replayOfPos: number | null; // in-slot replays record their physical predecessor (§4.5)
+  diskReclaimFailed: boolean;
+  probeDivergences: number;
   httpBodyBytes: number;
   cloneObjectStoreBytes: number | null;
   diskSampledPeakBytes: number;
@@ -378,6 +416,14 @@ export class BenchEngine {
   private readonly childPool = { pool: null as null | { acquire(): Promise<() => void> } };
   private readonly manifestHash: string;
   private runCounter = 0;
+  // §4.4: the acquisition form is decided at a unit's FIRST clone-involving rep and FROZEN for
+  // the unit; a later drift under the production form is R6's restart, never a silent switch
+  // (codex R1 finding 10)
+  private readonly unitForms = new Map<string, AcquisitionForm>();
+  private replayOfPos: number | null = null;
+  setReplayOf(pos: number | null): void {
+    this.replayOfPos = pos;
+  }
   constructor(o: EngineOptions) {
     this.o = o;
     this.manifestHash = o.runsLog.envManifestHash();
@@ -413,7 +459,7 @@ export class BenchEngine {
       throw new BenchProtocolError(`no pinned workload for ${row.unit}`);
     })();
     this.runCounter++;
-    const runDir = join(this.o.benchRoot, `run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}`);
+    const runDir = join(this.o.benchRoot, `run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-a${this.runCounter}`);
     mkdirSync(runDir, { recursive: true });
     mkdirSync(this.o.runCacheDir, { recursive: true });
     const dbPath = join(this.o.runCacheDir, `bench-run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-${this.runCounter}.sqlite`);
@@ -421,10 +467,29 @@ export class BenchEngine {
     const client = this.o.makeClient(db);
     const httpRecords: BenchHttpAttemptRecord[] = [];
     const spawnRecords: BenchSpawnRecord[] = [];
+    const wcRef = { core: Number.MAX_SAFE_INTEGER, graphql: Number.MAX_SAFE_INTEGER };
     const buckets = makeBuckets();
+    let liveGraphqlPoints = 0;
+    let liveCoreAttempts = 0;
     const gh: BenchGhContext = {
       client, db, cfg, core: buckets.core, graphql: buckets.graphql,
-      record: (r) => httpRecords.push(r),
+      record: (r) => {
+        httpRecords.push(r);
+        if (r.servedFromCache) return;
+        // R5's frozen assumptions are enforced AT THE REQUEST, not post-run (codex R1 finding
+        // 9): one over-P_max cost or a WC overrun halts before another dispatch can go out.
+        if (r.kind === "graphql") {
+          liveGraphqlPoints += r.pointsCost ?? 1;
+          if (r.pointsCost !== null && r.pointsCost > cfg.budget.pMaxPointsPerGraphqlAttempt)
+            throw new BenchProtocolError(`R5 frozen-assumption breach: measured cost ${r.pointsCost} exceeds P_max ${cfg.budget.pMaxPointsPerGraphqlAttempt} — halt for freeze repair`);
+          if (liveGraphqlPoints > Math.max(wcRef.graphql, 1))
+            throw new BenchProtocolError(`R5 frozen-assumption breach: live graphql consumption ${liveGraphqlPoints} overran WC ${wcRef.graphql} — halt for freeze repair`);
+        } else if (r.status > 0 && r.status !== 304) {
+          liveCoreAttempts++;
+          if (liveCoreAttempts > wcRef.core)
+            throw new BenchProtocolError(`R5 frozen-assumption breach: live core consumption ${liveCoreAttempts} overran WC ${wcRef.core} — halt for freeze repair`);
+        }
+      },
       now: () => this.now(), sleep: (ms) => this.sleep(ms),
     };
     const ghMeta: BenchGhContext = { ...gh, db: null }; // reservation/straddle snapshots bypass the run cache
@@ -437,13 +502,31 @@ export class BenchEngine {
       cfg, slot, unit, benchRoot: this.o.benchRoot,
       gitEnv: this.gitEnvFor(row.probe), spawnObserver: (r: BenchSpawnRecord) => spawnRecords.push(r),
     };
-    if (needsClonePath && !(row.driver === "T2a" && workload.escapeTripped && !workload.truncatedTree)) {
-      const live = await probeLiveHead(probeCtx);
-      form = live === unit.sha ? "production" : "scaffolding";
-      if (form === "scaffolding") this.o.log(`${row.unit}: live head drifted — all reps use the SHA-pinned scaffolding form`);
+    const clonePathActive = needsClonePath && !(row.driver === "T2a" && workload.escapeTripped && !workload.truncatedTree);
+    if (clonePathActive) {
+      const frozen = this.unitForms.get(row.unit);
+      if (frozen === "scaffolding") {
+        form = "scaffolding"; // SHA-pinned form needs no live-head probe
+      } else {
+        const live = await probeLiveHead(probeCtx);
+        if (frozen === undefined) {
+          form = live === unit.sha ? "production" : "scaffolding";
+          this.unitForms.set(row.unit, form);
+          if (form === "scaffolding") this.o.log(`${row.unit}: live head drifted — all reps use the SHA-pinned scaffolding form`);
+        } else if (live !== unit.sha) {
+          // mid-unit drift under the frozen PRODUCTION form: discard reps, restart on the
+          // scaffolding form via the preregistered epilogue (§4.4/§4.5 R6 branch arm)
+          this.unitForms.set(row.unit, "scaffolding");
+          throw new DriftSignal(live);
+        } else {
+          form = "production";
+        }
+      }
     }
 
     const wc = computeWorstCase(row.driver, workload, cfg, { owner: slot.owner, repo: slot.repo });
+    wcRef.core = wc.core;
+    wcRef.graphql = wc.graphql;
     // §4.8 feasibility: over-capacity WC runs execute in segmented mode (per-file REST shapes
     // only); each segment satisfies the guard in its own bucket window, deltas sum, and the
     // wall clock pauses between segments.
@@ -454,7 +537,7 @@ export class BenchEngine {
     let segBefore: RateLimitSnapshot;
     const segmentWc = (sizes: readonly number[], i: number): WorstCase => {
       const budget = restFallbackBudgetFor(cfg, workload.entries.length);
-      return { core: ((sizes[i] ?? 0) + (i === 0 ? 1 : 0) + budget) * cfg.rest.attemptCap + cfg.budget.fixedPerRunOverheadRequests, graphql: 0, plannedBatches: 0 };
+      return { core: ((sizes[i] ?? 0) + (i === 0 ? 1 : 0) + budget) * cfg.rest.attemptCap + cfg.rest.attemptCap + cfg.budget.fixedPerRunOverheadRequests, graphql: 0, plannedBatches: 0 };
     };
     if (segmented) {
       this.o.log(`${row.unit} ${row.driver}: WC exceeds bucket capacity — segmented mode, ${segmentSizes.length} segments (${segmentSizes.join(", ")})`);
@@ -499,6 +582,8 @@ export class BenchEngine {
     let verification: VerificationReport | null = null;
     let runOutcome: RunRecord["outcome"] = "complete";
     let failureCause: string | null = null;
+    let failureEvidence: RunRecord["failureEvidence"] = null;
+    let r5: BenchProtocolError | null = null;
     try {
       outcome = await runDriver(row.driver, ctx, this.childPool.pool);
     } catch (e) {
@@ -508,9 +593,18 @@ export class BenchEngine {
       } else if (e instanceof RePinRequired) {
         runOutcome = "re-pin-required";
         failureCause = e.message;
+      } else if (e instanceof BenchProtocolError && e.message.includes("R5")) {
+        runOutcome = "halt-r5-breach"; // recorded IN runs.jsonl, then the halt propagates
+        failureCause = e.message;
+        r5 = e;
       } else if (e instanceof UnitFailure) {
         runOutcome = "unit-failure";
         failureCause = e.cause2;
+        failureEvidence = { kind: "unit" };
+      } else if (e instanceof BenchHttpError) {
+        runOutcome = "unit-failure";
+        failureCause = `${e.code}: ${e.message}`;
+        failureEvidence = { kind: "http", code: e.code, lastClassification: e.lastClassification, requestClass: e.requestClass };
       } else {
         runOutcome = "unit-failure";
         failureCause = `harness/driver error: ${e instanceof Error ? e.message : String(e)}`;
@@ -523,16 +617,23 @@ export class BenchEngine {
       cloneObjectStoreBytes = duBytes(join(outcome.cloneDir, ".git"));
       sampler.point(runDir);
     }
+    let diskReclaimFailed = false;
+    try {
+      db.close();
+    } catch {
+      // a close failure must not mask the run outcome; the file removal below still runs
+    }
     try {
       rmSync(runDir, { recursive: true, force: true });
       for (const suffix of ["", "-wal", "-shm"]) rmSync(`${dbPath}${suffix}`, { force: true });
     } catch {
-      // best-effort; the bench root sweep at exit reclaims stragglers
+      diskReclaimFailed = true;
     }
+    if (existsSync(runDir)) diskReclaimFailed = true; // verified reclaim, never assumed (finding 18)
     const wallMs = wall.stop();
     const after = await readRateLimit(ghMeta);
     const disk = sampler.stop();
-    if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver);
+    if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
 
     // per-segment same-window deltas, summed by construction (§4.6.2); the final (or only)
     // segment closes against the post-run snapshot. Any straddled segment invalidates the run.
@@ -548,26 +649,39 @@ export class BenchEngine {
     };
     const deltas = { core: sumDelta((d) => d.core), graphql: sumDelta((d) => d.graphql) };
     if ((!deltas.core.valid || !deltas.graphql.valid) && runOutcome === "complete") runOutcome = "invalidated-straddle"; // R4
+    // R3 foreign consumption (§4.5/§4.8): the observed delta must reconcile with the harness's
+    // OWN accounting — unexplained excess is external interference: run invalid, replayed in
+    // its own slot, never charged to the driver allowance (codex R1 finding 8). Conditional
+    // 304s and rate_limit reads consume nothing; every other live response consumes one.
+    const expectedCore = httpRecords.filter((r) => !r.servedFromCache && r.kind === "rest" && r.status > 0 && r.status !== 304 && r.requestClass !== "rest-meta").length;
+    const expectedGraphql = httpRecords.filter((r) => !r.servedFromCache && r.kind === "graphql").reduce((n, r) => n + (r.pointsCost ?? 1), 0);
+    if (runOutcome === "complete") {
+      if ((deltas.core.valid && deltas.core.used !== null && deltas.core.used > expectedCore) ||
+          (deltas.graphql.valid && deltas.graphql.used !== null && deltas.graphql.used > expectedGraphql)) {
+        runOutcome = "invalidated-foreign";
+        failureCause = `observed consumption (core ${deltas.core.used}, graphql ${deltas.graphql.used}) exceeds harness-owned accounting (core ${expectedCore}, graphql ${expectedGraphql})`;
+      }
+    }
 
     const requests: Record<string, number> = {};
+    const attempts = { fivexx: 0, retries: 0, secondaryByKind: {} as Record<string, number> };
     let measuredCostSum = 0;
     let imputed = 0;
     let secondarySignals = 0;
     for (const r of httpRecords) {
       if (r.servedFromCache) continue;
       requests[r.requestClass] = (requests[r.requestClass] ?? 0) + 1;
+      if (r.status >= 500) attempts.fivexx++;
+      if (r.attempt > 1) attempts.retries++;
       if (r.kind === "graphql") {
         if (r.pointsCost !== null) measuredCostSum += r.pointsCost;
         else imputed += 1;
-        if (r.pointsCost !== null && r.pointsCost > cfg.budget.pMaxPointsPerGraphqlAttempt)
-          throw new BenchProtocolError(`R5 frozen-assumption breach: measured cost ${r.pointsCost} exceeds P_max ${cfg.budget.pMaxPointsPerGraphqlAttempt} — halt for freeze repair`);
       }
-      if (r.secondarySignal !== null) secondarySignals++;
+      if (r.secondarySignal !== null) {
+        secondarySignals++;
+        attempts.secondaryByKind[r.secondarySignal] = (attempts.secondaryByKind[r.secondarySignal] ?? 0) + 1;
+      }
     }
-    if (deltas.core.valid && deltas.core.used !== null && deltas.core.used > wc.core)
-      throw new BenchProtocolError(`R5 frozen-assumption breach: core consumption ${deltas.core.used} overran WC ${wc.core} — halt for freeze repair`);
-    if (deltas.graphql.valid && deltas.graphql.used !== null && deltas.graphql.used > Math.max(wc.graphql, 1))
-      throw new BenchProtocolError(`R5 frozen-assumption breach: graphql consumption ${deltas.graphql.used} overran WC ${wc.graphql} — halt for freeze repair`);
 
     const horizon = outstandingHorizonMs(gh);
     const washoutAppliedMs = washoutMs(cfg, horizon, this.now());
@@ -576,10 +690,16 @@ export class BenchEngine {
       type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
       probe: row.probe, phase, acquisitionForm: outcome?.acquisitionForm ?? (needsClonePath ? form : null),
       startedAtIso, wallMs, segments: segmentSizes.length, outcome: runOutcome, failureCause,
-      requests, secondarySignals,
+      failureEvidence,
+      requests, attempts, secondarySignals,
       points: { measuredCostSum, imputed },
       bucketDeltas: deltas,
-      httpBodyBytes: outcome?.httpBodyBytes ?? 0,
+      expectedConsumption: { core: expectedCore, graphql: expectedGraphql },
+      replayOfPos: this.replayOfPos,
+      diskReclaimFailed,
+      probeDivergences: verification?.probeDivergences.length ?? 0,
+      // body bytes derive from the RECORDS so a thrown driver still reports its real transfer
+      httpBodyBytes: httpRecords.reduce((n, r) => n + (r.servedFromCache ? 0 : r.bodyBytes), 0),
       cloneObjectStoreBytes,
       diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples,
       fallbackSpend: outcome?.fallbackSpend ?? 0,
@@ -591,6 +711,8 @@ export class BenchEngine {
       harnessCommit: this.o.runsLog.manifest.harnessCommit,
     };
     this.o.runsLog.append(record);
+    this.replayOfPos = null;
+    if (r5 !== null) throw r5; // the halt propagates AFTER the terminal record landed (finding 9)
     if (verification !== null && (verification.g1Failures.length > 0 || verification.g2Failures.length > 0)) {
       this.o.log(`${row.unit} ${row.driver} rep${row.rep}: G1=${verification.g1Failures.length} G2=${verification.g2Failures.length}`);
       for (const f of [...verification.g1Failures.slice(0, 5)]) this.o.log(`  G1 ${f.path} [${f.route}]: ${f.reason}`);

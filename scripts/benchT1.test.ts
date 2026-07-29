@@ -35,13 +35,25 @@ describe("planRounds", () => {
       entry("pkg/bun.lockb", { class: "lockfile", read: false, noReadReason: "binary-lockfile-skip", canonicalSeamSha256: null, rawSha256: null, checkoutSeamSha256: null, gql: null }),
     ],
   });
-  test("two-round shape as the production design forces; pre-routed entries never batch", () => {
+  test("two-round shape; ONLY tree-knowable facts pre-route (binary/truncated are response-discovered)", () => {
     const plan = planRounds(workload);
     expect(plan.round1.map((e) => e.path)).toEqual(["package.json", "run.sh"]);
-    expect(plan.round2.map((e) => e.path)).toEqual(["src/a.ts", "package-lock.json"]);
+    // img.png batches like any blob — its binary state is DISCOVERED in the response, never
+    // read off the pinned expectation (the pin is ground truth, not a runtime oracle)
+    expect(plan.round2.map((e) => e.path)).toEqual(["src/a.ts", "package-lock.json", "img.png"]);
     expect(plan.preRouted.map((p) => [p.entry.path, p.route])).toEqual([
       ["link", "symlink-fallback"],
-      ["img.png", "binary-fallback"],
+    ]);
+  });
+  test("a lone entry above the content cap pre-routes as content-cap-singleton (tree-knowable)", () => {
+    const big = buildUnitWorkload({
+      unit: "C2:o/r@main", sha: sha("0"), treeOid: sha("f"), objectFormat: "sha1",
+      generatedAtIso: "2026-07-28T00:00:00Z", truncatedTree: false, escapeTripped: false,
+      batchContentBytesCap: CFG.t1.batchContentBytesCap,
+      entries: [entry("huge.lock", { class: "lockfile", size: 2_000_000 })],
+    });
+    expect(planRounds(big).preRouted).toEqual([
+      { entry: big.entries[0]!, route: "content-cap-singleton" },
     ]);
   });
 });
@@ -82,8 +94,8 @@ const BATCH = buildBatchQuery([goodEntry, entry("other.ts")], {
   aliasSelection: CFG.t1.aliasSelection, rateLimitRider: CFG.t1.rateLimitRider, label: "t.b0",
 });
 const dispatch = (over: Partial<BenchGraphqlDispatch>): BenchGraphqlDispatch => ({
-  status: 200, exitCode: 0, headers: {}, bodyText: "{}", data: {}, errors: [], jsonParseable: true,
-  classification: "ok", secondaryLike: false, primaryUntilMs: null, pointsCost: 1,
+  status: 200, exitCode: 0, headers: {}, bodyText: "{}", data: {}, errors: [], malformedErrorEntries: 0,
+  jsonParseable: true, classification: "ok", secondaryLike: false, primaryUntilMs: null, pointsCost: 1,
   ...over,
 });
 const aliasPayload = (text: string | null, over: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -131,7 +143,15 @@ describe("analyzeBatchResponse — exhaustive, closed-default", () => {
     );
     if (bad.kind !== "per-alias") throw new Error("expected per-alias");
     expect(bad.outcomes[0]).toMatchObject({ kind: "validation-fallback", reason: "byteSize mismatch" });
-    expect(bad.outcomes[1]).toMatchObject({ kind: "validation-fallback", reason: "text null/non-string" });
+    // observed text:null routes as the vocabulary's own binary-fallback, not a validation catch-all
+    expect(bad.outcomes[1]).toEqual({ kind: "binary-fallback", index: 1 });
+    const states = analyzeBatchResponse(
+      dispatch({ data: { repository: { a0: aliasPayload(TEXT, { isTruncated: true }), a1: aliasPayload(null, { oid: sha("c"), byteSize: 10, isBinary: true }) } } }),
+      BATCH, "sha1", CFG,
+    );
+    if (states.kind !== "per-alias") throw new Error("expected per-alias");
+    expect(states.outcomes[0]).toEqual({ kind: "truncated-blob-fallback", index: 0 });
+    expect(states.outcomes[1]).toEqual({ kind: "binary-fallback", index: 1 });
 
     const mixed = analyzeBatchResponse(
       dispatch({
@@ -151,6 +171,15 @@ describe("analyzeBatchResponse — exhaustive, closed-default", () => {
     const nothing = analyzeBatchResponse(dispatch({ data: { repository: {} } }), BATCH, "sha1", CFG);
     if (nothing.kind !== "per-alias") throw new Error("expected per-alias");
     expect(nothing.outcomes.map((o) => o.kind)).toEqual(["unattributed", "unattributed"]);
+  });
+  test("attributed errors of any OTHER type hit the closed default; malformed members fail the batch", () => {
+    const forbidden = analyzeBatchResponse(
+      dispatch({ data: {}, errors: [{ type: "FORBIDDEN", message: "nope", path: ["repository", "a0"] }] }),
+      BATCH, "sha1", CFG,
+    );
+    expect(forbidden).toMatchObject({ kind: "default-failure" }); // never a permitted absence
+    const malformed = analyzeBatchResponse(dispatch({ malformedErrorEntries: 1 }), BATCH, "sha1", CFG);
+    expect(malformed).toMatchObject({ kind: "default-failure" });
   });
   test("hash validation is real: a text whose blob hash mismatches the tree oid falls back", () => {
     const tampered = analyzeBatchResponse(
