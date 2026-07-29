@@ -53,6 +53,9 @@ export interface BenchHttpAttemptRecord {
   remaining: number | null;
   resetEpochSec: number | null;
   servedFromCache: boolean;
+  // NOTE: measured on the DECODED body re-encoded as UTF-8 (the production spawn hands strings,
+  // not bytes) — invalid input bytes inflate to 3-byte replacement chars. Recorded as-is with
+  // this caveat; raw byte counts would need a byte-mode transport production does not expose.
   bodyBytes: number;
 }
 export type BenchHttpRecorder = (rec: BenchHttpAttemptRecord) => void;
@@ -266,6 +269,9 @@ export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, u
   const errors: BenchGraphqlErrorEntry[] = [];
   let malformedErrorEntries = 0;
   const errRaw = o["errors"];
+  // a PRESENT non-array errors container is spec-malformed and must select the closed default,
+  // never resolve as success beside valid data (codex R2 finding 11)
+  if (errRaw !== undefined && !Array.isArray(errRaw)) malformedErrorEntries++;
   if (Array.isArray(errRaw)) {
     for (const e of errRaw) {
       // a member with no readable shape is EVIDENCE, never a silent drop (codex R1 finding 5):
@@ -296,6 +302,7 @@ export async function benchGraphqlDispatch(
   query: string,
   fields: Record<string, string>,
   label: string,
+  attemptOrdinal = 1, // the chain's physical dispatch ordinal — recorded (codex R2 finding 25)
 ): Promise<BenchGraphqlDispatch> {
   await waitBucket(ctx, ctx.graphql);
   const args = ["api", "-i", "graphql", "-f", `query=${query}`];
@@ -323,7 +330,7 @@ export async function benchGraphqlDispatch(
     : detectRestSecondarySignal(parsed.status, parsed.headers, parsed.body);
   ctx.record({
     type: "http-attempt", atMs: startedAt, wallMs: now - startedAt, kind: "graphql",
-    requestClass: "graphql-batch", label, attempt: 1, status: parsed.status, exitCode: res.exitCode,
+    requestClass: "graphql-batch", label, attempt: attemptOrdinal, status: parsed.status, exitCode: res.exitCode,
     classification: cls.kind, secondarySignal: signal, pointsCost,
     remaining: headerInt(parsed.headers["x-ratelimit-remaining"]),
     resetEpochSec: headerInt(parsed.headers["x-ratelimit-reset"]),

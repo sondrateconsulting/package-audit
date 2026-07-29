@@ -263,7 +263,7 @@ forced.
 
 | Slot | Purpose | Candidate(s) | Pinning verification |
 |---|---|---|---|
-| C1 | Multi-branch tree sharing + concurrency probe | `fastify/fastify` (main + released lines, each a pinned named branch unit) | ≥4 branch units (the probe needs 4 streams); ≥80% shared tree OIDs between two of them |
+| C1 | Multi-branch tree sharing + concurrency probe | `fastify/fastify` (main + released lines, each a pinned named branch unit) | ≥4 branch units (the probe needs 4 streams); ≥80% shared **blob** OIDs between two of them (\|A∩B\|/min(\|A\|,\|B\|) — the measure the Step-B amendment below defines) |
 | C2 | Mid-size typical service repo | `nodejs/undici` | 1k–3k files; JS/TS manifests present; REST tree `truncated: false` |
 | C3 | Path-heavy tree | `NixOS/nixpkgs` | recursive-tree payload dominated by path bytes; deep nesting; REST tree `truncated: false` (else it is a C4, not a C3) |
 | C4 | Truncated tree | `llvm/llvm-project`, else `chromium/chromium` | REST recursive tree returns `truncated: true` at the pinned SHA |
@@ -685,7 +685,8 @@ path out of Step D skips review, in either direction.
   is capped — attempts ≤ 6, REST fallbacks ≤ the budget, splits ≤ 4 descendants per batch,
   reruns ≤ 1 — so each run's worst-case bucket consumption `WC` is *computable exactly* from the
   pinned workload and constants: REST — (per-file requests + tree requests + fallback budget) ×
-  attempt cap + the fixed per-run overhead; GraphQL — planned batches × (1 + descendant cap)
+  attempt cap + one SHA-classifier attempt-loop allowance (§4.4's pinned-object probe on a 404'd
+  fallback is its own bounded loop) + the fixed per-run overhead; GraphQL — planned batches × (1 + descendant cap)
   dispatches × attempt cap × **`P_max`, a preregistered per-attempt point bound (10 — an order of
   magnitude over every measured cost)**, never the 1-point minimum, which is a floor and no bound
   at all. `P_max` is a *frozen assumption*, and it is treated as one: the harness monitors live
@@ -790,12 +791,14 @@ timed matrix run**:
 influence a timed measurement or its consumption accounting: the spawn/framing seams, drivers,
 protocol engine, configuration loaders, and the preregistered constants and schedule. Code that
 only READS committed `runs.jsonl` and artifacts after the fact — scoring/report generation and
-the §4.7 rule evaluation — plus the post-matrix informational executors (§4.4's boundary probe,
-§4.5's concurrency probe, §4.4's Option-3 offline analysis and warm scenario, whose commit pair
-IS frozen at Step B in `corpus.json`) may be added at Step C without invalidating timing data:
-they run after every timed row and cannot affect measurement. Their addition still passes
-review as part of Step C's own PR; any change to the frozen surface itself keeps the full
-amendment + restart rule below.
+the §4.7 rule evaluation — may be added at Step C without invalidating timing data: it runs
+after every timed row and cannot affect measurement. The post-matrix informational EXECUTORS
+(§4.4's boundary probe, §4.5's concurrency probe, §4.4's Option-3 offline analysis and warm
+scenario, whose commit pair IS frozen at Step B in `corpus.json`) generate their OWN evidence,
+so the pure-reader latitude does not extend to them: each is frozen and passes one adversarial
+review round BEFORE it collects data, and a later change to one reruns THAT executor's
+evidence, never the completed matrix. Any change to the frozen measurement surface itself keeps
+the full amendment + restart rule below.
 
 **Freeze semantics — the frozen set is everything the result depends on:** corpus SHAs and
 branches, selected sets, route-expectation matrices and ground-truth hashes, every
