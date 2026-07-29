@@ -15,7 +15,7 @@
 // Artifacts land in docs/adrs/0001-benchmark/. The pinning cache lives under ./data (a §0
 // write root, git-ignored) so re-runs are cheap; bench run dirs live under a pa-bench-* root.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -65,10 +65,14 @@ const log = (line: string): void => {
 // digest nor the frozen surface (codex R2 finding 1).
 function frozenSurfaceDigest(): string {
   const files: string[] = [];
+  // EVERY non-test script — the bench modules AND the production modules they execute through
+  // (github.ts, readOnlyGuard.ts, db.ts, the selection pipeline…) all drive measurement
+  // (codex R3 f.1); plus both normative documents and the preregistered artifacts.
   for (const name of readdirSync(join(REPO_ROOT, "scripts"))) {
-    if (/^bench[A-Z][A-Za-z]*\.ts$/.test(name) && !name.includes(".test.")) files.push(join(REPO_ROOT, "scripts", name));
+    if (/\.(ts|tsx)$/.test(name) && !name.includes(".test.")) files.push(join(REPO_ROOT, "scripts", name));
   }
-  files.push(join(REPO_ROOT, "scripts", "benchContentTransport.ts"));
+  files.push(join(REPO_ROOT, "docs", "plans", "adr-0001-disagreements-resolution.md"));
+  files.push(join(REPO_ROOT, "docs", "adrs", "0001-file-content-acquisition-strategy.md"));
   files.push(CONFIG_PATH, CORPUS_PATH);
   for (const name of readdirSync(SELECTED_DIR)) files.push(join(SELECTED_DIR, name));
   const uniq = [...new Set(files)].sort();
@@ -106,7 +110,9 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
     argv: ["status", "--porcelain"], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
     benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 },
   });
-  const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.json", "docs/adrs/0001-benchmark/ratification.json", "data/"];
+  // ratification.json is deliberately NOT here: it must be COMMITTED, so tampering with the
+  // signed answers or the digest needs a visible commit (codex R3 f.1)
+  const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl", "data/"];
   const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && !APPEND_ONLY.some((a) => f.startsWith(a)));
   if (dirty.length > 0)
     throw new Error(`REFUSING: dirty tracked files outside the append-only outputs: ${dirty.slice(0, 5).join(", ")} — the frozen surface must be committed (§8)`);
@@ -917,13 +923,19 @@ async function cmdFidelity(): Promise<void> {
           const expected = route === "symlink-fallback" || entry.mode === "120000" || typeof expectCanonical !== "string" ? expectDeref : expectCanonical;
           const pass = typeof expected === "string" && gotHash === expected;
           if (!pass) failures++;
-          results.push({ fixture: fixture.kind, driver, entry: entry.path, route, pass, rawVerified, gotHash, expected });
+          const resultRec = { type: "fidelity", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: fixture.kind, driver, entry: entry.path, route, pass, rawVerified, gotHash, expected };
+          results.push(resultRec);
+          // append-only, per entry: an exception later cannot erase earlier evidence, and a
+          // re-run APPENDS beside a recorded mismatch instead of overwriting it (codex R3 f.8 —
+          // a fidelity mismatch is never rerunnable, §4.2)
+          appendFileSync(join(ARTIFACTS, "fidelity.jsonl"), `${JSON.stringify(resultRec)}\n`);
           log(`fidelity ${fixture.kind} ${driver} ${entry.path} [${route}]: ${pass ? "PASS" : "FAIL"}`);
         }
       }
     }
     void seamHash;
-    writeFileSync(join(ARTIFACTS, "fidelity.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, failures, results }, null, 2)}\n`);
+    void results;
+    appendFileSync(join(ARTIFACTS, "fidelity.jsonl"), `${JSON.stringify({ type: "fidelity-summary", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, failures })}\n`);
     if (failures > 0) throw new Error(`fidelity battery FAILED: ${failures} mismatch(es) — a G1 event for the affected driver (global eligibility spans the fidelity battery, §4.2)`);
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
@@ -944,9 +956,12 @@ async function cmdMatrix(): Promise<void> {
     const straddled = new Set<string>();
     const successLedger = new Set<string>(); // unit|driver|requestClass with an ok in a COMPLETED rep
     const driftedUnits = new Set<string>();
+    const washoutDone = new Set<number>();
+    const pendingRows: Array<Record<string, unknown>> = [];
     const resumeForms = new Map<string, "production" | "scaffolding">();
     if (existsSync(runsPath)) {
       const currentCommit = engine.harnessCommit();
+      const currentEnvHash = engine.envManifestHashValue();
       for (const line of readFileSync(runsPath, "utf8").split("\n")) {
         if (line.trim() === "") continue;
         let rec: Record<string, unknown>;
@@ -955,14 +970,22 @@ async function cmdMatrix(): Promise<void> {
         } catch {
           continue;
         }
+        if (rec["type"] === "washout-done" && rec["phase"] === "matrix") {
+          washoutDone.add(rec["pos"] as number);
+          continue;
+        }
         if (rec["type"] !== "run" || rec["phase"] !== "matrix") continue;
         // resume only trusts records from THIS frozen harness revision — rows from another
         // revision/machine must not silently mix into one traversal (codex R2 f.21)
         if (rec["harnessCommit"] !== currentCommit)
           throw new Error(`REFUSING to resume: runs.jsonl carries matrix rows from harness ${String(rec["harnessCommit"]).slice(0, 12)} != current ${currentCommit.slice(0, 12)} — a re-ratified matrix starts a fresh log`);
+        // one machine, one network, one credential for ALL timed data (§8) — a foreign
+        // environment's rows must never mix into this traversal (codex R3 f.2)
+        if (rec["envManifestHash"] !== currentEnvHash)
+          throw new Error(`REFUSING to resume: runs.jsonl carries rows from environment ${String(rec["envManifestHash"])} != current ${currentEnvHash}`);
         const pos = rec["pos"] as number;
         const outcome = rec["outcome"] as string;
-        if (outcome === "complete" || outcome === "unit-failure") terminalPos.add(pos);
+        if (outcome === "complete" || outcome === "unit-failure") pendingRows.push(rec);
         if (outcome === "invalidated-straddle") straddled.add(rec["unit"] as string);
         if (outcome === "drift-restart") driftedUnits.add(rec["unit"] as string); // pending R6 epilogue survives interruption (f.20)
         if (outcome === "complete") {
@@ -975,6 +998,18 @@ async function cmdMatrix(): Promise<void> {
         // only R1/R2 replays charge the driver allowance; R3/R4 in-slot replays do not (f.23)
         if (rec["replayKind"] === "r1r2") rerunUsed.add(`${rec["unit"] as string}|${rec["driver"] as string}`);
       }
+      // a row is terminal only once its post-run washout MARKER landed — an interrupted washout
+      // (or an interrupted R1/R2 replay decision) re-runs the row (codex R3 f.3). Epilogue rows
+      // for drifted units terminalize only as epilogue rows (f.4).
+      for (const rec of pendingRows) {
+        const pos = rec["pos"] as number;
+        if (!washoutDone.has(pos)) continue;
+        const unit = rec["unit"] as string;
+        if (driftedUnits.has(unit) && rec["epilogue"] !== true) continue; // discarded main reps
+        terminalPos.add(pos);
+      }
+      // a drifted unit's form is scaffolding regardless of what its pre-drift rows recorded
+      for (const unit of driftedUnits) resumeForms.set(unit, "scaffolding");
       if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
       engine.restoreUnitForms(resumeForms);
     }
@@ -986,7 +1021,7 @@ async function cmdMatrix(): Promise<void> {
       const ev = record.failureEvidence;
       if (ev === null || ev.kind !== "http") return false;
       if (ev.code === "no-response") return true; // R1
-      if (ev.code === "attempts-exhausted" && ev.lastClassification === "transient")
+      if ((ev.code === "attempts-exhausted" || ev.code === "http-failure") && ev.lastClassification === "transient")
         return successLedger.has(`${record.unit}|${record.driver}|${ev.requestClass ?? ""}`); // R2
       return false;
     };
@@ -1036,9 +1071,13 @@ async function cmdMatrix(): Promise<void> {
     await executeRows(cfg.schedule.rows, "main");
     if (driftedUnits.size > 0) {
       log(`epilogue: restarting ${driftedUnits.size} drifted unit(s) on the scaffolding form (R6 branch arm)`);
-      const epilogue = cfg.schedule.rows.filter((r) => driftedUnits.has(r.unit));
-      driftedUnits.clear();
-      await executeRows(epilogue, "epilogue");
+      const epilogue = cfg.schedule.rows.filter((r) => driftedUnits.has(r.unit) && !terminalPos.has(r.pos));
+      engine.setEpilogueMode(true);
+      try {
+        await executeRows(epilogue, "epilogue");
+      } finally {
+        engine.setEpilogueMode(false);
+      }
     }
     log("matrix complete — runs.jsonl carries every record (scoring/report generation reads it downstream, plan §8's read-only-analysis carve-out)");
   } finally {

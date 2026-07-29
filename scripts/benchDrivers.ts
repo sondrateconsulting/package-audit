@@ -84,6 +84,9 @@ export interface DriverRunContext {
   acquisitionForm: AcquisitionForm;
   fallbackBudget: number;
   onCloneDirReady?: (dir: string) => void; // the disk sampler attaches the moment bytes can land
+  // live progress mirror the ENGINE reads when the driver throws — fallback spend and delivered
+  // routes survive a unit failure instead of flattening to zero (codex R3 f.9)
+  liveState?: { fallbackSpend: number; routesDelivered: Record<string, number> };
   // §4.8 segmented mode (per-file REST shapes only): the read loop is chunked into the pinned
   // segment sizes and the engine's gate runs BETWEEN segments (clock paused, bucket re-reserved,
   // per-segment deltas summed). Absent = single-segment run.
@@ -103,6 +106,12 @@ interface RunState {
   // every path whose CONTENT the run acquired, by any route/transport — §4.3's no-read
   // verification asserts zero events for skip routes (codex R1 finding 20)
   acquiredPaths: Set<string>;
+  live?: DriverRunContext["liveState"];
+}
+
+function deliver(st: RunState, d: EntryDelivery): void {
+  st.deliveries.push(d);
+  if (st.live !== undefined) st.live.routesDelivered[d.route] = (st.live.routesDelivered[d.route] ?? 0) + 1;
 }
 
 // One REST content read at the pinned SHA. A 404 on a tree-listed path is never benign here:
@@ -111,6 +120,7 @@ interface RunState {
 async function restRead(ctx: DriverRunContext, st: RunState, entry: WorkloadEntry, route: RouteId, cls: "rest-content" | "rest-fallback"): Promise<void> {
   if (cls === "rest-fallback") {
     st.fallbackSpend++;
+    if (st.live !== undefined) st.live.fallbackSpend = st.fallbackSpend;
     if (st.fallbackSpend > ctx.fallbackBudget) throw new UnitFailure(`REST fallback budget (${ctx.fallbackBudget}) exhausted at ${entry.path}`);
   }
   let body: string;
@@ -131,7 +141,7 @@ async function restRead(ctx: DriverRunContext, st: RunState, entry: WorkloadEntr
   }
   st.httpBodyBytes += Buffer.byteLength(body, "utf8");
   st.acquiredPaths.add(entry.path);
-  st.deliveries.push({ path: entry.path, route, delivered: body, rawVerified: null });
+  deliver(st, { path: entry.path, route, delivered: body, rawVerified: null });
 }
 
 // The SHA-pinned-context classifier (§4.4): probe the pinned object itself.
@@ -151,7 +161,7 @@ async function classifyPinnedObjectAbsence(ctx: DriverRunContext, what: string):
 function pushNoReads(ctx: DriverRunContext, st: RunState): void {
   for (const entry of ctx.workload.entries) {
     if (entry.read) continue;
-    st.deliveries.push({ path: entry.path, route: entry.noReadReason!, delivered: null, rawVerified: null });
+    deliver(st, { path: entry.path, route: entry.noReadReason!, delivered: null, rawVerified: null });
   }
 }
 
@@ -273,7 +283,7 @@ function readCheckoutDelivery(ctx: DriverRunContext, cloneDir: string, st: RunSt
   assertContained(abs, [cloneDir]);
   const bytes = readFileSync(abs);
   st.acquiredPaths.add(entry.path);
-  st.deliveries.push({ path: entry.path, route, delivered: seamDecode(bytes), rawVerified: null });
+  deliver(st, { path: entry.path, route, delivered: seamDecode(bytes), rawVerified: null });
 }
 
 // ---- the REST tree fetch T0/T1 pay (§4.6: tree acquisition counts toward units) --------------
@@ -304,7 +314,7 @@ async function runTruncatedCheckout(ctx: DriverRunContext, st: RunState): Promis
 
 // ---- T0 --------------------------------------------------------------------------------------
 export async function runT0(ctx: DriverRunContext): Promise<DriverRunOutcome> {
-  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set() };
+  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set(), live: ctx.liveState };
   pushNoReads(ctx, st);
   let cloneDir: string | null = null;
   const tree = await fetchRestTree(ctx, st);
@@ -334,7 +344,7 @@ async function segmentedRestReads(ctx: DriverRunContext, st: RunState, route: Ro
 
 // ---- T1 --------------------------------------------------------------------------------------
 export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
-  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set() };
+  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set(), live: ctx.liveState };
   pushNoReads(ctx, st);
   let cloneDir: string | null = null;
   const tree = await fetchRestTree(ctx, st);
@@ -431,7 +441,7 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
         const entry = batch.entries[outcome.index]!;
         if (outcome.kind === "resolved") {
           st.acquiredPaths.add(entry.path);
-          st.deliveries.push({ path: entry.path, route: "primary", delivered: outcome.text, rawVerified: true });
+          deliver(st, { path: entry.path, route: "primary", delivered: outcome.text, rawVerified: true });
         } else if (outcome.kind === "binary-fallback" || outcome.kind === "truncated-blob-fallback") {
           // OBSERVED routing states (never pre-routed from pins) → REST, counted
           await restRead(ctx, st, entry, outcome.kind, "rest-fallback");
@@ -473,7 +483,7 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
 
 // ---- T2a -------------------------------------------------------------------------------------
 export async function runT2a(ctx: DriverRunContext): Promise<DriverRunOutcome> {
-  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set() };
+  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set(), live: ctx.liveState };
   pushNoReads(ctx, st);
   if (ctx.workload.escapeTripped && !ctx.workload.truncatedTree) {
     // the size-based api-escape resolves with FULL T0 semantics (§4.4): the REST tree request
@@ -504,7 +514,7 @@ export async function runT2a(ctx: DriverRunContext): Promise<DriverRunOutcome> {
 
 // ---- T2c -------------------------------------------------------------------------------------
 export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Promise<() => void> }): Promise<DriverRunOutcome> {
-  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set() };
+  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set(), live: ctx.liveState };
   pushNoReads(ctx, st);
   const { dir, headRev } = await acquireStore(ctx, { checkout: false });
   const lsIndex = await enumerateStore(ctx, dir, headRev);
@@ -552,7 +562,7 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
       if (gitBlobOid(frame.body, ctx.slot.objectFormat) !== ls.oid)
         throw new UnitFailure(`frame bytes do not hash to the enumerated oid at ${entry.path}`);
       st.acquiredPaths.add(entry.path);
-      st.deliveries.push({ path: entry.path, route: "primary", delivered: seamDecode(frame.body), rawVerified: true });
+      deliver(st, { path: entry.path, route: "primary", delivered: seamDecode(frame.body), rawVerified: true });
     }
   } finally {
     // ordered teardown BEFORE the engine may delete the clone dir (§3.1); the pool permit is

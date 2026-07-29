@@ -318,6 +318,7 @@ export interface RunRecord {
   rep: number;
   probe: boolean;
   phase: "pilot" | "matrix" | "fidelity";
+  epilogue: boolean; // R6 branch-arm restart rows (scaffolding form), distinct from main rows
   acquisitionForm: AcquisitionForm | null;
   startedAtIso: string;
   wallMs: number; // workload start → unit slot release, teardown included (§4.6.1)
@@ -353,6 +354,9 @@ export interface RunRecord {
 
 export class RunsLog {
   constructor(private readonly path: string, readonly manifest: EnvManifest) {}
+  appendMarker(marker: Record<string, unknown>): void {
+    appendFileSync(this.path, `${JSON.stringify(marker)}\n`);
+  }
   envManifestHash(): string {
     return createHash("sha256").update(JSON.stringify(this.manifest)).digest("hex").slice(0, 16);
   }
@@ -443,12 +447,19 @@ export class BenchEngine {
   private readonly unitForms = new Map<string, AcquisitionForm>();
   private replayOfPos: number | null = null;
   private replayKind: "r1r2" | "r3r4" | null = null;
+  private epilogueMode = false;
+  setEpilogueMode(on: boolean): void {
+    this.epilogueMode = on;
+  }
   setReplayOf(pos: number | null, kind: "r1r2" | "r3r4" | null = null): void {
     this.replayOfPos = pos;
     this.replayKind = pos === null ? null : kind;
   }
   harnessCommit(): string {
     return this.o.runsLog.manifest.harnessCommit;
+  }
+  envManifestHashValue(): string {
+    return this.manifestHash;
   }
   // resume support: restore the per-unit frozen acquisition forms reconstructed from durable
   // records (codex R2 f.20)
@@ -556,7 +567,7 @@ export class BenchEngine {
           this.unitForms.set(row.unit, "scaffolding");
           const driftRecord: RunRecord = {
             type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
-            probe: row.probe, phase, acquisitionForm: "production", startedAtIso: new Date(this.now()).toISOString(),
+            probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: "production", startedAtIso: new Date(this.now()).toISOString(),
             wallMs: 0, segments: 1, outcome: "drift-restart", failureCause: `live head ${live.slice(0, 12)} moved off the pinned SHA at the pre-rep probe`,
             failureEvidence: null, requests: {}, attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
             secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
@@ -606,12 +617,14 @@ export class BenchEngine {
     sampler.extraFiles([dbPath, `${dbPath}-wal`, `${dbPath}-shm`]); // the run's FULL footprint incl. cache sidecars (R2 f.29)
 
     if (this.childPool.pool === null) this.childPool.pool = makeChildPool(cfg.frame.childPoolSize);
+    const liveState = { fallbackSpend: 0, routesDelivered: {} as Record<string, number> };
     const ctx: DriverRunContext = {
       cfg, slot, unit, workload, gh, benchRoot: this.o.benchRoot, runDir,
       gitEnv: this.gitEnvFor(row.probe),
       spawnObserver: (r) => spawnRecords.push(r),
       acquisitionForm: form,
       fallbackBudget: restFallbackBudgetFor(cfg, workload.entries.length),
+      liveState,
       onCloneDirReady: () => sampler.point(runDir),
       ...(segmented
         ? {
@@ -646,6 +659,7 @@ export class BenchEngine {
       if (e instanceof DriftSignal) {
         runOutcome = "drift-restart";
         failureCause = e.message;
+        this.unitForms.set(row.unit, "scaffolding"); // the epilogue restart runs SHA-pinned (R6)
       } else if (e instanceof RePinRequired) {
         runOutcome = "re-pin-required";
         failureCause = e.message;
@@ -656,7 +670,9 @@ export class BenchEngine {
       } else if (e instanceof UnitFailure) {
         runOutcome = "unit-failure";
         failureCause = e.cause2;
-        failureEvidence = { kind: "unit" };
+        failureEvidence = e.httpEvidence !== null
+          ? { kind: "http", code: e.httpEvidence.code, lastClassification: e.httpEvidence.lastClassification, requestClass: e.httpEvidence.requestClass }
+          : { kind: "unit" };
       } else if (e instanceof BenchHttpError) {
         runOutcome = "unit-failure";
         failureCause = `${e.code}: ${e.message}`;
@@ -691,7 +707,7 @@ export class BenchEngine {
       // the minimal terminal R5 record lands BEFORE any fallible post-run work (codex R2 f.18)
       const r5record: RunRecord = {
         type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
-        probe: row.probe, phase, acquisitionForm: needsClonePath ? form : null,
+        probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: needsClonePath ? form : null,
         startedAtIso, wallMs, segments: segmentSizes.length, outcome: "halt-r5-breach",
         failureCause, failureEvidence: null, requests: {}, attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
         secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
@@ -750,6 +766,7 @@ export class BenchEngine {
     let secondarySignals = 0;
     for (const r of httpRecords) {
       if (r.servedFromCache) continue;
+      if (r.requestClass === "rest-meta") continue; // control-plane probes are never driver evidence (codex R3 f.7)
       requests[r.requestClass] = (requests[r.requestClass] ?? 0) + 1;
       if (r.status >= 500) attempts.fivexx++;
       if (r.attempt > 1) attempts.retries++;
@@ -768,7 +785,7 @@ export class BenchEngine {
 
     const record: RunRecord = {
       type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
-      probe: row.probe, phase,
+      probe: row.probe, phase, epilogue: this.epilogueMode,
       acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
       startedAtIso, wallMs, segments: segmentSizes.length, outcome: runOutcome, failureCause,
       failureEvidence,
@@ -782,11 +799,11 @@ export class BenchEngine {
       diskReclaimFailed,
       probeDivergences: verification?.probeDivergences.length ?? 0,
       // body bytes derive from the RECORDS so a thrown driver still reports its real transfer
-      httpBodyBytes: httpRecords.reduce((n, r) => n + (r.servedFromCache ? 0 : r.bodyBytes), 0),
+      httpBodyBytes: httpRecords.reduce((n, r) => n + (r.servedFromCache || r.requestClass === "rest-meta" ? 0 : r.bodyBytes), 0),
       cloneObjectStoreBytes,
       diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples,
-      fallbackSpend: outcome?.fallbackSpend ?? 0,
-      routesDelivered: verification?.routesDelivered ?? {},
+      fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
+      routesDelivered: verification?.routesDelivered ?? liveState.routesDelivered,
       g1Failures: verification?.g1Failures.length ?? 0,
       g2Failures: verification?.g2Failures.length ?? 0,
       washoutAppliedMs,
@@ -801,9 +818,12 @@ export class BenchEngine {
       for (const f of [...verification.g1Failures.slice(0, 5)]) this.o.log(`  G1 ${f.path} [${f.route}]: ${f.reason}`);
       for (const f of [...verification.g2Failures.slice(0, 5)]) this.o.log(`  G2 ${f.path}: ${f.reason}`);
     }
-    // §4.5 washout between consecutive runs — the caller sequences runs, we sleep here
+    // §4.5 washout between consecutive runs — the caller sequences runs, we sleep here. The
+    // washout-done marker lands AFTER the sleep: resume treats an unmarked terminal row as
+    // still-pending its washout/replay transition (codex R3 f.3).
     this.o.log(`washout ${Math.ceil(washoutAppliedMs / 1000)}s (horizon ${horizon === 0 ? "none" : new Date(horizon).toISOString()})`);
     await this.sleep(washoutAppliedMs);
+    this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
     return { outcome, verification, record };
   }
 
