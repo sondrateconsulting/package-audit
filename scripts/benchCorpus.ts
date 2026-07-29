@@ -270,19 +270,22 @@ export function verifyC2(stats: { fileCount: number; truncated: boolean; manifes
   return { ok: reasons.length === 0, reasons, evidence: { ...stats } };
 }
 
-// C3: path-heavy — the recursive-tree payload dominated by path bytes, deep nesting, and
-// truncated:false (else it is a C4, not a C3). Operationalisation, recorded in the evidence:
-// path bytes ≥ 50% of the estimated per-entry payload (paths + oid hex + fixed JSON overhead),
-// and ≥1000 entries at directory depth ≥ 6.
+// C3: path-heavy — a large deep tree whose enumeration cost is about MANY LONG PATHS, and
+// truncated:false (else it is a C4, not a C3). Operationalisation — recalibrated at pinning
+// against measured REST payloads: a fixed share-of-payload threshold is unreachable in the real
+// wire format (each entry's `url` member alone carries ~100+ bytes and a second oid hex), so
+// the predicate uses absolute path-heaviness instead: ≥20,000 entries, mean path length ≥ 55
+// bytes, and ≥5,000 entries at directory depth ≥ 6. Measured calibration points (2026-07-28):
+// kubernetes ~31.3k entries / mean ~67 B (passes); home-assistant/core mean ~47 B (fails);
+// nixpkgs is REST-truncated (a C4 shape, fails here by design).
 export function verifyC3(stats: { truncated: boolean; entryCount: number; pathByteSum: number; oidHexLength: number; deepEntryCount: number }): SlotVerdict {
   const reasons: string[] = [];
-  const PER_ENTRY_JSON_OVERHEAD = 60; // {"path":"","mode":"","type":"","sha":"","size":N,"url":…} skeleton, sans url
-  const payloadEstimate = stats.pathByteSum + stats.entryCount * (stats.oidHexLength + PER_ENTRY_JSON_OVERHEAD);
-  const fraction = payloadEstimate === 0 ? 0 : stats.pathByteSum / payloadEstimate;
+  const meanPathBytes = stats.entryCount === 0 ? 0 : stats.pathByteSum / stats.entryCount;
   if (stats.truncated) reasons.push("REST recursive tree is truncated — this candidate is a C4, not a C3");
-  if (fraction < 0.5) reasons.push(`path bytes are ${(fraction * 100).toFixed(1)}% of the payload estimate (< 50%)`);
-  if (stats.deepEntryCount < 1000) reasons.push(`only ${stats.deepEntryCount} entries at depth ≥ 6`);
-  return { ok: reasons.length === 0, reasons, evidence: { ...stats, pathByteFraction: Number(fraction.toFixed(4)) } };
+  if (stats.entryCount < 20_000) reasons.push(`only ${stats.entryCount} entries (< 20000)`);
+  if (meanPathBytes < 55) reasons.push(`mean path length ${meanPathBytes.toFixed(1)} B (< 55)`);
+  if (stats.deepEntryCount < 5_000) reasons.push(`only ${stats.deepEntryCount} entries at depth ≥ 6 (< 5000)`);
+  return { ok: reasons.length === 0, reasons, evidence: { ...stats, meanPathBytes: Number(meanPathBytes.toFixed(1)) } };
 }
 
 // C4: REST recursive tree truncated:true at the pinned SHA.

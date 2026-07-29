@@ -78,9 +78,10 @@ describe("§4.2 slot predicates", () => {
     expect(verifyC2({ fileCount: 999, truncated: false, manifestCount: 2 }).ok).toBe(false);
     expect(verifyC2({ fileCount: 1500, truncated: true, manifestCount: 2 }).ok).toBe(false);
     expect(verifyC2({ fileCount: 1500, truncated: false, manifestCount: 0 }).ok).toBe(false);
-    const pathHeavy = { truncated: false, entryCount: 40_000, pathByteSum: 4_500_000, oidHexLength: 40, deepEntryCount: 30_000 };
+    const pathHeavy = { truncated: false, entryCount: 31_000, pathByteSum: 2_100_000, oidHexLength: 40, deepEntryCount: 12_000 }; // kubernetes-shaped
     expect(verifyC3(pathHeavy).ok).toBe(true);
-    expect(verifyC3({ ...pathHeavy, pathByteSum: 100_000 }).ok).toBe(false); // not path-dominated
+    expect(verifyC3({ ...pathHeavy, pathByteSum: 1_200_000 }).ok).toBe(false); // mean path < 55 B (home-assistant-shaped)
+    expect(verifyC3({ ...pathHeavy, entryCount: 5_000, pathByteSum: 400_000 }).ok).toBe(false); // too small a tree
     expect(verifyC3({ ...pathHeavy, deepEntryCount: 10 }).ok).toBe(false); // not deep
     expect(verifyC3({ ...pathHeavy, truncated: true }).ok).toBe(false); // "else it is a C4"
     expect(verifyC4({ truncated: true }).ok).toBe(true);
