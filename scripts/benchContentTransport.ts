@@ -74,6 +74,10 @@ function frozenSurfaceDigest(): string {
   files.push(join(REPO_ROOT, "docs", "plans", "adr-0001-disagreements-resolution.md"));
   files.push(join(REPO_ROOT, "docs", "adrs", "0001-file-content-acquisition-strategy.md"));
   files.push(CONFIG_PATH, CORPUS_PATH);
+  for (const tool of ["package.json", "tsconfig.json", "bun.lock", "bun.lockb"]) {
+    const tp = join(REPO_ROOT, tool);
+    if (existsSync(tp)) files.push(tp);
+  }
   for (const name of readdirSync(SELECTED_DIR)) files.push(join(SELECTED_DIR, name));
   const uniq = [...new Set(files)].sort();
   const h = createHash("sha256");
@@ -90,6 +94,10 @@ function frozenSurfaceDigest(): string {
 // present with all four answers, the band bound to the pilot, the frozen-surface digest bound,
 // and a clean tree EXCLUDING the append-only outputs and ratification.json itself.
 async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>; digest: string }> {
+  // §8 binds ONE network for all timed data; the placeholder default would hash every network
+  // identically (codex R4) — gate-relevant runs demand an explicit operator-set description
+  if ((process.env["BENCH_NETWORK_DESC"] ?? "") === "")
+    throw new Error("REFUSING: BENCH_NETWORK_DESC is unset — §8 requires a concrete network-location description; every timed row binds to it via the environment manifest");
   if (!existsSync(RATIFICATION_PATH))
     throw new Error(`REFUSING: ${RATIFICATION_PATH} does not exist — §8 ratification (the four sign-off points) must be recorded before any gate-relevant run (Step C)`);
   const rat = JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>;
@@ -112,6 +120,13 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
   });
   // ratification.json is deliberately NOT here: it must be COMMITTED, so tampering with the
   // signed answers or the digest needs a visible commit (codex R3 f.1)
+  const lsFiles = await runBenchGit({
+    argv: ["ls-files", "--error-unmatch", "docs/adrs/0001-benchmark/ratification.json"],
+    lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
+    benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  if (lsFiles.exitCode !== 0)
+    throw new Error("REFUSING: ratification.json is not TRACKED — the signed answers must be committed, not a local file (§8)");
   const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl", "data/"];
   const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && !APPEND_ONLY.some((a) => f.startsWith(a)));
   if (dirty.length > 0)
@@ -958,6 +973,7 @@ async function cmdMatrix(): Promise<void> {
     const driftedUnits = new Set<string>();
     const washoutDone = new Set<number>();
     const pendingRows: Array<Record<string, unknown>> = [];
+    const completedRows: Array<Record<string, unknown>> = [];
     const resumeForms = new Map<string, "production" | "scaffolding">();
     if (existsSync(runsPath)) {
       const currentCommit = engine.harnessCommit();
@@ -988,10 +1004,9 @@ async function cmdMatrix(): Promise<void> {
         if (outcome === "complete" || outcome === "unit-failure") pendingRows.push(rec);
         if (outcome === "invalidated-straddle") straddled.add(rec["unit"] as string);
         if (outcome === "drift-restart") driftedUnits.add(rec["unit"] as string); // pending R6 epilogue survives interruption (f.20)
-        if (outcome === "complete") {
-          for (const cls of Object.keys((rec["requests"] as Record<string, number> | undefined) ?? {}))
-            successLedger.add(`${rec["unit"] as string}|${rec["driver"] as string}|${cls}`);
-        }
+        if (outcome === "halt-r5-breach" || outcome === "re-pin-required")
+          throw new Error(`REFUSING to resume: runs.jsonl carries a terminal ${outcome} row — that is freeze-repair/amendment territory (§4.5 R5/R6), never a silent retry`);
+        if (outcome === "complete") completedRows.push(rec);
         const form = rec["acquisitionForm"];
         if (form === "scaffolding") resumeForms.set(rec["unit"] as string, "scaffolding");
         else if (form === "production" && !resumeForms.has(rec["unit"] as string)) resumeForms.set(rec["unit"] as string, "production");
@@ -1007,6 +1022,13 @@ async function cmdMatrix(): Promise<void> {
         const unit = rec["unit"] as string;
         if (driftedUnits.has(unit) && rec["epilogue"] !== true) continue; // discarded main reps
         terminalPos.add(pos);
+      }
+      // the success ledger admits only rows whose washout marker landed — an unfinished
+      // repetition must not authorize its own R2 replay (codex R4)
+      for (const rec of completedRows) {
+        if (!washoutDone.has(rec["pos"] as number)) continue;
+        for (const cls of Object.keys((rec["requests"] as Record<string, number> | undefined) ?? {}))
+          successLedger.add(`${rec["unit"] as string}|${rec["driver"] as string}|${cls}`);
       }
       // a drifted unit's form is scaffolding regardless of what its pre-drift rows recorded
       for (const unit of driftedUnits) resumeForms.set(unit, "scaffolding");
@@ -1202,8 +1224,12 @@ async function main(): Promise<void> {
     case "refresh-evidence": return cmdRefreshEvidence();
     case "matrix": return cmdMatrix();
     case "verify-corpus": return cmdVerifyCorpus();
+    case "digest": {
+      log(frozenSurfaceDigest()); // the §8 freeze binding ratification.json records
+      return;
+    }
     default:
-      log("usage: bun run bench:content <pin-corpus | refresh-evidence | diagnostics | verify-corpus | budget | pilot | fidelity | matrix>");
+      log("usage: bun run bench:content <pin-corpus | refresh-evidence | diagnostics | verify-corpus | digest | budget | pilot | fidelity | matrix>");
       process.exitCode = 2;
   }
 }

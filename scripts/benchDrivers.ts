@@ -403,7 +403,12 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
         queue.unshift({ entries: a, depth: q.depth + 1 });
       };
       if (analysis.kind === "http-failure") {
-        failedDispatch({ code: d.status === 0 ? "no-response" : "http-failure", lastClassification: d.status === 0 ? "no-response" : "transient" });
+        // R2's evidence is 5xx-only (plan §4.5): a 200-with-non-JSON parse failure is NOT a
+        // rerunnable shape (codex R4)
+        failedDispatch({
+          code: d.status === 0 ? "no-response" : "http-failure",
+          lastClassification: d.status === 0 ? "no-response" : d.status >= 500 ? "transient" : "non-json",
+        });
         consecutive5xx = analysis.fivexxSplitCandidate ? consecutive5xx + 1 : 0;
         if (fivexxSplitConditionMet(batch, consecutive5xx, ctx.cfg) && canSplit(item)) enqueueSplit(item);
         else {
