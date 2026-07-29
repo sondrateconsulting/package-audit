@@ -43,10 +43,20 @@ import { BatchChild, runBenchGit, type BenchSpawnRecord } from "./benchSpawn.ts"
 import { benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuckets, readRateLimit, type BenchGhContext } from "./benchGh.ts";
 import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts";
 import {
-  BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, planSegments,
+  BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, isRerunnableEvidence, planSegments,
+  reconstructMatrixState,
 } from "./benchProtocol.ts";
-import { acquireStore, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
+import { RePinRequired, acquireStore, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
 import { noiseBandFrom } from "./benchConfig.ts";
+import {
+  judgeFidelity, reconstructFidelityLedger, shouldAttemptCell, type FidelityOutcome,
+} from "./benchFidelity.ts";
+import { scoreMatrix, type ScoreBundle, type ScoreOutput } from "./benchScore.ts";
+import { buildReport } from "./benchReport.ts";
+import { planBoundaryCells, runBoundaryProbe } from "./benchBoundary.ts";
+import { runConcurrencyProbe } from "./benchConcurrencyProbe.ts";
+import { CLONE_COMPOSITION_STATEMENT, analyzeOidDuplication, runOption3WarmScenario } from "./benchOption3.ts";
+import type { DriverId } from "./benchSchedule.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const ARTIFACTS = join(REPO_ROOT, "docs", "adrs", "0001-benchmark");
@@ -74,6 +84,14 @@ function frozenSurfaceDigest(): string {
   files.push(join(REPO_ROOT, "docs", "plans", "adr-0001-disagreements-resolution.md"));
   files.push(join(REPO_ROOT, "docs", "adrs", "0001-file-content-acquisition-strategy.md"));
   files.push(CONFIG_PATH, CORPUS_PATH);
+  // Step-C amendment: the pilot's walls ARE the noise band's calibration evidence and the
+  // acquisition diagnostics bound the scaffolding-form interpretation — both preregistered
+  // artifacts must be tamper-evident under the freeze, not just the band value the gate
+  // cross-checks (Step B checked only ratification.noiseBand == pilot.noiseBand).
+  for (const artifact of ["pilot.json", "acquisition-diagnostics.json"]) {
+    const p = join(ARTIFACTS, artifact);
+    if (existsSync(p)) files.push(p);
+  }
   for (const tool of ["package.json", "tsconfig.json", "bun.lock", "bun.lockb"]) {
     const tp = join(REPO_ROOT, tool);
     if (existsSync(tp)) files.push(tp);
@@ -127,7 +145,15 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
   });
   if (lsFiles.exitCode !== 0)
     throw new Error("REFUSING: ratification.json is not TRACKED — the signed answers must be committed, not a local file (§8)");
-  const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl", "data/"];
+  // outputs the frozen surface legitimately produces while dirty: the evidence logs plus the
+  // Step-C executor artifacts (all OUTSIDE the digest's input set — they are results, not
+  // measurement surface; each is committed as evidence once its executor finishes)
+  const APPEND_ONLY = [
+    "docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl",
+    "docs/adrs/0001-benchmark/boundary-probe.json", "docs/adrs/0001-benchmark/concurrency-probe.json",
+    "docs/adrs/0001-benchmark/option3.json", "docs/adrs/0001-benchmark/report.md",
+    "data/",
+  ];
   const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && !APPEND_ONLY.some((a) => f.startsWith(a)));
   if (dirty.length > 0)
     throw new Error(`REFUSING: dirty tracked files outside the append-only outputs: ${dirty.slice(0, 5).join(", ")} — the frozen surface must be committed (§8)`);
@@ -823,138 +849,172 @@ async function cmdDiagnostics(): Promise<void> {
   }
 }
 
-// The C6 fidelity battery (§4.2): untimed, once per (fixture, driver), gate-relevant — a
-// mismatch is a G1 event for that driver and FAILS this command; a skipped applicable fixture
-// is a G2 event. Each driver resolves through its REAL seam (codex R1 finding 6): T0 via the
-// recorded REST layer, T1 via a real single-alias GraphQL dispatch + per-alias validation,
-// T2a via an acquired checkout read, T2c via an acquired store + BatchChild frame.
+// The C6 fidelity battery (§4.2): untimed, once per applicable (fixture × driver × entry),
+// gate-relevant — global eligibility spans the battery, so a mismatch is a G1 event and a
+// skipped applicable cell is a G2 event for that driver. Each driver resolves through its REAL
+// seam (codex R1 finding 6): T0 via the recorded REST layer, T1 via a real single-alias
+// GraphQL dispatch + per-alias validation, T2a via an acquired checkout read, T2c via an
+// acquired store + BatchChild frame. Cross-invocation discipline lives in benchFidelity's
+// typed ledger (Step-C residual 4): ONE objective-external rerun per (fixture, driver),
+// mismatches never re-run, and the verdict aggregates over the whole ledger.
+interface FidelityCellDelivery {
+  route: string;
+  delivered: string | null;
+  rawVerified: boolean | null;
+}
+
+async function runFidelityCell(rt: PinRuntime, cfg: BenchConfig, fixture: C6Fixture, driver: string, entry: C6Fixture["entries"][number]): Promise<FidelityCellDelivery> {
+  const contentsEndpoint = `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`;
+  if (entry.mode === "120000" && driver === "T1") {
+    // T1's mode source is the tree it fetched — the fixture pin stands in for it here; the
+    // REST dereference is the matrix's route
+    const res = await benchRestGet(rt.gh, { endpoint: contentsEndpoint, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
+    return { route: "symlink-fallback", delivered: res.body, rawVerified: null };
+  }
+  if (driver === "T0") {
+    const res = await benchRestGet(rt.gh, { endpoint: contentsEndpoint, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-content" });
+    return { route: "primary", delivered: res.body, rawVerified: null };
+  }
+  if (driver === "T1") {
+    // ONE real aliased dispatch through the T1 seam, validated per-alias
+    const workloadEntry: WorkloadEntry = {
+      path: entry.path, mode: entry.mode, blobOid: entry.oid, size: entry.size, class: "cli",
+      read: true, noReadReason: null, canonicalSeamSha256: null, rawSha256: null,
+      restDerefSeamSha256: null, checkoutSeamSha256: null, gql: null,
+    };
+    const batch = buildBatchQuery([workloadEntry], {
+      owner: fixture.owner, repo: fixture.repo, sha: fixture.sha,
+      aliasSelection: cfg.t1.aliasSelection, rateLimitRider: cfg.t1.rateLimitRider, label: `fid-${fixture.kind}`,
+    });
+    const d = await benchGraphqlDispatch(rt.gh, batch.query, batch.fields, batch.label);
+    const analysis = analyzeBatchResponse(d, batch, fixture.objectFormat, cfg);
+    if (analysis.kind === "per-alias" && analysis.outcomes[0]?.kind === "resolved") {
+      return { route: "primary", delivered: analysis.outcomes[0].text, rawVerified: true };
+    }
+    if (analysis.kind === "per-alias" && (analysis.outcomes[0]?.kind === "binary-fallback" || analysis.outcomes[0]?.kind === "truncated-blob-fallback" || analysis.outcomes[0]?.kind === "validation-fallback")) {
+      const res = await benchRestGet(rt.gh, { endpoint: contentsEndpoint, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
+      return { route: analysis.outcomes[0].kind, delivered: res.body, rawVerified: null };
+    }
+    // batch-level non-answers (http-failure / throttle / timeout / default / unattributed
+    // aliases) prevented any comparison — the ledger classifies these objective-external
+    return { route: `unresolved:${analysis.kind}`, delivered: null, rawVerified: null };
+  }
+  // clone drivers acquire through the REAL acquisition machinery + seams
+  const runDir = join(rt.benchRoot, `fid-${fixture.kind}-${driver}`);
+  mkdirSync(runDir, { recursive: true });
+  try {
+    const slotLike = { slot: "C5", owner: fixture.owner, repo: fixture.repo, objectFormat: fixture.objectFormat, repoSizeKb: 0, units: [], verification: {} } as unknown as PerformanceSlot;
+    const unitLike = { unitId: `fid:${fixture.owner}/${fixture.repo}@${fixture.branch ?? "sha"}`, branch: fixture.branch ?? "", sha: fixture.sha, treeOid: fixture.sha } as CorpusUnit;
+    const ctx = {
+      cfg, slot: slotLike, unit: unitLike, workload: null as never, gh: rt.gh,
+      benchRoot: rt.benchRoot, runDir, gitEnv: rt.gitEnv, spawnObserver: rt.spawnObs,
+      acquisitionForm: "scaffolding", fallbackBudget: 20,
+    } as unknown as DriverRunContext;
+    const { dir, headRev } = await acquireStore(ctx, { checkout: driver === "T2a" });
+    // route on the LIVE enumeration's observed mode, never the fixture pin (codex R2 f.9)
+    const lsOut = await runBenchGit({
+      argv: ["ls-tree", "-r", "-z", "-l", "--full-tree", headRev === "HEAD" ? "HEAD" : fixture.sha],
+      lane: { lane: "transport", objectFormat: fixture.objectFormat },
+      env: rt.gitEnv, benchRoot: rt.benchRoot, cwd: dir,
+      limits: { maxStdoutBytes: cfg.lsTree.maxOutputBytes, maxStderrBytes: 1024 * 1024, deadlineMs: cfg.spawn.timeoutMs },
+      onRecord: rt.spawnObs,
+    });
+    const lsEntries = parseLsTreeZ(lsOut.stdout, fixture.objectFormat, { maxEntries: cfg.lsTree.maxEntries, maxRecordBytes: cfg.lsTree.maxRecordBytes });
+    const liveEntry = lsEntries.find((e) => e.path === entry.path);
+    if (liveEntry === undefined) {
+      // the pinned path is absent from the live enumeration at the pinned SHA — deterministic,
+      // content-shaped, never objective-external
+      return { route: "missing-from-live-enumeration", delivered: null, rawVerified: null };
+    }
+    if (liveEntry.mode === "120000") {
+      const res = await benchRestGet(rt.gh, { endpoint: contentsEndpoint, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
+      return { route: "symlink-fallback", delivered: res.body, rawVerified: null };
+    }
+    if (driver === "T2a") {
+      return { route: "primary", delivered: seamDecode(readFileSync(join(dir, entry.path))), rawVerified: null };
+    }
+    const child = new BatchChild({
+      objectFormat: fixture.objectFormat, env: rt.gitEnv, cwd: dir, benchRoot: rt.benchRoot,
+      limits: { maxHeaderBytes: cfg.frame.maxHeaderBytes, frameCeiling: cfg.frame.frameCeilingBytes, stderrRingBytes: cfg.frame.stderrRingBytes, readDeadlineMs: cfg.frame.readDeadlineMs, disposeDeadlineMs: cfg.frame.disposeDeadlineMs },
+      onRecord: rt.spawnObs,
+    });
+    try {
+      const frame = await child.readObject({ oid: entry.oid, size: entry.size });
+      if (frame.kind === "content" && gitBlobOid(frame.body, fixture.objectFormat) === entry.oid) {
+        return { route: "primary", delivered: seamDecode(frame.body), rawVerified: true };
+      }
+      return { route: "missing-or-unverified-frame", delivered: null, rawVerified: null };
+    } finally {
+      await child.dispose();
+    }
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
+}
+
 async function cmdFidelity(): Promise<void> {
-  const { cfg, corpus, workloads } = loadPinned();
+  const { cfg, corpus } = loadPinned();
   // gate-relevant evidence rides the SAME §8 freeze gate as the matrix (codex R2 f.8)
   const { digest } = await assertRatifiedAndFrozen();
-  const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
-  void engine;
+  const fidelityPath = join(ARTIFACTS, "fidelity.jsonl");
+  const readLedger = (): ReturnType<typeof reconstructFidelityLedger> =>
+    reconstructFidelityLedger(existsSync(fidelityPath) ? readFileSync(fidelityPath, "utf8").split("\n") : [], digest);
+  let ledger = readLedger();
   const rt = makePinRuntime(cfg);
-  const results: Array<Record<string, unknown>> = [];
-  let failures = 0;
-  const seamHash = (bytes: Uint8Array): string => sha256Hex(Buffer.from(seamDecode(bytes), "utf8"));
   try {
     for (const fixture of corpus.fidelity) {
       for (const driver of fixture.appliesTo) {
         for (const entry of fixture.entries) {
+          if (!shouldAttemptCell(ledger, fixture.kind, driver, entry.path)) {
+            log(`fidelity ${fixture.kind} ${driver} ${entry.path}: ledger state is terminal — not re-run (§4.2)`);
+            continue;
+          }
           const expectDeref = fixture.verification["restDerefSeamSha256"];
           const expectCanonical = fixture.verification["canonicalSeamSha256"];
-          let delivered: string | null = null;
-          let rawVerified: boolean | null = null;
-          let route = "";
-          if (entry.mode === "120000" && driver === "T1") {
-            // T1's mode source is the tree it fetched — the fixture pin stands in for it here;
-            // the REST dereference is the matrix's route
-            const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
-            delivered = res.body;
-            route = "symlink-fallback";
-          } else if (driver === "T0") {
-            const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-content" });
-            delivered = res.body;
-            route = "primary";
-          } else if (driver === "T1") {
-            // ONE real aliased dispatch through the T1 seam, validated per-alias
-            const workloadEntry: WorkloadEntry = {
-              path: entry.path, mode: entry.mode, blobOid: entry.oid, size: entry.size, class: "cli",
-              read: true, noReadReason: null, canonicalSeamSha256: null, rawSha256: null,
-              restDerefSeamSha256: null, checkoutSeamSha256: null, gql: null,
-            };
-            const batch = buildBatchQuery([workloadEntry], {
-              owner: fixture.owner, repo: fixture.repo, sha: fixture.sha,
-              aliasSelection: cfg.t1.aliasSelection, rateLimitRider: cfg.t1.rateLimitRider, label: `fid-${fixture.kind}`,
-            });
-            const d = await benchGraphqlDispatch(rt.gh, batch.query, batch.fields, batch.label);
-            const analysis = analyzeBatchResponse(d, batch, fixture.objectFormat, cfg);
-            if (analysis.kind === "per-alias" && analysis.outcomes[0]?.kind === "resolved") {
-              delivered = analysis.outcomes[0].text;
-              rawVerified = true;
-              route = "primary";
-            } else if (analysis.kind === "per-alias" && (analysis.outcomes[0]?.kind === "binary-fallback" || analysis.outcomes[0]?.kind === "truncated-blob-fallback" || analysis.outcomes[0]?.kind === "validation-fallback")) {
-              const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
-              delivered = res.body;
-              route = analysis.outcomes[0].kind === "validation-fallback" ? "validation-fallback" : analysis.outcomes[0].kind;
+          let outcome: FidelityOutcome;
+          let detail: Record<string, unknown>;
+          try {
+            const d = await runFidelityCell(rt, cfg, fixture, driver, entry);
+            const expected = d.route === "symlink-fallback" || entry.mode === "120000" || typeof expectCanonical !== "string" ? expectDeref : expectCanonical;
+            if (d.delivered === null) {
+              // no comparison happened: batch-level non-answers are objective-external (one
+              // rerun permitted); deterministic content-shaped absences are mismatches
+              outcome = d.route.startsWith("unresolved:") ? "attempt-error" : "mismatch";
+              detail = { route: d.route, pass: false, rawVerified: d.rawVerified, gotHash: null, expected };
             } else {
-              route = `unresolved:${analysis.kind}`;
+              const gotHash = sha256Hex(Buffer.from(d.delivered, "utf8"));
+              const pass = typeof expected === "string" && gotHash === expected;
+              outcome = pass ? "match" : "mismatch";
+              detail = { route: d.route, pass, rawVerified: d.rawVerified, gotHash, expected };
             }
-          } else {
-            // clone drivers acquire through the REAL acquisition machinery + seams
-            const runDir = join(rt.benchRoot, `fid-${fixture.kind}-${driver}`);
-            mkdirSync(runDir, { recursive: true });
-            const slotLike = { slot: "C5", owner: fixture.owner, repo: fixture.repo, objectFormat: fixture.objectFormat, repoSizeKb: 0, units: [], verification: {} } as unknown as PerformanceSlot;
-            const unitLike = { unitId: `fid:${fixture.owner}/${fixture.repo}@${fixture.branch ?? "sha"}`, branch: fixture.branch ?? "", sha: fixture.sha, treeOid: fixture.sha } as CorpusUnit;
-            const ctx = {
-              cfg, slot: slotLike, unit: unitLike, workload: null as never, gh: rt.gh,
-              benchRoot: rt.benchRoot, runDir, gitEnv: rt.gitEnv, spawnObserver: rt.spawnObs,
-              acquisitionForm: "scaffolding", fallbackBudget: 20,
-            } as unknown as DriverRunContext;
-            const { dir, headRev } = await acquireStore(ctx, { checkout: driver === "T2a" });
-            // route on the LIVE enumeration's observed mode, never the fixture pin (codex R2 f.9)
-            const lsOut = await runBenchGit({
-              argv: ["ls-tree", "-r", "-z", "-l", "--full-tree", headRev === "HEAD" ? "HEAD" : fixture.sha],
-              lane: { lane: "transport", objectFormat: fixture.objectFormat },
-              env: rt.gitEnv, benchRoot: rt.benchRoot, cwd: dir,
-              limits: { maxStdoutBytes: cfg.lsTree.maxOutputBytes, maxStderrBytes: 1024 * 1024, deadlineMs: cfg.spawn.timeoutMs },
-              onRecord: rt.spawnObs,
-            });
-            const lsEntries = parseLsTreeZ(lsOut.stdout, fixture.objectFormat, { maxEntries: cfg.lsTree.maxEntries, maxRecordBytes: cfg.lsTree.maxRecordBytes });
-            const liveEntry = lsEntries.find((e) => e.path === entry.path);
-            if (liveEntry === undefined) {
-              route = "missing-from-live-enumeration";
-            } else if (liveEntry.mode === "120000") {
-              const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
-              delivered = res.body;
-              route = "symlink-fallback";
-            } else if (driver === "T2a") {
-              delivered = seamDecode(readFileSync(join(dir, entry.path)));
-              route = "primary";
-            } else {
-              const child = new BatchChild({
-                objectFormat: fixture.objectFormat, env: rt.gitEnv, cwd: dir, benchRoot: rt.benchRoot,
-                limits: { maxHeaderBytes: cfg.frame.maxHeaderBytes, frameCeiling: cfg.frame.frameCeilingBytes, stderrRingBytes: cfg.frame.stderrRingBytes, readDeadlineMs: cfg.frame.readDeadlineMs, disposeDeadlineMs: cfg.frame.disposeDeadlineMs },
-                onRecord: rt.spawnObs,
-              });
-              try {
-                const frame = await child.readObject({ oid: entry.oid, size: entry.size });
-                if (frame.kind === "content" && gitBlobOid(frame.body, fixture.objectFormat) === entry.oid) {
-                  delivered = seamDecode(frame.body);
-                  rawVerified = true;
-                  route = "primary";
-                } else {
-                  route = "missing-or-unverified-frame";
-                }
-              } finally {
-                await child.dispose();
-              }
-            }
-            rmSync(runDir, { recursive: true, force: true });
-            void liveEntry;
+          } catch (e) {
+            if (e instanceof RePinRequired) throw e; // the frozen object is gone — §8 amendment territory, halt
+            outcome = "attempt-error";
+            detail = { route: "attempt-error", pass: false, rawVerified: null, gotHash: null, expected: null, error: e instanceof Error ? `${e.name}: ${e.message.slice(0, 300)}` : String(e) };
           }
-          const gotHash = delivered === null ? null : sha256Hex(Buffer.from(delivered, "utf8"));
-          const expected = route === "symlink-fallback" || entry.mode === "120000" || typeof expectCanonical !== "string" ? expectDeref : expectCanonical;
-          const pass = typeof expected === "string" && gotHash === expected;
-          if (!pass) failures++;
-          const resultRec = { type: "fidelity", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: fixture.kind, driver, entry: entry.path, route, pass, rawVerified, gotHash, expected };
-          results.push(resultRec);
-          // append-only, per entry: an exception later cannot erase earlier evidence, and a
-          // re-run APPENDS beside a recorded mismatch instead of overwriting it (codex R3 f.8 —
-          // a fidelity mismatch is never rerunnable, §4.2)
-          appendFileSync(join(ARTIFACTS, "fidelity.jsonl"), `${JSON.stringify(resultRec)}\n`);
-          log(`fidelity ${fixture.kind} ${driver} ${entry.path} [${route}]: ${pass ? "PASS" : "FAIL"}`);
+          // append-only, per cell: an exception later cannot erase earlier evidence, and a
+          // re-invocation APPENDS beside a recorded mismatch instead of overwriting it
+          // (codex R3 f.8 — a fidelity mismatch is never rerunnable, §4.2)
+          const rec = { type: "fidelity", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: fixture.kind, driver, entry: entry.path, outcome, ...detail };
+          appendFileSync(fidelityPath, `${JSON.stringify(rec)}\n`);
+          log(`fidelity ${fixture.kind} ${driver} ${entry.path} [${String(detail["route"])}]: ${outcome.toUpperCase()}`);
+          ledger = readLedger(); // the group cap must see this record before the next cell
         }
       }
     }
-    void seamHash;
-    void results;
-    appendFileSync(join(ARTIFACTS, "fidelity.jsonl"), `${JSON.stringify({ type: "fidelity-summary", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, failures })}\n`);
-    if (failures > 0) throw new Error(`fidelity battery FAILED: ${failures} mismatch(es) — a G1 event for the affected driver (global eligibility spans the fidelity battery, §4.2)`);
+    // the verdict aggregates over the WHOLE ledger, not this invocation — a matching-digest
+    // pass:false entry stays failed forever (Step-C residual 4's cross-invocation note)
+    const verdict = judgeFidelity(corpus.fidelity, readLedger());
+    appendFileSync(fidelityPath, `${JSON.stringify({ type: "fidelity-summary", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, cells: verdict.cells.length, failures: verdict.failures.length, pendingRetry: verdict.pendingRetry.length, neverAttempted: verdict.neverAttempted.length })}\n`);
+    if (verdict.failures.length > 0)
+      throw new Error(`fidelity battery FAILED: ${verdict.failures.length} terminal failure(s) [${verdict.failures.map((c) => `${c.kind}/${c.driver}:${c.final}`).join(", ")}] — a G1/G2 event for the affected driver(s) (§4.2)`);
+    if (verdict.pendingRetry.length > 0)
+      throw new Error(`fidelity battery INCOMPLETE: ${verdict.pendingRetry.length} cell(s) hit an objective-external error — one re-invocation may retry them (§4.2/§4.5); a second attempt-error is terminal`);
+    if (verdict.neverAttempted.length > 0)
+      throw new Error(`fidelity battery INCOMPLETE: ${verdict.neverAttempted.length} applicable cell(s) never attempted — a skipped applicable fixture is a G2 event (§4.2)`);
+    log(`fidelity battery: all ${verdict.cells.length} applicable cells PASS`);
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
-    rmSync(benchRoot, { recursive: true, force: true });
   }
 }
 
@@ -964,93 +1024,44 @@ async function cmdMatrix(): Promise<void> {
   await assertRatifiedAndFrozen();
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
   try {
-    // ---- resumability (codex R1 f.17): reconstruct terminal state from runs.jsonl ----------
+    // ---- resumability: reconstruct terminal state from runs.jsonl via the SHARED rule ------
+    // (benchProtocol.reconstructMatrixState — the same function the scoring reader uses, so
+    // resume and scoring can never disagree; codex R1 f.17 / R2 f.21 / R3 f.2-f.4 semantics
+    // live inside it, plus the Step-C residual repairs: attempt-keyed markers, the persisted
+    // washout horizon, straddle COUNTS, and interrupted-rerun recovery)
     const runsPath = join(ARTIFACTS, "runs.jsonl");
-    const terminalPos = new Set<number>();
-    const rerunUsed = new Set<string>();
-    const straddled = new Set<string>();
-    const successLedger = new Set<string>(); // unit|driver|requestClass with an ok in a COMPLETED rep
-    const driftedUnits = new Set<string>();
-    const washoutDone = new Set<number>();
-    const pendingRows: Array<Record<string, unknown>> = [];
-    const completedRows: Array<Record<string, unknown>> = [];
-    const resumeForms = new Map<string, "production" | "scaffolding">();
-    if (existsSync(runsPath)) {
-      const currentCommit = engine.harnessCommit();
-      const currentEnvHash = engine.envManifestHashValue();
-      for (const line of readFileSync(runsPath, "utf8").split("\n")) {
-        if (line.trim() === "") continue;
-        let rec: Record<string, unknown>;
-        try {
-          rec = JSON.parse(line) as Record<string, unknown>;
-        } catch {
-          continue;
-        }
-        if (rec["type"] === "washout-done" && rec["phase"] === "matrix") {
-          washoutDone.add(rec["pos"] as number);
-          continue;
-        }
-        if (rec["type"] !== "run" || rec["phase"] !== "matrix") continue;
-        // resume only trusts records from THIS frozen harness revision — rows from another
-        // revision/machine must not silently mix into one traversal (codex R2 f.21)
-        if (rec["harnessCommit"] !== currentCommit)
-          throw new Error(`REFUSING to resume: runs.jsonl carries matrix rows from harness ${String(rec["harnessCommit"]).slice(0, 12)} != current ${currentCommit.slice(0, 12)} — a re-ratified matrix starts a fresh log`);
-        // one machine, one network, one credential for ALL timed data (§8) — a foreign
-        // environment's rows must never mix into this traversal (codex R3 f.2)
-        if (rec["envManifestHash"] !== currentEnvHash)
-          throw new Error(`REFUSING to resume: runs.jsonl carries rows from environment ${String(rec["envManifestHash"])} != current ${currentEnvHash}`);
-        const pos = rec["pos"] as number;
-        const outcome = rec["outcome"] as string;
-        if (outcome === "complete" || outcome === "unit-failure") pendingRows.push(rec);
-        if (outcome === "invalidated-straddle") straddled.add(rec["unit"] as string);
-        if (outcome === "drift-restart") driftedUnits.add(rec["unit"] as string); // pending R6 epilogue survives interruption (f.20)
-        if (outcome === "halt-r5-breach" || outcome === "re-pin-required")
-          throw new Error(`REFUSING to resume: runs.jsonl carries a terminal ${outcome} row — that is freeze-repair/amendment territory (§4.5 R5/R6), never a silent retry`);
-        if (outcome === "complete") completedRows.push(rec);
-        const form = rec["acquisitionForm"];
-        if (form === "scaffolding") resumeForms.set(rec["unit"] as string, "scaffolding");
-        else if (form === "production" && !resumeForms.has(rec["unit"] as string)) resumeForms.set(rec["unit"] as string, "production");
-        // only R1/R2 replays charge the driver allowance; R3/R4 in-slot replays do not (f.23)
-        if (rec["replayKind"] === "r1r2") rerunUsed.add(`${rec["unit"] as string}|${rec["driver"] as string}`);
-      }
-      // a row is terminal only once its post-run washout MARKER landed — an interrupted washout
-      // (or an interrupted R1/R2 replay decision) re-runs the row (codex R3 f.3). Epilogue rows
-      // for drifted units terminalize only as epilogue rows (f.4).
-      for (const rec of pendingRows) {
-        const pos = rec["pos"] as number;
-        if (!washoutDone.has(pos)) continue;
-        const unit = rec["unit"] as string;
-        if (driftedUnits.has(unit) && rec["epilogue"] !== true) continue; // discarded main reps
-        terminalPos.add(pos);
-      }
-      // the success ledger admits only rows whose washout marker landed — an unfinished
-      // repetition must not authorize its own R2 replay (codex R4)
-      for (const rec of completedRows) {
-        if (!washoutDone.has(rec["pos"] as number)) continue;
-        for (const cls of Object.keys((rec["requests"] as Record<string, number> | undefined) ?? {}))
-          successLedger.add(`${rec["unit"] as string}|${rec["driver"] as string}|${cls}`);
-      }
-      // a drifted unit's form is scaffolding regardless of what its pre-drift rows recorded
-      for (const unit of driftedUnits) resumeForms.set(unit, "scaffolding");
-      if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
-      engine.restoreUnitForms(resumeForms);
+    const state = reconstructMatrixState(
+      existsSync(runsPath) ? readFileSync(runsPath, "utf8").split("\n") : [],
+      { harnessCommit: engine.harnessCommit(), envManifestHash: engine.envManifestHashValue() },
+    );
+    const { terminalPos, rerunUsed, straddleCounts, driftedUnits, successLedger, pendingReplays } = state;
+    if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
+    engine.restoreUnitForms(state.resumeForms);
+    // an interrupted washout owes its REMAINING horizon before anything re-runs (residual 2)
+    const owedMs = state.pendingWashoutUntilMs - Date.now();
+    if (owedMs > 0) {
+      log(`restoring an interrupted washout: sleeping ${Math.ceil(owedMs / 1000)}s to the recorded horizon`);
+      await new Promise((r) => setTimeout(r, owedMs));
     }
-    // the frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7): R1 = a network-layer
-    // failure outside any HTTP response, rerunnable unconditionally (≤1); R2 = a transient-5xx
-    // exhaustion within caps whose request class SUCCEEDED in at least one other completed
-    // repetition of this unit × driver. Secondary-shaped failures are NEVER rerunnable.
-    const isRerunnable = (record: import("./benchProtocol.ts").RunRecord): boolean => {
-      const ev = record.failureEvidence;
-      if (ev === null || ev.kind !== "http") return false;
-      if (ev.code === "no-response") return true; // R1
-      if ((ev.code === "attempts-exhausted" || ev.code === "http-failure") && ev.lastClassification === "transient")
-        return successLedger.has(`${record.unit}|${record.driver}|${ev.requestClass ?? ""}`); // R2
-      return false;
-    };
+    // the frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7), shared with the
+    // reconstruction: R1 = a network-layer failure outside any HTTP response, rerunnable
+    // unconditionally (≤1); R2 = a transient-5xx exhaustion within caps whose request class
+    // SUCCEEDED in at least one other completed repetition of this unit × driver.
+    // Secondary-shaped failures are NEVER rerunnable.
+    const isRerunnable = (record: import("./benchProtocol.ts").RunRecord): boolean =>
+      isRerunnableEvidence(record.failureEvidence, record.unit, record.driver, successLedger);
     const executeRows = async (rows: NonNullable<typeof cfg.schedule>["rows"], phaseNote: string): Promise<void> => {
       for (const row of rows) {
         if (terminalPos.has(row.pos) && phaseNote === "main") continue;
         if (driftedUnits.has(row.unit) && phaseNote === "main") continue; // discarded reps; the epilogue re-runs the whole unit
+        // a crash-interrupted replay decision resumes AS the replay it owed, with its physical
+        // predecessor linkage restored (§4.5's recorded-predecessor rule survives the crash)
+        const owed = pendingReplays.get(row.pos);
+        if (owed !== undefined) {
+          engine.setReplayOf(row.pos, owed);
+          pendingReplays.delete(row.pos);
+        }
+        let controlPlaneReplays = 0;
         for (;;) {
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
@@ -1059,8 +1070,9 @@ async function cmdMatrix(): Promise<void> {
             break;
           }
           if (handle.record.outcome === "invalidated-straddle") {
-            if (straddled.has(row.unit)) throw new Error(`R4 recurred on ${row.unit} — halt for freeze repair (plan §4.5)`);
-            straddled.add(row.unit);
+            const count = (straddleCounts.get(row.unit) ?? 0) + 1;
+            straddleCounts.set(row.unit, count);
+            if (count >= 2) throw new Error(`R4 recurred on ${row.unit} (${count} straddles) — halt for freeze repair (plan §4.5)`);
             log(`R4 straddle on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
             engine.setReplayOf(row.pos, "r3r4");
             continue;
@@ -1068,6 +1080,17 @@ async function cmdMatrix(): Promise<void> {
           if (handle.record.outcome === "invalidated-foreign") {
             // R3: verified external interference — replay in slot, never charged to the driver
             log(`R3 foreign consumption on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
+            engine.setReplayOf(row.pos, "r3r4");
+            continue;
+          }
+          if (handle.record.outcome === "invalidated-control-plane") {
+            // a rate_limit snapshot failed (residual 3): run invalid, replay in slot, never
+            // charged to the driver — bounded, because each replay is a full physical run and
+            // a persistently dead control plane needs the operator, not a loop
+            controlPlaneReplays++;
+            if (controlPlaneReplays > 2)
+              throw new Error(`control-plane failure persisted through ${controlPlaneReplays} attempts at pos ${row.pos} (${handle.record.failureCause ?? ""}) — fix connectivity and resume`);
+            log(`control-plane invalidation on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
             engine.setReplayOf(row.pos, "r3r4");
             continue;
           }
@@ -1199,6 +1222,186 @@ async function cmdRefreshEvidence(): Promise<void> {
   }
 }
 
+// ---- Step-C executors (scoring reader, report, and the informational evidence probes) --------
+function readArtifactLines(name: string): string[] {
+  const p = join(ARTIFACTS, name);
+  return existsSync(p) ? readFileSync(p, "utf8").split("\n") : [];
+}
+
+function loadScoreBundle(): { bundle: ScoreBundle; rat: Record<string, unknown> } {
+  const { cfg, corpus, workloads } = loadPinned();
+  const rat = JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>;
+  const noiseBand = rat["noiseBand"];
+  if (typeof noiseBand !== "number") throw new Error("ratification.json carries no numeric noiseBand");
+  return {
+    bundle: { cfg, corpus, workloads, runsLines: readArtifactLines("runs.jsonl"), fidelityLines: readArtifactLines("fidelity.jsonl"), noiseBand },
+    rat,
+  };
+}
+
+// per-stream/leg cold cache DBs for the probes — same containment rules as the engine's run
+// caches (a §0-permitted ./data root; never the production sqlite path; removed on dispose)
+function makeProbeDbFactory(): { makeDb: (name: string) => AuditDb; disposeDb: (db: AuditDb, name: string) => void } {
+  const cacheDir = join(REPO_ROOT, "data", "bench-run-caches");
+  mkdirSync(cacheDir, { recursive: true });
+  const paths = new Map<string, string>();
+  return {
+    makeDb: (name) => {
+      const p = join(cacheDir, `probe-${name}-${process.pid}-${Date.now()}.sqlite`);
+      paths.set(name, p);
+      return AuditDb.open({ sqlitePath: p, fresh: true, purgeCache: true });
+    },
+    disposeDb: (db, name) => {
+      try {
+        db.close();
+      } catch {
+        // a close failure must not mask the probe outcome; the removal below still runs
+      }
+      const p = paths.get(name);
+      if (p !== undefined) for (const sfx of ["", "-wal", "-shm"]) rmSync(`${p}${sfx}`, { force: true });
+    },
+  };
+}
+
+function renderScoreToLog(out: ScoreOutput): void {
+  log(`identity: harness ${out.identity.harnessCommit.slice(0, 12)}, env ${out.identity.envManifestHash}, band ${out.noiseBand}`);
+  for (const g of out.gates) {
+    log(`${g.driver}: G1 ${g.g1}, G2 ${g.g2}, G3 ${g.g3}, G4 ${g.g4} (${g.g4AttributableSignals} attributable signals) → ${g.eligible ? "ELIGIBLE" : "ineligible"}`);
+    for (const r of g.reasons.slice(0, 6)) log(`    ${r}`);
+  }
+  for (const cell of out.cells) {
+    if (cell.medianT === null) continue;
+    log(`  ${cell.unit} ${cell.driver}: median T ${cell.medianT.toFixed(1)} files/h (worst ${(cell.worstT ?? 0).toFixed(1)}, @15k ${(cell.medianT15k ?? 0).toFixed(1)})`);
+  }
+  log(`§4.7 case: ${out.caseMapping.kind}${out.caseMapping.recommendation !== null ? ` → recommend ${out.caseMapping.recommendation}` : ""}`);
+}
+
+async function cmdScore(): Promise<void> {
+  const { bundle } = loadScoreBundle();
+  renderScoreToLog(scoreMatrix(bundle));
+}
+
+async function cmdReport(): Promise<void> {
+  const { bundle, rat } = loadScoreBundle();
+  const score = scoreMatrix(bundle);
+  const envManifests: Array<Record<string, unknown>> = [];
+  for (const line of bundle.runsLines) {
+    if (line.trim() === "") continue;
+    try {
+      const rec = JSON.parse(line) as Record<string, unknown>;
+      if (rec["type"] === "env-manifest") envManifests.push(rec);
+    } catch {
+      continue;
+    }
+  }
+  const readJson = (name: string): Record<string, unknown> | null => {
+    const p = join(ARTIFACTS, name);
+    return existsSync(p) ? (JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>) : null;
+  };
+  const ratified = String(rat["frozenSurfaceDigest"] ?? "");
+  const live = frozenSurfaceDigest();
+  // the report is a pure reader (§8's carve-out) so a changed tree only WARNS — but the stamp
+  // is always the ratified digest the evidence actually bound to, never the live tree's
+  if (live !== ratified) log(`WARNING: live tree digest ${live.slice(0, 12)}… != ratified ${ratified.slice(0, 12)}… — report stamps the ratified digest`);
+  const md = buildReport({
+    score, cfg: bundle.cfg, corpus: bundle.corpus, ratification: rat, envManifests,
+    frozenSurfaceDigest: ratified,
+    boundary: readJson("boundary-probe.json"),
+    concurrency: readJson("concurrency-probe.json"),
+    option3: readJson("option3.json"),
+    generatedAtIso: new Date().toISOString(),
+  });
+  writeFileSync(join(ARTIFACTS, "report.md"), md);
+  log(`report.md written — §4.7 output: ${score.caseMapping.kind}${score.caseMapping.recommendation !== null ? ` → ${score.caseMapping.recommendation}` : ""}`);
+}
+
+async function cmdBoundaryProbe(): Promise<void> {
+  const { cfg, corpus } = loadPinned();
+  const { digest } = await assertRatifiedAndFrozen();
+  const rt = makePinRuntime(cfg);
+  try {
+    const c2 = corpus.performance.find((s) => s.slot === "C2") ?? ((): never => {
+      throw new Error("no pinned C2 slot");
+    })();
+    const unit = c2.units[0]!;
+    log(`boundary probe on ${c2.owner}/${c2.repo}@${unit.sha.slice(0, 12)} (the pinned mid-size C2 unit, §4.4)`);
+    const json = await rt.client.restGetJson(`repos/${encodeURIComponent(c2.owner)}/${encodeURIComponent(c2.repo)}/git/trees/${unit.treeOid}?recursive=1`, { immutable: true });
+    const tree = parseTreeResponse(json, "boundary-tree", unit.treeOid);
+    if (tree.truncated) throw new Error("C2's REST tree is truncated — the boundary probe's planning source is gone");
+    const blobs = tree.paths.filter((e) => e.type === "blob" && typeof e.size === "number").map((e) => ({ path: e.path, oid: e.sha, size: e.size as number }));
+    const cells = planBoundaryCells(blobs);
+    const results = await runBoundaryProbe(
+      { gh: rt.gh, cfg, owner: c2.owner, repo: c2.repo, sha: unit.sha, log, now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
+      cells,
+    );
+    writeFileSync(join(ARTIFACTS, "boundary-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, repo: `${c2.owner}/${c2.repo}`, sha: unit.sha, cells: results }, null, 2)}\n`);
+    log("boundary-probe.json written — informational, not scored (§4.4)");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+}
+
+async function cmdConcurrencyProbe(): Promise<void> {
+  const { cfg, corpus, workloads } = loadPinned();
+  const { digest } = await assertRatifiedAndFrozen();
+  const rt = makePinRuntime(cfg);
+  const { makeDb, disposeDb } = makeProbeDbFactory();
+  try {
+    const blocks = await runConcurrencyProbe({
+      cfg, corpus, workloads, client: rt.client, makeDb, disposeDb,
+      benchRoot: rt.benchRoot, gitEnv: rt.gitEnv, log, now: Date.now,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
+    writeFileSync(join(ARTIFACTS, "concurrency-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, streams: 4, drivers: blocks }, null, 2)}\n`);
+    log("concurrency-probe.json written — reported, not scored (§4.5)");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+}
+
+async function cmdOption3(): Promise<void> {
+  const { cfg, corpus, workloads } = loadPinned();
+  const { digest } = await assertRatifiedAndFrozen();
+  const duplication = analyzeOidDuplication(corpus, workloads);
+  // the warm scenario runs on the §4.7 rule's recommended driver when one exists, else on both
+  // finalists (plan §4.4) — scoring is a pure reader over runs.jsonl, so consult it
+  let drivers: DriverId[] = ["T1", "T2c"];
+  let driversRationale = "no §4.7 recommendation — both finalists (plan §4.4)";
+  try {
+    const { bundle } = loadScoreBundle();
+    const score = scoreMatrix(bundle);
+    if (score.caseMapping.recommendation !== null) {
+      drivers = [score.caseMapping.recommendation];
+      driversRationale = `§4.7 rule output ${score.caseMapping.kind} → ${score.caseMapping.recommendation}`;
+    }
+  } catch (e) {
+    log(`scoring unavailable (${e instanceof Error ? e.message.slice(0, 120) : String(e)}) — running both finalists`);
+  }
+  log(`option3 warm-scenario drivers: ${drivers.join(", ")} (${driversRationale})`);
+  const c1 = corpus.performance.find((s) => s.slot === "C1") ?? ((): never => {
+    throw new Error("no pinned C1 slot");
+  })();
+  const advanced = workloads.get(c1.units[0]!.unitId) ?? ((): never => {
+    throw new Error("no pinned C1-main workload");
+  })();
+  const rt = makePinRuntime(cfg);
+  const { makeDb, disposeDb } = makeProbeDbFactory();
+  try {
+    const warm = await runOption3WarmScenario({
+      cfg, corpus, advancedWorkload: advanced, client: rt.client, makeDb, disposeDb,
+      benchRoot: rt.benchRoot, gitEnv: rt.gitEnv, drivers, log, now: Date.now,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
+    writeFileSync(join(ARTIFACTS, "option3.json"), `${JSON.stringify({
+      generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, driversRationale,
+      duplication, warmScenario: warm, cloneCompositionStatement: CLONE_COMPOSITION_STATEMENT,
+    }, null, 2)}\n`);
+    log("option3.json written — the compositional analysis, reported alongside the matrix (§4.4)");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+}
+
 async function cmdVerifyCorpus(): Promise<void> {
   const { corpus, workloads } = loadPinned();
   log(`corpus pinned ${corpus.pinnedAtIso} by ${corpus.pinnedByLogin}`);
@@ -1223,13 +1426,18 @@ async function main(): Promise<void> {
     case "fidelity": return cmdFidelity();
     case "refresh-evidence": return cmdRefreshEvidence();
     case "matrix": return cmdMatrix();
+    case "score": return cmdScore();
+    case "report": return cmdReport();
+    case "boundary-probe": return cmdBoundaryProbe();
+    case "concurrency-probe": return cmdConcurrencyProbe();
+    case "option3": return cmdOption3();
     case "verify-corpus": return cmdVerifyCorpus();
     case "digest": {
       log(frozenSurfaceDigest()); // the §8 freeze binding ratification.json records
       return;
     }
     default:
-      log("usage: bun run bench:content <pin-corpus | refresh-evidence | diagnostics | verify-corpus | digest | budget | pilot | fidelity | matrix>");
+      log("usage: bun run bench:content <pin-corpus | refresh-evidence | diagnostics | verify-corpus | digest | budget | pilot | matrix | fidelity | boundary-probe | concurrency-probe | option3 | score | report>");
       process.exitCode = 2;
   }
 }

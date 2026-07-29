@@ -80,6 +80,12 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       "BenchGrammarViolation", "BenchFrameError", "BenchSpawnError", "BenchConfigError",
       "BenchScheduleError", "BenchCorpusError", "BenchWorkloadError", "BenchT1Error",
       "BenchHttpError", "BenchProtocolError", "UnitFailure", "DriftSignal", "RePinRequired",
+      // Step-C additions, same rationale and surfacing path: ControlPlaneFailure is the
+      // engine's typed invalidation signal (caught cross-module like UnitFailure); the rest
+      // are the Step-C executors' own error classes (scoring reader, fidelity ledger, and the
+      // three informational probes), surfaced only via bench:content's top-level catch.
+      "ControlPlaneFailure", "BenchFidelityError", "BenchScoreError", "BenchBoundaryError",
+      "BenchProbeError", "BenchOption3Error",
     ]);
     const declared = new Set<string>();
     // recursive: scripts/tui/ declares operator-facing classes too (TuiActivationError)
