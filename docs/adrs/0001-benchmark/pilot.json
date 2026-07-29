@@ -1,0 +1,17 @@
+{
+  "generatedAtIso": "2026-07-29T03:55:29.129Z",
+  "driver": "T0",
+  "slot": "C2",
+  "reps": 5,
+  "wallsMs": [
+    22340,
+    22058,
+    21732,
+    21868,
+    21115
+  ],
+  "pilotSpread": 1.058,
+  "noiseBand": 1.25,
+  "formula": "max(1.25, spread rounded up to the next 0.05)",
+  "nonDecision": "declared diagnostic (plan §4.7/§8) — calibrates the band, ranks nothing"
+}

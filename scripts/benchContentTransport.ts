@@ -44,7 +44,7 @@ import { packBatches } from "./benchT1.ts";
 import {
   BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, planSegments,
 } from "./benchProtocol.ts";
-import { acquireStore, type DriverRunContext } from "./benchDrivers.ts";
+import { acquireStore, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
 import { noiseBandFrom } from "./benchConfig.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -514,13 +514,20 @@ async function acquisitionDiagnostics(rt: PinRuntime, corpus: Corpus, workloads:
   for (const slot of corpus.performance) {
     for (const unit of slot.units) {
       const workload = workloads.get(unit.unitId)!;
-      if (slot.slot !== "C4" && workload.escapeTripped) {
-        results.push({ unit: unit.unitId, skipped: "api-escape unit — clone drivers never acquire here" });
-        continue;
-      }
+      // the api-escape belongs to T2a ALONE (§4.4): an escape-tripped untruncated unit still
+      // gets cloned by T2c in the matrix, so only the checkout (T2a) arms are skipped here.
+      const skipCheckoutArms = workload.escapeTripped && !workload.truncatedTree;
+      // §4.4: a branch that drifted between pinning and this diagnostic makes the PRODUCTION
+      // form unable to acquire the pinned SHA at all (clone --branch takes the live head) —
+      // the same condition the matrix answers with the scaffolding form. Probe once here;
+      // measure the production arm only while the head still equals the pin, and record the
+      // drift verbatim otherwise (the form comparison is then unavailable, not fabricated).
+      const live = await probeLiveHead({ cfg: rt.cfg, slot, unit, benchRoot: rt.benchRoot, gitEnv: rt.gitEnv, spawnObserver: rt.spawnObs });
+      const drifted = live !== unit.sha;
+      if (drifted) log(`diag ${unit.unitId}: live head ${live.slice(0, 12)} drifted off the pin — production form unavailable, measuring scaffolding alone`);
       const perForm: Record<string, { walls: number[]; tip: string; tree: string; closureSha256: string; inventorySha256: string }> = {};
-      for (const form of ["production", "scaffolding"] as const) {
-        for (const checkout of [true, false]) {
+      for (const form of (drifted ? ["scaffolding"] : ["production", "scaffolding"]) as ReadonlyArray<"production" | "scaffolding">) {
+        for (const checkout of skipCheckoutArms ? [false] : [true, false]) {
           const key = `${form}:${checkout ? "T2a" : "T2c"}`;
           const walls: number[] = [];
           let evidence: { tip: string; tree: string; closureSha256: string; inventorySha256: string } | null = null;
@@ -552,11 +559,14 @@ async function acquisitionDiagnostics(rt: PinRuntime, corpus: Corpus, workloads:
         }
       }
       // assert identical tip/tree oids and identical reachable closure across the forms
+      // (form comparison requires the production arm — a drifted unit records scaffolding only)
       const anomalies: string[] = [];
-      for (const checkout of ["T2a", "T2c"]) {
-        const prod = perForm[`production:${checkout}`]!;
+      for (const checkout of skipCheckoutArms ? ["T2c"] : ["T2a", "T2c"]) {
         const scaf = perForm[`scaffolding:${checkout}`]!;
-        if (prod.tip !== unit.sha || scaf.tip !== unit.sha) anomalies.push(`${checkout}: tip != pinned SHA`);
+        if (scaf.tip !== unit.sha) anomalies.push(`${checkout}: scaffolding tip != pinned SHA`);
+        if (drifted) continue;
+        const prod = perForm[`production:${checkout}`]!;
+        if (prod.tip !== unit.sha) anomalies.push(`${checkout}: production tip != pinned SHA`);
         if (prod.tree !== scaf.tree) anomalies.push(`${checkout}: tree oids differ across forms`);
         if (prod.closureSha256 !== scaf.closureSha256) anomalies.push(`${checkout}: reachable closures differ across forms`);
         const med = (w: number[]): number => [...w].sort((a, b) => a - b)[1]!;
@@ -564,7 +574,7 @@ async function acquisitionDiagnostics(rt: PinRuntime, corpus: Corpus, workloads:
         if (delta > 0.1) anomalies.push(`${checkout}: median wall delta ${(delta * 100).toFixed(1)}% > 10% — interpret scaffolding-form units with this bound in hand`);
       }
       if (anomalies.some((a) => a.includes("differ") || a.includes("tip"))) throw new Error(`acquisition diagnostics failed for ${unit.unitId}: ${anomalies.join("; ")}`);
-      results.push({ unit: unit.unitId, forms: perForm, flags: anomalies });
+      results.push({ unit: unit.unitId, driftedAtDiagnostics: drifted, liveHeadAtDiagnostics: live, t2aArmsSkipped: skipCheckoutArms, forms: perForm, flags: anomalies });
     }
   }
   return results;
@@ -588,7 +598,9 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
   const runsLog = new RunsLog(join(ARTIFACTS, "runs.jsonl"), manifest);
   runsLog.writeManifestOnce();
   const engine = new BenchEngine({
-    cfg, corpus, workloads, benchRoot, artifactsDir: ARTIFACTS, runsLog,
+    cfg, corpus, workloads, benchRoot, artifactsDir: ARTIFACTS,
+    runCacheDir: join(REPO_ROOT, "data", "bench-run-caches"),
+    runsLog,
     client: metaClient,
     makeClient: (db) => new GithubClient({ githubHost: cfg.githubHost, db, tempRoot: benchRoot }),
     log,
