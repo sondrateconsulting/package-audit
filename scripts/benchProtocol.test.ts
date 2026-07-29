@@ -848,7 +848,8 @@ const row = (over: Record<string, unknown>): string =>
     replayOfPos: null, replayKind: null, diskReclaimFailed: false, probeDivergences: 0,
     httpBodyBytes: 0, cloneObjectStoreBytes: null, diskSampledPeakBytes: 0, diskSamples: 0,
     fallbackSpend: 0, routesDelivered: {}, g1Failures: 0, g2Failures: 0,
-    washoutAppliedMs: 60_000, washoutUntilEpochMs: 0,
+    washoutAppliedMs: 60_000, washoutUntilEpochMs: 0, controlPlaneFailed: false,
+    frozenSurfaceDigest: "F1",
     envManifestHash: IDENTITY.envManifestHash, harnessCommit: IDENTITY.harnessCommit,
     ...over,
   });
@@ -885,11 +886,11 @@ describe("reconstructMatrixState — attempt-keyed terminalization (Step-C resid
     expect(state.terminalPos.has(1)).toBe(false);
   });
   test("two recorded straddles on one unit refuse reconstruction (residual 7)", () => {
-    const one = reconstructMatrixState([row({ pos: 1, attemptId: "a-1", outcome: "invalidated-straddle" })], IDENTITY);
+    const one = reconstructMatrixState([row({ pos: 1, attemptId: "a-1", outcome: "invalidated-straddle", straddledReset: true })], IDENTITY);
     expect(one.straddleCounts.get("U1")).toBe(1);
     expect(() => reconstructMatrixState([
-      row({ pos: 1, attemptId: "a-1", outcome: "invalidated-straddle" }),
-      row({ pos: 7, attemptId: "a-2", outcome: "invalidated-straddle" }),
+      row({ pos: 1, attemptId: "a-1", outcome: "invalidated-straddle", straddledReset: true }),
+      row({ pos: 7, attemptId: "a-2", outcome: "invalidated-straddle", straddledReset: true }),
     ], IDENTITY)).toThrow(/R4 straddles/);
   });
   test("halt/re-pin rows and foreign identities refuse reconstruction", () => {
@@ -944,11 +945,11 @@ describe("reconstructMatrixState — attempt-keyed terminalization (Step-C resid
   });
   test("a last invalidated attempt owes an in-slot replay linkage; a later terminal attempt clears it", () => {
     const state = reconstructMatrixState([
-      row({ pos: 6, attemptId: "a-s", outcome: "invalidated-straddle" }), marker("a-s", 6),
+      row({ pos: 6, attemptId: "a-s", outcome: "invalidated-straddle", straddledReset: true }), marker("a-s", 6),
     ], IDENTITY);
     expect(state.pendingReplays.get(6)).toBe("r3r4");
     const replayed = reconstructMatrixState([
-      row({ pos: 6, attemptId: "a-s", outcome: "invalidated-straddle" }), marker("a-s", 6),
+      row({ pos: 6, attemptId: "a-s", outcome: "invalidated-straddle", straddledReset: true }), marker("a-s", 6),
       row({ pos: 6, attemptId: "a-r", replayOfPos: 6, replayKind: "r3r4" }), marker("a-r", 6),
     ], IDENTITY);
     expect(replayed.pendingReplays.has(6)).toBe(false);
@@ -997,8 +998,8 @@ describe("reconstructMatrixState — codex C0-R1 remediations", () => {
   });
   test("control-plane invalidations count durably per pos (f.3)", () => {
     const state = reconstructMatrixState([
-      row({ pos: 7, attemptId: "a-1", outcome: "invalidated-control-plane" }), marker("a-1", 7),
-      row({ pos: 7, attemptId: "a-2", outcome: "invalidated-control-plane" }), marker("a-2", 7),
+      row({ pos: 7, attemptId: "a-1", outcome: "invalidated-control-plane", controlPlaneFailed: true }), marker("a-1", 7),
+      row({ pos: 7, attemptId: "a-2", outcome: "invalidated-control-plane", controlPlaneFailed: true }), marker("a-2", 7),
     ], IDENTITY);
     expect(state.controlPlaneCounts.get(7)).toBe(2);
     expect(state.pendingReplays.get(7)).toBe("r3r4");

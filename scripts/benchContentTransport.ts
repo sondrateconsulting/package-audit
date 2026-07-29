@@ -27,7 +27,7 @@
 // them (the production sweep deliberately targets pkg-audit-* only); stale ones are safe to
 // delete by hand.
 
-import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -262,7 +262,37 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
     assertAppendOnlyPrefix(`${rel} (staged)`, show.stdout, staged.stdout);
     assertAppendOnlyPrefix(`${rel} (staged vs working)`, staged.stdout, working);
   }
-  return { rat, digest };
+}
+
+// reader-side integrity for score/report (codex C0-R2 finding 2): the evidence INPUTS must be
+// committed and unedited. The full §8 gate's digest equality is deliberately NOT demanded —
+// the pure-reader carve-out lets scoring/report code change after collection — but the frozen
+// preregistered artifacts, the logs' committed prefixes, and (via per-row digest stamps,
+// checked in benchScore) the rows' own freeze binding all still hold.
+async function assertEvidenceReadable(): Promise<void> {
+  const repoRoot = realpathSync(REPO_ROOT);
+  const env = buildGitEnv(process.env, "/dev/null");
+  const lsFiles = await runBenchGit({
+    argv: ["ls-files", "--error-unmatch", "docs/adrs/0001-benchmark/ratification.json"],
+    lane: { lane: "pinning" }, env, benchRoot: repoRoot, cwd: repoRoot,
+    limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  if (lsFiles.exitCode !== 0)
+    throw new Error("REFUSING: ratification.json is not TRACKED — scoring reads only committed, signed answers (§8)");
+  const statusOut = await runBenchGit({
+    argv: ["status", "--porcelain"], lane: { lane: "pinning" }, env,
+    benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  const FROZEN_INPUTS = [
+    "docs/adrs/0001-benchmark/bench-config.json", "docs/adrs/0001-benchmark/corpus.json",
+    "docs/adrs/0001-benchmark/selected/", "docs/adrs/0001-benchmark/pilot.json",
+    "docs/adrs/0001-benchmark/acquisition-diagnostics.json", "docs/adrs/0001-benchmark/ratification.json",
+    "docs/plans/adr-0001-disagreements-resolution.md", "docs/adrs/0001-file-content-acquisition-strategy.md",
+  ];
+  const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && FROZEN_INPUTS.some((a) => f.startsWith(a)));
+  if (dirty.length > 0)
+    throw new Error(`REFUSING: frozen evidence inputs are edited on disk: ${dirty.slice(0, 5).join(", ")} — scoring reads only committed preregistration (codex C0-R2 finding 2)`);
+  await assertAppendOnlyLogs({ repairTornTail: false });
 }
 
 const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl", "data/"];
@@ -1007,6 +1037,7 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
   const runsLog = new RunsLog(join(ARTIFACTS, "runs.jsonl"), manifest);
   const engine = new BenchEngine({
     cfg, corpus, workloads, benchRoot, artifactsDir: ARTIFACTS,
+    frozenSurfaceDigest: frozenSurfaceDigest(), // every row binds to its freeze (codex C0-R2 f.2)
     runCacheDir: join(REPO_ROOT, "data", "bench-run-caches"),
     runsLog,
     frozenSurfaceDigest,
@@ -1960,7 +1991,7 @@ async function cmdMatrix(): Promise<void> {
     const runsPath = join(ARTIFACTS, "runs.jsonl");
     const state = reconstructMatrixState(
       existsSync(runsPath) ? readFileSync(runsPath, "utf8").split("\n") : [],
-      { harnessCommit: engine.harnessCommit(), envManifestHash: engine.envManifestHashValue() },
+      { harnessCommit: engine.harnessCommit(), envManifestHash: engine.envManifestHashValue(), frozenSurfaceDigest: digest },
     );
     const { terminalPos, rerunUsed, straddleCounts, driftedUnits, successLedger, pendingReplays } = state;
     if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
@@ -1999,10 +2030,13 @@ async function cmdMatrix(): Promise<void> {
           engine.setReplayOf(row.pos, owed);
           pendingReplays.delete(row.pos);
         }
-        // the control-plane replay cap is DURABLE across invocations: recorded invalidations
-        // seed the counter, so restarting the process cannot reset it (codex C0-R1 finding 3)
+        // the control-plane replay cap is DURABLE across invocations: recorded failures seed
+        // the counter, and the guard runs BEFORE another physical attempt — a restart must not
+        // buy one extra run per invocation (codex C0-R1 finding 3; C0-R2 verdict)
         let controlPlaneReplays = state.controlPlaneCounts.get(row.pos) ?? 0;
         for (;;) {
+          if (controlPlaneReplays > 2)
+            throw new Error(`control-plane failure recorded ${controlPlaneReplays}× at pos ${row.pos} — fix connectivity, then resume (the recorded rows stay; §4.5's in-slot replay discipline)`);
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
           if (handle.record.outcome === "complete") {
@@ -2026,11 +2060,8 @@ async function cmdMatrix(): Promise<void> {
           }
           if (handle.record.outcome === "invalidated-control-plane") {
             // a rate_limit snapshot failed (residual 3): run invalid, replay in slot, never
-            // charged to the driver — bounded, because each replay is a full physical run and
-            // a persistently dead control plane needs the operator, not a loop
+            // charged to the driver — the loop-top durable guard bounds the retries
             controlPlaneReplays++;
-            if (controlPlaneReplays > 2)
-              throw new Error(`control-plane failure persisted through ${controlPlaneReplays} attempts at pos ${row.pos} (${handle.record.failureCause ?? ""}) — fix connectivity and resume`);
             log(`control-plane invalidation on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
             engine.setReplayOf(row.pos, "r3r4");
             continue;
@@ -2209,11 +2240,19 @@ function loadScoreBundle(): { bundle: ScoreBundle; rat: Record<string, unknown> 
   if (typeof noiseBand !== "number") throw new Error("ratification.json carries no numeric noiseBand");
   // the band is not taken on faith (codex C0-R1 finding 12): it must equal pilot.json's
   // calibrated value AND re-derive from the pilot spread under the frozen §4.7 formula
-  const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number; pilotSpread?: number };
+  const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number; pilotSpread?: number; wallsMs?: number[] };
   if (noiseBand !== pilot.noiseBand)
     throw new Error(`ratification.json noiseBand (${noiseBand}) != pilot.json's calibrated band (${String(pilot.noiseBand)})`);
-  if (typeof pilot.pilotSpread !== "number" || noiseBandFrom(cfg, pilot.pilotSpread) !== noiseBand)
-    throw new Error(`the ratified band ${noiseBand} does not re-derive from the pilot spread ${String(pilot.pilotSpread)} under the frozen formula`);
+  // the spread is RECOMPUTED from the recorded walls, never trusted as declared (codex C0-R2
+  // re f.12) — pilot.json stores it at 4 decimal places, so the recomputation matches that
+  const walls = pilot.wallsMs;
+  if (!Array.isArray(walls) || walls.length === 0 || walls.some((w) => typeof w !== "number" || w <= 0))
+    throw new Error("pilot.json carries no usable wallsMs — the band cannot be re-derived");
+  const recomputedSpread = Number((Math.max(...walls) / Math.min(...walls)).toFixed(4));
+  if (recomputedSpread !== pilot.pilotSpread)
+    throw new Error(`pilot.json's declared spread ${String(pilot.pilotSpread)} != ${recomputedSpread} recomputed from its own walls`);
+  if (noiseBandFrom(cfg, recomputedSpread) !== noiseBand)
+    throw new Error(`the ratified band ${noiseBand} does not re-derive from the recomputed pilot spread ${recomputedSpread} under the frozen formula`);
   const ratifiedDigest = rat["frozenSurfaceDigest"];
   if (typeof ratifiedDigest !== "string" || ratifiedDigest.length === 0)
     throw new Error("ratification.json carries no frozenSurfaceDigest — scoring cannot scope the fidelity ledger");
@@ -2255,17 +2294,19 @@ function renderScoreToLog(out: ScoreOutput): void {
   }
   for (const cell of out.cells) {
     if (cell.medianT === null) continue;
-    log(`  ${cell.unit} ${cell.driver}: median T ${cell.medianT.toFixed(1)} files/h (worst ${(cell.worstT ?? 0).toFixed(1)}, @15k ${(cell.medianT15k ?? 0).toFixed(1)})`);
+    log(`  ${cell.unit} ${cell.driver}: median T ${cell.medianT.toFixed(1)} files/h (worst ${(cell.worstT ?? 0).toFixed(1)}); @15k median ${(cell.medianT15k ?? 0).toFixed(1)} (worst ${(cell.worstT15k ?? 0).toFixed(1)})`);
   }
   log(`§4.7 case: ${out.caseMapping.kind}${out.caseMapping.recommendation !== null ? ` → recommend ${out.caseMapping.recommendation}` : ""}`);
 }
 
 async function cmdScore(): Promise<void> {
+  await assertEvidenceReadable();
   const { bundle } = loadScoreBundle();
   renderScoreToLog(scoreMatrix(bundle));
 }
 
 async function cmdReport(): Promise<void> {
+  await assertEvidenceReadable();
   const { bundle, rat } = loadScoreBundle();
   const score = scoreMatrix(bundle);
   const envManifests: Array<Record<string, unknown>> = [];
@@ -2322,7 +2363,7 @@ async function cmdBoundaryProbe(): Promise<void> {
     const blobs = tree.paths.filter((e) => e.type === "blob" && typeof e.size === "number").map((e) => ({ path: e.path, oid: e.sha, size: e.size as number }));
     const cells = planBoundaryCells(blobs);
     const probeRun = await runBoundaryProbe(
-      { gh: rt.gh, cfg, owner: c2.owner, repo: c2.repo, sha: unit.sha, log, now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
+      { gh: rt.gh, cfg, owner: c2.owner, repo: c2.repo, sha: unit.sha, objectFormat: c2.objectFormat, log, now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
       cells,
     );
     writeFileSync(join(ARTIFACTS, "boundary-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, repo: `${c2.owner}/${c2.repo}`, sha: unit.sha, bucketBefore: probeRun.before, bucketAfter: probeRun.after, finalWashoutMs: probeRun.finalWashoutMs, cells: probeRun.cells }, null, 2)}\n`);

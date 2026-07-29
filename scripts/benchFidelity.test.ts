@@ -33,7 +33,7 @@ describe("reconstructFidelityLedger", () => {
       rec({ outcome: "mismatch", pass: false, frozenSurfaceDigest: "x".repeat(64) }), // dead evidence
       "not json", "",
     ], DIGEST);
-    expect(ledger.cells.get("clone-symlink|T2c|a/link.sh")).toEqual({ matches: 1, mismatches: 0, attemptErrors: 0 });
+    expect(ledger.cells.get("clone-symlink|T2c|a/link.sh")).toEqual({ matches: 1, mismatches: 0, contentFailures: 0, attemptErrors: 0 });
     expect(ledger.groupAttemptErrors.get("clone-symlink|T2a")).toBe(2);
   });
   test("legacy records without an outcome field map pass:true → match and pass:false → mismatch (fail-closed)", () => {

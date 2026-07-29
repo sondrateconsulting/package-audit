@@ -10,6 +10,8 @@
 
 import type { BenchConfig } from "./benchConfig.ts";
 import { benchGraphqlDispatch, outstandingHorizonMs, readRateLimit, type BenchGhContext, type RateLimitSnapshot } from "./benchGh.ts";
+import { analyzeBatchResponse } from "./benchT1.ts";
+import type { BenchObjectFormat } from "./benchGrammar.ts";
 import { washoutMs } from "./benchProtocol.ts";
 import { buildBatchQuery } from "./benchT1.ts";
 import type { WorkloadEntry } from "./benchWorkload.ts";
@@ -94,11 +96,13 @@ export interface BoundaryTryResult {
   jsonParseable: boolean;
   errorTypes: string[]; // distinct errors[].type values observed
   malformedErrorEntries: number;
-  // an alias counts as RESOLVED only when its payload validates (oid echo + string text) — a
-  // bare object count would launder error-shaped or null-content aliases into successes
-  // (codex C0-R1 finding 14)
+  // an alias counts as RESOLVED only when it passes T1's OWN per-alias validation (typename,
+  // oid echo, byteSize, hash — analyzeBatchResponse), so error-shaped, conflicted, or
+  // null-content aliases can never be laundered into successes (codex C0-R1/R2 finding 14)
   resolvedAliases: number;
   objectAliases: number; // any non-null object came back (the raw shape count, for contrast)
+  analysisKind: string; // the exhaustive transition table's verdict on the whole envelope
+  aliasConflicts: number; // aliases present in BOTH data and errors[]
   pointsCost: number | null;
   wallMs: number;
   bodyBytes: number;
@@ -120,6 +124,7 @@ export interface BoundaryProbeDeps {
   owner: string;
   repo: string;
   sha: string;
+  objectFormat: BenchObjectFormat;
   log: (line: string) => void;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -154,7 +159,8 @@ export async function runBoundaryProbe(deps: BoundaryProbeDeps, cells: readonly 
   }
   const before = await readRateLimit(deps.gh);
   const results: BoundaryCellResult[] = [];
-  for (const [cellIndex, cell] of cells.entries()) {
+  try {
+    for (const [cellIndex, cell] of cells.entries()) {
     if (cellIndex > 0) await deps.sleep(CELL_GAP_MS);
     const batch = buildBatchQuery(cell.blobs.map(toEntry), {
       owner: deps.owner, repo: deps.repo, sha: deps.sha,
@@ -173,7 +179,8 @@ export async function runBoundaryProbe(deps: BoundaryProbeDeps, cells: readonly 
         result.tries.push({
           tryOrdinal: t, dispatched: false, status: 0, classification: "undispatchable",
           jsonParseable: false, errorTypes: [], malformedErrorEntries: 0, resolvedAliases: 0,
-          objectAliases: 0, pointsCost: null, wallMs: 0, bodyBytes: 0, secondaryLike: false,
+          objectAliases: 0, analysisKind: "undispatched", aliasConflicts: 0,
+          pointsCost: null, wallMs: 0, bodyBytes: 0, secondaryLike: false,
         });
         continue;
       }
@@ -181,33 +188,38 @@ export async function runBoundaryProbe(deps: BoundaryProbeDeps, cells: readonly 
       const d = await benchGraphqlDispatch(deps.gh, batch.query, batch.fields, batch.label, t);
       const repo = d.data?.["repository"];
       const repoObj = typeof repo === "object" && repo !== null && !Array.isArray(repo) ? (repo as Record<string, unknown>) : null;
-      let resolved = 0;
       let objects = 0;
       for (let i = 0; i < cell.aliasCount; i++) {
         const alias = repoObj?.[`a${i}`];
-        if (typeof alias !== "object" || alias === null) continue;
-        objects++;
-        const o = alias as Record<string, unknown>;
-        if (o["oid"] === cell.blobs[i]!.oid && typeof o["text"] === "string") resolved++;
+        if (typeof alias === "object" && alias !== null) objects++;
       }
+      // T1's OWN exhaustive transition table judges the envelope; resolved = fully validated
+      const analysis = analyzeBatchResponse(d, batch, deps.objectFormat, deps.cfg);
+      const resolved = analysis.kind === "per-alias" ? analysis.outcomes.filter((o) => o.kind === "resolved").length : 0;
+      const conflicts = analysis.kind === "per-alias" ? analysis.conflicts.length : 0;
       result.tries.push({
         tryOrdinal: t, dispatched: true, status: d.status, classification: d.classification,
         jsonParseable: d.jsonParseable,
         errorTypes: [...new Set(d.errors.map((e) => e.type ?? "?"))],
         malformedErrorEntries: d.malformedErrorEntries,
-        resolvedAliases: resolved, objectAliases: objects, pointsCost: d.pointsCost,
+        resolvedAliases: resolved, objectAliases: objects, analysisKind: analysis.kind, aliasConflicts: conflicts,
+        pointsCost: d.pointsCost,
         wallMs: deps.now() - startedAt, bodyBytes: Buffer.byteLength(d.bodyText, "utf8"),
         secondaryLike: d.secondaryLike,
       });
-      deps.log(`  try ${t}: HTTP ${d.status} (${d.classification}), ${resolved}/${cell.aliasCount} aliases validated (${objects} objects), cost ${d.pointsCost ?? "?"}`);
+      deps.log(`  try ${t}: HTTP ${d.status} (${d.classification}/${analysis.kind}), ${resolved}/${cell.aliasCount} aliases validated (${objects} objects), cost ${d.pointsCost ?? "?"}`);
     }
     results.push(result);
+    }
+  } finally {
+    // the sweep ALWAYS ends with a full washout of its own throttle horizon — even on a thrown
+    // dispatch — so an above-cap burst cannot bleed into the next executor's window (codex
+    // C0-R1/R2 finding 14)
+    const finalWashoutMs = washoutMs(deps.cfg, outstandingHorizonMs(deps.gh), deps.now());
+    deps.log(`boundary probe winding down — final washout ${Math.ceil(finalWashoutMs / 1000)}s`);
+    await deps.sleep(finalWashoutMs);
   }
   const after = await readRateLimit(deps.gh);
-  // the sweep ends with a full washout of its own throttle horizon so an above-cap burst
-  // cannot bleed into the next executor's window (codex C0-R1 finding 14)
-  const finalWashoutMs = washoutMs(deps.cfg, outstandingHorizonMs(deps.gh), deps.now());
-  deps.log(`boundary probe done — final washout ${Math.ceil(finalWashoutMs / 1000)}s`);
-  await deps.sleep(finalWashoutMs);
+  const finalWashoutMs = washoutMs(deps.cfg, 0, deps.now());
   return { before, after, finalWashoutMs, cells: results };
 }

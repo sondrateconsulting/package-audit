@@ -216,6 +216,12 @@ export function scoreMatrix(bundle: ScoreBundle): ScoreOutput {
   const firstRow = allRows[0];
   if (firstRow === undefined) fail("no matrix rows carry an identity");
   const identity: ScoreOutput["identity"] = { harnessCommit: rstr(firstRow!, "harnessCommit"), envManifestHash: rstr(firstRow!, "envManifestHash") };
+  // every row must bind to the RATIFIED freeze: a re-ratified surface can never silently
+  // consume a prior freeze's matrix (codex C0-R2 finding 2)
+  for (const rec of allRows) {
+    if (rec["frozenSurfaceDigest"] !== bundle.ratifiedDigest)
+      fail(`matrix row pos=${String(rec["pos"])} is stamped ${String(rec["frozenSurfaceDigest"]).slice(0, 12)}… but the ratified digest is ${bundle.ratifiedDigest.slice(0, 12)}… — evidence from a different freeze`);
+  }
 
   if (bundle.ratifiedDigest.length === 0) fail("scoring requires the ratified frozen-surface digest (codex C0-R1 finding 8)");
   const fidelity = judgeFidelity(corpus.fidelity, reconstructFidelityLedger(bundle.fidelityLines, bundle.ratifiedDigest));

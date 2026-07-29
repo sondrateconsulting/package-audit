@@ -321,8 +321,16 @@ export interface RunRecord {
   attempts: { fivexx: number; retries: number; secondaryByKind: Record<string, number> };
   // a reset epoch was OBSERVED to move under a consumed bucket mid-run — recorded even when a
   // driver failure or control-plane invalidation would otherwise claim the outcome, because
-  // R4 recurrence counting must see every real straddle (codex C0-R1 finding 4)
+  // R4 recurrence counting must see every real straddle (codex C0-R1 finding 4). Recurrence
+  // counts read THIS FACT, not the outcome, so precedence collisions cannot hide it (C0-R2).
   straddledReset: boolean;
+  // a control-plane snapshot failed during this attempt (segment gate or post-run) — again a
+  // FACT independent of which outcome won precedence, so the durable per-pos cap counts every
+  // occurrence (codex C0-R2 finding 3)
+  controlPlaneFailed: boolean;
+  // the frozen-surface digest the attempt ran under: rows bind to their freeze, so evidence
+  // from different freezes can never be presented as one matrix (codex C0-R2 finding 2)
+  frozenSurfaceDigest: string;
   secondarySignals: number; // attributable (driver-own matrix traffic) — G4's classifier input
   points: { measuredCostSum: number; imputed: number };
   bucketDeltas: { core: BucketDelta; graphql: BucketDelta };
@@ -478,7 +486,7 @@ export function isRerunnableEvidence(
 
 export function reconstructMatrixState(
   lines: readonly string[],
-  expect: { harnessCommit: string; envManifestHash: string } | null,
+  expect: { harnessCommit: string; envManifestHash: string; frozenSurfaceDigest?: string } | null,
 ): MatrixResumeState {
   const state: MatrixResumeState = {
     terminalPos: new Set(), terminalRowByPos: new Map(), rerunUsed: new Set(),
@@ -546,6 +554,8 @@ export function reconstructMatrixState(
         throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from harness ${String(rec["harnessCommit"]).slice(0, 12)} != current ${expect.harnessCommit.slice(0, 12)} — a re-ratified matrix starts a fresh log`);
       if (rec["envManifestHash"] !== expect.envManifestHash)
         throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from environment ${String(rec["envManifestHash"])} != current ${expect.envManifestHash}`);
+      if (expect.frozenSurfaceDigest !== undefined && rec["frozenSurfaceDigest"] !== expect.frozenSurfaceDigest)
+        throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from frozen surface ${String(rec["frozenSurfaceDigest"]).slice(0, 12)} != current ${expect.frozenSurfaceDigest.slice(0, 12)} — a re-frozen matrix starts a fresh log (§8)`);
     } else {
       identities.add(`${String(rec["harnessCommit"])}|${String(rec["envManifestHash"])}`);
       if (identities.size > 1)
@@ -558,8 +568,13 @@ export function reconstructMatrixState(
     const attemptId = typeof rec["attemptId"] === "string" ? (rec["attemptId"] as string) : "";
     if (outcome === "halt-r5-breach" || outcome === "re-pin-required")
       throw new BenchProtocolError(`REFUSING: runs.jsonl carries a terminal ${outcome} row — that is freeze-repair/amendment territory (§4.5 R5/R6), never a silent retry`);
-    if (outcome === "invalidated-straddle") state.straddleCounts.set(unit, (state.straddleCounts.get(unit) ?? 0) + 1);
-    if (outcome === "invalidated-control-plane") state.controlPlaneCounts.set(pos, (state.controlPlaneCounts.get(pos) ?? 0) + 1);
+    // recurrence counts read the recorded FACTS, never the outcome — precedence collisions
+    // (straddle over drift, straddle over control-plane) must not hide either event (C0-R2
+    // findings 1/3); rows predating the fact fields fall back to their outcome
+    if (rec["straddledReset"] === true || (rec["straddledReset"] === undefined && outcome === "invalidated-straddle"))
+      state.straddleCounts.set(unit, (state.straddleCounts.get(unit) ?? 0) + 1);
+    if (rec["controlPlaneFailed"] === true || (rec["controlPlaneFailed"] === undefined && outcome === "invalidated-control-plane"))
+      state.controlPlaneCounts.set(pos, (state.controlPlaneCounts.get(pos) ?? 0) + 1);
     if (outcome === "drift-restart") state.driftedUnits.add(unit);
     const form = rec["acquisitionForm"];
     if (form === "scaffolding") state.resumeForms.set(unit, "scaffolding");
@@ -890,6 +905,7 @@ export interface EngineOptions {
   workloads: Map<string, UnitWorkload>; // unitId → pinned workload
   benchRoot: string;
   artifactsDir: string;
+  frozenSurfaceDigest: string; // stamped into every row (codex C0-R2 finding 2)
   // per-run cache DBs live here — inside the repo's §0-permitted ./data root (AuditDb's write
   // containment demands it; the bench temp root is NOT a permitted sqlite home), one file per
   // run, deleted at teardown. NEVER the production sqlite path.
@@ -1178,6 +1194,7 @@ export class BenchEngine {
     let outcome: DriverRunOutcome | null = null;
     let verification: VerificationReport | null = null;
     let runOutcome: RunRecord["outcome"] = "complete";
+    let controlPlaneFailed = false;
     let failureCause: string | null = null;
     let failureEvidence: RunRecord["failureEvidence"] = null;
     let r5: BenchProtocolError | null = null;
@@ -1303,6 +1320,7 @@ export class BenchEngine {
         // driver failure and never charged to the driver allowance (Step-C residual 3)
         runOutcome = "invalidated-control-plane";
         failureCause = e.message;
+        controlPlaneFailed = true;
       } else if (e instanceof UnitFailure) {
         runOutcome = "unit-failure";
         failureCause = e.cause2;
@@ -1337,7 +1355,7 @@ export class BenchEngine {
         // an R5 halt is the evidence a freeze repair is diagnosed from, so it carries the partial
         // traffic it actually observed rather than zeroes — through the SAME control-plane rule
         // the normal record uses, which this literal previously contradicted
-        requests: r5traffic.requests, okRequestClasses: r5traffic.okRequestClasses, attempts: r5traffic.attempts, straddledReset: false,
+        requests: r5traffic.requests, okRequestClasses: r5traffic.okRequestClasses, attempts: r5traffic.attempts, straddledReset: false, controlPlaneFailed: false,
         secondarySignals: r5traffic.secondarySignals, points: r5traffic.points,
         bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
         bucketSnapshots,
@@ -1407,6 +1425,7 @@ export class BenchEngine {
       // semantics read the outcome (a re-pin row REFUSES resume; an invalidated-finalisation
       // row in its place would silently re-run against a dead SHA). Those runs keep their
       // classified record, with the deltas degraded and the accounting failure noted.
+      controlPlaneFailed = true;
       if (runOutcome === "complete") {
         const partial = summarizeTraffic(httpRecords, t1TableAccepted());
         this.o.runsLog.append({
@@ -1518,7 +1537,7 @@ export class BenchEngine {
       acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
       startedAtIso, wallMs, segments: segmentSizes.length, outcome: runOutcome, failureCause,
       failureEvidence,
-      requests, okRequestClasses: traffic.okRequestClasses, attempts, straddledReset, secondarySignals,
+      requests, okRequestClasses: traffic.okRequestClasses, attempts, straddledReset, controlPlaneFailed, secondarySignals,
       points: { measuredCostSum, imputed },
       bucketDeltas: deltas,
       bucketSnapshots,

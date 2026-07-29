@@ -18,14 +18,17 @@ export class BenchFidelityError extends Error {
 }
 
 // Cell outcomes, typed. `match`/`mismatch` mean the byte comparison actually happened;
-// `attempt-error` means an objective-external condition prevented it (network-layer failure,
-// a batch-level GraphQL non-answer) — only attempt-errors are ever rerunnable, and only once
-// per (fixture, driver) group.
-export type FidelityOutcome = "match" | "mismatch" | "attempt-error";
+// `content-failure` is a PERMANENT no-comparison defect (absent path, unverifiable frame,
+// deterministic response defects, harness exceptions) — it maps to G2 completeness, never G1
+// byte divergence (codex C0-R2 re f.9); `attempt-error` means a frozen objective-external
+// condition prevented the comparison — only attempt-errors are ever rerunnable, once per
+// (fixture, driver) group.
+export type FidelityOutcome = "match" | "mismatch" | "content-failure" | "attempt-error";
 
 export interface FidelityCellState {
   matches: number;
   mismatches: number;
+  contentFailures: number;
   attemptErrors: number;
 }
 
@@ -74,15 +77,16 @@ export function reconstructFidelityLedger(lines: readonly string[], digest: stri
     // legacy shape tolerance: records predating the outcome field carry only pass — a
     // pass:false there was a comparison-shaped failure, so it maps to mismatch (fail-closed)
     const eff: FidelityOutcome =
-      outcome === "match" || outcome === "mismatch" || outcome === "attempt-error"
+      outcome === "match" || outcome === "mismatch" || outcome === "content-failure" || outcome === "attempt-error"
         ? outcome
         : rec["pass"] === true
           ? "match"
           : "mismatch";
     const key = fidelityCellKey(kind, driver, path);
-    const cell = ledger.cells.get(key) ?? { matches: 0, mismatches: 0, attemptErrors: 0 };
+    const cell = ledger.cells.get(key) ?? { matches: 0, mismatches: 0, contentFailures: 0, attemptErrors: 0 };
     if (eff === "match") cell.matches++;
     else if (eff === "mismatch") cell.mismatches++;
+    else if (eff === "content-failure") cell.contentFailures++;
     else {
       cell.attemptErrors++;
       const g = fidelityGroupKey(kind, driver);
@@ -93,7 +97,7 @@ export function reconstructFidelityLedger(lines: readonly string[], digest: stri
   return ledger;
 }
 
-export type FidelityCellFinal = "pass" | "fail-mismatch" | "fail-exhausted" | "pending-retry" | "never-attempted";
+export type FidelityCellFinal = "pass" | "fail-mismatch" | "fail-content" | "fail-exhausted" | "pending-retry" | "never-attempted";
 
 export interface FidelityCellVerdict {
   kind: string;
@@ -119,9 +123,10 @@ export interface FidelityVerdict {
 // `shouldAttempt` says so; the verdict below is what scoring reads.
 export function cellFinalState(ledger: FidelityLedger, kind: string, driver: string, path: string): FidelityCellFinal {
   const cell = ledger.cells.get(fidelityCellKey(kind, driver, path));
-  // a recorded mismatch is permanent even beside a later match — re-running mismatches is
-  // forbidden (§4.2), so a match AFTER a mismatch could only come from tampering
+  // a recorded mismatch or content-failure is permanent even beside a later match — re-running
+  // them is forbidden (§4.2), so a match AFTER one could only come from tampering
   if (cell !== undefined && cell.mismatches > 0) return "fail-mismatch";
+  if (cell !== undefined && cell.contentFailures > 0) return "fail-content";
   if (cell !== undefined && cell.matches > 0) return "pass";
   const groupErrors = ledger.groupAttemptErrors.get(fidelityGroupKey(kind, driver)) ?? 0;
   if (groupErrors >= FIDELITY_MAX_ATTEMPT_ERRORS) return "fail-exhausted";
@@ -148,7 +153,7 @@ export function judgeFidelity(fixtures: readonly C6Fixture[], ledger: FidelityLe
         if (final === "fail-mismatch") {
           verdict.failures.push(cell);
           verdict.mismatchDrivers.add(driver);
-        } else if (final === "fail-exhausted") {
+        } else if (final === "fail-content" || final === "fail-exhausted") {
           verdict.failures.push(cell);
           verdict.incompleteDrivers.add(driver);
         } else if (final === "pending-retry") {
