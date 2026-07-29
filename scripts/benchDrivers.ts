@@ -1,0 +1,543 @@
+// benchDrivers.ts — the four transport drivers (resolution plan §4.4), each the minimal
+// faithful implementation of its option as evaluated in the ADR. Serial per-run (the matrix is
+// a per-scenario serial cost profile, §4.6); every HTTP attempt rides benchGh's recorded layer;
+// every git spawn rides benchSpawn's lane-gated single site. Route decisions come from the
+// PINNED workload matrix — a driver never improvises a route at observation time.
+
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { assertContained } from "./readOnlyGuard.ts";
+import { parseTreeResponse } from "./github.ts";
+import type { BenchConfig } from "./benchConfig.ts";
+import type { CorpusUnit, PerformanceSlot } from "./benchCorpus.ts";
+import { BatchChild, runBenchGit, type BenchSpawnObserver } from "./benchSpawn.ts";
+import { parseLsTreeZ, type LsTreeEntry } from "./benchFrame.ts";
+import {
+  BenchHttpError, benchRestGet, gitBlobOid, type BenchGhContext,
+} from "./benchGh.ts";
+import {
+  analyzeBatchResponse, buildBatchQuery, fivexxSplitConditionMet, packBatches, planRounds,
+  splitEntries, type PlannedBatch,
+} from "./benchT1.ts";
+import { benchGraphqlDispatch } from "./benchGh.ts";
+import { seamDecode, type RouteId, type UnitWorkload, type WorkloadEntry } from "./benchWorkload.ts";
+import type { DriverId } from "./benchSchedule.ts";
+
+// ---- terminal signals ------------------------------------------------------------------------
+// A unit failure with cause (G2 territory) — recorded, never silently absorbed.
+export class UnitFailure extends Error {
+  readonly cause2: string;
+  constructor(cause: string) {
+    super(`UNIT FAILURE: ${cause}`);
+    this.name = "UnitFailure";
+    this.cause2 = cause;
+  }
+}
+// Confirmed upstream drift (R6 branch arm): the live head moved off the pinned SHA. The engine
+// discards the unit's collected reps and restarts the whole unit on the scaffolding form.
+export class DriftSignal extends Error {
+  constructor(readonly liveHead: string) {
+    super(`DRIFT: live head ${liveHead} moved off the pinned SHA`);
+    this.name = "DriftSignal";
+  }
+}
+// The pinned object itself is no longer served (R6 SHA arm): re-pin = a §8 freeze amendment.
+export class RePinRequired extends Error {
+  constructor(message: string) {
+    super(`RE-PIN REQUIRED: ${message}`);
+    this.name = "RePinRequired";
+  }
+}
+
+export type AcquisitionForm = "production" | "scaffolding";
+
+export interface EntryDelivery {
+  path: string;
+  route: RouteId;
+  delivered: string | null; // null = verified non-acquisition (no-read routes)
+  rawVerified: boolean | null; // pre-decode bytes hashed against the tree oid (raw-capable drivers)
+}
+
+export interface DriverRunOutcome {
+  deliveries: EntryDelivery[];
+  fallbackSpend: number;
+  httpBodyBytes: number;
+  cloneDir: string | null; // engine measures on-disk object-store bytes + reclaims
+  acquisitionForm: AcquisitionForm | null;
+}
+
+export interface DriverRunContext {
+  cfg: BenchConfig;
+  slot: PerformanceSlot;
+  unit: CorpusUnit;
+  workload: UnitWorkload;
+  gh: BenchGhContext;
+  benchRoot: string;
+  runDir: string;
+  gitEnv: Record<string, string>; // sanitized, pinned gitconfig (baseline or the probe's), GIT_NO_REPLACE_OBJECTS=1
+  spawnObserver: BenchSpawnObserver;
+  acquisitionForm: AcquisitionForm;
+  fallbackBudget: number;
+  onCloneDirReady?: (dir: string) => void; // the disk sampler attaches the moment bytes can land
+  // §4.8 segmented mode (per-file REST shapes only): the read loop is chunked into the pinned
+  // segment sizes and the engine's gate runs BETWEEN segments (clock paused, bucket re-reserved,
+  // per-segment deltas summed). Absent = single-segment run.
+  segments?: { sizes: readonly number[]; gate: (nextSegmentIndex: number) => Promise<void> };
+}
+
+// ---- shared plumbing -------------------------------------------------------------------------
+function contentsEndpoint(ctx: DriverRunContext, path: string): string {
+  const enc = path.split("/").map(encodeURIComponent).join("/");
+  return `repos/${encodeURIComponent(ctx.slot.owner)}/${encodeURIComponent(ctx.slot.repo)}/contents/${enc}?ref=${encodeURIComponent(ctx.unit.sha)}`;
+}
+
+interface RunState {
+  deliveries: EntryDelivery[];
+  fallbackSpend: number;
+  httpBodyBytes: number;
+}
+
+// One REST content read at the pinned SHA. A 404 on a tree-listed path is never benign here:
+// the form-aware SHA classifier decides (§4.4) — pinned object gone → re-pin (freeze
+// amendment); still served → unexpected-absence unit failure.
+async function restRead(ctx: DriverRunContext, st: RunState, entry: WorkloadEntry, route: RouteId, cls: "rest-content" | "rest-fallback"): Promise<void> {
+  if (cls === "rest-fallback") {
+    st.fallbackSpend++;
+    if (st.fallbackSpend > ctx.fallbackBudget) throw new UnitFailure(`REST fallback budget (${ctx.fallbackBudget}) exhausted at ${entry.path}`);
+  }
+  let body: string;
+  try {
+    const res = await benchRestGet(ctx.gh, {
+      endpoint: contentsEndpoint(ctx, entry.path),
+      accept: ctx.cfg.rest.rawAccept,
+      immutable: true,
+      requestClass: cls,
+    });
+    body = res.body;
+  } catch (e) {
+    if (e instanceof BenchHttpError && e.status === 404) {
+      await classifyPinnedObjectAbsence(ctx, `tree-listed ${entry.path} returned 404`);
+      throw new UnitFailure(`unexpected absence: ${entry.path} 404s while the pinned commit is still served`);
+    }
+    throw e;
+  }
+  st.httpBodyBytes += Buffer.byteLength(body, "utf8");
+  st.deliveries.push({ path: entry.path, route, delivered: body, rawVerified: null });
+}
+
+// The SHA-pinned-context classifier (§4.4): probe the pinned object itself.
+async function classifyPinnedObjectAbsence(ctx: DriverRunContext, what: string): Promise<void> {
+  try {
+    await benchRestGet(ctx.gh, {
+      endpoint: `repos/${encodeURIComponent(ctx.slot.owner)}/${encodeURIComponent(ctx.slot.repo)}/commits/${encodeURIComponent(ctx.unit.sha)}`,
+      requestClass: "rest-meta",
+    });
+  } catch (e) {
+    if (e instanceof BenchHttpError && e.status === 404)
+      throw new RePinRequired(`${what}; the pinned commit ${ctx.unit.sha} is no longer served`);
+    throw e;
+  }
+}
+
+function pushNoReads(ctx: DriverRunContext, st: RunState): void {
+  for (const entry of ctx.workload.entries) {
+    if (entry.read) continue;
+    st.deliveries.push({ path: entry.path, route: entry.noReadReason!, delivered: null, rawVerified: null });
+  }
+}
+
+// ---- acquisition (§4.4: production argv by default, SHA-pinned scaffolding on drift) ---------
+const substitute = (tuple: readonly string[], slots: Record<string, string>): string[] =>
+  tuple.map((t) => t.replace(/\{(\w+)\}/g, (_, k: string) => slots[k] ?? ((): never => {
+    throw new UnitFailure(`scaffolding tuple slot {${k}} has no substitution`);
+  })()));
+
+export function parseLsRemoteProbe(stdout: Uint8Array, branch: string, oidLength: number): string {
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(stdout);
+  const lines = text.split("\n").filter((l) => l.trim() !== "");
+  if (lines.length !== 1) throw new UnitFailure(`ls-remote probe returned ${lines.length} lines, expected exactly 1`);
+  const [oid, ref] = lines[0]!.split("\t");
+  if (ref !== `refs/heads/${branch}`) throw new UnitFailure(`ls-remote probe ref ${JSON.stringify(ref)} is not refs/heads/${branch}`);
+  if (oid === undefined || oid.length !== oidLength || !/^[0-9a-f]+$/.test(oid))
+    throw new UnitFailure(`ls-remote probe oid is not a full ${oidLength}-hex object id`);
+  return oid;
+}
+
+// Probe the live head (scaffolding lane; outside any timed window — the engine calls this
+// before each clone-driver rep). Advisory only: every acquisition still ends with an in-store
+// coherence assertion.
+export async function probeLiveHead(ctx: Pick<DriverRunContext, "cfg" | "slot" | "unit" | "benchRoot" | "gitEnv" | "spawnObserver">): Promise<string> {
+  const url = `https://${ctx.cfg.githubHost}/${encodeURIComponent(ctx.slot.owner)}/${encodeURIComponent(ctx.slot.repo)}.git`;
+  const argv = substitute(ctx.cfg.scaffolding.tuples.lsRemoteProbe, { url, branch: ctx.unit.branch });
+  const res = await runBenchGit({
+    argv, lane: { lane: "scaffolding", expectArgv: argv }, env: ctx.gitEnv, benchRoot: ctx.benchRoot,
+    limits: { maxStdoutBytes: 1024 * 1024, maxStderrBytes: 1024 * 1024, deadlineMs: ctx.cfg.spawn.timeoutMs },
+    onRecord: ctx.spawnObserver,
+  });
+  if (res.exitCode !== 0) throw new UnitFailure(`ls-remote probe failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`);
+  return parseLsRemoteProbe(res.stdout, ctx.unit.branch, ctx.slot.objectFormat === "sha1" ? 40 : 64);
+}
+
+async function transportGit(ctx: DriverRunContext, argv: string[], opts: { cwd?: string; cloneShape?: "checkout" | "no-checkout"; maxStdoutBytes?: number }): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array }> {
+  return runBenchGit({
+    argv,
+    lane: { lane: "transport", objectFormat: ctx.slot.objectFormat, ...(opts.cloneShape === undefined ? {} : { cloneShape: opts.cloneShape }) },
+    env: ctx.gitEnv, benchRoot: ctx.benchRoot, ...(opts.cwd === undefined ? {} : { cwd: opts.cwd }),
+    limits: { maxStdoutBytes: opts.maxStdoutBytes ?? 4 * 1024 * 1024, maxStderrBytes: 1024 * 1024, deadlineMs: ctx.cfg.spawn.timeoutMs },
+    onRecord: ctx.spawnObserver,
+  });
+}
+
+async function scaffoldGit(ctx: DriverRunContext, argv: string[], cwd?: string): Promise<void> {
+  const res = await runBenchGit({
+    argv, lane: { lane: "scaffolding", expectArgv: argv }, env: ctx.gitEnv, benchRoot: ctx.benchRoot,
+    ...(cwd === undefined ? {} : { cwd }),
+    limits: { maxStdoutBytes: 4 * 1024 * 1024, maxStderrBytes: 1024 * 1024, deadlineMs: ctx.cfg.spawn.timeoutMs },
+    onRecord: ctx.spawnObserver,
+  });
+  if (res.exitCode !== 0) throw new UnitFailure(`scaffolding ${argv[0]} failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`);
+}
+
+// Acquire the unit's store into runDir/clone. Ends with the coherence assertion; failure
+// classification is form-aware (§4.4): production form re-probes the LIVE HEAD (moved → R6
+// branch-arm drift; unmoved → driver failure); scaffolding form probes the PINNED OBJECT
+// (gone → re-pin; served → a harness bug, since git semantics pin FETCH_HEAD to the fetch).
+export async function acquireStore(ctx: DriverRunContext, opts: { checkout: boolean }): Promise<{ dir: string; headRev: "HEAD" | "FETCH_HEAD" }> {
+  const dir = join(ctx.runDir, "clone");
+  assertContained(dir, [ctx.benchRoot]);
+  ctx.onCloneDirReady?.(ctx.runDir);
+  const url = `https://${ctx.cfg.githubHost}/${encodeURIComponent(ctx.slot.owner)}/${encodeURIComponent(ctx.slot.repo)}.git`;
+  if (ctx.acquisitionForm === "production") {
+    const argv = [
+      "clone", "--depth", "1", "--single-branch", "--branch", ctx.unit.branch,
+      "--no-tags", "--no-recurse-submodules", "--template=",
+      ...(opts.checkout ? [] : ["--no-checkout"]), url, dir,
+    ];
+    const res = await transportGit(ctx, argv, { cloneShape: opts.checkout ? "checkout" : "no-checkout" });
+    if (res.exitCode !== 0) throw new UnitFailure(`clone failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`);
+    const rev = await transportGit(ctx, ["rev-parse", "HEAD"], { cwd: dir });
+    const head = seamDecode(rev.stdout).trim();
+    if (rev.exitCode !== 0 || head !== ctx.unit.sha) {
+      const live = await probeLiveHead(ctx);
+      if (live !== ctx.unit.sha) throw new DriftSignal(live);
+      throw new UnitFailure(`coherence failure: clone HEAD ${head.slice(0, 12)} != pinned SHA while the live head is unmoved`);
+    }
+    return { dir, headRev: "HEAD" };
+  }
+  // scaffolding form: init --object-format → remote add → fetch <sha> → optional detach checkout
+  const t = ctx.cfg.scaffolding.tuples;
+  await scaffoldGit(ctx, substitute(t.init, { objectFormat: ctx.slot.objectFormat, dest: dir }));
+  await scaffoldGit(ctx, substitute(t.remoteAdd, { url }), dir);
+  await scaffoldGit(ctx, substitute(t.fetch, { sha: ctx.unit.sha }), dir);
+  if (opts.checkout) await scaffoldGit(ctx, substitute(t.checkoutDetach, {}), dir);
+  const rev = await transportGit(ctx, ["rev-parse", "FETCH_HEAD"], { cwd: dir });
+  const head = seamDecode(rev.stdout).trim();
+  if (rev.exitCode !== 0 || head !== ctx.unit.sha) {
+    await classifyPinnedObjectAbsence(ctx, `scaffolding coherence failure (FETCH_HEAD ${head.slice(0, 12)})`);
+    throw new UnitFailure("scaffolding coherence mismatch while the pinned object is still served — a harness bug by git semantics");
+  }
+  return { dir, headRev: "FETCH_HEAD" };
+}
+
+async function enumerateStore(ctx: DriverRunContext, dir: string, headRev: "HEAD" | "FETCH_HEAD"): Promise<Map<string, LsTreeEntry>> {
+  // production form addresses HEAD; the SHA-pinned scaffolding form addresses the pinned SHA
+  // itself (a bare fetch leaves no HEAD, §4.4).
+  const rev = headRev === "HEAD" ? "HEAD" : ctx.unit.sha;
+  const res = await transportGit(ctx, ["ls-tree", "-r", "-z", "-l", "--full-tree", rev], {
+    cwd: dir, maxStdoutBytes: ctx.cfg.lsTree.maxOutputBytes,
+  });
+  if (res.exitCode !== 0) throw new UnitFailure(`ls-tree failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`);
+  const entries = parseLsTreeZ(res.stdout, ctx.slot.objectFormat, {
+    maxEntries: ctx.cfg.lsTree.maxEntries, maxRecordBytes: ctx.cfg.lsTree.maxRecordBytes,
+  });
+  return new Map(entries.map((e) => [e.path, e]));
+}
+
+function readCheckoutDelivery(ctx: DriverRunContext, cloneDir: string, st: RunState, entry: WorkloadEntry, route: RouteId): void {
+  const abs = join(cloneDir, entry.path);
+  assertContained(abs, [cloneDir]);
+  const bytes = readFileSync(abs);
+  st.deliveries.push({ path: entry.path, route, delivered: seamDecode(bytes), rawVerified: null });
+}
+
+// ---- the REST tree fetch T0/T1 pay (§4.6: tree acquisition counts toward units) --------------
+async function fetchRestTree(ctx: DriverRunContext, st: RunState): Promise<{ truncated: boolean }> {
+  const endpoint = `repos/${encodeURIComponent(ctx.slot.owner)}/${encodeURIComponent(ctx.slot.repo)}/git/trees/${encodeURIComponent(ctx.unit.treeOid)}?recursive=1`;
+  const res = await benchRestGet(ctx.gh, { endpoint, immutable: true, requestClass: "rest-tree" });
+  st.httpBodyBytes += Buffer.byteLength(res.body, "utf8");
+  let json: unknown;
+  try {
+    json = JSON.parse(res.body);
+  } catch {
+    throw new UnitFailure(`invalid JSON tree from ${endpoint}`);
+  }
+  const tree = parseTreeResponse(json, endpoint, ctx.unit.treeOid);
+  return { truncated: tree.truncated };
+}
+
+// C4's production fallback for T0/T1: checkout clone + read every read-entry from the working
+// tree (route truncated-tree-checkout, the declared-caveat route).
+async function runTruncatedCheckout(ctx: DriverRunContext, st: RunState): Promise<string> {
+  const { dir } = await acquireStore(ctx, { checkout: true });
+  for (const entry of ctx.workload.entries) {
+    if (!entry.read) continue;
+    readCheckoutDelivery(ctx, dir, st, entry, "truncated-tree-checkout");
+  }
+  return dir;
+}
+
+// ---- T0 --------------------------------------------------------------------------------------
+export async function runT0(ctx: DriverRunContext): Promise<DriverRunOutcome> {
+  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0 };
+  pushNoReads(ctx, st);
+  let cloneDir: string | null = null;
+  const tree = await fetchRestTree(ctx, st);
+  if (tree.truncated !== ctx.workload.truncatedTree)
+    throw new UnitFailure(`live tree truncation (${tree.truncated}) disagrees with the pinned workload (${ctx.workload.truncatedTree})`);
+  if (tree.truncated) {
+    cloneDir = await runTruncatedCheckout(ctx, st);
+  } else {
+    await segmentedRestReads(ctx, st, "primary", "rest-content");
+  }
+  return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, cloneDir, acquisitionForm: cloneDir === null ? null : ctx.acquisitionForm };
+}
+
+// the per-file REST loop, chunked into the pinned segments when the engine supplies them
+async function segmentedRestReads(ctx: DriverRunContext, st: RunState, route: RouteId, cls: "rest-content" | "rest-fallback"): Promise<void> {
+  const reads = ctx.workload.entries.filter((e) => e.read);
+  const sizes = ctx.segments?.sizes ?? [reads.length];
+  let at = 0;
+  for (let seg = 0; seg < sizes.length; seg++) {
+    if (seg > 0) await ctx.segments!.gate(seg);
+    const slice = reads.slice(at, at + sizes[seg]!);
+    at += sizes[seg]!;
+    for (const entry of slice) await restRead(ctx, st, entry, route, cls);
+  }
+  if (at !== reads.length) throw new UnitFailure(`segment sizes cover ${at} reads, workload has ${reads.length}`);
+}
+
+// ---- T1 --------------------------------------------------------------------------------------
+export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
+  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0 };
+  pushNoReads(ctx, st);
+  let cloneDir: string | null = null;
+  const tree = await fetchRestTree(ctx, st);
+  if (tree.truncated !== ctx.workload.truncatedTree)
+    throw new UnitFailure(`live tree truncation (${tree.truncated}) disagrees with the pinned workload (${ctx.workload.truncatedTree})`);
+  if (tree.truncated) {
+    cloneDir = await runTruncatedCheckout(ctx, st);
+    return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, cloneDir, acquisitionForm: ctx.acquisitionForm };
+  }
+  const plan = planRounds(ctx.workload);
+  for (const { entry, route } of plan.preRouted) {
+    await restRead(ctx, st, entry, route as RouteId, "rest-fallback");
+  }
+  let consecutiveFailedDispatches = 0; // the unit-level circuit breaker (§4.4)
+  const dispatchChain = async (original: PlannedBatch): Promise<void> => {
+    let attempts = 0;
+    let descendants = 0;
+    let consecutive5xx = 0;
+    let retriedUnattributed = false;
+    interface QueueItem { entries: WorkloadEntry[]; depth: number }
+    const queue: QueueItem[] = [{ entries: original.entries, depth: 0 }];
+    const toFallback = async (entries: WorkloadEntry[], route: RouteId): Promise<void> => {
+      for (const e of entries) await restRead(ctx, st, e, route, "rest-fallback");
+    };
+    while (queue.length > 0) {
+      const item = queue.shift()!;
+      if (attempts >= ctx.cfg.rest.attemptCap) {
+        // dispatches exhausted without a terminal unit event → surviving aliases to
+        // batch-error-fallback, each counted against the budget (§4.4)
+        await toFallback(item.entries, "batch-error-fallback");
+        continue;
+      }
+      const batch = buildBatchQuery(item.entries, {
+        owner: ctx.slot.owner, repo: ctx.slot.repo, sha: ctx.unit.sha,
+        aliasSelection: ctx.cfg.t1.aliasSelection, rateLimitRider: ctx.cfg.t1.rateLimitRider,
+        label: `${original.label}@d${item.depth}`,
+      });
+      attempts++;
+      const d = await benchGraphqlDispatch(ctx.gh, batch.query, batch.fields, batch.label);
+      st.httpBodyBytes += Buffer.byteLength(d.bodyText, "utf8");
+      const analysis = analyzeBatchResponse(d, batch, ctx.slot.objectFormat, ctx.cfg);
+      const failedDispatch = (): void => {
+        consecutiveFailedDispatches++;
+        if (consecutiveFailedDispatches >= ctx.cfg.t1.circuitBreakerConsecutiveFailedDispatches)
+          throw new UnitFailure(`circuit breaker: ${consecutiveFailedDispatches} consecutive failed dispatches`);
+      };
+      const canSplit = (q: QueueItem): boolean =>
+        q.entries.length >= 2 && q.depth < ctx.cfg.t1.split.maxDepth &&
+        descendants + 2 <= ctx.cfg.t1.split.maxDescendantsPerOriginal;
+      const enqueueSplit = (q: QueueItem): void => {
+        const [a, b] = splitEntries(q.entries);
+        descendants += 2;
+        queue.unshift({ entries: b, depth: q.depth + 1 });
+        queue.unshift({ entries: a, depth: q.depth + 1 });
+      };
+      if (analysis.kind === "http-failure") {
+        failedDispatch();
+        consecutive5xx = analysis.fivexxSplitCandidate ? consecutive5xx + 1 : 0;
+        if (fivexxSplitConditionMet(batch, consecutive5xx, ctx.cfg) && canSplit(item)) enqueueSplit(item);
+        else {
+          await ctx.gh.sleep(ctx.cfg.rest.transientBaseWaitMs * 2 ** Math.min(attempts, 5));
+          queue.unshift(item); // bounded transient retry — never split on first failure
+        }
+        continue;
+      }
+      consecutive5xx = 0;
+      if (analysis.kind === "throttle-retry") {
+        failedDispatch();
+        if (analysis.cause !== "primary") await ctx.gh.sleep(ctx.cfg.rest.secondaryBaseWaitMs);
+        queue.unshift(item); // primary pauses are armed on the bucket; the next dispatch waits
+        continue;
+      }
+      if (analysis.kind === "batch-timeout") {
+        failedDispatch();
+        if (item.entries.length === 1) await toFallback(item.entries, "timeout-singleton");
+        else if (canSplit(item)) enqueueSplit(item);
+        else queue.unshift(item);
+        continue;
+      }
+      if (analysis.kind === "default-failure") {
+        failedDispatch();
+        if (attempts >= ctx.cfg.rest.attemptCap)
+          throw new UnitFailure(`default-clause response persisted through the attempt budget: ${analysis.rawCondition}`);
+        queue.unshift(item);
+        continue;
+      }
+      // per-alias
+      consecutiveFailedDispatches = 0;
+      const timeouts: WorkloadEntry[] = [];
+      const unattributed: WorkloadEntry[] = [];
+      for (const outcome of analysis.outcomes) {
+        const entry = batch.entries[outcome.index]!;
+        if (outcome.kind === "resolved") {
+          st.deliveries.push({ path: entry.path, route: "primary", delivered: outcome.text, rawVerified: true });
+        } else if (outcome.kind === "validation-fallback") {
+          await restRead(ctx, st, entry, "validation-fallback", "rest-fallback");
+        } else if (outcome.kind === "timeout") {
+          timeouts.push(entry);
+        } else if (outcome.kind === "missing") {
+          // restRead's 404 path runs the SHA-form classifier (§4.4): re-pin vs unexpected-absence
+          await restRead(ctx, st, entry, "missing-alias-fallback", "rest-fallback");
+        } else {
+          unattributed.push(entry);
+        }
+      }
+      if (timeouts.length === 1) await toFallback(timeouts, "timeout-singleton");
+      else if (timeouts.length >= 2) {
+        const q: QueueItem = { entries: timeouts, depth: item.depth };
+        if (canSplit(q)) enqueueSplit(q);
+        else queue.unshift(q);
+      }
+      if (unattributed.length > 0) {
+        if (!retriedUnattributed) {
+          retriedUnattributed = true; // one batch-level retry, then missing-alias-fallback (§4.4)
+          queue.unshift({ entries: unattributed, depth: item.depth });
+        } else {
+          await toFallback(unattributed, "missing-alias-fallback");
+        }
+      }
+    }
+  };
+  for (const round of [plan.round1, plan.round2]) {
+    if (round.length === 0) continue; // either round can legitimately be empty (ADR)
+    for (const batch of packBatches(round, ctx.cfg, { owner: ctx.slot.owner, repo: ctx.slot.repo, sha: ctx.unit.sha, roundLabel: round === plan.round1 ? "r1" : "r2" })) {
+      await dispatchChain(batch);
+    }
+  }
+  return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, cloneDir: null, acquisitionForm: null };
+}
+
+// ---- T2a -------------------------------------------------------------------------------------
+export async function runT2a(ctx: DriverRunContext): Promise<DriverRunOutcome> {
+  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0 };
+  pushNoReads(ctx, st);
+  if (ctx.workload.escapeTripped && !ctx.workload.truncatedTree) {
+    // the size-based api-escape resolves with T0 semantics (§4.4), segmentable like T0
+    await segmentedRestReads(ctx, st, "api-escape", "rest-content");
+    return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, cloneDir: null, acquisitionForm: null };
+  }
+  const { dir, headRev } = await acquireStore(ctx, { checkout: true });
+  const lsIndex = await enumerateStore(ctx, dir, headRev);
+  for (const entry of ctx.workload.entries) {
+    if (!entry.read) continue;
+    const ls = lsIndex.get(entry.path);
+    if (ls === undefined) throw new UnitFailure(`ls-tree omits pinned entry ${entry.path}`);
+    if (ls.oid !== entry.blobOid) throw new UnitFailure(`ls-tree oid disagrees with the pinned workload at ${entry.path}`);
+    if (ls.mode === "120000") {
+      await restRead(ctx, st, entry, "symlink-fallback", "rest-fallback"); // mode-routed, REST-deref parity
+    } else {
+      readCheckoutDelivery(ctx, dir, st, entry, "primary");
+    }
+  }
+  return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, cloneDir: dir, acquisitionForm: ctx.acquisitionForm };
+}
+
+// ---- T2c -------------------------------------------------------------------------------------
+export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Promise<() => void> }): Promise<DriverRunOutcome> {
+  const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0 };
+  pushNoReads(ctx, st);
+  const { dir, headRev } = await acquireStore(ctx, { checkout: false });
+  const lsIndex = await enumerateStore(ctx, dir, headRev);
+  const holder: { child: BatchChild | null; release: (() => void) | null } = { child: null, release: null };
+  let respawns = 0;
+  const ensureChild = async (): Promise<BatchChild> => {
+    if (holder.child !== null) return holder.child;
+    if (holder.release === null) holder.release = await childPool.acquire(); // lazy spawn at first canonical read (§3.1)
+    holder.child = new BatchChild({
+      objectFormat: ctx.slot.objectFormat, env: ctx.gitEnv, cwd: dir, benchRoot: ctx.benchRoot,
+      limits: {
+        maxHeaderBytes: ctx.cfg.frame.maxHeaderBytes, frameCeiling: ctx.cfg.frame.frameCeilingBytes,
+        stderrRingBytes: ctx.cfg.frame.stderrRingBytes, readDeadlineMs: ctx.cfg.frame.readDeadlineMs,
+        disposeDeadlineMs: ctx.cfg.frame.disposeDeadlineMs,
+      },
+      onRecord: ctx.spawnObserver,
+    });
+    return holder.child;
+  };
+  try {
+    for (const entry of ctx.workload.entries) {
+      if (!entry.read) continue;
+      const ls = lsIndex.get(entry.path);
+      if (ls === undefined) throw new UnitFailure(`ls-tree omits pinned entry ${entry.path}`);
+      if (ls.oid !== entry.blobOid) throw new UnitFailure(`ls-tree oid disagrees with the pinned workload at ${entry.path}`);
+      if (ls.mode === "120000") {
+        await restRead(ctx, st, entry, "symlink-fallback", "rest-fallback");
+        continue;
+      }
+      if (ls.size === null) throw new UnitFailure(`ls-tree carries no size for blob ${entry.path}`);
+      let frame;
+      try {
+        frame = await (await ensureChild()).readObject({ oid: ls.oid, size: ls.size });
+      } catch (e) {
+        // at most one respawn per unit; a second child death fails the unit (§3.1)
+        if (respawns >= 1) throw new UnitFailure(`batch child died twice: ${e instanceof Error ? e.message : String(e)}`);
+        respawns++;
+        await holder.child?.dispose();
+        holder.child = null;
+        frame = await (await ensureChild()).readObject({ oid: ls.oid, size: ls.size });
+      }
+      if (frame.kind === "missing")
+        throw new UnitFailure(`object-store corruption: ${entry.path}'s enumerated oid is missing from the acquired store`);
+      // self-verification BEFORE the seam decode: the frame bytes must hash to the tree oid
+      if (gitBlobOid(frame.body, ctx.slot.objectFormat) !== ls.oid)
+        throw new UnitFailure(`frame bytes do not hash to the enumerated oid at ${entry.path}`);
+      st.deliveries.push({ path: entry.path, route: "primary", delivered: seamDecode(frame.body), rawVerified: true });
+    }
+  } finally {
+    // ordered teardown BEFORE the engine may delete the clone dir (§3.1)
+    if (holder.child !== null) await holder.child.dispose();
+    holder.release?.();
+  }
+  return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, cloneDir: dir, acquisitionForm: ctx.acquisitionForm };
+}
+
+export async function runDriver(driver: DriverId, ctx: DriverRunContext, childPool: { acquire(): Promise<() => void> }): Promise<DriverRunOutcome> {
+  switch (driver) {
+    case "T0": return runT0(ctx);
+    case "T1": return runT1(ctx);
+    case "T2a": return runT2a(ctx);
+    case "T2c": return runT2c(ctx, childPool);
+  }
+}
