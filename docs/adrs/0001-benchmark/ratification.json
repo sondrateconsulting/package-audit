@@ -10,7 +10,7 @@
   },
   "noiseBand": 1.25,
   "pilotSpread": 1.034,
-  "frozenSurfaceDigest": "5481914e6571a006087308d5a80d33801a44d6be36b3c2bd9976cb4c26dee0a2",
+  "frozenSurfaceDigest": "fa99cb0bd8b5b9acda143516c8c9d348253f300992da9d63d1c65bd5c2710ed1",
   "amendments": [
     {
       "at": "Step B, post-ratification review round",
@@ -26,8 +26,16 @@
         "buildEnvManifest ignored the exit codes of `git --version` and `gh --version`, so a blank version could enter the environment-manifest hash that binds every timed row",
         "BatchChild.dispose()'s verdict — the fatal condition plus git's retained stderr — was discarded by every caller, so a poisoned teardown could accompany a reported success and the double-death message lost the first child's diagnosis"
       ],
+      "alsoFixedInReviewRound2": [
+        "the frozen-surface digest walked scripts/ NON-recursively, silently omitting all eight tracked non-test modules under scripts/tui/ — a freeze that covered less than its own description claimed. The traversal is now recursive, which is why the digest differs from the one first recorded for this amendment",
+        "the worker-backed disk sampler had no error channel, no reply deadline, and no idempotence, so a worker that died or never replied would hang between the driver returning and the run record being appended; instrumentation failure now degrades the disk fields (cloneObjectStoreBytes null, diskSampleError set) and never eats the row, which also restores R5's before-any-fallible-work guarantee",
+        "cloneObjectStoreBytes was computed with the deliberately-tolerant sampling walker, so an unreadable object store could report a plausible 0 — it is a measurement, so a failed walk is now null",
+        "parseProbeBatch accepted arrays and non-Blob nodes and coerced absent fields into definite facts; it now requires __typename Blob with correctly-typed fields",
+        "BatchChild disposal was only rejected on an explicit protocol fault, and the fidelity path discarded the verdict entirely; both callers now require exit 0 with no fault"
+      ],
       "ratifiedAnswersUnchanged": true,
-      "note": "The four §8 sign-off answers below are untouched and remain as rvo recorded them on 2026-07-28. This amendment changes the measurement surface, not the decisions: the noise band, protocol constants, corpus pinning, and symlink policy are all unaffected. No timed matrix data existed to invalidate — the matrix has never run. The decision-maker must re-affirm this amended surface before Step C executes."
+      "note": "The four §8 sign-off answers below are untouched and remain as rvo recorded them on 2026-07-28. This amendment changes the measurement surface, not the decisions: the noise band, protocol constants, corpus pinning, and symlink policy are all unaffected. No timed matrix data existed to invalidate — the matrix has never run.",
+      "reaffirmation": "NOT gate-enforced, and deliberately so: the matrix gate checks the digest, not who approved it, so updating frozenSurfaceDigest above is sufficient to let Step C run. The decision-maker should nevertheless re-affirm this amended surface before executing the matrix; that judgement is recorded here rather than mechanised, and no field in this file is checked for it."
     }
   ],
   "harnessCommit": "42c970f-informational (the digest above is the binding; the commit recorded per-row in runs.jsonl)",

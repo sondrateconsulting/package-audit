@@ -4,7 +4,7 @@
 // runs.jsonl record shape. The pure decision pieces (WC formulas, segmentation, washout,
 // straddle, verification) are exported for CI tests; the live engine composes them.
 
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, arch, cpus, platform, release } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -296,6 +296,9 @@ export interface RunRecord {
   cloneObjectStoreBytes: number | null;
   diskSampledPeakBytes: number;
   diskSamples: number;
+  // non-null when the disk instrumentation itself failed: the row still stands (its wall and
+  // consumption are unaffected), but its disk fields are degraded and must not be read as measured
+  diskSampleError: string | null;
   fallbackSpend: number;
   routesDelivered: Record<string, number>;
   g1Failures: number;
@@ -386,7 +389,14 @@ export async function finishMeasuredRun(opts: {
 // run, deleted at teardown", so a path that returns without closing it leaks both the handle and
 // its -wal/-shm sidecars while the emitted record still claims a clean reclaim.
 // Returns whether anything failed to reclaim — verified, never assumed (finding 18).
-export function reclaimRunResources(db: { close: () => void }, runDir: string, dbPath: string): boolean {
+export function reclaimRunResources(
+  db: { close: () => void },
+  runDir: string,
+  dbPath: string,
+  // seam for CI: lets a test drive the case where removal SILENTLY fails to remove, which is the
+  // only case the post-removal verification below actually exists to catch
+  io: { rm: (path: string, opts: { recursive?: boolean; force: boolean }) => void } = { rm: rmSync },
+): boolean {
   let failed = false;
   try {
     db.close();
@@ -394,8 +404,8 @@ export function reclaimRunResources(db: { close: () => void }, runDir: string, d
     failed = true; // a close failure must not mask the run outcome, but it IS a reclaim failure
   }
   try {
-    rmSync(runDir, { recursive: true, force: true });
-    for (const suffix of ["", "-wal", "-shm"]) rmSync(`${dbPath}${suffix}`, { force: true });
+    io.rm(runDir, { recursive: true, force: true });
+    for (const suffix of ["", "-wal", "-shm"]) io.rm(`${dbPath}${suffix}`, { force: true });
   } catch {
     failed = true;
   }
@@ -626,7 +636,7 @@ export class BenchEngine {
             // rather than asserting a teardown this path used to skip entirely
             diskReclaimFailed: driftReclaimFailed,
             probeDivergences: 0, httpBodyBytes: 0, cloneObjectStoreBytes: null,
-            diskSampledPeakBytes: 0, diskSamples: 0, fallbackSpend: 0, routesDelivered: {},
+            diskSampledPeakBytes: 0, diskSamples: 0, diskSampleError: null, fallbackSpend: 0, routesDelivered: {},
             g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
             envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
           };
@@ -763,6 +773,7 @@ export class BenchEngine {
         replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed, probeDivergences: 0,
         httpBodyBytes: r5traffic.httpBodyBytes,
         cloneObjectStoreBytes, diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples,
+        diskSampleError: disk.sampleError,
         fallbackSpend: liveState.fallbackSpend, routesDelivered: liveState.routesDelivered,
         g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
         envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
@@ -831,7 +842,7 @@ export class BenchEngine {
       // body bytes derive from the RECORDS so a thrown driver still reports its real transfer
       httpBodyBytes: traffic.httpBodyBytes,
       cloneObjectStoreBytes,
-      diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples,
+      diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples, diskSampleError: disk.sampleError,
       fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
       routesDelivered: verification?.routesDelivered ?? liveState.routesDelivered,
       g1Failures: verification?.g1Failures.length ?? 0,
@@ -857,8 +868,10 @@ export class BenchEngine {
     return { outcome, verification, record };
     } finally {
       // a no-op on every path that already reclaimed; the backstop for the ones that throw
-      // before the scored teardown is reached
-      reclaimOnce();
+      // before the scored teardown is reached. A failure HERE has no record to land on (the
+      // throw is on its way out), so it is logged rather than dropped silently.
+      if (reclaimOnce())
+        this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run resources did not fully reclaim (${runDir})`);
     }
   }
 

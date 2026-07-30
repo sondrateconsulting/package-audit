@@ -25,6 +25,13 @@ import type { DriverId } from "./benchSchedule.ts";
 
 // ---- terminal signals ------------------------------------------------------------------------
 // A unit failure with cause (G2 territory) — recorded, never silently absorbed.
+// A clean teardown is exit 0 with no protocol fault. `git cat-file --batch` closing normally
+// exits 0; anything else — a non-zero code, or a child that never settled inside the bounded
+// waits — means the read stream it served cannot be vouched for.
+export function disposalIsClean(d: BatchChildDisposal): boolean {
+  return d.protocolError === null && d.exitCode === 0;
+}
+
 // The batch child's teardown verdict, rendered for an operator: the fatal condition that poisoned
 // it plus git's own retained stderr — the diagnosis that was previously captured and discarded.
 export function describeDisposal(d: BatchChildDisposal): string {
@@ -596,8 +603,10 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
   // a child that was poisoned mid-unit could previously report a clean run: dispose()'s verdict
   // was captured and dropped on the floor. Checked AFTER the finally so it cannot mask a real
   // in-flight failure, and only on the path that would otherwise have returned success.
-  if (finalDisposal !== null && finalDisposal.protocolError !== null)
-    throw new UnitFailure(`batch child teardown reported a protocol fault: ${describeDisposal(finalDisposal)}`);
+  // A non-zero exit, or a child that never settled, is just as disqualifying as an explicit
+  // protocol fault — `git cat-file --batch` exits 0 on a clean close and nothing else.
+  if (finalDisposal !== null && !disposalIsClean(finalDisposal))
+    throw new UnitFailure(`batch child teardown was not clean: ${describeDisposal(finalDisposal)}`);
   return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, acquiredPaths: st.acquiredPaths, cloneDir: dir, acquisitionForm: ctx.acquisitionForm };
 }
 

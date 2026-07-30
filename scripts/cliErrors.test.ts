@@ -83,6 +83,8 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       // a HARNESS fault (a failed local git/tooling call) as opposed to an observation about a
       // transport — kept distinct so it can never be recorded as a driver's fidelity divergence
       "BenchOperationalError",
+      // the disk sampler's own failure: degrades the run record's disk fields, never the run
+      "DiskSamplerError",
     ]);
     const declared = new Set<string>();
     // recursive: scripts/tui/ declares operator-facing classes too (TuiActivationError)

@@ -577,8 +577,8 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
    synchronous reclamation, so stopping the clock at the last resolved entry would structurally
    favour clone drivers, whose teardown is the expensive one. For §4.8 segmented runs, the sum of
    segment walls, with inter-segment sleeps excluded and the segment count reported).
-   **The harness's own instrumentation is excluded** *(amended at Step B; §8 records the
-   re-ratification)*:
+   **The harness's own instrumentation is excluded** *(amended at Step B; the amendment and the
+   digest it supersedes are recorded in `ratification.json`)*:
    teardown is production-equivalent work and is therefore scored, but MEASURING a run is not part
    of performing it. Concretely, the wall pauses across the disk snapshot and resumes for
    reclamation. This distinction is not cosmetic — the disk metric (item 4) walks the run directory,

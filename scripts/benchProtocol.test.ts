@@ -11,6 +11,7 @@ import {
   planSegments, reclaimRunResources, requireToolVersion, summarizeTraffic, verifyDeliveries,
   washoutMs,
 } from "./benchProtocol.ts";
+import { InlineDiskSampler, WorkerDiskSampler, parseDiskWalkReply } from "./benchDiskSampler.ts";
 import type { BenchHttpAttemptRecord } from "./benchGh.ts";
 import { buildUnitWorkload, seamStringSha256, type WorkloadEntry } from "./benchWorkload.ts";
 import type { EntryDelivery } from "./benchDrivers.ts";
@@ -208,6 +209,97 @@ describe("summarizeTraffic — one control-plane rule for EVERY record (F7)", ()
   });
 });
 
+describe("InlineDiskSampler + finish() contract (santa round 2)", () => {
+  // Round-1 review: the worker sampler could hang forever, wasn't idempotent, and reused the
+  // deliberately-tolerant sampling walk for cloneObjectStoreBytes — a RECORDED measurement that
+  // could therefore silently become 0. And because finish() sits between the driver returning
+  // and the record being appended, a throw here would have eaten the run row (including an R5
+  // halt record, which is the evidence a freeze repair is diagnosed from).
+  test("a failed clone-store walk yields null, never a fabricated 0", async () => {
+    const s = new InlineDiskSampler((dir) => { if (dir.includes(".git")) throw new Error("walk blew up"); return 500; });
+    const snap = await s.finish("/run", "/run/clone/.git");
+    expect(snap.cloneObjectStoreBytes).toBeNull(); // NOT 0 — absence of measurement, not zero bytes
+    expect(snap.sampleError).toContain("walk blew up");
+  });
+  test("instrumentation failure degrades the disk fields but never throws", async () => {
+    const s = new InlineDiskSampler(() => { throw new Error("nope"); });
+    const snap = await s.finish("/run", null);
+    expect(snap.sampleError).not.toBeNull();
+    expect(snap.cloneObjectStoreBytes).toBeNull();
+  });
+  test("finish() is idempotent — one snapshot per run, by contract", async () => {
+    let calls = 0;
+    const s = new InlineDiskSampler(() => { calls++; return 10; });
+    const a = await s.finish("/run", null);
+    const b = await s.finish("/run", null);
+    expect(b).toEqual(a);
+    expect(calls).toBe(1); // the second call re-walks nothing
+  });
+  test("a clean walk records the clone store and no error", async () => {
+    const s = new InlineDiskSampler((dir) => (dir.includes(".git") ? 2048 : 4096));
+    const snap = await s.finish("/run", "/run/clone/.git");
+    expect(snap.cloneObjectStoreBytes).toBe(2048);
+    expect(snap.peakBytes).toBe(4096);
+    expect(snap.sampleError).toBeNull();
+  });
+});
+
+describe("WorkerDiskSampler — the real worker-backed sampler (santa round 2)", () => {
+  // The round-1 sampler had no error channel, no reply deadline, and no idempotence, so a worker
+  // that never replied would hang the matrix between the driver returning and the record landing.
+  // These drive the REAL worker, not a fake.
+  test("measures a real directory off-thread and reports no sample error", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-worker-"));
+    mkdirSync(join(root, "clone", ".git"), { recursive: true });
+    writeFileSync(join(root, "clone", ".git", "pack"), "x".repeat(1024));
+    writeFileSync(join(root, "file"), "y".repeat(2048));
+    const s = new WorkerDiskSampler();
+    const snap = await s.finish(root, join(root, "clone", ".git"));
+    expect(snap.sampleError).toBeNull();
+    expect(snap.cloneObjectStoreBytes).toBeGreaterThanOrEqual(1024);
+    expect(snap.peakBytes).toBeGreaterThanOrEqual(3072);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("finish() without start() still produces a snapshot (no tick ever fired)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-worker-"));
+    writeFileSync(join(root, "f"), "z".repeat(64));
+    const snap = await new WorkerDiskSampler().finish(root, null);
+    expect(snap.sampleError).toBeNull();
+    expect(snap.cloneObjectStoreBytes).toBeNull();
+    expect(snap.samples).toBe(1);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("finish() is idempotent and terminates the worker", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-worker-"));
+    const s = new WorkerDiskSampler();
+    const a = await s.finish(root, null);
+    const b = await s.finish(root, null);
+    expect(b).toEqual(a);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("a reply that never arrives is bounded by the deadline, not an infinite hang", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-worker-"));
+    const s = new WorkerDiskSampler(50); // 50ms deadline
+    // point the walk at a path the worker will answer for, but starve the reply by terminating
+    // the worker as soon as it exists — finish() must resolve with an error, never hang
+    const p = s.finish(root, join(root, "nonexistent", ".git"));
+    (s as unknown as { worker: Worker | null }).worker?.terminate();
+    const snap = await p;
+    expect(snap.sampleError).not.toBeNull();
+    expect(snap.cloneObjectStoreBytes).toBeNull();
+    rmSync(root, { recursive: true, force: true });
+  }, 10_000);
+  test("a malformed worker reply is rejected rather than folded into the peak as NaN", () => {
+    expect(parseDiskWalkReply({ seq: 1, bytes: 10 })).toEqual({ seq: 1, bytes: 10 });
+    expect(parseDiskWalkReply({ seq: 1, bytes: "10" })).toBeNull();
+    expect(parseDiskWalkReply({ seq: 1, bytes: Number.NaN })).toBeNull();
+    expect(parseDiskWalkReply({ seq: 1, bytes: -5 })).toBeNull();
+    expect(parseDiskWalkReply({ bytes: 10 })).toBeNull();
+    expect(parseDiskWalkReply([1, 2])).toBeNull();
+    expect(parseDiskWalkReply(null)).toBeNull();
+  });
+});
+
 describe("requireToolVersion — the §8 environment manifest cannot be half-empty", () => {
   // buildEnvManifest ignored the exit codes of `git --version` / `gh --version`, so a failed or
   // empty probe silently produced gitVersion:"" — and that empty string is folded into the
@@ -243,7 +335,7 @@ describe("finishMeasuredRun — instrumentation is not scored, reclamation is (F
   // synchronous reclamation"), but says nothing about charging MEASUREMENT to the measurement.
   // This helper encodes both halves: the wall is paused across instrumentation and running
   // across reclamation.
-  const snap = { peakBytes: 4096, samples: 7, cloneObjectStoreBytes: 2048 };
+  const snap = { peakBytes: 4096, samples: 7, cloneObjectStoreBytes: 2048, sampleError: null };
   test("the wall excludes the disk snapshot and includes reclamation", async () => {
     let t = 0;
     const wall = new WallClock(() => t);
@@ -325,12 +417,19 @@ describe("reclaimRunResources — teardown owns the DB, not the happy path (F6)"
     expect(existsSync(dbPath)).toBe(false);
     rmSync(root, { recursive: true, force: true });
   });
-  test("a run directory that survives removal reports failure rather than assuming success", () => {
+  test("a run directory that SURVIVES removal reports failure rather than assuming success", () => {
+    // NB: passing an already-absent path would be vacuous — it passes whether or not the
+    // post-removal verification exists. This drives the real case: removal runs, the directory
+    // is still there afterwards, and the flag must say so.
     const root = mkdtempSync(join(tmpdir(), "pa-bench-reclaim-"));
+    const runDir = mkdirp(join(root, "run"));
     const dbPath = join(root, "run.sqlite");
-    // point at a path that cannot be removed because it is not a directory we own the parent of
-    const failed = reclaimRunResources({ close: () => {} }, join(root, "absent"), dbPath);
-    expect(failed).toBe(false); // absent == reclaimed; the flag is about SURVIVING state
+    writeFileSync(dbPath, "x");
+    // removal that silently does nothing — no throw, so ONLY the post-removal verification can
+    // catch it. Delete that verification and this test goes red.
+    const failed = reclaimRunResources({ close: () => {} }, runDir, dbPath, { rm: () => {} });
+    expect(failed).toBe(true);
+    expect(existsSync(runDir)).toBe(true); // it really did survive
     rmSync(root, { recursive: true, force: true });
   });
 });

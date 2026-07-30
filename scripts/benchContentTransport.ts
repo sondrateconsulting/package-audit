@@ -48,7 +48,7 @@ import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts
 import {
   BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, planSegments,
 } from "./benchProtocol.ts";
-import { acquireStore, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
+import { acquireStore, describeDisposal, disposalIsClean, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
 import { noiseBandFrom } from "./benchConfig.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -87,7 +87,10 @@ function frozenSurfaceDigest(): string {
   // EVERY non-test script — the bench modules AND the production modules they execute through
   // (github.ts, readOnlyGuard.ts, db.ts, the selection pipeline…) all drive measurement
   // (codex R3 f.1); plus both normative documents and the preregistered artifacts.
-  for (const name of readdirSync(join(REPO_ROOT, "scripts"))) {
+  // RECURSIVE: the original readdirSync was flat and silently omitted every nested module
+  // (scripts/tui/*), so the digest bound less than the comment above claimed. A freeze that
+  // does not cover what it says it covers is worse than no freeze — it reads as assurance.
+  for (const name of readdirSync(join(REPO_ROOT, "scripts"), { recursive: true }) as string[]) {
     if (/\.(ts|tsx)$/.test(name) && !name.includes(".test.")) files.push(join(REPO_ROOT, "scripts", name));
   }
   files.push(join(REPO_ROOT, "docs", "plans", "adr-0001-disagreements-resolution.md"));
@@ -355,12 +358,21 @@ export function parseProbeBatch(
   const facts = new Map<string, GqlFact>();
   for (const [i, entry] of entries.entries()) {
     const alias = repoObj[`a${i}`];
-    if (typeof alias !== "object" || alias === null)
+    // `typeof x === "object"` alone admits arrays and any wrong-typed node, and the field reads
+    // below coerce anything missing into a definite-looking fact. The alias must POSITIVELY be a
+    // Blob with correctly-typed fields before it becomes ground truth for the whole matrix.
+    if (typeof alias !== "object" || alias === null || Array.isArray(alias))
       return { ok: false, reason: `alias a${i} (${entry.path}) is absent or opaque — refusing to fabricate a binary fact` };
     const o = alias as Record<string, unknown>;
+    if (o["__typename"] !== "Blob")
+      return { ok: false, reason: `alias a${i} (${entry.path}) resolved to ${typeof o["__typename"] === "string" ? String(o["__typename"]) : "an untyped node"}, not a Blob` };
+    if (typeof o["isBinary"] !== "boolean" || typeof o["isTruncated"] !== "boolean")
+      return { ok: false, reason: `alias a${i} (${entry.path}) is missing a boolean isBinary/isTruncated — an absent field is not a false one` };
+    if (o["text"] !== null && typeof o["text"] !== "string")
+      return { ok: false, reason: `alias a${i} (${entry.path}) carries a text field that is neither string nor null` };
     facts.set(entry.path, {
-      isBinary: o["isBinary"] === true,
-      isTruncated: o["isTruncated"] === true,
+      isBinary: o["isBinary"],
+      isTruncated: o["isTruncated"],
       textNull: typeof o["text"] !== "string",
     });
   }
@@ -1024,7 +1036,12 @@ async function cmdFidelity(): Promise<void> {
                   route = "missing-or-unverified-frame";
                 }
               } finally {
-                await child.dispose();
+                // the fidelity battery reads bytes through this child, so an unclean teardown
+                // means the bytes it just delivered cannot be vouched for. Raised as a HARNESS
+                // fault, never as a transport divergence — §4.7 disqualification is permanent.
+                const d = await child.dispose();
+                if (!disposalIsClean(d))
+                  throw new BenchOperationalError(`fidelity batch child teardown was not clean: ${describeDisposal(d)}`);
               }
             }
             rmSync(runDir, { recursive: true, force: true });
