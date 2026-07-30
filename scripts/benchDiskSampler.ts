@@ -228,10 +228,12 @@ export class WorkerDiskSampler extends BaseSampler {
   override abandon(): void {
     // R5 peeks and then throws: without this the tick timer stays armed and the worker stays
     // alive for the rest of the process, since finish() (the only other disposer) never runs.
+    // Pending requests are REJECTED rather than merely dropped — their deadline timers are
+    // deliberately referenced (so a dead worker cannot let the process exit mid-measurement),
+    // and clearing the map without settling them would leave those timers holding the loop.
     this.stopTimer();
     this.tickSeq = null;
-    this.pending.clear();
-    this.disposeWorker();
+    this.failAll(new DiskSamplerError("sampler abandoned before this walk completed"));
   }
   private finishing: Promise<DiskSnapshot> | null = null;
   finish(dir: string, cloneGitDir: string | null): Promise<DiskSnapshot> {

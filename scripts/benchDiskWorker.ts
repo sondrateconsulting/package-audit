@@ -34,7 +34,9 @@ export function parseDiskWalkRequest(data: unknown): DiskWalkRequest | null {
   const { seq, dir, extras, strict } = o;
   if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
   if (typeof dir !== "string" || dir === "") return null;
-  if (!Array.isArray(extras) || extras.some((x) => typeof x !== "string")) return null;
+  // `some` skips holes, so a SPARSE array passed the check and was then cast to string[]
+  if (!Array.isArray(extras) || extras.length !== Object.keys(extras).length) return null;
+  if (!extras.every((x) => typeof x === "string")) return null;
   if (typeof strict !== "boolean") return null;
   return { seq, dir, extras: extras as string[], strict };
 }

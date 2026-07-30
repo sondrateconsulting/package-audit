@@ -8,7 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   BenchOperationalError, assertFreezeGitState, classifyFidelityEnumeration,
-  harnessCommitFromGitResult, parseProbeBatch,
+  harnessCommitFromGitResult, loginFromUserPayload, parseProbeBatch,
 } from "./benchContentTransport.ts";
 import { UnitFailure, describeDisposal } from "./benchDrivers.ts";
 import type { WorkloadEntry } from "./benchWorkload.ts";
@@ -208,5 +208,22 @@ describe("parseProbeBatch — pinned GraphQL facts are all-or-nothing (F5)", () 
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error("unreachable");
     expect(r.reason).toMatch(/malformed/);
+  });
+});
+
+describe("loginFromUserPayload — the §8 credential identity cannot degrade to a literal", () => {
+  // An unvalidated cast let a malformed /user payload become the string "unknown", which then
+  // hashes into the environment manifest every timed row binds to — provenance that reads as
+  // real but names nobody.
+  test("a usable login is returned", () => {
+    expect(loginFromUserPayload({ login: "sondrateconsulting-ryan" })).toBe("sondrateconsulting-ryan");
+  });
+  test("a missing, empty, non-string, or non-object payload refuses", () => {
+    expect(() => loginFromUserPayload({})).toThrow(/no usable login/);
+    expect(() => loginFromUserPayload({ login: "" })).toThrow(/no usable login/);
+    expect(() => loginFromUserPayload({ login: "   " })).toThrow(/no usable login/);
+    expect(() => loginFromUserPayload({ login: 42 })).toThrow(/no usable login/);
+    expect(() => loginFromUserPayload(null)).toThrow(/no object/);
+    expect(() => loginFromUserPayload([{ login: "x" }])).toThrow(/no object/);
   });
 });

@@ -75,6 +75,18 @@ export class BenchOperationalError extends Error {
   }
 }
 
+// §8 binds every timed row to the credential identity that produced it. An unvalidated cast let
+// a malformed /user payload silently become the literal "unknown", which hashes into the
+// environment manifest as if it were a real identity.
+export function loginFromUserPayload(json: unknown): string {
+  if (typeof json !== "object" || json === null || Array.isArray(json))
+    throw new Error("REFUSING: GET /user returned no object — §8 needs the credential identity behind every timed row");
+  const login = (json as Record<string, unknown>)["login"];
+  if (typeof login !== "string" || login.trim() === "")
+    throw new Error("REFUSING: GET /user carries no usable login — §8 needs the credential identity behind every timed row");
+  return login;
+}
+
 const gitFailure = (what: string, res: { exitCode: number; stderr: Uint8Array }): string =>
   `${what} failed (exit ${res.exitCode}): ${text(res.stderr).trim().slice(0, 400)}`;
 
@@ -780,7 +792,7 @@ async function acquisitionDiagnostics(rt: PinRuntime, corpus: Corpus, workloads:
 async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<string, UnitWorkload>): Promise<{ engine: BenchEngine; benchRoot: string }> {
   const benchRoot = mkdtempSync(join(realpathSync(tmpdir()), cfg.protocol.tempPrefix));
   const metaClient = new GithubClient({ githubHost: cfg.githubHost, db: null, tempRoot: benchRoot });
-  const login = ((await metaClient.restGetJson("user")) as { login?: string }).login ?? "unknown";
+  const login = loginFromUserPayload(await metaClient.restGetJson("user"));
   const harnessCommit = harnessCommitFromGitResult(await runBenchGit({
     argv: ["rev-parse", "HEAD"], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
     benchRoot: realpathSync(REPO_ROOT), cwd: REPO_ROOT,
@@ -832,7 +844,7 @@ async function cmdPinCorpus(): Promise<void> {
       bundles.push(await pinPerformanceSlot(rt, slotId));
     }
     const fidelity = await pinFidelity(rt);
-    const login = ((await rt.client.restGetJson("user")) as { login?: string }).login ?? "unknown";
+    const login = loginFromUserPayload(await rt.client.restGetJson("user"));
     // Option 3's warm-run scenario pair, frozen at Step B (plan §4.4): base = the parent of
     // C1-main's pinned SHA, advanced = the pinned SHA itself.
     const c1 = bundles[0]!.slot;
@@ -996,8 +1008,9 @@ async function cmdFidelity(): Promise<void> {
               // timeout, the closed default — and none of them is an observation about T1's
               // FIDELITY. Recording any of them as a route appends a pass:false row to the
               // append-only log and disqualifies the driver globally and irreversibly (§4.7).
-              // Written as an else rather than a list so a NEW analysis kind fails closed too:
-              // this defect class has already appeared four times in this harness.
+              // Written as an else rather than a list so a NEW analysis kind fails closed too.
+              // This defect class — a transient failure recorded as a PERMANENT verdict — has now
+              // been found five times in this harness; ratification.json enumerates them.
               const detail = analysis.kind === "per-alias"
                 ? `alias outcome ${analysis.outcomes[0]?.kind ?? "none"}`
                 : analysis.kind;

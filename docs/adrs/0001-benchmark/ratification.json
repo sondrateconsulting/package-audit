@@ -10,7 +10,7 @@
   },
   "noiseBand": 1.25,
   "pilotSpread": 1.034,
-  "frozenSurfaceDigest": "de927bec651c5fb703f10ddf29b833300d36a52f2ef17a91c68387d9c84860a3",
+  "frozenSurfaceDigest": "7f4c55b659e7a38083fb95aa95592d95577aa645e673832f1ac1d10f80c2ade3",
   "amendments": [
     {
       "at": "Step B, post-ratification review round",
@@ -57,7 +57,17 @@
         "the R5 sampler release ran AFTER runsLog.append, so an appendFileSync failure (disk full, EACCES) left the sampler armed with no disposer remaining; abandon() now runs in a finally around the append",
         "WorkerDiskSampler folded ANY well-shaped reply with an unrecognised sequence into the peak as 'an unawaited tick', so a duplicate, stale, or unsolicited message could fabricate a disk figure the filesystem never held. Exactly one outstanding tick sequence is now tracked and anything else fails the sampler",
         "a throw in post-run finalisation (the rate-limit read) between reclamation and the append discarded a run that had already been measured — wall, traffic and all. It now appends an 'invalidated-finalisation' row preserving the measured wall and partial traffic, marked unscoreable rather than dropped"
-      ]
+      ],
+      "alsoFixedInReviewRound6": [
+        "abandon() cleared the pending map without settling it. Because the awaited walk's deadline timers are deliberately REFERENCED (so a dead worker cannot let the process exit mid-measurement), dropping them unsettled left those timers holding the event loop. abandon() now rejects every pending request",
+        "the worker's request validator used extras.some(), which SKIPS array holes, so a sparse array passed and was then cast to string[]",
+        "GET /user was cast to {login?:string} with a `?? \"unknown\"` fallback, so a malformed payload silently became the literal identity \"unknown\" — which then hashes into the §8 environment manifest that every timed row binds to. It is now validated and refuses"
+      ],
+      "openAndDeliberatelyNotFixed": {
+        "finding": "A git spawn TIMEOUT (exit 124 — clone, scaffolding fetch, or ls-tree) is thrown as UnitFailure with no HTTP evidence, so the engine records failureEvidence {kind:'unit'} and the matrix rerun predicate (isRerunnable) refuses it: it accepts only {kind:'http'}. A transient transport timeout therefore becomes a permanent, non-rerunnable unit failure — a sixth instance of the transient-becomes-permanent class found in this harness.",
+        "whyNotFixed": "Unlike every other fix in this amendment, this one would change a RATIFIED DECISION rather than the measurement surface. §4.5's R1/R2 rerun predicate and the failure policy are covered by ratified answer 2 ('the full pinned failure policy'). Extending rerunnability to spawn timeouts is a protocol judgement for the decision-maker — morally R1 ('no response from the transport') would cover it, but that is rvo's call to make, not the implementer's.",
+        "ifAccepted": "Add a typed {kind:'spawn', timedOut:true} failureEvidence variant preserved from BenchGitResult.timedOut, and admit it in isRerunnable alongside R1's no-response."
+      }
     }
   ],
   "harnessCommit": "42c970f-informational (the digest above is the binding; the commit recorded per-row in runs.jsonl)",
