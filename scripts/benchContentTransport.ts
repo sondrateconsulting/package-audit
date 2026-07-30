@@ -4,13 +4,16 @@
 // prefix, or production source files. No CI job runs this — every subcommand that talks to the
 // network runs locally under the operator's gh identity.
 //
-//   pin-corpus     verify §4.2 slot candidates, pin SHAs, record workloads + ground truth,
-//                  write corpus.json / selected/*.json / the schedule table into bench-config
-//   diagnostics    §4.4 acquisition diagnostics (production vs scaffolding forms, 3× each)
-//   budget         print per-(unit × driver) worst-case spend + the schedule's total
-//   pilot          §8's pre-ratification diagnostic pilot (K reps of T0 on C2) → noise band
-//   matrix         Step C's timed traversal — REFUSES to run before ratification.json exists
-//   fidelity       the C6 fidelity battery (untimed, once per applicable driver)
+//   pin-corpus       verify §4.2 slot candidates, pin SHAs, record workloads + ground truth,
+//                    write corpus.json / selected/*.json / the schedule table into bench-config
+//   refresh-evidence recompute the committed corpus verification evidence in place
+//   verify-corpus    re-check the pinned corpus against its recorded evidence
+//   diagnostics      §4.4 acquisition diagnostics (production vs scaffolding forms, 3× each)
+//   budget           print per-(unit × driver) worst-case spend + the schedule's total
+//   digest           print the §8 frozen-surface digest the ratification gate binds
+//   pilot            §8's pre-ratification diagnostic pilot (K reps of T0 on C2) → noise band
+//   matrix           Step C's timed traversal — REFUSES to run before ratification.json exists
+//   fidelity         the C6 fidelity battery (untimed, once per applicable driver)
 //
 // Artifacts land in docs/adrs/0001-benchmark/. The pinning cache lives under ./data (a §0
 // write root, git-ignored) so re-runs are cheap; bench run dirs live under a pa-bench-* root.
@@ -58,6 +61,22 @@ const RATIFICATION_PATH = join(ARTIFACTS, "ratification.json");
 const log = (line: string): void => {
   process.stderr.write(`${line}\n`);
 };
+const text = (b: Uint8Array): string => new TextDecoder().decode(b);
+
+// A HARNESS failure, as opposed to an observation about a transport. The distinction is
+// load-bearing: §4.7 disqualifies a driver globally on an observed divergence and a fidelity
+// mismatch is never rerunnable, so a local git/tooling failure must never be recorded through
+// that channel — it is the operator's problem, and re-running it is legitimate.
+export class BenchOperationalError extends Error {
+  readonly rerunnable = true as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "BenchOperationalError";
+  }
+}
+
+const gitFailure = (what: string, res: { exitCode: number; stderr: Uint8Array }): string =>
+  `${what} failed (exit ${res.exitCode}): ${text(res.stderr).trim().slice(0, 400)}`;
 
 // The frozen MEASUREMENT surface's content digest (§8 as amended): every bench module + the
 // preregistered artifacts. Binding ratification to THIS (not to HEAD) keeps the gate
@@ -125,13 +144,55 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
     lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
     benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
   });
+  assertFreezeGitState(statusOut, lsFiles, APPEND_ONLY);
+  return { rat, digest };
+}
+
+const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl", "data/"];
+
+// The §8 gate's git-state leg, pure over the two command results so it is testable in CI.
+// BOTH exit codes are checked. `git status` was previously trusted unconditionally: a
+// status-only failure yields empty stdout, which parses as "no dirty files" and lets the
+// tamper-detection leg pass. (A GLOBAL git failure was already caught, since `ls-files` runs
+// under the same pinned env and its exit IS checked — the hole was only ever status-specific.)
+export function assertFreezeGitState(
+  statusOut: { exitCode: number; stdout: Uint8Array; stderr: Uint8Array },
+  lsFiles: { exitCode: number },
+  appendOnly: readonly string[],
+): void {
+  if (statusOut.exitCode !== 0)
+    throw new Error(`REFUSING: ${gitFailure("git status --porcelain", statusOut)} — the freeze gate cannot verify a clean tree, so it fails closed (§8)`);
   if (lsFiles.exitCode !== 0)
     throw new Error("REFUSING: ratification.json is not TRACKED — the signed answers must be committed, not a local file (§8)");
-  const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl", "data/"];
-  const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && !APPEND_ONLY.some((a) => f.startsWith(a)));
+  const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && !appendOnly.some((a) => f.startsWith(a)));
   if (dirty.length > 0)
     throw new Error(`REFUSING: dirty tracked files outside the append-only outputs: ${dirty.slice(0, 5).join(", ")} — the frozen surface must be committed (§8)`);
-  return { rat, digest };
+}
+
+// Provenance acquisition, fail-closed. An unchecked rev-parse that returned "" made every row
+// claim harnessCommit:"" and turned the resume guard's revision comparison into "" !== "",
+// which silently merged rows from different harness revisions into one traversal (§8).
+export function harnessCommitFromGitResult(res: { exitCode: number; stdout: Uint8Array; stderr: Uint8Array }): string {
+  if (res.exitCode !== 0)
+    throw new Error(`REFUSING: ${gitFailure("git rev-parse HEAD", res)} — §8 binds every timed row to a harness revision, which must never be empty`);
+  const oid = text(res.stdout).trim();
+  if (!/^[0-9a-f]{40}$/.test(oid) && !/^[0-9a-f]{64}$/.test(oid))
+    throw new Error(`REFUSING: git rev-parse HEAD returned ${oid === "" ? "an empty string" : `"${oid.slice(0, 24)}"`}, not a full object id — §8 provenance must be a complete sha1/sha256 oid`);
+  return oid;
+}
+
+// The fidelity battery's live enumeration. A non-zero git exit is a HARNESS failure, never an
+// observation: parseLsTreeZ over the deadline path's empty stdout returns [] without throwing,
+// which previously read as "the entry is absent from the live tree" — a pass:false row appended
+// to the append-only fidelity log, disqualifying the driver globally and irreversibly (§4.7).
+export function classifyFidelityEnumeration(
+  res: { exitCode: number; stdout: Uint8Array; stderr: Uint8Array },
+  format: "sha1" | "sha256",
+  limits: { maxEntries: number; maxRecordBytes: number },
+): LsTreeEntry[] {
+  if (res.exitCode !== 0)
+    throw new BenchOperationalError(`${gitFailure("fidelity ls-tree", res)} — a local enumeration failure is a harness fault, not a transport divergence; re-run the battery`);
+  return parseLsTreeZ(res.stdout, format, limits);
 }
 
 // §4.2 candidates, in preference order — a failing candidate is SWAPPED, never forced.
@@ -156,8 +217,9 @@ const SLOT_CANDIDATES: Record<string, Array<{ owner: string; repo: string; branc
     { owner: "pnpm", repo: "pnpm", branches: ["main"] },
   ],
   // C3 measured at pinning: nixpkgs's REST tree is TRUNCATED (a C4 shape — 53.6k entries) and
-  // home-assistant/core's paths are short (mean ~47 B); kubernetes (~31.3k entries, mean ~67 B,
-  // deep staging/ nesting) is the path-heavy candidate that verifies, so it leads.
+  // home-assistant/core's paths are short (mean ~47 B); kubernetes (37,393 entries, mean 64.2 B,
+  // deep staging/ nesting — the figures corpus.json records) is the path-heavy candidate that
+  // verifies, so it leads.
   C3: [
     { owner: "kubernetes", repo: "kubernetes", branches: ["master"] },
     { owner: "NixOS", repo: "nixpkgs", branches: ["master"] },
@@ -235,7 +297,6 @@ async function pinGit(rt: PinRuntime, argv: string[], opts: { cwd?: string; env?
     throw new Error(`pinning git ${argv[0]} failed: ${new TextDecoder().decode(res.stderr).trim().slice(0, 400)}`);
   return res.stdout;
 }
-const text = (b: Uint8Array): string => new TextDecoder().decode(b);
 
 async function pinClone(rt: PinRuntime, owner: string, repo: string, branch: string, name: string, env?: Record<string, string>): Promise<{ dir: string; sha: string; treeOid: string; objectFormat: "sha1" | "sha256" }> {
   const dir = join(rt.benchRoot, name);
@@ -263,8 +324,51 @@ async function fetchRestTruncation(rt: PinRuntime, owner: string, repo: string, 
   return tree.truncated;
 }
 
-async function probeGqlFacts(rt: PinRuntime, slot: { owner: string; repo: string }, sha: string, entries: WorkloadEntry[]): Promise<Map<string, { isBinary: boolean; isTruncated: boolean; textNull: boolean }>> {
-  const facts = new Map<string, { isBinary: boolean; isTruncated: boolean; textNull: boolean }>();
+export interface GqlFact { isBinary: boolean; isTruncated: boolean; textNull: boolean }
+export type ProbeBatchResult =
+  | { ok: true; facts: Map<string, GqlFact> }
+  | { ok: false; reason: string };
+
+// Pinned GraphQL facts are ground truth for the WHOLE matrix, so they commit per batch and only
+// when every alias in that batch resolved cleanly. Previously an absent/opaque alias — including
+// one whose expression carried an alias-attributed error inside an otherwise-200 response — was
+// coerced to the POSITIVE fact {isBinary:true}. deriveRoutes freezes that as primary
+// "binary-fallback" with no permitted alternative, so at matrix time a normal delivery becomes a
+// G2 completeness failure and disqualifies T1 globally, on an artifact of one flaky alias.
+// Absence is not a measurement: reject the batch and let the caller retry, then fail the pin.
+export function parseProbeBatch(
+  data: Record<string, unknown>,
+  entries: readonly WorkloadEntry[],
+  errors: readonly unknown[] | undefined,
+  malformedErrorEntries = 0,
+): ProbeBatchResult {
+  if (errors !== undefined && errors.length > 0)
+    return { ok: false, reason: `response carried ${errors.length} error entr${errors.length === 1 ? "y" : "ies"} — an alias-attributed error is not a fact` };
+  // an unreadable errors[] member is an error we cannot attribute, which is strictly worse than
+  // one we can — it must not read as "no errors" (the closed default T1's analyzer already uses)
+  if (malformedErrorEntries > 0)
+    return { ok: false, reason: `response carried ${malformedErrorEntries} malformed error entr${malformedErrorEntries === 1 ? "y" : "ies"} — unattributable errors cannot be read as success` };
+  const repo = data["repository"];
+  if (typeof repo !== "object" || repo === null)
+    return { ok: false, reason: "response carried no repository object" };
+  const repoObj = repo as Record<string, unknown>;
+  const facts = new Map<string, GqlFact>();
+  for (const [i, entry] of entries.entries()) {
+    const alias = repoObj[`a${i}`];
+    if (typeof alias !== "object" || alias === null)
+      return { ok: false, reason: `alias a${i} (${entry.path}) is absent or opaque — refusing to fabricate a binary fact` };
+    const o = alias as Record<string, unknown>;
+    facts.set(entry.path, {
+      isBinary: o["isBinary"] === true,
+      isTruncated: o["isTruncated"] === true,
+      textNull: typeof o["text"] !== "string",
+    });
+  }
+  return { ok: true, facts };
+}
+
+async function probeGqlFacts(rt: PinRuntime, slot: { owner: string; repo: string }, sha: string, entries: WorkloadEntry[]): Promise<Map<string, GqlFact>> {
+  const facts = new Map<string, GqlFact>();
   const probeCfg: BenchConfig = { ...rt.cfg, t1: { ...rt.cfg.t1, aliasCap: 100, batchContentBytesCap: 1024 * 1024 } };
   const candidates = entries.filter((e) => e.read && e.mode !== "120000");
   const batches = packBatches(candidates, probeCfg, { owner: slot.owner, repo: slot.repo, sha, roundLabel: "gqlprobe" });
@@ -277,24 +381,16 @@ async function probeGqlFacts(rt: PinRuntime, slot: { owner: string; repo: string
         await new Promise((r) => setTimeout(r, 3000));
         continue;
       }
-      const repo = d.data["repository"];
-      const repoObj = typeof repo === "object" && repo !== null ? (repo as Record<string, unknown>) : {};
-      batch.entries.forEach((entry, i) => {
-        const alias = repoObj[`a${i}`];
-        if (typeof alias !== "object" || alias === null) {
-          facts.set(entry.path, { isBinary: true, isTruncated: false, textNull: true }); // absent/opaque: route to fallback
-          return;
-        }
-        const o = alias as Record<string, unknown>;
-        facts.set(entry.path, {
-          isBinary: o["isBinary"] === true,
-          isTruncated: o["isTruncated"] === true,
-          textNull: typeof o["text"] !== "string",
-        });
-      });
+      const parsed = parseProbeBatch(d.data, batch.entries, d.errors, d.malformedErrorEntries);
+      if (!parsed.ok) {
+        log(`  gql probe ${batch.label}: ${parsed.reason}, retrying`);
+        await new Promise((r) => setTimeout(r, 3000));
+        continue;
+      }
+      for (const [path, fact] of parsed.facts) facts.set(path, fact); // batch-atomic commit
       done = true;
     }
-    if (!done) throw new Error(`gql probe ${batch.label} failed after 3 attempts`);
+    if (!done) throw new Error(`gql probe ${batch.label} failed after 3 attempts — pinning refuses to record fabricated facts`);
   }
   return facts;
 }
@@ -669,11 +765,11 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
   const benchRoot = mkdtempSync(join(realpathSync(tmpdir()), cfg.protocol.tempPrefix));
   const metaClient = new GithubClient({ githubHost: cfg.githubHost, db: null, tempRoot: benchRoot });
   const login = ((await metaClient.restGetJson("user")) as { login?: string }).login ?? "unknown";
-  const harnessCommit = text(await runBenchGit({
+  const harnessCommit = harnessCommitFromGitResult(await runBenchGit({
     argv: ["rev-parse", "HEAD"], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
     benchRoot: realpathSync(REPO_ROOT), cwd: REPO_ROOT,
     limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
-  }).then((r) => r.stdout)).trim();
+  }));
   const manifest = await buildEnvManifest(metaClient, {
     login, harnessCommit,
     networkDescription: process.env["BENCH_NETWORK_DESC"] ?? "operator workstation (BENCH_NETWORK_DESC unset)",
@@ -901,7 +997,7 @@ async function cmdFidelity(): Promise<void> {
               limits: { maxStdoutBytes: cfg.lsTree.maxOutputBytes, maxStderrBytes: 1024 * 1024, deadlineMs: cfg.spawn.timeoutMs },
               onRecord: rt.spawnObs,
             });
-            const lsEntries = parseLsTreeZ(lsOut.stdout, fixture.objectFormat, { maxEntries: cfg.lsTree.maxEntries, maxRecordBytes: cfg.lsTree.maxRecordBytes });
+            const lsEntries = classifyFidelityEnumeration(lsOut, fixture.objectFormat, { maxEntries: cfg.lsTree.maxEntries, maxRecordBytes: cfg.lsTree.maxRecordBytes });
             const liveEntry = lsEntries.find((e) => e.path === entry.path);
             if (liveEntry === undefined) {
               route = "missing-from-live-enumeration";

@@ -80,6 +80,9 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       "BenchGrammarViolation", "BenchFrameError", "BenchSpawnError", "BenchConfigError",
       "BenchScheduleError", "BenchCorpusError", "BenchWorkloadError", "BenchT1Error",
       "BenchHttpError", "BenchProtocolError", "UnitFailure", "DriftSignal", "RePinRequired",
+      // a HARNESS fault (a failed local git/tooling call) as opposed to an observation about a
+      // transport — kept distinct so it can never be recorded as a driver's fidelity divergence
+      "BenchOperationalError",
     ]);
     const declared = new Set<string>();
     // recursive: scripts/tui/ declares operator-facing classes too (TuiActivationError)

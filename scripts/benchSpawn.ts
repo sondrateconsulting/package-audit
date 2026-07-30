@@ -1,4 +1,6 @@
-// benchSpawn.ts — the benchmark's ONLY process-launch site (ADR-0001 resolution plan §4.1).
+// benchSpawn.ts — the benchmark's only DIRECT process-launch site (ADR-0001 resolution plan
+// §4.1). REST/GraphQL traffic still launches `gh` through the PRODUCTION chokepoint in
+// github.ts; this module joins that chokepoint for git, it does not replace it.
 // The repo-wide chokepoint scan in github.test.ts allowlists exactly one launch call in this
 // file, mirroring the github.ts discipline. Every launch is git, byte-oriented, and gated by
 // its LANE before anything starts:

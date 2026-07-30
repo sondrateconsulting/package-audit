@@ -10,7 +10,7 @@ import { assertContained } from "./readOnlyGuard.ts";
 import { parseTreeResponse } from "./github.ts";
 import type { BenchConfig } from "./benchConfig.ts";
 import type { CorpusUnit, PerformanceSlot } from "./benchCorpus.ts";
-import { BatchChild, runBenchGit, type BenchSpawnObserver } from "./benchSpawn.ts";
+import { BatchChild, runBenchGit, type BatchChildDisposal, type BenchSpawnObserver } from "./benchSpawn.ts";
 import { parseLsTreeZ, type LsTreeEntry } from "./benchFrame.ts";
 import {
   BenchHttpError, benchRestGet, gitBlobOid, type BenchGhContext,
@@ -25,6 +25,18 @@ import type { DriverId } from "./benchSchedule.ts";
 
 // ---- terminal signals ------------------------------------------------------------------------
 // A unit failure with cause (G2 territory) — recorded, never silently absorbed.
+// The batch child's teardown verdict, rendered for an operator: the fatal condition that poisoned
+// it plus git's own retained stderr — the diagnosis that was previously captured and discarded.
+export function describeDisposal(d: BatchChildDisposal): string {
+  const tail = new TextDecoder().decode(d.stderrTail).trim().slice(0, 300);
+  const dropped = d.stderrDroppedBytes > 0 ? ` (+${d.stderrDroppedBytes}B dropped)` : "";
+  return [
+    d.protocolError === null ? null : `protocol fault: ${d.protocolError}`,
+    `exit ${d.exitCode === null ? "never settled" : d.exitCode}`,
+    tail === "" ? null : `stderr: ${tail}${dropped}`,
+  ].filter((s) => s !== null).join("; ");
+}
+
 export class UnitFailure extends Error {
   readonly cause2: string;
   // when the terminal condition was HTTP-shaped (e.g. the circuit breaker tripped on repeated
@@ -83,7 +95,6 @@ export interface DriverRunContext {
   spawnObserver: BenchSpawnObserver;
   acquisitionForm: AcquisitionForm;
   fallbackBudget: number;
-  onCloneDirReady?: (dir: string) => void; // the disk sampler attaches the moment bytes can land
   // live progress mirror the ENGINE reads when the driver throws — fallback spend and delivered
   // routes survive a unit failure instead of flattening to zero (codex R3 f.9)
   liveState?: { fallbackSpend: number; routesDelivered: Record<string, number> };
@@ -230,7 +241,6 @@ async function scaffoldGit(ctx: DriverRunContext, argv: string[], cwd?: string):
 export async function acquireStore(ctx: DriverRunContext, opts: { checkout: boolean }): Promise<{ dir: string; headRev: "HEAD" | "FETCH_HEAD" }> {
   const dir = join(ctx.runDir, "clone");
   assertContained(dir, [ctx.benchRoot]);
-  ctx.onCloneDirReady?.(ctx.runDir);
   const url = `https://${ctx.cfg.githubHost}/${encodeURIComponent(ctx.slot.owner)}/${encodeURIComponent(ctx.slot.repo)}.git`;
   if (ctx.acquisitionForm === "production") {
     const argv = [
@@ -525,6 +535,8 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
   const lsIndex = await enumerateStore(ctx, dir, headRev);
   const holder: { child: BatchChild | null; release: (() => void) | null } = { child: null, release: null };
   let respawns = 0;
+  let firstDisposal: BatchChildDisposal | null = null;
+  let finalDisposal: BatchChildDisposal | null = null;
   const ensureChild = async (): Promise<BatchChild> => {
     if (holder.child !== null) return holder.child;
     if (holder.release === null) holder.release = await childPool.acquire(); // lazy spawn at first canonical read (§3.1)
@@ -554,10 +566,13 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
       try {
         frame = await (await ensureChild()).readObject({ oid: ls.oid, size: ls.size });
       } catch (e) {
-        // at most one respawn per unit; a second child death fails the unit (§3.1)
-        if (respawns >= 1) throw new UnitFailure(`batch child died twice: ${e instanceof Error ? e.message : String(e)}`);
+        // at most one respawn per unit; a second child death fails the unit (§3.1). The FIRST
+        // child's disposal carries the actual diagnosis (git's own stderr, the fatal condition
+        // that poisoned it) — without it the surviving message is only the second failure's.
+        if (respawns >= 1)
+          throw new UnitFailure(`batch child died twice: ${e instanceof Error ? e.message : String(e)}${firstDisposal === null ? "" : ` — first child: ${describeDisposal(firstDisposal)}`}`);
         respawns++;
-        await holder.child?.dispose();
+        firstDisposal = (await holder.child?.dispose()) ?? null;
         holder.child = null;
         frame = await (await ensureChild()).readObject({ oid: ls.oid, size: ls.size });
       }
@@ -573,11 +588,16 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
     // ordered teardown BEFORE the engine may delete the clone dir (§3.1); the pool permit is
     // released in its OWN finally so a rejected dispose can never leak it (codex R2 f.32)
     try {
-      if (holder.child !== null) await holder.child.dispose();
+      if (holder.child !== null) finalDisposal = await holder.child.dispose();
     } finally {
       holder.release?.();
     }
   }
+  // a child that was poisoned mid-unit could previously report a clean run: dispose()'s verdict
+  // was captured and dropped on the floor. Checked AFTER the finally so it cannot mask a real
+  // in-flight failure, and only on the path that would otherwise have returned success.
+  if (finalDisposal !== null && finalDisposal.protocolError !== null)
+    throw new UnitFailure(`batch child teardown reported a protocol fault: ${describeDisposal(finalDisposal)}`);
   return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, acquiredPaths: st.acquiredPaths, cloneDir: dir, acquisitionForm: ctx.acquisitionForm };
 }
 

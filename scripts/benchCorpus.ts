@@ -300,8 +300,9 @@ export function verifyC2(stats: { fileCount: number; truncated: boolean; manifes
 // against measured REST payloads: a fixed share-of-payload threshold is unreachable in the real
 // wire format (each entry's `url` member alone carries ~100+ bytes and a second oid hex), so
 // the predicate uses absolute path-heaviness instead: ≥20,000 entries, mean path length ≥ 55
-// bytes, and ≥5,000 entries at directory depth ≥ 6. Measured calibration points (2026-07-28):
-// kubernetes ~31.3k entries / mean ~67 B (passes); home-assistant/core mean ~47 B (fails);
+// bytes, and ≥5,000 entries at directory depth ≥ 6. Measured calibration points, as recorded in
+// corpus.json at pinning: kubernetes 37,393 entries / mean 64.2 B (passes); home-assistant/core
+// mean ~47 B (fails);
 // nixpkgs is REST-truncated (a C4 shape, fails here by design).
 export function verifyC3(stats: { truncated: boolean; entryCount: number; pathByteSum: number; oidHexLength: number; deepEntryCount: number }): SlotVerdict {
   const reasons: string[] = [];

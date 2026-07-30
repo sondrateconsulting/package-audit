@@ -131,7 +131,8 @@ export interface BenchConfig {
   schedule: Schedule | null;
 }
 
-// §4.4: the per-unit REST fallback budget, every driver — max(floor, ceil(fraction × selected)).
+// §4.3: the per-unit REST fallback budget, EVERY driver — max(floor, ceil(fraction × selected)).
+// (§4.4 states the formula inside T1's failure policy; §4.3 is the clause that makes it universal.)
 export function restFallbackBudgetFor(cfg: BenchConfig, selectedCount: number): number {
   return Math.max(cfg.restFallbackBudget.floor, Math.ceil(cfg.restFallbackBudget.fractionOfSelected * selectedCount));
 }

@@ -24,6 +24,7 @@ import {
   type BenchGhContext, type BenchHttpAttemptRecord, type RateLimitSnapshot,
 } from "./benchGh.ts";
 import { seamStringSha256, type UnitWorkload } from "./benchWorkload.ts";
+import { WorkerDiskSampler, type DiskSamplerPort, type DiskSnapshot } from "./benchDiskSampler.ts";
 import type { DriverId } from "./benchSchedule.ts";
 import type { BenchSpawnRecord } from "./benchSpawn.ts";
 
@@ -211,69 +212,9 @@ export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly En
   return report;
 }
 
-// ---- disk sampler (sampled peak at 1 Hz, §4.6.4) ---------------------------------------------
-function duBytes(dir: string): number {
-  let total = 0;
-  let entries: import("node:fs").Dirent[];
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return 0; // the dir may vanish mid-sample (teardown race) — a sample, not an invariant
-  }
-  for (const e of entries) {
-    const p = join(dir, e.name);
-    try {
-      const st = lstatSync(p);
-      total += st.size;
-      if (st.isDirectory()) total += duBytes(p);
-    } catch {
-      // vanished mid-walk
-    }
-  }
-  return total;
-}
-export class DiskSampler {
-  private timer: ReturnType<typeof setInterval> | null = null;
-  private peak = 0;
-  private samples = 0;
-  private extras: string[] = [];
-  extraFiles(paths: string[]): void {
-    this.extras = paths;
-  }
-  private extraBytes(): number {
-    let total = 0;
-    for (const p of this.extras) {
-      try {
-        total += lstatSync(p).size;
-      } catch {
-        // absent sidecar
-      }
-    }
-    return total;
-  }
-  start(dir: string, hz: number): void {
-    this.stopTimer();
-    this.timer = setInterval(() => {
-      this.samples++;
-      const b = duBytes(dir) + this.extraBytes();
-      if (b > this.peak) this.peak = b;
-    }, Math.max(1, Math.round(1000 / hz)));
-    this.timer.unref?.();
-  }
-  point(dir: string): void {
-    const b = duBytes(dir) + this.extraBytes();
-    this.samples++;
-    if (b > this.peak) this.peak = b;
-  }
-  private stopTimer(): void {
-    if (this.timer !== null) clearInterval(this.timer);
-    this.timer = null;
-  }
-  stop(): { peakBytes: number; samples: number } {
-    this.stopTimer();
-    return { peakBytes: this.peak, samples: this.samples };
-  }
-}
+// ---- disk sampler ----------------------------------------------------------------------------
+// Moved to benchDiskSampler.ts: the §4.6 peak-disk walk now runs OFF the measured thread, so
+// instrumentation cost no longer lands on the wall term it is measured against.
 
 // ---- environment manifest (§8) ---------------------------------------------------------------
 export interface EnvManifest {
@@ -289,17 +230,29 @@ export interface EnvManifest {
   login: string;
   harnessCommit: string;
 }
+// §8 binds every timed row to an environment manifest whose HASH resume compares. An unchecked
+// version probe that returned "" made that binding quietly weaker than it reads, so a blank
+// version is refused rather than recorded.
+export function requireToolVersion(tool: string, res: { exitCode: number; stdout: string; stderr: string }): string {
+  if (res.exitCode !== 0)
+    throw new BenchProtocolError(`${tool} --version failed (exit ${res.exitCode}): ${res.stderr.trim().slice(0, 200)} — the §8 environment manifest must record a real toolchain`);
+  const line = res.stdout.split("\n")[0]?.trim() ?? "";
+  if (line === "")
+    throw new BenchProtocolError(`${tool} --version reported no version — the §8 environment manifest must record a real toolchain`);
+  return line;
+}
+
 export async function buildEnvManifest(client: GithubClient, opts: { login: string; harnessCommit: string; networkDescription: string; credentialType: string }): Promise<EnvManifest> {
-  const git = await client.git(["--version"]);
-  const gh = await client.gh(["--version"]);
+  const git = requireToolVersion("git", await client.git(["--version"]));
+  const gh = requireToolVersion("gh", await client.gh(["--version"]));
   const cpuModel = cpus()[0]?.model ?? "unknown";
   return {
     os: platform(),
     osVersion: release(),
     archName: arch(),
     hardwareIdHash: createHash("sha256").update(`${hostname()}|${cpuModel}|${cpus().length}`).digest("hex").slice(0, 16),
-    gitVersion: git.stdout.trim(),
-    ghVersion: gh.stdout.split("\n")[0]?.trim() ?? "",
+    gitVersion: git,
+    ghVersion: gh,
     bunVersion: Bun.version,
     networkDescription: opts.networkDescription,
     credentialType: opts.credentialType,
@@ -371,6 +324,86 @@ export class RunsLog {
 // active-wall accounting: segment sleeps are excluded from the wall term (§4.6.1/§4.7 —
 // dropping the wall for segmented runs would make segmentation a scoring exploit, so the wall
 // is the SUM of active segments).
+export interface TrafficSummary {
+  requests: Record<string, number>;
+  attempts: { fivexx: number; retries: number; secondaryByKind: Record<string, number> };
+  points: { measuredCostSum: number; imputed: number };
+  secondarySignals: number;
+  httpBodyBytes: number;
+}
+
+// The SINGLE place the control-plane exclusion is expressed. Cache-served attempts crossed no
+// wire, and rest-meta probes are the harness's own book-keeping — neither is driver evidence
+// (§4.6). Every run record, including the R5 halt record, derives its traffic figures here so
+// the rule cannot drift between them.
+export function summarizeTraffic(httpRecords: readonly BenchHttpAttemptRecord[]): TrafficSummary {
+  const requests: Record<string, number> = {};
+  const attempts = { fivexx: 0, retries: 0, secondaryByKind: {} as Record<string, number> };
+  let measuredCostSum = 0;
+  let imputed = 0;
+  let secondarySignals = 0;
+  let httpBodyBytes = 0;
+  for (const r of httpRecords) {
+    if (r.servedFromCache) continue;
+    if (r.requestClass === "rest-meta") continue;
+    requests[r.requestClass] = (requests[r.requestClass] ?? 0) + 1;
+    httpBodyBytes += r.bodyBytes;
+    if (r.status >= 500) attempts.fivexx++;
+    if (r.attempt > 1) attempts.retries++;
+    if (r.kind === "graphql") {
+      if (r.pointsCost !== null) measuredCostSum += r.pointsCost;
+      else imputed += 1;
+    }
+    if (r.secondarySignal !== null) {
+      secondarySignals++;
+      attempts.secondaryByKind[r.secondarySignal] = (attempts.secondaryByKind[r.secondarySignal] ?? 0) + 1;
+    }
+  }
+  return { requests, attempts, points: { measuredCostSum, imputed }, secondarySignals, httpBodyBytes };
+}
+
+// The end of a measured run, in the order §4.6 actually licenses.
+//
+// Reclamation is INSIDE the clock on purpose: production holds the unit slot through synchronous
+// reclamation, so stopping at the last resolved entry would structurally favour clone drivers,
+// whose teardown is the expensive one (§4.6.1). Instrumentation is a different animal — §4.6
+// mandates COLLECTING disk data, never charging its collection to the wall — and charging it
+// biased the comparison toward whichever driver materialised fewer files.
+export async function finishMeasuredRun(opts: {
+  wall: WallClock;
+  sampler: { finish: () => Promise<DiskSnapshot> };
+  reclaim: () => boolean;
+}): Promise<{ wallMs: number; disk: DiskSnapshot; diskReclaimFailed: boolean }> {
+  opts.wall.pause();
+  const disk = await opts.sampler.finish(); // sampled before reclamation removes what it measures
+  opts.wall.start();
+  const diskReclaimFailed = opts.reclaim();
+  return { wallMs: opts.wall.stop(), disk, diskReclaimFailed };
+}
+
+// Per-run resource reclamation, run by EVERY exit path (normal, drift-restart, and the throws
+// that escape before the driver's try-block). The run cache DB is documented as "one file per
+// run, deleted at teardown", so a path that returns without closing it leaks both the handle and
+// its -wal/-shm sidecars while the emitted record still claims a clean reclaim.
+// Returns whether anything failed to reclaim — verified, never assumed (finding 18).
+export function reclaimRunResources(db: { close: () => void }, runDir: string, dbPath: string): boolean {
+  let failed = false;
+  try {
+    db.close();
+  } catch {
+    failed = true; // a close failure must not mask the run outcome, but it IS a reclaim failure
+  }
+  try {
+    rmSync(runDir, { recursive: true, force: true });
+    for (const suffix of ["", "-wal", "-shm"]) rmSync(`${dbPath}${suffix}`, { force: true });
+  } catch {
+    failed = true;
+  }
+  if (existsSync(runDir)) failed = true;
+  for (const suffix of ["", "-wal", "-shm"]) if (existsSync(`${dbPath}${suffix}`)) failed = true;
+  return failed;
+}
+
 export class WallClock {
   private activeMs = 0;
   private startedAt: number | null = null;
@@ -404,6 +437,8 @@ export interface EngineOptions {
   runsLog: RunsLog;
   client: GithubClient; // meta traffic (rate_limit, env manifest probes); drivers get their own per-run client
   makeClient: (db: AuditDb | null) => GithubClient;
+  // seam for CI: the default samples disk off-thread, which a test cannot drive deterministically
+  makeDiskSampler?: () => DiskSamplerPort;
   log: (line: string) => void;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -509,6 +544,18 @@ export class BenchEngine {
     // (production --fresh preserves them by design) (codex R2 f.24)
     const dbPath = join(this.o.runCacheDir, `bench-run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-${process.pid}-${this.now()}-${this.runCounter}.sqlite`);
     const db = AuditDb.open({ sqlitePath: dbPath, fresh: true, purgeCache: true });
+    // The run's resources are owned from HERE, not from the driver's try-block. Several paths
+    // leave before that block — the mid-unit drift restart, and throws from probeLiveHead /
+    // reserve / the pre-run rate-limit read / planning — and each previously leaked the open
+    // handle plus its -wal/-shm sidecars while the emitted record still claimed a clean reclaim.
+    // Idempotent so the scored teardown can run it and the outer finally stays a no-op.
+    let reclaimed = false;
+    const reclaimOnce = (): boolean => {
+      if (reclaimed) return false;
+      reclaimed = true;
+      return reclaimRunResources(db, runDir, dbPath);
+    };
+    try {
     const client = this.o.makeClient(db);
     const httpRecords: BenchHttpAttemptRecord[] = [];
     const spawnRecords: BenchSpawnRecord[] = [];
@@ -565,6 +612,7 @@ export class BenchEngine {
           // part of the RECORDED lifecycle — a drift-restart record lands in runs.jsonl and the
           // caller's loop routes it to the epilogue (codex R2 f.19).
           this.unitForms.set(row.unit, "scaffolding");
+          const driftReclaimFailed = reclaimOnce();
           const driftRecord: RunRecord = {
             type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
             probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: "production", startedAtIso: new Date(this.now()).toISOString(),
@@ -573,14 +621,16 @@ export class BenchEngine {
             secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
             bucketDeltas: { core: { valid: true, used: 0 }, graphql: { valid: true, used: 0 } },
             bucketSnapshots: [],
-            expectedConsumption: { core: 0, graphql: 0 }, replayOfPos: null, replayKind: null, diskReclaimFailed: false,
+            expectedConsumption: { core: 0, graphql: 0 }, replayOfPos: null, replayKind: null,
+            // reclaim BEFORE the record is built, so the flag reports what actually happened
+            // rather than asserting a teardown this path used to skip entirely
+            diskReclaimFailed: driftReclaimFailed,
             probeDivergences: 0, httpBodyBytes: 0, cloneObjectStoreBytes: null,
             diskSampledPeakBytes: 0, diskSamples: 0, fallbackSpend: 0, routesDelivered: {},
             g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
             envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
           };
           this.o.runsLog.append(driftRecord);
-          rmSync(runDir, { recursive: true, force: true });
           return { outcome: null, verification: null, record: driftRecord };
         } else {
           form = "production";
@@ -612,9 +662,9 @@ export class BenchEngine {
     }
     const before = await readRateLimit(ghMeta);
     segBefore = before;
-    const sampler = new DiskSampler();
-    sampler.start(runDir, cfg.protocol.diskSamplerHz);
+    const sampler: DiskSamplerPort = this.o.makeDiskSampler?.() ?? new WorkerDiskSampler();
     sampler.extraFiles([dbPath, `${dbPath}-wal`, `${dbPath}-shm`]); // the run's FULL footprint incl. cache sidecars (R2 f.29)
+    sampler.start(runDir, cfg.protocol.diskSamplerHz);
 
     if (this.childPool.pool === null) this.childPool.pool = makeChildPool(cfg.frame.childPoolSize);
     const liveState = { fallbackSpend: 0, routesDelivered: {} as Record<string, number> };
@@ -625,7 +675,6 @@ export class BenchEngine {
       acquisitionForm: form,
       fallbackBudget: restFallbackBudgetFor(cfg, workload.entries.length),
       liveState,
-      onCloneDirReady: () => sampler.point(runDir),
       ...(segmented
         ? {
             segments: {
@@ -682,42 +731,40 @@ export class BenchEngine {
         failureCause = `harness/driver error: ${e instanceof Error ? e.message : String(e)}`;
       }
     }
-    // teardown INSIDE the wall: production holds the unit slot through synchronous reclamation
-    // (§4.6.1) — clone-dir removal is part of the measured cost.
-    let cloneObjectStoreBytes: number | null = null;
-    if (outcome?.cloneDir != null) {
-      cloneObjectStoreBytes = duBytes(join(outcome.cloneDir, ".git"));
-      sampler.point(runDir);
-    }
-    let diskReclaimFailed = false;
-    try {
-      db.close();
-    } catch {
-      // a close failure must not mask the run outcome; the file removal below still runs
-    }
-    try {
-      rmSync(runDir, { recursive: true, force: true });
-      for (const suffix of ["", "-wal", "-shm"]) rmSync(`${dbPath}${suffix}`, { force: true });
-    } catch {
-      diskReclaimFailed = true;
-    }
-    if (existsSync(runDir)) diskReclaimFailed = true; // verified reclaim, never assumed (finding 18)
-    const wallMs = wall.stop();
+    // §4.6.1 keeps RECLAMATION inside the wall (production holds the unit slot through
+    // synchronous reclamation, so stopping at the last resolved entry would structurally favour
+    // clone drivers). It does not license charging INSTRUMENTATION to the same clock, so the
+    // disk snapshot is taken with the wall paused — see finishMeasuredRun.
+    const finished = await finishMeasuredRun({
+      wall,
+      sampler: { finish: () => sampler.finish(runDir, outcome?.cloneDir != null ? join(outcome.cloneDir, ".git") : null) },
+      reclaim: reclaimOnce,
+    });
+    const cloneObjectStoreBytes = finished.disk.cloneObjectStoreBytes;
+    const diskReclaimFailed = finished.diskReclaimFailed;
+    const disk = finished.disk;
+    const wallMs = finished.wallMs;
     if (r5 !== null) {
       // the minimal terminal R5 record lands BEFORE any fallible post-run work (codex R2 f.18)
+      const r5traffic = summarizeTraffic(httpRecords);
       const r5record: RunRecord = {
         type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
         probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: needsClonePath ? form : null,
         startedAtIso, wallMs, segments: segmentSizes.length, outcome: "halt-r5-breach",
-        failureCause, failureEvidence: null, requests: {}, attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
-        secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
+        failureCause, failureEvidence: null,
+        // an R5 halt is the evidence a freeze repair is diagnosed from, so it carries the partial
+        // traffic it actually observed rather than zeroes — through the SAME control-plane rule
+        // the normal record uses, which this literal previously contradicted
+        requests: r5traffic.requests, attempts: r5traffic.attempts,
+        secondarySignals: r5traffic.secondarySignals, points: r5traffic.points,
         bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
         bucketSnapshots,
         expectedConsumption: { core: liveCoreAttempts, graphql: liveGraphqlPoints },
         replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed, probeDivergences: 0,
-        httpBodyBytes: httpRecords.reduce((n, r) => n + (r.servedFromCache ? 0 : r.bodyBytes), 0),
-        cloneObjectStoreBytes, diskSampledPeakBytes: sampler.stop().peakBytes, diskSamples: 0,
-        fallbackSpend: 0, routesDelivered: {}, g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
+        httpBodyBytes: r5traffic.httpBodyBytes,
+        cloneObjectStoreBytes, diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples,
+        fallbackSpend: liveState.fallbackSpend, routesDelivered: liveState.routesDelivered,
+        g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
         envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
       };
       this.o.runsLog.append(r5record);
@@ -725,7 +772,6 @@ export class BenchEngine {
       throw r5;
     }
     const after = await readRateLimit(ghMeta);
-    const disk = sampler.stop();
     if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
 
     // per-segment same-window deltas, summed by construction (§4.6.2); the final (or only)
@@ -759,26 +805,10 @@ export class BenchEngine {
       }
     }
 
-    const requests: Record<string, number> = {};
-    const attempts = { fivexx: 0, retries: 0, secondaryByKind: {} as Record<string, number> };
-    let measuredCostSum = 0;
-    let imputed = 0;
-    let secondarySignals = 0;
-    for (const r of httpRecords) {
-      if (r.servedFromCache) continue;
-      if (r.requestClass === "rest-meta") continue; // control-plane probes are never driver evidence (codex R3 f.7)
-      requests[r.requestClass] = (requests[r.requestClass] ?? 0) + 1;
-      if (r.status >= 500) attempts.fivexx++;
-      if (r.attempt > 1) attempts.retries++;
-      if (r.kind === "graphql") {
-        if (r.pointsCost !== null) measuredCostSum += r.pointsCost;
-        else imputed += 1;
-      }
-      if (r.secondarySignal !== null) {
-        secondarySignals++;
-        attempts.secondaryByKind[r.secondarySignal] = (attempts.secondaryByKind[r.secondarySignal] ?? 0) + 1;
-      }
-    }
+    // control-plane probes are never driver evidence (codex R3 f.7) — one rule, one place
+    const traffic = summarizeTraffic(httpRecords);
+    const { requests, attempts, secondarySignals } = traffic;
+    const { measuredCostSum, imputed } = traffic.points;
 
     const horizon = outstandingHorizonMs(gh);
     const washoutAppliedMs = washoutMs(cfg, horizon, this.now());
@@ -799,7 +829,7 @@ export class BenchEngine {
       diskReclaimFailed,
       probeDivergences: verification?.probeDivergences.length ?? 0,
       // body bytes derive from the RECORDS so a thrown driver still reports its real transfer
-      httpBodyBytes: httpRecords.reduce((n, r) => n + (r.servedFromCache || r.requestClass === "rest-meta" ? 0 : r.bodyBytes), 0),
+      httpBodyBytes: traffic.httpBodyBytes,
       cloneObjectStoreBytes,
       diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples,
       fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
@@ -825,6 +855,11 @@ export class BenchEngine {
     await this.sleep(washoutAppliedMs);
     this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
     return { outcome, verification, record };
+    } finally {
+      // a no-op on every path that already reclaimed; the backstop for the ones that throw
+      // before the scored teardown is reached
+      reclaimOnce();
+    }
   }
 
   private gitEnvFor(probeRep: boolean): Record<string, string> {
@@ -842,7 +877,8 @@ export class BenchEngine {
     return env;
   }
 
-  // §9 diagnostic pilot: K reps of the pinned pilot driver on the pinned slot; the spread feeds
+  // §4.7/§8's pre-ratification diagnostic pilot: K reps of the pinned pilot driver on the pinned
+  // slot; the spread feeds
   // the frozen noise-band formula. Declared non-decision.
   async runPilot(schedulePositions: number): Promise<{ walls: number[]; spread: number }> {
     const cfg = this.o.cfg;

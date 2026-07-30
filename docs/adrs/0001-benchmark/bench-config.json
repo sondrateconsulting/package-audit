@@ -106,7 +106,7 @@
     }
   },
   "budget": {
-    "$comment": "\u00a74.8 worst-case reservation. P_max is a FROZEN ASSUMPTION: any measured per-request cost above it, or any run overrunning its own WC, halts the matrix (R5 freeze repair). rate_limit reads are excluded (documented as not counting against the REST primary limit). Formulas (evaluated in benchBudget.ts): REST WC_core = (contentRequests + treeRequests + fallbackBudget) \u00d7 attemptCap + attemptCap (the \u00a74.4 SHA-classifier attempt-loop allowance) + fixedPerRunOverheadRequests; GraphQL WC_graphql = plannedBatches \u00d7 (1 + maxDescendantsPerOriginal) \u00d7 attemptCap \u00d7 pMax.",
+    "$comment": "\u00a74.8 worst-case reservation. P_max is a FROZEN ASSUMPTION: any measured per-request cost above it, or any run overrunning its own WC, halts the matrix (R5 freeze repair). rate_limit reads are excluded (documented as not counting against the REST primary limit). Formulas (evaluated by computeWorstCase/planSegments in benchProtocol.ts): REST WC_core = (contentRequests + treeRequests + fallbackBudget) \u00d7 attemptCap + attemptCap (the \u00a74.4 SHA-classifier attempt-loop allowance) + fixedPerRunOverheadRequests; GraphQL WC_graphql = plannedBatches \u00d7 (1 + maxDescendantsPerOriginal) \u00d7 attemptCap \u00d7 pMax.",
     "pMaxPointsPerGraphqlAttempt": 10,
     "headroomFactor": 1.1,
     "bucketCapacityPerHour": 5000,

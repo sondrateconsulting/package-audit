@@ -577,6 +577,15 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
    synchronous reclamation, so stopping the clock at the last resolved entry would structurally
    favour clone drivers, whose teardown is the expensive one. For §4.8 segmented runs, the sum of
    segment walls, with inter-segment sleeps excluded and the segment count reported).
+   **The harness's own instrumentation is excluded** *(amended at Step B; §8 records the
+   re-ratification)*:
+   teardown is production-equivalent work and is therefore scored, but MEASURING a run is not part
+   of performing it. Concretely, the wall pauses across the disk snapshot and resumes for
+   reclamation. This distinction is not cosmetic — the disk metric (item 4) walks the run directory,
+   whose cost scales with entry count, so charging it to the wall taxes whichever driver
+   materialised more files. That is exactly the axis under test, and the §8 pilot could not have
+   revealed it: the pilot configuration (T0 on C2) creates no checkout, so its instrumentation cost
+   is ~0 and the calibrated noise band never saw the effect.
 2. HTTP requests by class: REST content, REST tree, REST fallback, GraphQL requests. **Bucket
    consumption is the authoritative figure, measured within a single reset window**: the harness
    records `(remaining, reset-epoch)` before and after; a delta is valid only when the epoch is
@@ -592,8 +601,17 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
    on-disk object-store bytes after acquisition (clone drivers — labelled on-disk, since git
    reports no clean transfer-byte figure without packet tracing).
 4. Peak disk under the run's temp dir, measured as a **sampled peak**: a bench-local sampler polls
-   the run directory's usage at 1 Hz and takes the maximum, supplemented by post-acquisition and
-   post-run point measurements; declared as sampled-peak-at-1 Hz, an approximation by nature.
+   the run directory's usage at 1 Hz and takes the maximum, supplemented by a final point
+   measurement taken after the driver returns; declared as sampled-peak-at-1 Hz, an approximation
+   by nature. *(Amended at Step B:* the walk executes on a **worker thread**, and the final point
+   sample plus the clone object-store read are taken with the wall paused — see item 1. The
+   original text also described a "post-acquisition" point sample; that hook in fact fired
+   *before* the clone command ran, so it sampled an empty directory and has been removed rather
+   than corrected. Moving the walk off the measured thread removes the event-loop blocking, which
+   is the dominant and clearly driver-correlated part of the effect; it does **not** claim to
+   remove all resource contention, since a walk on another thread still competes for CPU and disk
+   bandwidth with the git subprocess under test. That residual is second-order and undeclared as a
+   correction.*)
 5. Failures: 5xx, timeouts, retries (attempt-counted), fallback count by cause (symlink, binary,
    truncated, content-cap-singleton, batch-error, validation, timeout-singleton, missing-alias),
    incomplete entries, secondary-limit signals by kind, rerun usage with recorded cause.
