@@ -258,6 +258,23 @@ describe("InlineDiskSampler + finish() contract (santa round 2)", () => {
     expect(snap.peakBytes).toBe(4096);
     expect(snap.sampleError).toBeNull();
   });
+  test("abandon() releases the sampler without a snapshot — the R5 path's only disposer", async () => {
+    // R5 peeks and throws; it never calls finish(), which is the only other disposer. Without
+    // abandon() the tick timer stays armed and (for the worker sampler) the worker outlives the
+    // run. Driving the REAL worker here so a no-op abandon() would leave it alive.
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-abandon-"));
+    writeFileSync(join(root, "f"), "k".repeat(256));
+    const s = new WorkerDiskSampler();
+    s.start(root, 50);
+    await new Promise((r) => setTimeout(r, 120));
+    const peeked = s.peek();
+    s.abandon();
+    expect(() => s.abandon()).not.toThrow(); // idempotent
+    // after abandon the sampler is inert: a later tick cannot revive the worker or add samples
+    await new Promise((r) => setTimeout(r, 120));
+    expect(s.peek().samples).toBe(peeked.samples);
+    rmSync(root, { recursive: true, force: true });
+  }, 10_000);
   test("peek() is synchronous, infallible, and reports no clone measurement", () => {
     // the R5 halt path uses this INSTEAD of finish(), so nothing fallible precedes that record
     const s = new InlineDiskSampler(() => 4096, () => { throw new Error("would have thrown"); });

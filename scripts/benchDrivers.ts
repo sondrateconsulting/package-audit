@@ -45,15 +45,27 @@ export function describeDisposal(d: BatchChildDisposal): string {
 }
 
 export class UnitFailure extends Error {
-  readonly cause2: string;
+  // NOT readonly, but only writable through annotateTeardown below: the engine records `cause2`
+  // (not `message`), so evidence discovered during teardown must land HERE or it never reaches
+  // runs.jsonl — a mutation of `message` alone is invisible to the record.
+  private mutableCause: string;
+  get cause2(): string {
+    return this.mutableCause;
+  }
   // when the terminal condition was HTTP-shaped (e.g. the circuit breaker tripped on repeated
   // no-response dispatches), the typed R1/R2 evidence survives the breaker (codex R2 f.14)
   readonly httpEvidence: { code: string; lastClassification: string | null; requestClass: string | null } | null;
   constructor(cause: string, httpEvidence: { code: string; lastClassification: string | null; requestClass: string | null } | null = null) {
     super(`UNIT FAILURE: ${cause}`);
     this.name = "UnitFailure";
-    this.cause2 = cause;
+    this.mutableCause = cause;
     this.httpEvidence = httpEvidence;
+  }
+  /** Append teardown evidence found AFTER this was thrown — the batch child's disposal verdict,
+   *  which is only available in the finally that runs on the way out. */
+  annotateTeardown(note: string): void {
+    this.mutableCause = `${this.mutableCause} — ${note}`;
+    this.message = `UNIT FAILURE: ${this.mutableCause}`;
   }
 }
 // Confirmed upstream drift (R6 branch arm): the live head moved off the pinned SHA. The engine
@@ -605,9 +617,13 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
       finalDisposal = null;
     } finally {
       // on the EXCEPTION path the post-finally check below never runs, so the verdict would be
-      // captured and discarded exactly as before. Attach it to the error instead of losing it.
-      if (thrown !== null && finalDisposal !== null && !disposalIsClean(finalDisposal))
-        thrown.message = `${thrown.message} — batch child teardown was also unclean: ${describeDisposal(finalDisposal)}`;
+      // captured and discarded exactly as before. Attach it to the error instead of losing it —
+      // via annotateTeardown, because the engine records UnitFailure.cause2, NOT .message.
+      if (thrown !== null && finalDisposal !== null && !disposalIsClean(finalDisposal)) {
+        const note = `batch child teardown was also unclean: ${describeDisposal(finalDisposal)}`;
+        if (thrown instanceof UnitFailure) thrown.annotateTeardown(note);
+        else thrown.message = `${thrown.message} — ${note}`;
+      }
       holder.release?.();
     }
   }

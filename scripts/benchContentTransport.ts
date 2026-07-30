@@ -990,6 +990,12 @@ async function cmdFidelity(): Promise<void> {
               const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
               delivered = res.body;
               route = analysis.outcomes[0].kind === "validation-fallback" ? "validation-fallback" : analysis.outcomes[0].kind;
+            } else if (analysis.kind === "http-failure") {
+              // 5xx / no HTTP response / non-JSON body is a TRANSIENT condition, not an
+              // observation about T1's fidelity. Recording it as a route would append a
+              // pass:false row to the append-only fidelity log and disqualify the driver
+              // globally and irreversibly (§4.7) — the same shape as the ls-tree hole.
+              throw new BenchOperationalError(`fidelity T1 dispatch failed for ${entry.path}: HTTP ${d.status} — a transport-level failure is a harness fault; re-run the battery`);
             } else {
               route = `unresolved:${analysis.kind}`;
             }

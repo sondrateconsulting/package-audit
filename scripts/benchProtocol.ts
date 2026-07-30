@@ -774,6 +774,10 @@ export class BenchEngine {
         envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
       };
       this.o.runsLog.append(r5record);
+      // the row is durable now, so releasing the sampler can no longer cost us the evidence.
+      // Without this the tick timer stays armed and the worker outlives the run — finish() is
+      // the only other disposer and this path deliberately never calls it.
+      sampler.abandon();
       this.replayOfPos = null;
       throw r5;
     }

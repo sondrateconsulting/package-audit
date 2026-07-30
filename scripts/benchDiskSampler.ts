@@ -30,6 +30,10 @@ export interface DiskSamplerPort {
   /** The peak observed SO FAR, synchronously and infallibly. Used where a record must land
    *  before any fallible work (the R5 halt row) and cannot wait on a worker round-trip. */
   peek(): DiskSnapshot;
+  /** Release the sampler WITHOUT taking a snapshot. Synchronous, infallible, idempotent — for
+   *  the paths that peek() and then abandon the run (R5), which would otherwise leave the tick
+   *  timer armed and the worker alive. */
+  abandon(): void;
 }
 
 const intervalMsFor = (hz: number): number => Math.max(1, Math.round(1000 / hz));
@@ -64,6 +68,9 @@ abstract class BaseSampler implements DiskSamplerPort {
   }
   peek(): DiskSnapshot {
     return { peakBytes: this.peak, samples: this.samples, cloneObjectStoreBytes: null, sampleError: null };
+  }
+  abandon(): void {
+    this.stopTimer();
   }
   abstract start(dir: string, hz: number): void;
   abstract finish(dir: string, cloneGitDir: string | null): Promise<DiskSnapshot>;
@@ -211,6 +218,13 @@ export class WorkerDiskSampler extends BaseSampler {
       }
     }, intervalMsFor(hz));
     this.timer.unref?.();
+  }
+  override abandon(): void {
+    // R5 peeks and then throws: without this the tick timer stays armed and the worker stays
+    // alive for the rest of the process, since finish() (the only other disposer) never runs.
+    this.stopTimer();
+    this.pending.clear();
+    this.disposeWorker();
   }
   private finishing: Promise<DiskSnapshot> | null = null;
   finish(dir: string, cloneGitDir: string | null): Promise<DiskSnapshot> {

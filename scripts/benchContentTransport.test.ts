@@ -10,7 +10,7 @@ import {
   BenchOperationalError, assertFreezeGitState, classifyFidelityEnumeration,
   harnessCommitFromGitResult, parseProbeBatch,
 } from "./benchContentTransport.ts";
-import { describeDisposal } from "./benchDrivers.ts";
+import { UnitFailure, describeDisposal } from "./benchDrivers.ts";
 import type { WorkloadEntry } from "./benchWorkload.ts";
 
 const bytes = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -135,6 +135,26 @@ describe("describeDisposal — the batch child's teardown verdict survives", () 
   });
   test("dropped stderr bytes are disclosed, never silently omitted", () => {
     expect(describeDisposal(disposal({ stderrDroppedBytes: 4096 }))).toContain("4096B dropped");
+  });
+});
+
+describe("UnitFailure.annotateTeardown — teardown evidence must reach the RECORD", () => {
+  // The engine writes `failureCause = e.cause2`, not `e.message`. A previous fix annotated
+  // `message` only, so the batch child's disposal diagnosis was preserved in an error nobody
+  // read and still absent from runs.jsonl — the exact discard it was meant to fix.
+  test("the annotation lands on cause2, which is what the run record reads", () => {
+    const f = new UnitFailure("batch child died twice: deadline expired");
+    f.annotateTeardown("batch child teardown was also unclean: protocol fault: poisoned");
+    expect(f.cause2).toContain("died twice");
+    expect(f.cause2).toContain("teardown was also unclean");
+    expect(f.message).toContain("teardown was also unclean"); // message stays consistent
+  });
+  test("httpEvidence survives annotation — the typed R1/R2 evidence is not collateral", () => {
+    const ev = { code: "no-response", lastClassification: "transient", requestClass: "graphql-batch" };
+    const f = new UnitFailure("breaker tripped", ev);
+    f.annotateTeardown("teardown unclean");
+    expect(f.httpEvidence).toEqual(ev);
+    expect(f.cause2.startsWith("breaker tripped")).toBe(true);
   });
 });
 

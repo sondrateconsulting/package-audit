@@ -10,7 +10,7 @@
   },
   "noiseBand": 1.25,
   "pilotSpread": 1.034,
-  "frozenSurfaceDigest": "c326c34f5364df11d9f4f6a698003251f32367d86556aad32140bc47bdb3fd34",
+  "frozenSurfaceDigest": "26f00497dc7360e070d2167d4e8f1338668938eba261c25cc842597897597442",
   "amendments": [
     {
       "at": "Step B, post-ratification review round",
@@ -41,6 +41,11 @@
         "pilot.json was READ by the freeze gate but excluded from the digest, so its walls, spread, reps, driver, or slot could be edited freely as long as noiseBand still matched. It is now inside the frozen artifact set",
         "diskSampleError was write-only: nothing logged or acted on it, so a degraded disk row could later read as a real measurement. It now emits an explicit operator warning naming the affected row",
         "runT2c's exception path assigned the disposal verdict in its finally and then skipped the check, discarding the diagnosis exactly as before; an unclean teardown now annotates the propagating error"
+      ],
+      "alsoFixedInReviewRound4": [
+        "the R5 halt path peeked the sampler and threw without ever releasing it — finish() is the only other disposer and that path deliberately never calls it, so the tick timer stayed armed and the worker outlived the run. A synchronous, infallible, idempotent abandon() now runs immediately after the row is durable",
+        "the runT2c exception-path teardown annotation was written to Error.message, but the engine records UnitFailure.cause2 — so the disposal diagnosis was preserved in a field nothing reads and remained absent from runs.jsonl. UnitFailure now exposes annotateTeardown(), which updates cause2 (and keeps message consistent)",
+        "the T1 fidelity path mapped an http-failure analysis (5xx / no HTTP response / non-JSON body — all TRANSIENT) to route 'unresolved:http-failure' and appended a pass:false row, manufacturing a permanent never-rerunnable driver disqualification from a transport blip. This is the third instance of that defect class found in this harness; it now raises BenchOperationalError like the ls-tree path"
       ],
       "ratifiedAnswersUnchanged": true,
       "note": "The four §8 sign-off answers below are untouched and remain as rvo recorded them on 2026-07-28. This amendment changes the measurement surface, not the decisions: the noise band, protocol constants, corpus pinning, and symlink policy are all unaffected. No timed matrix data existed to invalidate — the matrix has never run.",
