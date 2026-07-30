@@ -800,12 +800,19 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
   const benchRoot = mkdtempSync(join(realpathSync(tmpdir()), cfg.protocol.tempPrefix));
   const metaClient = new GithubClient({ githubHost: cfg.githubHost, db: null, tempRoot: benchRoot });
   const login = ((await metaClient.restGetJson("user")) as { login?: string }).login ?? "unknown";
-  // the bench identity is FAIL-CLOSED when declared (§8 environment amendment; codex
-  // amendment-review finding 2): an omitted or mistyped GH_TOKEN must never silently fall
-  // back to the operator's stored auth and collect a whole matrix under the wrong identity
-  const expectedLogin = process.env["BENCH_EXPECTED_LOGIN"] ?? "";
+  // the bench identity is FAIL-CLOSED and bound in the TRACKED signed record (§8 environment
+  // amendment; codex amendment-review rounds 1–2): once ratification.json declares benchLogin,
+  // EVERY engine construction refuses any other authenticated identity — an omitted or
+  // mistyped GH_TOKEN can never silently fall back to the operator's stored auth, no matter
+  // which entrypoint or launcher started the process. BENCH_EXPECTED_LOGIN remains as an
+  // additional pre-ratification guard.
+  let expectedLogin = process.env["BENCH_EXPECTED_LOGIN"] ?? "";
+  if (existsSync(RATIFICATION_PATH)) {
+    const ratLogin = (JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>)["benchLogin"];
+    if (typeof ratLogin === "string" && ratLogin !== "") expectedLogin = ratLogin;
+  }
   if (expectedLogin !== "" && login !== expectedLogin)
-    throw new Error(`REFUSING: authenticated as ${JSON.stringify(login)} but BENCH_EXPECTED_LOGIN=${expectedLogin} — set GH_TOKEN to the dedicated bench identity's token (§8)`);
+    throw new Error(`REFUSING: authenticated as ${JSON.stringify(login)} but the bench identity is ${expectedLogin} — set GH_TOKEN to the dedicated bench identity's token (§8; ratification.json benchLogin)`);
   const harnessCommit = text(await runBenchGit({
     argv: ["rev-parse", "HEAD"], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
     benchRoot: realpathSync(REPO_ROOT), cwd: REPO_ROOT,
