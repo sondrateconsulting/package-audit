@@ -12,6 +12,8 @@ import {
   washoutMs,
 } from "./benchProtocol.ts";
 import { InlineDiskSampler, WorkerDiskSampler, parseDiskWalkReply } from "./benchDiskSampler.ts";
+import { parseDiskWalkRequest } from "./benchDiskWorker.ts";
+import { DiskWalkError, duBytes, duBytesStrict } from "./benchDiskWalk.ts";
 import type { BenchHttpAttemptRecord } from "./benchGh.ts";
 import { buildUnitWorkload, seamStringSha256, type WorkloadEntry } from "./benchWorkload.ts";
 import type { EntryDelivery } from "./benchDrivers.ts";
@@ -215,10 +217,24 @@ describe("InlineDiskSampler + finish() contract (santa round 2)", () => {
   // could therefore silently become 0. And because finish() sits between the driver returning
   // and the record being appended, a throw here would have eaten the run row (including an R5
   // halt record, which is the evidence a freeze repair is diagnosed from).
-  test("a failed clone-store walk yields null, never a fabricated 0", async () => {
-    const s = new InlineDiskSampler((dir) => { if (dir.includes(".git")) throw new Error("walk blew up"); return 500; });
+  test("the DEFAULT clone-store walker is strict — an unreadable store is null, not 0", async () => {
+    // Regression for a real hole: the first fix injected a THROWING walk in its test, so it
+    // stayed green while the production default still used the tolerant duBytes, which returns
+    // 0 for an unreadable root. This drives the default walker against a store that does not
+    // exist, which the tolerant walker would happily report as 0 bytes.
+    const s = new InlineDiskSampler((_d, _e) => 500); // sampling walk stubbed; strict one is REAL
+    const snap = await s.finish("/run", "/definitely/not/a/real/git/store");
+    expect(snap.cloneObjectStoreBytes).toBeNull();
+    expect(snap.sampleError).toContain("cannot read");
+  });
+  test("duBytesStrict throws where duBytes silently returns 0", () => {
+    expect(duBytes("/definitely/not/a/real/path")).toBe(0);        // tolerant: a SAMPLE
+    expect(() => duBytesStrict("/definitely/not/a/real/path")).toThrow(DiskWalkError); // strict: a MEASUREMENT
+  });
+  test("an injected walk failure still yields null rather than a fabricated 0", async () => {
+    const s = new InlineDiskSampler(() => 500, () => { throw new Error("walk blew up"); });
     const snap = await s.finish("/run", "/run/clone/.git");
-    expect(snap.cloneObjectStoreBytes).toBeNull(); // NOT 0 — absence of measurement, not zero bytes
+    expect(snap.cloneObjectStoreBytes).toBeNull();
     expect(snap.sampleError).toContain("walk blew up");
   });
   test("instrumentation failure degrades the disk fields but never throws", async () => {
@@ -236,11 +252,19 @@ describe("InlineDiskSampler + finish() contract (santa round 2)", () => {
     expect(calls).toBe(1); // the second call re-walks nothing
   });
   test("a clean walk records the clone store and no error", async () => {
-    const s = new InlineDiskSampler((dir) => (dir.includes(".git") ? 2048 : 4096));
+    const s = new InlineDiskSampler(() => 4096, () => 2048);
     const snap = await s.finish("/run", "/run/clone/.git");
     expect(snap.cloneObjectStoreBytes).toBe(2048);
     expect(snap.peakBytes).toBe(4096);
     expect(snap.sampleError).toBeNull();
+  });
+  test("peek() is synchronous, infallible, and reports no clone measurement", () => {
+    // the R5 halt path uses this INSTEAD of finish(), so nothing fallible precedes that record
+    const s = new InlineDiskSampler(() => 4096, () => { throw new Error("would have thrown"); });
+    const p = s.peek();
+    expect(p.cloneObjectStoreBytes).toBeNull();
+    expect(p.sampleError).toBeNull();
+    expect(p.samples).toBe(0);
   });
 });
 
@@ -269,6 +293,22 @@ describe("WorkerDiskSampler — the real worker-backed sampler (santa round 2)",
     expect(snap.samples).toBe(1);
     rmSync(root, { recursive: true, force: true });
   });
+  test("start() drives real periodic ticks through the worker, and they fold into the peak", async () => {
+    // Every other worker test calls finish() directly, so reverting periodic sampling to a
+    // synchronous in-wall walk would leave them green. This one exercises start().
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-worker-"));
+    writeFileSync(join(root, "a"), "a".repeat(4096));
+    const s = new WorkerDiskSampler();
+    s.start(root, 50); // 20ms period
+    await new Promise((r) => setTimeout(r, 250));
+    writeFileSync(join(root, "b"), "b".repeat(8192)); // grows while sampling
+    await new Promise((r) => setTimeout(r, 250));
+    const snap = await s.finish(root, null);
+    expect(snap.samples).toBeGreaterThan(1);          // ticks actually fired, not just the final one
+    expect(snap.peakBytes).toBeGreaterThanOrEqual(12288);
+    expect(snap.sampleError).toBeNull();
+    rmSync(root, { recursive: true, force: true });
+  }, 15_000);
   test("finish() is idempotent and terminates the worker", async () => {
     const root = mkdtempSync(join(tmpdir(), "pa-bench-worker-"));
     const s = new WorkerDiskSampler();
@@ -294,9 +334,29 @@ describe("WorkerDiskSampler — the real worker-backed sampler (santa round 2)",
     expect(parseDiskWalkReply({ seq: 1, bytes: "10" })).toBeNull();
     expect(parseDiskWalkReply({ seq: 1, bytes: Number.NaN })).toBeNull();
     expect(parseDiskWalkReply({ seq: 1, bytes: -5 })).toBeNull();
+    expect(parseDiskWalkReply({ seq: 1.5, bytes: 10 })).toBeNull();  // seq must be a safe integer
+    expect(parseDiskWalkReply({ seq: -1, bytes: 10 })).toBeNull();
     expect(parseDiskWalkReply({ bytes: 10 })).toBeNull();
     expect(parseDiskWalkReply([1, 2])).toBeNull();
     expect(parseDiskWalkReply(null)).toBeNull();
+  });
+  test("the WORKER validates its inbound request too — the main thread is not privileged input", () => {
+    expect(parseDiskWalkRequest({ seq: 0, dir: "/x", extras: [], strict: false })).toEqual({ seq: 0, dir: "/x", extras: [], strict: false });
+    expect(parseDiskWalkRequest({ seq: 0, dir: "", extras: [], strict: false })).toBeNull();
+    expect(parseDiskWalkRequest({ seq: 0, dir: "/x", extras: [1], strict: false })).toBeNull();
+    expect(parseDiskWalkRequest({ seq: 0, dir: "/x", extras: [] })).toBeNull();   // strict missing
+    expect(parseDiskWalkRequest({ seq: -1, dir: "/x", extras: [], strict: true })).toBeNull();
+    expect(parseDiskWalkRequest(null)).toBeNull();
+  });
+  test("concurrent finish() calls join ONE snapshot rather than racing two through one worker", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-worker-"));
+    writeFileSync(join(root, "f"), "q".repeat(128));
+    const s = new WorkerDiskSampler();
+    const [a, b] = await Promise.all([s.finish(root, null), s.finish(root, null)]);
+    expect(b).toEqual(a);          // same object contents — single-flight, not two walks
+    expect(a.sampleError).toBeNull();
+    expect(a.samples).toBe(1);     // exactly one final sample was taken
+    rmSync(root, { recursive: true, force: true });
   });
 });
 

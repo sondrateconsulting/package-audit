@@ -544,6 +544,7 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
   let respawns = 0;
   let firstDisposal: BatchChildDisposal | null = null;
   let finalDisposal: BatchChildDisposal | null = null;
+  let thrown: Error | null = null;
   const ensureChild = async (): Promise<BatchChild> => {
     if (holder.child !== null) return holder.child;
     if (holder.release === null) holder.release = await childPool.acquire(); // lazy spawn at first canonical read (§3.1)
@@ -591,12 +592,22 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
       st.acquiredPaths.add(entry.path);
       deliver(st, { path: entry.path, route: "primary", delivered: seamDecode(frame.body), rawVerified: true });
     }
+  } catch (e) {
+    thrown = e instanceof Error ? e : new Error(String(e));
+    throw thrown;
   } finally {
     // ordered teardown BEFORE the engine may delete the clone dir (§3.1); the pool permit is
     // released in its OWN finally so a rejected dispose can never leak it (codex R2 f.32)
     try {
       if (holder.child !== null) finalDisposal = await holder.child.dispose();
+    } catch {
+      // dispose() itself failing must never mask the in-flight error, but must not vanish either
+      finalDisposal = null;
     } finally {
+      // on the EXCEPTION path the post-finally check below never runs, so the verdict would be
+      // captured and discarded exactly as before. Attach it to the error instead of losing it.
+      if (thrown !== null && finalDisposal !== null && !disposalIsClean(finalDisposal))
+        thrown.message = `${thrown.message} — batch child teardown was also unclean: ${describeDisposal(finalDisposal)}`;
       holder.release?.();
     }
   }

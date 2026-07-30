@@ -10,7 +10,7 @@
   },
   "noiseBand": 1.25,
   "pilotSpread": 1.034,
-  "frozenSurfaceDigest": "fa99cb0bd8b5b9acda143516c8c9d348253f300992da9d63d1c65bd5c2710ed1",
+  "frozenSurfaceDigest": "c326c34f5364df11d9f4f6a698003251f32367d86556aad32140bc47bdb3fd34",
   "amendments": [
     {
       "at": "Step B, post-ratification review round",
@@ -32,6 +32,15 @@
         "cloneObjectStoreBytes was computed with the deliberately-tolerant sampling walker, so an unreadable object store could report a plausible 0 — it is a measurement, so a failed walk is now null",
         "parseProbeBatch accepted arrays and non-Blob nodes and coerced absent fields into definite facts; it now requires __typename Blob with correctly-typed fields",
         "BatchChild disposal was only rejected on an explicit protocol fault, and the fidelity path discarded the verdict entirely; both callers now require exit 0 with no fault"
+      ],
+      "alsoFixedInReviewRound3": [
+        "the round-2 entry above claimed cloneObjectStoreBytes failures became null; that claim was PREMATURE. The wrapper caught throws, but the walker underneath was still the tolerant duBytes, which returns 0 and never throws — so the catch was unreachable and a missing store still recorded a plausible 0. All three reviewers reproduced it independently. There is now a genuinely strict walker (duBytesStrict) that raises on any unreadable entry, selected per-request so sampled peaks stay tolerant and the recorded measurement does not",
+        "the worker's inbound request was cast rather than validated, and reply sequence numbers accepted fractional/negative values; both are now parsed and rejected",
+        "concurrent finish() calls raced through one worker — the first terminated it and cleared the second's pending entry without rejecting it. finish() is now single-flight: the in-progress promise is stored before the first await",
+        "the awaited walk's deadline timer was unref'd, so a worker terminated mid-finish could let the process exit 0 with no snapshot and no run row; it is now referenced for the life of the request",
+        "pilot.json was READ by the freeze gate but excluded from the digest, so its walls, spread, reps, driver, or slot could be edited freely as long as noiseBand still matched. It is now inside the frozen artifact set",
+        "diskSampleError was write-only: nothing logged or acted on it, so a degraded disk row could later read as a real measurement. It now emits an explicit operator warning naming the affected row",
+        "runT2c's exception path assigned the disposal verdict in its finally and then skipped the check, discarding the diagnosis exactly as before; an unclean teardown now annotates the propagating error"
       ],
       "ratifiedAnswersUnchanged": true,
       "note": "The four §8 sign-off answers below are untouched and remain as rvo recorded them on 2026-07-28. This amendment changes the measurement surface, not the decisions: the noise band, protocol constants, corpus pinning, and symlink policy are all unaffected. No timed matrix data existed to invalidate — the matrix has never run.",

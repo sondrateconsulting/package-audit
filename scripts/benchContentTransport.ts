@@ -95,7 +95,11 @@ function frozenSurfaceDigest(): string {
   }
   files.push(join(REPO_ROOT, "docs", "plans", "adr-0001-disagreements-resolution.md"));
   files.push(join(REPO_ROOT, "docs", "adrs", "0001-file-content-acquisition-strategy.md"));
-  files.push(CONFIG_PATH, CORPUS_PATH);
+  // pilot.json belongs here: the gate READS it (the ratified band must equal the pilot's
+  // calibrated band), so leaving it out let its walls, spread, reps, driver, or slot be edited
+  // freely as long as noiseBand still matched. ratification.json is still deliberately excluded —
+  // it must be COMMITTED, and binding a file to a digest recorded inside it is unsatisfiable.
+  files.push(CONFIG_PATH, CORPUS_PATH, join(ARTIFACTS, "pilot.json"));
   for (const tool of ["package.json", "tsconfig.json", "bun.lock", "bun.lockb"]) {
     const tp = join(REPO_ROOT, tool);
     if (existsSync(tp)) files.push(tp);

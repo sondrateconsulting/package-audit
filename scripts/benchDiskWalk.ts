@@ -29,6 +29,41 @@ export function duBytes(dir: string): number {
   return total;
 }
 
+/** A walk error the STRICT walker refuses to swallow. */
+export class DiskWalkError extends Error {
+  constructor(message: string) {
+    super(`BENCH DISK WALK: ${message}`);
+    this.name = "DiskWalkError";
+  }
+}
+
+// The strict counterpart, for RECORDED MEASUREMENTS rather than samples. `cloneObjectStoreBytes`
+// is decision evidence — the storage cost of the clone transports against the API ones — so an
+// unreadable entry must abort rather than quietly shrink the total. The tolerant walker above
+// returns 0 for an unreadable root and skips unreadable subtrees, which would land in the record
+// as a real, plausible, and wrong number.
+export function duBytesStrict(dir: string): number {
+  let total = 0;
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    throw new DiskWalkError(`cannot read ${dir}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  for (const e of entries) {
+    const p = join(dir, e.name);
+    let st: import("node:fs").Stats;
+    try {
+      st = lstatSync(p);
+    } catch (err) {
+      throw new DiskWalkError(`cannot stat ${p}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    total += st.size;
+    if (st.isDirectory()) total += duBytesStrict(p);
+  }
+  return total;
+}
+
 // The sidecars a run's cache DB may leave beside it; absent ones contribute nothing.
 export function extraBytes(paths: readonly string[]): number {
   let total = 0;

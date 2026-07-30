@@ -741,21 +741,14 @@ export class BenchEngine {
         failureCause = `harness/driver error: ${e instanceof Error ? e.message : String(e)}`;
       }
     }
-    // §4.6.1 keeps RECLAMATION inside the wall (production holds the unit slot through
-    // synchronous reclamation, so stopping at the last resolved entry would structurally favour
-    // clone drivers). It does not license charging INSTRUMENTATION to the same clock, so the
-    // disk snapshot is taken with the wall paused — see finishMeasuredRun.
-    const finished = await finishMeasuredRun({
-      wall,
-      sampler: { finish: () => sampler.finish(runDir, outcome?.cloneDir != null ? join(outcome.cloneDir, ".git") : null) },
-      reclaim: reclaimOnce,
-    });
-    const cloneObjectStoreBytes = finished.disk.cloneObjectStoreBytes;
-    const diskReclaimFailed = finished.diskReclaimFailed;
-    const disk = finished.disk;
-    const wallMs = finished.wallMs;
     if (r5 !== null) {
-      // the minimal terminal R5 record lands BEFORE any fallible post-run work (codex R2 f.18)
+      // The minimal terminal R5 record lands BEFORE any fallible post-run work (codex R2 f.18) —
+      // it is the evidence a freeze repair is diagnosed from, so nothing that can throw, await a
+      // worker, or block on reclamation may run ahead of it. wall.stop() and peek() are both
+      // synchronous and infallible; the disk snapshot is deliberately the peek, not the full
+      // finish, and the run's resources are reclaimed in the outer finally on the way out.
+      const wallMs = wall.stop();
+      const disk = sampler.peek();
       const r5traffic = summarizeTraffic(httpRecords);
       const r5record: RunRecord = {
         type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
@@ -770,10 +763,12 @@ export class BenchEngine {
         bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
         bucketSnapshots,
         expectedConsumption: { core: liveCoreAttempts, graphql: liveGraphqlPoints },
-        replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed, probeDivergences: 0,
+        // reclamation has NOT run yet on this path (it happens in the outer finally, after this
+        // record is durable), so the flag reports the only truthful value available here
+        replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed: false, probeDivergences: 0,
         httpBodyBytes: r5traffic.httpBodyBytes,
-        cloneObjectStoreBytes, diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples,
-        diskSampleError: disk.sampleError,
+        cloneObjectStoreBytes: null, diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples,
+        diskSampleError: "not sampled: R5 halt records before any fallible post-run work",
         fallbackSpend: liveState.fallbackSpend, routesDelivered: liveState.routesDelivered,
         g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
         envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
@@ -782,6 +777,19 @@ export class BenchEngine {
       this.replayOfPos = null;
       throw r5;
     }
+    // §4.6.1 keeps RECLAMATION inside the wall (production holds the unit slot through
+    // synchronous reclamation, so stopping at the last resolved entry would structurally favour
+    // clone drivers). It does not license charging INSTRUMENTATION to the same clock, so the
+    // disk snapshot is taken with the wall paused — see finishMeasuredRun.
+    const finished = await finishMeasuredRun({
+      wall,
+      sampler: { finish: () => sampler.finish(runDir, outcome?.cloneDir != null ? join(outcome.cloneDir, ".git") : null) },
+      reclaim: reclaimOnce,
+    });
+    const cloneObjectStoreBytes = finished.disk.cloneObjectStoreBytes;
+    const diskReclaimFailed = finished.diskReclaimFailed;
+    const disk = finished.disk;
+    const wallMs = finished.wallMs;
     const after = await readRateLimit(ghMeta);
     if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
 
@@ -852,6 +860,10 @@ export class BenchEngine {
       harnessCommit: this.o.runsLog.manifest.harnessCommit,
     };
     this.o.runsLog.append(record);
+    // degraded disk fields must reach the operator, not just the raw row: a silent null here
+    // would later read as "this driver used no disk" to anything scoring the §4.6 disk axis
+    if (disk.sampleError !== null)
+      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: DISK INSTRUMENTATION DEGRADED — ${disk.sampleError} (diskSampledPeakBytes/cloneObjectStoreBytes are not measurements for this row)`);
     this.replayOfPos = null;
     this.replayKind = null;
     if (verification !== null && (verification.g1Failures.length > 0 || verification.g2Failures.length > 0)) {

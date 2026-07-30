@@ -85,6 +85,9 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       "BenchOperationalError",
       // the disk sampler's own failure: degrades the run record's disk fields, never the run
       "DiskSamplerError",
+      // the STRICT disk walk's refusal — a recorded measurement that could not be taken, as
+      // opposed to the tolerant sampling walk which is allowed to skip what it cannot read
+      "DiskWalkError",
     ]);
     const declared = new Set<string>();
     // recursive: scripts/tui/ declares operator-facing classes too (TuiActivationError)

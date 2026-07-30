@@ -7,7 +7,7 @@
 //                       updates the peak. The main thread's per-tick cost is a postMessage.
 //   InlineDiskSampler — the same accounting with a synchronous walk. Correct only where nothing
 //                       is being timed (pinning, diagnostics) or where a test injects the walk.
-import { duBytes, extraBytes } from "./benchDiskWalk.ts";
+import { duBytes, duBytesStrict, extraBytes } from "./benchDiskWalk.ts";
 import type { DiskWalkReply, DiskWalkRequest } from "./benchDiskWorker.ts";
 
 export interface DiskSnapshot {
@@ -27,6 +27,9 @@ export interface DiskSamplerPort {
   /** Stop sampling and return the final snapshot. Includes a last point sample of `dir`, plus
    *  the clone object-store size when `cloneGitDir` is given. Never runs inside a timed window. */
   finish(dir: string, cloneGitDir: string | null): Promise<DiskSnapshot>;
+  /** The peak observed SO FAR, synchronously and infallibly. Used where a record must land
+   *  before any fallible work (the R5 halt row) and cannot wait on a worker round-trip. */
+  peek(): DiskSnapshot;
 }
 
 const intervalMsFor = (hz: number): number => Math.max(1, Math.round(1000 / hz));
@@ -36,10 +39,11 @@ const intervalMsFor = (hz: number): number => Math.max(1, Math.round(1000 / hz))
 export function parseDiskWalkReply(data: unknown): DiskWalkReply | null {
   if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
   const o = data as Record<string, unknown>;
-  const { seq, bytes } = o;
-  if (typeof seq !== "number" || !Number.isFinite(seq)) return null;
+  const { seq, bytes, error } = o;
+  if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
   if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return null;
-  return { seq, bytes };
+  if (error !== undefined && typeof error !== "string") return null;
+  return error === undefined ? { seq, bytes } : { seq, bytes, error };
 }
 
 abstract class BaseSampler implements DiskSamplerPort {
@@ -58,14 +62,21 @@ abstract class BaseSampler implements DiskSamplerPort {
     if (this.timer !== null) clearInterval(this.timer);
     this.timer = null;
   }
+  peek(): DiskSnapshot {
+    return { peakBytes: this.peak, samples: this.samples, cloneObjectStoreBytes: null, sampleError: null };
+  }
   abstract start(dir: string, hz: number): void;
   abstract finish(dir: string, cloneGitDir: string | null): Promise<DiskSnapshot>;
 }
 
 export class InlineDiskSampler extends BaseSampler {
   private done: DiskSnapshot | null = null;
-  constructor(private readonly walk: (dir: string, extras: readonly string[]) => number =
-    (d, e) => duBytes(d) + extraBytes(e)) {
+  constructor(
+    private readonly walk: (dir: string, extras: readonly string[]) => number =
+      (d, e) => duBytes(d) + extraBytes(e),
+    // the RECORDED measurement gets the strict walker by default; only a test overrides it
+    private readonly strictWalk: (dir: string) => number = duBytesStrict,
+  ) {
     super();
   }
   start(dir: string, hz: number): void {
@@ -85,7 +96,7 @@ export class InlineDiskSampler extends BaseSampler {
     let clone: number | null = null;
     let sampleError: string | null = null;
     try {
-      if (cloneGitDir !== null) clone = this.walk(cloneGitDir, []);
+      if (cloneGitDir !== null) clone = this.strictWalk(cloneGitDir);
       this.observe(this.walk(dir, this.extras));
     } catch (e) {
       sampleError = e instanceof Error ? e.message : String(e);
@@ -144,7 +155,11 @@ export class WorkerDiskSampler extends BaseSampler {
       }
       const settle = this.pending.get(reply.seq);
       this.pending.delete(reply.seq);
-      if (settle !== undefined) settle.resolve(reply.bytes);
+      // a strict walk that failed inside the worker comes back as an ERROR, not a smaller number
+      if (settle !== undefined) {
+        if (reply.error !== undefined) settle.reject(new DiskSamplerError(reply.error));
+        else settle.resolve(reply.bytes);
+      }
       else {
         this.inFlightTick = false;
         this.observe(reply.bytes); // an unawaited tick reply
@@ -156,16 +171,18 @@ export class WorkerDiskSampler extends BaseSampler {
     this.worker = w;
     return w;
   }
-  private request(dir: string, extras: readonly string[]): Promise<number> {
+  private request(dir: string, extras: readonly string[], strict: boolean): Promise<number> {
     if (this.failed !== null) return Promise.reject(this.failed);
     const w = this.ensureWorker();
-    const req: DiskWalkRequest = { seq: ++this.seq, dir, extras };
+    const req: DiskWalkRequest = { seq: ++this.seq, dir, extras, strict };
     return new Promise<number>((resolve, reject) => {
+      // NOT unref'd: an awaited walk is the only thing keeping the process alive between the
+      // driver returning and the run record landing. Unref'ing let a terminated worker drop the
+      // event loop to empty and exit 0 with no snapshot and no row (reproduced in review).
       const timer = setTimeout(() => {
         this.pending.delete(req.seq);
         reject(new DiskSamplerError(`walk of ${dir} did not reply within ${this.replyTimeoutMs}ms`));
       }, this.replyTimeoutMs);
-      timer.unref?.();
       this.pending.set(req.seq, {
         resolve: (b) => { clearTimeout(timer); resolve(b); },
         reject: (e) => { clearTimeout(timer); reject(e); },
@@ -188,22 +205,30 @@ export class WorkerDiskSampler extends BaseSampler {
       this.inFlightTick = true;
       try {
         const w = this.ensureWorker();
-        w.postMessage({ seq: ++this.seq, dir, extras: this.extras } satisfies DiskWalkRequest);
+        w.postMessage({ seq: ++this.seq, dir, extras: this.extras, strict: false } satisfies DiskWalkRequest);
       } catch {
         this.inFlightTick = false; // a failed tick is a lost SAMPLE, which the metric tolerates
       }
     }, intervalMsFor(hz));
     this.timer.unref?.();
   }
-  async finish(dir: string, cloneGitDir: string | null): Promise<DiskSnapshot> {
-    if (this.done !== null) return this.done; // idempotent: one snapshot per run, by contract
+  private finishing: Promise<DiskSnapshot> | null = null;
+  finish(dir: string, cloneGitDir: string | null): Promise<DiskSnapshot> {
+    if (this.done !== null) return Promise.resolve(this.done);
+    // single-flight: the in-progress promise is stored BEFORE the first await, so concurrent
+    // callers join it rather than racing two snapshots through one shared worker
+    if (this.finishing !== null) return this.finishing;
+    this.finishing = this.runFinish(dir, cloneGitDir);
+    return this.finishing;
+  }
+  private async runFinish(dir: string, cloneGitDir: string | null): Promise<DiskSnapshot> {
     this.stopTimer();
     let clone: number | null = null;
     let sampleError: string | null = null;
     try {
       // cloneObjectStoreBytes is a MEASUREMENT: a failed walk yields null, never a fabricated 0
-      if (cloneGitDir !== null) clone = await this.request(cloneGitDir, []);
-      this.observe(await this.request(dir, this.extras));
+      if (cloneGitDir !== null) clone = await this.request(cloneGitDir, [], true); // MEASUREMENT
+      this.observe(await this.request(dir, this.extras, false)); // sample
     } catch (e) {
       // NEVER propagate: this runs between the driver returning and the run record being
       // appended, and an R5 halt record in particular is the evidence a freeze repair is
