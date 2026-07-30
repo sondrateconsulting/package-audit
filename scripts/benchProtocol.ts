@@ -276,7 +276,11 @@ export interface RunRecord {
   startedAtIso: string;
   wallMs: number; // workload start → unit slot release, teardown included (§4.6.1)
   segments: number;
-  outcome: "complete" | "unit-failure" | "invalidated-straddle" | "invalidated-foreign" | "halt-r5-breach" | "drift-restart" | "re-pin-required";
+  // "invalidated-finalisation": the run was measured and reclaimed, but post-run accounting (the
+  // rate-limit read) failed. The wall stands; the consumption figures do not, so the row is
+  // invalid for scoring — recorded rather than dropped, since silently losing a completed
+  // measurement is worse than recording one that cannot be scored.
+  outcome: "complete" | "unit-failure" | "invalidated-straddle" | "invalidated-foreign" | "invalidated-finalisation" | "halt-r5-breach" | "drift-restart" | "re-pin-required";
   failureCause: string | null;
   // typed R1/R2 evidence (§4.5): the rerun predicate reads THIS, never a message regex
   failureEvidence: { kind: "http"; code: string; lastClassification: string | null; requestClass: string | null } | { kind: "unit" } | null;
@@ -773,11 +777,15 @@ export class BenchEngine {
         g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
         envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
       };
-      this.o.runsLog.append(r5record);
-      // the row is durable now, so releasing the sampler can no longer cost us the evidence.
-      // Without this the tick timer stays armed and the worker outlives the run — finish() is
-      // the only other disposer and this path deliberately never calls it.
-      sampler.abandon();
+      try {
+        this.o.runsLog.append(r5record);
+      } finally {
+        // in a finally, not after the append: appendFileSync can throw (disk full, EACCES), and
+        // on that path the sampler would otherwise stay armed with no disposer left — finish()
+        // is the only other one and this path deliberately never calls it. abandon() cannot
+        // throw, so it can never mask the append failure.
+        sampler.abandon();
+      }
       this.replayOfPos = null;
       throw r5;
     }
@@ -794,7 +802,39 @@ export class BenchEngine {
     const diskReclaimFailed = finished.diskReclaimFailed;
     const disk = finished.disk;
     const wallMs = finished.wallMs;
-    const after = await readRateLimit(ghMeta);
+    // Everything from here to the append is post-run FINALISATION: the rate-limit probe, delivery
+    // verification, and delta arithmetic. A throw in any of it used to discard a run that had
+    // already been measured and reclaimed — the wall, the traffic, and the driver's actual work
+    // all lost because a control-plane read failed afterwards. Record what we have instead.
+    let after: RateLimitSnapshot;
+    try {
+      after = await readRateLimit(ghMeta);
+    } catch (e) {
+      const partial = summarizeTraffic(httpRecords);
+      this.o.runsLog.append({
+        type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+        probe: row.probe, phase, epilogue: this.epilogueMode,
+        acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
+        startedAtIso, wallMs, segments: segmentSizes.length,
+        // the measured wall stands; only the post-run accounting is missing, so the row is
+        // marked invalid for scoring rather than dropped or passed off as complete
+        outcome: "invalidated-finalisation", failureCause: `post-run rate-limit read failed: ${e instanceof Error ? e.message : String(e)}`,
+        failureEvidence: null,
+        requests: partial.requests, attempts: partial.attempts, secondarySignals: partial.secondarySignals,
+        points: partial.points,
+        bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
+        bucketSnapshots,
+        expectedConsumption: { core: liveCoreAttempts, graphql: liveGraphqlPoints },
+        replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed, probeDivergences: 0,
+        httpBodyBytes: partial.httpBodyBytes, cloneObjectStoreBytes,
+        diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples, diskSampleError: disk.sampleError,
+        fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
+        routesDelivered: liveState.routesDelivered,
+        g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
+        envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
+      });
+      throw e;
+    }
     if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
 
     // per-segment same-window deltas, summed by construction (§4.6.2); the final (or only)

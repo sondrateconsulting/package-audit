@@ -169,6 +169,11 @@ export function analyzeBatchResponse(
   // malformed errors[] members carry no attributable signal — the closed default, never a drop
   if (d.malformedErrorEntries > 0 && d.status === 200 && d.jsonParseable)
     return { kind: "default-failure", rawCondition: `${d.malformedErrorEntries} malformed errors[] member(s)` };
+  // A non-zero `gh` exit is a FAILED transport call regardless of what its stdout parsed to.
+  // Without this a subprocess that failed — but happened to emit a parseable 200-shaped body —
+  // yielded resolved aliases, i.e. content accepted from a call that did not succeed.
+  if (d.exitCode !== 0)
+    return { kind: "http-failure", fivexxSplitCandidate: false, rawCondition: `gh exited ${d.exitCode}` };
   // HTTP-level failure first: 5xx / no response / a 200 whose body is not JSON.
   if (d.status === 0 || d.status >= 500 || (d.status === 200 && !d.jsonParseable)) {
     const bodyEmptyOrNonJson = d.bodyText.trim() === "" || !d.jsonParseable;

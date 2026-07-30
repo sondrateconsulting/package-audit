@@ -207,3 +207,26 @@ describe("split machinery", () => {
     expect(fivexxSplitConditionMet(bigBatch, 2, CFG)).toBe(true); // 200 ≥ 0.8 × 250
   });
 });
+
+describe("analyzeBatchResponse — a failed subprocess is not data (santa round 4)", () => {
+  // benchGraphqlDispatch records `gh`'s exit code, and the analyzer ignored it. A subprocess that
+  // FAILED but happened to emit a parseable 200-shaped body therefore produced resolved aliases —
+  // content accepted from a call that did not succeed. The exit code is now checked first.
+  const TXT = "hello t1\n";
+  const okEntry = entry("good.ts", { blobOid: gitBlobOid(Buffer.from(TXT, "utf8"), "sha1"), size: Buffer.byteLength(TXT) });
+  const B = buildBatchQuery([okEntry], {
+    owner: "o", repo: "r", sha: sha("0"),
+    aliasSelection: CFG.t1.aliasSelection, rateLimitRider: CFG.t1.rateLimitRider, label: "x.b0",
+  });
+  test("a non-zero gh exit is an http-failure even when the body parses as a clean 200", () => {
+    const good = dispatch({ data: { repository: { a0: aliasPayload(TXT) } } });
+    // sanity: with exitCode 0 this exact body resolves
+    expect(analyzeBatchResponse({ ...good, exitCode: 0 }, B, "sha1", CFG).kind).toBe("per-alias");
+    // the ONLY difference is the subprocess exit code
+    const failed = analyzeBatchResponse({ ...good, exitCode: 1 }, B, "sha1", CFG);
+    expect(failed.kind).toBe("http-failure");
+    if (failed.kind !== "http-failure") throw new Error("unreachable");
+    expect(failed.rawCondition).toContain("exited 1");
+    expect(failed.fivexxSplitCandidate).toBe(false); // not a 5xx shape — never a split trigger
+  });
+});

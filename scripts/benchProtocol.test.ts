@@ -346,6 +346,23 @@ describe("WorkerDiskSampler — the real worker-backed sampler (santa round 2)",
     expect(snap.cloneObjectStoreBytes).toBeNull();
     rmSync(root, { recursive: true, force: true });
   }, 10_000);
+  test("an UNSOLICITED or stale reply cannot fabricate a peak", async () => {
+    // Previously any well-shaped reply with an unrecognised sequence was folded into the peak as
+    // "an unawaited tick", so a duplicate, stale, or spurious message could invent a disk figure
+    // the filesystem never held. Only the ONE outstanding tick sequence may contribute.
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-worker-"));
+    writeFileSync(join(root, "f"), "u".repeat(512));
+    const s = new WorkerDiskSampler();
+    const before = s.peek().samples;
+    // inject a reply the sampler never asked for, straight into its handler
+    const w = (s as unknown as { ensureWorker: () => Worker }).ensureWorker();
+    (w.onmessage as (e: MessageEvent) => void)({ data: { seq: 987654, bytes: 999_999_999 } } as MessageEvent);
+    const after = s.peek();
+    expect(after.samples).toBe(before);          // not counted
+    expect(after.peakBytes).toBe(0);             // and definitely not a peak
+    s.abandon();
+    rmSync(root, { recursive: true, force: true });
+  });
   test("a malformed worker reply is rejected rather than folded into the peak as NaN", () => {
     expect(parseDiskWalkReply({ seq: 1, bytes: 10 })).toEqual({ seq: 1, bytes: 10 });
     expect(parseDiskWalkReply({ seq: 1, bytes: "10" })).toBeNull();

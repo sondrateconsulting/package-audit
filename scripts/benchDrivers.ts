@@ -557,6 +557,7 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
   let firstDisposal: BatchChildDisposal | null = null;
   let finalDisposal: BatchChildDisposal | null = null;
   let thrown: Error | null = null;
+  let disposeRejected: string | null = null;
   const ensureChild = async (): Promise<BatchChild> => {
     if (holder.child !== null) return holder.child;
     if (holder.release === null) holder.release = await childPool.acquire(); // lazy spawn at first canonical read (§3.1)
@@ -612,17 +613,23 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
     // released in its OWN finally so a rejected dispose can never leak it (codex R2 f.32)
     try {
       if (holder.child !== null) finalDisposal = await holder.child.dispose();
-    } catch {
-      // dispose() itself failing must never mask the in-flight error, but must not vanish either
-      finalDisposal = null;
+    } catch (e) {
+      // A REJECTED dispose() previously set finalDisposal = null, which the post-finally check
+      // reads as "nothing to complain about" — so a teardown that failed outright returned a
+      // clean run. Record it as an unclean verdict instead of erasing it.
+      disposeRejected = e instanceof Error ? e.message : String(e);
     } finally {
       // on the EXCEPTION path the post-finally check below never runs, so the verdict would be
       // captured and discarded exactly as before. Attach it to the error instead of losing it —
       // via annotateTeardown, because the engine records UnitFailure.cause2, NOT .message.
-      if (thrown !== null && finalDisposal !== null && !disposalIsClean(finalDisposal)) {
-        const note = `batch child teardown was also unclean: ${describeDisposal(finalDisposal)}`;
-        if (thrown instanceof UnitFailure) thrown.annotateTeardown(note);
-        else thrown.message = `${thrown.message} — ${note}`;
+      const teardownNote = disposeRejected !== null
+        ? `batch child dispose() itself failed: ${disposeRejected}`
+        : (finalDisposal !== null && !disposalIsClean(finalDisposal)
+            ? `batch child teardown was also unclean: ${describeDisposal(finalDisposal)}`
+            : null);
+      if (thrown !== null && teardownNote !== null) {
+        if (thrown instanceof UnitFailure) thrown.annotateTeardown(teardownNote);
+        else thrown.message = `${thrown.message} — ${teardownNote}`;
       }
       holder.release?.();
     }
@@ -632,6 +639,8 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
   // in-flight failure, and only on the path that would otherwise have returned success.
   // A non-zero exit, or a child that never settled, is just as disqualifying as an explicit
   // protocol fault — `git cat-file --batch` exits 0 on a clean close and nothing else.
+  if (disposeRejected !== null)
+    throw new UnitFailure(`batch child dispose() failed, so the bytes it delivered cannot be vouched for: ${disposeRejected}`);
   if (finalDisposal !== null && !disposalIsClean(finalDisposal))
     throw new UnitFailure(`batch child teardown was not clean: ${describeDisposal(finalDisposal)}`);
   return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, acquiredPaths: st.acquiredPaths, cloneDir: dir, acquisitionForm: ctx.acquisitionForm };

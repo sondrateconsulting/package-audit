@@ -990,14 +990,18 @@ async function cmdFidelity(): Promise<void> {
               const res = await benchRestGet(rt.gh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
               delivered = res.body;
               route = analysis.outcomes[0].kind === "validation-fallback" ? "validation-fallback" : analysis.outcomes[0].kind;
-            } else if (analysis.kind === "http-failure") {
-              // 5xx / no HTTP response / non-JSON body is a TRANSIENT condition, not an
-              // observation about T1's fidelity. Recording it as a route would append a
-              // pass:false row to the append-only fidelity log and disqualify the driver
-              // globally and irreversibly (§4.7) — the same shape as the ls-tree hole.
-              throw new BenchOperationalError(`fidelity T1 dispatch failed for ${entry.path}: HTTP ${d.status} — a transport-level failure is a harness fault; re-run the battery`);
             } else {
-              route = `unresolved:${analysis.kind}`;
+              // FAIL-CLOSED BY DEFAULT. Everything that is not one of the delivering cases above
+              // is a transport-level condition — http-failure, throttle-retry, batch/alias
+              // timeout, the closed default — and none of them is an observation about T1's
+              // FIDELITY. Recording any of them as a route appends a pass:false row to the
+              // append-only log and disqualifies the driver globally and irreversibly (§4.7).
+              // Written as an else rather than a list so a NEW analysis kind fails closed too:
+              // this defect class has already appeared four times in this harness.
+              const detail = analysis.kind === "per-alias"
+                ? `alias outcome ${analysis.outcomes[0]?.kind ?? "none"}`
+                : analysis.kind;
+              throw new BenchOperationalError(`fidelity T1 could not deliver ${entry.path} (${detail}) — a transport-level failure is a harness fault, not a transport divergence; re-run the battery`);
             }
           } else {
             // clone drivers acquire through the REAL acquisition machinery + seams

@@ -10,7 +10,7 @@
   },
   "noiseBand": 1.25,
   "pilotSpread": 1.034,
-  "frozenSurfaceDigest": "26f00497dc7360e070d2167d4e8f1338668938eba261c25cc842597897597442",
+  "frozenSurfaceDigest": "de927bec651c5fb703f10ddf29b833300d36a52f2ef17a91c68387d9c84860a3",
   "amendments": [
     {
       "at": "Step B, post-ratification review round",
@@ -49,7 +49,15 @@
       ],
       "ratifiedAnswersUnchanged": true,
       "note": "The four §8 sign-off answers below are untouched and remain as rvo recorded them on 2026-07-28. This amendment changes the measurement surface, not the decisions: the noise band, protocol constants, corpus pinning, and symlink policy are all unaffected. No timed matrix data existed to invalidate — the matrix has never run.",
-      "reaffirmation": "NOT gate-enforced, and deliberately so: the matrix gate checks the digest, not who approved it, so updating frozenSurfaceDigest above is sufficient to let Step C run. The decision-maker should nevertheless re-affirm this amended surface before executing the matrix; that judgement is recorded here rather than mechanised, and no field in this file is checked for it."
+      "reaffirmation": "NOT gate-enforced, and deliberately so: the matrix gate checks the digest, not who approved it, so updating frozenSurfaceDigest above is sufficient to let Step C run. The decision-maker should nevertheless re-affirm this amended surface before executing the matrix; that judgement is recorded here rather than mechanised, and no field in this file is checked for it.",
+      "alsoFixedInReviewRound5": [
+        "FOURTH and FIFTH instances of the transient-failure-becomes-permanent-verdict class. The T1 fidelity path routed only http-failure to an operational error; GraphQL TIMEOUT (batch or per-alias), throttle-retry, and the closed default still fell through to route 'unresolved:*' and appended pass:false, disqualifying the driver globally. That branch is now an ELSE — anything that is not one of the delivering cases fails closed, so a NEW analysis kind cannot reopen the hole",
+        "analyzeBatchResponse ignored `gh`'s exit code entirely, so a subprocess that FAILED but emitted a parseable 200-shaped body produced resolved aliases — content accepted from a call that did not succeed. A non-zero exit is now an http-failure before any body inspection",
+        "runT2c swallowed a REJECTED dispose(): the catch set finalDisposal = null, which the post-teardown check reads as 'nothing to complain about', so a teardown that failed outright returned a clean run. A rejection is now its own unclean verdict on both the success and exception paths",
+        "the R5 sampler release ran AFTER runsLog.append, so an appendFileSync failure (disk full, EACCES) left the sampler armed with no disposer remaining; abandon() now runs in a finally around the append",
+        "WorkerDiskSampler folded ANY well-shaped reply with an unrecognised sequence into the peak as 'an unawaited tick', so a duplicate, stale, or unsolicited message could fabricate a disk figure the filesystem never held. Exactly one outstanding tick sequence is now tracked and anything else fails the sampler",
+        "a throw in post-run finalisation (the rate-limit read) between reclamation and the append discarded a run that had already been measured — wall, traffic and all. It now appends an 'invalidated-finalisation' row preserving the measured wall and partial traffic, marked unscoreable rather than dropped"
+      ]
     }
   ],
   "harnessCommit": "42c970f-informational (the digest above is the binding; the commit recorded per-row in runs.jsonl)",

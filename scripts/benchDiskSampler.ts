@@ -129,7 +129,7 @@ export class WorkerDiskSampler extends BaseSampler {
   private pending = new Map<number, { resolve: (b: number) => void; reject: (e: Error) => void }>();
   private failed: Error | null = null;
   private done: DiskSnapshot | null = null;
-  private inFlightTick = false;
+  private tickSeq: number | null = null; // the ONE outstanding tick, by sequence
   constructor(private readonly replyTimeoutMs = 120_000) {
     super();
   }
@@ -166,11 +166,17 @@ export class WorkerDiskSampler extends BaseSampler {
       if (settle !== undefined) {
         if (reply.error !== undefined) settle.reject(new DiskSamplerError(reply.error));
         else settle.resolve(reply.bytes);
+        return;
       }
-      else {
-        this.inFlightTick = false;
-        this.observe(reply.bytes); // an unawaited tick reply
+      // Only the ONE outstanding tick may fold into the peak. Previously any well-shaped reply
+      // with an unrecognised sequence was accepted as a sample, so a duplicate, stale, or
+      // unsolicited message could fabricate a peak the filesystem never held.
+      if (this.tickSeq !== null && reply.seq === this.tickSeq) {
+        this.tickSeq = null;
+        if (reply.error === undefined) this.observe(reply.bytes);
+        return;
       }
+      this.failAll(new DiskSamplerError(`worker replied with an unexpected sequence ${reply.seq}`));
     };
     // a worker that fails to load, or throws outside the walk's own guards, must fail LOUDLY
     w.onerror = (e: ErrorEvent): void => this.failAll(new DiskSamplerError(`worker error: ${e.message}`));
@@ -208,13 +214,13 @@ export class WorkerDiskSampler extends BaseSampler {
     this.timer = setInterval(() => {
       // the tick is O(1) on THIS thread — the walk happens in the worker. Coalesced: a tick is
       // skipped while one is still outstanding, so a slow walk cannot queue an unbounded backlog.
-      if (this.failed !== null || this.done !== null || this.inFlightTick) return;
-      this.inFlightTick = true;
+      if (this.failed !== null || this.done !== null || this.tickSeq !== null) return;
+      const seq = ++this.seq;
+      this.tickSeq = seq;
       try {
-        const w = this.ensureWorker();
-        w.postMessage({ seq: ++this.seq, dir, extras: this.extras, strict: false } satisfies DiskWalkRequest);
+        this.ensureWorker().postMessage({ seq, dir, extras: this.extras, strict: false } satisfies DiskWalkRequest);
       } catch {
-        this.inFlightTick = false; // a failed tick is a lost SAMPLE, which the metric tolerates
+        this.tickSeq = null; // a failed tick is a lost SAMPLE, which the metric tolerates
       }
     }, intervalMsFor(hz));
     this.timer.unref?.();
@@ -223,6 +229,7 @@ export class WorkerDiskSampler extends BaseSampler {
     // R5 peeks and then throws: without this the tick timer stays armed and the worker stays
     // alive for the rest of the process, since finish() (the only other disposer) never runs.
     this.stopTimer();
+    this.tickSeq = null;
     this.pending.clear();
     this.disposeWorker();
   }
