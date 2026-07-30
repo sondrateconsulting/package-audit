@@ -330,11 +330,25 @@ interface PinRuntime {
   spawnObs: (r: BenchSpawnRecord) => void;
 }
 
-function makePinRuntime(cfg: BenchConfig): PinRuntime {
+async function makePinRuntime(cfg: BenchConfig): Promise<PinRuntime> {
   const benchRoot = mkdtempSync(join(realpathSync(tmpdir()), cfg.protocol.tempPrefix));
   mkdirSync(join(REPO_ROOT, "data"), { recursive: true });
   const db = AuditDb.open({ sqlitePath: join(REPO_ROOT, "data", "bench-pin-cache.sqlite"), fresh: false, purgeCache: false });
   const client = new GithubClient({ githubHost: cfg.githubHost, db, tempRoot: benchRoot });
+  // EVERY evidence-producing runtime enforces the ratified bench identity, not only the
+  // engine (codex amendment-review round 3): the fidelity battery and the three post-matrix
+  // executors route their traffic through this runtime, and their evidence must ride the
+  // same dedicated credential as the matrix rows once ratification binds one.
+  if (existsSync(RATIFICATION_PATH)) {
+    const ratLogin = (JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>)["benchLogin"];
+    if (typeof ratLogin === "string" && ratLogin !== "") {
+      const login = ((await client.restGetJson("user")) as { login?: string }).login ?? "unknown";
+      if (login !== ratLogin) {
+        rmSync(benchRoot, { recursive: true, force: true });
+        throw new Error(`REFUSING: authenticated as ${JSON.stringify(login)} but the bench identity is ${ratLogin} — set GH_TOKEN to the dedicated bench identity's token (§8; ratification.json benchLogin)`);
+      }
+    }
+  }
   const buckets = makeBuckets();
   const gh: BenchGhContext = {
     client, db, cfg, core: buckets.core, graphql: buckets.graphql,
@@ -858,7 +872,7 @@ const workloadFileName = (unitId: string): string => `${unitId.replace(/[^A-Za-z
 async function cmdPinCorpus(): Promise<void> {
   assertNotRatified("pin-corpus");
   const cfg = loadBenchConfig(CONFIG_PATH);
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
   log(`bench root: ${rt.benchRoot}`);
   const snap = await readRateLimit(rt.gh);
   log(`rate_limit headroom: core ${snap.core.remaining}, graphql ${snap.graphql.remaining}`);
@@ -964,7 +978,7 @@ async function cmdPilot(): Promise<void> {
 async function cmdDiagnostics(): Promise<void> {
   assertNotRatified("diagnostics");
   const { cfg, corpus, workloads } = loadPinned();
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
   try {
     const diagnostics = await acquisitionDiagnostics(rt, corpus, workloads);
     writeFileSync(join(ARTIFACTS, "acquisition-diagnostics.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), results: diagnostics }, null, 2)}\n`);
@@ -1129,7 +1143,7 @@ async function cmdFidelity(): Promise<void> {
   const readLedger = (): ReturnType<typeof reconstructFidelityLedger> =>
     reconstructFidelityLedger(existsSync(fidelityPath) ? readFileSync(fidelityPath, "utf8").split("\n") : [], digest);
   let ledger = readLedger();
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
   // the battery must EXERCISE the current freeze, never replay pre-amendment cached bodies:
   // the persistent pin cache is swapped for a fresh per-invocation DB (codex C0-R2 finding 5)
   const { makeDb: makeFidelityDb, disposeDb: disposeFidelityDb } = makeProbeDbFactory();
@@ -1344,7 +1358,7 @@ async function cmdMatrix(): Promise<void> {
 async function cmdRefreshEvidence(): Promise<void> {
   assertNotRatified("refresh-evidence");
   const { cfg, corpus } = loadPinned();
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
   try {
     const c3 = corpus.performance.find((s) => s.slot === "C3")!;
     const c3unit = c3.units[0]!;
@@ -1605,7 +1619,7 @@ async function cmdReport(): Promise<void> {
 async function cmdBoundaryProbe(): Promise<void> {
   const { cfg, corpus } = loadPinned();
   const { digest } = await assertRatifiedAndFrozen();
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
   try {
     const c2 = corpus.performance.find((s) => s.slot === "C2") ?? ((): never => {
       throw new Error("no pinned C2 slot");
@@ -1631,7 +1645,7 @@ async function cmdBoundaryProbe(): Promise<void> {
 async function cmdConcurrencyProbe(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
   const { digest } = await assertRatifiedAndFrozen();
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
   const { makeDb, disposeDb } = makeProbeDbFactory();
   try {
     const blocks = await runConcurrencyProbe({
@@ -1671,7 +1685,7 @@ async function cmdOption3(): Promise<void> {
   const advanced = workloads.get(c1.units[0]!.unitId) ?? ((): never => {
     throw new Error("no pinned C1-main workload");
   })();
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
   const { makeDb, disposeDb } = makeProbeDbFactory();
   try {
     const warm = await runOption3WarmScenario({
