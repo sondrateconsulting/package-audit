@@ -20,6 +20,7 @@
     "answersNote": "answers.noiseBandAndDominance records the 2026-07-28 ratification (band 1.25, spread 1.034) and is preserved byte-identical as history; THIS field and the top-level noiseBand/pilotSpread supersede its band value. The matrix gate compares the top-level noiseBand to pilot.json's calibrated band."
   },
   "frozenSurfaceDigest": "6cd995f9d9550238f686a3772e5cf1871e6f785a78510674b02dc924b9bd9bae",
+  "benchLogin": "rvobot",
   "reaffirmedBy": "rvo (decision-maker; plan §4.7/§8)",
   "reaffirmedAtIso": "2026-08-02T16:18:24Z",
   "reaffirmedDigest": "6cd995f9d9550238f686a3772e5cf1871e6f785a78510674b02dc924b9bd9bae",
