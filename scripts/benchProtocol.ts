@@ -386,7 +386,11 @@ export interface TrafficSummary {
   // classes with at least one SUCCESSFUL attempt — §4.5 R2's ledger input ("succeeded in at
   // least one other repetition"): `requests` counts every attempt including failures, and a
   // completed run can contain a class that only ever failed (e.g. every batch drained to
-  // batch-error-fallback), which must not authorize an R2 replay
+  // batch-error-fallback), which must not authorize an R2 replay. TWO sources feed it: the
+  // record classification (an "ok"/"not-modified" the envelope supports), and the caller's
+  // table-accepted classes — a partial-data 200 is classification "fatal" on every record
+  // (production drops partial data BY DESIGN) while the frozen T1 table delivers its resolved
+  // aliases, and omitting that success denied R2 replays to genuinely-working classes
   okRequestClasses: string[];
   attempts: { fivexx: number; retries: number; secondaryByKind: Record<string, number> };
   points: { measuredCostSum: number; imputed: number };
@@ -398,9 +402,9 @@ export interface TrafficSummary {
 // wire, and rest-meta probes are the harness's own book-keeping — neither is driver evidence
 // (§4.6). Every run record, including the R5 halt record, derives its traffic figures here so
 // the rule cannot drift between them.
-export function summarizeTraffic(httpRecords: readonly BenchHttpAttemptRecord[]): TrafficSummary {
+export function summarizeTraffic(httpRecords: readonly BenchHttpAttemptRecord[], tableAcceptedClasses: readonly string[] = []): TrafficSummary {
   const requests: Record<string, number> = {};
-  const okClasses = new Set<string>();
+  const okClasses = new Set<string>(tableAcceptedClasses);
   const attempts = { fivexx: 0, retries: 0, secondaryByKind: {} as Record<string, number> };
   let measuredCostSum = 0;
   let imputed = 0;
@@ -714,6 +718,15 @@ export class BenchEngine {
     sampler.start(runDir, cfg.protocol.diskSamplerHz);
     if (this.childPool.pool === null) this.childPool.pool = makeChildPool(cfg.frame.childPoolSize);
     const liveState = { fallbackSpend: 0, routesDelivered: {} as Record<string, number>, cloneDir: null as string | null, t1Conflicts: 0, t1BodyTimeouts: 0 };
+    // §4.5 R2's ledger must also see the success the frozen table accepts and production's
+    // classifier does not: a partial-data 200 (some aliases resolved, some attributed-errored)
+    // is classification "fatal" on every http record (production drops partial data BY DESIGN),
+    // yet the T1 table delivers its resolved aliases — hash-verified, route "primary". Without
+    // this, a unit whose pinned workload always carries one dead path never mints
+    // graphql-batch, and a later transient 5xx exhaustion is denied its R2 replay — a
+    // transient failure turned terminal G3 by ledger blindness.
+    const t1TableAccepted = (): readonly string[] =>
+      row.driver === "T1" && (liveState.routesDelivered["primary"] ?? 0) > 0 ? ["graphql-batch"] : [];
     const startedAt = this.now();
     const startedAtIso = new Date(startedAt).toISOString();
     let outcome: DriverRunOutcome | null = null;
@@ -768,7 +781,7 @@ export class BenchEngine {
               // the ratified reclaim-failure disposition promises an operator log wherever a
               // row records diskReclaimFailed:true — this early return bypasses the normal tail
               if (driftReclaimFailed)
-                this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (${runDir}; diskReclaimFailed:true on the row)`);
+                this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (run dir ${runDir}; cache DB ${dbPath}[-wal/-shm]; diskReclaimFailed:true on the row)`);
               this.replayOfPos = null;
               this.replayKind = null;
               // no washout is owed (the probe consumed no API traffic), but the marker-per-row
@@ -862,7 +875,7 @@ export class BenchEngine {
       // finish, and the run's resources are reclaimed in the outer finally on the way out.
       const wallMs = wall.stop();
       const disk = sampler.peek();
-      const r5traffic = summarizeTraffic(httpRecords);
+      const r5traffic = summarizeTraffic(httpRecords, t1TableAccepted());
       const r5record: RunRecord = {
         type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
         probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: needsClonePath ? form : null,
@@ -941,7 +954,7 @@ export class BenchEngine {
       // row in its place would silently re-run against a dead SHA). Those runs keep their
       // classified record, with the deltas degraded and the accounting failure noted.
       if (runOutcome === "complete") {
-        const partial = summarizeTraffic(httpRecords);
+        const partial = summarizeTraffic(httpRecords, t1TableAccepted());
         this.o.runsLog.append({
           type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
           probe: row.probe, phase, epilogue: this.epilogueMode,
@@ -978,7 +991,7 @@ export class BenchEngine {
         });
         // same promise as the drift path: a diskReclaimFailed:true row is always operator-logged
         if (diskReclaimFailed)
-          this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (${runDir}; diskReclaimFailed:true on the row)`);
+          this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (run dir ${runDir}; cache DB ${dbPath}[-wal/-shm]; diskReclaimFailed:true on the row)`);
         throw e;
       }
       failureCause = `${failureCause ?? "(no recorded cause)"} — post-run rate-limit read also failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`;
@@ -1032,7 +1045,7 @@ export class BenchEngine {
     }
 
     // control-plane probes are never driver evidence (codex R3 f.7) — one rule, one place
-    const traffic = summarizeTraffic(httpRecords);
+    const traffic = summarizeTraffic(httpRecords, t1TableAccepted());
     const { requests, attempts, secondarySignals } = traffic;
     const { measuredCostSum, imputed } = traffic.points;
 
@@ -1079,7 +1092,7 @@ export class BenchEngine {
     if (disk.sampleError !== null)
       this.o.log(`${row.unit} ${row.driver} rep${row.rep}: DISK INSTRUMENTATION DEGRADED — ${disk.sampleError} (diskSampledPeakBytes/cloneObjectStoreBytes are not measurements for this row)`);
     if (diskReclaimFailed)
-      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (${runDir}; diskReclaimFailed:true on the row)`);
+      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (run dir ${runDir}; cache DB ${dbPath}[-wal/-shm]; diskReclaimFailed:true on the row)`);
     this.replayOfPos = null;
     this.replayKind = null;
     if (verification !== null && (verification.g1Failures.length > 0 || verification.g2Failures.length > 0)) {
@@ -1099,7 +1112,7 @@ export class BenchEngine {
       // before the scored teardown is reached. A failure HERE has no record to land on (the
       // throw is on its way out), so it is logged rather than dropped silently.
       if (reclaimOnce())
-        this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run resources did not fully reclaim (${runDir} and/or its run-cache DB sidecars)`);
+        this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run resources did not fully reclaim (run dir ${runDir} and/or cache DB ${dbPath}[-wal/-shm])`);
     }
   }
 

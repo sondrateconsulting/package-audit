@@ -233,6 +233,24 @@ describe("summarizeTraffic — one control-plane rule for EVERY record (F7)", ()
     expect(s.okRequestClasses).toEqual([]);
     expect(s.requests["graphql-batch"]).toBe(1);
   });
+  test("table-accepted classes reach the ledger even when every record is 'fatal' (partial-data acceptance)", () => {
+    // a partial-data 200 (some aliases resolved, one attributed NOT_FOUND) is classification
+    // "fatal" on the record — production drops partial data BY DESIGN — while the frozen T1
+    // table delivers the resolved aliases; the ledger takes the caller's table-accepted
+    // classes so that success is not invisible to §4.5 R2
+    const s = summarizeTraffic(
+      [httpRec({ kind: "graphql", requestClass: "graphql-batch", classification: "fatal", exitCode: 1 })],
+      ["graphql-batch"],
+    );
+    expect(s.okRequestClasses).toEqual(["graphql-batch"]);
+  });
+  test("table-accepted classes union and dedupe with record-derived ones, sorted", () => {
+    const s = summarizeTraffic(
+      [httpRec(), httpRec({ kind: "graphql", requestClass: "graphql-batch", classification: "ok", exitCode: 0 })],
+      ["graphql-batch"],
+    );
+    expect(s.okRequestClasses).toEqual(["graphql-batch", "rest-content"]);
+  });
   test("secondary signals are tallied by kind, control-plane excluded", () => {
     const s = summarizeTraffic([
       httpRec({ secondarySignal: "status-429" }),
