@@ -275,7 +275,8 @@ export class WorkerDiskSampler extends BaseSampler {
       this.observe(await this.request(dir, this.extras, true));
     } catch (e) {
       // NEVER propagate: this runs between the driver returning and the run record being
-      // appended (finishMeasuredRun), on a run that has already been measured and reclaimed.
+      // appended (finishMeasuredRun), on a run whose measured work is already over — the wall is
+      // paused for this call and reclamation runs after it.
       // Instrumentation failure degrades the disk fields; it does not eat the row. (The R5 halt
       // path never reaches here: it peek()s, appends, and abandon()s — see benchProtocol.)
       sampleError = e instanceof Error ? e.message : String(e);

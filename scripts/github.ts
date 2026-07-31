@@ -1,5 +1,6 @@
-// github.ts — the ONLY module that spawns gh/git/tar (§6 single chokepoint; grep-enforced by
-// tests). Every spawn passes the matching readOnlyGuard assert on the argv ARRAY first, runs
+// github.ts — the audit product's ONLY module that spawns gh/git/tar (§6 chokepoint;
+// grep-enforced by tests, whose allowlist also carries the ADR-0001 benchmark harness's separate
+// git launcher, scripts/benchSpawn.ts — no audit entrypoint imports it). Every spawn passes the matching readOnlyGuard assert on the argv ARRAY first, runs
 // with a sanitized allowlist env, and every write target (clone dest, tar -C dir, gitconfig)
 // is assertContained before the process starts (§0). Handles TS pagination via per-page
 // `gh api -i` header parsing, the §4 rate-limit classes, api_cache integration (§3), the

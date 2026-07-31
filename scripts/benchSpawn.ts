@@ -510,9 +510,10 @@ export class BatchChild {
     return this.fatal;
   }
 
-  // Ordered, idempotent teardown. After this resolves the child is gone (or escalated and
-  // unref'd past the bounded waits) and both pumps have ended — ONLY THEN may the caller
-  // delete the clone directory and release the child-pool permit (plan §3.1).
+  // Ordered, idempotent teardown, every wait BOUNDED. Once this RESOLVES the caller may delete the
+  // clone directory and release the child-pool permit (plan §3.1). Resolution is not a proof of
+  // termination: a child whose exit never settles is escalated and unref'd, and the pumps may still
+  // be unsettled — that case resolves with an UNCLEAN verdict, which callers treat as a harness fault.
   dispose(): Promise<BatchChildDisposal> {
     if (this.disposed !== null) return this.disposed;
     this.disposed = (async (): Promise<BatchChildDisposal> => {

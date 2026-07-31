@@ -32,7 +32,7 @@ every run as "continue the job," not "start over," unless the user passes `--fre
   `--template=` blocks init.templateDir hooks, `GIT_TERMINAL_PROMPT=0` prevents
   credential-prompt hangs. Record `git rev-parse HEAD` so permalinks pin the fetched
   SHA. Never write inside a repo working tree.
-- All `gh`/`git`/`tar` shell-outs go through the single wrapper module (§6) that
+- All `gh`/`git`/`tar` shell-outs in the audit product go through the single wrapper module (§6) that
   invokes `readOnlyGuard` on the argv ARRAY — never a joined string (naive substring
   matching false-positives on a repo named `create-x` and, worse, lets `gh api -X
   DELETE` through). The guard is an ALLOWLIST of read-only `gh`/`git` verbs+argv

@@ -2845,7 +2845,7 @@ describe("single chokepoint (grep-enforced)", () => {
   // several intermediate bindings (`const g = globalThis; const b = g.Bun; b.spawn(...)`).
   // Defense against those deliberately-evasive forms is code review, not this grep. This file
   // is exempt from the scan — it must name the very tokens it asserts about.
-  test("no file other than github.ts reaches a spawn surface; github.ts has exactly one spawn site", () => {
+  test("only the two allowlisted files reach a spawn surface; each has exactly one spawn site", () => {
     // Walk the WHOLE repo (the locked guarantee is repo-wide), skipping only non-code dirs.
     const skip = new Set(["node_modules", ".git", "data", "output"]);
     // dotted call, tolerating whitespace and optional chaining before the member (Bun?.spawn,

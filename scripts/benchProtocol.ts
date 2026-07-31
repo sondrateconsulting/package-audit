@@ -703,7 +703,8 @@ export class BenchEngine {
     const isCloneDriver = row.driver === "T2a" || row.driver === "T2c";
     const needsClonePath = isCloneDriver || workload.truncatedTree;
 
-    // acquisition-form decision: probe the live head before every clone-involving rep (§4.4).
+    // acquisition-form decision: probe the live head before a unit's FIRST clone-involving rep and
+    // before each later PRODUCTION-form one; a form frozen as scaffolding is SHA-pinned and skips it (§4.4).
     // null until DECIDED: a pre-decision failure row must not invent "production" — resume
     // would restore the invented form as frozen, and a later probe seeing an already-drifted
     // branch would then be misclassified as mid-unit R6 drift (discard + epilogue restart)

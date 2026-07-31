@@ -233,8 +233,9 @@ seam (its parser is a pure function with CI unit tests, including synthetic inva
 TAB/LF-in-path, and malformed-frame fixtures). Two test-only accommodations are required and
 declared here — test-list changes, not production-code changes; without them Step B is
 unimplementable. **(Amended at Step B; the original text declared only the first.)** (i)
-`github.test.ts` enforces a repo-wide single-spawn chokepoint, and its allowlist gains the bench
-spawn module. (ii) `cliErrors.test.ts` enforces a repo-wide registry over every exported `Error`
+`github.test.ts` enforces a repo-wide spawn-site allowlist, and it gains the bench spawn module as
+a second entry (exact repo-relative path) alongside the production wrapper — so the repo-wide
+guarantee becomes "exactly these two files, one spawn each", not "one wrapper". (ii) `cliErrors.test.ts` enforces a repo-wide registry over every exported `Error`
 subclass (operator-facing errors must join `KNOWN_OPERATOR_ERRORS`; everything else must be
 explicitly excluded); the bench's error classes are harness-internal — they surface only through
 `bench:content`'s own top-level catch, never through the production CLIs' `renderFatal` — and
@@ -251,8 +252,9 @@ grammars as a standalone module (production guard untouched), and the bench asse
 the **transport operations under evaluation**: both exact clone shapes, the `ls-tree` tuple, the
 `cat-file --batch` tuple. The SHA-pinned acquisition scaffolding (§4.4) is *bench scaffolding, not
 proposed production grammar* — its exact argv tuples are pinned in `bench-config.json` so runs are
-reproducible, but no production claim attaches to them. Measurement instrumentation (the disk
-sampler, `rate_limit` reads) is bench-local and outside guard discipline entirely.
+reproducible, but no production claim attaches to them. Measurement instrumentation is bench-local: the disk
+sampler sits outside argv-guard discipline entirely (it spawns nothing), while `rate_limit` reads
+go out through the production client and are argv-guarded like any other `gh api` call.
 
 ### 4.2 Corpus
 
@@ -276,8 +278,10 @@ fidelity battery**, so a C6 fidelity or completeness failure disqualifies a driv
 performance-unit failure does. Its protocol is explicit: each fixture entry runs **once per
 applicable driver** (K = 1 — a deterministic byte check gains nothing from repetition). The
 `nodejs/node` M9 fixture applies to T0 and T1 only (it exercises REST/GraphQL symlink routes; no
-one clones node for it); the clone-feasible fixture repo applies to all four drivers. §4.5's
-objective-external rerun predicate applies once per (fixture, driver); a fidelity mismatch is
+one clones node for it); the clone-feasible fixture repo applies to all four drivers. an objective-external rerun applies once per (fixture, driver) — deliberately BROADER than §4.5's
+matrix predicate, since the battery has no repetition ledger for R2's prior-success arm: it counts
+every harness-fault abort (including transient transport kinds and untyped failures) against that
+single allowance; a fidelity mismatch is
 never rerunnable; a skipped applicable fixture is a G2 failure. Invalid *path* bytes (as opposed
 to content) are covered by the parser's CI unit tests with synthetic fixtures — committed
 non-UTF-8 paths in stable public repositories are not reliably available, and the failure mode is
@@ -417,8 +421,9 @@ event); per-unit REST fallback budget — max(20, 10% of selected), exceeded →
 discretion:** HTTP-level failure (5xx / timeout / non-JSON) → whole-batch attempt failure →
 bounded retry → split trigger evaluation → circuit breaker → surviving aliases to
 `batch-error-fallback` only if the batch's dispatches are exhausted without a terminal unit event
-(each fallback counted against the budget — a persistent whole-batch failure therefore drains the
-budget and terminates as a unit failure, never as N benign absences). HTTP 200 with `errors[]` →
+(each fallback counted against the budget — a persistent whole-batch failure therefore terminates
+as a unit failure, never as N benign absences; in practice the circuit breaker opens at three
+consecutive failed dispatches, before the six-attempt total can drain). HTTP 200 with `errors[]` →
 per alias: valid `data` → validate and use; `data` failing validation (typename/OID/byteSize/hash)
 → per-alias validation fallback (counted); alias named by `errors[].path` with type `RATE_LIMITED`
 → whole-batch backoff retry (same attempt budget); type `TIMEOUT` → split trigger, and an
@@ -609,7 +614,9 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
    epoch is unchanged — subtraction across a reset undercounts arbitrarily. *(Amended at Step B:*
    one further case is valid by GitHub's observed reset semantics — a FULL, untouched bucket floats
    its reset epoch until the first request opens the window, so when `used` was 0 before the run
-   the changed epoch is expected and `after.used` is the exact consumption.*)* Scheduling *tries* to
+   the changed epoch is expected and `after.used` is taken as the consumption. (The check is `used == 0`
+   alone — it carries no timestamp and cannot detect a SECOND reset inside a long run, so this arm
+   trusts that a run does not span two windows rather than proving it.)*)* Scheduling *tries* to
    avoid straddling (it reserves against live headroom and sleeps to reset when the bucket cannot
    cover the worst case; there is no wall-duration estimator), but correctness
    does not rest on the estimate: **a run that straddles a reset is invalidated and replayed in
@@ -623,8 +630,7 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
    reports no clean transfer-byte figure without packet tracing).
 4. Peak disk attributable to a run, measured as a **sampled peak**: a bench-local sampler polls, at
    1 Hz, the sum of the run directory's usage **and the run's own cache-DB file plus its `-wal`/
-   `-shm` sidecars, which live outside the temp dir under `data/bench-run-caches/`** — the run's
-   full footprint — and takes the maximum, supplemented by a final point
+   `-shm` sidecars, which live outside the temp dir under `data/bench-run-caches/`** — and takes the maximum, supplemented by a final point
    measurement taken after the driver returns; declared as sampled-peak-at-1 Hz, an approximation
    by nature. *(Amended at Step B:* the walk executes on a **worker thread**, and the final point
    sample plus the clone object-store read are taken with the wall paused — see item 1. The
@@ -637,8 +643,9 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
    correction.*)
 5. Failures: 5xx and retries (attempt-counted) on the HTTP side; timeouts on the subprocess side
    (spawn records carry a per-lane `timedOut`) and on the GraphQL side (`t1BodyTimeouts`, the
-   TIMEOUT-typed batch and alias errors) — a transport-level HTTP no-response is visible only as a
-   retry, not as its own typed counter; fallback count by cause (symlink, binary,
+   TIMEOUT-typed batch and alias errors) — a transport-level HTTP no-response has no aggregate counter of its own — a
+   retried one is visible only as a retry, though a terminal one is recorded as typed
+   `failureEvidence` with code `no-response`; fallback count by cause (symlink, binary,
    truncated, content-cap-singleton, batch-error, validation, timeout-singleton, missing-alias),
    incomplete entries, secondary-limit signals by kind, rerun usage with recorded cause.
 6. Fidelity: every delivered entry checked against the §4.3 route-expectation matrix at the string
@@ -707,8 +714,10 @@ expensive enough to segment. Boundary effects of segmentation (changed batch adj
 reported, not scored away. *(Amended at Step B:* segmentation is **unexercised by the pinned
 corpus** — the largest reservation is T0 on C3 at `WC × 1.1 = 2541`, well under the 5,000 bucket
 capacity, so `planSegments` returns a single segment for every pinned unit and driver. The
-mechanism and its scoring rule stand for any future corpus that does cross the threshold, but no
-Step-C row will exercise them.*)
+mechanism and its scoring rule stand for a future corpus that crosses the threshold **in a shape
+segmentation supports** — per-file REST work only (T0, and T2a when it API-escapes); an over-cap
+T1, T2c, clone-form T2a or truncated shape raises instead of segmenting. No Step-C row exercises
+either path.*)
 
 The round-1 draft's 2.0× incumbent-displacement margin is withdrawn: both finalists are equally
 unimplemented, so there is no incumbent in any engineering sense, and an uncalibrated asymmetric
@@ -756,7 +765,8 @@ path out of Step D skips review, in either direction.
   one" actually hold. The harness is **bucket-aware and resumable**: below the reserve it sleeps
   to the reset epoch; partial results persist and resume.
 - **Feasibility gate:** if a single run's `WC × 1.1` exceeds a bucket's *full capacity* (5,000),
-  no reset can ever satisfy the guard. Such runs (realistically: T0 on C3/C4-scale units) execute
+  no reset can ever satisfy the guard. Such runs (only per-file REST shapes — T0, or T2a when it
+  API-escapes; no pinned unit reaches the threshold) execute
   in **segmented mode**: the workload splits into pinned contiguous segments each satisfying the
   guard, segments run in successive bucket windows, the clock pauses between segments, and the
   segmentation is reported; scoring per §4.7's segmented-run rule.
@@ -870,8 +880,8 @@ source and prose, not in `bench-config.json`), and **the
 execution environment** — one machine for all timed data, with an environment manifest (OS and
 version, hardware identifier hash, git/Bun/gh versions, network location description, credential
 type, and the authenticated-login fingerprint from §4.8) written as an `env-manifest` row at each
-engine start — one row per evidence-producing invocation, byte-identical while the environment is
-unchanged — and stamped BY HASH into every `runs.jsonl` run record alongside the harness commit
+engine start (five in the committed log; the fidelity battery produces gate-relevant evidence
+without one), byte-identical while the environment is unchanged, and stamped BY HASH into every `runs.jsonl` run record alongside the harness commit
 SHA, which is provenance only: resume refuses any row whose stamped environment hash or
 frozen-surface digest differs from the current one.
 Local-subprocess wall times and remote-API wall times are only comparable when both were measured

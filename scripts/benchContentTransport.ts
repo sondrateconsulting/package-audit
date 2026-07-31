@@ -137,9 +137,10 @@ function frozenSurfaceDigest(): string {
 
 // The §8 freeze gate shared by every gate-relevant executor (matrix, fidelity): ratification
 // present with all four answers, the band bound to the pilot, the frozen-surface digest bound,
-// and a clean tree whose ONLY exemptions are the append-only evidence outputs. ratification.json
-// is exempt from the DIGEST, never from the cleanliness scan: it must be TRACKED and
-// committed-clean, so editing the signed answers or the recorded digest takes a visible commit.
+// and a clean tree whose exemptions are exactly the APPEND_ONLY prefixes — the two evidence logs
+// plus the whole data/ directory (the run caches live there). ratification.json is exempt from the
+// DIGEST, never from the cleanliness scan: it must be TRACKED and committed-clean, so editing the
+// signed answers or the recorded digest takes a visible commit.
 async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>; digest: string }> {
   // §8 binds ONE network for all timed data; the placeholder default would hash every network
   // identically (codex R4) — gate-relevant runs demand an explicit operator-set description
@@ -1171,7 +1172,9 @@ export function classifyFidelityLog(lines: readonly string[], digest: string): F
 // mismatch is a G1 event for that driver and FAILS this command; a skipped applicable fixture
 // is a G2 event. Each driver resolves through its REAL seam (codex R1 finding 6): T0 via the
 // recorded REST layer, T1 via a real single-alias GraphQL dispatch + per-alias validation,
-// T2a via an acquired checkout read, T2c via an acquired store + BatchChild frame.
+// T2a via an acquired checkout read, T2c via an acquired store + BatchChild frame — EXCEPT where
+// the frozen route matrix itself sends the entry elsewhere: a mode-120000 fixture is a REST
+// dereference for every driver, which is the route under test for it (§4.2 symlink parity).
 async function cmdFidelity(): Promise<void> {
   // the single-writer lock comes FIRST: the pre-lock window previously ran workload parsing,
   // the freeze gate's git scans, and temp-root setup CONCURRENTLY with a live matrix's
@@ -1487,7 +1490,8 @@ export interface ResumeState {
   // unit|driver|requestClass a completed rep SUCCEEDED on — wider than "a record classified ok":
   // it is that rep's okRequestClasses, i.e. records classified ok/not-modified PLUS the frozen T1
   // table's accepted class, which a partial-data 200 mints with every record classified fatal
-  // (see summarizeTraffic's tableAcceptedClasses)
+  // (see summarizeTraffic's tableAcceptedClasses), plus the implied rest-meta entry the
+  // reconstruction inserts for every completed rep's accounting read
   successLedger: Set<string>;
   driftedUnits: Set<string>;
   resumeForms: Map<string, "production" | "scaffolding">;

@@ -17,7 +17,9 @@
 //
 // SHA-pinned acquisition scaffolding (init/remote add/fetch/checkout --detach) is bench
 // scaffolding, NOT proposed production grammar — its exact argv tuples are pinned in
-// bench-config.json and asserted by the spawn module's scaffolding lane, never here (§4.1).
+// bench-config.json and reach git only through the spawn module's scaffolding lane, which forbids
+// a caller-supplied argv and substitutes the tuple it is handed; the binding of that tuple to the
+// pinned config is the loader's (and the digest's), not a lane-side assertion. Never checked here (§4.1).
 //
 // Style mirrors readOnlyGuard.ts on purpose (raw-argv parsing, arity-aware value flags,
 // fail-closed deny) so a future adoption diff is a transplant, not a rewrite.
