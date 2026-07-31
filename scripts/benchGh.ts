@@ -280,8 +280,11 @@ export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, u
   let malformedErrorEntries = 0;
   const errRaw = o["errors"];
   // a PRESENT non-array errors container is spec-malformed and must select the closed default,
-  // never resolve as success beside valid data (codex R2 finding 11)
+  // never resolve as success beside valid data (codex R2 finding 11); the GraphQL spec requires
+  // a NON-EMPTY errors list, and production's envelope parser rejects an empty one — accepting
+  // it here let malformed subprocess output become a completed scored run
   if (errRaw !== undefined && !Array.isArray(errRaw)) malformedErrorEntries++;
+  if (Array.isArray(errRaw) && errRaw.length === 0) malformedErrorEntries++;
   if (Array.isArray(errRaw)) {
     for (const e of errRaw) {
       // a member with no readable shape is EVIDENCE, never a silent drop (codex R1 finding 5):

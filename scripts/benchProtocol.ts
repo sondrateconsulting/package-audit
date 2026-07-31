@@ -1,7 +1,7 @@
 // benchProtocol.ts — the run engine (resolution plan §4.5/§4.6/§4.8): per-run cold setup,
-// worst-case budget reservation with bucket-aware admission, the disk sampler, delivery
-// verification against the pinned matrix, washout, reset-window straddle detection, and the
-// runs.jsonl record shape. The pure decision pieces (WC formulas, segmentation, washout,
+// worst-case budget reservation with bucket-aware admission, disk-sampler orchestration (the
+// sampler itself lives in benchDiskSampler.ts), delivery verification against the pinned
+// matrix, washout, reset-window straddle detection, and the runs.jsonl record shape. The pure decision pieces (WC formulas, segmentation, washout,
 // straddle, verification) are exported for CI tests; the live engine composes them.
 
 import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -906,6 +906,11 @@ export class BenchEngine {
     // verification, and delta arithmetic. A throw in any of it used to discard a run that had
     // already been measured and reclaimed — the wall, the traffic, and the driver's actual work
     // all lost because a control-plane read failed afterwards. Record what we have instead.
+    // delivery verification runs BEFORE the fallible accounting read: a §4.7 G1/G2 event is
+    // globally irreversible evidence, and appending the invalidated-finalisation row with
+    // zeroed failure counts let a wrong-bytes run whose rate-limit read then failed be
+    // re-executed and ERASED by a clean replay
+    if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
     let after: RateLimitSnapshot | null = null;
     try {
       after = await readRateLimit(ghMeta);
@@ -938,7 +943,9 @@ export class BenchEngine {
           diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples, diskSampleError: disk.sampleError,
           fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
           routesDelivered: liveState.routesDelivered,
-          g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
+          g1Failures: verification?.g1Failures.length ?? 0, g2Failures: verification?.g2Failures.length ?? 0,
+          g1Details: verification?.g1Failures.slice(0, DETAIL_CAP) ?? [], g2Details: verification?.g2Failures.slice(0, DETAIL_CAP) ?? [],
+          probeDivergenceDetails: verification?.probeDivergences.slice(0, DETAIL_CAP) ?? [],
           spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts, t1BodyTimeouts: liveState.t1BodyTimeouts,
           // this row throws before any washout sleep, so resume completes the OWED washout
           // from this field — a hardcoded 0 collapsed a live Retry-After horizon (e.g. the
@@ -951,8 +958,6 @@ export class BenchEngine {
       }
       failureCause = `${failureCause ?? "(no recorded cause)"} — post-run rate-limit read also failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`;
     }
-    if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
-
     // per-segment same-window deltas, summed by construction (§4.6 item 2); the final (or only)
     // segment closes against the post-run snapshot. Any straddled segment invalidates the run.
     if (after !== null && segBefore !== null) {

@@ -335,7 +335,9 @@ export function parseUnitWorkload(jsonText: string): UnitWorkload {
   const optStr = (eo: Record<string, unknown>, key: string, path: string): string | null => {
     const v = eo[key];
     if (v === null) return null;
-    if (typeof v !== "string" || v.length === 0) fail(`${path}.${key} must be a non-empty string or null`);
+    // these fields are GROUND-TRUTH sha256 hashes: any non-hash string would make correct
+    // delivered bytes mismatch and permanently disqualify a driver over a malformed artifact
+    if (typeof v !== "string" || !/^[0-9a-f]{64}$/.test(v)) fail(`${path}.${key} must be a 64-hex sha256 or null`);
     return v as string;
   };
   const seenPaths = new Set<string>();

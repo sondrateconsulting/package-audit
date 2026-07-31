@@ -970,6 +970,8 @@ const workloadFileName = (unitId: string): string => `${unitId.replace(/[^A-Za-z
 
 // ---- subcommands -----------------------------------------------------------------------------
 async function cmdPinCorpus(): Promise<void> {
+  const releaseLock = acquireSingleWriterLock("pin-corpus");
+  try {
   const cfg = loadBenchConfig(CONFIG_PATH);
   const rt = makePinRuntime(cfg);
   try {
@@ -1015,6 +1017,9 @@ async function cmdPinCorpus(): Promise<void> {
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
   }
+  } finally {
+    releaseLock();
+  }
 }
 
 async function cmdBudget(): Promise<void> {
@@ -1052,6 +1057,8 @@ function findUnitIn(corpus: Corpus, unitId: string): { slot: PerformanceSlot } {
 }
 
 async function cmdPilot(): Promise<void> {
+  const releaseLock = acquireSingleWriterLock("pilot");
+  try {
   const { cfg, corpus, workloads } = loadPinned();
   // the pilot runs BEFORE ratification exists, so its rows carry no frozen-surface digest
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads, null);
@@ -1071,9 +1078,14 @@ async function cmdPilot(): Promise<void> {
   } finally {
     rmSync(benchRoot, { recursive: true, force: true });
   }
+  } finally {
+    releaseLock();
+  }
 }
 
 async function cmdDiagnostics(): Promise<void> {
+  const releaseLock = acquireSingleWriterLock("diagnostics");
+  try {
   const { cfg, corpus, workloads } = loadPinned();
   const rt = makePinRuntime(cfg);
   try {
@@ -1082,6 +1094,9 @@ async function cmdDiagnostics(): Promise<void> {
     log("acquisition-diagnostics.json written");
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+  } finally {
+    releaseLock();
   }
 }
 
@@ -1132,19 +1147,26 @@ export function classifyFidelityLog(lines: readonly string[], digest: string): F
 // recorded REST layer, T1 via a real single-alias GraphQL dispatch + per-alias validation,
 // T2a via an acquired checkout read, T2c via an acquired store + BatchChild frame.
 async function cmdFidelity(): Promise<void> {
+  // the single-writer lock comes FIRST: the pre-lock window previously ran workload parsing,
+  // the freeze gate's git scans, and temp-root setup CONCURRENTLY with a live matrix's
+  // measured walls — exactly the perturbation the lock exists to prevent
+  const releaseLock = acquireSingleWriterLock("fidelity");
+  try {
   const { cfg, corpus, workloads } = loadPinned();
   // gate-relevant evidence rides the SAME §8 freeze gate as the matrix (codex R2 f.8)
   const { digest } = await assertRatifiedAndFrozen();
-  const releaseLock = acquireSingleWriterLock("fidelity");
   const rt = makePinRuntime(cfg);
+  let inFlight: { fixture: string; driver: string } | null = null;
+  const fidelityLogPath = join(ARTIFACTS, "fidelity.jsonl");
+  const results: Array<Record<string, unknown>> = [];
+  let failures = 0;
+  try {
   // Gate-relevant fidelity evidence must come off the WIRE, never from the persistent pinning
   // cache: an immutable cache hit would let a stale or corrupted local bench-pin-cache row
   // become a permanent pass/fail verdict in the append-only log with no transport happening.
   // The battery is untimed and tiny (K = 1 per applicable driver), so the extra requests are
   // immaterial.
   const fidelityGh: BenchGhContext = { ...rt.gh, db: null };
-  const results: Array<Record<string, unknown>> = [];
-  let failures = 0;
   const seamHash = (bytes: Uint8Array): string => sha256Hex(Buffer.from(seamDecode(bytes), "utf8"));
   // resume discipline over the battery's own append-only log (§4.2): a recorded pass at THIS
   // surface is skipped (idempotence — re-running it would append duplicate evidence and spend
@@ -1152,7 +1174,6 @@ async function cmdFidelity(): Promise<void> {
   // rerunnable — re-running until it passed would launder a permanent G1 verdict); a second
   // operational abort on one (fixture, driver) refuses (the ≤1 objective-external rerun is
   // spent — the operator investigates the harness fault rather than retrying forever).
-  const fidelityLogPath = join(ARTIFACTS, "fidelity.jsonl");
   const logState: FidelityLogState = existsSync(fidelityLogPath)
     ? classifyFidelityLog(readFileSync(fidelityLogPath, "utf8").split("\n"), digest)
     : { passed: new Set<string>(), failed: new Set<string>(), driverFailures: new Set<string>(), operationalAborts: new Map<string, number>() };
@@ -1160,8 +1181,27 @@ async function cmdFidelity(): Promise<void> {
     throw new Error(`REFUSING: fidelity.jsonl records ${logState.failed.size} pass:false row(s) at the current frozen surface — a fidelity mismatch is never rerunnable (§4.2); the G1 verdict stands`);
   if (logState.driverFailures.size > 0)
     throw new Error(`REFUSING: fidelity.jsonl records driver failure(s) at the current frozen surface (${[...logState.driverFailures].join(", ")}) — §4.5 makes driver failures non-rerunnable; re-running until a pass would launder them`);
-  let inFlight: { fixture: string; driver: string } | null = null;
-  try {
+  // a 404 on a SHA-pinned fidelity read runs the same §4.4 pinned-object classifier the driver
+  // path uses: fixture commit gone → freeze-repair (re-pin), never a permanent driver verdict
+  const classifyFixture404 = async (fixture: { owner: string; repo: string; sha: string }, what: string): Promise<never> => {
+    try {
+      await benchRestGet(fidelityGh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/commits/${encodeURIComponent(fixture.sha)}`, requestClass: "rest-classifier" });
+    } catch (probeErr) {
+      if (probeErr instanceof BenchHttpError && probeErr.status === 404)
+        throw new Error(`RE-PIN REQUIRED: ${what}; the pinned fixture commit ${fixture.sha} is no longer served — a §8 freeze amendment, never a driver verdict`);
+      throw probeErr;
+    }
+    throw new UnitFailure(`unexpected absence: ${what} while the pinned fixture commit is still served`);
+  };
+  const fidelityRestRead = async (fixture: { owner: string; repo: string; sha: string }, path: string, requestClass: "rest-content" | "rest-fallback"): Promise<string> => {
+    try {
+      const res = await benchRestGet(fidelityGh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass });
+      return res.body;
+    } catch (e) {
+      if (e instanceof BenchHttpError && e.status === 404) return classifyFixture404(fixture, `${path} returned 404`);
+      throw e;
+    }
+  };
     for (const fixture of corpus.fidelity) {
       for (const driver of fixture.appliesTo) {
         const abortKey = `${fixture.kind}|${driver}`;
@@ -1181,12 +1221,10 @@ async function cmdFidelity(): Promise<void> {
           if (entry.mode === "120000" && driver === "T1") {
             // T1's mode source is the tree it fetched — the fixture pin stands in for it here;
             // the REST dereference is the matrix's route
-            const res = await benchRestGet(fidelityGh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
-            delivered = res.body;
+            delivered = await fidelityRestRead(fixture, entry.path, "rest-fallback");
             route = "symlink-fallback";
           } else if (driver === "T0") {
-            const res = await benchRestGet(fidelityGh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-content" });
-            delivered = res.body;
+            delivered = await fidelityRestRead(fixture, entry.path, "rest-content");
             route = "primary";
           } else if (driver === "T1") {
             // ONE real aliased dispatch through the T1 seam, validated per-alias
@@ -1206,22 +1244,23 @@ async function cmdFidelity(): Promise<void> {
               rawVerified = true;
               route = "primary";
             } else if (analysis.kind === "per-alias" && (analysis.outcomes[0]?.kind === "binary-fallback" || analysis.outcomes[0]?.kind === "truncated-blob-fallback" || analysis.outcomes[0]?.kind === "validation-fallback")) {
-              const res = await benchRestGet(fidelityGh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
-              delivered = res.body;
+              delivered = await fidelityRestRead(fixture, entry.path, "rest-fallback");
               route = analysis.outcomes[0].kind === "validation-fallback" ? "validation-fallback" : analysis.outcomes[0].kind;
             } else {
               // FAIL-CLOSED BY DEFAULT. Everything that is not one of the delivering cases above
-              // is a transport-level condition — http-failure, throttle-retry, batch/alias
-              // timeout, the closed default — and none of them is an observation about T1's
-              // FIDELITY. Recording any of them as a route appends a pass:false row to the
+              // is a transport-level condition and none of it is an observation about T1's
+              // FIDELITY — recording any of it as a route appends a pass:false row to the
               // append-only log and disqualifies the driver globally and irreversibly (§4.7).
               // Written as an else rather than a list so a NEW analysis kind fails closed too.
-              // This defect class — a transient failure recorded as a PERMANENT verdict — has now
-              // been found five times in this harness; ratification.json enumerates them.
+              // WITHIN the else, §4.5's split still applies: transient transport kinds
+              // (http-failure / throttle / timeouts) are operational aborts, but the closed
+              // default — which includes fatal classifications — is a DRIVER failure, no rerun.
               const detail = analysis.kind === "per-alias"
                 ? `alias outcome ${analysis.outcomes[0]?.kind ?? "none"}`
                 : analysis.kind;
-              throw new BenchOperationalError(`fidelity T1 could not deliver ${entry.path} (${detail}) — a transport-level failure is a harness fault, not a transport divergence; re-run the battery`);
+              if (analysis.kind === "http-failure" || analysis.kind === "throttle-retry" || analysis.kind === "batch-timeout")
+                throw new BenchOperationalError(`fidelity T1 could not deliver ${entry.path} (${detail}) — a transient transport failure is a harness fault, not a transport divergence; re-run the battery`);
+              throw new UnitFailure(`fidelity T1 could not deliver ${entry.path} (${detail}) — the closed default is a driver failure, no rerun (§4.5)`);
             }
           } else {
             // clone drivers acquire through the REAL acquisition machinery + seams
@@ -1251,8 +1290,7 @@ async function cmdFidelity(): Promise<void> {
               // fidelity observation (the same channel rule as the oid/size staleness check)
               throw new BenchOperationalError(`fixture ${fixture.kind} pins ${entry.path}, which is absent from the pinned tree's own enumeration — repair corpus.json, never record a verdict from it`);
             } else if (liveEntry.mode === "120000") {
-              const res = await benchRestGet(fidelityGh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
-              delivered = res.body;
+              delivered = await fidelityRestRead(fixture, entry.path, "rest-fallback");
               route = "symlink-fallback";
             } else if (driver === "T2a") {
               delivered = seamDecode(readFileSync(join(dir, entry.path)));
@@ -1313,7 +1351,14 @@ async function cmdFidelity(): Promise<void> {
           // append-only, per entry: an exception later cannot erase earlier evidence, and a
           // re-run APPENDS beside a recorded mismatch instead of overwriting it (codex R3 f.8 —
           // a fidelity mismatch is never rerunnable, §4.2)
-          appendFileSync(join(ARTIFACTS, "fidelity.jsonl"), `${JSON.stringify(resultRec)}\n`);
+          try {
+            appendFileSync(join(ARTIFACTS, "fidelity.jsonl"), `${JSON.stringify(resultRec)}\n`);
+          } catch (appendErr) {
+            // the row is IRREVERSIBLE evidence; if it cannot be made durable the battery must
+            // stop loudly with the row in the operator's face, never continue as if recorded
+            log(`EVIDENCE ROW COULD NOT BE APPENDED: ${JSON.stringify(resultRec)}`);
+            throw new Error(`REFUSING: could not append a fidelity evidence row (${appendErr instanceof Error ? appendErr.message : String(appendErr)}) — the row is printed above; repair the log medium before re-running`);
+          }
           log(`fidelity ${fixture.kind} ${driver} ${entry.path} [${route}]: ${pass ? "PASS" : "FAIL"}`);
         }
       }
@@ -1333,15 +1378,14 @@ async function cmdFidelity(): Promise<void> {
     //     driver-failure row, never rerunnable: re-running until a pass would launder a §4.5
     //     "driver failure, no rerun" through the battery.
     if (inFlight !== null) {
+      // STRICT §4.5: only R1 (a network-layer failure outside any HTTP response) qualifies as
+      // objective-external here — the battery has no completed repetitions, so R2's
+      // prior-success predicate can NEVER be satisfied (an earlier draft synthesised a ledger
+      // from pinning-time success, which grants replays §4.5 does not); everything else
+      // HTTP-shaped is a recorded driver failure
       const rerunnableAbort =
         e instanceof BenchOperationalError ||
-        (e instanceof BenchHttpError && evidenceIsRerunnable(
-          { kind: "http", code: e.code, lastClassification: e.lastClassification, requestClass: e.requestClass },
-          `${inFlight.fixture}|${inFlight.driver}`,
-          // the battery has no repetition ledger; R2's prior-success stands on the pinning-time
-          // success of the same read class, recorded in corpus.json's verification evidence
-          new Set([`${inFlight.fixture}|${inFlight.driver}|${e.requestClass ?? ""}`]),
-        ));
+        (e instanceof BenchHttpError && e.code === "no-response");
       const driverFailure = !rerunnableAbort && (e instanceof UnitFailure || e instanceof BenchSpawnError || e instanceof BenchHttpError);
       const marker = rerunnableAbort
         ? { type: "fidelity-operational-abort", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: (e instanceof Error ? e.message : String(e)).slice(0, 300) }
@@ -1359,6 +1403,9 @@ async function cmdFidelity(): Promise<void> {
     throw e;
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+  } finally {
+    // in its OWN finally: a failing temp-root removal above must never strand the lock
     releaseLock();
   }
 }
@@ -1574,10 +1621,12 @@ export function reconstructResumeState(
 }
 
 async function cmdMatrix(): Promise<void> {
-  const { cfg, corpus, workloads } = loadPinned();
-  if (cfg.schedule === null) throw new Error("REFUSING: bench-config.json carries no pinned schedule (run pin-corpus first)");
+  // the lock comes FIRST — the pre-lock window previously ran workload parsing and the freeze
+  // gate's git scans concurrently with whatever held the lock
   const releaseLock = acquireSingleWriterLock("matrix");
   try {
+  const { cfg, corpus, workloads } = loadPinned();
+  if (cfg.schedule === null) throw new Error("REFUSING: bench-config.json carries no pinned schedule (run pin-corpus first)");
   const { digest } = await assertRatifiedAndFrozen();
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads, digest);
   try {
@@ -1709,6 +1758,8 @@ async function cmdMatrix(): Promise<void> {
 // single-repo attempt (does the symlink fixture repo also carry a selected non-UTF-8 file?),
 // and the Option-3 warm-scenario pair for an already-pinned corpus (codex R1 f.21/23 + f.1).
 async function cmdRefreshEvidence(): Promise<void> {
+  const releaseLock = acquireSingleWriterLock("refresh-evidence");
+  try {
   const { cfg, corpus } = loadPinned();
   const rt = makePinRuntime(cfg);
   try {
@@ -1796,6 +1847,9 @@ async function cmdRefreshEvidence(): Promise<void> {
     log("corpus.json evidence refreshed (no pinned SHA moved)");
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+  } finally {
+    releaseLock();
   }
 }
 

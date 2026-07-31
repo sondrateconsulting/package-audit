@@ -97,9 +97,16 @@ interface LaunchedChild {
   unref(): void;
 }
 
+// memoized per PATH value: production resolves its binaries ONCE at client construction, and a
+// synchronous PATH scan on every launch taxed exactly the clone drivers' measured walls
+const GIT_BIN_CACHE = new Map<string, string>();
 function resolveGitBin(env: Record<string, string>): string {
-  const path = env["PATH"];
-  return (path !== undefined ? Bun.which("git", { PATH: path }) : Bun.which("git")) ?? "git";
+  const path = env["PATH"] ?? "";
+  const hit = GIT_BIN_CACHE.get(path);
+  if (hit !== undefined) return hit;
+  const resolved = (path !== "" ? Bun.which("git", { PATH: path }) : Bun.which("git")) ?? "git";
+  GIT_BIN_CACHE.set(path, resolved);
+  return resolved;
 }
 
 // THE single launch site. Lane assertion + containment run in the caller wrappers BEFORE this.
@@ -509,7 +516,18 @@ export class BatchChild {
       this.poison("disposed"); // rejects any pending read; first-fatal wins if one is already set
       try {
         const sink = this.child.stdin;
-        if (sink !== null) await Promise.resolve(sink.end());
+        // BOUNDED: a wedged async FileSink.end must not hang disposal (and T2c's measured wall)
+        // indefinitely — the exit wait below governs teardown either way
+        if (sink !== null) {
+          let endTimer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([
+            Promise.resolve(sink.end()).catch(() => undefined),
+            new Promise<void>((resolve) => {
+              endTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS);
+            }),
+          ]);
+          clearTimeout(endTimer);
+        }
       } catch {
         // stdin already closed/broken — the exit wait below still governs
       }
@@ -547,9 +565,17 @@ export class BatchChild {
       clearTimeout(pumpTimer);
       if (pumpsWedged) {
         // a pump that never settled means the stream state cannot be vouched for — cancel the
-        // readers so nothing stays attached after the caller deletes the store, and surface the
-        // wedge as an UNCLEAN disposal instead of returning a clean-looking verdict
-        for (const r of [this.outReader, this.errReader]) r.cancel().catch(() => {});
+        // readers and AWAIT the cancellations (bounded: an unbounded join would recreate the
+        // hang) so nothing stays attached when the caller deletes the store and releases the
+        // permit (§3.1's ordered teardown), and surface the wedge as an UNCLEAN disposal
+        let cancelTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          Promise.allSettled([this.outReader, this.errReader].map((r) => r.cancel())),
+          new Promise<void>((resolve) => {
+            cancelTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS);
+          }),
+        ]);
+        clearTimeout(cancelTimer);
         if (this.fatal === null || this.fatal === "disposed") this.fatal = "stream pumps did not settle within the bounded dispose wait";
       }
       const snap = this.ring.snapshot();

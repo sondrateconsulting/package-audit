@@ -276,6 +276,9 @@ export async function acquireStore(ctx: DriverRunContext, opts: { checkout: bool
     ];
     const res = await transportGit(ctx, argv, { cloneShape: opts.checkout ? "checkout" : "no-checkout" });
     if (res.exitCode !== 0) throw new UnitFailure(`clone failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`);
+    // mirrored the moment the store EXISTS: the coherence checks below are fallible, and a
+    // post-clone failure must still let the engine measure the store it actually acquired
+    if (ctx.liveState !== undefined) ctx.liveState.cloneDir = dir;
     const rev = await transportGit(ctx, ["rev-parse", "HEAD"], { cwd: dir });
     const head = seamDecode(rev.stdout).trim();
     if (rev.exitCode !== 0 || head !== ctx.unit.sha) {
@@ -288,6 +291,7 @@ export async function acquireStore(ctx: DriverRunContext, opts: { checkout: bool
   // scaffolding form: init --object-format → remote add → fetch <sha> → optional detach checkout
   const t = ctx.cfg.scaffolding.tuples;
   await scaffoldGit(ctx, t.init, { objectFormat: ctx.slot.objectFormat, dest: dir });
+  if (ctx.liveState !== undefined) ctx.liveState.cloneDir = dir; // the store exists from init on
   await scaffoldGit(ctx, t.remoteAdd, { url }, dir);
   await scaffoldGit(ctx, t.fetch, { sha: ctx.unit.sha }, dir);
   if (opts.checkout) await scaffoldGit(ctx, t.checkoutDetach, {}, dir);
@@ -352,7 +356,6 @@ async function fetchRestTree(ctx: DriverRunContext, st: RunState): Promise<{ tru
 // tree (route truncated-tree-checkout, the declared-caveat route).
 async function runTruncatedCheckout(ctx: DriverRunContext, st: RunState): Promise<string> {
   const { dir } = await acquireStore(ctx, { checkout: true });
-  if (st.live !== undefined) st.live.cloneDir = dir;
   // §4.2 defines the C4 comparison as "{REST tree attempt + checkout clone + WALK}": production
   // enumerates the whole checkout recursively (orchestrate's walkClone — lstat over every
   // entry) before any read, and skipping that walk here understated T0/T1's fallback cost by
@@ -578,7 +581,6 @@ export async function runT2a(ctx: DriverRunContext): Promise<DriverRunOutcome> {
     return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, acquiredPaths: st.acquiredPaths, cloneDir: null, acquisitionForm: null };
   }
   const { dir, headRev } = await acquireStore(ctx, { checkout: true });
-  if (st.live !== undefined) st.live.cloneDir = dir;
   const lsIndex = await enumerateStore(ctx, dir, headRev);
   for (const entry of ctx.workload.entries) {
     if (!entry.read) continue;
@@ -599,7 +601,6 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
   const st: RunState = { deliveries: [], fallbackSpend: 0, acquiredPaths: new Set(), live: ctx.liveState };
   pushNoReads(ctx, st);
   const { dir, headRev } = await acquireStore(ctx, { checkout: false });
-  if (st.live !== undefined) st.live.cloneDir = dir;
   const lsIndex = await enumerateStore(ctx, dir, headRev);
   const holder: { child: BatchChild | null; release: (() => void) | null } = { child: null, release: null };
   let respawns = 0;

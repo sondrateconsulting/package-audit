@@ -87,9 +87,13 @@ export function buildBatchQuery(
   return { label: opts.label, entries: [...entries], query, fields, queryBytes, argvBytes, contentEstimateBytes };
 }
 
-// Greedy contiguous packing under ALL FOUR caps (alias count, content estimate, query-document
-// bytes, argv bytes). Deterministic; an entry that alone violates a byte cap is impossible here
-// (content-cap singletons were pre-routed; a single path cannot overflow the 48 KiB document).
+// Contiguous packing under ALL FOUR caps (alias count, content estimate, query-document bytes,
+// argv bytes) by HALVING an oversized candidate window — deterministic and preregistered, but
+// NOT maximal-greedy: a halved window can under-fill relative to the largest fitting prefix,
+// and the resulting batch-size vector is part of the frozen behavior (split-trigger geometry
+// depends on it), so it must not be "optimised" post-ratification. An entry that alone violates
+// a byte cap is impossible here (content-cap singletons were pre-routed; a single path cannot
+// overflow the 48 KiB document).
 export function packBatches(
   entries: readonly WorkloadEntry[],
   cfg: BenchConfig,
@@ -150,7 +154,10 @@ export type BatchAnalysis =
 // leading zeros never occur in generated names) as alias 0, misrouting another alias's error.
 // Anything else is unattributable and takes the closed default via the caller's null branch.
 const aliasIndexFromPath = (path: ReadonlyArray<string | number> | null, aliasCount: number): number | null => {
-  if (path === null || path.length < 2 || path[0] !== "repository" || typeof path[1] !== "string") return null;
+  // EXACTLY two segments: a deeper path (["repository","a0","text"]) names a subfield, and the
+  // ratified strictness rationale is that only the alias-level shape is attributable — anything
+  // else takes the closed default via the caller's null branch
+  if (path === null || path.length !== 2 || path[0] !== "repository" || typeof path[1] !== "string") return null;
   const m = /^a(0|[1-9]\d*)$/.exec(path[1]);
   if (m === null) return null;
   const idx = Number(m[1]);
