@@ -6,8 +6,10 @@
 //
 //   pin-corpus       verify §4.2 slot candidates, pin SHAs, record workloads + ground truth,
 //                    write corpus.json / selected/*.json / the schedule table into bench-config
-//   refresh-evidence recompute a LIMITED evidence subset in place without moving any pin: the
-//                    C3 REST-tree stats, the Option-3 warm pair, and the C6 unification search
+//   refresh-evidence recompute a LIMITED evidence subset in place: the C3 REST-tree stats,
+//                    the Option-3 warm pair, and the C6 unification search — which MAY re-pin
+//                    the two fidelity fixtures onto a unified candidate (performance-slot pins
+//                    never move)
 //   verify-corpus    offline parse + summary of the pinned corpus and workloads (strict-parse
 //                    consistency; it re-runs no live verifyC* predicate)
 //   diagnostics      §4.4 acquisition diagnostics (production vs scaffolding forms, 3× each)
@@ -1759,7 +1761,9 @@ async function cmdMatrix(): Promise<void> {
   }
 }
 
-// refresh-evidence: recompute committed EVIDENCE without moving any pinned SHA — the C3 stats
+// refresh-evidence: recompute committed EVIDENCE — performance-slot pins never move, though
+// the C6 unification branch may re-pin the two fidelity fixtures onto a unified candidate
+// (the §4.2 contingency search is itself a pinning act) — the C3 stats
 // from the REST recursive tree it cites (directory depth = path segments − 1), the C6
 // single-repo attempt (does the symlink fixture repo also carry a selected non-UTF-8 file?),
 // and the Option-3 warm-scenario pair for an already-pinned corpus (codex R1 f.21/23 + f.1).
@@ -1850,7 +1854,7 @@ async function cmdRefreshEvidence(): Promise<void> {
     }
     loadCorpus(JSON.stringify(corpus)); // strict self-check before writing
     writeFileSync(CORPUS_PATH, `${JSON.stringify(corpus, null, 2)}\n`);
-    log("corpus.json evidence refreshed (no pinned SHA moved)");
+    log("corpus.json evidence refreshed (performance-slot pins unmoved; C6 fixtures re-pinned only if the unification search succeeded)");
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
   }
