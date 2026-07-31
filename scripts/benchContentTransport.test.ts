@@ -8,10 +8,10 @@
 // decision rests on, so each of these must fail closed rather than fabricate.
 import { describe, expect, test } from "bun:test";
 import {
-  BenchOperationalError, assertFreezeGitState, classifyFidelityAbort, classifyFidelityEnumeration,
-  harnessCommitFromGitResult, loginFromUserPayload, parseProbeBatch,
+  BenchOperationalError, assertFreezeGitState, classifyFidelityAbort,
+  classifyFidelityEnumeration, harnessCommitFromGitResult, loginFromUserPayload, parseProbeBatch,
 } from "./benchContentTransport.ts";
-import { UnitFailure, describeDisposal } from "./benchDrivers.ts";
+import { RePinRequired, UnitFailure, describeDisposal } from "./benchDrivers.ts";
 import { BenchHttpError } from "./benchGh.ts";
 import { BenchSpawnError } from "./benchSpawn.ts";
 import type { WorkloadEntry } from "./benchWorkload.ts";
@@ -509,5 +509,9 @@ describe("classifyFidelityAbort — fail-closed §4.2 abort taxonomy (continuati
     expect(classifyFidelityAbort(new Error("launch ENOENT surfaced untyped"))).toBe("operational-abort");
     expect(classifyFidelityAbort(new TypeError("undefined is not a function"))).toBe("operational-abort");
     expect(classifyFidelityAbort("string throw")).toBe("operational-abort");
+  });
+  test("a re-pin condition is neither an abort nor a driver failure — no marker, digest-gated", () => {
+    expect(classifyFidelityAbort(new RePinRequired("fixture commit gone")))
+      .toBe("re-pin-required");
   });
 });

@@ -2922,8 +2922,8 @@ describe("single chokepoint (grep-enforced)", () => {
         // ADR-0001 Step B (resolution plan §4.1): the benchmark's framed binary seam. Its ONE
         // launch site drives the evaluated-transport / scaffolding / pinning git children,
         // gated by benchGrammar's proposed grammars and the config-pinned scaffolding tuples.
-        // This allowlist entry is the FIRST of the plan's two sanctioned test-list changes (the second
-    // is cliErrors.test.ts's operator-error-registry exclusions) — production
+        // This allowlist entry is the FIRST of the plan's two sanctioned test-list changes
+        // (the second is cliErrors.test.ts's operator-error-registry exclusions) — production
         // code (github.ts, readOnlyGuard.ts) is untouched by Step B.
         expect({ file: f, ...counts }).toEqual({ file: f, ...zero, bun: 1 });
       } else if (f === "scripts/github.test.ts" || f === join("scripts", "github.test.ts") || f === "scripts/tuiPurity.test.ts" || f === join("scripts", "tuiPurity.test.ts")) {

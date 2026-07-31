@@ -190,15 +190,16 @@ describe("summarizeTraffic — one control-plane rule for EVERY record (F7)", ()
     expect(summarizeTraffic([httpRec({ servedFromCache: true, bodyBytes: 999 })]).httpBodyBytes).toBe(0);
   });
   test("5xx, retries, graphql points and imputation are counted off the same pass", () => {
-    // 5xx fixtures carry the classification production actually assigns them ("transient",
-    // never "ok") — a status-502/classification-ok record is a combination benchGh cannot
-    // emit, and driving the okRequestClasses ledger with it masked its own defects
+    // 5xx fixtures carry what production actually records for them: classification
+    // "transient" (never "ok") AND a nonzero gh exit — gh exits 1 BY DESIGN on every
+    // non-2xx response. A status-502/classification-ok/exit-0 record is a combination
+    // benchGh cannot emit, and driving the okRequestClasses ledger with it masked defects
     const s = summarizeTraffic([
-      httpRec({ status: 502, classification: "transient" }),
+      httpRec({ status: 502, classification: "transient", exitCode: 1 }),
       httpRec({ attempt: 2 }),
       httpRec({ kind: "graphql", requestClass: "graphql-batch", pointsCost: 3 }),
       httpRec({ kind: "graphql", requestClass: "graphql-batch", pointsCost: null }),
-      httpRec({ requestClass: "rest-meta", status: 502, classification: "transient", attempt: 3 }), // still excluded everywhere
+      httpRec({ requestClass: "rest-meta", status: 502, classification: "transient", exitCode: 1, attempt: 3 }), // still excluded everywhere
     ]);
     expect(s.attempts.fivexx).toBe(1);
     expect(s.attempts.retries).toBe(1);
@@ -221,7 +222,16 @@ describe("summarizeTraffic — one control-plane rule for EVERY record (F7)", ()
     expect(s.okRequestClasses).toEqual(["graphql-batch"]);
   });
   test("a transient 5xx attempt never mints an okRequestClasses entry", () => {
-    expect(summarizeTraffic([httpRec({ status: 502, classification: "transient" })]).okRequestClasses).toEqual([]);
+    expect(summarizeTraffic([httpRec({ status: 502, classification: "transient", exitCode: 1 })]).okRequestClasses).toEqual([]);
+  });
+  test("a malformed-body 200 GraphQL record never mints an okRequestClasses entry", () => {
+    // benchGh records "malformed-body" for a 200 whose body the envelope parser cannot read —
+    // the analyzer treats that dispatch as an http-failure, so even exit 0 must mint nothing
+    const s = summarizeTraffic([
+      httpRec({ kind: "graphql", requestClass: "graphql-batch", classification: "malformed-body", exitCode: 0 }),
+    ]);
+    expect(s.okRequestClasses).toEqual([]);
+    expect(s.requests["graphql-batch"]).toBe(1);
   });
   test("secondary signals are tallied by kind, control-plane excluded", () => {
     const s = summarizeTraffic([

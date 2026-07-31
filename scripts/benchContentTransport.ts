@@ -55,7 +55,7 @@ import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts
 import {
   BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, planSegments,
 } from "./benchProtocol.ts";
-import { UnitFailure, acquireStore, describeDisposal, disposalIsClean, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
+import { RePinRequired, UnitFailure, acquireStore, describeDisposal, disposalIsClean, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
 import { noiseBandFrom } from "./benchConfig.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -1110,11 +1110,15 @@ async function cmdDiagnostics(): Promise<void> {
 // has no completed repetitions, so R2's prior-success predicate can NEVER be satisfied (an
 // earlier draft synthesised a ledger from pinning-time success, which grants replays §4.5 does
 // not); everything else HTTP-shaped, plus store corruption, coherence and spawn faults, is a
-// recorded driver failure. FAIL-CLOSED over unknown error shapes: an error outside the
-// harness's own typed classes is by definition a harness fault, and §4.2's discipline counts
-// harness-fault aborts against the ≤1 rerun allowance — mapping it to NO marker left those
-// aborts invisible and re-runnable without limit.
-export function classifyFidelityAbort(e: unknown): "operational-abort" | "driver-failure" {
+// recorded driver failure. A re-pin condition is NEITHER: it demands a §8 freeze amendment, so
+// it gets no marker at all (re-running before the re-pin hits the same condition — nothing to
+// launder — and after it the digest differs; charging the ≤1 harness-fault allowance would
+// mislabel an artifact condition as a harness fault). FAIL-CLOSED over unknown error shapes:
+// an error outside the harness's own typed classes is by definition a harness fault, and
+// §4.2's discipline counts harness-fault aborts against the ≤1 rerun allowance — mapping it to
+// NO marker left those aborts invisible and re-runnable without limit.
+export function classifyFidelityAbort(e: unknown): "re-pin-required" | "operational-abort" | "driver-failure" {
+  if (e instanceof RePinRequired) return "re-pin-required";
   if (e instanceof BenchOperationalError || (e instanceof BenchHttpError && e.code === "no-response")) return "operational-abort";
   if (e instanceof UnitFailure || e instanceof BenchSpawnError || e instanceof BenchHttpError) return "driver-failure";
   return "operational-abort";
@@ -1208,7 +1212,7 @@ async function cmdFidelity(): Promise<void> {
       await benchRestGet(fidelityGh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/commits/${encodeURIComponent(fixture.sha)}`, requestClass: "rest-classifier" });
     } catch (probeErr) {
       if (probeErr instanceof BenchHttpError && probeErr.status === 404)
-        throw new Error(`RE-PIN REQUIRED: ${what}; the pinned fixture commit ${fixture.sha} is no longer served — a §8 freeze amendment, never a driver verdict`);
+        throw new RePinRequired(`${what}; the pinned fixture commit ${fixture.sha} is no longer served — a §8 freeze amendment, never a driver verdict`);
       throw probeErr;
     }
     throw new UnitFailure(`unexpected absence: ${what} while the pinned fixture commit is still served`);
@@ -1257,38 +1261,56 @@ async function cmdFidelity(): Promise<void> {
               owner: fixture.owner, repo: fixture.repo, sha: fixture.sha,
               aliasSelection: cfg.t1.aliasSelection, rateLimitRider: cfg.t1.rateLimitRider, label: `fid-${fixture.kind}`,
             });
-            const d = await benchGraphqlDispatch(fidelityGh, batch.query, batch.fields, batch.label);
-            const analysis = analyzeBatchResponse(d, batch, fixture.objectFormat, cfg);
+            // ≤1 batch-level retry for an UNATTRIBUTED singleton before any routing decision,
+            // mirroring the matrix's one-retry-then-fallback discipline for that shape (§4.4)
+            let d = await benchGraphqlDispatch(fidelityGh, batch.query, batch.fields, batch.label);
+            let analysis = analyzeBatchResponse(d, batch, fixture.objectFormat, cfg);
+            if (analysis.kind === "per-alias" && analysis.outcomes[0]?.kind === "unattributed") {
+              d = await benchGraphqlDispatch(fidelityGh, batch.query, batch.fields, batch.label, 2);
+              analysis = analyzeBatchResponse(d, batch, fixture.objectFormat, cfg);
+            }
+            const aliasOutcome = analysis.kind === "per-alias" ? analysis.outcomes[0]?.kind ?? null : null;
             if (analysis.kind === "per-alias" && analysis.outcomes[0]?.kind === "resolved") {
               delivered = analysis.outcomes[0].text;
               rawVerified = true;
               route = "primary";
-            } else if (analysis.kind === "per-alias" && (analysis.outcomes[0]?.kind === "binary-fallback" || analysis.outcomes[0]?.kind === "truncated-blob-fallback" || analysis.outcomes[0]?.kind === "validation-fallback")) {
+            } else if (aliasOutcome === "binary-fallback" || aliasOutcome === "truncated-blob-fallback" || aliasOutcome === "validation-fallback") {
               delivered = await fidelityRestRead(fixture, entry.path, "rest-fallback");
-              route = analysis.outcomes[0].kind === "validation-fallback" ? "validation-fallback" : analysis.outcomes[0].kind;
-            } else if (analysis.kind === "per-alias" && analysis.outcomes[0]?.kind === "timeout") {
-              // the frozen table's route for a singleton alias-attributed TIMEOUT — the matrix
-              // sends it to REST as "timeout-singleton", never a terminal verdict — so the
-              // battery verifies the bytes that route actually delivers. Leaving it to the
-              // closed default turned a transient server response into a PERMANENT
+              route = aliasOutcome;
+            } else if (aliasOutcome === "timeout" || analysis.kind === "batch-timeout") {
+              // the frozen table's route for a singleton TIMEOUT, alias-attributed or pathless:
+              // benchDrivers routes BOTH to REST as "timeout-singleton" when the batch is a
+              // singleton — and the battery's batch always is — never a terminal verdict, so
+              // the battery verifies the bytes that route actually delivers. Leaving either to
+              // the closed default turned a transient server response into a PERMANENT
               // fidelity-driver-failure marker: the transient-becomes-permanent class again
               delivered = await fidelityRestRead(fixture, entry.path, "rest-fallback");
               route = "timeout-singleton";
+            } else if (aliasOutcome === "missing" || aliasOutcome === "unattributed") {
+              // the frozen table's remaining per-alias routes: a MISSING alias goes straight
+              // to the REST fallback, an UNATTRIBUTED one after the single retry above. The
+              // fidelity REST read runs the same §4.4 pinned-object classifier the matrix's
+              // restRead runs, so a dead fixture pin still classifies as re-pin, never a
+              // permanent driver verdict
+              delivered = await fidelityRestRead(fixture, entry.path, "rest-fallback");
+              route = "missing-alias-fallback";
             } else {
               // FAIL-CLOSED BY DEFAULT. Everything that is not one of the delivering cases above
               // is a transport-level condition and none of it is an observation about T1's
               // FIDELITY — recording any of it as a route appends a pass:false row to the
               // append-only log and disqualifies the driver globally and irreversibly (§4.7).
               // Written as an else rather than a list so a NEW analysis kind fails closed too.
-              // WITHIN the else, §4.5's split still applies: transient transport kinds
-              // (http-failure / throttle / batch-timeout) are operational aborts, but the closed
+              // WITHIN the else, §4.5's split still applies: http-failure and throttle-retry
+              // are operational aborts (the matrix RETRIES those dispatches in-run, so the
+              // battery's ≤1 counted abort is the strictly tighter analogue), while the closed
               // default — which includes fatal classifications — is a DRIVER failure, no rerun.
-              // (Alias-attributed timeouts never reach here — they take the frozen table's
-              // timeout-singleton REST route above, exactly as the matrix routes them.)
+              // (Every TIMEOUT shape and per-alias missing/unattributed never reach here —
+              // they take the frozen table's REST routes above, exactly as the matrix routes
+              // them.)
               const detail = analysis.kind === "per-alias"
                 ? `alias outcome ${analysis.outcomes[0]?.kind ?? "none"}`
                 : analysis.kind;
-              if (analysis.kind === "http-failure" || analysis.kind === "throttle-retry" || analysis.kind === "batch-timeout")
+              if (analysis.kind === "http-failure" || analysis.kind === "throttle-retry")
                 throw new BenchOperationalError(`fidelity T1 could not deliver ${entry.path} (${detail}) — a transient transport failure is a harness fault, not a transport divergence; re-run the battery`);
               throw new UnitFailure(`fidelity T1 could not deliver ${entry.path} (${detail}) — the closed default is a driver failure, no rerun (§4.5)`);
             }
@@ -1410,7 +1432,7 @@ async function cmdFidelity(): Promise<void> {
     //   • DRIVER failures (store corruption, coherence, fatal HTTP, spawn faults) — a durable
     //     driver-failure row, never rerunnable: re-running until a pass would launder a §4.5
     //     "driver failure, no rerun" through the battery.
-    if (inFlight !== null) {
+    if (inFlight !== null && classifyFidelityAbort(e) !== "re-pin-required") {
       const markerType = classifyFidelityAbort(e) === "operational-abort" ? "fidelity-operational-abort" : "fidelity-driver-failure";
       const marker = { type: markerType, generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: (e instanceof Error ? e.message : String(e)).slice(0, 300) };
       try {
@@ -1422,7 +1444,13 @@ async function cmdFidelity(): Promise<void> {
         // propagate, so the failure is put in the operator's face — marker printed, error
         // annotated — instead of a swallowed one-line warning.
         log(`MARKER COULD NOT BE APPENDED: ${JSON.stringify(marker)} (${appendErr instanceof Error ? appendErr.message : String(appendErr)}) — repair the log medium before re-running`);
-        if (e instanceof Error) e.message = `${e.message} — ALSO: the ${markerType} marker could not be appended; it is printed in the log above`;
+        try {
+          if (e instanceof Error) e.message = `${e.message} — ALSO: the ${markerType} marker could not be appended; it is printed in the log above`;
+        } catch {
+          // a frozen/non-writable Error — the annotation is best-effort; the loud log above
+          // already carries the marker, and replacing the propagating abort with a TypeError
+          // here would mask the very evidence this block exists to preserve
+        }
       }
     }
     throw e;

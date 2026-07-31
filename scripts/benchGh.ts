@@ -51,7 +51,7 @@ export interface BenchHttpAttemptRecord {
   attempt: number; // 1-based within this call
   status: number;
   exitCode: number;
-  classification: string; // ok | primary | secondary | transient | fatal | no-response | truncated
+  classification: string; // ok | not-modified | cache | primary | secondary | transient | fatal | no-response | truncated | malformed-body
   secondarySignal: SecondarySignalKind | null;
   pointsCost: number | null; // graphql rateLimit.cost when readable; 1 imputed by the caller's accounting
   remaining: number | null;
@@ -360,7 +360,13 @@ export async function benchGraphqlDispatch(
   ctx.record({
     type: "http-attempt", atMs: startedAt, wallMs: now - startedAt, kind: "graphql",
     requestClass: "graphql-batch", label, attempt: attemptOrdinal, status: parsed.status, exitCode: res.exitCode,
-    classification: cls.kind, secondarySignal: signal, pointsCost,
+    // a 200 whose body the envelope parser cannot read is NOT an "ok" record, whatever
+    // classifyGraphql concluded from its (empty) error list — the analyzer treats exactly this
+    // dispatch as an http-failure (benchT1's "200 non-JSON body" arm), so recording "ok" would
+    // mint §4.5 R2 ledger successes from rejected dispatches. Non-200 statuses keep the
+    // classifier's status-based verdict (a 502's HTML body is not the story of that record).
+    classification: parsed.status === 200 && !full.jsonParseable ? "malformed-body" : cls.kind,
+    secondarySignal: signal, pointsCost,
     remaining: headerInt(parsed.headers["x-ratelimit-remaining"]),
     resetEpochSec: headerInt(parsed.headers["x-ratelimit-reset"]),
     servedFromCache: false,

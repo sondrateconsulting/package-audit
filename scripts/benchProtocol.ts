@@ -768,7 +768,7 @@ export class BenchEngine {
               // the ratified reclaim-failure disposition promises an operator log wherever a
               // row records diskReclaimFailed:true — this early return bypasses the normal tail
               if (driftReclaimFailed)
-                this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — files remain under ${runDir} (diskReclaimFailed:true on the row)`);
+                this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (${runDir}; diskReclaimFailed:true on the row)`);
               this.replayOfPos = null;
               this.replayKind = null;
               // no washout is owed (the probe consumed no API traffic), but the marker-per-row
@@ -978,7 +978,7 @@ export class BenchEngine {
         });
         // same promise as the drift path: a diskReclaimFailed:true row is always operator-logged
         if (diskReclaimFailed)
-          this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — files remain under ${runDir} (diskReclaimFailed:true on the row)`);
+          this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (${runDir}; diskReclaimFailed:true on the row)`);
         throw e;
       }
       failureCause = `${failureCause ?? "(no recorded cause)"} — post-run rate-limit read also failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`;
@@ -1079,7 +1079,7 @@ export class BenchEngine {
     if (disk.sampleError !== null)
       this.o.log(`${row.unit} ${row.driver} rep${row.rep}: DISK INSTRUMENTATION DEGRADED — ${disk.sampleError} (diskSampledPeakBytes/cloneObjectStoreBytes are not measurements for this row)`);
     if (diskReclaimFailed)
-      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — files remain under ${runDir} (diskReclaimFailed:true on the row)`);
+      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (${runDir}; diskReclaimFailed:true on the row)`);
     this.replayOfPos = null;
     this.replayKind = null;
     if (verification !== null && (verification.g1Failures.length > 0 || verification.g2Failures.length > 0)) {
@@ -1099,7 +1099,7 @@ export class BenchEngine {
       // before the scored teardown is reached. A failure HERE has no record to land on (the
       // throw is on its way out), so it is logged rather than dropped silently.
       if (reclaimOnce())
-        this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run resources did not fully reclaim (${runDir})`);
+        this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run resources did not fully reclaim (${runDir} and/or its run-cache DB sidecars)`);
     }
   }
 
