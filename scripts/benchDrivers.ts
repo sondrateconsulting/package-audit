@@ -221,8 +221,10 @@ export function parseLsRemoteProbe(stdout: Uint8Array, branch: string, oidLength
   return oid;
 }
 
-// Probe the live head (scaffolding lane; outside any timed window — the engine calls this
-// before each clone-driver rep). Advisory only: every acquisition still ends with an in-store
+// Probe the live head (scaffolding lane; outside any timed window). The engine probes before a
+// unit's FIRST clone-involving rep and before each later PRODUCTION-form one; once a unit's form
+// is frozen as scaffolding (first probe drifted, or a mid-unit drift restart), later reps are
+// SHA-pinned and need no probe. Advisory only: every acquisition still ends with an in-store
 // coherence assertion.
 export async function probeLiveHead(ctx: Pick<DriverRunContext, "cfg" | "slot" | "unit" | "benchRoot" | "gitEnv" | "spawnObserver">): Promise<string> {
   const url = `https://${ctx.cfg.githubHost}/${encodeURIComponent(ctx.slot.owner)}/${encodeURIComponent(ctx.slot.repo)}.git`;

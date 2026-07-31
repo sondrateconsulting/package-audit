@@ -3,8 +3,9 @@
 // semantic field is validated fail-closed (house posture: config.ts) — a preregistration that
 // half-parses is a preregistration that can drift. (Unknown extra keys are ignored, not
 // rejected; the digest freezes the file bytes, so an added key cannot drift silently.) The schedule member is null until corpus pinning writes the
-// literal traversal table; when present it is validated against the §4.5 rules via
-// benchSchedule's validators plus the corpus units the caller supplies.
+// literal traversal table; this loader validates only its SHAPE (row/field types and domains).
+// The §4.5 PROPERTY checks (order, coverage, probe placement) need the corpus, which the loader
+// never receives — CI runs benchSchedule's validators against the committed corpus instead.
 
 import { readFileSync } from "node:fs";
 import {
@@ -362,6 +363,11 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
   // code honours, the exact class the removed "when: after-matrix" field exemplified
   if (cfg.protocol.fidelityBattery.repsPerFixtureDriver !== 1)
     fail("protocol.fidelityBattery: repsPerFixtureDriver must be 1 — the battery is single-pass; a different K requires the implementing code change with its §8 amendment");
+  // the ≤1 R1/R2 allowance is STRUCTURAL: the resume reconstruction enforces it by unit|driver set
+  // membership and never reads this number, so any other value would be a frozen-config claim no
+  // code honours — the same class as the fidelityBattery.when field round 3 removed
+  if (cfg.protocol.rerunAllowancePerUnitDriver !== 1)
+    fail("protocol.rerunAllowancePerUnitDriver must be 1 — the ≤1 objective-external rerun is enforced structurally (unit|driver set membership); a different allowance requires the implementing code change with its §8 amendment");
   return cfg;
 }
 

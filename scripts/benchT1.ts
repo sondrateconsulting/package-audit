@@ -24,9 +24,11 @@ export class BenchT1Error extends Error {
 // ---- rounds ----------------------------------------------------------------------------------
 // Round 1 batches what the tree alone makes knowable (manifests + CLI-classifiable paths);
 // round 2 batches the source files round 1's manifests made relevant plus the required nearest
-// lockfiles (ADR "Rounds"). Pre-routed entries (symlink / binary / truncated-blob /
-// content-cap-singleton per the pinned matrix) never enter a batch — they go straight to the
-// REST fallback lane with their pinned cause.
+// lockfiles (ADR "Rounds"). Pre-routing covers ONLY what the tree alone knows: symlinks (mode
+// 120000) and content-cap singletons (ls-tree size above the per-batch content cap). Those never
+// enter a batch — they go straight to the REST fallback lane with their pinned cause. Binary and
+// truncated-blob are NOT pre-routed: GitHub's isBinary/isTruncated/text judgment is DISCOVERED in
+// the timed GraphQL response and routed afterward (see the alias-outcome walk below).
 export interface T1Plan {
   round1: WorkloadEntry[];
   round2: WorkloadEntry[];
@@ -81,7 +83,11 @@ export function buildBatchQuery(
   const query = `query(${varDecls.join(",")}){repository(owner:$owner,name:$name){${selections.join(" ")}} ${opts.rateLimitRider}}`;
   const queryBytes = Buffer.byteLength(query, "utf8");
   // argv shape mirrors the production client: -f query=… plus one -f per variable (github.ts's
-  // graphql argv); E2BIG binds on the SUM of argv bytes.
+  // graphql argv). This is a PREREGISTERED ADMISSION cap on the serialized argv PAYLOAD — a
+  // deliberately conservative proxy for E2BIG, not kernel-accurate accounting: argv[0], the fixed
+  // `api -i graphql` prefix, per-argument NUL terminators, the pointer array and the environment
+  // block all sit outside it. The cap is frozen (split-trigger geometry depends on the resulting
+  // batch-size vector), so it must not be "corrected" post-ratification.
   let argvBytes = Buffer.byteLength(`query=${query}`, "utf8") + 2 * "-f".length;
   for (const [k, v] of Object.entries(fields)) argvBytes += Buffer.byteLength(`${k}=${v}`, "utf8") + "-f".length;
   const contentEstimateBytes = entries.reduce((n, e) => n + e.size, 0);

@@ -335,7 +335,7 @@ everywhere.
 At pinning time, once per corpus unit (repo × branch):
 
 1. **Pin the bench configuration** as a committed artifact (`bench-config.json`): the
-   tracked-package set, exclusion globs, CLI-classifier terms, size-gate constants, T1 caps and
+   tracked-package set, exclusion globs, size-gate constants, T1 caps and
    failure-policy constants (§4.4), the full traversal/order schedule (§4.5), the projected-spend
    formulas (§4.8), and the exact scaffolding argv tuples. The workload is a function of
    (config, repo, SHA) and all three are pinned.
@@ -476,12 +476,21 @@ would confound acquisition invisibly. The checkout-config probe varies exactly o
 At pinning time, both forms run **three times each** per clone driver as **non-decision
 diagnostics**: identical tip and tree OIDs and an **identical reachable-object closure** are
 asserted (`git rev-list --objects <sha>` sorted and hashed — reachable closure is what workload
-reads can observe; physical store inventories may differ in packing and are additionally listed
-via `git cat-file --batch-all-objects --batch-check` for the record — pinning tooling is
+reads can observe; physical store inventories may differ in packing, so each arm's inventory is
+captured with `git cat-file --batch-all-objects --batch-check` and recorded as a SHA-256 digest
+(`inventorySha256`) rather than as the listing itself — pinning tooling is
 unconstrained), and the medians' wall-time delta is recorded; any delta > 10% is flagged so
 scaffolding-form units are interpreted with that bound in hand rather than folded silently into a
-noise-band comparison. If a pinned SHA becomes unreachable entirely (force-push), the fetch fails
-loudly and the slot is re-pinned — under §8's freeze, a re-pin restarts that unit's matrix.
+noise-band comparison. *(Amended at Step B:* these diagnostics are their own `bench diagnostics`
+invocation over the already-pinned corpus, so a unit's live head can have drifted off its pinned
+SHA by the time they run. `git clone --branch` takes a REF, not a SHA, so a production-form arm
+would then acquire a different tree and the cross-form comparison would be meaningless: on
+detected drift the run degrades to scaffolding-form arms only and records
+`driftedAtDiagnostics` with the observed head, leaving no cross-form closure assertion or
+wall-time delta for that unit. C4 is recorded that way in the committed artifact — the
+"unavailable, never fabricated" discipline, not a silent skip.*)* If a pinned SHA becomes
+unreachable entirely (force-push), the fetch fails loudly and the slot is re-pinned — under
+§8's freeze, a re-pin restarts that unit's matrix.
 
 **Option 3 is not a driver.** It is evaluated the way the ADR already recommends: an offline
 duplicate-OID analysis over the corpus trees (cheap, no network), reported alongside — plus one
@@ -596,9 +605,13 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
    is ~0 and the calibrated noise band never saw the effect.
 2. HTTP requests by class: REST content, REST tree, REST fallback, GraphQL requests. **Bucket
    consumption is the authoritative figure, measured within a single reset window**: the harness
-   records `(remaining, reset-epoch)` before and after; a delta is valid only when the epoch is
-   unchanged — subtraction across a reset undercounts arbitrarily. Scheduling *tries* to avoid
-   straddling (best-effort pre-run wall estimate; sleep to reset when doubtful), but correctness
+   records `(remaining, reset-epoch, used)` before and after; a delta is subtraction-valid when the
+   epoch is unchanged — subtraction across a reset undercounts arbitrarily. *(Amended at Step B:*
+   one further case is valid by GitHub's observed reset semantics — a FULL, untouched bucket floats
+   its reset epoch until the first request opens the window, so when `used` was 0 before the run
+   the changed epoch is expected and `after.used` is the exact consumption.*)* Scheduling *tries* to
+   avoid straddling (it reserves against live headroom and sleeps to reset when the bucket cannot
+   cover the worst case; there is no wall-duration estimator), but correctness
    does not rest on the estimate: **a run that straddles a reset is invalidated and replayed in
    its own slot** (§4.5's R4 — a harness scheduling defect, not a driver failure; reconstruction
    from per-request sums could under-report, since costless GraphQL attempts are only *imputed*
@@ -608,8 +621,10 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
 3. Transfer, reported as two explicitly non-comparable kinds: HTTP body bytes (API drivers) and
    on-disk object-store bytes after acquisition (clone drivers — labelled on-disk, since git
    reports no clean transfer-byte figure without packet tracing).
-4. Peak disk under the run's temp dir, measured as a **sampled peak**: a bench-local sampler polls
-   the run directory's usage at 1 Hz and takes the maximum, supplemented by a final point
+4. Peak disk attributable to a run, measured as a **sampled peak**: a bench-local sampler polls, at
+   1 Hz, the sum of the run directory's usage **and the run's own cache-DB file plus its `-wal`/
+   `-shm` sidecars, which live outside the temp dir under `data/bench-run-caches/`** — the run's
+   full footprint — and takes the maximum, supplemented by a final point
    measurement taken after the driver returns; declared as sampled-peak-at-1 Hz, an approximation
    by nature. *(Amended at Step B:* the walk executes on a **worker thread**, and the final point
    sample plus the clone object-store read are taken with the wall paused — see item 1. The
@@ -620,7 +635,10 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
    remove all resource contention, since a walk on another thread still competes for CPU and disk
    bandwidth with the git subprocess under test. That residual is second-order and undeclared as a
    correction.*)
-5. Failures: 5xx, timeouts, retries (attempt-counted), fallback count by cause (symlink, binary,
+5. Failures: 5xx and retries (attempt-counted) on the HTTP side; timeouts on the subprocess side
+   (spawn records carry a per-lane `timedOut`) and on the GraphQL side (`t1BodyTimeouts`, the
+   TIMEOUT-typed batch and alias errors) — a transport-level HTTP no-response is visible only as a
+   retry, not as its own typed counter; fallback count by cause (symlink, binary,
    truncated, content-cap-singleton, batch-error, validation, timeout-singleton, missing-alias),
    incomplete entries, secondary-limit signals by kind, rerun usage with recorded cause.
 6. Fidelity: every delivered entry checked against the §4.3 route-expectation matrix at the string
@@ -686,8 +704,11 @@ bucket ceilings)`, where the wall term uses §4.6's summed active-segment wall (
 sleeps excluded). Dropping the wall term for segmented runs would make crossing the reservation
 threshold a scoring exploit — a driver whose wall is its weakness must not escape it by being
 expensive enough to segment. Boundary effects of segmentation (changed batch adjacency) are
-reported, not scored away; in practice segmentation affects T0 on C3/C4-scale units, where the
-ceiling term dominates the min regardless.
+reported, not scored away. *(Amended at Step B:* segmentation is **unexercised by the pinned
+corpus** — the largest reservation is T0 on C3 at `WC × 1.1 = 2541`, well under the 5,000 bucket
+capacity, so `planSegments` returns a single segment for every pinned unit and driver. The
+mechanism and its scoring rule stand for any future corpus that does cross the threshold, but no
+Step-C row will exercise them.*)
 
 The round-1 draft's 2.0× incumbent-displacement margin is withdrawn: both finalists are equally
 unimplemented, so there is no incumbent in any engineering sense, and an uncalibrated asymmetric
@@ -716,8 +737,11 @@ path out of Step D skips review, in either direction.
 
 - **Reserved spend is a worst-case bound, not an estimate.** Every consuming loop in every driver
   is capped — attempts ≤ 6, REST fallbacks ≤ the budget, splits ≤ 4 descendants per batch,
-  reruns ≤ 1 — so each run's worst-case bucket consumption `WC` is *computable exactly* from the
-  pinned workload and constants: REST — (per-file requests + tree requests + fallback budget) ×
+  reruns ≤ 1 — so each run's worst-case bucket consumption `WC` is *computed by a closed-form
+  formula over the pinned workload and constants — a safe upper bound, deliberately not a tight
+  one* (the GraphQL term multiplies the dispatch-node count by the attempt cap, while the
+  implementation shares ONE attempt counter across an original batch and all its descendants, so
+  the reservation over-counts that allowance rather than under-counting it): REST — (per-file requests + tree requests + fallback budget) ×
   attempt cap + one SHA-classifier attempt-loop allowance (§4.4's pinned-object probe on a 404'd
   fallback is its own bounded loop) + the fixed per-run overhead; GraphQL — planned batches × (1 + descendant cap)
   dispatches × attempt cap × **`P_max`, a preregistered per-attempt point bound (10 — an order of
@@ -838,17 +862,25 @@ the full amendment + restart rule below.
 
 **Freeze semantics — the frozen set is everything the result depends on:** corpus SHAs and
 branches, selected sets, route-expectation matrices and ground-truth hashes, every
-`bench-config.json` constant (gates, caps, failure policy, noise band, dominance definition,
-schedule table, scaffolding argv, spend formulas), **the harness source revision**, and **the
+`bench-config.json` constant (gates, caps, failure policy, noise band, schedule table,
+scaffolding argv, spend formulas), **the harness source content** (bound by the frozen-surface
+digest over every non-test script plus the preregistered artifacts and both normative documents —
+not by the commit id; the §4.7 dominance definition and the CLI classifier live in that frozen
+source and prose, not in `bench-config.json`), and **the
 execution environment** — one machine for all timed data, with an environment manifest (OS and
 version, hardware identifier hash, git/Bun/gh versions, network location description, credential
-type, and the authenticated-login fingerprint from §4.8) recorded once and stamped into every
-`runs.jsonl` record alongside the harness commit SHA.
+type, and the authenticated-login fingerprint from §4.8) written as an `env-manifest` row at each
+engine start — one row per evidence-producing invocation, byte-identical while the environment is
+unchanged — and stamped BY HASH into every `runs.jsonl` run record alongside the harness commit
+SHA, which is provenance only: resume refuses any row whose stamped environment hash or
+frozen-surface digest differs from the current one.
 Local-subprocess wall times and remote-API wall times are only comparable when both were measured
 from the same box over the same network. After ratification, any change to any frozen *artifact* —
-a re-pin after upstream force-push (a new SHA), any `bench-config.json` constant, any harness code
-change, or an environment change — invalidates the affected timing data (the unit restarts; a
-harness or environment change restarts the whole matrix) and requires amending this plan plus one
+a re-pin after upstream force-push (a new SHA), any `bench-config.json` constant, any change to the
+frozen measurement surface (any non-test script or normative document inside the digest — an
+evidence-only or test-only commit does NOT, since the binding is the content digest, not the commit
+id), or an environment change — invalidates the affected timing data (the unit restarts; a
+surface or environment change restarts the whole matrix) and requires amending this plan plus one
 adversarial review round on the amendment before new timing data is collected. Pre-registration
 that can be edited mid-run is not pre-registration.
 

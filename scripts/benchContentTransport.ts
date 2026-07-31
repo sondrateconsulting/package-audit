@@ -137,7 +137,9 @@ function frozenSurfaceDigest(): string {
 
 // The §8 freeze gate shared by every gate-relevant executor (matrix, fidelity): ratification
 // present with all four answers, the band bound to the pilot, the frozen-surface digest bound,
-// and a clean tree EXCLUDING the append-only outputs and ratification.json itself.
+// and a clean tree whose ONLY exemptions are the append-only evidence outputs. ratification.json
+// is exempt from the DIGEST, never from the cleanliness scan: it must be TRACKED and
+// committed-clean, so editing the signed answers or the recorded digest takes a visible commit.
 async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>; digest: string }> {
   // §8 binds ONE network for all timed data; the placeholder default would hash every network
   // identically (codex R4) — gate-relevant runs demand an explicit operator-set description
@@ -1482,7 +1484,11 @@ export interface ResumeState {
   terminalPos: Set<number>;
   rerunUsed: Set<string>; // unit|driver keys whose ≤1 R1/R2 allowance is spent
   straddled: Set<string>; // units with a recorded R4 straddle (a second one halts)
-  successLedger: Set<string>; // unit|driver|requestClass with an ok in a completed rep
+  // unit|driver|requestClass a completed rep SUCCEEDED on — wider than "a record classified ok":
+  // it is that rep's okRequestClasses, i.e. records classified ok/not-modified PLUS the frozen T1
+  // table's accepted class, which a partial-data 200 mints with every record classified fatal
+  // (see summarizeTraffic's tableAcceptedClasses)
+  successLedger: Set<string>;
   driftedUnits: Set<string>;
   resumeForms: Map<string, "production" | "scaffolding">;
   // pos → unit|driver: a rerunnable unit-failure whose MANDATED in-slot R1/R2 replay (§4.5)

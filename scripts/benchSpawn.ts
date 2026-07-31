@@ -350,10 +350,12 @@ interface PendingRead {
 // One long-lived interactive child serving pull-style reads: write one format-validated oid
 // line, read exactly one frame (plan §3.1). Lifecycle discipline: continuous stdout/stderr
 // pumps from birth (a full pipe must never wedge the child), per-read deadline with the kill
-// escalation, fatal-poisoning on any framing violation, and an ORDERED teardown — close stdin
-// → await exit under a deadline → escalate → await the pumps — so the caller can delete the
-// clone directory only after this child is provably gone (plan §3.1 "Teardown is owned and
-// ordered").
+// escalation, fatal-poisoning on any framing violation, and an ORDERED teardown with every wait
+// BOUNDED — close stdin → await exit under a deadline → escalate → join the pumps — so the caller
+// may delete the clone directory once dispose() RESOLVES (plan §3.1 "Teardown is owned and
+// ordered"). A child whose exit never settles is SIGKILLed, group-killed and unref'd, and
+// REPORTED as an unclean disposal rather than waited on indefinitely: callers treat an unclean
+// verdict as a harness fault, they do not get a proof of termination.
 export class BatchChild {
   private readonly child: LaunchedChild;
   private readonly outReader: ByteReader;

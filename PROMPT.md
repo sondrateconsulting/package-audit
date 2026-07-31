@@ -1175,10 +1175,13 @@ Entrypoints:
   bun run scripts/compare.ts <runIdA> <runIdB> [--config <path>] [--help]
     # deterministic run-to-run usage diff (two COMPLETED run ids) — one JSON line on stdout
 
-The wrapper module (github.ts) is the ONLY place `Bun.spawn` touches `gh`/`git`/`tar`;
+The wrapper module (github.ts) is the ONLY place `Bun.spawn` touches `gh`/`git`/`tar` in the
+audit product; the ADR-0001 benchmark harness adds ONE further, separately-gated git launcher
+(benchSpawn.ts), allowlisted by exact repo-relative path in the same scan and imported by no
+audit entrypoint;
 each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
 (`assertReadOnlyGh`/`assertReadOnlyGit`/`assertReadOnlyTar`) on the argv ARRAY before
-spawning. A test greps the repo as a best-effort tripwire asserting NO other file reaches a
+spawning. A test greps the repo as a best-effort tripwire asserting NO file other than those two reaches a
 spawn surface (`Bun.spawn`/`Bun.spawnSync`/`Bun.$` — dotted, optional-chained, or whitespaced;
 imported from the `"bun"` module; aliased, parenthesized, bracket-accessed, or reached via
 `globalThis.Bun`), uses `child_process` in any form, imports a dynamic specifier that is a bare
@@ -1187,7 +1190,7 @@ common direct wrapper-bypasses and fails them in CI, but it is a textual lint, n
 proof: deliberately evasive forms — comment-hidden tokens, a module name assembled by other
 means (`.concat`, char codes), or the Bun global routed through several intermediate bindings — are out of
 its scope (caught by code review). The load-bearing read-only guarantee is the argv allowlist
-below, of which github.ts is the single chokepoint; it enforces the
+below, of which github.ts is the single chokepoint for every audit command; it enforces the
 read-only allowlist including tar's command-execution options
 (`--checkpoint-action=exec=…`, `--to-command`, `--use-compress-program`/`-I`, `-F`). Every invocation runs with a sanitized env
 (`GH_HOST=<githubHost>`, `GIT_TERMINAL_PROMPT=0`, no pager/prompt/extension

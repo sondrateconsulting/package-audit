@@ -250,5 +250,7 @@ Ready-made DuckDB and jq recipes live in the README's "Analyze the exports" sect
 are executed **verbatim in CI** against a synthetic fixture export (via a SHA-pinned DuckDB
 CLI), and a local test keeps their table/column identifiers in sync with the registry — a
 renamed column fails the build, not your query. Local `bun test` does not execute DuckDB
-itself: spawning external binaries from this codebase is confined to the audited `gh`/`git`/
-`tar` chokepoint by a repo-wide guarantee, so recipe execution lives in CI.
+itself: spawning external binaries from this codebase is confined to audited chokepoints by a
+repo-wide guarantee — the production `gh`/`git`/`tar` wrapper, plus the ADR-0001 benchmark
+harness's separately-gated git launcher, which no audit command imports — so recipe
+execution lives in CI.
