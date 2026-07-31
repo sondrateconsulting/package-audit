@@ -410,7 +410,13 @@ export function summarizeTraffic(httpRecords: readonly BenchHttpAttemptRecord[])
     if (r.servedFromCache) continue;
     if (r.requestClass === "rest-meta") continue;
     requests[r.requestClass] = (requests[r.requestClass] ?? 0) + 1;
-    if (r.classification === "ok" || r.classification === "not-modified") okClasses.add(r.requestClass);
+    // benchT1's truncated-transfer rule, mirrored for the ledger: a success-shaped GraphQL
+    // envelope from a gh that exited nonzero is transport-failure evidence (the analyzer
+    // retries that dispatch, never accepts its content), so its record must not mint an
+    // R2-authorizing success. REST cannot reach here in that state — benchGh throws
+    // truncated-transfer before any "ok" REST record exists.
+    if ((r.classification === "ok" || r.classification === "not-modified") && !(r.kind === "graphql" && r.exitCode !== 0))
+      okClasses.add(r.requestClass);
     httpBodyBytes += r.bodyBytes;
     if (r.status >= 500) attempts.fivexx++;
     if (r.attempt > 1) attempts.retries++;
@@ -759,6 +765,10 @@ export class BenchEngine {
             };
             try {
               this.o.runsLog.append(driftRecord);
+              // the ratified reclaim-failure disposition promises an operator log wherever a
+              // row records diskReclaimFailed:true — this early return bypasses the normal tail
+              if (driftReclaimFailed)
+                this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — files remain under ${runDir} (diskReclaimFailed:true on the row)`);
               this.replayOfPos = null;
               this.replayKind = null;
               // no washout is owed (the probe consumed no API traffic), but the marker-per-row
@@ -946,7 +956,11 @@ export class BenchEngine {
           bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
           bucketSnapshots,
           expectedConsumption: { core: liveCoreAttempts, graphql: liveGraphqlPoints },
-          replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed, probeDivergences: 0,
+          // counted from the SAME verification the g1/g2 and detail fields read below — it ran
+          // BEFORE the failed accounting read, so a hardcoded 0 contradicted the nonempty
+          // probeDivergenceDetails this row can carry
+          replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed,
+          probeDivergences: verification?.probeDivergences.length ?? 0,
           httpBodyBytes: partial.httpBodyBytes, cloneObjectStoreBytes,
           diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples, diskSampleError: disk.sampleError,
           fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
@@ -962,6 +976,9 @@ export class BenchEngine {
           envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
           frozenSurfaceDigest: this.o.frozenSurfaceDigest,
         });
+        // same promise as the drift path: a diskReclaimFailed:true row is always operator-logged
+        if (diskReclaimFailed)
+          this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — files remain under ${runDir} (diskReclaimFailed:true on the row)`);
         throw e;
       }
       failureCause = `${failureCause ?? "(no recorded cause)"} — post-run rate-limit read also failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`;

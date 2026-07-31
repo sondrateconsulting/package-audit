@@ -1104,6 +1104,22 @@ async function cmdDiagnostics(): Promise<void> {
   }
 }
 
+// The fidelity battery's abort taxonomy, extracted PURE so CI can drive it (the same pattern as
+// evidenceIsRerunnable below). STRICT §4.5 scope: only R1 (a network-layer failure outside any
+// HTTP response) qualifies as objective-external alongside the operational class — the battery
+// has no completed repetitions, so R2's prior-success predicate can NEVER be satisfied (an
+// earlier draft synthesised a ledger from pinning-time success, which grants replays §4.5 does
+// not); everything else HTTP-shaped, plus store corruption, coherence and spawn faults, is a
+// recorded driver failure. FAIL-CLOSED over unknown error shapes: an error outside the
+// harness's own typed classes is by definition a harness fault, and §4.2's discipline counts
+// harness-fault aborts against the ≤1 rerun allowance — mapping it to NO marker left those
+// aborts invisible and re-runnable without limit.
+export function classifyFidelityAbort(e: unknown): "operational-abort" | "driver-failure" {
+  if (e instanceof BenchOperationalError || (e instanceof BenchHttpError && e.code === "no-response")) return "operational-abort";
+  if (e instanceof UnitFailure || e instanceof BenchSpawnError || e instanceof BenchHttpError) return "driver-failure";
+  return "operational-abort";
+}
+
 // The fidelity battery's resume discipline over its own append-only log (§4.2: "§4.5's
 // objective-external rerun predicate applies once per (fixture, driver); a fidelity mismatch is
 // never rerunnable"). Only rows at the CURRENT frozen surface count: another surface's rows
@@ -1250,6 +1266,14 @@ async function cmdFidelity(): Promise<void> {
             } else if (analysis.kind === "per-alias" && (analysis.outcomes[0]?.kind === "binary-fallback" || analysis.outcomes[0]?.kind === "truncated-blob-fallback" || analysis.outcomes[0]?.kind === "validation-fallback")) {
               delivered = await fidelityRestRead(fixture, entry.path, "rest-fallback");
               route = analysis.outcomes[0].kind === "validation-fallback" ? "validation-fallback" : analysis.outcomes[0].kind;
+            } else if (analysis.kind === "per-alias" && analysis.outcomes[0]?.kind === "timeout") {
+              // the frozen table's route for a singleton alias-attributed TIMEOUT — the matrix
+              // sends it to REST as "timeout-singleton", never a terminal verdict — so the
+              // battery verifies the bytes that route actually delivers. Leaving it to the
+              // closed default turned a transient server response into a PERMANENT
+              // fidelity-driver-failure marker: the transient-becomes-permanent class again
+              delivered = await fidelityRestRead(fixture, entry.path, "rest-fallback");
+              route = "timeout-singleton";
             } else {
               // FAIL-CLOSED BY DEFAULT. Everything that is not one of the delivering cases above
               // is a transport-level condition and none of it is an observation about T1's
@@ -1257,8 +1281,10 @@ async function cmdFidelity(): Promise<void> {
               // append-only log and disqualifies the driver globally and irreversibly (§4.7).
               // Written as an else rather than a list so a NEW analysis kind fails closed too.
               // WITHIN the else, §4.5's split still applies: transient transport kinds
-              // (http-failure / throttle / timeouts) are operational aborts, but the closed
+              // (http-failure / throttle / batch-timeout) are operational aborts, but the closed
               // default — which includes fatal classifications — is a DRIVER failure, no rerun.
+              // (Alias-attributed timeouts never reach here — they take the frozen table's
+              // timeout-singleton REST route above, exactly as the matrix routes them.)
               const detail = analysis.kind === "per-alias"
                 ? `alias outcome ${analysis.outcomes[0]?.kind ?? "none"}`
                 : analysis.kind;
@@ -1365,6 +1391,9 @@ async function cmdFidelity(): Promise<void> {
           }
           log(`fidelity ${fixture.kind} ${driver} ${entry.path} [${route}]: ${pass ? "PASS" : "FAIL"}`);
         }
+        // this (fixture, driver) unit is complete — a throw from here on (the summary append,
+        // the battery-failure verdict) is not attributable to it and must not mint its marker
+        inFlight = null;
       }
     }
     void seamHash;
@@ -1373,35 +1402,27 @@ async function cmdFidelity(): Promise<void> {
     if (failures > 0) throw new Error(`fidelity battery FAILED: ${failures} mismatch(es) — a G1 event for the affected driver (global eligibility spans the fidelity battery, §4.2)`);
   } catch (e) {
     // a HARNESS fault (never a divergence) aborts the battery: record which (fixture, driver)
-    // was in flight so the ≤1 rerun allowance is countable across invocations. Best-effort —
-    // the abort itself must still propagate even if the marker append fails.
-    // Two DISTINCT durable outcomes, matching §4.5's split exactly:
-    //   • operational/R1-R2-shaped aborts (harness faults; network-layer no-response; transient
-    //     5xx exhaustion) — an abort marker, and the ≤1 objective-external rerun applies;
+    // was in flight so the ≤1 rerun allowance is countable across invocations.
+    // Two DISTINCT durable outcomes, mirroring §4.5's two-way split (its SCOPE here
+    // deliberately differs from the matrix predicate — see classifyFidelityAbort):
+    //   • operational aborts (harness faults, incl. UNKNOWN error shapes; network-layer
+    //     no-response) — an abort marker, and the ≤1 objective-external rerun applies;
     //   • DRIVER failures (store corruption, coherence, fatal HTTP, spawn faults) — a durable
     //     driver-failure row, never rerunnable: re-running until a pass would launder a §4.5
     //     "driver failure, no rerun" through the battery.
     if (inFlight !== null) {
-      // STRICT §4.5: only R1 (a network-layer failure outside any HTTP response) qualifies as
-      // objective-external here — the battery has no completed repetitions, so R2's
-      // prior-success predicate can NEVER be satisfied (an earlier draft synthesised a ledger
-      // from pinning-time success, which grants replays §4.5 does not); everything else
-      // HTTP-shaped is a recorded driver failure
-      const rerunnableAbort =
-        e instanceof BenchOperationalError ||
-        (e instanceof BenchHttpError && e.code === "no-response");
-      const driverFailure = !rerunnableAbort && (e instanceof UnitFailure || e instanceof BenchSpawnError || e instanceof BenchHttpError);
-      const marker = rerunnableAbort
-        ? { type: "fidelity-operational-abort", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: (e instanceof Error ? e.message : String(e)).slice(0, 300) }
-        : driverFailure
-          ? { type: "fidelity-driver-failure", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: (e instanceof Error ? e.message : String(e)).slice(0, 300) }
-          : null;
-      if (marker !== null) {
-        try {
-          appendFileSync(fidelityLogPath, `${JSON.stringify(marker)}\n`);
-        } catch {
-          log(`WARNING: could not append the ${String(marker.type)} marker to fidelity.jsonl`);
-        }
+      const markerType = classifyFidelityAbort(e) === "operational-abort" ? "fidelity-operational-abort" : "fidelity-driver-failure";
+      const marker = { type: markerType, generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: (e instanceof Error ? e.message : String(e)).slice(0, 300) };
+      try {
+        appendFileSync(fidelityLogPath, `${JSON.stringify(marker)}\n`);
+      } catch (appendErr) {
+        // the marker is DURABLE evidence under the same discipline as the row append above: a
+        // lost driver-failure marker lets a later invocation launder a no-rerun verdict, and a
+        // lost abort marker refunds the spent ≤1 allowance. The original abort must still
+        // propagate, so the failure is put in the operator's face — marker printed, error
+        // annotated — instead of a swallowed one-line warning.
+        log(`MARKER COULD NOT BE APPENDED: ${JSON.stringify(marker)} (${appendErr instanceof Error ? appendErr.message : String(appendErr)}) — repair the log medium before re-running`);
+        if (e instanceof Error) e.message = `${e.message} — ALSO: the ${markerType} marker could not be appended; it is printed in the log above`;
       }
     }
     throw e;

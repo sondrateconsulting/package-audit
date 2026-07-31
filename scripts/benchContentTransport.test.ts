@@ -8,10 +8,12 @@
 // decision rests on, so each of these must fail closed rather than fabricate.
 import { describe, expect, test } from "bun:test";
 import {
-  BenchOperationalError, assertFreezeGitState, classifyFidelityEnumeration,
+  BenchOperationalError, assertFreezeGitState, classifyFidelityAbort, classifyFidelityEnumeration,
   harnessCommitFromGitResult, loginFromUserPayload, parseProbeBatch,
 } from "./benchContentTransport.ts";
 import { UnitFailure, describeDisposal } from "./benchDrivers.ts";
+import { BenchHttpError } from "./benchGh.ts";
+import { BenchSpawnError } from "./benchSpawn.ts";
 import type { WorkloadEntry } from "./benchWorkload.ts";
 
 const bytes = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -486,5 +488,26 @@ describe("assertAppendOnlyPrefix — the exemption's append-only CLAIM is verifi
   });
   test("an edited byte refuses — rewriting prior evidence is not appending", () => {
     expect(() => assertAppendOnlyPrefix("runs.jsonl", b("a\nb\n"), b("a\nX\nc\n"))).toThrow(/edited, not appended/);
+  });
+});
+
+describe("classifyFidelityAbort — fail-closed §4.2 abort taxonomy (continuation loop R1)", () => {
+  // The bug: the marker construction enumerated the harness's typed error classes and mapped
+  // everything else to NO marker at all — an untyped throw (e.g. a launch failure surfacing
+  // straight from the runtime) aborted the battery invisibly, so re-invocations were never
+  // countable against the ≤1 rerun allowance.
+  test("operational classes and R1-shaped no-response failures are operational aborts", () => {
+    expect(classifyFidelityAbort(new BenchOperationalError("teardown was not clean"))).toBe("operational-abort");
+    expect(classifyFidelityAbort(new BenchHttpError("no-response", "curl-level failure", 0))).toBe("operational-abort");
+  });
+  test("typed driver classes are durable driver failures", () => {
+    expect(classifyFidelityAbort(new UnitFailure("object-store corruption"))).toBe("driver-failure");
+    expect(classifyFidelityAbort(new BenchSpawnError("wall-deadline", "child overran the deadline"))).toBe("driver-failure");
+    expect(classifyFidelityAbort(new BenchHttpError("attempts-exhausted", "HTTP 500 exhausted the cap", 500))).toBe("driver-failure");
+  });
+  test("an UNKNOWN error shape is a counted operational abort, never invisible", () => {
+    expect(classifyFidelityAbort(new Error("launch ENOENT surfaced untyped"))).toBe("operational-abort");
+    expect(classifyFidelityAbort(new TypeError("undefined is not a function"))).toBe("operational-abort");
+    expect(classifyFidelityAbort("string throw")).toBe("operational-abort");
   });
 });

@@ -190,16 +190,38 @@ describe("summarizeTraffic — one control-plane rule for EVERY record (F7)", ()
     expect(summarizeTraffic([httpRec({ servedFromCache: true, bodyBytes: 999 })]).httpBodyBytes).toBe(0);
   });
   test("5xx, retries, graphql points and imputation are counted off the same pass", () => {
+    // 5xx fixtures carry the classification production actually assigns them ("transient",
+    // never "ok") — a status-502/classification-ok record is a combination benchGh cannot
+    // emit, and driving the okRequestClasses ledger with it masked its own defects
     const s = summarizeTraffic([
-      httpRec({ status: 502 }),
+      httpRec({ status: 502, classification: "transient" }),
       httpRec({ attempt: 2 }),
       httpRec({ kind: "graphql", requestClass: "graphql-batch", pointsCost: 3 }),
       httpRec({ kind: "graphql", requestClass: "graphql-batch", pointsCost: null }),
-      httpRec({ requestClass: "rest-meta", status: 502, attempt: 3 }), // still excluded everywhere
+      httpRec({ requestClass: "rest-meta", status: 502, classification: "transient", attempt: 3 }), // still excluded everywhere
     ]);
     expect(s.attempts.fivexx).toBe(1);
     expect(s.attempts.retries).toBe(1);
     expect(s.points).toEqual({ measuredCostSum: 3, imputed: 1 });
+  });
+  test("okRequestClasses excludes a success-shaped GraphQL envelope from a failed gh (truncated-transfer rule)", () => {
+    // benchGh records classifyGraphql's envelope verdict ("ok") with gh's exit code alongside;
+    // benchT1's analyzer treats exactly this record as an http-failure and retries the
+    // dispatch — so the ledger must not count it as the §4.5 R2 "succeeded" evidence
+    const s = summarizeTraffic([
+      httpRec({ kind: "graphql", requestClass: "graphql-batch", classification: "ok", exitCode: 1 }),
+    ]);
+    expect(s.okRequestClasses).toEqual([]);
+    expect(s.requests["graphql-batch"]).toBe(1); // still counted as an ATTEMPT
+  });
+  test("okRequestClasses includes graphql-batch when the envelope is ok AND gh exited 0", () => {
+    const s = summarizeTraffic([
+      httpRec({ kind: "graphql", requestClass: "graphql-batch", classification: "ok", exitCode: 0 }),
+    ]);
+    expect(s.okRequestClasses).toEqual(["graphql-batch"]);
+  });
+  test("a transient 5xx attempt never mints an okRequestClasses entry", () => {
+    expect(summarizeTraffic([httpRec({ status: 502, classification: "transient" })]).okRequestClasses).toEqual([]);
   });
   test("secondary signals are tallied by kind, control-plane excluded", () => {
     const s = summarizeTraffic([

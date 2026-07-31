@@ -2911,8 +2911,10 @@ describe("single chokepoint (grep-enforced)", () => {
         dynNonliteral: (src.match(DYN_NONLITERAL_RE) ?? []).length,
       };
       const zero = { bun: 0, cp: 0, bunModule: 0, bunIndirect: 0, dynAssembly: 0, dynNonliteral: 0 };
-      if (f.endsWith("scripts/github.ts")) {
-        // the single realSpawn site; zero on every other surface
+      if (f === "scripts/github.ts" || f === join("scripts", "github.ts")) {
+        // the single realSpawn site; zero on every other surface. EXACT repo-relative path,
+        // matching the benchSpawn entry below — a suffix match would let a nested
+        // evil/scripts/github.ts inherit the sanctioned-chokepoint allowance.
         expect({ file: f, ...counts }).toEqual({ file: f, ...zero, bun: 1 });
       } else if (f === "scripts/benchSpawn.ts" || f === join("scripts", "benchSpawn.ts")) {
         // EXACT repo-relative path (never a suffix match — a nested evil/scripts/benchSpawn.ts
@@ -2924,9 +2926,11 @@ describe("single chokepoint (grep-enforced)", () => {
     // is cliErrors.test.ts's operator-error-registry exclusions) — production
         // code (github.ts, readOnlyGuard.ts) is untouched by Step B.
         expect({ file: f, ...counts }).toEqual({ file: f, ...zero, bun: 1 });
-      } else if (f.endsWith("scripts/github.test.ts") || f.endsWith("scripts/tuiPurity.test.ts")) {
+      } else if (f === "scripts/github.test.ts" || f === join("scripts", "github.test.ts") || f === "scripts/tuiPurity.test.ts" || f === join("scripts", "tuiPurity.test.ts")) {
         // these SCANNER test files name the patterns in their own assertions — exempt them
-        // (tuiPurity.test.ts is the display-layer purity scan; it must spell the same tokens)
+        // (tuiPurity.test.ts is the display-layer purity scan; it must spell the same tokens).
+        // EXACT paths for the same reason as the allowlist entries: a suffix-matched exemption
+        // was a total scan bypass for any nested file that borrowed these names.
       } else {
         expect({ file: f, ...counts }).toEqual({ file: f, ...zero });
       }
