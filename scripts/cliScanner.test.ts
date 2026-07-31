@@ -139,8 +139,8 @@ describe("scanCli — Dockerfile FROM…AS stage parsing (linear, ReDoS-safe)", 
   // We run scanCli in a Worker so a re-introduced backtracking regex hangs the WORKER, not the test
   // runner: the parent races a 5s deadline and terminate()s a hung worker, turning a would-be
   // unbounded hang into a bounded, deterministic failure. A synchronous regex cannot be interrupted
-  // by Bun's per-test timeout, and the repo-wide single-chokepoint guard (github.test.ts) forbids
-  // process-spawning APIs, so a Worker (a thread the parent can terminate) is the fit.
+  // by Bun's per-test timeout, and the repo-wide spawn-site guard (github.test.ts) forbids
+  // process-spawning APIs outside its two allowlisted files, so a Worker (a thread the parent can terminate) is the fit.
   //
   // Three outcomes, all bounded: the worker posts a tagged reply on success/scanCli-throw (surfaced
   // immediately with its real cause), `onerror` catches a worker that fails to load/run, and the 5s

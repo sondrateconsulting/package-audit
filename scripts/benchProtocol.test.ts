@@ -89,7 +89,7 @@ describe("washout + straddle", () => {
     expect(bucketDelta({ remaining: 100, reset: 5, used: 4900 }, { remaining: 4990, reset: 6, used: 10 })).toEqual({ valid: false, used: null });
     expect(bucketDelta({ remaining: 100, reset: 5, used: 4900 }, { remaining: 100, reset: 5, used: 4900 })).toEqual({ valid: true, used: 0 });
     // a FULL bucket floats its reset until first consumption — the run opened the window, so
-    // after.used is exactly the run's own spend (measured live: pilot rep 1, 2026-07-29)
+    // after.used is taken as the run's own spend (measured live: pilot rep 1, 2026-07-29)
     expect(bucketDelta({ remaining: 5000, reset: 5, used: 0 }, { remaining: 4940, reset: 9, used: 60 })).toEqual({ valid: true, used: 60 });
     expect(bucketDelta({ remaining: 5000, reset: 5, used: 0 }, { remaining: 5000, reset: 9, used: 0 })).toEqual({ valid: true, used: 0 });
   });

@@ -1112,8 +1112,10 @@ async function cmdDiagnostics(): Promise<void> {
 // HTTP response) qualifies as objective-external alongside the operational class — the battery
 // has no completed repetitions, so R2's prior-success predicate can NEVER be satisfied (an
 // earlier draft synthesised a ledger from pinning-time success, which grants replays §4.5 does
-// not); everything else HTTP-shaped, plus store corruption, coherence and spawn faults, is a
-// recorded driver failure. A re-pin condition is NEITHER: it demands a §8 freeze amendment, so
+// not); store corruption, coherence and spawn faults are recorded driver failures. NOTE the
+// battery's deliberate breadth: the T1 branch converts http-failure and throttle-retry into
+// BenchOperationalError before reaching here, so those transient transport kinds are counted
+// aborts rather than driver failures — wider than the matrix's R1/R2, as §4.2 records. A re-pin condition is NEITHER: it demands a §8 freeze amendment, so
 // it gets no marker at all (re-running before the re-pin hits the same condition — nothing to
 // launder — and after it the digest differs; charging the ≤1 harness-fault allowance would
 // mislabel an artifact condition as a harness fault). FAIL-CLOSED over unknown error shapes:

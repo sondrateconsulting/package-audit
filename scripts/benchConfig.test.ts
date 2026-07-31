@@ -29,14 +29,14 @@ describe("the committed bench-config.json", () => {
     expect(CFG.t1.split).toEqual({ maxDepth: 2, maxDescendantsPerOriginal: 4 });
     expect(CFG.t1.circuitBreakerConsecutiveFailedDispatches).toBe(3);
     expect(CFG.t1.splitTriggers.graphqlErrorType).toBe("TIMEOUT");
-    expect(CFG.t1.splitTriggers.consecutive5xx).toEqual({ count: 2, statuses: [502, 503, 504], capUtilisationFloor: 0.8 });
+    expect(CFG.t1.splitTriggers.consecutive5xx).toEqual({ count: 2, statuses: [502, 503, 504], bodies: "empty-or-non-json", capUtilisationFloor: 0.8 });
     expect(CFG.restFallbackBudget).toEqual({ floor: 20, fractionOfSelected: 0.1 });
     expect(CFG.budget.pMaxPointsPerGraphqlAttempt).toBe(10); // never the 1-point floor
     expect(CFG.budget.headroomFactor).toBe(1.1);
     expect(CFG.budget.bucketCapacityPerHour).toBe(5000);
     expect(CFG.protocol.washoutFloorMs).toBe(60_000);
     expect(CFG.protocol.diskGateBytes).toBe(2 * 1024 * 1024 * 1024); // the 2 GiB G4 gate
-    expect(CFG.protocol.g4).toEqual({ warnAtMost: 1, failAt: 2 });
+    expect(CFG.protocol.g4).toEqual({ pass: 0, warnAtMost: 1, failAt: 2 });
     expect(CFG.noiseBand).toEqual({ floor: 1.25, roundUpTo: 0.05 });
     expect(CFG.pilot).toEqual({ driver: "T0", slot: "C2", reps: 5 });
     expect(CFG.protocol.tempPrefix).toBe("pa-bench-"); // NOT pkg-audit-* (production sweeps that)

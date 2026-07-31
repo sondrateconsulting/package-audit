@@ -96,7 +96,7 @@ export interface BenchConfig {
     splitTriggers: {
       graphqlErrorType: string;
       timeoutMessageRe: RegExp;
-      consecutive5xx: { count: number; statuses: number[]; capUtilisationFloor: number };
+      consecutive5xx: { count: number; statuses: number[]; bodies: string; capUtilisationFloor: number };
     };
     split: { maxDepth: number; maxDescendantsPerOriginal: number };
     circuitBreakerConsecutiveFailedDispatches: number;
@@ -117,7 +117,7 @@ export interface BenchConfig {
     washoutFloorMs: number;
     diskGateBytes: number;
     diskSamplerHz: number;
-    g4: { warnAtMost: number; failAt: number };
+    g4: { pass: number; warnAtMost: number; failAt: number };
     rerunAllowancePerUnitDriver: number;
     fidelityBattery: { repsPerFixtureDriver: number };
   };
@@ -280,6 +280,7 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
         consecutive5xx: {
           count: num(c5xx, "t1.splitTriggers.consecutive5xx", "count", { min: 1 }),
           statuses: statuses as number[],
+          bodies: str(c5xx, "t1.splitTriggers.consecutive5xx", "bodies"),
           capUtilisationFloor: fraction(c5xx, "t1.splitTriggers.consecutive5xx", "capUtilisationFloor"),
         },
       },
@@ -314,6 +315,7 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
       diskGateBytes: num(protocol, "protocol", "diskGateBytes", { min: 1 }),
       diskSamplerHz: num(protocol, "protocol", "diskSamplerHz", { min: 1 }),
       g4: {
+        pass: num(g4, "protocol.g4", "pass", { min: 0 }),
         warnAtMost: num(g4, "protocol.g4", "warnAtMost", { min: 0 }),
         failAt: num(g4, "protocol.g4", "failAt", { min: 1 }),
       },
@@ -355,6 +357,13 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
   // cross-field coherence the formulas rely on
   if (cfg.protocol.g4.failAt !== cfg.protocol.g4.warnAtMost + 1)
     fail("protocol.g4: failAt must be warnAtMost + 1 (pass/warn/fail is a partition)");
+  // pass is the partition's lower bound and the classifier treats "no attributable signal" as the
+  // only passing count, so any other value would be a frozen-config claim no code honours
+  if (cfg.protocol.g4.pass !== 0) fail("protocol.g4: pass must be 0 — the partition's passing band is exactly zero attributable secondary signals");
+  // benchT1 hardcodes the qualifying-body condition (empty or non-JSON); pinning the literal keeps
+  // the preregistered value and the implemented predicate from drifting apart silently
+  if (cfg.t1.splitTriggers.consecutive5xx.bodies !== "empty-or-non-json")
+    fail("t1.splitTriggers.consecutive5xx.bodies must be 'empty-or-non-json' — the implemented split predicate hardcodes that condition; a different value requires the implementing code change with its §8 amendment");
   if (cfg.frame.frameCeilingBytes !== cfg.spawn.outputCapBytes)
     fail("frame.frameCeilingBytes must equal spawn.outputCapBytes (the plan pins the ceiling to production's spawn cap)");
   if (cfg.pilot.reps !== cfg.reps) fail("pilot.reps must equal reps (the pilot calibrates the same K)");

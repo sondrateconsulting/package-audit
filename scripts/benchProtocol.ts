@@ -116,8 +116,9 @@ export interface BucketDelta {
 // fixed for the window, so equal epochs ⇒ a subtraction-valid delta. A FULL, untouched bucket
 // FLOATS its reset (now + window) until the first consumption opens the window — measured live:
 // epoch equality is unsatisfiable when a run starts on a full bucket. When before.used === 0
-// the run itself opened the window, so nothing prior can be misattributed and after.used IS the
-// run's own consumption (runs are minutes long, far inside the window they opened). Everything
+// the run itself opened the window, so nothing prior can be misattributed and after.used is TAKEN
+// AS the run's own consumption — the check is used === 0 alone, with no timestamp, so it trusts
+// that a minutes-long run does not span a SECOND reset rather than proving it. Everything
 // else — a consumed bucket whose epoch changed under the run — is the straddle R4 invalidates.
 export function bucketDelta(before: { remaining: number; reset: number; used: number }, after: { remaining: number; reset: number; used: number }): BucketDelta {
   if (before.reset === after.reset) return { valid: true, used: Math.max(0, before.remaining - after.remaining) };
@@ -732,7 +733,7 @@ export class BenchEngine {
       return { core: ((sizes[i] ?? 0) + (i === 0 ? 1 : 0) + budget) * cfg.rest.attemptCap + cfg.rest.attemptCap + cfg.budget.fixedPerRunOverheadRequests, graphql: 0, plannedBatches: 0 };
     };
     const sampler: DiskSamplerPort = this.o.makeDiskSampler?.() ?? new WorkerDiskSampler();
-    sampler.extraFiles([dbPath, `${dbPath}-wal`, `${dbPath}-shm`]); // the run's FULL footprint incl. cache sidecars (R2 f.29)
+    sampler.extraFiles([dbPath, `${dbPath}-wal`, `${dbPath}-shm`]); // runDir PLUS the run-cache DB and its sidecars, which live outside it (R2 f.29)
     sampler.start(runDir, cfg.protocol.diskSamplerHz);
     if (this.childPool.pool === null) this.childPool.pool = makeChildPool(cfg.frame.childPoolSize);
     const liveState = { fallbackSpend: 0, routesDelivered: {} as Record<string, number>, cloneDir: null as string | null, t1Conflicts: 0, t1BodyTimeouts: 0 };

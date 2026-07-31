@@ -235,7 +235,9 @@ declared here — test-list changes, not production-code changes; without them S
 unimplementable. **(Amended at Step B; the original text declared only the first.)** (i)
 `github.test.ts` enforces a repo-wide spawn-site allowlist, and it gains the bench spawn module as
 a second entry (exact repo-relative path) alongside the production wrapper — so the repo-wide
-guarantee becomes "exactly these two files, one spawn each", not "one wrapper". (ii) `cliErrors.test.ts` enforces a repo-wide registry over every exported `Error`
+guarantee becomes "one spawn each in the two allowlisted SOURCE files", not "one wrapper". (Two
+scanner test files stay fully exempt — they must name the very tokens they assert about, and
+`github.test.ts` genuinely spawns in its own integration tests.) (ii) `cliErrors.test.ts` enforces a repo-wide registry over every exported `Error`
 subclass (operator-facing errors must join `KNOWN_OPERATOR_ERRORS`; everything else must be
 explicitly excluded); the bench's error classes are harness-internal — they surface only through
 `bench:content`'s own top-level catch, never through the production CLIs' `renderFatal` — and
@@ -253,7 +255,7 @@ the **transport operations under evaluation**: both exact clone shapes, the `ls-
 `cat-file --batch` tuple. The SHA-pinned acquisition scaffolding (§4.4) is *bench scaffolding, not
 proposed production grammar* — its exact argv tuples are pinned in `bench-config.json` so runs are
 reproducible, but no production claim attaches to them. Measurement instrumentation is bench-local: the disk
-sampler sits outside argv-guard discipline entirely (it spawns nothing), while `rate_limit` reads
+sampler starts no argv-bearing subprocess (it runs in a Worker thread), so no argv guard applies to it, while `rate_limit` reads
 go out through the production client and are argv-guarded like any other `gh api` call.
 
 ### 4.2 Corpus
@@ -435,8 +437,9 @@ neither `data` nor `errors[]` → one batch-level retry, then `missing-alias-fal
 an alias appearing in *both* `data` and `errors[]` is treated as errored (the conflict recorded).
 **Default clause:** any response condition not matched above — pathless or batch-global errors of
 other types, malformed or unattributable `errors[].path`, unknown error types — is a whole-batch
-attempt failure, and if it persists through the attempt budget, a unit failure with the raw
-condition recorded. Every terminal state is one of: resolved, counted fallback, or unit failure
+attempt failure, and if it persists, a unit failure with the raw condition recorded — in practice
+the circuit breaker opens at three consecutive failed dispatches, before the six-attempt budget
+can drain. Every terminal state is one of: resolved, counted fallback, or unit failure
 with cause; nothing falls through to judgment at observation time.
 
 **Clone acquisition: production argv by default, SHA-pinned scaffolding as the drift fallback —
@@ -478,7 +481,9 @@ alike — run under the bench's sanitized environment and pinned generated gitco
 production's `buildGitEnv`/`ensureGitConfig` approach): argv alone does not pin git behaviour,
 and an inherited `~/.gitconfig` URL rewrite, filter, credential helper, or line-ending default
 would confound acquisition invisibly. The checkout-config probe varies exactly one pinned knob.
-At pinning time, both forms run **three times each** per clone driver as **non-decision
+At pinning time, both forms run **three times each** per APPLICABLE clone driver (C3's T2a arms
+are skipped: its untruncated workload API-escapes instead of cloning, recorded as `t2aArmsSkipped`)
+as **non-decision
 diagnostics**: identical tip and tree OIDs and an **identical reachable-object closure** are
 asserted (`git rev-list --objects <sha>` sorted and hashed — reachable closure is what workload
 reads can observe; physical store inventories may differ in packing, so each arm's inventory is
@@ -877,11 +882,14 @@ scaffolding argv, spend formulas), **the harness source content** (bound by the 
 digest over every non-test script plus the preregistered artifacts and both normative documents —
 not by the commit id; the §4.7 dominance definition and the CLI classifier live in that frozen
 source and prose, not in `bench-config.json`), and **the
-execution environment** — one machine for all timed data, with an environment manifest (OS and
+execution environment** — one machine for all timed data (ENFORCED for matrix rows: resume compares
+the environment hash on `phase:"matrix"` rows; the pilot artifact carries no environment hash, so
+there it is a discipline rather than a gate), with an environment manifest (OS and
 version, hardware identifier hash, git/Bun/gh versions, network location description, credential
 type, and the authenticated-login fingerprint from §4.8) written as an `env-manifest` row at each
 engine start (five in the committed log; the fidelity battery produces gate-relevant evidence
-without one), byte-identical while the environment is unchanged, and stamped BY HASH into every `runs.jsonl` run record alongside the harness commit
+without one). Those five are NOT byte-identical — each carries the harness commit of the invocation
+that wrote it, so the pre-remediation pilot rows differ from the later ones in commit and hash — and stamped BY HASH into every `runs.jsonl` run record alongside the harness commit
 SHA, which is provenance only: resume refuses any row whose stamped environment hash or
 frozen-surface digest differs from the current one.
 Local-subprocess wall times and remote-API wall times are only comparable when both were measured

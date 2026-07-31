@@ -2833,8 +2833,8 @@ describe("temp sweep (§0)", () => {
   });
 });
 
-// ---- the §6 single-chokepoint guarantee (grep-enforced) --------------------------------------
-describe("single chokepoint (grep-enforced)", () => {
+// ---- the §6 spawn-site guarantee: two allowlisted files, one spawn each (grep-enforced) -------
+describe("spawn-site allowlist (grep-enforced)", () => {
   // A best-effort textual tripwire, NOT a semantic proof. It fails on the common direct routes
   // to a spawn surface — a dotted/optional-chained/whitespaced `Bun.spawn|spawnSync|$`; a
   // `"bun"`-module import (quote or backtick); `Bun` aliased, parenthesized, bracket-indexed,
