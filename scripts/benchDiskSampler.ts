@@ -1,5 +1,8 @@
-// benchDiskSampler.ts — the §4.6 peak-disk metric, sampled without charging the measurement to
-// the measured wall.
+// benchDiskSampler.ts — the §4.6 peak-disk metric, sampled without BLOCKING the measured wall.
+// Precisely: the walk no longer runs on the main thread inside the window, and the final snapshot
+// is taken with the wall paused. It is NOT a claim that instrumentation costs the wall nothing —
+// a walk on another thread still competes for CPU and disk bandwidth with the git subprocess
+// under test. That residual is declared in the plan's §4.6 amendment.
 //
 // Two implementations behind one port:
 //   WorkerDiskSampler — the default for TIMED runs. Each tick posts a request to a worker and

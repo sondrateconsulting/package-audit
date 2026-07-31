@@ -464,7 +464,8 @@ acquisition forms). Head already drifted → all reps use the SHA-pinned scaffol
 `corpus.json` at pinning — a plain `init` would default to SHA-1 and be unable to fetch from a
 SHA-256 repository) → `git remote add origin <url>` →
 `git fetch --depth 1 --no-tags --no-recurse-submodules origin <sha>` →
-`git checkout --detach FETCH_HEAD` for any driver materialising a working tree (T2a everywhere;
+`git checkout --detach FETCH_HEAD` for any driver materialising a working tree (T2a on every unit
+except an escape-tripped untruncated one — C3 api-escapes and clones nothing;
 T0/T1 on C4), while T2c addresses objects by the pinned SHA directly (`ls-tree … <sha>`;
 `rev-parse FETCH_HEAD` asserted equal to `<sha>`, since a bare fetch leaves no `HEAD`). Every run
 records which form it used. **All bench git operations — timed transport, scaffolding, and probes
@@ -555,7 +556,10 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   enters. A replay's physical predecessor is the failed attempt itself — recorded as such; the
   slot placement preserves the schedule's predecessor structure for everything downstream.
 - **Checkout-config probe:** every run configuration that materialises a checkout — T2a on all
-  units, T0/T1 on C4 via the truncated-tree fallback — gets one additional repetition under
+  units *(amended at Step B: NOT strictly true — on an escape-tripped untruncated unit, C3 today,
+  T2a takes the REST api-escape and clones nothing, so its preregistered probe row probes no
+  checkout. The row stands as scheduled; the discrepancy is recorded rather than changed under
+  freeze.)*, T0/T1 on C4 via the truncated-tree fallback — gets one additional repetition under
   `core.autocrlf=true` (matrix reps run `false`). Any seam-level byte divergence between the two
   configs on the same entry is a G1 event on that route. The claim this probe supports is
   config-dependence within the pinned bench environment — one demonstrated divergence makes the
@@ -577,6 +581,10 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
    synchronous reclamation, so stopping the clock at the last resolved entry would structurally
    favour clone drivers, whose teardown is the expensive one. For §4.8 segmented runs, the sum of
    segment walls, with inter-segment sleeps excluded and the segment count reported).
+   *(Amended at Step B — the R5 exception:* a run halted by an R5 frozen-assumption breach stops
+   the clock BEFORE its terminal record is appended, so that run's reclamation happens outside the
+   stopped wall. Its wall term is therefore not comparable to a completed run's — which is correct,
+   since an R5 row is diagnostic and never scored.*)*
    **The harness's own instrumentation is excluded** *(amended at Step B; the amendment and the
    digest it supersedes are recorded in `ratification.json`)*:
    teardown is production-equivalent work and is therefore scored, but MEASURING a run is not part
@@ -666,7 +674,10 @@ scenarios quietly vanish from the comparison. The gates:
 drivers' scores; differences within the **noise band** are a tie for that unit. The band is
 `max(1.25, pilot spread)` where *pilot spread* is the max/min wall-time ratio observed in a
 pre-ratification diagnostic pilot (K = 5 reps of T0 on C2, declared non-decision), rounded up to
-the next 0.05 — the band is calibrated by a preregistered formula rather than asserted. This
+the next 0.05 *(precisely: the implementation rounds the ratio to 4 decimal places FIRST — an
+integer-domain guard against float artifacts — then applies the ceiling, so e.g. 1.25001 resolves
+to 1.25 rather than 1.30; see bench-config.json's noiseBand $comment)* — the band is calibrated by
+a preregistered formula rather than asserted. This
 yields a per-unit win/tie/loss table. A driver **dominates** when, against every other eligible
 driver, it has at least one unit-win and no unit-losses.
 

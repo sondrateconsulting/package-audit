@@ -137,7 +137,9 @@ export function restFallbackBudgetFor(cfg: BenchConfig, selectedCount: number): 
   return Math.max(cfg.restFallbackBudget.floor, Math.ceil(cfg.restFallbackBudget.fractionOfSelected * selectedCount));
 }
 
-// §4.7: band = max(floor, pilot spread rounded UP to the next roundUpTo step).
+// §4.7: band = max(floor, pilot spread rounded UP to the next roundUpTo step) — where the spread
+// is first rounded to 4 decimal places, so a value just above a step boundary (1.25001) resolves
+// DOWN to that boundary rather than up to the next step. See noiseBandFrom below.
 export function noiseBandFrom(cfg: BenchConfig, pilotSpread: number): number {
   if (!Number.isFinite(pilotSpread) || pilotSpread < 1) fail(`pilot spread must be a finite ratio >= 1, got ${pilotSpread}`);
   const step = cfg.noiseBand.roundUpTo;

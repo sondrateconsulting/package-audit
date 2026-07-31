@@ -108,7 +108,7 @@ export interface BucketDelta {
   valid: boolean; // false = the run straddled a reset window (R4: invalid, replay in slot)
   used: number | null;
 }
-// §4.6.2 with GitHub's observed reset semantics: a PARTIALLY-consumed bucket's reset epoch is
+// §4.6 item 2 with GitHub's observed reset semantics: a PARTIALLY-consumed bucket's reset epoch is
 // fixed for the window, so equal epochs ⇒ a subtraction-valid delta. A FULL, untouched bucket
 // FLOATS its reset (now + window) until the first consumption opens the window — measured live:
 // epoch equality is unsatisfiable when a run starts on a full bucket. When before.used === 0
@@ -124,7 +124,7 @@ export function bucketDelta(before: { remaining: number; reset: number; used: nu
   return { valid: false, used: null };
 }
 
-// ---- delivery verification (§4.6.6 fidelity + G2 completeness bookkeeping) -------------------
+// ---- delivery verification (§4.6 item 6 fidelity + G2 completeness bookkeeping) -------------------
 export interface VerificationReport {
   resolved: number;
   g1Failures: Array<{ path: string; route: string; reason: string }>;
@@ -213,8 +213,9 @@ export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly En
 }
 
 // ---- disk sampler ----------------------------------------------------------------------------
-// Moved to benchDiskSampler.ts: the §4.6 peak-disk walk now runs OFF the measured thread, so
-// instrumentation cost no longer lands on the wall term it is measured against.
+// Moved to benchDiskSampler.ts: the §4.6 peak-disk walk now runs OFF the measured thread, so it
+// no longer BLOCKS the wall term it is measured against. Residual cross-thread CPU/disk
+// contention remains and is declared in the plan's §4.6 amendment — not eliminated.
 
 // ---- environment manifest (§8) ---------------------------------------------------------------
 export interface EnvManifest {
@@ -274,7 +275,7 @@ export interface RunRecord {
   epilogue: boolean; // R6 branch-arm restart rows (scaffolding form), distinct from main rows
   acquisitionForm: AcquisitionForm | null;
   startedAtIso: string;
-  wallMs: number; // workload start → unit slot release, teardown included (§4.6.1)
+  wallMs: number; // workload start → unit slot release, teardown included (§4.6 item 1)
   segments: number;
   // "invalidated-finalisation": the run was measured and reclaimed, but post-run accounting (the
   // rate-limit read) failed. The wall stands; the consumption figures do not, so the row is
@@ -328,7 +329,7 @@ export class RunsLog {
   }
 }
 
-// active-wall accounting: segment sleeps are excluded from the wall term (§4.6.1/§4.7 —
+// active-wall accounting: segment sleeps are excluded from the wall term (§4.6 item 1/§4.7 —
 // dropping the wall for segmented runs would make segmentation a scoring exploit, so the wall
 // is the SUM of active segments).
 export interface TrafficSummary {
@@ -373,7 +374,7 @@ export function summarizeTraffic(httpRecords: readonly BenchHttpAttemptRecord[])
 //
 // Reclamation is INSIDE the clock on purpose: production holds the unit slot through synchronous
 // reclamation, so stopping at the last resolved entry would structurally favour clone drivers,
-// whose teardown is the expensive one (§4.6.1). Instrumentation is a different animal — §4.6
+// whose teardown is the expensive one (§4.6 item 1). Instrumentation is a different animal — §4.6
 // mandates COLLECTING disk data, never charging its collection to the wall — and charging it
 // biased the comparison toward whichever driver materialised fewer files.
 export async function finishMeasuredRun(opts: {
@@ -789,7 +790,7 @@ export class BenchEngine {
       this.replayOfPos = null;
       throw r5;
     }
-    // §4.6.1 keeps RECLAMATION inside the wall (production holds the unit slot through
+    // §4.6 item 1 keeps RECLAMATION inside the wall (production holds the unit slot through
     // synchronous reclamation, so stopping at the last resolved entry would structurally favour
     // clone drivers). It does not license charging INSTRUMENTATION to the same clock, so the
     // disk snapshot is taken with the wall paused — see finishMeasuredRun.
@@ -837,7 +838,7 @@ export class BenchEngine {
     }
     if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
 
-    // per-segment same-window deltas, summed by construction (§4.6.2); the final (or only)
+    // per-segment same-window deltas, summed by construction (§4.6 item 2); the final (or only)
     // segment closes against the post-run snapshot. Any straddled segment invalidates the run.
     bucketSnapshots.push({ before: segBefore, after });
     segmentDeltas.push({ core: bucketDelta(segBefore.core, after.core), graphql: bucketDelta(segBefore.graphql, after.graphql) });

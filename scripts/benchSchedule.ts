@@ -114,8 +114,11 @@ export function interleaveUnits(units: readonly ScheduleUnit[]): ScheduleUnit[] 
 
 // ---- schedule construction -------------------------------------------------------------------
 // probeDriversFor: which drivers of this unit get the checkout-config probe rep — T2a on every
-// unit (checkout is its primary route); T0/T1 only where they materialise a checkout (the C4
-// truncated-tree fallback). Plan §4.5.
+// unit, T0/T1 only where they materialise a checkout (the C4 truncated-tree fallback). Plan §4.5.
+// CAVEAT (recorded, not silently patched): T2a does NOT always materialise a checkout. On an
+// escape-tripped untruncated unit — C3 today — it takes the REST api-escape and clones nothing,
+// so its scheduled probe rep probes no checkout. The row is preregistered and stays; the
+// discrepancy is noted in ratification.json rather than changed under freeze.
 export function probeDriversFor(unit: ScheduleUnit): DriverId[] {
   return unit.slot === "C4" ? ["T0", "T1", "T2a"] : ["T2a"];
 }

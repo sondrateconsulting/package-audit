@@ -419,11 +419,13 @@ describe("finishMeasuredRun — instrumentation is not scored, reclamation is (F
   // The bug: the peak-disk sampler ran a SYNCHRONOUS recursive directory walk on the main thread
   // via setInterval, started before wall.start() and stopped after wall.stop(); two further full
   // walks (the .git size read and the post-acquisition point sample) also sat inside the window.
-  // The walk's cost scales with ENTRY COUNT, so it taxed checkout drivers (T2a always; T0/T1 on
+  // The walk's cost scales with ENTRY COUNT, so it taxed checkout drivers (T2a on every unit
+  // except the api-escaping C3; T0/T1 on
   // the truncated-tree fallback) and barely touched T2c's --no-checkout store. That is a
   // driver-correlated tax on the PRIMARY scored metric, and the pilot that calibrated the noise
-  // band (T0 on C2, no clone) is precisely the configuration where it is zero — so the band
-  // could never have covered it.
+  // band (T0 on C2, no clone) is the configuration where it is SMALLEST — that run directory stays
+  // small, so its walk is cheap (the pilot rows still record sampling) — so the band never saw the
+  // driver-correlated part.
   //
   // §4.6 puts teardown inside the clock deliberately ("production holds the unit slot through
   // synchronous reclamation"), but says nothing about charging MEASUREMENT to the measurement.

@@ -144,7 +144,7 @@ describe("benchSchedule", () => {
     const main = schedule.rows.filter((r) => !r.probe);
     const probe = schedule.rows.filter((r) => r.probe);
     expect(main.length).toBe(UNITS.length * CFG.reps * DRIVERS.length); // 8 × 5 × 4 = 160
-    // probe: T2a everywhere + T0/T1 on the C4 unit = 8 + 2
+    // probe: T2a on all 8 units (scheduled regardless of C3's api-escape) + T0/T1 on C4 = 8 + 2
     expect(probe.length).toBe(10);
     expect(probeDriversFor(UNITS[6]!)).toEqual(["T0", "T1", "T2a"]); // the C4 unit
     expect(probeDriversFor(UNITS[0]!)).toEqual(["T2a"]);
