@@ -1,7 +1,8 @@
 // benchConfig.ts — strict loader for docs/adrs/0001-benchmark/bench-config.json, the
-// benchmark's preregistered-constants artifact (resolution plan §4.3 step 1). Every field is
-// validated fail-closed (house posture: config.ts) — a preregistration that half-parses is a
-// preregistration that can drift. The schedule member is null until corpus pinning writes the
+// benchmark's preregistered-constants artifact (resolution plan §4.3 step 1). Every CONSUMED
+// semantic field is validated fail-closed (house posture: config.ts) — a preregistration that
+// half-parses is a preregistration that can drift. (Unknown extra keys are ignored, not
+// rejected; the digest freezes the file bytes, so an added key cannot drift silently.) The schedule member is null until corpus pinning writes the
 // literal traversal table; when present it is validated against the §4.5 rules via
 // benchSchedule's validators plus the corpus units the caller supplies.
 

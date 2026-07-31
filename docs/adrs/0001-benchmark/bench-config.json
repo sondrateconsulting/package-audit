@@ -11,7 +11,7 @@
     "T2c"
   ],
   "selection": {
-    "$comment": "The production selection function's pinned inputs (§4.3): scanUnit/locateManifests/classifyFile are reused directly, so the classifier terms are the production code itself; these are the config-shaped inputs it takes. trackedPackages was finalised at corpus pinning (pre-freeze, plan §4.2's C2 ≤~500 preference): react resolves in C1/prometheus's web/ui (a genuine source class); pino was chosen as a second, deliberately LOW-yield tracked name — no selected artifact resolves it, so it exercises the tracked-set machinery without inflating any workload (an earlier note here claimed 'fastify-ecosystem coverage', which no committed evidence supports); typescript/eslint/semver were deliberately EXCLUDED — C2/nest declares them, which made every .ts file source-selected (1,785 reads measured) and would have pushed C2's ONE segmentable run — T0 — into multi-window segmentation. NB neither of C2's other API-shaped runs segments: T1 never segments at all (planSegments admits only the per-file REST shape), and C2's T2a clones rather than api-escaping (486,063 KB is below the 1,048,576 KB threshold), so it is not a REST shape either.",
+    "$comment": "The production selection function's pinned inputs (§4.3): scanUnit/locateManifests/classifyFile are reused directly, so the classifier terms are the production code itself; trackedPackages and excludeDirGlobs are the inputs the production selection takes, while maxScanBytes MIRRORS the module-local production gate (the bench uses it only to enumerate the no-read outcomes the pipeline skips before reading). trackedPackages was finalised at corpus pinning (pre-freeze, plan §4.2's C2 ≤~500 preference): react resolves in C1/prometheus's web/ui (a genuine source class); pino was chosen as a second, deliberately LOW-yield tracked name — no selected artifact resolves it, so it exercises the tracked-set machinery without inflating any workload (an earlier note here claimed 'fastify-ecosystem coverage', which no committed evidence supports); typescript/eslint/semver were deliberately EXCLUDED — C2/nest declares them, which made every .ts file source-selected (1,785 reads measured) and would have pushed C2's ONE segmentable run — T0 — into multi-window segmentation. NB neither of C2's other API-shaped runs segments: T1 never segments at all (planSegments admits only the per-file REST shape), and C2's T2a clones rather than api-escaping (486,063 KB is below the 1,048,576 KB threshold), so it is not a REST shape either.",
     "trackedPackages": [
       "react",
       "pino"
@@ -113,7 +113,7 @@
     "fixedPerRunOverheadRequests": 0
   },
   "noiseBand": {
-    "$comment": "§4.7: band = max(floor, pilot max/min wall ratio rounded UP to the next roundUpTo). Exactly, per noiseBandFrom: the ratio is first rounded to 4 decimal places (an integer-domain guard so 1.3000000000000003 cannot round to 1.35), THEN ceilinged to the step — so a value just above a boundary, e.g. 1.25001, resolves to 1.25 rather than 1.30. The plan's §4.7 sentence and benchConfig.ts's header state the rule without this pre-rounding step; this $comment is the precise one.",
+    "$comment": "§4.7: band = max(floor, pilot max/min wall ratio rounded UP to the next roundUpTo). Exactly, per noiseBandFrom: the ratio is first rounded to 4 decimal places (an integer-domain guard so 1.3000000000000003 cannot round to 1.35), THEN ceilinged to the step — so a value just above a boundary, e.g. 1.25001, resolves to 1.25 rather than 1.30. (The plan's §4.7 text and noiseBandFrom's own header state the same pre-rounding rule.)",
     "floor": 1.25,
     "roundUpTo": 0.05
   },
@@ -156,7 +156,7 @@
   ],
   "williamsFifthRowNote": "Rows 1-4 are a digram-balanced 4×4 Williams square (each driver once per position; each ordered predecessor pair exactly once). Row 5 is the declared fifth order: its three digrams (T0→T2a, T2a→T1, T1→T2c) each already occur exactly once in rows 1-4, so no ordered pair reaches three occurrences — the minimum any fifth row can achieve.",
   "scaffolding": {
-    "$comment": "SHA-pinned acquisition scaffolding (§4.4) — bench scaffolding, NOT proposed production grammar. Slots in {braces} are substituted before the spawn module compares argv verbatim. The gitconfig is the bench's pinned generated config (mirroring production's ensureGitConfig approach: credential helper delegating to gh, https-only protocol) plus the ONE probe-varied knob, core.autocrlf (baseline false; the checkout-config probe rep runs true).",
+    "$comment": "SHA-pinned acquisition scaffolding (§4.4) — bench scaffolding, NOT proposed production grammar. Slots in {braces} are substituted INSIDE the spawn module, which derives the launched argv from this pinned tuple itself (caller-supplied scaffolding argv is rejected). The gitconfig is the bench's pinned generated config (mirroring production's ensureGitConfig approach: credential helper delegating to gh, https-only protocol) plus the ONE probe-varied knob, core.autocrlf (baseline false; the checkout-config probe rep runs true).",
     "tuples": {
       "init": [
         "init",

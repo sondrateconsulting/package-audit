@@ -825,7 +825,10 @@ influence a timed measurement or its consumption accounting: the spawn/framing s
 protocol engine, configuration loaders, and the preregistered constants and schedule. Code that
 only READS committed `runs.jsonl` and artifacts after the fact — scoring/report generation and
 the §4.7 rule evaluation — may be added at Step C without invalidating timing data: it runs
-after every timed row and cannot affect measurement. The post-matrix informational EXECUTORS
+after every timed row and cannot affect measurement. *(Mechanically — noted at Step B: the
+gate's digest is one global hash over every non-test script, with no reader/executor
+classification, so this latitude applies BETWEEN traversals — add readers after the matrix
+completes; a mid-traversal addition changes the digest and resume refuses.)* The post-matrix informational EXECUTORS
 (§4.4's boundary probe, §4.5's concurrency probe, §4.4's Option-3 offline analysis and warm
 scenario, whose commit pair IS frozen at Step B in `corpus.json`) generate their OWN evidence,
 so the pure-reader latitude does not extend to them: each is frozen and passes one adversarial

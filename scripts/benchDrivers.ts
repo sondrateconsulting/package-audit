@@ -1,8 +1,10 @@
 // benchDrivers.ts — the four transport drivers (resolution plan §4.4), each the minimal
 // faithful implementation of its option as evaluated in the ADR. Serial per-run (the matrix is
 // a per-scenario serial cost profile, §4.6); every HTTP attempt rides benchGh's recorded layer;
-// every git spawn rides benchSpawn's lane-gated single site. Route decisions come from the
-// PINNED workload matrix — a driver never improvises a route at observation time.
+// every git spawn rides benchSpawn's lane-gated single site. The PINNED workload matrix
+// constrains every permitted route and its expected bytes; T1 additionally selects
+// response-DISCOVERED routes (binary/truncated/validation/timeout/missing) through the frozen
+// §4.4 transition table — never a discretionary post-hoc class.
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";

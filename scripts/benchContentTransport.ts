@@ -6,8 +6,10 @@
 //
 //   pin-corpus       verify §4.2 slot candidates, pin SHAs, record workloads + ground truth,
 //                    write corpus.json / selected/*.json / the schedule table into bench-config
-//   refresh-evidence recompute the committed corpus verification evidence in place
-//   verify-corpus    re-check the pinned corpus against its recorded evidence
+//   refresh-evidence recompute a LIMITED evidence subset in place without moving any pin: the
+//                    C3 REST-tree stats, the Option-3 warm pair, and the C6 unification search
+//   verify-corpus    offline parse + summary of the pinned corpus and workloads (strict-parse
+//                    consistency; it re-runs no live verifyC* predicate)
 //   diagnostics      §4.4 acquisition diagnostics (production vs scaffolding forms, 3× each)
 //   budget           print per-(unit × driver) worst-case spend + the schedule's total
 //   digest           print the §8 frozen-surface digest the ratification gate binds
@@ -1554,7 +1556,11 @@ export function reconstructResumeState(
     // only R1/R2 replays charge the driver allowance; R3/R4 in-slot replays do not (f.23)
     if (rec["replayKind"] === "r1r2") rerunUsed.add(`${unit}|${expected.driver}`);
     if (outcome === "complete") {
-      for (const cls of Object.keys((rec["requests"] as Record<string, number> | undefined) ?? {}))
+      // §4.5 R2 needs classes that SUCCEEDED — `requests` counts every attempt including
+      // failures (a completed run can carry a class that only ever failed, e.g. every batch
+      // drained to fallback), so the ledger reads the ok-classes field
+      const okClasses = rec["okRequestClasses"];
+      for (const cls of Array.isArray(okClasses) ? okClasses.filter((c): c is string => typeof c === "string") : [])
         ledgerEntries.push({ pos, key: `${unit}|${expected.driver}|${cls}`, unit, epilogue: rec["epilogue"] === true });
       // every completed run READ rate_limit successfully before and after (its accounting
       // depends on it), but rest-meta is control-plane and excluded from `requests` — without
@@ -1688,7 +1694,7 @@ async function cmdMatrix(): Promise<void> {
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
           if (handle.record.outcome === "complete") {
-            for (const cls of Object.keys(handle.record.requests)) successLedger.add(`${key}|${cls}`);
+            for (const cls of handle.record.okRequestClasses) successLedger.add(`${key}|${cls}`); // §4.5 R2: SUCCESSFUL classes only
             successLedger.add(`${key}|rest-meta`); // implied: a completed run's accounting read rate_limit successfully
             break;
           }

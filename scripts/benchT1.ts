@@ -1,11 +1,12 @@
 // benchT1.ts — Option 1's driver planning + response transition table, PURE (resolution plan
 // §4.4). Two-round dispatch exactly as the production design forces (round 1: manifests +
-// CLI-classifiable paths, knowable from the tree alone; round 2: source + lockfiles), greedy
-// batch packing under the four preregistered caps, variable-bound query construction (never
-// string interpolation — a legal path may contain quotes/backslashes/newlines, ADR §7), and an
-// EXHAUSTIVE response transition table with a closed default — nothing is classified at
-// observation time. The driver loop (benchDrivers) consumes these outcomes; everything here is
-// CI-tested without a network.
+// CLI-classifiable paths, knowable from the tree alone; round 2: source + lockfiles),
+// deterministic halving-based contiguous batch packing under the four preregistered caps,
+// variable-bound query construction (never string interpolation — a legal path may contain
+// quotes/backslashes/newlines, ADR §7), and an EXHAUSTIVE response transition table with a
+// closed default — every observed response is classified through the preregistered table,
+// with no discretionary post-hoc classes. The driver loop (benchDrivers) consumes these
+// outcomes; everything here is CI-tested without a network.
 
 import type { BenchConfig } from "./benchConfig.ts";
 import type { BenchGraphqlDispatch } from "./benchGh.ts";

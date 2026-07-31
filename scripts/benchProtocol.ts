@@ -290,6 +290,7 @@ export interface RunRecord {
   // typed R1/R2 evidence (§4.5): the rerun predicate reads THIS, never a message regex
   failureEvidence: { kind: "http"; code: string; lastClassification: string | null; requestClass: string | null } | { kind: "unit" } | null;
   requests: Record<string, number>;
+  okRequestClasses: string[]; // §4.5 R2 ledger input: classes with ≥1 SUCCESSFUL attempt
   attempts: { fivexx: number; retries: number; secondaryByKind: Record<string, number> };
   secondarySignals: number; // attributable (driver-own matrix traffic) — G4's classifier input
   points: { measuredCostSum: number; imputed: number };
@@ -382,6 +383,11 @@ export class RunsLog {
 // is the SUM of active segments).
 export interface TrafficSummary {
   requests: Record<string, number>;
+  // classes with at least one SUCCESSFUL attempt — §4.5 R2's ledger input ("succeeded in at
+  // least one other repetition"): `requests` counts every attempt including failures, and a
+  // completed run can contain a class that only ever failed (e.g. every batch drained to
+  // batch-error-fallback), which must not authorize an R2 replay
+  okRequestClasses: string[];
   attempts: { fivexx: number; retries: number; secondaryByKind: Record<string, number> };
   points: { measuredCostSum: number; imputed: number };
   secondarySignals: number;
@@ -394,6 +400,7 @@ export interface TrafficSummary {
 // the rule cannot drift between them.
 export function summarizeTraffic(httpRecords: readonly BenchHttpAttemptRecord[]): TrafficSummary {
   const requests: Record<string, number> = {};
+  const okClasses = new Set<string>();
   const attempts = { fivexx: 0, retries: 0, secondaryByKind: {} as Record<string, number> };
   let measuredCostSum = 0;
   let imputed = 0;
@@ -403,6 +410,7 @@ export function summarizeTraffic(httpRecords: readonly BenchHttpAttemptRecord[])
     if (r.servedFromCache) continue;
     if (r.requestClass === "rest-meta") continue;
     requests[r.requestClass] = (requests[r.requestClass] ?? 0) + 1;
+    if (r.classification === "ok" || r.classification === "not-modified") okClasses.add(r.requestClass);
     httpBodyBytes += r.bodyBytes;
     if (r.status >= 500) attempts.fivexx++;
     if (r.attempt > 1) attempts.retries++;
@@ -415,7 +423,7 @@ export function summarizeTraffic(httpRecords: readonly BenchHttpAttemptRecord[])
       attempts.secondaryByKind[r.secondarySignal] = (attempts.secondaryByKind[r.secondarySignal] ?? 0) + 1;
     }
   }
-  return { requests, attempts, points: { measuredCostSum, imputed }, secondarySignals, httpBodyBytes };
+  return { requests, okRequestClasses: [...okClasses].sort(), attempts, points: { measuredCostSum, imputed }, secondarySignals, httpBodyBytes };
 }
 
 // The end of a measured run, in the order §4.6 actually licenses.
@@ -730,7 +738,7 @@ export class BenchEngine {
               type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
               probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: "production", startedAtIso: new Date(this.now()).toISOString(),
               wallMs: 0, segments: 1, outcome: "drift-restart", failureCause: `live head ${live.slice(0, 12)} moved off the pinned SHA at the pre-rep probe`,
-              failureEvidence: null, requests: {}, attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
+              failureEvidence: null, requests: {}, okRequestClasses: [], attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
               secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
               bucketDeltas: { core: { valid: true, used: 0 }, graphql: { valid: true, used: 0 } },
               bucketSnapshots: [],
@@ -853,7 +861,7 @@ export class BenchEngine {
         // an R5 halt is the evidence a freeze repair is diagnosed from, so it carries the partial
         // traffic it actually observed rather than zeroes — through the SAME control-plane rule
         // the normal record uses, which this literal previously contradicted
-        requests: r5traffic.requests, attempts: r5traffic.attempts,
+        requests: r5traffic.requests, okRequestClasses: r5traffic.okRequestClasses, attempts: r5traffic.attempts,
         secondarySignals: r5traffic.secondarySignals, points: r5traffic.points,
         bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
         bucketSnapshots,
@@ -933,7 +941,7 @@ export class BenchEngine {
           // marked invalid for scoring rather than dropped or passed off as complete
           outcome: "invalidated-finalisation", failureCause: `post-run rate-limit read failed: ${e instanceof Error ? e.message : String(e)}`,
           failureEvidence: null,
-          requests: partial.requests, attempts: partial.attempts, secondarySignals: partial.secondarySignals,
+          requests: partial.requests, okRequestClasses: partial.okRequestClasses, attempts: partial.attempts, secondarySignals: partial.secondarySignals,
           points: partial.points,
           bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
           bucketSnapshots,
@@ -1020,7 +1028,7 @@ export class BenchEngine {
       acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
       startedAtIso, wallMs, segments: segmentSizes.length, outcome: runOutcome, failureCause,
       failureEvidence,
-      requests, attempts, secondarySignals,
+      requests, okRequestClasses: traffic.okRequestClasses, attempts, secondarySignals,
       points: { measuredCostSum, imputed },
       bucketDeltas: deltas,
       bucketSnapshots,
@@ -1053,6 +1061,8 @@ export class BenchEngine {
     // would later read as "this driver used no disk" to anything scoring the §4.6 disk axis
     if (disk.sampleError !== null)
       this.o.log(`${row.unit} ${row.driver} rep${row.rep}: DISK INSTRUMENTATION DEGRADED — ${disk.sampleError} (diskSampledPeakBytes/cloneObjectStoreBytes are not measurements for this row)`);
+    if (diskReclaimFailed)
+      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — files remain under ${runDir} (diskReclaimFailed:true on the row)`);
     this.replayOfPos = null;
     this.replayKind = null;
     if (verification !== null && (verification.g1Failures.length > 0 || verification.g2Failures.length > 0)) {

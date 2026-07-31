@@ -2,9 +2,10 @@
 // the §8 freeze gate's git-state evaluation, harness-commit provenance acquisition, the
 // fidelity battery's live-enumeration classification, and the pinning probe's batch atomicity.
 //
-// Every case here targets a path where a FAILED subprocess or a partially-errored response could
-// otherwise be read as a valid observation. The harness's output is the evidence a one-way
-// architecture decision rests on, so each of these must fail closed rather than fabricate.
+// The cases target paths where a FAILED subprocess or a partially-errored response could be
+// read as a valid observation, plus the resume/ledger/washout reconstruction and the
+// append-only freeze invariants. The harness's output is the evidence a one-way architecture
+// decision rests on, so each of these must fail closed rather than fabricate.
 import { describe, expect, test } from "bun:test";
 import {
   BenchOperationalError, assertFreezeGitState, classifyFidelityEnumeration,
@@ -279,8 +280,8 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
   });
   test("R2 is evaluated against the ledger AS OF the failure — later completions never authorize", () => {
     const failure = runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R2_EVIDENCE });
-    const completedBefore = runRow({ pos: 3, outcome: "complete", requests: { "rest-content": 3 } });
-    const completedAfter = runRow({ pos: 7, outcome: "complete", requests: { "rest-content": 3 } });
+    const completedBefore = runRow({ pos: 3, outcome: "complete", requests: { "rest-content": 3 }, okRequestClasses: ["rest-content"] });
+    const completedAfter = runRow({ pos: 7, outcome: "complete", requests: { "rest-content": 3 }, okRequestClasses: ["rest-content"] });
     const owed = state([completedBefore, marker(3), failure, marker(5)]);
     expect(owed.owedReplays.get(5)).toBe(KEY);
     // the same completion recorded AFTER the failure must not retroactively grant the replay —
@@ -292,7 +293,7 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
   test("a spent allowance is never re-granted: the landed replay row settles the pos", () => {
     const s = state([
       runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R1_EVIDENCE }), marker(5),
-      runRow({ pos: 5, outcome: "complete", replayKind: "r1r2", requests: { "rest-content": 2 } }), marker(5),
+      runRow({ pos: 5, outcome: "complete", replayKind: "r1r2", requests: { "rest-content": 2 }, okRequestClasses: ["rest-content"] }), marker(5),
     ]);
     expect(s.terminalPos.has(5)).toBe(true);
     expect(s.owedReplays.size).toBe(0);
@@ -305,7 +306,7 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
     // position could never terminalize across any number of resumes.
     const s = state([
       runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R1_EVIDENCE }), marker(5),
-      runRow({ pos: 5, outcome: "complete", replayKind: "r1r2", requests: { "rest-content": 2 }, washoutAppliedMs: 90_000 }),
+      runRow({ pos: 5, outcome: "complete", replayKind: "r1r2", requests: { "rest-content": 2 }, okRequestClasses: ["rest-content"], washoutAppliedMs: 90_000 }),
     ]);
     expect(s.owedWashout).toEqual({ pos: 5, ms: 90_000 }); // the caller sleeps this, then appends the marker
     expect(s.terminalPos.has(5)).toBe(true); // the replay STANDS — it measured; only its washout is owed
@@ -348,11 +349,20 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
     expect(() => reconstructResumeState([runRow({ pos: 1 })], "0".repeat(64), ENV_HASH, SCHED)).toThrow(/changed measurement surface/);
     expect(() => reconstructResumeState([runRow({ pos: 1 })], DIGEST, "other-env", SCHED)).toThrow(/REFUSING to resume/);
   });
+  test("a class that only ever FAILED inside a completed rep never authorizes R2", () => {
+    // `requests` counts attempts; §4.5 R2 needs SUCCESS — a completed run whose batches all
+    // drained to fallback carries graphql-batch attempts with zero successes
+    const completed = runRow({ pos: 3, outcome: "complete", requests: { "graphql-batch": 6, "rest-fallback": 4 }, okRequestClasses: ["rest-fallback"] });
+    const failure = runRow({ pos: 5, outcome: "unit-failure", failureEvidence: { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "graphql-batch" } });
+    const s = state([completed, marker(3), failure, marker(5)]);
+    expect(s.owedReplays.size).toBe(0); // graphql-batch never SUCCEEDED — no R2
+    expect(s.terminalPos.has(5)).toBe(true);
+  });
   test("a completed rep implies rest-meta success — a pre-run rate_limit exhaustion stays R2-rerunnable", () => {
     // rest-meta is control-plane and excluded from `requests`, so the only ledger that can
     // authorize an R2 replay never saw it succeed — even though every completed run's
     // accounting read rate_limit before and after by construction
-    const completed = runRow({ pos: 3, outcome: "complete", requests: { "rest-content": 3 } });
+    const completed = runRow({ pos: 3, outcome: "complete", requests: { "rest-content": 3 }, okRequestClasses: ["rest-content"] });
     const metaFailure = runRow({ pos: 5, outcome: "unit-failure", failureEvidence: { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-meta" } });
     const s = state([completed, marker(3), metaFailure, marker(5)]);
     expect(s.successLedger.has(`${KEY}|rest-meta`)).toBe(true);
@@ -361,7 +371,7 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
   test("the binding is the frozen-surface DIGEST, never the commit — an evidence-only commit must not orphan rows", () => {
     // rows carry a different harnessCommit (HEAD moved when the evidence log was committed)
     // but the SAME digest — the frozen surface is unchanged and resume must accept them
-    const s = state([runRow({ pos: 1, harnessCommit: "d".repeat(40), requests: { "rest-content": 1 } }), marker(1)]);
+    const s = state([runRow({ pos: 1, harnessCommit: "d".repeat(40), requests: { "rest-content": 1 }, okRequestClasses: ["rest-content"] }), marker(1)]);
     expect(s.terminalPos.has(1)).toBe(true);
   });
   test("an R3/R4-invalidated last row owes its IN-SLOT replay with r3r4 bookkeeping", () => {
@@ -393,7 +403,7 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
   });
   test("drift bookkeeping: main rows of a drifted unit never terminalize; its form is scaffolding", () => {
     const s = state([
-      runRow({ pos: 1, outcome: "complete", acquisitionForm: "production", requests: { "rest-content": 1 } }), marker(1),
+      runRow({ pos: 1, outcome: "complete", acquisitionForm: "production", requests: { "rest-content": 1 }, okRequestClasses: ["rest-content"] }), marker(1),
       runRow({ pos: 2, outcome: "drift-restart", acquisitionForm: "production" }), marker(2),
     ]);
     expect(s.driftedUnits.has(UNIT)).toBe(true);

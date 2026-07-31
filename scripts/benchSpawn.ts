@@ -7,8 +7,9 @@
 //
 //   • "transport"   — an evaluated-transport operation; argv MUST pass the proposed grammars
 //                     (benchGrammar.ts) or nothing is launched.
-//   • "scaffolding" — the SHA-pinned acquisition fallback; argv MUST equal the bench-config
-//                     pinned tuple verbatim (slots pre-substituted by the caller). Bench
+//   • "scaffolding" — the SHA-pinned acquisition fallback; the caller supplies the
+//                     bench-config pinned TUPLE plus slot values and runBenchGit derives the
+//                     launched argv itself (caller-supplied argv is rejected). Bench
 //                     scaffolding, not proposed production grammar (plan §4.1).
 //   • "pinning"     — pinning/diagnostic tooling, deliberately unconstrained by grammar
 //                     (plan §4.3 "pinning tooling is unconstrained") but still recorded,
