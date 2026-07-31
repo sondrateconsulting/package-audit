@@ -186,12 +186,17 @@ describe("BatchChild — the unit-lived interactive seam", () => {
 
 describe("BatchChild — a fired per-read deadline is durable TIMEOUT evidence (§4.6 item 5)", () => {
   test("the disposal spawn record carries timedOut:true after a read deadline fires", async () => {
-    // Deterministic: a fake `git` that never replies sits first on the child's PATH, so the
-    // per-read deadline ALWAYS fires — no race against a real cat-file's reply. The disposal's
-    // spawn record previously hardcoded timedOut:false, hiding real interactive-read timeouts
-    // from the run evidence.
+    // Deterministic: a fake `git` that never replies is the ONLY entry on the child's PATH, so
+    // the per-read deadline ALWAYS fires — no race against a real cat-file's reply. The fake
+    // must block using shell BUILTINS only: that same one-entry PATH is inherited by the script,
+    // so an external command (`sleep`) would fail lookup and exit the fake instantly — on a fast
+    // runner that death reached the pending read before the 50 ms deadline and the rejection
+    // carried a non-deadline error (caught as a CI-only flake). `while read` consumes whatever
+    // the harness writes, then blocks until dispose closes stdin. The disposal's spawn record
+    // previously hardcoded timedOut:false, hiding real interactive-read timeouts from the run
+    // evidence.
     const fakeBin = mkdtempSync(join(realpathSync(tmpdir()), "pa-bench-fakegit-"));
-    writeFileSync(join(fakeBin, "git"), "#!/bin/sh\nsleep 60\n", { mode: 0o755 });
+    writeFileSync(join(fakeBin, "git"), "#!/bin/sh\nwhile read _x; do :; done\n", { mode: 0o755 });
     const records: BenchSpawnRecord[] = [];
     const child = new BatchChild({
       objectFormat: "sha1", env: { ...ENV, PATH: fakeBin }, cwd: REPO, benchRoot: BENCH_ROOT,
