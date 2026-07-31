@@ -13,8 +13,8 @@ import {
 } from "./benchProtocol.ts";
 import { InlineDiskSampler, WorkerDiskSampler, parseDiskWalkReply } from "./benchDiskSampler.ts";
 import { parseDiskWalkRequest } from "./benchDiskWorker.ts";
-import { DiskWalkError, duBytes, duBytesStrict } from "./benchDiskWalk.ts";
-import type { BenchHttpAttemptRecord } from "./benchGh.ts";
+import { DiskWalkError, duBytes, duBytesStrict, extraBytesStrict } from "./benchDiskWalk.ts";
+import { parseRateLimitBucket, type BenchHttpAttemptRecord } from "./benchGh.ts";
 import { buildUnitWorkload, seamStringSha256, type WorkloadEntry } from "./benchWorkload.ts";
 import type { EntryDelivery } from "./benchDrivers.ts";
 
@@ -554,5 +554,32 @@ describe("summarizeSpawns — §4.6 item 5's git-side evidence reaches the recor
       rec({ exitCode: null }),
     ]);
     expect(s).toEqual({ total: 4, timedOut: 1, nonZeroExit: 2, neverSettled: 1, byLane: { transport: 3, scaffolding: 1 } });
+  });
+});
+
+describe("parseRateLimitBucket — R3/R4 verdicts must not ride unvalidated counters", () => {
+  test("a well-formed bucket parses", () => {
+    expect(parseRateLimitBucket({ resources: { core: { remaining: 4000, reset: 1000, used: 12 } } }, "core"))
+      .toEqual({ remaining: 4000, reset: 1000, used: 12 });
+  });
+  test("null root, missing resources, fractional or negative counters all refuse", () => {
+    expect(() => parseRateLimitBucket(null, "core")).toThrow(/not an object/);
+    expect(() => parseRateLimitBucket({}, "core")).toThrow(/no resources/);
+    expect(() => parseRateLimitBucket({ resources: {} }, "core")).toThrow(/missing resources.core/);
+    expect(() => parseRateLimitBucket({ resources: { core: { remaining: 1.5, reset: 1, used: 0 } } }, "core")).toThrow(/nonnegative integer/);
+    expect(() => parseRateLimitBucket({ resources: { core: { remaining: -1, reset: 1, used: 0 } } }, "core")).toThrow(/nonnegative integer/);
+  });
+});
+
+describe("extraBytesStrict — a present-but-unreadable sidecar fails the measurement", () => {
+  test("absent sidecars contribute nothing (they legitimately come and go)", () => {
+    expect(extraBytesStrict(["/definitely/not/a/real/sidecar-wal"])).toBe(0);
+  });
+  test("a real file is counted", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pa-bench-extras-"));
+    const p = join(dir, "db-wal");
+    writeFileSync(p, "x".repeat(64));
+    expect(extraBytesStrict([p])).toBe(64);
+    rmSync(dir, { recursive: true, force: true });
   });
 });

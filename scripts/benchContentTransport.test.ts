@@ -241,22 +241,29 @@ describe("loginFromUserPayload — the §8 credential identity cannot degrade to
 });
 
 // ---- the resume reconstruction (§4.5/§4.8) ---------------------------------------------------
-import { assertAppendOnlyPrefix, reconstructResumeState, evidenceIsRerunnable } from "./benchContentTransport.ts";
+import { assertAppendOnlyPrefix, classifyFidelityLog, reconstructResumeState, evidenceIsRerunnable } from "./benchContentTransport.ts";
 
 describe("reconstructResumeState — resume must honour the frozen §4.5 discipline exactly", () => {
   const COMMIT = "f".repeat(40);
   const ENV_HASH = "abcd1234abcd1234";
   const UNIT = "C2:o/r@main";
   const KEY = `${UNIT}|T0`;
-  const runRow = (over: Record<string, unknown>): string =>
-    JSON.stringify({
-      type: "run", schemaVersion: 1, phase: "matrix", pos: 1, unit: UNIT, driver: "T0", rep: 1,
+  // the frozen schedule identity the rows must match: rep = pos for these fixtures
+  const SCHED = new Map(
+    Array.from({ length: 9 }, (_, i) => [i + 1, { unit: UNIT, driver: "T0", rep: i + 1, probe: false }] as const),
+  );
+  const runRow = (over: Record<string, unknown>): string => {
+    const pos = typeof over["pos"] === "number" ? (over["pos"] as number) : 1;
+    return JSON.stringify({
+      type: "run", schemaVersion: 1, phase: "matrix", pos, unit: UNIT, driver: "T0", rep: pos,
       probe: false, epilogue: false, outcome: "complete", failureEvidence: null, requests: {},
-      acquisitionForm: null, replayKind: null, harnessCommit: COMMIT, envManifestHash: ENV_HASH,
+      acquisitionForm: null, replayKind: null, washoutAppliedMs: 60_000,
+      harnessCommit: COMMIT, envManifestHash: ENV_HASH,
       ...over,
     });
+  };
   const marker = (pos: number): string => JSON.stringify({ type: "washout-done", phase: "matrix", pos });
-  const state = (lines: string[]) => reconstructResumeState(lines, COMMIT, ENV_HASH);
+  const state = (lines: string[]) => reconstructResumeState(lines, COMMIT, ENV_HASH, SCHED);
   const R1_EVIDENCE = { kind: "http", code: "no-response", lastClassification: "no-response", requestClass: "rest-content" };
   const R2_EVIDENCE = { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-content" };
 
@@ -268,11 +275,12 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
     const s = state([runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R1_EVIDENCE }), marker(5)]);
     expect(s.terminalPos.has(5)).toBe(false);
     expect(s.owedReplays.get(5)).toBe(KEY);
+    expect(s.owedWashout).toBeNull();
   });
   test("R2 is evaluated against the ledger AS OF the failure — later completions never authorize", () => {
     const failure = runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R2_EVIDENCE });
-    const completedBefore = runRow({ pos: 3, rep: 9, outcome: "complete", requests: { "rest-content": 3 } });
-    const completedAfter = runRow({ pos: 7, rep: 9, outcome: "complete", requests: { "rest-content": 3 } });
+    const completedBefore = runRow({ pos: 3, outcome: "complete", requests: { "rest-content": 3 } });
+    const completedAfter = runRow({ pos: 7, outcome: "complete", requests: { "rest-content": 3 } });
     const owed = state([completedBefore, marker(3), failure, marker(5)]);
     expect(owed.owedReplays.get(5)).toBe(KEY);
     // the same completion recorded AFTER the failure must not retroactively grant the replay —
@@ -290,21 +298,41 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
     expect(s.owedReplays.size).toBe(0);
     expect(s.rerunUsed.has(KEY)).toBe(true);
   });
-  test("washout markers pair with rows IN ORDER — the first attempt's marker cannot vouch for its replay", () => {
-    // an attempt and its in-slot replay share the pos; a pos-keyed SET let marker #1 terminalize
-    // the replay row whose own washout never completed
+  test("an interrupted washout is OWED as idle time — the measured attempt is never re-run", () => {
+    // The earlier design re-ran any row whose marker was missing, which duplicated a completed
+    // measurement, consumed live budget for an owed IDLE period, and (because the re-run added
+    // one row and one marker) left the marker count permanently one behind the row count — the
+    // position could never terminalize across any number of resumes.
     const s = state([
       runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R1_EVIDENCE }), marker(5),
-      runRow({ pos: 5, outcome: "complete", replayKind: "r1r2", requests: { "rest-content": 2 } }),
+      runRow({ pos: 5, outcome: "complete", replayKind: "r1r2", requests: { "rest-content": 2 }, washoutAppliedMs: 90_000 }),
     ]);
-    expect(s.terminalPos.has(5)).toBe(false); // the replay's washout is unfinished → re-run per the marker rule
-    expect(s.owedReplays.size).toBe(0); // the allowance was spent — no second replay
+    expect(s.owedWashout).toEqual({ pos: 5, ms: 90_000 }); // the caller sleeps this, then appends the marker
+    expect(s.terminalPos.has(5)).toBe(true); // the replay STANDS — it measured; only its washout is owed
+    expect(s.owedReplays.size).toBe(0);
     expect(s.rerunUsed.has(KEY)).toBe(true);
-    expect(s.successLedger.has(`${KEY}|rest-content`)).toBe(false); // an unwashed rep is not evidence
   });
-  test("a completed row without its washout marker is not terminal", () => {
-    const s = state([runRow({ pos: 4, outcome: "complete" })]);
-    expect(s.terminalPos.has(4)).toBe(false);
+  test("only the FINAL event may be unmarked — an interior unmarked row refuses as a violated invariant", () => {
+    expect(() => state([
+      runRow({ pos: 4, outcome: "complete" }), // no marker
+      runRow({ pos: 5, outcome: "complete" }), marker(5),
+    ])).toThrow(/row\/marker invariant/);
+  });
+  test("a stray or mismatched washout marker refuses — the live engine cannot have written it", () => {
+    expect(() => state([marker(3)])).toThrow(/row\/marker invariant/);
+    expect(() => state([runRow({ pos: 4, outcome: "complete" }), marker(6)])).toThrow(/row\/marker invariant/);
+  });
+  test("rows are validated against the FROZEN schedule — wrong identity or unknown pos refuses", () => {
+    expect(() => state([runRow({ pos: 99 })])).toThrow(/schedule does not contain/);
+    expect(() => state([runRow({ pos: 2, driver: "T1" })])).toThrow(/does not match the frozen schedule/);
+    expect(() => state([runRow({ pos: 2, rep: 1 })])).toThrow(/does not match the frozen schedule/);
+    expect(() => state([runRow({ pos: 2, outcome: "made-up-outcome" })])).toThrow(/unknown outcome/);
+  });
+  test("two recorded R4 straddles on one unit refuse — the live traversal already halted for freeze repair", () => {
+    expect(() => state([
+      runRow({ pos: 2, outcome: "invalidated-straddle" }), marker(2),
+      runRow({ pos: 2, outcome: "invalidated-straddle" }), marker(2),
+    ])).toThrow(/R4 straddles/);
   });
   test("{kind:'unit'} evidence is never owed a replay — the frozen predicate accepts only http shapes", () => {
     const s = state([runRow({ pos: 5, outcome: "unit-failure", failureEvidence: { kind: "unit" } }), marker(5)]);
@@ -317,19 +345,40 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
   test("halt-r5/re-pin rows, foreign commits, and foreign environments all refuse", () => {
     expect(() => state([runRow({ pos: 1, outcome: "halt-r5-breach" })])).toThrow(/freeze-repair/);
     expect(() => state([runRow({ pos: 1, outcome: "re-pin-required" })])).toThrow(/freeze-repair/);
-    expect(() => reconstructResumeState([runRow({ pos: 1 })], "0".repeat(40), ENV_HASH)).toThrow(/REFUSING to resume/);
-    expect(() => reconstructResumeState([runRow({ pos: 1 })], COMMIT, "other-env")).toThrow(/REFUSING to resume/);
+    expect(() => reconstructResumeState([runRow({ pos: 1 })], "0".repeat(40), ENV_HASH, SCHED)).toThrow(/REFUSING to resume/);
+    expect(() => reconstructResumeState([runRow({ pos: 1 })], COMMIT, "other-env", SCHED)).toThrow(/REFUSING to resume/);
   });
   test("drift bookkeeping: main rows of a drifted unit never terminalize; its form is scaffolding", () => {
     const s = state([
       runRow({ pos: 1, outcome: "complete", acquisitionForm: "production", requests: { "rest-content": 1 } }), marker(1),
-      runRow({ pos: 2, outcome: "drift-restart", acquisitionForm: "production" }),
+      runRow({ pos: 2, outcome: "drift-restart", acquisitionForm: "production" }), marker(2),
     ]);
     expect(s.driftedUnits.has(UNIT)).toBe(true);
     expect(s.terminalPos.has(1)).toBe(false); // discarded reps — the epilogue re-runs the whole unit
     expect(s.resumeForms.get(UNIT)).toBe("scaffolding");
     expect(s.successLedger.has(`${KEY}|rest-content`)).toBe(false); // discarded reps are not evidence
     expect(s.owedReplays.size).toBe(0);
+  });
+});
+
+describe("classifyFidelityLog — the battery's own append-only discipline (§4.2)", () => {
+  const DIGEST = "d".repeat(64);
+  const row = (over: Record<string, unknown>): string =>
+    JSON.stringify({ type: "fidelity", frozenSurfaceDigest: DIGEST, fixture: "clone-symlink", driver: "T2c", entry: "a/b.sh", pass: true, ...over });
+  test("passes are skippable, failures are recorded, aborts are counted — at THIS surface only", () => {
+    const s = classifyFidelityLog([
+      row({}),
+      row({ driver: "T2a", pass: false }),
+      JSON.stringify({ type: "fidelity-operational-abort", frozenSurfaceDigest: DIGEST, fixture: "clone-symlink", driver: "T1" }),
+      row({ frozenSurfaceDigest: "e".repeat(64), driver: "T0", pass: false }), // another surface — ignored
+    ], DIGEST);
+    expect(s.passed.has("clone-symlink|T2c|a/b.sh")).toBe(true);
+    expect(s.failed.has("clone-symlink|T2a|a/b.sh")).toBe(true);
+    expect(s.failed.has("clone-symlink|T0|a/b.sh")).toBe(false);
+    expect(s.operationalAborts.get("clone-symlink|T1")).toBe(1);
+  });
+  test("a corrupted line refuses — evidence logs are never silently skimmed", () => {
+    expect(() => classifyFidelityLog(["{nope"], DIGEST)).toThrow(/corrupted/);
   });
 });
 

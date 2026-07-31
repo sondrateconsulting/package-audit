@@ -146,6 +146,10 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
     if (typeof a !== "string" || a.length === 0) throw new Error(`REFUSING: ratification.json answers.${key} is missing/empty — all four §8 sign-off points must carry explicit answers`);
   }
   const pilot = JSON.parse(readFileSync(join(ARTIFACTS, "pilot.json"), "utf8")) as { noiseBand?: number };
+  // the band must POSITIVELY be a usable ratio before equality means anything — strict equality
+  // alone let two nulls (or two matching non-numeric values) pass as a "bound" band
+  if (typeof rat["noiseBand"] !== "number" || !Number.isFinite(rat["noiseBand"]) || rat["noiseBand"] < 1)
+    throw new Error(`REFUSING: ratification.json noiseBand (${String(rat["noiseBand"])}) is not a finite ratio >= 1 — no calibrated band is bound`);
   if (rat["noiseBand"] !== pilot.noiseBand)
     throw new Error(`REFUSING: ratification.json noiseBand (${String(rat["noiseBand"])}) != pilot.json's calibrated band (${String(pilot.noiseBand)})`);
   const digest = frozenSurfaceDigest();
@@ -164,19 +168,33 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
     benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
   });
   assertFreezeGitState(statusOut, lsFiles, APPEND_ONLY);
-  // verify the append-only CLAIM for each tracked evidence log: committed bytes must be a
-  // byte-exact prefix of the working copy. A `git show` failure here means the path is not in
-  // HEAD yet (first run of a log — nothing to prefix-check): git's own health was just proven
-  // by the status/ls-files legs above, under the same pinned env.
+  // Verify the append-only CLAIM for each tracked evidence log: committed bytes must be a
+  // byte-exact prefix of the working copy. Presence-in-HEAD is probed with `ls-tree HEAD --`,
+  // whose contract is exit 0 with empty output for an absent path — so a NON-ZERO exit from
+  // either probe or show is a git failure and REFUSES (an earlier draft skipped on any show
+  // failure, which failed OPEN for exactly the rewritten-log case this check exists to catch).
+  // KNOWN LIMIT, stated plainly: this proves no COMMITTED evidence was edited or truncated;
+  // rows appended since the last commit have no committed baseline and are protected only by
+  // committing them — commit the evidence logs early and often during Step C.
   for (const rel of APPEND_ONLY) {
     if (rel.endsWith("/")) continue; // directory exemptions are untracked scratch space
+    const gitLimits = { maxStdoutBytes: 512 * 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 };
+    const probe = await runBenchGit({
+      argv: ["ls-tree", "HEAD", "--", rel], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
+      benchRoot: repoRoot, cwd: repoRoot, limits: gitLimits,
+    });
+    if (probe.exitCode !== 0)
+      throw new Error(`REFUSING: ${gitFailure(`git ls-tree HEAD -- ${rel}`, probe)} — the append-only verification cannot run, so it fails closed (§8)`);
+    if (text(probe.stdout).trim() === "") continue; // not in HEAD yet (first run of a log) — nothing to prefix-check
     const abs = join(REPO_ROOT, rel);
-    if (!existsSync(abs)) continue;
+    if (!existsSync(abs))
+      throw new Error(`REFUSING: ${rel} is committed in HEAD but ABSENT from the working tree — deleting an evidence log is not appending (§8)`);
     const show = await runBenchGit({
       argv: ["show", `HEAD:${rel}`], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
-      benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 512 * 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 },
+      benchRoot: repoRoot, cwd: repoRoot, limits: gitLimits,
     });
-    if (show.exitCode !== 0) continue;
+    if (show.exitCode !== 0)
+      throw new Error(`REFUSING: ${gitFailure(`git show HEAD:${rel}`, show)} — the committed evidence baseline is unreadable, so the append-only claim cannot be verified (§8)`);
     assertAppendOnlyPrefix(rel, show.stdout, readFileSync(abs));
   }
   return { rat, digest };
@@ -453,8 +471,12 @@ async function probeGqlFacts(rt: PinRuntime, slot: { owner: string; repo: string
     let done = false;
     for (let attempt = 0; attempt < 3 && !done; attempt++) {
       const d = await benchGraphqlDispatch(rt.gh, batch.query, batch.fields, batch.label);
-      if (d.status !== 200 || !d.jsonParseable || d.data === null) {
-        log(`  gql probe ${batch.label}: HTTP ${d.status}, retrying`);
+      // gh's exit code matters here exactly as the matrix analyzer treats it: a nonzero exit
+      // under an otherwise success-shaped envelope means the transfer cannot be vouched for,
+      // and this probe COMMITS ground truth — retry, never pin from it. (Errored envelopes are
+      // already rejected downstream by parseProbeBatch.)
+      if (d.status !== 200 || !d.jsonParseable || d.data === null || (d.exitCode !== 0 && d.errors.length === 0 && d.malformedErrorEntries === 0)) {
+        log(`  gql probe ${batch.label}: HTTP ${d.status} (gh exit ${d.exitCode}), retrying`);
         await new Promise((r) => setTimeout(r, 3000));
         continue;
       }
@@ -998,6 +1020,40 @@ async function cmdDiagnostics(): Promise<void> {
   }
 }
 
+// The fidelity battery's resume discipline over its own append-only log (§4.2: "§4.5's
+// objective-external rerun predicate applies once per (fixture, driver); a fidelity mismatch is
+// never rerunnable"). Only rows at the CURRENT frozen surface count: another surface's rows
+// neither skip nor block (a digest change restarts the battery like any §8 amendment).
+export interface FidelityLogState {
+  passed: Set<string>; // "kind|driver|path" recorded pass:true — skipped on re-run (idempotence)
+  failed: Set<string>; // any recorded pass:false — the battery REFUSES to re-run (G1 stands)
+  operationalAborts: Map<string, number>; // "kind|driver" → recorded operational-abort count
+}
+export function classifyFidelityLog(lines: readonly string[], digest: string): FidelityLogState {
+  const passed = new Set<string>();
+  const failed = new Set<string>();
+  const operationalAborts = new Map<string, number>();
+  for (const [i, line] of lines.entries()) {
+    if (line.trim() === "") continue;
+    let rec: Record<string, unknown>;
+    try {
+      rec = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      throw new Error(`REFUSING: fidelity.jsonl line ${i + 1} is not valid JSON — the append-only evidence log is corrupted; §8 freeze-repair territory, never a silent skip`);
+    }
+    if (rec["frozenSurfaceDigest"] !== digest) continue;
+    if (rec["type"] === "fidelity") {
+      const key = `${String(rec["fixture"])}|${String(rec["driver"])}|${String(rec["entry"])}`;
+      if (rec["pass"] === true) passed.add(key);
+      else failed.add(key);
+    } else if (rec["type"] === "fidelity-operational-abort") {
+      const key = `${String(rec["fixture"])}|${String(rec["driver"])}`;
+      operationalAborts.set(key, (operationalAborts.get(key) ?? 0) + 1);
+    }
+  }
+  return { passed, failed, operationalAborts };
+}
+
 // The C6 fidelity battery (§4.2): untimed, once per (fixture, driver), gate-relevant — a
 // mismatch is a G1 event for that driver and FAILS this command; a skipped applicable fixture
 // is a G2 event. Each driver resolves through its REAL seam (codex R1 finding 6): T0 via the
@@ -1019,10 +1075,31 @@ async function cmdFidelity(): Promise<void> {
   const results: Array<Record<string, unknown>> = [];
   let failures = 0;
   const seamHash = (bytes: Uint8Array): string => sha256Hex(Buffer.from(seamDecode(bytes), "utf8"));
+  // resume discipline over the battery's own append-only log (§4.2): a recorded pass at THIS
+  // surface is skipped (idempotence — re-running it would append duplicate evidence and spend
+  // live requests for nothing); a recorded FAIL refuses outright (a fidelity mismatch is never
+  // rerunnable — re-running until it passed would launder a permanent G1 verdict); a second
+  // operational abort on one (fixture, driver) refuses (the ≤1 objective-external rerun is
+  // spent — the operator investigates the harness fault rather than retrying forever).
+  const fidelityLogPath = join(ARTIFACTS, "fidelity.jsonl");
+  const logState = existsSync(fidelityLogPath)
+    ? classifyFidelityLog(readFileSync(fidelityLogPath, "utf8").split("\n"), digest)
+    : { passed: new Set<string>(), failed: new Set<string>(), operationalAborts: new Map<string, number>() };
+  if (logState.failed.size > 0)
+    throw new Error(`REFUSING: fidelity.jsonl records ${logState.failed.size} pass:false row(s) at the current frozen surface — a fidelity mismatch is never rerunnable (§4.2); the G1 verdict stands`);
+  let inFlight: { fixture: string; driver: string } | null = null;
   try {
     for (const fixture of corpus.fidelity) {
       for (const driver of fixture.appliesTo) {
+        const abortKey = `${fixture.kind}|${driver}`;
+        if ((logState.operationalAborts.get(abortKey) ?? 0) >= 2)
+          throw new Error(`REFUSING: fidelity.jsonl records ${logState.operationalAborts.get(abortKey)} operational aborts for ${abortKey} at the current surface — the ≤1 rerun allowance (§4.2/§4.5) is spent; investigate the harness fault`);
         for (const entry of fixture.entries) {
+          if (logState.passed.has(`${fixture.kind}|${driver}|${entry.path}`)) {
+            log(`fidelity ${fixture.kind} ${driver} ${entry.path}: already recorded PASS at this surface — skipping`);
+            continue;
+          }
+          inFlight = { fixture: fixture.kind, driver };
           const expectDeref = fixture.verification["restDerefSeamSha256"];
           const expectCanonical = fixture.verification["canonicalSeamSha256"];
           let delivered: string | null = null;
@@ -1142,7 +1219,12 @@ async function cmdFidelity(): Promise<void> {
           }
           const gotHash = delivered === null ? null : sha256Hex(Buffer.from(delivered, "utf8"));
           const expected = route === "symlink-fallback" || entry.mode === "120000" || typeof expectCanonical !== "string" ? expectDeref : expectCanonical;
-          const pass = typeof expected === "string" && gotHash === expected;
+          // a fixture whose verification carries NO usable hash is a corpus-artifact defect —
+          // recording pass:false from it would permanently disqualify every applicable driver
+          // over a malformed ARTIFACT, not an observed divergence. Refuse instead.
+          if (typeof expected !== "string" || expected.length === 0)
+            throw new BenchOperationalError(`fixture ${fixture.kind} carries no usable verification hash for ${entry.path} (route ${route}) — a corpus artifact defect; repair corpus.json, never record a verdict from it`);
+          const pass = gotHash === expected;
           if (!pass) failures++;
           const resultRec = { type: "fidelity", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: fixture.kind, driver, entry: entry.path, route, pass, rawVerified, gotHash, expected };
           results.push(resultRec);
@@ -1158,6 +1240,18 @@ async function cmdFidelity(): Promise<void> {
     void results;
     appendFileSync(join(ARTIFACTS, "fidelity.jsonl"), `${JSON.stringify({ type: "fidelity-summary", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, failures })}\n`);
     if (failures > 0) throw new Error(`fidelity battery FAILED: ${failures} mismatch(es) — a G1 event for the affected driver (global eligibility spans the fidelity battery, §4.2)`);
+  } catch (e) {
+    // a HARNESS fault (never a divergence) aborts the battery: record which (fixture, driver)
+    // was in flight so the ≤1 rerun allowance is countable across invocations. Best-effort —
+    // the abort itself must still propagate even if the marker append fails.
+    if (e instanceof BenchOperationalError && inFlight !== null) {
+      try {
+        appendFileSync(fidelityLogPath, `${JSON.stringify({ type: "fidelity-operational-abort", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: e.message.slice(0, 300) })}\n`);
+      } catch {
+        log("WARNING: could not append the operational-abort marker to fidelity.jsonl");
+      }
+    }
+    throw e;
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
     rmSync(benchRoot, { recursive: true, force: true });
@@ -1183,33 +1277,65 @@ export interface ResumeState {
   terminalPos: Set<number>;
   rerunUsed: Set<string>; // unit|driver keys whose ≤1 R1/R2 allowance is spent
   straddled: Set<string>; // units with a recorded R4 straddle (a second one halts)
-  successLedger: Set<string>; // unit|driver|requestClass with an ok in a WASHED completed rep
+  successLedger: Set<string>; // unit|driver|requestClass with an ok in a completed rep
   driftedUnits: Set<string>;
   resumeForms: Map<string, "production" | "scaffolding">;
-  // pos → unit|driver: a washed-out rerunnable unit-failure whose MANDATED in-slot R1/R2
-  // replay (§4.5) never landed a row — the traversal owes it, it is not terminal
+  // pos → unit|driver: a rerunnable unit-failure whose MANDATED in-slot R1/R2 replay (§4.5)
+  // never landed a row — the traversal owes it, it is not terminal
   owedReplays: Map<number, string>;
+  // non-null when the log's FINAL event is a run row whose washout marker never landed: the
+  // washout was interrupted, and the caller COMPLETES it (sleep, then append the marker)
+  // before executing anything — §4.5's separation is satisfied without re-running a transport
+  // attempt that already measured (an earlier design re-ran the row, which duplicated
+  // measurements and consumed budget for an owed IDLE period)
+  owedWashout: { pos: number; ms: number } | null;
 }
 
-// Reconstruct the traversal state from runs.jsonl. Two properties matter beyond bookkeeping:
-//   • washout markers carry only a pos, and an attempt and its in-slot replay SHARE the pos —
-//     so markers pair with run rows IN ORDER (the k-th row at a pos is washed iff ≥ k markers
-//     landed; markers are prefix-complete by construction, since the next attempt at a pos
-//     starts only after the previous one's washout). A set keyed by pos let the FIRST attempt's
-//     marker vouch for its replay's unfinished washout.
-//   • a washed unit-failure whose live traversal had decided an R1/R2 replay — and was then
+// the identity a resume row must match — the frozen schedule's own row at that position
+export interface ScheduleRowIdentity {
+  unit: string;
+  driver: string;
+  rep: number;
+  probe: boolean;
+}
+
+const RESUME_OUTCOMES = new Set([
+  "complete", "unit-failure", "invalidated-straddle", "invalidated-foreign",
+  "invalidated-finalisation", "halt-r5-breach", "drift-restart", "re-pin-required",
+]);
+
+// Reconstruct the traversal state from runs.jsonl. The properties that matter beyond
+// bookkeeping:
+//   • every run row is validated against the FROZEN schedule's identity at its position —
+//     a parseable-but-wrong row (garbage unit/driver, an unknown outcome) must refuse, never
+//     silently terminalize a position it does not describe;
+//   • washout markers pair with run rows by LOG ORDER (a marker certifies the row it follows;
+//     the live engine appends row-then-marker before anything else runs, so at most the FINAL
+//     event may be an unmarked row). An interrupted washout is returned as owedWashout for the
+//     caller to COMPLETE (sleep + append the marker) — never a reason to re-run a transport
+//     attempt that already measured, which duplicated measurements and consumed budget for an
+//     owed idle period;
+//   • a unit-failure whose live traversal had decided an R1/R2 replay — and was then
 //     interrupted anywhere in the replay run — must NOT terminalize: the frozen §4.5 discipline
 //     mandated that replay. It is re-decided here with the SAME predicate over the ledger AS OF
 //     the failure's position (a completion recorded after it must not retroactively authorize —
 //     §4.5's "evaluated at failure time" is order-stable), so a live "no rerun" decision
-//     reconstructs identically and is never granted a replay resume-side.
-export function reconstructResumeState(lines: readonly string[], currentCommit: string, currentEnvHash: string): ResumeState {
+//     reconstructs identically and is never granted a replay resume-side;
+//   • two recorded R4 straddles on one unit mean the live traversal already halted for freeze
+//     repair — resume REFUSES rather than quietly executing a third attempt past that halt.
+export function reconstructResumeState(
+  lines: readonly string[],
+  currentCommit: string,
+  currentEnvHash: string,
+  schedule: ReadonlyMap<number, ScheduleRowIdentity>,
+): ResumeState {
   const rowsAtPos = new Map<number, Array<Record<string, unknown>>>();
-  const markerCount = new Map<number, number>();
-  const straddled = new Set<string>();
+  const straddleRows = new Map<string, number>();
   const driftedUnits = new Set<string>();
   const rerunUsed = new Set<string>();
   const resumeForms = new Map<string, "production" | "scaffolding">();
+  const ledgerEntries: Array<{ pos: number; key: string; unit: string; epilogue: boolean }> = [];
+  let pendingUnmarked: { pos: number; rec: Record<string, unknown>; line: number } | null = null;
   for (const [i, line] of lines.entries()) {
     if (line.trim() === "") continue;
     let rec: Record<string, unknown>;
@@ -1222,8 +1348,11 @@ export function reconstructResumeState(lines: readonly string[], currentCommit: 
       throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} is not valid JSON — the append-only evidence log is corrupted; that is §8 freeze-repair territory, never a silent skip`);
     }
     if (rec["type"] === "washout-done" && rec["phase"] === "matrix") {
-      const pos = rec["pos"];
-      if (typeof pos === "number") markerCount.set(pos, (markerCount.get(pos) ?? 0) + 1);
+      // a marker certifies the row it follows — one with no unmarked row, or the wrong pos,
+      // describes a log the live engine cannot have written
+      if (pendingUnmarked === null || rec["pos"] !== pendingUnmarked.pos)
+        throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} carries a washout marker with no matching preceding run row — the evidence log violates the row/marker invariant`);
+      pendingUnmarked = null;
       continue;
     }
     if (rec["type"] !== "run" || rec["phase"] !== "matrix") continue;
@@ -1235,48 +1364,66 @@ export function reconstructResumeState(lines: readonly string[], currentCommit: 
     // environment's rows must never mix into this traversal (codex R3 f.2)
     if (rec["envManifestHash"] !== currentEnvHash)
       throw new Error(`REFUSING to resume: runs.jsonl carries rows from environment ${String(rec["envManifestHash"])} != current ${currentEnvHash}`);
-    const outcome = rec["outcome"] as string;
+    const outcome = rec["outcome"];
     if (outcome === "halt-r5-breach" || outcome === "re-pin-required")
       throw new Error(`REFUSING to resume: runs.jsonl carries a terminal ${outcome} row — that is freeze-repair/amendment territory (§4.5 R5/R6), never a silent retry`);
+    if (typeof outcome !== "string" || !RESUME_OUTCOMES.has(outcome))
+      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} carries unknown outcome ${JSON.stringify(outcome)} — a row this scan cannot classify must not be skimmed past`);
     const pos = rec["pos"];
     if (typeof pos !== "number")
       throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} is a matrix run row with no numeric pos`);
+    // the row must describe the FROZEN schedule's own identity at its position — a garbage
+    // unit/driver would otherwise terminalize a position it does not describe
+    const expected = schedule.get(pos);
+    if (expected === undefined)
+      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} names pos ${pos}, which the frozen schedule does not contain`);
+    if (rec["unit"] !== expected.unit || rec["driver"] !== expected.driver || rec["rep"] !== expected.rep || rec["probe"] !== expected.probe)
+      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} at pos ${pos} does not match the frozen schedule row (${expected.unit} ${expected.driver} rep${expected.rep}${expected.probe ? " probe" : ""})`);
+    if (pendingUnmarked !== null)
+      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} appends a run row while line ${pendingUnmarked.line} is still awaiting its washout marker — the evidence log violates the row/marker invariant`);
+    pendingUnmarked = { pos, rec, line: i + 1 };
     const list = rowsAtPos.get(pos) ?? [];
     list.push(rec);
     rowsAtPos.set(pos, list);
-    if (outcome === "invalidated-straddle") straddled.add(rec["unit"] as string);
-    if (outcome === "drift-restart") driftedUnits.add(rec["unit"] as string); // pending R6 epilogue survives interruption (f.20)
+    const unit = expected.unit;
+    if (outcome === "invalidated-straddle") straddleRows.set(unit, (straddleRows.get(unit) ?? 0) + 1);
+    if (outcome === "drift-restart") driftedUnits.add(unit); // pending R6 epilogue survives interruption (f.20)
     const form = rec["acquisitionForm"];
-    if (form === "scaffolding") resumeForms.set(rec["unit"] as string, "scaffolding");
-    else if (form === "production" && !resumeForms.has(rec["unit"] as string)) resumeForms.set(rec["unit"] as string, "production");
+    if (form === "scaffolding") resumeForms.set(unit, "scaffolding");
+    else if (form === "production" && !resumeForms.has(unit)) resumeForms.set(unit, "production");
     // only R1/R2 replays charge the driver allowance; R3/R4 in-slot replays do not (f.23)
-    if (rec["replayKind"] === "r1r2") rerunUsed.add(`${rec["unit"] as string}|${rec["driver"] as string}`);
+    if (rec["replayKind"] === "r1r2") rerunUsed.add(`${unit}|${expected.driver}`);
+    if (outcome === "complete") {
+      for (const cls of Object.keys((rec["requests"] as Record<string, number> | undefined) ?? {}))
+        ledgerEntries.push({ pos, key: `${unit}|${expected.driver}|${cls}`, unit, epilogue: rec["epilogue"] === true });
+    }
   }
+  // §4.5 R4: the SECOND straddle on a unit halts the matrix for freeze repair — a log carrying
+  // two straddle rows records a traversal that already halted; resume must not run a third
+  for (const [unit, n] of straddleRows) {
+    if (n >= 2)
+      throw new Error(`REFUSING to resume: runs.jsonl records ${n} R4 straddles on ${unit} — the second one halted the matrix for freeze repair (§4.5); never a silent third attempt`);
+  }
+  const straddled = new Set(straddleRows.keys());
   // a drifted unit's form is scaffolding regardless of what its pre-drift rows recorded
   for (const unit of driftedUnits) resumeForms.set(unit, "scaffolding");
-  const washedRows = (pos: number): number => Math.min(markerCount.get(pos) ?? 0, (rowsAtPos.get(pos) ?? []).length);
+  // drift may have landed AFTER a completion entered the ledger above — a drifted unit's
+  // non-epilogue reps are discarded and their evidence with them
+  const filteredLedger = ledgerEntries.filter((e) => !driftedUnits.has(e.unit) || e.epilogue);
+  const successLedger = new Set(filteredLedger.map((e) => e.key));
+  const ledgerBefore = (pos: number): Set<string> => new Set(filteredLedger.filter((e) => e.pos < pos).map((e) => e.key));
 
-  // the success ledger admits only rows whose OWN washout marker landed (an unfinished
-  // repetition must not authorize its own R2 replay — codex R4), tagged with pos so
-  // owed-replay evaluation can restrict to completions BEFORE the failure
-  const ledgerEntries: Array<{ pos: number; key: string }> = [];
-  for (const [pos, rows] of rowsAtPos) {
-    const washed = washedRows(pos);
-    rows.forEach((rec, k) => {
-      if (rec["outcome"] !== "complete" || k >= washed) return;
-      const unit = rec["unit"] as string;
-      if (driftedUnits.has(unit) && rec["epilogue"] !== true) return; // discarded reps are not evidence
-      for (const cls of Object.keys((rec["requests"] as Record<string, number> | undefined) ?? {}))
-        ledgerEntries.push({ pos, key: `${unit}|${rec["driver"] as string}|${cls}` });
-    });
-  }
-  const successLedger = new Set(ledgerEntries.map((e) => e.key));
-  const ledgerBefore = (pos: number): Set<string> => new Set(ledgerEntries.filter((e) => e.pos < pos).map((e) => e.key));
+  // the final event may legitimately be an unmarked row: its washout was interrupted and is
+  // OWED — the caller completes it before executing anything
+  const washoutMsOf = (rec: Record<string, unknown>): number => {
+    const v = rec["washoutAppliedMs"];
+    return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+  };
+  const owedWashout = pendingUnmarked === null ? null : { pos: pendingUnmarked.pos, ms: washoutMsOf(pendingUnmarked.rec) };
 
   const terminalPos = new Set<number>();
   const owedReplays = new Map<number, string>();
   for (const [pos, rows] of rowsAtPos) {
-    if (washedRows(pos) < rows.length) continue; // some row's washout never completed → re-run (codex R3 f.3)
     const last = rows[rows.length - 1]!;
     const outcome = last["outcome"] as string;
     if (outcome !== "complete" && outcome !== "unit-failure") continue; // invalidated/drift rows never terminalize
@@ -1291,7 +1438,7 @@ export function reconstructResumeState(lines: readonly string[], currentCommit: 
     }
     terminalPos.add(pos);
   }
-  return { terminalPos, rerunUsed, straddled, successLedger, driftedUnits, resumeForms, owedReplays };
+  return { terminalPos, rerunUsed, straddled, successLedger, driftedUnits, resumeForms, owedReplays, owedWashout };
 }
 
 async function cmdMatrix(): Promise<void> {
@@ -1308,15 +1455,27 @@ async function cmdMatrix(): Promise<void> {
     let driftedUnits = new Set<string>();
     let owedReplays = new Map<number, string>();
     if (existsSync(runsPath)) {
+      const scheduleByPos = new Map(cfg.schedule.rows.map((r) => [r.pos, { unit: r.unit, driver: r.driver, rep: r.rep, probe: r.probe }]));
       const state = reconstructResumeState(
         readFileSync(runsPath, "utf8").split("\n"),
         engine.harnessCommit(),
         engine.envManifestHashValue(),
+        scheduleByPos,
       );
       ({ terminalPos, rerunUsed, straddled, successLedger, driftedUnits, owedReplays } = state);
       if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
       if (owedReplays.size > 0) log(`resuming: ${owedReplays.size} owed R1/R2 replay(s) reconstructed from the log`);
       engine.restoreUnitForms(state.resumeForms);
+      if (state.owedWashout !== null) {
+        // the last recorded run's washout was interrupted: complete the owed IDLE period and
+        // append its marker — never re-run a transport attempt that already measured (§4.5's
+        // separation is about idle time, not repetition)
+        const sched = scheduleByPos.get(state.owedWashout.pos)!;
+        const ms = Math.max(cfg.protocol.washoutFloorMs, state.owedWashout.ms);
+        log(`completing the interrupted washout for pos ${state.owedWashout.pos} (${Math.ceil(ms / 1000)}s) before resuming (§4.5)`);
+        await new Promise((r) => setTimeout(r, ms));
+        engine.appendLogMarker({ type: "washout-done", pos: state.owedWashout.pos, rep: sched.rep, probe: sched.probe, phase: "matrix", unit: sched.unit, driver: sched.driver });
+      }
     }
     const isRerunnable = (record: import("./benchProtocol.ts").RunRecord): boolean =>
       evidenceIsRerunnable(record.failureEvidence, `${record.unit}|${record.driver}`, successLedger);

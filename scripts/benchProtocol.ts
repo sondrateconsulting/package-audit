@@ -553,10 +553,18 @@ export class BenchEngine {
   restoreUnitForms(forms: ReadonlyMap<string, AcquisitionForm>): void {
     for (const [unit, form] of forms) this.unitForms.set(unit, form);
   }
+  // resume support: the caller COMPLETES an interrupted washout (sleep, then this marker) —
+  // §4.5's separation is satisfied without re-running an attempt that already measured
+  appendLogMarker(marker: Record<string, unknown>): void {
+    this.o.runsLog.appendMarker(marker);
+  }
   constructor(o: EngineOptions) {
     this.o = o;
     this.manifestHash = o.runsLog.envManifestHash();
   }
+  // EPOCH time, deliberately distinct from the WallClock's monotonic source: this feeds ISO
+  // stamps and reset-epoch arithmetic, where epoch semantics are the point. The scored wall
+  // never accumulates through this (see the WallClock construction in runOne).
   private now(): number {
     return (this.o.now ?? Date.now)();
   }
@@ -673,7 +681,11 @@ export class BenchEngine {
             secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
             bucketDeltas: { core: { valid: true, used: 0 }, graphql: { valid: true, used: 0 } },
             bucketSnapshots: [],
-            expectedConsumption: { core: 0, graphql: 0 }, replayOfPos: null, replayKind: null,
+            // this attempt may BE a dispatched replay — its record must say so, and the pending
+            // replay state must reset here exactly as the normal tail resets it: leaving it set
+            // stamped replayKind:"r1r2" onto the NEXT unrelated row, whose resume scan then
+            // counted a different unit×driver's ≤1 allowance as spent
+            expectedConsumption: { core: 0, graphql: 0 }, replayOfPos: this.replayOfPos, replayKind: this.replayKind,
             // reclaim BEFORE the record is built, so the flag reports what actually happened
             // rather than asserting a teardown this path used to skip entirely
             diskReclaimFailed: driftReclaimFailed,
@@ -684,6 +696,11 @@ export class BenchEngine {
             envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
           };
           this.o.runsLog.append(driftRecord);
+          this.replayOfPos = null;
+          this.replayKind = null;
+          // no washout is owed (the probe consumed no API traffic), but the marker-per-row
+          // invariant the resume scan enforces must hold for THIS row too
+          this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
           return { outcome: null, verification: null, record: driftRecord };
         } else {
           form = "production";
@@ -908,7 +925,21 @@ export class BenchEngine {
     const deltas = after !== null
       ? { core: sumDelta((d) => d.core), graphql: sumDelta((d) => d.graphql) }
       : { core: { valid: false, used: null } as BucketDelta, graphql: { valid: false, used: null } as BucketDelta };
-    if ((!deltas.core.valid || !deltas.graphql.valid) && runOutcome === "complete") runOutcome = "invalidated-straddle"; // R4
+    // R4/R3 apply to unit-failure runs too, not only completed ones: §4.5 declares an invalid
+    // run "replayed in its own slot" with no completion condition, and a failure observed under
+    // verified external interference (or across a reset) is contaminated evidence — recording
+    // it as the driver's permanent failure would let a foreign consumer manufacture G3
+    // ineligibility. Invalidation SUPERSEDES the failure; the original cause is preserved.
+    const invalidatable = runOutcome === "complete" || runOutcome === "unit-failure";
+    const supersede = (newOutcome: "invalidated-straddle" | "invalidated-foreign", why: string): void => {
+      failureCause = runOutcome === "unit-failure"
+        ? `${why} — superseding a unit-failure observed under it: ${failureCause ?? "(no recorded cause)"}`
+        : why;
+      runOutcome = newOutcome;
+      failureEvidence = null; // an invalidated run's evidence is contaminated, never R1/R2 input
+    };
+    if ((!deltas.core.valid || !deltas.graphql.valid) && invalidatable && after !== null)
+      supersede("invalidated-straddle", "a bucket delta straddled a reset window (R4)");
     // R3 foreign consumption (§4.5/§4.8): the observed delta must reconcile with the harness's
     // OWN accounting — unexplained excess is external interference: run invalid, replayed in
     // its own slot, never charged to the driver allowance (codex R1 finding 8). Conditional
@@ -917,11 +948,10 @@ export class BenchEngine {
     // unknown costs reconcile at their UPPER bound (1..P_max) — an owned-but-unreadable cost
     // must never be labeled foreign (codex R2 f.15); overruns of the frozen bound are R5's job
     const expectedGraphql = httpRecords.filter((r) => !r.servedFromCache && r.kind === "graphql").reduce((n, r) => n + (r.pointsCost ?? cfg.budget.pMaxPointsPerGraphqlAttempt), 0);
-    if (runOutcome === "complete") {
+    if (runOutcome === "complete" || runOutcome === "unit-failure") {
       if ((deltas.core.valid && deltas.core.used !== null && deltas.core.used > expectedCore) ||
           (deltas.graphql.valid && deltas.graphql.used !== null && deltas.graphql.used > expectedGraphql)) {
-        runOutcome = "invalidated-foreign";
-        failureCause = `observed consumption (core ${deltas.core.used}, graphql ${deltas.graphql.used}) exceeds harness-owned accounting (core ${expectedCore}, graphql ${expectedGraphql})`;
+        supersede("invalidated-foreign", `observed consumption (core ${deltas.core.used}, graphql ${deltas.graphql.used}) exceeds harness-owned accounting (core ${expectedCore}, graphql ${expectedGraphql})`);
       }
     }
 

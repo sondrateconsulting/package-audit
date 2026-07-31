@@ -171,3 +171,19 @@ describe("seam helpers", () => {
     expect(countReplacementChars(new TextEncoder().encode("clean"))).toBe(0);
   });
 });
+
+describe("deriveRoutes — T1 precedence matches the runtime transition table exactly", () => {
+  // validateAlias (benchT1.ts) checks isTruncated BEFORE isBinary/text-null; a pin that ordered
+  // them the other way manufactured a permanent G2 out of a route-label disagreement over
+  // identical REST-fallback bytes.
+  test("a blob GitHub reports both truncated and binary pins truncated-blob-fallback", () => {
+    const entry: WorkloadEntry = {
+      path: "weird.bin", mode: "100644", blobOid: "c".repeat(40), size: 10, class: "source",
+      read: true, noReadReason: null, canonicalSeamSha256: "h".repeat(64), rawSha256: "r".repeat(64),
+      restDerefSeamSha256: null, checkoutSeamSha256: "k".repeat(64),
+      gql: { isBinary: true, isTruncated: true, textNull: true },
+    };
+    const routes = deriveRoutes(entry, { truncatedTree: false, escapeTripped: false, batchContentBytesCap: 1_572_864 });
+    expect(routes.T1.primary).toBe("truncated-blob-fallback");
+  });
+});

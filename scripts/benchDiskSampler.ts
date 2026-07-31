@@ -10,7 +10,7 @@
 //                       updates the peak. The main thread's per-tick cost is a postMessage.
 //   InlineDiskSampler — the same accounting with a synchronous walk. Correct only where nothing
 //                       is being timed (pinning, diagnostics) or where a test injects the walk.
-import { duBytes, duBytesStrict, extraBytes } from "./benchDiskWalk.ts";
+import { duBytes, duBytesStrict, extraBytes, extraBytesStrict } from "./benchDiskWalk.ts";
 import type { DiskWalkReply, DiskWalkRequest } from "./benchDiskWorker.ts";
 
 export interface DiskSnapshot {
@@ -110,8 +110,9 @@ export class InlineDiskSampler extends BaseSampler {
       // the FINAL sample is load-bearing (on a short run it may be the ONLY sample), and the
       // run dir is quiescent here — the driver has returned and reclamation has not started —
       // so tolerance would let an unreadable root record a plausible-looking 0-byte peak with
-      // sampleError null. Strict, like the clone-store measurement; ticks stay tolerant.
-      this.observe(this.strictWalk(dir) + extraBytes(this.extras));
+      // sampleError null. Strict on BOTH terms (a present-but-unreadable db sidecar must not
+      // silently shrink the figure); ticks stay tolerant.
+      this.observe(this.strictWalk(dir) + extraBytesStrict(this.extras));
     } catch (e) {
       sampleError = e instanceof Error ? e.message : String(e);
       clone = null;

@@ -9,7 +9,7 @@
 // that bias. It does NOT claim to remove all resource contention: a walk in another thread still
 // competes for CPU and disk bandwidth with the git subprocess under test. The residual is
 // second-order and is recorded as such in the plan amendment.
-import { duBytes, duBytesStrict, extraBytes } from "./benchDiskWalk.ts";
+import { duBytes, duBytesStrict, extraBytes, extraBytesStrict } from "./benchDiskWalk.ts";
 
 export interface DiskWalkRequest {
   seq: number;
@@ -45,10 +45,23 @@ declare const self: Worker;
 
 self.onmessage = (event: MessageEvent): void => {
   const req = parseDiskWalkRequest(event.data);
-  if (req === null) return; // an unparseable request is answered by silence; the requester deadlines
+  if (req === null) {
+    // When the malformed request still carries a routable seq, reply with an ERROR so the
+    // requester fails immediately instead of waiting out its full reply deadline. With no
+    // usable seq there is nothing to route — silence, and the requester deadlines.
+    const seq = typeof event.data === "object" && event.data !== null && !Array.isArray(event.data)
+      ? (event.data as Record<string, unknown>)["seq"]
+      : undefined;
+    if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0)
+      postMessage({ seq, bytes: 0, error: "malformed disk-walk request" } satisfies DiskWalkReply);
+    return;
+  }
   try {
+    // strict requests are RECORDED MEASUREMENTS end to end: the sidecar stats fail closed too
+    // (a present-but-unreadable -wal must not silently shrink the figure), where sampled ticks
+    // keep the tolerant walk on both terms
     const bytes = req.strict
-      ? duBytesStrict(req.dir) + extraBytes(req.extras)
+      ? duBytesStrict(req.dir) + extraBytesStrict(req.extras)
       : duBytes(req.dir) + extraBytes(req.extras);
     postMessage({ seq: req.seq, bytes } satisfies DiskWalkReply);
   } catch (e) {

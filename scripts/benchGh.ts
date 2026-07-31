@@ -367,17 +367,32 @@ export interface RateLimitSnapshot {
   graphql: { remaining: number; reset: number; used: number };
   atMs: number;
 }
+// Parse one bucket out of a rate_limit response body. These figures drive R3/R4 verdicts and
+// the §4.8 reservation, so they are VALIDATED, not cast: a null root previously escaped as a
+// raw TypeError, and fractional or negative counters would have become authoritative — a
+// fabricated delta can invalidate a run as foreign or admit a run the reservation should block.
+export function parseRateLimitBucket(json: unknown, name: string): { remaining: number; reset: number; used: number } {
+  if (typeof json !== "object" || json === null || Array.isArray(json))
+    throw new BenchHttpError("rate-limit-shape", "rate_limit response is not an object");
+  const resources = (json as Record<string, unknown>)["resources"];
+  if (typeof resources !== "object" || resources === null || Array.isArray(resources))
+    throw new BenchHttpError("rate-limit-shape", "rate_limit response carries no resources object");
+  const r = (resources as Record<string, unknown>)[name];
+  if (typeof r !== "object" || r === null || Array.isArray(r))
+    throw new BenchHttpError("rate-limit-shape", `rate_limit response missing resources.${name}`);
+  const ro = r as Record<string, unknown>;
+  const int = (key: string): number => {
+    const v = ro[key];
+    if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0)
+      throw new BenchHttpError("rate-limit-shape", `rate_limit resources.${name}.${key} is not a nonnegative integer`);
+    return v;
+  };
+  return { remaining: int("remaining"), reset: int("reset"), used: int("used") };
+}
+
 export async function readRateLimit(ctx: BenchGhContext): Promise<RateLimitSnapshot> {
   // rate_limit is documented as not counting against the REST primary limit; it is still a
   // recorded spawn (requestClass rest-meta) so accounting can prove zero unexplained traffic.
-  const json = (await benchRestJson(ctx, { endpoint: "rate_limit", requestClass: "rest-meta" })) as {
-    resources?: Record<string, { remaining?: number; reset?: number; used?: number }>;
-  };
-  const read = (name: string): { remaining: number; reset: number; used: number } => {
-    const r = json.resources?.[name];
-    if (r === undefined || typeof r.remaining !== "number" || typeof r.reset !== "number" || typeof r.used !== "number")
-      throw new BenchHttpError("rate-limit-shape", `rate_limit response missing resources.${name}`);
-    return { remaining: r.remaining, reset: r.reset, used: r.used };
-  };
-  return { core: read("core"), graphql: read("graphql"), atMs: ctx.now() };
+  const json = await benchRestJson(ctx, { endpoint: "rate_limit", requestClass: "rest-meta" });
+  return { core: parseRateLimitBucket(json, "core"), graphql: parseRateLimitBucket(json, "graphql"), atMs: ctx.now() };
 }

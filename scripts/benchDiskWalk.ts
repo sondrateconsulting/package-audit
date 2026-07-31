@@ -76,3 +76,19 @@ export function extraBytes(paths: readonly string[]): number {
   }
   return total;
 }
+
+// The strict counterpart for RECORDED measurements: an ABSENT sidecar is normal (-wal/-shm come
+// and go), but a present-yet-unreadable one (EIO, EACCES) must fail the measurement rather than
+// silently shrink it — the tolerant version above treated both identically.
+export function extraBytesStrict(paths: readonly string[]): number {
+  let total = 0;
+  for (const p of paths) {
+    try {
+      total += lstatSync(p).size;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; // absent sidecar — normal
+      throw new DiskWalkError(`cannot stat sidecar ${p}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  return total;
+}

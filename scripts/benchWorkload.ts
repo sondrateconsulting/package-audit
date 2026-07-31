@@ -250,10 +250,15 @@ export function deriveRoutes(entry: WorkloadEntry, ctx: UnitContext): Record<Dri
     t1 = { primary: "content-cap-singleton", declaredCaveat: false, permittedFallbacks: [], expected: { "content-cap-singleton": canonical() } };
   } else {
     const gql = entry.gql ?? fail(`gql facts missing for ${entry.path} (pinning must probe GitHub's own judgment)`);
-    if (gql.isBinary || gql.textNull) {
-      t1 = { primary: "binary-fallback", declaredCaveat: false, permittedFallbacks: [], expected: { "binary-fallback": canonical() } };
-    } else if (gql.isTruncated) {
+    // isTruncated FIRST, matching the runtime's validateAlias precedence exactly (benchT1.ts):
+    // if GitHub ever reports a blob both truncated and binary/text-null, the driver delivers
+    // truncated-blob-fallback — pinning the other label would manufacture a permanent G2
+    // mismatch out of route-name disagreement over identical REST-fallback bytes. (No committed
+    // workload carries the conflicting state, so every committed matrix re-derives unchanged.)
+    if (gql.isTruncated) {
       t1 = { primary: "truncated-blob-fallback", declaredCaveat: false, permittedFallbacks: [], expected: { "truncated-blob-fallback": canonical() } };
+    } else if (gql.isBinary || gql.textNull) {
+      t1 = { primary: "binary-fallback", declaredCaveat: false, permittedFallbacks: [], expected: { "binary-fallback": canonical() } };
     } else {
       const expected: RouteExpectation["expected"] = { primary: canonical() };
       for (const r of T1_OPERATIONAL_FALLBACKS) expected[r] = canonical();
