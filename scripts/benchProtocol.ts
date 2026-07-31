@@ -640,7 +640,24 @@ export class BenchEngine {
     // counter can never resurrect a warm cache; purgeCache drops api_cache rows outright
     // (production --fresh preserves them by design) (codex R2 f.24)
     const dbPath = join(this.o.runCacheDir, `bench-run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-${process.pid}-${this.now()}-${this.runCounter}.sqlite`);
-    const db = AuditDb.open({ sqlitePath: dbPath, fresh: true, purgeCache: true });
+    // the open itself can CREATE the file and then fail (WAL/schema initialisation, ENOSPC):
+    // nothing downstream owns the path yet — reclaimOnce and the outer finally both live past
+    // this line — so a mid-initialisation throw must sweep its own debris here, with the path
+    // in the operator's face, before rethrowing
+    let db: AuditDb;
+    try {
+      db = AuditDb.open({ sqlitePath: dbPath, fresh: true, purgeCache: true });
+    } catch (openErr) {
+      for (const suffix of ["", "-wal", "-shm"]) {
+        try {
+          rmSync(`${dbPath}${suffix}`, { force: true });
+        } catch {
+          // best-effort — the log below names the path either way
+        }
+      }
+      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run-cache DB failed to initialise (${openErr instanceof Error ? openErr.message : String(openErr)}) — swept ${dbPath}[-wal/-shm] best-effort before rethrowing`);
+      throw openErr;
+    }
     // The run's resources are owned from HERE, not from the driver's try-block. Several paths
     // leave before that block — the mid-unit drift restart, and throws from probeLiveHead /
     // reserve / the pre-run rate-limit read / planning — and each previously leaked the open

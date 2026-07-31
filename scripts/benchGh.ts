@@ -51,7 +51,7 @@ export interface BenchHttpAttemptRecord {
   attempt: number; // 1-based within this call
   status: number;
   exitCode: number;
-  classification: string; // ok | not-modified | cache | primary | secondary | transient | fatal | no-response | truncated | malformed-body
+  classification: string; // ok | not-modified | cache | primary | secondary | transient | fatal | no-response | truncated | malformed-body | unaccepted-2xx
   secondarySignal: SecondarySignalKind | null;
   pointsCost: number | null; // graphql rateLimit.cost when readable; 1 imputed by the caller's accounting
   remaining: number | null;
@@ -329,7 +329,12 @@ export function graphqlRecordClassification(
   clsKind: string,
   envelope: { jsonParseable: boolean; data: Record<string, unknown> | null; malformedErrorEntries: number },
 ): string {
-  if (status !== 200 || clsKind !== "ok") return clsKind;
+  if (clsKind !== "ok") return clsKind;
+  // benchT1's table accepts ONLY status-200 envelopes: production's classifier calls any
+  // errorless 2xx "ok" (a proxy-transformed 203/206 included, with gh exiting 0), but the
+  // analyzer routes every non-200 to its closed default — an "ok" record there would mint a
+  // §4.5 R2 ledger success from a dispatch the driver rejects wholesale.
+  if (status !== 200) return "unaccepted-2xx";
   if (!envelope.jsonParseable || envelope.data === null || envelope.malformedErrorEntries > 0) return "malformed-body";
   return clsKind;
 }

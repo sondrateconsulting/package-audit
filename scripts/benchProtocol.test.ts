@@ -634,6 +634,13 @@ describe("graphqlRecordClassification — degenerate envelopes never record 'ok'
   test("a well-formed success envelope keeps 'ok'", () => {
     expect(graphqlRecordClassification(200, "ok", parseGraphqlBodyFull('{"data":{"repository":{}}}'))).toBe("ok");
   });
+  test("an errorless non-200 2xx records unaccepted-2xx — the analyzer rejects every non-200", () => {
+    // production's classifier calls any errorless 2xx "ok" (a proxy-transformed 203/206, gh
+    // exit 0), but benchT1 routes every non-200 to its closed default — recording "ok" would
+    // mint a ledger success from a dispatch the driver rejects wholesale
+    expect(graphqlRecordClassification(203, "ok", parseGraphqlBodyFull('{"data":{"repository":{}}}'))).toBe("unaccepted-2xx");
+    expect(graphqlRecordClassification(206, "ok", parseGraphqlBodyFull('{"data":{"repository":{}}}'))).toBe("unaccepted-2xx");
+  });
   test("non-'ok' verdicts pass through untouched — they carry the honest status-based story", () => {
     expect(graphqlRecordClassification(200, "fatal", parseGraphqlBodyFull('{"data":null,"errors":[{"type":"FORBIDDEN","message":"x"}]}'))).toBe("fatal");
     expect(graphqlRecordClassification(502, "transient", parseGraphqlBodyFull("<html>bad gateway</html>"))).toBe("transient");
