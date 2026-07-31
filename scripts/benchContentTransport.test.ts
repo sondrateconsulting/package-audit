@@ -423,6 +423,15 @@ describe("classifyFidelityLog — the battery's own append-only discipline (§4.
   test("a corrupted line refuses — evidence logs are never silently skimmed", () => {
     expect(() => classifyFidelityLog(["{nope"], DIGEST)).toThrow(/corrupted/);
   });
+  test("driver-failure rows are durable and distinct from rerunnable aborts", () => {
+    // §4.5: store corruption / coherence / fatal HTTP are DRIVER failures, no rerun — recording
+    // them as rerunnable aborts would let re-invocations launder them into a pass
+    const s = classifyFidelityLog([
+      JSON.stringify({ type: "fidelity-driver-failure", frozenSurfaceDigest: DIGEST, fixture: "clone-symlink", driver: "T2c", reason: "object-store corruption" }),
+    ], DIGEST);
+    expect(s.driverFailures.has("clone-symlink|T2c")).toBe(true);
+    expect(s.operationalAborts.size).toBe(0);
+  });
 });
 
 describe("evidenceIsRerunnable — the frozen R1/R2 predicate over typed evidence", () => {

@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseTreeResponse } from "./github.ts";
+import { walkClone } from "./orchestrate.ts";
 import type { BenchConfig } from "./benchConfig.ts";
 import type { CorpusUnit, PerformanceSlot } from "./benchCorpus.ts";
 import { BatchChild, runBenchGit, type BatchChildDisposal, type BenchSpawnObserver } from "./benchSpawn.ts";
@@ -352,8 +353,16 @@ async function fetchRestTree(ctx: DriverRunContext, st: RunState): Promise<{ tru
 async function runTruncatedCheckout(ctx: DriverRunContext, st: RunState): Promise<string> {
   const { dir } = await acquireStore(ctx, { checkout: true });
   if (st.live !== undefined) st.live.cloneDir = dir;
+  // §4.2 defines the C4 comparison as "{REST tree attempt + checkout clone + WALK}": production
+  // enumerates the whole checkout recursively (orchestrate's walkClone — lstat over every
+  // entry) before any read, and skipping that walk here understated T0/T1's fallback cost by
+  // exactly the tree-scale term the truncated slot exists to exercise. The walk's entry list
+  // also guards the pinned read set: a pinned path absent from the live checkout is the same
+  // coherence condition the untruncated drivers fail on.
+  const walked = new Set(walkClone(dir).map((e) => e.path));
   for (const entry of ctx.workload.entries) {
     if (!entry.read) continue;
+    if (!walked.has(entry.path)) throw new UnitFailure(`checkout walk omits pinned entry ${entry.path}`);
     readCheckoutDelivery(ctx, dir, st, entry, "truncated-tree-checkout");
   }
   return dir;

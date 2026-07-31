@@ -283,6 +283,27 @@ describe("analyzeBatchResponse — a failed subprocess is not data (santa round 
   });
 });
 
+describe("analyzeBatchResponse — production-REALISTIC classifications (a 200 with errors[] classifies fatal)", () => {
+  // classifyGraphql marks EVERY 200 envelope carrying non-throttle errors[] as fatal (its own
+  // drop-partial-data design). An unscoped fatal-preempt therefore dead-coded this table for
+  // exactly the envelopes it attributes — the fixtures here carry the classification production
+  // actually produces, which the earlier classification:"ok" fixtures never did.
+  test("a 200 TIMEOUT envelope with the REAL fatal classification still splits", () => {
+    expect(analyzeBatchResponse(dispatch({ exitCode: 1, classification: "fatal", errors: [{ type: "TIMEOUT", message: null, path: null }] }), BATCH, "sha1", CFG))
+      .toEqual({ kind: "batch-timeout" });
+  });
+  test("a 200 alias-attributed NOT_FOUND with the REAL fatal classification resolves per alias", () => {
+    const a = analyzeBatchResponse(dispatch({
+      exitCode: 1, classification: "fatal",
+      data: { repository: { a0: aliasPayload(TEXT) } },
+      errors: [{ type: "NOT_FOUND", message: "gone", path: ["repository", "a1"] }],
+    }), BATCH, "sha1", CFG);
+    expect(a).toMatchObject({ kind: "per-alias" });
+    if (a.kind !== "per-alias") throw new Error("unreachable");
+    expect(a.outcomes[1]).toMatchObject({ kind: "missing" });
+  });
+});
+
 describe("analyzeBatchResponse — a FATAL classification is never throttle-like", () => {
   test("an SSO-enforcement 403 carrying a RATE_LIMITED body takes the closed default, not the throttle path", () => {
     // production short-circuits SSO before the RATE_LIMITED branch; routing it to throttle-retry

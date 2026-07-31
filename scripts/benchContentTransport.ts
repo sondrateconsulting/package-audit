@@ -21,7 +21,7 @@
 // them (the production sweep deliberately targets pkg-audit-* only); stale ones are safe to
 // delete by hand.
 
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -218,6 +218,39 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
 
 const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl", "data/"];
 
+// The traversal is SERIAL by §4.5 and the evidence logs are append-only files with no internal
+// framing protection — two concurrent matrix/fidelity invocations would interleave rows and
+// markers (which the resume invariant then rightly refuses) and perturb each other's walls.
+// One exclusive on-disk lock per repo enforces the single writer; a stale lock (crashed
+// process) is the operator's to remove, deliberately — silently stealing a lock a LIVE process
+// holds is the worse failure.
+function acquireSingleWriterLock(what: string): () => void {
+  mkdirSync(join(REPO_ROOT, "data"), { recursive: true });
+  const lockPath = join(REPO_ROOT, "data", "bench-single-writer.lock");
+  let fd: number;
+  try {
+    fd = openSync(lockPath, "wx");
+  } catch {
+    const holder = ((): string => {
+      try {
+        return readFileSync(lockPath, "utf8").trim();
+      } catch {
+        return "unreadable";
+      }
+    })();
+    throw new Error(`REFUSING: ${lockPath} exists (held by: ${holder}) — another ${what} invocation may be live; the traversal is single-writer (§4.5). If that process is dead, remove the lock file and re-run`);
+  }
+  writeFileSync(lockPath, `pid ${process.pid}, ${what}, started ${new Date().toISOString()}\n`);
+  closeSync(fd);
+  return () => {
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      log(`WARNING: could not remove ${lockPath} — remove it by hand before the next run`);
+    }
+  };
+}
+
 // The §8 gate's git-state leg, pure over the two command results so it is testable in CI.
 // BOTH exit codes are checked. `git status` was previously trusted unconditionally: a
 // status-only failure yields empty stdout, which parses as "no dirty files" and lets the
@@ -354,6 +387,7 @@ interface PinRuntime {
 
 function makePinRuntime(cfg: BenchConfig): PinRuntime {
   const benchRoot = mkdtempSync(join(realpathSync(tmpdir()), cfg.protocol.tempPrefix));
+  try {
   mkdirSync(join(REPO_ROOT, "data"), { recursive: true });
   const db = AuditDb.open({ sqlitePath: join(REPO_ROOT, "data", "bench-pin-cache.sqlite"), fresh: false, purgeCache: false });
   const client = new GithubClient({ githubHost: cfg.githubHost, db, tempRoot: benchRoot });
@@ -374,6 +408,12 @@ function makePinRuntime(cfg: BenchConfig): PinRuntime {
   const gitEnvProbe = buildGitEnv(process.env, writeGitcfg("gitcfg-probe", cfg.scaffolding.gitconfigProbeAutocrlfTrue));
   gitEnvProbe["GIT_NO_REPLACE_OBJECTS"] = "1";
   return { cfg, benchRoot, client, gh, gitEnv, gitEnvProbe, spawnObs: () => {} };
+  } catch (e) {
+    // construction failed before any caller could own benchRoot — reclaim it here or the
+    // pa-bench-* root (which nothing sweeps) leaks on every failed startup
+    rmSync(benchRoot, { recursive: true, force: true });
+    throw e;
+  }
 }
 
 // ---- pinning-lane git helpers ----------------------------------------------------------------
@@ -932,10 +972,10 @@ const workloadFileName = (unitId: string): string => `${unitId.replace(/[^A-Za-z
 async function cmdPinCorpus(): Promise<void> {
   const cfg = loadBenchConfig(CONFIG_PATH);
   const rt = makePinRuntime(cfg);
-  log(`bench root: ${rt.benchRoot}`);
-  const snap = await readRateLimit(rt.gh);
-  log(`rate_limit headroom: core ${snap.core.remaining}, graphql ${snap.graphql.remaining}`);
   try {
+    log(`bench root: ${rt.benchRoot}`);
+    const snap = await readRateLimit(rt.gh);
+    log(`rate_limit headroom: core ${snap.core.remaining}, graphql ${snap.graphql.remaining}`);
     const bundles: PinnedSlotBundle[] = [];
     for (const slotId of ["C1", "C2", "C3", "C4", "C5"] as const) {
       bundles.push(await pinPerformanceSlot(rt, slotId));
@@ -1052,11 +1092,16 @@ async function cmdDiagnostics(): Promise<void> {
 export interface FidelityLogState {
   passed: Set<string>; // "kind|driver|path" recorded pass:true — skipped on re-run (idempotence)
   failed: Set<string>; // any recorded pass:false — the battery REFUSES to re-run (G1 stands)
+  // "kind|driver" driver failures (store corruption, coherence, fatal HTTP): durable and NEVER
+  // rerunnable (§4.5 "everything else is a driver failure, no rerun") — re-running until a pass
+  // would launder them
+  driverFailures: Set<string>;
   operationalAborts: Map<string, number>; // "kind|driver" → recorded operational-abort count
 }
 export function classifyFidelityLog(lines: readonly string[], digest: string): FidelityLogState {
   const passed = new Set<string>();
   const failed = new Set<string>();
+  const driverFailures = new Set<string>();
   const operationalAborts = new Map<string, number>();
   for (const [i, line] of lines.entries()) {
     if (line.trim() === "") continue;
@@ -1074,9 +1119,11 @@ export function classifyFidelityLog(lines: readonly string[], digest: string): F
     } else if (rec["type"] === "fidelity-operational-abort") {
       const key = `${String(rec["fixture"])}|${String(rec["driver"])}`;
       operationalAborts.set(key, (operationalAborts.get(key) ?? 0) + 1);
+    } else if (rec["type"] === "fidelity-driver-failure") {
+      driverFailures.add(`${String(rec["fixture"])}|${String(rec["driver"])}`);
     }
   }
-  return { passed, failed, operationalAborts };
+  return { passed, failed, driverFailures, operationalAborts };
 }
 
 // The C6 fidelity battery (§4.2): untimed, once per (fixture, driver), gate-relevant — a
@@ -1088,6 +1135,7 @@ async function cmdFidelity(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
   // gate-relevant evidence rides the SAME §8 freeze gate as the matrix (codex R2 f.8)
   const { digest } = await assertRatifiedAndFrozen();
+  const releaseLock = acquireSingleWriterLock("fidelity");
   const rt = makePinRuntime(cfg);
   // Gate-relevant fidelity evidence must come off the WIRE, never from the persistent pinning
   // cache: an immutable cache hit would let a stale or corrupted local bench-pin-cache row
@@ -1105,11 +1153,13 @@ async function cmdFidelity(): Promise<void> {
   // operational abort on one (fixture, driver) refuses (the ≤1 objective-external rerun is
   // spent — the operator investigates the harness fault rather than retrying forever).
   const fidelityLogPath = join(ARTIFACTS, "fidelity.jsonl");
-  const logState = existsSync(fidelityLogPath)
+  const logState: FidelityLogState = existsSync(fidelityLogPath)
     ? classifyFidelityLog(readFileSync(fidelityLogPath, "utf8").split("\n"), digest)
-    : { passed: new Set<string>(), failed: new Set<string>(), operationalAborts: new Map<string, number>() };
+    : { passed: new Set<string>(), failed: new Set<string>(), driverFailures: new Set<string>(), operationalAborts: new Map<string, number>() };
   if (logState.failed.size > 0)
     throw new Error(`REFUSING: fidelity.jsonl records ${logState.failed.size} pass:false row(s) at the current frozen surface — a fidelity mismatch is never rerunnable (§4.2); the G1 verdict stands`);
+  if (logState.driverFailures.size > 0)
+    throw new Error(`REFUSING: fidelity.jsonl records driver failure(s) at the current frozen surface (${[...logState.driverFailures].join(", ")}) — §4.5 makes driver failures non-rerunnable; re-running until a pass would launder them`);
   let inFlight: { fixture: string; driver: string } | null = null;
   try {
     for (const fixture of corpus.fidelity) {
@@ -1254,8 +1304,8 @@ async function cmdFidelity(): Promise<void> {
           // a fixture whose verification carries NO usable hash is a corpus-artifact defect —
           // recording pass:false from it would permanently disqualify every applicable driver
           // over a malformed ARTIFACT, not an observed divergence. Refuse instead.
-          if (typeof expected !== "string" || expected.length === 0)
-            throw new BenchOperationalError(`fixture ${fixture.kind} carries no usable verification hash for ${entry.path} (route ${route}) — a corpus artifact defect; repair corpus.json, never record a verdict from it`);
+          if (typeof expected !== "string" || !/^[0-9a-f]{64}$/.test(expected))
+            throw new BenchOperationalError(`fixture ${fixture.kind} carries no usable sha256 verification hash for ${entry.path} (route ${route}) — a corpus artifact defect; repair corpus.json, never record a verdict from it`);
           const pass = gotHash === expected;
           if (!pass) failures++;
           const resultRec = { type: "fidelity", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: fixture.kind, driver, entry: entry.path, route, pass, rawVerified, gotHash, expected };
@@ -1276,21 +1326,40 @@ async function cmdFidelity(): Promise<void> {
     // a HARNESS fault (never a divergence) aborts the battery: record which (fixture, driver)
     // was in flight so the ≤1 rerun allowance is countable across invocations. Best-effort —
     // the abort itself must still propagate even if the marker append fails.
-    // the transient/operational WHITELIST: harness faults and transport-layer aborts, none of
-    // which is a fidelity observation. BenchHttpError (e.g. a no-response exhaustion in the T0
-    // battery read) previously escaped unmarked, so re-invocations were uncountable against
-    // §4.2's ≤1 external-rerun discipline.
-    const operationalAbort = e instanceof BenchOperationalError || e instanceof BenchHttpError || e instanceof BenchSpawnError || e instanceof UnitFailure;
-    if (operationalAbort && inFlight !== null) {
-      try {
-        appendFileSync(fidelityLogPath, `${JSON.stringify({ type: "fidelity-operational-abort", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: (e instanceof Error ? e.message : String(e)).slice(0, 300) })}\n`);
-      } catch {
-        log("WARNING: could not append the operational-abort marker to fidelity.jsonl");
+    // Two DISTINCT durable outcomes, matching §4.5's split exactly:
+    //   • operational/R1-R2-shaped aborts (harness faults; network-layer no-response; transient
+    //     5xx exhaustion) — an abort marker, and the ≤1 objective-external rerun applies;
+    //   • DRIVER failures (store corruption, coherence, fatal HTTP, spawn faults) — a durable
+    //     driver-failure row, never rerunnable: re-running until a pass would launder a §4.5
+    //     "driver failure, no rerun" through the battery.
+    if (inFlight !== null) {
+      const rerunnableAbort =
+        e instanceof BenchOperationalError ||
+        (e instanceof BenchHttpError && evidenceIsRerunnable(
+          { kind: "http", code: e.code, lastClassification: e.lastClassification, requestClass: e.requestClass },
+          `${inFlight.fixture}|${inFlight.driver}`,
+          // the battery has no repetition ledger; R2's prior-success stands on the pinning-time
+          // success of the same read class, recorded in corpus.json's verification evidence
+          new Set([`${inFlight.fixture}|${inFlight.driver}|${e.requestClass ?? ""}`]),
+        ));
+      const driverFailure = !rerunnableAbort && (e instanceof UnitFailure || e instanceof BenchSpawnError || e instanceof BenchHttpError);
+      const marker = rerunnableAbort
+        ? { type: "fidelity-operational-abort", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: (e instanceof Error ? e.message : String(e)).slice(0, 300) }
+        : driverFailure
+          ? { type: "fidelity-driver-failure", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: (e instanceof Error ? e.message : String(e)).slice(0, 300) }
+          : null;
+      if (marker !== null) {
+        try {
+          appendFileSync(fidelityLogPath, `${JSON.stringify(marker)}\n`);
+        } catch {
+          log(`WARNING: could not append the ${String(marker.type)} marker to fidelity.jsonl`);
+        }
       }
     }
     throw e;
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
+    releaseLock();
   }
 }
 
@@ -1507,6 +1576,8 @@ export function reconstructResumeState(
 async function cmdMatrix(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
   if (cfg.schedule === null) throw new Error("REFUSING: bench-config.json carries no pinned schedule (run pin-corpus first)");
+  const releaseLock = acquireSingleWriterLock("matrix");
+  try {
   const { digest } = await assertRatifiedAndFrozen();
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads, digest);
   try {
@@ -1628,6 +1699,9 @@ async function cmdMatrix(): Promise<void> {
   } finally {
     rmSync(benchRoot, { recursive: true, force: true });
   }
+  } finally {
+    releaseLock();
+  }
 }
 
 // refresh-evidence: recompute committed EVIDENCE without moving any pinned SHA — the C3 stats
@@ -1709,6 +1783,9 @@ async function cmdRefreshEvidence(): Promise<void> {
           searchEvidence.push({ candidate: `${cand.owner}/${cand.repo}`, error: e instanceof Error ? e.message.slice(0, 160) : String(e) });
         }
       }
+      const searchErrors = searchEvidence.filter((s) => s["error"] !== undefined).length;
+      if (!unified && searchErrors > 0)
+        throw new Error(`C6 unification search did NOT complete: ${searchErrors} candidate(s) errored — an incomplete search must not be committed as the §4.2 exhausted-search contingency; re-run refresh-evidence`);
       if (!unified) {
         log(`C6 stays split after exhausting ${C6_CLONE_CANDIDATES.length} candidates (evidence recorded; plan §4.2 contingency)`);
         corpus.fidelity = corpus.fidelity.map((f) => f.kind === "clone-symlink" || f.kind === "non-utf8-content" ? { ...f, verification: { ...f.verification, unifiedSearch: searchEvidence } } : f);

@@ -256,9 +256,17 @@ export function deriveRoutes(entry: WorkloadEntry, ctx: UnitContext): Record<Dri
     // mismatch out of route-name disagreement over identical REST-fallback bytes. (No committed
     // workload carries the conflicting state, so every committed matrix re-derives unchanged.)
     if (gql.isTruncated) {
-      t1 = { primary: "truncated-blob-fallback", declaredCaveat: false, permittedFallbacks: [], expected: { "truncated-blob-fallback": canonical() } };
+      // batched like any entry (the state is response-DISCOVERED), so every operational T1
+      // outcome remains possible: an alias whose response fails validation, times out
+      // unsplittably, goes missing, or drains with its batch must still deliver via the
+      // counted REST lane — an empty permitted set converted such recoveries into G2 failures
+      const expected: RouteExpectation["expected"] = { "truncated-blob-fallback": canonical() };
+      for (const r of T1_OPERATIONAL_FALLBACKS) expected[r] = canonical();
+      t1 = { primary: "truncated-blob-fallback", declaredCaveat: false, permittedFallbacks: [...T1_OPERATIONAL_FALLBACKS], expected };
     } else if (gql.isBinary || gql.textNull) {
-      t1 = { primary: "binary-fallback", declaredCaveat: false, permittedFallbacks: [], expected: { "binary-fallback": canonical() } };
+      const expected: RouteExpectation["expected"] = { "binary-fallback": canonical() };
+      for (const r of T1_OPERATIONAL_FALLBACKS) expected[r] = canonical();
+      t1 = { primary: "binary-fallback", declaredCaveat: false, permittedFallbacks: [...T1_OPERATIONAL_FALLBACKS], expected };
     } else {
       const expected: RouteExpectation["expected"] = { primary: canonical() };
       for (const r of T1_OPERATIONAL_FALLBACKS) expected[r] = canonical();

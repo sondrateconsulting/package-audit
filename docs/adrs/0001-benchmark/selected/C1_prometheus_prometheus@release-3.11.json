@@ -5022,9 +5022,26 @@
       "T1": {
         "primary": "truncated-blob-fallback",
         "declaredCaveat": false,
-        "permittedFallbacks": [],
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
         "expected": {
           "truncated-blob-fallback": {
+            "seamSha256": "06e4c002c79c7991054a2c5db76fae509ebd4fa40dc9ef33c7c87adf5176fd1a"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "06e4c002c79c7991054a2c5db76fae509ebd4fa40dc9ef33c7c87adf5176fd1a"
+          },
+          "validation-fallback": {
+            "seamSha256": "06e4c002c79c7991054a2c5db76fae509ebd4fa40dc9ef33c7c87adf5176fd1a"
+          },
+          "timeout-singleton": {
+            "seamSha256": "06e4c002c79c7991054a2c5db76fae509ebd4fa40dc9ef33c7c87adf5176fd1a"
+          },
+          "missing-alias-fallback": {
             "seamSha256": "06e4c002c79c7991054a2c5db76fae509ebd4fa40dc9ef33c7c87adf5176fd1a"
           }
         }

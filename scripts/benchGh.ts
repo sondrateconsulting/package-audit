@@ -210,7 +210,10 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
       return parsed;
     }
     if (cls.kind === "fatal") {
-      emit("fatal", signal);
+      // a FATAL response (SSO / permission) is never a secondary-limit signal, whatever its
+      // status/headers look like — the GraphQL side applies the same guard, and G4's count
+      // must not be fed by conditions production fails fast on
+      emit("fatal", null);
       throw new BenchHttpError("fatal", `${cls.message} (${opts.endpoint})`, cls.status);
     }
     if (cls.kind === "primary") {

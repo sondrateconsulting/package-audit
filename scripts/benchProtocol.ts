@@ -29,9 +29,13 @@ import type { DriverId } from "./benchSchedule.ts";
 import type { BenchSpawnRecord } from "./benchSpawn.ts";
 
 export class BenchProtocolError extends Error {
-  constructor(message: string) {
+  // typed discriminant: the engine's R5 classification must never ride a message regex (the
+  // same rule §4.5 imposes on the rerun predicate)
+  readonly code: "r5-breach" | null;
+  constructor(message: string, code: "r5-breach" | null = null) {
     super(`BENCH PROTOCOL: ${message}`);
     this.name = "BenchProtocolError";
+    this.code = code;
   }
 }
 
@@ -649,13 +653,13 @@ export class BenchEngine {
         if (r.kind === "graphql") {
           liveGraphqlPoints += r.pointsCost ?? 1;
           if (r.pointsCost !== null && r.pointsCost > cfg.budget.pMaxPointsPerGraphqlAttempt)
-            throw new BenchProtocolError(`R5 frozen-assumption breach: measured cost ${r.pointsCost} exceeds P_max ${cfg.budget.pMaxPointsPerGraphqlAttempt} — halt for freeze repair`);
+            throw new BenchProtocolError(`R5 frozen-assumption breach: measured cost ${r.pointsCost} exceeds P_max ${cfg.budget.pMaxPointsPerGraphqlAttempt} — halt for freeze repair`, "r5-breach");
           if (liveGraphqlPoints > wcRef.graphql)
-            throw new BenchProtocolError(`R5 frozen-assumption breach: live graphql consumption ${liveGraphqlPoints} overran WC ${wcRef.graphql} — halt for freeze repair`);
+            throw new BenchProtocolError(`R5 frozen-assumption breach: live graphql consumption ${liveGraphqlPoints} overran WC ${wcRef.graphql} — halt for freeze repair`, "r5-breach");
         } else if (r.status > 0 && r.status !== 304) {
           liveCoreAttempts++;
           if (liveCoreAttempts > wcRef.core)
-            throw new BenchProtocolError(`R5 frozen-assumption breach: live core consumption ${liveCoreAttempts} overran WC ${wcRef.core} — halt for freeze repair`);
+            throw new BenchProtocolError(`R5 frozen-assumption breach: live core consumption ${liveCoreAttempts} overran WC ${wcRef.core} — halt for freeze repair`, "r5-breach");
         }
       },
       now: () => this.now(), sleep: (ms) => this.sleep(ms),
@@ -664,8 +668,12 @@ export class BenchEngine {
     const isCloneDriver = row.driver === "T2a" || row.driver === "T2c";
     const needsClonePath = isCloneDriver || workload.truncatedTree;
 
-    // acquisition-form decision: probe the live head before every clone-involving rep (§4.4)
-    let form: AcquisitionForm = "production";
+    // acquisition-form decision: probe the live head before every clone-involving rep (§4.4).
+    // null until DECIDED: a pre-decision failure row must not invent "production" — resume
+    // would restore the invented form as frozen, and a later probe seeing an already-drifted
+    // branch would then be misclassified as mid-unit R6 drift (discard + epilogue restart)
+    // instead of the first-probe scaffolding adoption.
+    let form: AcquisitionForm | null = null;
     const probeCtx = {
       cfg, slot, unit, benchRoot: this.o.benchRoot,
       gitEnv: this.gitEnvFor(row.probe), spawnObserver: (r: BenchSpawnRecord) => spawnRecords.push(r),
@@ -741,16 +749,19 @@ export class BenchEngine {
               envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
               frozenSurfaceDigest: this.o.frozenSurfaceDigest,
             };
-            this.o.runsLog.append(driftRecord);
-            this.replayOfPos = null;
-            this.replayKind = null;
-            // no washout is owed (the probe consumed no API traffic), but the marker-per-row
-            // invariant the resume scan enforces must hold for THIS row too
-            this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
-            // the sampler was started before this branch (so pre-driver failures can classify
-            // with disk state) — this early return skips finishMeasuredRun, and an armed
-            // sampler surviving the run would tick its worker into LATER measured rows
-            sampler.abandon();
+            try {
+              this.o.runsLog.append(driftRecord);
+              this.replayOfPos = null;
+              this.replayKind = null;
+              // no washout is owed (the probe consumed no API traffic), but the marker-per-row
+              // invariant the resume scan enforces must hold for THIS row too
+              this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
+            } finally {
+              // in a finally, mirroring the R5 path: an ENOSPC/EACCES on either append must not
+              // skip the release — this early return bypasses finishMeasuredRun, and an armed
+              // sampler surviving the run would tick its worker into LATER measured rows
+              sampler.abandon();
+            }
             return { outcome: null, verification: null, record: driftRecord };
           } else {
             form = "production";
@@ -776,7 +787,7 @@ export class BenchEngine {
         cfg, slot, unit, workload, gh, benchRoot: this.o.benchRoot, runDir,
         gitEnv: this.gitEnvFor(row.probe),
         spawnObserver: (r) => spawnRecords.push(r),
-        acquisitionForm: form,
+        acquisitionForm: form ?? "production", // non-clone paths never read it; clone paths decided above
         fallbackBudget: restFallbackBudgetFor(cfg, workload.entries.length),
         liveState,
         ...(segmented
@@ -806,7 +817,7 @@ export class BenchEngine {
       } else if (e instanceof RePinRequired) {
         runOutcome = "re-pin-required";
         failureCause = e.message;
-      } else if (e instanceof BenchProtocolError && e.message.includes("R5")) {
+      } else if (e instanceof BenchProtocolError && e.code === "r5-breach") {
         runOutcome = "halt-r5-breach"; // recorded IN runs.jsonl, then the halt propagates
         failureCause = e.message;
         r5 = e;

@@ -191,11 +191,15 @@ export function analyzeBatchResponse(
     };
   }
   // throttle semantics next (classifyGraphql already ran): primary/secondary/RATE_LIMITED body.
-  // FATAL first — an SSO-enforcement 403 can carry a RATE_LIMITED body, and routing it to the
-  // throttle path retried (and G4-counted) a condition production fails fast on; the closed
-  // default bounds it by the attempt budget instead
-  if (d.classification === "fatal")
-    return { kind: "default-failure", rawCondition: `fatal classification at HTTP ${d.status} (e.g. SSO enforcement) — never throttle-like` };
+  // NON-200 FATAL first — an SSO/permission 403 can carry a RATE_LIMITED body, and routing it
+  // to the throttle path retried (and G4-counted) a condition production fails fast on; the
+  // closed default bounds it by the attempt budget instead. Scoped to NON-200 statuses only:
+  // production classifies EVERY 200 envelope carrying non-throttle errors[] as fatal (its own
+  // design drops partial data), and an unscoped preempt dead-coded this table for exactly the
+  // envelopes it exists to attribute — 200-with-TIMEOUT never split, alias NOT_FOUND never
+  // took its fallback (the same table-preemption failure the exit-code guard had).
+  if (d.classification === "fatal" && d.status !== 200)
+    return { kind: "default-failure", rawCondition: `fatal classification at HTTP ${d.status} (e.g. SSO/permission enforcement) — never throttle-like` };
   if (d.classification === "primary") return { kind: "throttle-retry", cause: "primary" };
   if (d.errors.some((e) => e.type === "RATE_LIMITED")) return { kind: "throttle-retry", cause: "rate-limited-body" };
   if (d.classification === "secondary") return { kind: "throttle-retry", cause: "secondary" };
