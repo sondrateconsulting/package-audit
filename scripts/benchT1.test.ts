@@ -131,6 +131,22 @@ describe("analyzeBatchResponse — gh exit semantics (gh exits 1 BY DESIGN on er
     expect(a.outcomes[0]).toMatchObject({ kind: "resolved" });
     expect(a.outcomes[1]).toMatchObject({ kind: "missing" });
   });
+  test("a recognized pathless TIMEOUT cannot mask a forbidden sibling — order-independent closed default", () => {
+    const timeoutThenUnknown = [{ type: "TIMEOUT", message: null, path: null }, { type: "SOME_NEW_TYPE", message: "??", path: null }];
+    expect(analyzeBatchResponse(dispatch({ errors: timeoutThenUnknown }), BATCH, "sha1", CFG)).toMatchObject({ kind: "default-failure" });
+    expect(analyzeBatchResponse(dispatch({ errors: [...timeoutThenUnknown].reverse() }), BATCH, "sha1", CFG)).toMatchObject({ kind: "default-failure" });
+    expect(analyzeBatchResponse(dispatch({ errors: [{ type: "TIMEOUT", message: null, path: null }, { type: "TIMEOUT", message: null, path: null }] }), BATCH, "sha1", CFG)).toEqual({ kind: "batch-timeout" });
+  });
+  test("alias attribution is STRICT: wrong subtree and leading-zero names are unattributable, not alias 0", () => {
+    // ["rateLimit","a0"] names a different subtree; "a00" is not a generated alias name — both
+    // previously attributed to alias 0, misrouting another alias's error
+    const wrongSubtree = analyzeBatchResponse(dispatch({ errors: [{ type: "NOT_FOUND", message: null, path: ["rateLimit", "a0"] }] }), BATCH, "sha1", CFG);
+    expect(wrongSubtree).toMatchObject({ kind: "default-failure" });
+    const leadingZero = analyzeBatchResponse(dispatch({ errors: [{ type: "NOT_FOUND", message: null, path: ["repository", "a00"] }] }), BATCH, "sha1", CFG);
+    expect(leadingZero).toMatchObject({ kind: "default-failure" });
+    const genuine = analyzeBatchResponse(dispatch({ data: { repository: { a0: aliasPayload(TEXT) } }, errors: [{ type: "NOT_FOUND", message: null, path: ["repository", "a1"] }] }), BATCH, "sha1", CFG);
+    expect(genuine).toMatchObject({ kind: "per-alias" });
+  });
   test("the original finding stays closed: a SUCCESS-shaped 200 from a failed gh is http-failure", () => {
     const a = analyzeBatchResponse(dispatch({ exitCode: 1, data: { repository: { a0: aliasPayload(TEXT), a1: aliasPayload(TEXT) } } }), BATCH, "sha1", CFG);
     expect(a).toMatchObject({ kind: "http-failure", fivexxSplitCandidate: false });

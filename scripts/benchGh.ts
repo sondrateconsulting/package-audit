@@ -35,7 +35,11 @@ export class BenchHttpError extends Error {
 
 // ---- recording -------------------------------------------------------------------------------
 export type SecondarySignalKind = "status-429" | "retry-after-403" | "body-secondary" | "graphql-rate-limited";
-export type RequestClass = "rest-content" | "rest-tree" | "rest-fallback" | "rest-meta" | "graphql-batch";
+// "rest-classifier" is the §4.4 SHA-form classifier's pinned-object probe: a CONSUMING core
+// request the §4.8 worst case explicitly reserves ("one SHA-classifier attempt-loop
+// allowance"). It must count as driver traffic — labeling it "rest-meta" excluded it from the
+// harness-owned accounting, so its own consumption read as R3 foreign interference.
+export type RequestClass = "rest-content" | "rest-tree" | "rest-fallback" | "rest-classifier" | "rest-meta" | "graphql-batch";
 
 export interface BenchHttpAttemptRecord {
   type: "http-attempt";
@@ -218,7 +222,10 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
     const waitMs = backoffWait(ctx.cfg, cls.kind, attempt, cls.kind === "secondary" ? cls.waitMs : null);
     // a secondary horizon is bucket-global evidence the washout must see (codex R1 finding 13)
     if (cls.kind === "secondary") ctx.core.pausedUntilMs = Math.max(ctx.core.pausedUntilMs, now + waitMs);
-    await ctx.sleep(waitMs);
+    // a backoff sleep is the PREFACE to a retry: after the final attempt the loop exhausts, and
+    // sleeping first would charge idle time to the scored wall for a retry that never happens
+    // (the secondary horizon above is armed either way — the next CALL's waitBucket honours it)
+    if (attempt < ctx.cfg.rest.attemptCap - 1) await ctx.sleep(waitMs);
   }
   throw new BenchHttpError("attempts-exhausted", `REST attempts exhausted for ${opts.endpoint}`, 0, { lastClassification: lastClass, requestClass: opts.requestClass });
 }
@@ -285,6 +292,11 @@ export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, u
       const pathWellFormed = Array.isArray(pathRaw) && pathRaw.every((p) => typeof p === "string" || typeof p === "number");
       if (pathRaw !== undefined && !pathWellFormed) malformedErrorEntries++;
       const path = pathWellFormed ? (pathRaw as Array<string | number>) : null;
+      // a PRESENT-but-wrong-typed type or message is malformed EVIDENCE, exactly as production's
+      // envelope parser treats it — sanitizing it to null and proceeding accepted (e.g. routed a
+      // TIMEOUT with an object-valued message through the split path) what production rejects
+      if (eo["type"] !== undefined && typeof eo["type"] !== "string") malformedErrorEntries++;
+      if (eo["message"] !== undefined && eo["message"] !== null && typeof eo["message"] !== "string") malformedErrorEntries++;
       const type = typeof eo["type"] === "string" ? (eo["type"] as string) : null;
       const message = typeof eo["message"] === "string" ? (eo["message"] as string) : null;
       if (type === null && message === null && path === null) {
@@ -323,9 +335,17 @@ export async function benchGraphqlDispatch(
   const rl = full.data?.["rateLimit"];
   if (typeof rl === "object" && rl !== null && !Array.isArray(rl)) {
     const cost = (rl as Record<string, unknown>)["cost"];
-    if (typeof cost === "number" && Number.isSafeInteger(cost) && cost >= 0) pointsCost = cost;
+    // the frozen accounting floor is ONE point per attempt (§4.6 item 2 imputes 1 where no
+    // cost is readable, and §4.8 calls the 1-point minimum a floor): a reported cost below the
+    // floor is treated as unreadable and imputed, never accepted — a 0 in expectedGraphql
+    // would let the run's own 1-point consumption read as R3 foreign interference
+    if (typeof cost === "number" && Number.isSafeInteger(cost) && cost >= 1) pointsCost = cost;
   }
-  const signal: SecondarySignalKind | null = rateLimited
+  // PRIMARY exhaustion is not a secondary-limit signal: G4's classifier counts attributable
+  // secondary signals, and recording a RATE_LIMITED body that classification already keyed as
+  // primary (remaining 0) would let two primary exhaustions manufacture a permanent G4 fail —
+  // the same remaining-0 exclusion detectRestSecondarySignal applies on the REST side
+  const signal: SecondarySignalKind | null = rateLimited && cls.kind !== "primary"
     ? "graphql-rate-limited"
     : detectRestSecondarySignal(parsed.status, parsed.headers, parsed.body);
   ctx.record({

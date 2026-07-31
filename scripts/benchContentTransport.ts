@@ -17,6 +17,9 @@
 //
 // Artifacts land in docs/adrs/0001-benchmark/. The pinning cache lives under ./data (a §0
 // write root, git-ignored) so re-runs are cheap; bench run dirs live under a pa-bench-* root.
+// NB a hard interrupt (SIGKILL, power loss) can strand a pa-bench-* root — nothing sweeps
+// them (the production sweep deliberately targets pkg-audit-* only); stale ones are safe to
+// delete by hand.
 
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -42,13 +45,13 @@ import {
 } from "./benchWorkload.ts";
 import { classifyFile } from "./cliScanner.ts";
 import { parseLsTreeZ, type LsTreeEntry } from "./benchFrame.ts";
-import { BatchChild, runBenchGit, type BenchSpawnRecord } from "./benchSpawn.ts";
-import { benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuckets, readRateLimit, type BenchGhContext } from "./benchGh.ts";
+import { BatchChild, BenchSpawnError, runBenchGit, type BenchSpawnRecord } from "./benchSpawn.ts";
+import { BenchHttpError, benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuckets, readRateLimit, type BenchGhContext } from "./benchGh.ts";
 import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts";
 import {
   BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, planSegments,
 } from "./benchProtocol.ts";
-import { acquireStore, describeDisposal, disposalIsClean, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
+import { UnitFailure, acquireStore, describeDisposal, disposalIsClean, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
 import { noiseBandFrom } from "./benchConfig.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -862,8 +865,9 @@ async function acquisitionDiagnostics(rt: PinRuntime, corpus: Corpus, workloads:
 }
 
 // ---- engine construction ---------------------------------------------------------------------
-async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<string, UnitWorkload>): Promise<{ engine: BenchEngine; benchRoot: string }> {
+async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<string, UnitWorkload>, frozenSurfaceDigest: string | null): Promise<{ engine: BenchEngine; benchRoot: string }> {
   const benchRoot = mkdtempSync(join(realpathSync(tmpdir()), cfg.protocol.tempPrefix));
+  try {
   const metaClient = new GithubClient({ githubHost: cfg.githubHost, db: null, tempRoot: benchRoot });
   const login = loginFromUserPayload(await metaClient.restGetJson("user"));
   const harnessCommit = harnessCommitFromGitResult(await runBenchGit({
@@ -882,11 +886,18 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
     cfg, corpus, workloads, benchRoot, artifactsDir: ARTIFACTS,
     runCacheDir: join(REPO_ROOT, "data", "bench-run-caches"),
     runsLog,
+    frozenSurfaceDigest,
     client: metaClient,
     makeClient: (db) => new GithubClient({ githubHost: cfg.githubHost, db, tempRoot: benchRoot }),
     log,
   });
   return { engine, benchRoot };
+  } catch (e) {
+    // construction failed before the caller could own benchRoot — reclaim it here or the
+    // temp root (pa-bench-*, which nothing sweeps) leaks on every failed startup
+    rmSync(benchRoot, { recursive: true, force: true });
+    throw e;
+  }
 }
 
 function loadPinned(): { cfg: BenchConfig; corpus: Corpus; workloads: Map<string, UnitWorkload> } {
@@ -989,7 +1000,8 @@ function findUnitIn(corpus: Corpus, unitId: string): { slot: PerformanceSlot } {
 
 async function cmdPilot(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
-  const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
+  // the pilot runs BEFORE ratification exists, so its rows carry no frozen-surface digest
+  const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads, null);
   try {
     const { walls, spread } = await engine.runPilot(0);
     const band = noiseBandFrom(cfg, spread);
@@ -1063,8 +1075,6 @@ async function cmdFidelity(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
   // gate-relevant evidence rides the SAME §8 freeze gate as the matrix (codex R2 f.8)
   const { digest } = await assertRatifiedAndFrozen();
-  const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
-  void engine;
   const rt = makePinRuntime(cfg);
   // Gate-relevant fidelity evidence must come off the WIRE, never from the persistent pinning
   // cache: an immutable cache hit would let a stale or corrupted local bench-pin-cache row
@@ -1244,9 +1254,14 @@ async function cmdFidelity(): Promise<void> {
     // a HARNESS fault (never a divergence) aborts the battery: record which (fixture, driver)
     // was in flight so the ≤1 rerun allowance is countable across invocations. Best-effort —
     // the abort itself must still propagate even if the marker append fails.
-    if (e instanceof BenchOperationalError && inFlight !== null) {
+    // the transient/operational WHITELIST: harness faults and transport-layer aborts, none of
+    // which is a fidelity observation. BenchHttpError (e.g. a no-response exhaustion in the T0
+    // battery read) previously escaped unmarked, so re-invocations were uncountable against
+    // §4.2's ≤1 external-rerun discipline.
+    const operationalAbort = e instanceof BenchOperationalError || e instanceof BenchHttpError || e instanceof BenchSpawnError || e instanceof UnitFailure;
+    if (operationalAbort && inFlight !== null) {
       try {
-        appendFileSync(fidelityLogPath, `${JSON.stringify({ type: "fidelity-operational-abort", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: e.message.slice(0, 300) })}\n`);
+        appendFileSync(fidelityLogPath, `${JSON.stringify({ type: "fidelity-operational-abort", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: inFlight.fixture, driver: inFlight.driver, reason: (e instanceof Error ? e.message : String(e)).slice(0, 300) })}\n`);
       } catch {
         log("WARNING: could not append the operational-abort marker to fidelity.jsonl");
       }
@@ -1254,7 +1269,6 @@ async function cmdFidelity(): Promise<void> {
     throw e;
   } finally {
     rmSync(rt.benchRoot, { recursive: true, force: true });
-    rmSync(benchRoot, { recursive: true, force: true });
   }
 }
 
@@ -1283,6 +1297,11 @@ export interface ResumeState {
   // pos → unit|driver: a rerunnable unit-failure whose MANDATED in-slot R1/R2 replay (§4.5)
   // never landed a row — the traversal owes it, it is not terminal
   owedReplays: Map<number, string>;
+  // pos set whose LAST row is an R3/R4 invalidation: the in-slot replay §4.5 mandates is still
+  // owed, and the caller must dispatch it AS an r3r4 replay so its record carries the
+  // physical-predecessor bookkeeping ("a replay's physical predecessor is the failed attempt
+  // itself — recorded as such") — a resumed re-execution previously ran unmarked
+  owedInSlotReplays: Set<number>;
   // non-null when the log's FINAL event is a run row whose washout marker never landed: the
   // washout was interrupted, and the caller COMPLETES it (sleep, then append the marker)
   // before executing anything — §4.5's separation is satisfied without re-running a transport
@@ -1325,7 +1344,7 @@ const RESUME_OUTCOMES = new Set([
 //     repair — resume REFUSES rather than quietly executing a third attempt past that halt.
 export function reconstructResumeState(
   lines: readonly string[],
-  currentCommit: string,
+  currentDigest: string,
   currentEnvHash: string,
   schedule: ReadonlyMap<number, ScheduleRowIdentity>,
 ): ResumeState {
@@ -1356,10 +1375,13 @@ export function reconstructResumeState(
       continue;
     }
     if (rec["type"] !== "run" || rec["phase"] !== "matrix") continue;
-    // resume only trusts records from THIS frozen harness revision — rows from another
-    // revision/machine must not silently mix into one traversal (codex R2 f.21)
-    if (rec["harnessCommit"] !== currentCommit)
-      throw new Error(`REFUSING to resume: runs.jsonl carries matrix rows from harness ${String(rec["harnessCommit"]).slice(0, 12)} != current ${currentCommit.slice(0, 12)} — a re-ratified matrix starts a fresh log`);
+    // resume only trusts records from THIS frozen measurement surface — rows from another
+    // surface/machine must not silently mix into one traversal (codex R2 f.21). The binding is
+    // the §8 CONTENT digest, not the commit: an evidence-only or test-only commit moves HEAD
+    // without changing the frozen surface, and must not orphan every prior row (the commit
+    // stays stamped per row as provenance).
+    if (rec["frozenSurfaceDigest"] !== currentDigest)
+      throw new Error(`REFUSING to resume: runs.jsonl carries matrix rows from frozen surface ${String(rec["frozenSurfaceDigest"]).slice(0, 12)} != current ${currentDigest.slice(0, 12)} — a changed measurement surface restarts the matrix (§8)`);
     // one machine, one network, one credential for ALL timed data (§8) — a foreign
     // environment's rows must never mix into this traversal (codex R3 f.2)
     if (rec["envManifestHash"] !== currentEnvHash)
@@ -1423,13 +1445,27 @@ export function reconstructResumeState(
 
   const terminalPos = new Set<number>();
   const owedReplays = new Map<number, string>();
+  const owedInSlotReplays = new Set<number>();
   for (const [pos, rows] of rowsAtPos) {
+    // a SECOND invalidated-finalisation at one position means the post-run accounting read is
+    // failing persistently — an unbounded silent retry class; the operator investigates
+    const finalisationFailures = rows.filter((r) => r["outcome"] === "invalidated-finalisation").length;
+    if (finalisationFailures >= 2)
+      throw new Error(`REFUSING to resume: pos ${pos} carries ${finalisationFailures} invalidated-finalisation rows — the post-run accounting is failing persistently; investigate before re-running`);
     const last = rows[rows.length - 1]!;
     const outcome = last["outcome"] as string;
-    if (outcome !== "complete" && outcome !== "unit-failure") continue; // invalidated/drift rows never terminalize
+    if (outcome === "invalidated-straddle" || outcome === "invalidated-foreign") {
+      // the §4.5 in-slot replay is owed AND must carry its replay bookkeeping when dispatched
+      owedInSlotReplays.add(pos);
+      continue;
+    }
+    if (outcome !== "complete" && outcome !== "unit-failure") continue; // finalisation/drift rows never terminalize
     const unit = last["unit"] as string;
     if (driftedUnits.has(unit) && last["epilogue"] !== true) continue; // discarded main reps; the epilogue re-runs them (f.4)
-    if (outcome === "unit-failure" && !driftedUnits.has(unit)) {
+    // the owed-replay reconstruction applies to EPILOGUE failures of drifted units too — an
+    // interrupt during an epilogue R1/R2 replay must not forfeit it (the ledger already keeps
+    // only the drifted unit's epilogue evidence)
+    if (outcome === "unit-failure" && (!driftedUnits.has(unit) || last["epilogue"] === true)) {
       const key = `${unit}|${last["driver"] as string}`;
       if (!rerunUsed.has(key) && evidenceIsRerunnable(last["failureEvidence"], key, ledgerBefore(pos))) {
         owedReplays.set(pos, key);
@@ -1438,14 +1474,14 @@ export function reconstructResumeState(
     }
     terminalPos.add(pos);
   }
-  return { terminalPos, rerunUsed, straddled, successLedger, driftedUnits, resumeForms, owedReplays, owedWashout };
+  return { terminalPos, rerunUsed, straddled, successLedger, driftedUnits, resumeForms, owedReplays, owedInSlotReplays, owedWashout };
 }
 
 async function cmdMatrix(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
   if (cfg.schedule === null) throw new Error("REFUSING: bench-config.json carries no pinned schedule (run pin-corpus first)");
-  await assertRatifiedAndFrozen();
-  const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads);
+  const { digest } = await assertRatifiedAndFrozen();
+  const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads, digest);
   try {
     const runsPath = join(ARTIFACTS, "runs.jsonl");
     let terminalPos = new Set<number>();
@@ -1454,15 +1490,16 @@ async function cmdMatrix(): Promise<void> {
     let successLedger = new Set<string>();
     let driftedUnits = new Set<string>();
     let owedReplays = new Map<number, string>();
+    let owedInSlotReplays = new Set<number>();
     if (existsSync(runsPath)) {
       const scheduleByPos = new Map(cfg.schedule.rows.map((r) => [r.pos, { unit: r.unit, driver: r.driver, rep: r.rep, probe: r.probe }]));
       const state = reconstructResumeState(
         readFileSync(runsPath, "utf8").split("\n"),
-        engine.harnessCommit(),
+        digest,
         engine.envManifestHashValue(),
         scheduleByPos,
       );
-      ({ terminalPos, rerunUsed, straddled, successLedger, driftedUnits, owedReplays } = state);
+      ({ terminalPos, rerunUsed, straddled, successLedger, driftedUnits, owedReplays, owedInSlotReplays } = state);
       if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
       if (owedReplays.size > 0) log(`resuming: ${owedReplays.size} owed R1/R2 replay(s) reconstructed from the log`);
       engine.restoreUnitForms(state.resumeForms);
@@ -1483,7 +1520,14 @@ async function cmdMatrix(): Promise<void> {
       for (const row of rows) {
         if (terminalPos.has(row.pos) && phaseNote === "main") continue;
         if (driftedUnits.has(row.unit) && phaseNote === "main") continue; // discarded reps; the epilogue re-runs the whole unit
-        const owedKey = phaseNote === "main" ? owedReplays.get(row.pos) : undefined;
+        if (owedInSlotReplays.has(row.pos)) {
+          // the pre-interrupt traversal's R3/R4 in-slot replay: dispatch it WITH its replay
+          // bookkeeping so the record names its physical predecessor (§4.5)
+          owedInSlotReplays.delete(row.pos);
+          engine.setReplayOf(row.pos, "r3r4");
+          log(`resuming the owed in-slot (R3/R4) replay at pos ${row.pos}`);
+        }
+        const owedKey = owedReplays.get(row.pos);
         if (owedKey !== undefined) {
           // the pre-interrupt traversal decided this R1/R2 replay (§4.5's evaluated-at-failure-
           // time predicate, reconstructed identically by reconstructResumeState) — execute it
@@ -1516,6 +1560,10 @@ async function cmdMatrix(): Promise<void> {
           if (handle.record.outcome === "drift-restart") {
             log(`R6 branch arm: ${row.unit} drifted — unit restarts on the scaffolding form in the epilogue`);
             driftedUnits.add(row.unit);
+            // §4.4 discards the unit's collected reps — including their SUCCESS-LEDGER evidence:
+            // a later epilogue R2 decision must not cite a discarded rep (resume filters these
+            // out; the live set must agree or live and resumed traversals diverge)
+            for (const k of [...successLedger]) if (k.startsWith(`${row.unit}|`)) successLedger.delete(k);
             // drift discovered at RUNTIME — possibly after resume restored earlier reps of this
             // unit as terminal. §4.4 discards the unit's collected reps and restarts the WHOLE
             // unit (medians never mix acquisition forms), so those restored positions must not

@@ -14,7 +14,7 @@ import {
 import { InlineDiskSampler, WorkerDiskSampler, parseDiskWalkReply } from "./benchDiskSampler.ts";
 import { parseDiskWalkRequest } from "./benchDiskWorker.ts";
 import { DiskWalkError, duBytes, duBytesStrict, extraBytesStrict } from "./benchDiskWalk.ts";
-import { parseRateLimitBucket, type BenchHttpAttemptRecord } from "./benchGh.ts";
+import { parseGraphqlBodyFull, parseRateLimitBucket, type BenchHttpAttemptRecord } from "./benchGh.ts";
 import { buildUnitWorkload, seamStringSha256, type WorkloadEntry } from "./benchWorkload.ts";
 import type { EntryDelivery } from "./benchDrivers.ts";
 
@@ -554,6 +554,17 @@ describe("summarizeSpawns — §4.6 item 5's git-side evidence reaches the recor
       rec({ exitCode: null }),
     ]);
     expect(s).toEqual({ total: 4, timedOut: 1, nonZeroExit: 2, neverSettled: 1, byLane: { transport: 3, scaffolding: 1 } });
+  });
+});
+
+describe("parseGraphqlBodyFull — present-but-wrong-typed members are malformed EVIDENCE", () => {
+  test("an object-valued message on a TIMEOUT error counts as malformed, like production", () => {
+    const r = parseGraphqlBodyFull(JSON.stringify({ data: {}, errors: [{ type: "TIMEOUT", message: { odd: true }, path: ["repository", "a0"] }] }));
+    expect(r.malformedErrorEntries).toBe(1);
+  });
+  test("a non-string type counts as malformed too; clean members do not", () => {
+    expect(parseGraphqlBodyFull(JSON.stringify({ data: {}, errors: [{ type: 42, message: "x" }] })).malformedErrorEntries).toBe(1);
+    expect(parseGraphqlBodyFull(JSON.stringify({ data: {}, errors: [{ type: "NOT_FOUND", message: "x", path: ["repository", "a1"] }] })).malformedErrorEntries).toBe(0);
   });
 });
 

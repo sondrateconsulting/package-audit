@@ -244,7 +244,7 @@ describe("loginFromUserPayload — the §8 credential identity cannot degrade to
 import { assertAppendOnlyPrefix, classifyFidelityLog, reconstructResumeState, evidenceIsRerunnable } from "./benchContentTransport.ts";
 
 describe("reconstructResumeState — resume must honour the frozen §4.5 discipline exactly", () => {
-  const COMMIT = "f".repeat(40);
+  const DIGEST = "f".repeat(64);
   const ENV_HASH = "abcd1234abcd1234";
   const UNIT = "C2:o/r@main";
   const KEY = `${UNIT}|T0`;
@@ -258,12 +258,12 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
       type: "run", schemaVersion: 1, phase: "matrix", pos, unit: UNIT, driver: "T0", rep: pos,
       probe: false, epilogue: false, outcome: "complete", failureEvidence: null, requests: {},
       acquisitionForm: null, replayKind: null, washoutAppliedMs: 60_000,
-      harnessCommit: COMMIT, envManifestHash: ENV_HASH,
+      harnessCommit: "c".repeat(40), frozenSurfaceDigest: DIGEST, envManifestHash: ENV_HASH,
       ...over,
     });
   };
   const marker = (pos: number): string => JSON.stringify({ type: "washout-done", phase: "matrix", pos });
-  const state = (lines: string[]) => reconstructResumeState(lines, COMMIT, ENV_HASH, SCHED);
+  const state = (lines: string[]) => reconstructResumeState(lines, DIGEST, ENV_HASH, SCHED);
   const R1_EVIDENCE = { kind: "http", code: "no-response", lastClassification: "no-response", requestClass: "rest-content" };
   const R2_EVIDENCE = { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-content" };
 
@@ -342,11 +342,44 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
   test("a corrupted evidence line REFUSES resume — a skipped line could hide a terminal halt row", () => {
     expect(() => state([runRow({ pos: 1 }), "{not json"])).toThrow(/corrupted/);
   });
-  test("halt-r5/re-pin rows, foreign commits, and foreign environments all refuse", () => {
+  test("halt-r5/re-pin rows, foreign surfaces, and foreign environments all refuse", () => {
     expect(() => state([runRow({ pos: 1, outcome: "halt-r5-breach" })])).toThrow(/freeze-repair/);
     expect(() => state([runRow({ pos: 1, outcome: "re-pin-required" })])).toThrow(/freeze-repair/);
-    expect(() => reconstructResumeState([runRow({ pos: 1 })], "0".repeat(40), ENV_HASH, SCHED)).toThrow(/REFUSING to resume/);
-    expect(() => reconstructResumeState([runRow({ pos: 1 })], COMMIT, "other-env", SCHED)).toThrow(/REFUSING to resume/);
+    expect(() => reconstructResumeState([runRow({ pos: 1 })], "0".repeat(64), ENV_HASH, SCHED)).toThrow(/changed measurement surface/);
+    expect(() => reconstructResumeState([runRow({ pos: 1 })], DIGEST, "other-env", SCHED)).toThrow(/REFUSING to resume/);
+  });
+  test("the binding is the frozen-surface DIGEST, never the commit — an evidence-only commit must not orphan rows", () => {
+    // rows carry a different harnessCommit (HEAD moved when the evidence log was committed)
+    // but the SAME digest — the frozen surface is unchanged and resume must accept them
+    const s = state([runRow({ pos: 1, harnessCommit: "d".repeat(40), requests: { "rest-content": 1 } }), marker(1)]);
+    expect(s.terminalPos.has(1)).toBe(true);
+  });
+  test("an R3/R4-invalidated last row owes its IN-SLOT replay with r3r4 bookkeeping", () => {
+    // a resumed re-execution previously ran unmarked, losing §4.5's physical-predecessor record
+    const s = state([runRow({ pos: 3, outcome: "invalidated-foreign" }), marker(3)]);
+    expect(s.owedInSlotReplays.has(3)).toBe(true);
+    expect(s.terminalPos.has(3)).toBe(false);
+    const straddle = state([runRow({ pos: 3, outcome: "invalidated-straddle" }), marker(3)]);
+    expect(straddle.owedInSlotReplays.has(3)).toBe(true);
+    expect(straddle.straddled.has(UNIT)).toBe(true);
+  });
+  test("a second invalidated-finalisation at one pos refuses — persistent accounting failure is not a silent retry loop", () => {
+    expect(() => state([
+      runRow({ pos: 4, outcome: "invalidated-finalisation" }), marker(4),
+      runRow({ pos: 4, outcome: "invalidated-finalisation" }), marker(4),
+    ])).toThrow(/failing persistently/);
+    // one is fine: re-run (unmarked as any §4.5 category — the accounting simply never landed)
+    const one = state([runRow({ pos: 4, outcome: "invalidated-finalisation" }), marker(4)]);
+    expect(one.terminalPos.has(4)).toBe(false);
+    expect(one.owedInSlotReplays.has(4)).toBe(false);
+  });
+  test("an epilogue R1/R2 failure of a DRIFTED unit is still owed its replay", () => {
+    const s = state([
+      runRow({ pos: 1, outcome: "drift-restart", acquisitionForm: "production" }), marker(1),
+      runRow({ pos: 2, outcome: "unit-failure", epilogue: true, acquisitionForm: "scaffolding", failureEvidence: R1_EVIDENCE }), marker(2),
+    ]);
+    expect(s.owedReplays.get(2)).toBe(KEY);
+    expect(s.terminalPos.has(2)).toBe(false);
   });
   test("drift bookkeeping: main rows of a drifted unit never terminalize; its form is scaffolding", () => {
     const s = state([

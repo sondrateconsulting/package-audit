@@ -144,17 +144,17 @@ export type BatchAnalysis =
   | { kind: "default-failure"; rawCondition: string } // the CLOSED default clause
   | { kind: "per-alias"; outcomes: AliasOutcome[]; conflicts: number[] };
 
+// STRICT attribution: the query's structure is exactly `repository.a<i>`, so only a path of
+// that shape names an alias. Scanning every segment for anything alias-shaped accepted
+// ["rateLimit","a0"] (a different subtree) and ["repository","a00"] (a DIFFERENT alias name —
+// leading zeros never occur in generated names) as alias 0, misrouting another alias's error.
+// Anything else is unattributable and takes the closed default via the caller's null branch.
 const aliasIndexFromPath = (path: ReadonlyArray<string | number> | null, aliasCount: number): number | null => {
-  if (path === null) return null;
-  for (const seg of path) {
-    if (typeof seg !== "string") continue;
-    const m = /^a(\d+)$/.exec(seg);
-    if (m !== null) {
-      const idx = Number(m[1]);
-      if (idx < aliasCount) return idx;
-    }
-  }
-  return null;
+  if (path === null || path.length < 2 || path[0] !== "repository" || typeof path[1] !== "string") return null;
+  const m = /^a(0|[1-9]\d*)$/.exec(path[1]);
+  if (m === null) return null;
+  const idx = Number(m[1]);
+  return idx < aliasCount ? idx : null;
 };
 
 export function analyzeBatchResponse(
@@ -199,19 +199,27 @@ export function analyzeBatchResponse(
   if (d.status !== 200)
     return { kind: "default-failure", rawCondition: `unhandled HTTP ${d.status} (classification ${d.classification})` };
 
-  // pathless / unattributable errors: TIMEOUT-shaped → the split path; anything else → the
-  // closed default clause (whole-batch attempt failure), even beside readable data.
+  // pathless / unattributable errors: collected FIRST, then classified as a set — returning on
+  // the first member made the verdict order-dependent, so a recognized TIMEOUT could mask a
+  // forbidden sibling that the closed default exists to catch (the same complete-set rule the
+  // per-alias branch applies, codex R2 finding 12).
   const aliasCount = batch.entries.length;
   const attributed = new Map<number, Array<{ type: string | null; message: string | null }>>();
+  const pathless: Array<{ type: string | null; message: string | null }> = [];
   for (const e of d.errors) {
     const idx = aliasIndexFromPath(e.path, aliasCount);
     if (idx === null) {
-      if (isTimeoutError(e)) return { kind: "batch-timeout" };
-      return { kind: "default-failure", rawCondition: `pathless/batch-global error ${e.type ?? "?"}: ${(e.message ?? "").slice(0, 200)}` };
+      pathless.push({ type: e.type, message: e.message });
+      continue;
     }
     const list = attributed.get(idx) ?? [];
     list.push({ type: e.type, message: e.message });
     attributed.set(idx, list);
+  }
+  if (pathless.length > 0) {
+    if (pathless.every(isTimeoutError)) return { kind: "batch-timeout" };
+    const first = pathless.find((e) => !isTimeoutError(e))!;
+    return { kind: "default-failure", rawCondition: `pathless/batch-global error ${first.type ?? "?"}: ${(first.message ?? "").slice(0, 200)}` };
   }
 
   const repo = d.data?.["repository"];

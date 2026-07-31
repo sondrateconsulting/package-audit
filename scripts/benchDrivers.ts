@@ -114,9 +114,11 @@ export interface DriverRunContext {
   spawnObserver: BenchSpawnObserver;
   acquisitionForm: AcquisitionForm;
   fallbackBudget: number;
-  // live progress mirror the ENGINE reads when the driver throws — fallback spend and delivered
-  // routes survive a unit failure instead of flattening to zero (codex R3 f.9)
-  liveState?: { fallbackSpend: number; routesDelivered: Record<string, number> };
+  // live progress mirror the ENGINE reads when the driver throws — fallback spend, delivered
+  // routes, and the acquired clone dir survive a unit failure instead of flattening to
+  // zero/null (codex R3 f.9; the cloneDir addition lets a post-acquisition failure still
+  // measure the store it actually cloned)
+  liveState?: { fallbackSpend: number; routesDelivered: Record<string, number>; cloneDir?: string | null; t1Conflicts?: number; t1BodyTimeouts?: number };
   // §4.8 segmented mode (per-file REST shapes only): the read loop is chunked into the pinned
   // segment sizes and the engine's gate runs BETWEEN segments (clock paused, bucket re-reserved,
   // per-segment deltas summed). Absent = single-segment run.
@@ -174,12 +176,15 @@ async function restRead(ctx: DriverRunContext, st: RunState, entry: WorkloadEntr
   deliver(st, { path: entry.path, route, delivered: body, rawVerified: null });
 }
 
-// The SHA-pinned-context classifier (§4.4): probe the pinned object itself.
+// The SHA-pinned-context classifier (§4.4): probe the pinned object itself. This is a
+// CONSUMING core request the §4.8 worst case reserves explicitly ("one SHA-classifier
+// attempt-loop allowance") — its class must count as driver traffic, or its own consumption
+// reads as R3 foreign interference (it was previously labeled rest-meta and excluded).
 async function classifyPinnedObjectAbsence(ctx: DriverRunContext, what: string): Promise<void> {
   try {
     await benchRestGet(ctx.gh, {
       endpoint: `repos/${encodeURIComponent(ctx.slot.owner)}/${encodeURIComponent(ctx.slot.repo)}/commits/${encodeURIComponent(ctx.unit.sha)}`,
-      requestClass: "rest-meta",
+      requestClass: "rest-classifier",
     });
   } catch (e) {
     if (e instanceof BenchHttpError && e.status === 404)
@@ -335,6 +340,7 @@ async function fetchRestTree(ctx: DriverRunContext, st: RunState): Promise<{ tru
 // tree (route truncated-tree-checkout, the declared-caveat route).
 async function runTruncatedCheckout(ctx: DriverRunContext, st: RunState): Promise<string> {
   const { dir } = await acquireStore(ctx, { checkout: true });
+  if (st.live !== undefined) st.live.cloneDir = dir;
   for (const entry of ctx.workload.entries) {
     if (!entry.read) continue;
     readCheckoutDelivery(ctx, dir, st, entry, "truncated-tree-checkout");
@@ -449,7 +455,10 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
         consecutive5xx = analysis.fivexxSplitCandidate ? consecutive5xx + 1 : 0;
         if (fivexxSplitConditionMet(batch, consecutive5xx, ctx.cfg) && canSplit(item)) enqueueSplit(item);
         else {
-          if (retryRemains) await ctx.gh.sleep(ctx.cfg.rest.transientBaseWaitMs * 2 ** Math.min(attempts, 5));
+          // zero-based like production's backoffWait (github.ts): `attempts` was already
+          // incremented for THIS dispatch, so 2**attempts doubled every wait relative to the
+          // production design T1 is supposed to reproduce — pure scored-wall inflation
+          if (retryRemains) await ctx.gh.sleep(ctx.cfg.rest.transientBaseWaitMs * 2 ** Math.min(attempts - 1, 5));
           queue.unshift(item); // bounded transient retry — never split on first failure
         }
         continue;
@@ -457,11 +466,16 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
       consecutive5xx = 0;
       if (analysis.kind === "throttle-retry") {
         failedDispatch(null, `throttle ${analysis.cause}`);
-        if (analysis.cause !== "primary" && retryRemains) await ctx.gh.sleep(ctx.cfg.rest.secondaryBaseWaitMs);
-        queue.unshift(item); // primary pauses are armed on the bucket; the next dispatch waits
+        // NO explicit sleep for any throttle cause: benchGraphqlDispatch already armed the
+        // bucket horizon (Retry-After when given, the secondary base otherwise), and the next
+        // dispatch's waitBucket honours exactly that — production's lease discipline. A fixed
+        // sleep HERE double-waited on top of the horizon and overrode a short Retry-After
+        // (e.g. 1 s) with the full 60 s base, inflating T1's scored wall.
+        queue.unshift(item);
         continue;
       }
       if (analysis.kind === "batch-timeout") {
+        if (st.live?.t1BodyTimeouts !== undefined) st.live.t1BodyTimeouts += 1;
         failedDispatch(null, "batch-timeout");
         if (item.entries.length === 1) await toFallback(item.entries, "timeout-singleton");
         else if (canSplit(item)) enqueueSplit(item);
@@ -477,6 +491,12 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
       }
       // per-alias
       consecutiveFailedDispatches = 0;
+      // §4.4's "the conflict recorded" and the alias-timeout events were computed by the
+      // analyzer and then dropped here — they now land in the run record via the live mirror
+      if (st.live !== undefined) {
+        st.live.t1Conflicts = (st.live.t1Conflicts ?? 0) + analysis.conflicts.length;
+        st.live.t1BodyTimeouts = (st.live.t1BodyTimeouts ?? 0) + analysis.outcomes.filter((o) => o.kind === "timeout").length;
+      }
       const timeouts: WorkloadEntry[] = [];
       const unattributed: WorkloadEntry[] = [];
       for (const outcome of analysis.outcomes) {
@@ -539,6 +559,7 @@ export async function runT2a(ctx: DriverRunContext): Promise<DriverRunOutcome> {
     return { deliveries: st.deliveries, fallbackSpend: st.fallbackSpend, httpBodyBytes: st.httpBodyBytes, acquiredPaths: st.acquiredPaths, cloneDir: null, acquisitionForm: null };
   }
   const { dir, headRev } = await acquireStore(ctx, { checkout: true });
+  if (st.live !== undefined) st.live.cloneDir = dir;
   const lsIndex = await enumerateStore(ctx, dir, headRev);
   for (const entry of ctx.workload.entries) {
     if (!entry.read) continue;
@@ -559,6 +580,7 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
   const st: RunState = { deliveries: [], fallbackSpend: 0, httpBodyBytes: 0, acquiredPaths: new Set(), live: ctx.liveState };
   pushNoReads(ctx, st);
   const { dir, headRev } = await acquireStore(ctx, { checkout: false });
+  if (st.live !== undefined) st.live.cloneDir = dir;
   const lsIndex = await enumerateStore(ctx, dir, headRev);
   const holder: { child: BatchChild | null; release: (() => void) | null } = { child: null, release: null };
   let respawns = 0;
@@ -603,7 +625,15 @@ export async function runT2c(ctx: DriverRunContext, childPool: { acquire(): Prom
         respawns++;
         firstDisposal = (await holder.child?.dispose()) ?? null;
         holder.child = null;
-        frame = await (await ensureChild()).readObject({ oid: ls.oid, size: ls.size });
+        try {
+          frame = await (await ensureChild()).readObject({ oid: ls.oid, size: ls.size });
+        } catch (e2) {
+          // an immediately-failing REPLACEMENT is the same double death — without this wrap the
+          // raw second error escaped the catch block and the FIRST child's retained diagnosis
+          // (its poisoned condition + git's own stderr) was discarded on exactly the path it
+          // matters most
+          throw new UnitFailure(`batch child died twice: ${e2 instanceof Error ? e2.message : String(e2)}${firstDisposal === null ? "" : ` — first child: ${describeDisposal(firstDisposal)}`}`);
+        }
       }
       if (frame.kind === "missing")
         throw new UnitFailure(`object-store corruption: ${entry.path}'s enumerated oid is missing from the acquired store`);

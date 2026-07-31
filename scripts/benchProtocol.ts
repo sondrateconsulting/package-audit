@@ -318,9 +318,16 @@ export interface RunRecord {
   // §4.6 item 5 evidence for the GIT side (the HTTP side rides `attempts`): spawn counts by
   // lane, timeouts, non-zero exits, and children that never settled
   spawns: SpawnStats;
+  // §4.4's "the conflict recorded" and the timed-out-then-split aliases were computed by the
+  // analyzer and then discarded — these counters make both durable per run
+  t1Conflicts: number;
+  t1BodyTimeouts: number;
   washoutAppliedMs: number;
   envManifestHash: string;
-  harnessCommit: string;
+  harnessCommit: string; // per-row provenance stamp (§8); the CONTENT binding is the digest below
+  // the §8 frozen-surface digest this row was produced under — resume's content binding: an
+  // evidence-only or test-only commit moves HEAD but not the digest, and must not orphan rows
+  frozenSurfaceDigest: string | null;
 }
 
 // bounded detail retention for the record — counts stay exact, details are evidence samples
@@ -350,8 +357,13 @@ export class RunsLog {
   appendMarker(marker: Record<string, unknown>): void {
     appendFileSync(this.path, `${JSON.stringify(marker)}\n`);
   }
+  // The environment hash deliberately EXCLUDES harnessCommit: the §8 source binding is the
+  // frozen-surface digest (content-addressed), and folding the commit into this hash made an
+  // evidence-only or test-only commit — which changes HEAD but not the frozen surface — orphan
+  // every prior row on resume. The commit itself is still stamped per row as provenance.
   envManifestHash(): string {
-    return createHash("sha256").update(JSON.stringify(this.manifest)).digest("hex").slice(0, 16);
+    const { harnessCommit: _provenanceOnly, ...environment } = this.manifest;
+    return createHash("sha256").update(JSON.stringify(environment)).digest("hex").slice(0, 16);
   }
   writeManifestOnce(): void {
     appendFileSync(this.path, `${JSON.stringify({ type: "env-manifest", schemaVersion: 1, ...this.manifest, hash: this.envManifestHash() })}\n`);
@@ -487,6 +499,9 @@ export interface EngineOptions {
   // run, deleted at teardown. NEVER the production sqlite path.
   runCacheDir: string;
   runsLog: RunsLog;
+  // the §8 frozen-surface digest rows are stamped with (null before ratification — the pilot);
+  // resume binds matrix rows to THIS, not to the commit
+  frozenSurfaceDigest: string | null;
   client: GithubClient; // meta traffic (rate_limit, env manifest probes); drivers get their own per-run client
   makeClient: (db: AuditDb | null) => GithubClient;
   // seam for CI: the default samples disk off-thread, which a test cannot drive deterministically
@@ -656,117 +671,29 @@ export class BenchEngine {
       gitEnv: this.gitEnvFor(row.probe), spawnObserver: (r: BenchSpawnRecord) => spawnRecords.push(r),
     };
     const clonePathActive = needsClonePath && !(row.driver === "T2a" && workload.escapeTripped && !workload.truncatedTree);
-    if (clonePathActive) {
-      const frozen = this.unitForms.get(row.unit);
-      if (frozen === "scaffolding") {
-        form = "scaffolding"; // SHA-pinned form needs no live-head probe
-      } else {
-        const live = await probeLiveHead(probeCtx);
-        if (frozen === undefined) {
-          form = live === unit.sha ? "production" : "scaffolding";
-          this.unitForms.set(row.unit, form);
-          if (form === "scaffolding") this.o.log(`${row.unit}: live head drifted — all reps use the SHA-pinned scaffolding form`);
-        } else if (live !== unit.sha) {
-          // mid-unit drift under the frozen PRODUCTION form: discard reps, restart on the
-          // scaffolding form via the preregistered epilogue (§4.4/§4.5 R6 branch arm). This is
-          // part of the RECORDED lifecycle — a drift-restart record lands in runs.jsonl and the
-          // caller's loop routes it to the epilogue (codex R2 f.19).
-          this.unitForms.set(row.unit, "scaffolding");
-          const driftReclaimFailed = reclaimOnce();
-          const driftRecord: RunRecord = {
-            type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
-            probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: "production", startedAtIso: new Date(this.now()).toISOString(),
-            wallMs: 0, segments: 1, outcome: "drift-restart", failureCause: `live head ${live.slice(0, 12)} moved off the pinned SHA at the pre-rep probe`,
-            failureEvidence: null, requests: {}, attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
-            secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
-            bucketDeltas: { core: { valid: true, used: 0 }, graphql: { valid: true, used: 0 } },
-            bucketSnapshots: [],
-            // this attempt may BE a dispatched replay — its record must say so, and the pending
-            // replay state must reset here exactly as the normal tail resets it: leaving it set
-            // stamped replayKind:"r1r2" onto the NEXT unrelated row, whose resume scan then
-            // counted a different unit×driver's ≤1 allowance as spent
-            expectedConsumption: { core: 0, graphql: 0 }, replayOfPos: this.replayOfPos, replayKind: this.replayKind,
-            // reclaim BEFORE the record is built, so the flag reports what actually happened
-            // rather than asserting a teardown this path used to skip entirely
-            diskReclaimFailed: driftReclaimFailed,
-            probeDivergences: 0, httpBodyBytes: 0, cloneObjectStoreBytes: null,
-            diskSampledPeakBytes: 0, diskSamples: 0, diskSampleError: null, fallbackSpend: 0, routesDelivered: {},
-            g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
-            spawns: summarizeSpawns(spawnRecords), washoutAppliedMs: 0,
-            envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
-          };
-          this.o.runsLog.append(driftRecord);
-          this.replayOfPos = null;
-          this.replayKind = null;
-          // no washout is owed (the probe consumed no API traffic), but the marker-per-row
-          // invariant the resume scan enforces must hold for THIS row too
-          this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
-          return { outcome: null, verification: null, record: driftRecord };
-        } else {
-          form = "production";
-        }
-      }
-    }
 
-    const wc = computeWorstCase(row.driver, workload, cfg, { owner: slot.owner, repo: slot.repo });
-    wcRef.core = wc.core;
-    wcRef.graphql = wc.graphql;
-    // §4.8 feasibility: over-capacity WC runs execute in segmented mode (per-file REST shapes
-    // only); each segment satisfies the guard in its own bucket window, deltas sum, and the
-    // wall clock pauses between segments.
-    const segmentSizes = planSegments(row.driver, workload, cfg, { owner: slot.owner, repo: slot.repo });
-    const segmented = segmentSizes.length > 1;
+    // Everything the record tail needs is initialised BEFORE the classifying try below, so a
+    // failure in ANY pre-driver phase — the live-head probe, WC planning, the reservation, the
+    // before-snapshot — lands as a classified, durable run row exactly like a driver failure.
+    // These phases previously threw PAST the classifier: cmdMatrix died with no row at all,
+    // and every re-invocation retried the position freely with no evidence trail.
     // monotonic by default (see WallClock); an injected o.now keeps tests deterministic
     const wall = new WallClock(this.o.now !== undefined ? () => this.now() : () => performance.now());
     const segmentDeltas: Array<{ core: BucketDelta; graphql: BucketDelta }> = [];
     const bucketSnapshots: Array<{ before: RateLimitSnapshot; after: RateLimitSnapshot }> = [];
-    let segBefore: RateLimitSnapshot;
+    let segBefore: RateLimitSnapshot | null = null;
+    let segmentSizes: number[] = [0]; // planned inside the try; [0].length === 1 keeps `segments: 1` for pre-planning failures
     const segmentWc = (sizes: readonly number[], i: number): WorstCase => {
       const budget = restFallbackBudgetFor(cfg, workload.entries.length);
       return { core: ((sizes[i] ?? 0) + (i === 0 ? 1 : 0) + budget) * cfg.rest.attemptCap + cfg.rest.attemptCap + cfg.budget.fixedPerRunOverheadRequests, graphql: 0, plannedBatches: 0 };
     };
-    if (segmented) {
-      this.o.log(`${row.unit} ${row.driver}: WC exceeds bucket capacity — segmented mode, ${segmentSizes.length} segments (${segmentSizes.join(", ")})`);
-      await this.reserve(ghMeta, segmentWc(segmentSizes, 0));
-    } else {
-      await this.reserve(ghMeta, wc);
-    }
-    const before = await readRateLimit(ghMeta);
-    segBefore = before;
     const sampler: DiskSamplerPort = this.o.makeDiskSampler?.() ?? new WorkerDiskSampler();
     sampler.extraFiles([dbPath, `${dbPath}-wal`, `${dbPath}-shm`]); // the run's FULL footprint incl. cache sidecars (R2 f.29)
     sampler.start(runDir, cfg.protocol.diskSamplerHz);
-
     if (this.childPool.pool === null) this.childPool.pool = makeChildPool(cfg.frame.childPoolSize);
-    const liveState = { fallbackSpend: 0, routesDelivered: {} as Record<string, number> };
-    const ctx: DriverRunContext = {
-      cfg, slot, unit, workload, gh, benchRoot: this.o.benchRoot, runDir,
-      gitEnv: this.gitEnvFor(row.probe),
-      spawnObserver: (r) => spawnRecords.push(r),
-      acquisitionForm: form,
-      fallbackBudget: restFallbackBudgetFor(cfg, workload.entries.length),
-      liveState,
-      ...(segmented
-        ? {
-            segments: {
-              sizes: segmentSizes,
-              gate: async (nextSegmentIndex: number): Promise<void> => {
-                wall.pause(); // the clock pauses between segments (§4.8)
-                const segAfter = await readRateLimit(ghMeta);
-                bucketSnapshots.push({ before: segBefore, after: segAfter });
-                segmentDeltas.push({ core: bucketDelta(segBefore.core, segAfter.core), graphql: bucketDelta(segBefore.graphql, segAfter.graphql) });
-                await this.reserve(ghMeta, segmentWc(segmentSizes, nextSegmentIndex));
-                segBefore = await readRateLimit(ghMeta);
-                wall.start();
-              },
-            },
-          }
-        : {}),
-    };
-
+    const liveState = { fallbackSpend: 0, routesDelivered: {} as Record<string, number>, cloneDir: null as string | null, t1Conflicts: 0, t1BodyTimeouts: 0 };
     const startedAt = this.now();
     const startedAtIso = new Date(startedAt).toISOString();
-    wall.start();
     let outcome: DriverRunOutcome | null = null;
     let verification: VerificationReport | null = null;
     let runOutcome: RunRecord["outcome"] = "complete";
@@ -774,6 +701,98 @@ export class BenchEngine {
     let failureEvidence: RunRecord["failureEvidence"] = null;
     let r5: BenchProtocolError | null = null;
     try {
+      if (clonePathActive) {
+        const frozen = this.unitForms.get(row.unit);
+        if (frozen === "scaffolding") {
+          form = "scaffolding"; // SHA-pinned form needs no live-head probe
+        } else {
+          const live = await probeLiveHead(probeCtx);
+          if (frozen === undefined) {
+            form = live === unit.sha ? "production" : "scaffolding";
+            this.unitForms.set(row.unit, form);
+            if (form === "scaffolding") this.o.log(`${row.unit}: live head drifted — all reps use the SHA-pinned scaffolding form`);
+          } else if (live !== unit.sha) {
+            // mid-unit drift under the frozen PRODUCTION form: discard reps, restart on the
+            // scaffolding form via the preregistered epilogue (§4.4/§4.5 R6 branch arm). This is
+            // part of the RECORDED lifecycle — a drift-restart record lands in runs.jsonl and the
+            // caller's loop routes it to the epilogue (codex R2 f.19).
+            this.unitForms.set(row.unit, "scaffolding");
+            const driftReclaimFailed = reclaimOnce();
+            const driftRecord: RunRecord = {
+              type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+              probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: "production", startedAtIso: new Date(this.now()).toISOString(),
+              wallMs: 0, segments: 1, outcome: "drift-restart", failureCause: `live head ${live.slice(0, 12)} moved off the pinned SHA at the pre-rep probe`,
+              failureEvidence: null, requests: {}, attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
+              secondarySignals: 0, points: { measuredCostSum: 0, imputed: 0 },
+              bucketDeltas: { core: { valid: true, used: 0 }, graphql: { valid: true, used: 0 } },
+              bucketSnapshots: [],
+              // this attempt may BE a dispatched replay — its record must say so, and the pending
+              // replay state must reset here exactly as the normal tail resets it: leaving it set
+              // stamped replayKind:"r1r2" onto the NEXT unrelated row, whose resume scan then
+              // counted a different unit×driver's ≤1 allowance as spent
+              expectedConsumption: { core: 0, graphql: 0 }, replayOfPos: this.replayOfPos, replayKind: this.replayKind,
+              // reclaim BEFORE the record is built, so the flag reports what actually happened
+              // rather than asserting a teardown this path used to skip entirely
+              diskReclaimFailed: driftReclaimFailed,
+              probeDivergences: 0, httpBodyBytes: 0, cloneObjectStoreBytes: null,
+              diskSampledPeakBytes: 0, diskSamples: 0, diskSampleError: null, fallbackSpend: 0, routesDelivered: {},
+              g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
+              spawns: summarizeSpawns(spawnRecords), t1Conflicts: 0, t1BodyTimeouts: 0, washoutAppliedMs: 0,
+              envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
+              frozenSurfaceDigest: this.o.frozenSurfaceDigest,
+            };
+            this.o.runsLog.append(driftRecord);
+            this.replayOfPos = null;
+            this.replayKind = null;
+            // no washout is owed (the probe consumed no API traffic), but the marker-per-row
+            // invariant the resume scan enforces must hold for THIS row too
+            this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
+            return { outcome: null, verification: null, record: driftRecord };
+          } else {
+            form = "production";
+          }
+        }
+      }
+      const wc = computeWorstCase(row.driver, workload, cfg, { owner: slot.owner, repo: slot.repo });
+      wcRef.core = wc.core;
+      wcRef.graphql = wc.graphql;
+      // §4.8 feasibility: over-capacity WC runs execute in segmented mode (per-file REST shapes
+      // only); each segment satisfies the guard in its own bucket window, deltas sum, and the
+      // wall clock pauses between segments.
+      segmentSizes = planSegments(row.driver, workload, cfg, { owner: slot.owner, repo: slot.repo });
+      const segmented = segmentSizes.length > 1;
+      if (segmented) {
+        this.o.log(`${row.unit} ${row.driver}: WC exceeds bucket capacity — segmented mode, ${segmentSizes.length} segments (${segmentSizes.join(", ")})`);
+        await this.reserve(ghMeta, segmentWc(segmentSizes, 0));
+      } else {
+        await this.reserve(ghMeta, wc);
+      }
+      segBefore = await readRateLimit(ghMeta);
+      const ctx: DriverRunContext = {
+        cfg, slot, unit, workload, gh, benchRoot: this.o.benchRoot, runDir,
+        gitEnv: this.gitEnvFor(row.probe),
+        spawnObserver: (r) => spawnRecords.push(r),
+        acquisitionForm: form,
+        fallbackBudget: restFallbackBudgetFor(cfg, workload.entries.length),
+        liveState,
+        ...(segmented
+          ? {
+              segments: {
+                sizes: segmentSizes,
+                gate: async (nextSegmentIndex: number): Promise<void> => {
+                  wall.pause(); // the clock pauses between segments (§4.8)
+                  const segAfter = await readRateLimit(ghMeta);
+                  bucketSnapshots.push({ before: segBefore!, after: segAfter });
+                  segmentDeltas.push({ core: bucketDelta(segBefore!.core, segAfter.core), graphql: bucketDelta(segBefore!.graphql, segAfter.graphql) });
+                  await this.reserve(ghMeta, segmentWc(segmentSizes, nextSegmentIndex));
+                  segBefore = await readRateLimit(ghMeta);
+                  wall.start();
+                },
+              },
+            }
+          : {}),
+      };
+      wall.start();
       outcome = await runDriver(row.driver, ctx, this.childPool.pool);
     } catch (e) {
       if (e instanceof DriftSignal) {
@@ -833,8 +852,9 @@ export class BenchEngine {
         diskSampleError: "not sampled: R5 halt records before any fallible post-run work",
         fallbackSpend: liveState.fallbackSpend, routesDelivered: liveState.routesDelivered,
         g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
-        spawns: summarizeSpawns(spawnRecords), washoutAppliedMs: 0,
+        spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts, t1BodyTimeouts: liveState.t1BodyTimeouts, washoutAppliedMs: 0,
         envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
+        frozenSurfaceDigest: this.o.frozenSurfaceDigest,
       };
       try {
         this.o.runsLog.append(r5record);
@@ -852,9 +872,15 @@ export class BenchEngine {
     // synchronous reclamation, so stopping at the last resolved entry would structurally favour
     // clone drivers). It does not license charging INSTRUMENTATION to the same clock, so the
     // disk snapshot is taken with the wall paused — see finishMeasuredRun.
+    // cloneObjectStoreBytes measures the OBJECT STORE (.git/objects), not all of .git — the
+    // index/refs/logs would tax T2a (whose checkout builds a full index) against T2c's
+    // --no-checkout store, a driver-correlated mislabel of §4.6 item 3's metric. The dir comes
+    // from the outcome OR the live mirror, so a post-acquisition failure still measures the
+    // store it actually cloned instead of recording a null indistinguishable from no-clone.
+    const measuredCloneDir = outcome?.cloneDir ?? liveState.cloneDir;
     const finished = await finishMeasuredRun({
       wall,
-      sampler: { finish: () => sampler.finish(runDir, outcome?.cloneDir != null ? join(outcome.cloneDir, ".git") : null) },
+      sampler: { finish: () => sampler.finish(runDir, measuredCloneDir != null ? join(measuredCloneDir, ".git", "objects") : null) },
       reclaim: reclaimOnce,
     });
     const cloneObjectStoreBytes = finished.disk.cloneObjectStoreBytes;
@@ -898,8 +924,9 @@ export class BenchEngine {
           fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
           routesDelivered: liveState.routesDelivered,
           g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
-          spawns: summarizeSpawns(spawnRecords), washoutAppliedMs: 0,
+          spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts, t1BodyTimeouts: liveState.t1BodyTimeouts, washoutAppliedMs: 0,
           envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
+          frozenSurfaceDigest: this.o.frozenSurfaceDigest,
         });
         throw e;
       }
@@ -909,7 +936,7 @@ export class BenchEngine {
 
     // per-segment same-window deltas, summed by construction (§4.6 item 2); the final (or only)
     // segment closes against the post-run snapshot. Any straddled segment invalidates the run.
-    if (after !== null) {
+    if (after !== null && segBefore !== null) {
       bucketSnapshots.push({ before: segBefore, after });
       segmentDeltas.push({ core: bucketDelta(segBefore.core, after.core), graphql: bucketDelta(segBefore.graphql, after.graphql) });
     }
@@ -990,9 +1017,12 @@ export class BenchEngine {
       g2Details: verification?.g2Failures.slice(0, DETAIL_CAP) ?? [],
       probeDivergenceDetails: verification?.probeDivergences.slice(0, DETAIL_CAP) ?? [],
       spawns: summarizeSpawns(spawnRecords),
+      t1Conflicts: liveState.t1Conflicts,
+      t1BodyTimeouts: liveState.t1BodyTimeouts,
       washoutAppliedMs,
       envManifestHash: this.manifestHash,
       harnessCommit: this.o.runsLog.manifest.harnessCommit,
+      frozenSurfaceDigest: this.o.frozenSurfaceDigest,
     };
     this.o.runsLog.append(record);
     // degraded disk fields must reach the operator, not just the raw row: a silent null here
