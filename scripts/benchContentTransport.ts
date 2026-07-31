@@ -198,7 +198,20 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
     });
     if (show.exitCode !== 0)
       throw new Error(`REFUSING: ${gitFailure(`git show HEAD:${rel}`, show)} — the committed evidence baseline is unreadable, so the append-only claim cannot be verified (§8)`);
-    assertAppendOnlyPrefix(rel, show.stdout, readFileSync(abs));
+    const working = readFileSync(abs);
+    assertAppendOnlyPrefix(rel, show.stdout, working);
+    // the INDEX is a third copy a later plain `git commit` would persist: a staged REWRITE
+    // beside an appended working file passed the HEAD↔working check alone. The staged copy
+    // must itself extend HEAD and be a prefix of the working bytes (the chain HEAD ⊑ index ⊑
+    // working is exactly "only appends, everywhere").
+    const staged = await runBenchGit({
+      argv: ["show", `:${rel}`], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
+      benchRoot: repoRoot, cwd: repoRoot, limits: gitLimits,
+    });
+    if (staged.exitCode !== 0)
+      throw new Error(`REFUSING: ${gitFailure(`git show :${rel}`, staged)} — the staged copy of an evidence log is unreadable, so the append-only claim cannot be verified (§8)`);
+    assertAppendOnlyPrefix(`${rel} (staged)`, show.stdout, staged.stdout);
+    assertAppendOnlyPrefix(`${rel} (staged vs working)`, staged.stdout, working);
   }
   return { rat, digest };
 }
@@ -1183,7 +1196,10 @@ async function cmdFidelity(): Promise<void> {
             const lsEntries = classifyFidelityEnumeration(lsOut, fixture.objectFormat, { maxEntries: cfg.lsTree.maxEntries, maxRecordBytes: cfg.lsTree.maxRecordBytes });
             const liveEntry = lsEntries.find((e) => e.path === entry.path);
             if (liveEntry === undefined) {
-              route = "missing-from-live-enumeration";
+              // the store is coherence-asserted at the PINNED sha, so a pinned path absent from
+              // its own enumeration is a stale corpus pin — an artifact defect, never a byte-
+              // fidelity observation (the same channel rule as the oid/size staleness check)
+              throw new BenchOperationalError(`fixture ${fixture.kind} pins ${entry.path}, which is absent from the pinned tree's own enumeration — repair corpus.json, never record a verdict from it`);
             } else if (liveEntry.mode === "120000") {
               const res = await benchRestGet(fidelityGh, { endpoint: `repos/${encodeURIComponent(fixture.owner)}/${encodeURIComponent(fixture.repo)}/contents/${entry.path.split("/").map(encodeURIComponent).join("/")}?ref=${fixture.sha}`, accept: cfg.rest.rawAccept, immutable: true, requestClass: "rest-fallback" });
               delivered = res.body;
@@ -1192,6 +1208,12 @@ async function cmdFidelity(): Promise<void> {
               delivered = seamDecode(readFileSync(join(dir, entry.path)));
               route = "primary";
             } else {
+              // a stale fixture pin is a CORPUS-ARTIFACT defect, and a store that cannot serve
+              // (or mis-serves) an oid its own enumeration listed is the acquisition condition
+              // runT2c classifies as a UnitFailure — neither is a BYTE-fidelity observation, so
+              // neither may append a permanent pass:false row (the wrong §4.7 channel)
+              if (liveEntry.oid !== entry.oid || (liveEntry.size ?? 0) !== entry.size)
+                throw new BenchOperationalError(`fixture ${fixture.kind} pin is stale for ${entry.path} (live ${liveEntry.oid.slice(0, 12)}…/${String(liveEntry.size)} != pinned ${entry.oid.slice(0, 12)}…/${entry.size}) — repair corpus.json, never record a verdict from it`);
               const child = new BatchChild({
                 objectFormat: fixture.objectFormat, env: rt.gitEnv, cwd: dir, benchRoot: rt.benchRoot,
                 limits: { maxHeaderBytes: cfg.frame.maxHeaderBytes, frameCeiling: cfg.frame.frameCeilingBytes, stderrRingBytes: cfg.frame.stderrRingBytes, readDeadlineMs: cfg.frame.readDeadlineMs, disposeDeadlineMs: cfg.frame.disposeDeadlineMs },
@@ -1199,14 +1221,14 @@ async function cmdFidelity(): Promise<void> {
               });
               let fidelityThrown: Error | null = null;
               try {
-                const frame = await child.readObject({ oid: entry.oid, size: entry.size });
-                if (frame.kind === "content" && gitBlobOid(frame.body, fixture.objectFormat) === entry.oid) {
-                  delivered = seamDecode(frame.body);
-                  rawVerified = true;
-                  route = "primary";
-                } else {
-                  route = "missing-or-unverified-frame";
-                }
+                const frame = await child.readObject({ oid: liveEntry.oid, size: liveEntry.size ?? 0 });
+                if (frame.kind === "missing")
+                  throw new UnitFailure(`object-store corruption: ${entry.path}'s enumerated oid is missing from the acquired store`);
+                if (gitBlobOid(frame.body, fixture.objectFormat) !== liveEntry.oid)
+                  throw new UnitFailure(`frame bytes do not hash to the enumerated oid at ${entry.path}`);
+                delivered = seamDecode(frame.body);
+                rawVerified = true;
+                route = "primary";
               } catch (e) {
                 fidelityThrown = e instanceof Error ? e : new Error(String(e));
                 throw fidelityThrown;
@@ -1418,6 +1440,11 @@ export function reconstructResumeState(
     if (outcome === "complete") {
       for (const cls of Object.keys((rec["requests"] as Record<string, number> | undefined) ?? {}))
         ledgerEntries.push({ pos, key: `${unit}|${expected.driver}|${cls}`, unit, epilogue: rec["epilogue"] === true });
+      // every completed run READ rate_limit successfully before and after (its accounting
+      // depends on it), but rest-meta is control-plane and excluded from `requests` — without
+      // this implied entry a pre-run rate_limit exhaustion could never satisfy R2's
+      // prior-success predicate and became a permanent G3 failure
+      ledgerEntries.push({ pos, key: `${unit}|${expected.driver}|rest-meta`, unit, epilogue: rec["epilogue"] === true });
     }
   }
   // §4.5 R4: the SECOND straddle on a unit halts the matrix for freeze repair — a log carrying
@@ -1542,6 +1569,7 @@ async function cmdMatrix(): Promise<void> {
           const key = `${row.unit}|${row.driver}`;
           if (handle.record.outcome === "complete") {
             for (const cls of Object.keys(handle.record.requests)) successLedger.add(`${key}|${cls}`);
+            successLedger.add(`${key}|rest-meta`); // implied: a completed run's accounting read rate_limit successfully
             break;
           }
           if (handle.record.outcome === "invalidated-straddle") {

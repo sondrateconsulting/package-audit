@@ -519,7 +519,10 @@ export class BatchChild {
           timer = setTimeout(() => resolve(null), ms);
         });
         try {
-          return await Promise.race([this.child.exited, gaveUp]);
+          // a REJECTED exit promise (a local process-wait failure) must not escape dispose()
+          // before the escalation and pump join run — it reads as "never settled", so the
+          // teardown proceeds and the constructor's poison keeps the disposal unclean
+          return await Promise.race([this.child.exited.then((c) => c, () => null), gaveUp]);
         } finally {
           clearTimeout(timer);
         }

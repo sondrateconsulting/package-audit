@@ -219,6 +219,16 @@ export class WorkerDiskSampler extends BaseSampler {
   }
   start(dir: string, hz: number): void {
     this.stopTimer();
+    // EAGER worker construction: start() runs before the wall opens, and constructing the
+    // Worker lazily meant the FIRST tick paid the synchronous construction cost wherever it
+    // happened to land — inside short-preflight rows' measured walls, outside longer ones' —
+    // row-correlated noise on the primary metric. A construction failure surfaces through
+    // failAll and degrades the disk fields at finish, never silently retried per tick.
+    try {
+      this.ensureWorker();
+    } catch (e) {
+      this.failAll(new DiskSamplerError(`worker construction failed: ${e instanceof Error ? e.message : String(e)}`));
+    }
     this.timer = setInterval(() => {
       // the tick is O(1) on THIS thread — the walk happens in the worker. Coalesced: a tick is
       // skipped while one is still outstanding, so a slow walk cannot queue an unbounded backlog.

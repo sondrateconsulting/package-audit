@@ -282,3 +282,14 @@ describe("analyzeBatchResponse — a failed subprocess is not data (santa round 
     expect(failed.fivexxSplitCandidate).toBe(false); // not a 5xx shape — never a split trigger
   });
 });
+
+describe("analyzeBatchResponse — a FATAL classification is never throttle-like", () => {
+  test("an SSO-enforcement 403 carrying a RATE_LIMITED body takes the closed default, not the throttle path", () => {
+    // production short-circuits SSO before the RATE_LIMITED branch; routing it to throttle-retry
+    // retried a fatal auth condition and let it feed G4's irreversible secondary-signal count
+    const a = analyzeBatchResponse(dispatch({ status: 403, classification: "fatal", errors: [{ type: "RATE_LIMITED", message: "slow down", path: null }] }), BATCH, "sha1", CFG);
+    expect(a).toMatchObject({ kind: "default-failure" });
+    if (a.kind !== "default-failure") throw new Error("unreachable");
+    expect(a.rawCondition).toContain("fatal classification");
+  });
+});

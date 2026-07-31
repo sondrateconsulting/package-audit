@@ -190,7 +190,12 @@ export function analyzeBatchResponse(
       rawCondition: `HTTP ${d.status}${d.jsonParseable ? "" : " non-JSON body"}`,
     };
   }
-  // throttle semantics next (classifyGraphql already ran): primary/secondary/RATE_LIMITED body
+  // throttle semantics next (classifyGraphql already ran): primary/secondary/RATE_LIMITED body.
+  // FATAL first — an SSO-enforcement 403 can carry a RATE_LIMITED body, and routing it to the
+  // throttle path retried (and G4-counted) a condition production fails fast on; the closed
+  // default bounds it by the attempt budget instead
+  if (d.classification === "fatal")
+    return { kind: "default-failure", rawCondition: `fatal classification at HTTP ${d.status} (e.g. SSO enforcement) — never throttle-like` };
   if (d.classification === "primary") return { kind: "throttle-retry", cause: "primary" };
   if (d.errors.some((e) => e.type === "RATE_LIMITED")) return { kind: "throttle-retry", cause: "rate-limited-body" };
   if (d.classification === "secondary") return { kind: "throttle-retry", cause: "secondary" };

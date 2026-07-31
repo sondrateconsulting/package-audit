@@ -330,7 +330,10 @@ export async function benchGraphqlDispatch(
     now,
   );
   const rateLimited = full.errors.some((e) => e.type === "RATE_LIMITED");
-  const secondaryLike = cls.kind === "secondary" || (rateLimited && cls.kind !== "primary");
+  // a FATAL classification (SSO enforcement) is never throttle-like, whatever the body says —
+  // production short-circuits SSO before the RATE_LIMITED branch for exactly this reason, and
+  // recording it as a secondary signal let a fatal auth condition feed G4's irreversible ≥2
+  const secondaryLike = cls.kind === "secondary" || (rateLimited && cls.kind !== "primary" && cls.kind !== "fatal");
   let pointsCost: number | null = null;
   const rl = full.data?.["rateLimit"];
   if (typeof rl === "object" && rl !== null && !Array.isArray(rl)) {
@@ -345,9 +348,9 @@ export async function benchGraphqlDispatch(
   // secondary signals, and recording a RATE_LIMITED body that classification already keyed as
   // primary (remaining 0) would let two primary exhaustions manufacture a permanent G4 fail —
   // the same remaining-0 exclusion detectRestSecondarySignal applies on the REST side
-  const signal: SecondarySignalKind | null = rateLimited && cls.kind !== "primary"
+  const signal: SecondarySignalKind | null = rateLimited && cls.kind !== "primary" && cls.kind !== "fatal"
     ? "graphql-rate-limited"
-    : detectRestSecondarySignal(parsed.status, parsed.headers, parsed.body);
+    : cls.kind === "fatal" ? null : detectRestSecondarySignal(parsed.status, parsed.headers, parsed.body);
   ctx.record({
     type: "http-attempt", atMs: startedAt, wallMs: now - startedAt, kind: "graphql",
     requestClass: "graphql-batch", label, attempt: attemptOrdinal, status: parsed.status, exitCode: res.exitCode,
@@ -361,7 +364,10 @@ export async function benchGraphqlDispatch(
   // a SECONDARY throttle's horizon (Retry-After or the production backoff base) is armed on the
   // bucket too — the next dispatch waits it out and the washout reads it (codex R1 finding 13)
   if (cls.kind === "secondary") {
-    const waitMs = cls.waitMs ?? ctx.cfg.rest.secondaryBaseWaitMs;
+    // no Retry-After → production's zero-based exponential (base × 2^(ordinal-1)); a fixed
+    // base under-armed the horizon on consecutive throttles, undercounting T1's wall and the
+    // successor's washout
+    const waitMs = cls.waitMs ?? ctx.cfg.rest.secondaryBaseWaitMs * 2 ** Math.min(attemptOrdinal - 1, 5);
     ctx.graphql.pausedUntilMs = Math.max(ctx.graphql.pausedUntilMs, now + waitMs);
   }
   return {

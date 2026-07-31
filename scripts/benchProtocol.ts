@@ -747,6 +747,10 @@ export class BenchEngine {
             // no washout is owed (the probe consumed no API traffic), but the marker-per-row
             // invariant the resume scan enforces must hold for THIS row too
             this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
+            // the sampler was started before this branch (so pre-driver failures can classify
+            // with disk state) — this early return skips finishMeasuredRun, and an armed
+            // sampler surviving the run would tick its worker into LATER measured rows
+            sampler.abandon();
             return { outcome: null, verification: null, record: driftRecord };
           } else {
             form = "production";
@@ -924,7 +928,11 @@ export class BenchEngine {
           fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
           routesDelivered: liveState.routesDelivered,
           g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
-          spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts, t1BodyTimeouts: liveState.t1BodyTimeouts, washoutAppliedMs: 0,
+          spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts, t1BodyTimeouts: liveState.t1BodyTimeouts,
+          // this row throws before any washout sleep, so resume completes the OWED washout
+          // from this field — a hardcoded 0 collapsed a live Retry-After horizon (e.g. the
+          // throttle that broke the accounting read) to the 60 s floor
+          washoutAppliedMs: washoutMs(cfg, outstandingHorizonMs(gh), this.now()),
           envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
           frozenSurfaceDigest: this.o.frozenSurfaceDigest,
         });

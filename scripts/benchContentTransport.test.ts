@@ -348,6 +348,16 @@ describe("reconstructResumeState — resume must honour the frozen §4.5 discipl
     expect(() => reconstructResumeState([runRow({ pos: 1 })], "0".repeat(64), ENV_HASH, SCHED)).toThrow(/changed measurement surface/);
     expect(() => reconstructResumeState([runRow({ pos: 1 })], DIGEST, "other-env", SCHED)).toThrow(/REFUSING to resume/);
   });
+  test("a completed rep implies rest-meta success — a pre-run rate_limit exhaustion stays R2-rerunnable", () => {
+    // rest-meta is control-plane and excluded from `requests`, so the only ledger that can
+    // authorize an R2 replay never saw it succeed — even though every completed run's
+    // accounting read rate_limit before and after by construction
+    const completed = runRow({ pos: 3, outcome: "complete", requests: { "rest-content": 3 } });
+    const metaFailure = runRow({ pos: 5, outcome: "unit-failure", failureEvidence: { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-meta" } });
+    const s = state([completed, marker(3), metaFailure, marker(5)]);
+    expect(s.successLedger.has(`${KEY}|rest-meta`)).toBe(true);
+    expect(s.owedReplays.get(5)).toBe(KEY);
+  });
   test("the binding is the frozen-surface DIGEST, never the commit — an evidence-only commit must not orphan rows", () => {
     // rows carry a different harnessCommit (HEAD moved when the evidence log was committed)
     // but the SAME digest — the frozen surface is unchanged and resume must accept them
