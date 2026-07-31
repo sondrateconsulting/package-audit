@@ -8,8 +8,8 @@ import { join } from "node:path";
 import { loadBenchConfig, restFallbackBudgetFor } from "./benchConfig.ts";
 import {
   BenchProtocolError, WallClock, bucketDelta, computeWorstCase, finishMeasuredRun, makeChildPool,
-  planSegments, reclaimRunResources, requireToolVersion, summarizeTraffic, verifyDeliveries,
-  washoutMs,
+  planSegments, reclaimRunResources, requireToolVersion, summarizeSpawns, summarizeTraffic,
+  verifyDeliveries, washoutMs,
 } from "./benchProtocol.ts";
 import { InlineDiskSampler, WorkerDiskSampler, parseDiskWalkReply } from "./benchDiskSampler.ts";
 import { parseDiskWalkRequest } from "./benchDiskWorker.ts";
@@ -238,25 +238,36 @@ describe("InlineDiskSampler + finish() contract (santa round 2)", () => {
     expect(snap.sampleError).toContain("walk blew up");
   });
   test("instrumentation failure degrades the disk fields but never throws", async () => {
-    const s = new InlineDiskSampler(() => { throw new Error("nope"); });
+    const s = new InlineDiskSampler(() => 500, () => { throw new Error("nope"); });
     const snap = await s.finish("/run", null);
     expect(snap.sampleError).not.toBeNull();
     expect(snap.cloneObjectStoreBytes).toBeNull();
   });
   test("finish() is idempotent — one snapshot per run, by contract", async () => {
     let calls = 0;
-    const s = new InlineDiskSampler(() => { calls++; return 10; });
+    const s = new InlineDiskSampler(() => 10, () => { calls++; return 10; });
     const a = await s.finish("/run", null);
     const b = await s.finish("/run", null);
     expect(b).toEqual(a);
     expect(calls).toBe(1); // the second call re-walks nothing
   });
-  test("a clean walk records the clone store and no error", async () => {
-    const s = new InlineDiskSampler(() => 4096, () => 2048);
+  test("a clean finish records the clone store AND takes the final sample with the STRICT walker", async () => {
+    // the final sample is load-bearing (on a short run it may be the only one), so it uses the
+    // strict walker like the clone-store measurement — the tolerant tick walker plays no part
+    const s = new InlineDiskSampler(() => 1, (d) => (d.endsWith(".git") ? 2048 : 4096));
     const snap = await s.finish("/run", "/run/clone/.git");
     expect(snap.cloneObjectStoreBytes).toBe(2048);
     expect(snap.peakBytes).toBe(4096);
+    expect(snap.samples).toBe(1);
     expect(snap.sampleError).toBeNull();
+  });
+  test("the DEFAULT final sample is strict — an unreadable run dir degrades, never a plausible 0 peak", async () => {
+    // drives the PRODUCTION strict walker: a tolerant walk of an unreadable root returned 0
+    // with sampleError null, which read as a real (and G4-passing) zero-disk measurement
+    const s = new InlineDiskSampler(() => 0);
+    const snap = await s.finish("/definitely/not/a/real/run-dir", null);
+    expect(snap.sampleError).toContain("cannot read");
+    expect(snap.samples).toBe(0); // no sample was fabricated
   });
   test("abandon() releases the sampler without a snapshot — the R5 path's only disposer", async () => {
     // R5 peeks and throws; it never calls finish(), which is the only other disposer. Without
@@ -527,5 +538,21 @@ describe("reclaimRunResources — teardown owns the DB, not the happy path (F6)"
     expect(failed).toBe(true);
     expect(existsSync(runDir)).toBe(true); // it really did survive
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("summarizeSpawns — §4.6 item 5's git-side evidence reaches the record", () => {
+  test("counts lanes, timeouts, non-zero exits, and never-settled children", () => {
+    const rec = (over: Partial<import("./benchSpawn.ts").BenchSpawnRecord>): import("./benchSpawn.ts").BenchSpawnRecord => ({
+      lane: "transport", argv: ["ls-tree"], cwd: null, startedAtMs: 0, wallMs: 1,
+      exitCode: 0, timedOut: false, stdoutBytes: 0, stderrBytes: 0, ...over,
+    });
+    const s = summarizeSpawns([
+      rec({}),
+      rec({ lane: "scaffolding", exitCode: 128 }),
+      rec({ exitCode: 124, timedOut: true }),
+      rec({ exitCode: null }),
+    ]);
+    expect(s).toEqual({ total: 4, timedOut: 1, nonZeroExit: 2, neverSettled: 1, byLane: { transport: 3, scaffolding: 1 } });
   });
 });

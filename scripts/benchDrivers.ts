@@ -196,10 +196,11 @@ function pushNoReads(ctx: DriverRunContext, st: RunState): void {
 }
 
 // ---- acquisition (§4.4: production argv by default, SHA-pinned scaffolding on drift) ---------
-const substitute = (tuple: readonly string[], slots: Record<string, string>): string[] =>
-  tuple.map((t) => t.replace(/\{(\w+)\}/g, (_, k: string) => slots[k] ?? ((): never => {
-    throw new UnitFailure(`scaffolding tuple slot {${k}} has no substitution`);
-  })()));
+// Scaffolding argv is DERIVED inside runBenchGit from the config-pinned tuple + slots (the lane
+// carries both) — this module never hand-builds a scaffolding vector, so the pinned tuple is the
+// single source. The previous shape had callers substitute the tuple themselves and pass the
+// result as BOTH argv and expectArgv, which made the lane's "must equal the pinned tuple" gate a
+// self-comparison that could never fail.
 
 export function parseLsRemoteProbe(stdout: Uint8Array, branch: string, oidLength: number): string {
   const text = new TextDecoder("utf-8", { fatal: false }).decode(stdout);
@@ -217,9 +218,9 @@ export function parseLsRemoteProbe(stdout: Uint8Array, branch: string, oidLength
 // coherence assertion.
 export async function probeLiveHead(ctx: Pick<DriverRunContext, "cfg" | "slot" | "unit" | "benchRoot" | "gitEnv" | "spawnObserver">): Promise<string> {
   const url = `https://${ctx.cfg.githubHost}/${encodeURIComponent(ctx.slot.owner)}/${encodeURIComponent(ctx.slot.repo)}.git`;
-  const argv = substitute(ctx.cfg.scaffolding.tuples.lsRemoteProbe, { url, branch: ctx.unit.branch });
   const res = await runBenchGit({
-    argv, lane: { lane: "scaffolding", expectArgv: argv }, env: ctx.gitEnv, benchRoot: ctx.benchRoot,
+    lane: { lane: "scaffolding", tuple: ctx.cfg.scaffolding.tuples.lsRemoteProbe, slots: { url, branch: ctx.unit.branch } },
+    env: ctx.gitEnv, benchRoot: ctx.benchRoot,
     limits: { maxStdoutBytes: 1024 * 1024, maxStderrBytes: 1024 * 1024, deadlineMs: ctx.cfg.spawn.timeoutMs },
     onRecord: ctx.spawnObserver,
   });
@@ -237,9 +238,9 @@ async function transportGit(ctx: DriverRunContext, argv: string[], opts: { cwd?:
   });
 }
 
-async function scaffoldGit(ctx: DriverRunContext, argv: string[], cwd?: string): Promise<void> {
+async function scaffoldGit(ctx: DriverRunContext, tuple: readonly string[], slots: Record<string, string>, cwd?: string): Promise<void> {
   const res = await runBenchGit({
-    argv, lane: { lane: "scaffolding", expectArgv: argv }, env: ctx.gitEnv, benchRoot: ctx.benchRoot,
+    lane: { lane: "scaffolding", tuple, slots }, env: ctx.gitEnv, benchRoot: ctx.benchRoot,
     ...(cwd === undefined ? {} : { cwd }),
     limits: { maxStdoutBytes: 4 * 1024 * 1024, maxStderrBytes: 1024 * 1024, deadlineMs: ctx.cfg.spawn.timeoutMs },
     onRecord: ctx.spawnObserver,
@@ -248,8 +249,8 @@ async function scaffoldGit(ctx: DriverRunContext, argv: string[], cwd?: string):
     // a FAILED SHA-pinned fetch runs the pinned-object classifier (§4.4): the frozen SHA no
     // longer served → the R6 SHA arm (re-pin, a freeze amendment), never a generic driver
     // failure (codex R1 finding 19)
-    if (argv[0] === "fetch") await classifyPinnedObjectAbsence(ctx, `scaffolding fetch of ${ctx.unit.sha} failed`);
-    throw new UnitFailure(`scaffolding ${argv[0]} failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`);
+    if (tuple[0] === "fetch") await classifyPinnedObjectAbsence(ctx, `scaffolding fetch of ${ctx.unit.sha} failed`);
+    throw new UnitFailure(`scaffolding ${tuple[0]} failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`);
   }
 }
 
@@ -280,10 +281,10 @@ export async function acquireStore(ctx: DriverRunContext, opts: { checkout: bool
   }
   // scaffolding form: init --object-format → remote add → fetch <sha> → optional detach checkout
   const t = ctx.cfg.scaffolding.tuples;
-  await scaffoldGit(ctx, substitute(t.init, { objectFormat: ctx.slot.objectFormat, dest: dir }));
-  await scaffoldGit(ctx, substitute(t.remoteAdd, { url }), dir);
-  await scaffoldGit(ctx, substitute(t.fetch, { sha: ctx.unit.sha }), dir);
-  if (opts.checkout) await scaffoldGit(ctx, substitute(t.checkoutDetach, {}), dir);
+  await scaffoldGit(ctx, t.init, { objectFormat: ctx.slot.objectFormat, dest: dir });
+  await scaffoldGit(ctx, t.remoteAdd, { url }, dir);
+  await scaffoldGit(ctx, t.fetch, { sha: ctx.unit.sha }, dir);
+  if (opts.checkout) await scaffoldGit(ctx, t.checkoutDetach, {}, dir);
   const rev = await transportGit(ctx, ["rev-parse", "FETCH_HEAD"], { cwd: dir });
   const head = seamDecode(rev.stdout).trim();
   if (rev.exitCode !== 0 || head !== ctx.unit.sha) {
@@ -414,11 +415,14 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
       const d = await benchGraphqlDispatch(ctx.gh, batch.query, batch.fields, batch.label, attempts);
       st.httpBodyBytes += Buffer.byteLength(d.bodyText, "utf8");
       const analysis = analyzeBatchResponse(d, batch, ctx.slot.objectFormat, ctx.cfg);
-      const failedDispatch = (evidence: { code: string; lastClassification: string | null } | null = null): void => {
+      // §4.4 requires a unit failure to carry "the raw condition recorded" — the breaker throw
+      // must not discard the last analysis's condition (it previously fired BEFORE the
+      // rawCondition-bearing default-failure throw could).
+      const failedDispatch = (evidence: { code: string; lastClassification: string | null } | null = null, lastCondition: string | null = null): void => {
         consecutiveFailedDispatches++;
         if (consecutiveFailedDispatches >= ctx.cfg.t1.circuitBreakerConsecutiveFailedDispatches)
           throw new UnitFailure(
-            `circuit breaker: ${consecutiveFailedDispatches} consecutive failed dispatches`,
+            `circuit breaker: ${consecutiveFailedDispatches} consecutive failed dispatches${lastCondition === null ? "" : ` (last: ${lastCondition.slice(0, 200)})`}`,
             evidence === null ? null : { ...evidence, requestClass: "graphql-batch" },
           );
       };
@@ -431,37 +435,41 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
         queue.unshift({ entries: b, depth: q.depth + 1 });
         queue.unshift({ entries: a, depth: q.depth + 1 });
       };
+      // a backoff sleep is only ever the PREFACE to a retry; once the attempt budget is spent
+      // the next loop iteration drains the item to its fallback, and sleeping first would charge
+      // driver-correlated idle to the scored wall for a dispatch that can never happen
+      const retryRemains = attempts < ctx.cfg.rest.attemptCap;
       if (analysis.kind === "http-failure") {
         // R2's evidence is 5xx-only (plan §4.5): a 200-with-non-JSON parse failure is NOT a
         // rerunnable shape (codex R4)
         failedDispatch({
           code: d.status === 0 ? "no-response" : "http-failure",
           lastClassification: d.status === 0 ? "no-response" : d.status >= 500 ? "transient" : "non-json",
-        });
+        }, analysis.rawCondition);
         consecutive5xx = analysis.fivexxSplitCandidate ? consecutive5xx + 1 : 0;
         if (fivexxSplitConditionMet(batch, consecutive5xx, ctx.cfg) && canSplit(item)) enqueueSplit(item);
         else {
-          await ctx.gh.sleep(ctx.cfg.rest.transientBaseWaitMs * 2 ** Math.min(attempts, 5));
+          if (retryRemains) await ctx.gh.sleep(ctx.cfg.rest.transientBaseWaitMs * 2 ** Math.min(attempts, 5));
           queue.unshift(item); // bounded transient retry — never split on first failure
         }
         continue;
       }
       consecutive5xx = 0;
       if (analysis.kind === "throttle-retry") {
-        failedDispatch();
-        if (analysis.cause !== "primary") await ctx.gh.sleep(ctx.cfg.rest.secondaryBaseWaitMs);
+        failedDispatch(null, `throttle ${analysis.cause}`);
+        if (analysis.cause !== "primary" && retryRemains) await ctx.gh.sleep(ctx.cfg.rest.secondaryBaseWaitMs);
         queue.unshift(item); // primary pauses are armed on the bucket; the next dispatch waits
         continue;
       }
       if (analysis.kind === "batch-timeout") {
-        failedDispatch();
+        failedDispatch(null, "batch-timeout");
         if (item.entries.length === 1) await toFallback(item.entries, "timeout-singleton");
         else if (canSplit(item)) enqueueSplit(item);
         else queue.unshift(item);
         continue;
       }
       if (analysis.kind === "default-failure") {
-        failedDispatch();
+        failedDispatch(null, analysis.rawCondition);
         if (attempts >= ctx.cfg.rest.attemptCap)
           throw new UnitFailure(`default-clause response persisted through the attempt budget: ${analysis.rawCondition}`);
         queue.unshift(item);

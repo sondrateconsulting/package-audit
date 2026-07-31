@@ -40,10 +40,26 @@ export class BenchSpawnError extends Error {
 }
 
 // ---- lanes -----------------------------------------------------------------------------------
+// The scaffolding lane carries the CONFIG-PINNED tuple plus its slot values, and runBenchGit
+// derives the launched argv from them itself. The earlier shape took a caller-substituted
+// `expectArgv` and compared the caller's argv against it — but every caller passed the same
+// object as both, so the "must equal the pinned tuple verbatim" gate was a self-comparison
+// that could never fail. Deriving inside the launch site makes the pinned tuple the ONLY
+// source of scaffolding argv.
 export type BenchLane =
   | { lane: "transport"; objectFormat: BenchObjectFormat; cloneShape?: CloneShape }
-  | { lane: "scaffolding"; expectArgv: readonly string[] }
+  | { lane: "scaffolding"; tuple: readonly string[]; slots: Readonly<Record<string, string>> }
   | { lane: "pinning" };
+
+// Substitute {slot} placeholders in a pinned scaffolding tuple. A slot with no substitution is
+// a harness/config bug and fails the launch closed before anything is spawned.
+export function substituteTuple(tuple: readonly string[], slots: Readonly<Record<string, string>>): string[] {
+  return tuple.map((t) => t.replace(/\{(\w+)\}/g, (_, k: string) => {
+    const v = slots[k];
+    if (v === undefined) throw new BenchSpawnError("tuple-slot", `scaffolding tuple slot {${k}} has no substitution`);
+    return v;
+  }));
+}
 
 // Every launch is reported here (argv is the exact vector launched, never a joined string).
 export interface BenchSpawnRecord {
@@ -131,14 +147,10 @@ function assertLane(argv: readonly string[], lane: BenchLane): void {
     assertProposedReadOnlyGit([...argv], { objectFormat: lane.objectFormat, cloneShape: lane.cloneShape });
     return;
   }
-  if (lane.lane === "scaffolding") {
-    const exp = lane.expectArgv;
-    const same = argv.length === exp.length && argv.every((a, i) => a === exp[i]);
-    if (!same)
-      throw new BenchSpawnError("scaffolding-argv", `argv does not equal the pinned scaffolding tuple: got [${argv.join(" ")}]`);
-    return;
-  }
-  // "pinning": unconstrained by design, recorded by the observer
+  // "scaffolding": argv was DERIVED from the pinned tuple inside runBenchGit (see BenchLane) —
+  // construction from the single pinned source replaces an equality assertion, which the old
+  // caller-substituted shape had reduced to a tautology.
+  // "pinning": unconstrained by design, recorded by the observer.
 }
 
 // The write destinations a git argv implies, for containment: a clone's <dest> positional and
@@ -172,7 +184,9 @@ function gateLaunch(argv: readonly string[], lane: BenchLane, benchRoot: string,
 
 // ---- one-shot capped byte capture ------------------------------------------------------------
 export interface BenchGitRequest {
-  argv: readonly string[]; // git argv WITHOUT the binary
+  // git argv WITHOUT the binary. OMITTED for the scaffolding lane, whose argv is derived from
+  // the lane's pinned tuple + slots inside runBenchGit (the single source — see BenchLane).
+  argv?: readonly string[];
   lane: BenchLane;
   env: Record<string, string>;
   benchRoot: string;
@@ -216,10 +230,19 @@ async function readAllCapped(reader: ByteReader, cap: number, onExceed: () => vo
 // the production escalation, and hold the return until the exit promise settles (callers may
 // delete the working directory the moment this resolves).
 export async function runBenchGit(req: BenchGitRequest): Promise<BenchGitResult> {
-  gateLaunch(req.argv, req.lane, req.benchRoot, req.cwd);
+  let argv: readonly string[];
+  if (req.lane.lane === "scaffolding") {
+    if (req.argv !== undefined)
+      throw new BenchSpawnError("scaffolding-argv", "scaffolding launches derive argv from the pinned tuple — a caller-supplied argv would bypass the single source");
+    argv = substituteTuple(req.lane.tuple, req.lane.slots);
+  } else {
+    if (req.argv === undefined) throw new BenchSpawnError("argv-missing", `${req.lane.lane} lane requires an explicit argv`);
+    argv = req.argv;
+  }
+  gateLaunch(argv, req.lane, req.benchRoot, req.cwd);
   const startedAtMs = Date.now();
   const bin = resolveGitBin(req.env);
-  const child = launch(bin, req.argv, { env: req.env, cwd: req.cwd, stdinPipe: false });
+  const child = launch(bin, argv, { env: req.env, cwd: req.cwd, stdinPipe: false });
   const outReader = child.stdout.getReader();
   const errReader = child.stderr.getReader();
   const kill = (): void => killWithEscalation(child, [outReader, errReader]);
@@ -230,7 +253,7 @@ export async function runBenchGit(req: BenchGitRequest): Promise<BenchGitResult>
   }, req.limits.deadlineMs);
   const record = (exitCode: number | null, stdoutBytes: number, stderrBytes: number): void => {
     req.onRecord?.({
-      lane: req.lane.lane, argv: req.argv, cwd: req.cwd ?? null, startedAtMs,
+      lane: req.lane.lane, argv, cwd: req.cwd ?? null, startedAtMs,
       wallMs: Date.now() - startedAtMs, exitCode, timedOut, stdoutBytes, stderrBytes,
     });
   };
@@ -267,7 +290,7 @@ export async function runBenchGit(req: BenchGitRequest): Promise<BenchGitResult>
     clearTimeout(gaveUpTimer);
     if (bounded === null) {
       record(null, 0, 0);
-      throw new BenchSpawnError("exit-wedged", `child never settled within deadline+grace: git ${req.argv[0]}`);
+      throw new BenchSpawnError("exit-wedged", `child never settled within deadline+grace: git ${argv[0]}`);
     }
     const [stdout, stderr, exitCode] = bounded;
     // deadline first: an escalation-induced reader cancellation must surface as the promised
@@ -338,6 +361,9 @@ export class BatchChild {
   private disposed: Promise<BatchChildDisposal> | null = null;
   private stdoutBytes = 0;
   private stderrBytes = 0;
+  // a per-read deadline that fired is TIMEOUT evidence (§4.6 item 5) — without this flag the
+  // disposal's spawn record reported timedOut:false even when the read deadline killed the child
+  private readDeadlineFired = false;
 
   constructor(opts: BatchChildOptions) {
     const argv = ["cat-file", "--batch"] as const;
@@ -451,6 +477,7 @@ export class BatchChild {
     this.parser.arm(expected); // validates oid format + size bound BEFORE the request is written
     const frameP = new Promise<BatchFrame>((resolve, reject) => {
       const timer = setTimeout(() => {
+        this.readDeadlineFired = true;
         this.poison(`per-read deadline (${this.opts.limits.readDeadlineMs}ms) expired for ${expected.oid}`);
         killWithEscalation(this.child, [this.outReader, this.errReader]);
       }, this.opts.limits.readDeadlineMs);
@@ -505,18 +532,28 @@ export class BatchChild {
       // the pumps end when the streams close or their readers are cancelled by the escalation;
       // the join is BOUNDED so a wedged stream cannot hang disposal (codex R2 f.32)
       let pumpTimer: ReturnType<typeof setTimeout> | undefined;
+      let pumpsWedged = true;
       await Promise.race([
-        this.pumpsDone,
+        this.pumpsDone.then(() => {
+          pumpsWedged = false;
+        }),
         new Promise<void>((resolve) => {
           pumpTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 2_000);
         }),
       ]);
       clearTimeout(pumpTimer);
+      if (pumpsWedged) {
+        // a pump that never settled means the stream state cannot be vouched for — cancel the
+        // readers so nothing stays attached after the caller deletes the store, and surface the
+        // wedge as an UNCLEAN disposal instead of returning a clean-looking verdict
+        for (const r of [this.outReader, this.errReader]) r.cancel().catch(() => {});
+        if (this.fatal === null || this.fatal === "disposed") this.fatal = "stream pumps did not settle within the bounded dispose wait";
+      }
       const snap = this.ring.snapshot();
       this.opts.onRecord?.({
         lane: "transport", argv: ["cat-file", "--batch"], cwd: this.opts.cwd,
         startedAtMs: this.startedAtMs, wallMs: Date.now() - this.startedAtMs,
-        exitCode: exit ?? this.exitedCode, timedOut: false,
+        exitCode: exit ?? this.exitedCode, timedOut: this.readDeadlineFired,
         stdoutBytes: this.stdoutBytes, stderrBytes: this.stderrBytes,
       });
       return {

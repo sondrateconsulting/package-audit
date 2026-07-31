@@ -169,11 +169,18 @@ export function analyzeBatchResponse(
   // malformed errors[] members carry no attributable signal — the closed default, never a drop
   if (d.malformedErrorEntries > 0 && d.status === 200 && d.jsonParseable)
     return { kind: "default-failure", rawCondition: `${d.malformedErrorEntries} malformed errors[] member(s)` };
-  // A non-zero `gh` exit is a FAILED transport call regardless of what its stdout parsed to.
-  // Without this a subprocess that failed — but happened to emit a parseable 200-shaped body —
-  // yielded resolved aliases, i.e. content accepted from a call that did not succeed.
-  if (d.exitCode !== 0)
-    return { kind: "http-failure", fivexxSplitCandidate: false, rawCondition: `gh exited ${d.exitCode}` };
+  // gh exits 1 BY DESIGN after a COMPLETE HTTP-200 envelope whose body carries errors[] — and
+  // on every non-2xx status (github.ts documents exactly this at its graphql() attempt loop,
+  // and deliberately avoids a broad nonzero-exit guard there because it would blind-retry real
+  // throttles). An earlier fix here WAS that broad guard: it preempted the entire transition
+  // table for exactly the envelopes the table exists to classify — a 200-with-TIMEOUT never
+  // split, RATE_LIMITED never took the throttle path, and 502/503/504 (gh exit 1) could never
+  // arm the 5xx split trigger. The exit code is transport-failure evidence only where the
+  // parsed response does not already explain it: a SUCCESS-shaped 200 (parseable, no errors)
+  // from a gh that failed is a truncated/poisoned transfer — the original finding the removed
+  // guard was written for — and stays a whole-batch http-failure.
+  if (d.exitCode !== 0 && d.status === 200 && d.jsonParseable && d.errors.length === 0 && d.malformedErrorEntries === 0)
+    return { kind: "http-failure", fivexxSplitCandidate: false, rawCondition: `gh exited ${d.exitCode} with a success-shaped 200 envelope` };
   // HTTP-level failure first: 5xx / no response / a 200 whose body is not JSON.
   if (d.status === 0 || d.status >= 500 || (d.status === 200 && !d.jsonParseable)) {
     const bodyEmptyOrNonJson = d.bodyText.trim() === "" || !d.jsonParseable;

@@ -107,7 +107,11 @@ export class InlineDiskSampler extends BaseSampler {
     let sampleError: string | null = null;
     try {
       if (cloneGitDir !== null) clone = this.strictWalk(cloneGitDir);
-      this.observe(this.walk(dir, this.extras));
+      // the FINAL sample is load-bearing (on a short run it may be the ONLY sample), and the
+      // run dir is quiescent here — the driver has returned and reclamation has not started —
+      // so tolerance would let an unreadable root record a plausible-looking 0-byte peak with
+      // sampleError null. Strict, like the clone-store measurement; ticks stay tolerant.
+      this.observe(this.strictWalk(dir) + extraBytes(this.extras));
     } catch (e) {
       sampleError = e instanceof Error ? e.message : String(e);
       clone = null;
@@ -254,7 +258,10 @@ export class WorkerDiskSampler extends BaseSampler {
     try {
       // cloneObjectStoreBytes is a MEASUREMENT: a failed walk yields null, never a fabricated 0
       if (cloneGitDir !== null) clone = await this.request(cloneGitDir, [], true); // MEASUREMENT
-      this.observe(await this.request(dir, this.extras, false)); // sample
+      // the FINAL sample is strict too: on a short run it may be the ONLY sample, the run dir
+      // is quiescent (driver returned, reclamation not started), and a tolerant walk of an
+      // unreadable root would record a plausible 0-byte peak with sampleError null
+      this.observe(await this.request(dir, this.extras, true));
     } catch (e) {
       // NEVER propagate: this runs between the driver returning and the run record being
       // appended, and an R5 halt record in particular is the evidence a freeze repair is

@@ -11,7 +11,7 @@ import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import { BenchGrammarViolation } from "./benchGrammar.ts";
 import { parseLsTreeZ } from "./benchFrame.ts";
 import {
-  BatchChild, BenchSpawnError, runBenchGit,
+  BatchChild, BenchSpawnError, runBenchGit, substituteTuple,
   type BenchGitRequest, type BenchSpawnRecord,
 } from "./benchSpawn.ts";
 
@@ -68,14 +68,42 @@ describe("lane gating happens BEFORE anything launches", () => {
     ).rejects.toThrow(BenchGrammarViolation);
     expect(records).toEqual([]); // nothing launched, nothing recorded
   });
-  test("scaffolding lane demands verbatim equality with the pinned tuple", async () => {
+  // The scaffolding lane DERIVES its argv from the pinned tuple + slots inside runBenchGit.
+  // The previous shape compared a caller-substituted argv against a caller-supplied expectArgv,
+  // and every production caller passed the SAME object as both — a gate that could never fail.
+  test("scaffolding argv is derived from the pinned tuple; the record carries the substitution", async () => {
+    const records: BenchSpawnRecord[] = [];
+    const res = await runBenchGit({
+      lane: { lane: "scaffolding", tuple: ["rev-parse", "{what}"], slots: { what: "--git-dir" } },
+      env: ENV, benchRoot: BENCH_ROOT, cwd: REPO, limits: LIMITS, onRecord: (r) => records.push(r),
+    });
+    expect(res.exitCode).toBe(0);
+    expect(records.map((r) => [...r.argv])).toEqual([["rev-parse", "--git-dir"]]);
+  });
+  test("a caller-supplied argv on the scaffolding lane is rejected — it would bypass the single source", async () => {
+    const records: BenchSpawnRecord[] = [];
     await expect(
       runBenchGit({
-        argv: ["checkout", "--detach", "FETCH_HEAD", "-q"],
-        lane: { lane: "scaffolding", expectArgv: ["checkout", "--detach", "FETCH_HEAD"] },
-        env: ENV, benchRoot: BENCH_ROOT, cwd: REPO, limits: LIMITS,
+        argv: ["checkout", "--detach", "FETCH_HEAD"],
+        lane: { lane: "scaffolding", tuple: ["checkout", "--detach", "FETCH_HEAD"], slots: {} },
+        env: ENV, benchRoot: BENCH_ROOT, cwd: REPO, limits: LIMITS, onRecord: (r) => records.push(r),
       }),
     ).rejects.toThrow(BenchSpawnError);
+    expect(records).toEqual([]); // nothing launched, nothing recorded
+  });
+  test("a tuple slot with no substitution fails closed before anything launches", async () => {
+    const records: BenchSpawnRecord[] = [];
+    await expect(
+      runBenchGit({
+        lane: { lane: "scaffolding", tuple: ["fetch", "origin", "{sha}"], slots: {} },
+        env: ENV, benchRoot: BENCH_ROOT, cwd: REPO, limits: LIMITS, onRecord: (r) => records.push(r),
+      }),
+    ).rejects.toThrow(/slot \{sha\} has no substitution/);
+    expect(records).toEqual([]);
+  });
+  test("substituteTuple substitutes every {slot} and leaves literal tokens alone", () => {
+    expect(substituteTuple(["init", "--template=", "--object-format={objectFormat}", "{dest}"], { objectFormat: "sha1", dest: "/tmp/x" }))
+      .toEqual(["init", "--template=", "--object-format=sha1", "/tmp/x"]);
   });
   test("cwd outside the bench root is a containment violation, launch never happens", async () => {
     await expect(pin(["status"], realpathSync(tmpdir()))).rejects.toThrow(ReadOnlyViolation);
@@ -153,5 +181,31 @@ describe("BatchChild — the unit-lived interactive seam", () => {
     const disposal = await child.dispose();
     expect(disposal.protocolError).toBeNull();
     expect(disposal.exitCode).toBe(0);
+  });
+});
+
+describe("BatchChild — a fired per-read deadline is durable TIMEOUT evidence (§4.6 item 5)", () => {
+  test("the disposal spawn record carries timedOut:true after a read deadline fires", async () => {
+    // Deterministic: a fake `git` that never replies sits first on the child's PATH, so the
+    // per-read deadline ALWAYS fires — no race against a real cat-file's reply. The disposal's
+    // spawn record previously hardcoded timedOut:false, hiding real interactive-read timeouts
+    // from the run evidence.
+    const fakeBin = mkdtempSync(join(realpathSync(tmpdir()), "pa-bench-fakegit-"));
+    writeFileSync(join(fakeBin, "git"), "#!/bin/sh\nsleep 60\n", { mode: 0o755 });
+    const records: BenchSpawnRecord[] = [];
+    const child = new BatchChild({
+      objectFormat: "sha1", env: { ...ENV, PATH: fakeBin }, cwd: REPO, benchRoot: BENCH_ROOT,
+      limits: { maxHeaderBytes: 256, frameCeiling: 1024 * 1024, stderrRingBytes: 4096, readDeadlineMs: 50, disposeDeadlineMs: 500 },
+      onRecord: (r) => records.push(r),
+    });
+    try {
+      await expect(child.readObject({ oid: "c".repeat(40), size: 10 })).rejects.toThrow(/deadline/);
+    } finally {
+      const disposal = await child.dispose();
+      expect(disposal.protocolError).toContain("deadline");
+      rmSync(fakeBin, { recursive: true, force: true });
+    }
+    expect(records.length).toBe(1);
+    expect(records[0]?.timedOut).toBe(true);
   });
 });

@@ -191,7 +191,7 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
         await ctx.sleep(backoffWait(ctx.cfg, "transient", attempt, null));
         continue;
       }
-      throw new BenchHttpError("truncated-transfer", `gh exited ${res.exitCode} with an HTTP 200 response`);
+      throw new BenchHttpError("truncated-transfer", `gh exited ${res.exitCode} with an HTTP 200 response`, parsed.status, { lastClassification: "truncated", requestClass: opts.requestClass });
     }
     const cls = classifyRest(parsed.status, parsed.headers, parsed.body, now);
     lastClass = cls.kind;

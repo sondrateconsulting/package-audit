@@ -295,7 +295,9 @@ export interface RunRecord {
   expectedConsumption: { core: number; graphql: number }; // harness-owned accounting (R3's input)
   replayOfPos: number | null; // in-slot replays record their physical predecessor (§4.5)
   replayKind: "r1r2" | "r3r4" | null; // only r1r2 charges the driver allowance (codex R2 f.23)
-  diskReclaimFailed: boolean;
+  // null = reclamation had not yet been attempted when this record landed (only the R5 halt
+  // path, whose record must be durable before any fallible work — including reclamation)
+  diskReclaimFailed: boolean | null;
   probeDivergences: number;
   httpBodyBytes: number;
   cloneObjectStoreBytes: number | null;
@@ -308,9 +310,39 @@ export interface RunRecord {
   routesDelivered: Record<string, number>;
   g1Failures: number;
   g2Failures: number;
+  // §4.7 disqualification evidence must be auditable from the committed log, not just counted:
+  // the first DETAIL_CAP verification failures/divergences ride the row (counts above are exact)
+  g1Details: Array<{ path: string; route: string; reason: string }>;
+  g2Details: Array<{ path: string; reason: string }>;
+  probeDivergenceDetails: Array<{ path: string; route: string }>;
+  // §4.6 item 5 evidence for the GIT side (the HTTP side rides `attempts`): spawn counts by
+  // lane, timeouts, non-zero exits, and children that never settled
+  spawns: SpawnStats;
   washoutAppliedMs: number;
   envManifestHash: string;
   harnessCommit: string;
+}
+
+// bounded detail retention for the record — counts stay exact, details are evidence samples
+export const DETAIL_CAP = 20;
+
+export interface SpawnStats {
+  total: number;
+  timedOut: number;
+  nonZeroExit: number;
+  neverSettled: number;
+  byLane: Record<string, number>;
+}
+export function summarizeSpawns(records: readonly BenchSpawnRecord[]): SpawnStats {
+  const s: SpawnStats = { total: 0, timedOut: 0, nonZeroExit: 0, neverSettled: 0, byLane: {} };
+  for (const r of records) {
+    s.total++;
+    s.byLane[r.lane] = (s.byLane[r.lane] ?? 0) + 1;
+    if (r.timedOut) s.timedOut++;
+    if (r.exitCode === null) s.neverSettled++;
+    else if (r.exitCode !== 0) s.nonZeroExit++;
+  }
+  return s;
 }
 
 export class RunsLog {
@@ -419,6 +451,11 @@ export function reclaimRunResources(
   return failed;
 }
 
+// The PRIMARY scored metric accumulates through this clock, so its time source must be
+// monotonic: the engine's default is performance.now(), never the system clock — an NTP step
+// or manual clock adjustment mid-run would otherwise stretch, shrink, or negate exactly one
+// driver's wall. (Epoch time is still used where epochs are the point: ISO stamps and
+// reset-epoch arithmetic.)
 export class WallClock {
   private activeMs = 0;
   private startedAt: number | null = null;
@@ -642,7 +679,8 @@ export class BenchEngine {
             diskReclaimFailed: driftReclaimFailed,
             probeDivergences: 0, httpBodyBytes: 0, cloneObjectStoreBytes: null,
             diskSampledPeakBytes: 0, diskSamples: 0, diskSampleError: null, fallbackSpend: 0, routesDelivered: {},
-            g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
+            g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
+            spawns: summarizeSpawns(spawnRecords), washoutAppliedMs: 0,
             envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
           };
           this.o.runsLog.append(driftRecord);
@@ -661,7 +699,8 @@ export class BenchEngine {
     // wall clock pauses between segments.
     const segmentSizes = planSegments(row.driver, workload, cfg, { owner: slot.owner, repo: slot.repo });
     const segmented = segmentSizes.length > 1;
-    const wall = new WallClock(() => this.now());
+    // monotonic by default (see WallClock); an injected o.now keeps tests deterministic
+    const wall = new WallClock(this.o.now !== undefined ? () => this.now() : () => performance.now());
     const segmentDeltas: Array<{ core: BucketDelta; graphql: BucketDelta }> = [];
     const bucketSnapshots: Array<{ before: RateLimitSnapshot; after: RateLimitSnapshot }> = [];
     let segBefore: RateLimitSnapshot;
@@ -769,13 +808,15 @@ export class BenchEngine {
         bucketSnapshots,
         expectedConsumption: { core: liveCoreAttempts, graphql: liveGraphqlPoints },
         // reclamation has NOT run yet on this path (it happens in the outer finally, after this
-        // record is durable), so the flag reports the only truthful value available here
-        replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed: false, probeDivergences: 0,
+        // record is durable) — null says "not attempted", which a false would misreport as
+        // "attempted and succeeded"
+        replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed: null, probeDivergences: 0,
         httpBodyBytes: r5traffic.httpBodyBytes,
         cloneObjectStoreBytes: null, diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples,
         diskSampleError: "not sampled: R5 halt records before any fallible post-run work",
         fallbackSpend: liveState.fallbackSpend, routesDelivered: liveState.routesDelivered,
-        g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
+        g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
+        spawns: summarizeSpawns(spawnRecords), washoutAppliedMs: 0,
         envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
       };
       try {
@@ -807,41 +848,54 @@ export class BenchEngine {
     // verification, and delta arithmetic. A throw in any of it used to discard a run that had
     // already been measured and reclaimed — the wall, the traffic, and the driver's actual work
     // all lost because a control-plane read failed afterwards. Record what we have instead.
-    let after: RateLimitSnapshot;
+    let after: RateLimitSnapshot | null = null;
     try {
       after = await readRateLimit(ghMeta);
     } catch (e) {
-      const partial = summarizeTraffic(httpRecords);
-      this.o.runsLog.append({
-        type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
-        probe: row.probe, phase, epilogue: this.epilogueMode,
-        acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
-        startedAtIso, wallMs, segments: segmentSizes.length,
-        // the measured wall stands; only the post-run accounting is missing, so the row is
-        // marked invalid for scoring rather than dropped or passed off as complete
-        outcome: "invalidated-finalisation", failureCause: `post-run rate-limit read failed: ${e instanceof Error ? e.message : String(e)}`,
-        failureEvidence: null,
-        requests: partial.requests, attempts: partial.attempts, secondarySignals: partial.secondarySignals,
-        points: partial.points,
-        bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
-        bucketSnapshots,
-        expectedConsumption: { core: liveCoreAttempts, graphql: liveGraphqlPoints },
-        replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed, probeDivergences: 0,
-        httpBodyBytes: partial.httpBodyBytes, cloneObjectStoreBytes,
-        diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples, diskSampleError: disk.sampleError,
-        fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
-        routesDelivered: liveState.routesDelivered,
-        g1Failures: 0, g2Failures: 0, washoutAppliedMs: 0,
-        envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
-      });
-      throw e;
+      // A COMPLETE run without its consumption accounting cannot be scored — that stays the
+      // invalidated-finalisation row (wall preserved, then propagate). But a run that already
+      // CLASSIFIED a terminal outcome (unit-failure / drift-restart / re-pin-required) must not
+      // have that classification overwritten by a later accounting failure: resume and §4.5
+      // semantics read the outcome (a re-pin row REFUSES resume; an invalidated-finalisation
+      // row in its place would silently re-run against a dead SHA). Those runs keep their
+      // classified record, with the deltas degraded and the accounting failure noted.
+      if (runOutcome === "complete") {
+        const partial = summarizeTraffic(httpRecords);
+        this.o.runsLog.append({
+          type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+          probe: row.probe, phase, epilogue: this.epilogueMode,
+          acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
+          startedAtIso, wallMs, segments: segmentSizes.length,
+          // the measured wall stands; only the post-run accounting is missing, so the row is
+          // marked invalid for scoring rather than dropped or passed off as complete
+          outcome: "invalidated-finalisation", failureCause: `post-run rate-limit read failed: ${e instanceof Error ? e.message : String(e)}`,
+          failureEvidence: null,
+          requests: partial.requests, attempts: partial.attempts, secondarySignals: partial.secondarySignals,
+          points: partial.points,
+          bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
+          bucketSnapshots,
+          expectedConsumption: { core: liveCoreAttempts, graphql: liveGraphqlPoints },
+          replayOfPos: this.replayOfPos, replayKind: this.replayKind, diskReclaimFailed, probeDivergences: 0,
+          httpBodyBytes: partial.httpBodyBytes, cloneObjectStoreBytes,
+          diskSampledPeakBytes: disk.peakBytes, diskSamples: disk.samples, diskSampleError: disk.sampleError,
+          fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
+          routesDelivered: liveState.routesDelivered,
+          g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
+          spawns: summarizeSpawns(spawnRecords), washoutAppliedMs: 0,
+          envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
+        });
+        throw e;
+      }
+      failureCause = `${failureCause ?? "(no recorded cause)"} — post-run rate-limit read also failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`;
     }
     if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
 
     // per-segment same-window deltas, summed by construction (§4.6 item 2); the final (or only)
     // segment closes against the post-run snapshot. Any straddled segment invalidates the run.
-    bucketSnapshots.push({ before: segBefore, after });
-    segmentDeltas.push({ core: bucketDelta(segBefore.core, after.core), graphql: bucketDelta(segBefore.graphql, after.graphql) });
+    if (after !== null) {
+      bucketSnapshots.push({ before: segBefore, after });
+      segmentDeltas.push({ core: bucketDelta(segBefore.core, after.core), graphql: bucketDelta(segBefore.graphql, after.graphql) });
+    }
     const sumDelta = (pick: (d: { core: BucketDelta; graphql: BucketDelta }) => BucketDelta): BucketDelta => {
       let used = 0;
       for (const d of segmentDeltas) {
@@ -851,7 +905,9 @@ export class BenchEngine {
       }
       return { valid: true, used };
     };
-    const deltas = { core: sumDelta((d) => d.core), graphql: sumDelta((d) => d.graphql) };
+    const deltas = after !== null
+      ? { core: sumDelta((d) => d.core), graphql: sumDelta((d) => d.graphql) }
+      : { core: { valid: false, used: null } as BucketDelta, graphql: { valid: false, used: null } as BucketDelta };
     if ((!deltas.core.valid || !deltas.graphql.valid) && runOutcome === "complete") runOutcome = "invalidated-straddle"; // R4
     // R3 foreign consumption (§4.5/§4.8): the observed delta must reconcile with the harness's
     // OWN accounting — unexplained excess is external interference: run invalid, replayed in
@@ -900,6 +956,10 @@ export class BenchEngine {
       routesDelivered: verification?.routesDelivered ?? liveState.routesDelivered,
       g1Failures: verification?.g1Failures.length ?? 0,
       g2Failures: verification?.g2Failures.length ?? 0,
+      g1Details: verification?.g1Failures.slice(0, DETAIL_CAP) ?? [],
+      g2Details: verification?.g2Failures.slice(0, DETAIL_CAP) ?? [],
+      probeDivergenceDetails: verification?.probeDivergences.slice(0, DETAIL_CAP) ?? [],
+      spawns: summarizeSpawns(spawnRecords),
       washoutAppliedMs,
       envManifestHash: this.manifestHash,
       harnessCommit: this.o.runsLog.manifest.harnessCommit,
@@ -964,9 +1024,13 @@ export class BenchEngine {
           { pos: schedulePositions + rep, unit: unit.unitId, driver: cfg.pilot.driver, rep, probe: false },
           "pilot",
         );
-        // R3/R4 invalidations REPLAY in their own slot (§4.5) — the pilot honours the same
-        // frozen semantics as the matrix (measured live: a single foreign GraphQL point from a
-        // background consumer invalidated a rep on 2026-07-29)
+        // R3/R4 invalidations replay in their own slot, mirroring §4.5's replay PLACEMENT —
+        // but NOT its full taxonomy: this pre-ratification diagnostic bounds BOTH kinds at 2
+        // invalidations per rep and then stops for the operator, where the matrix halts on the
+        // second R4 per UNIT and never caps R3. The pilot is a declared non-decision
+        // diagnostic; its stricter stop exists to surface a noisy account early (measured
+        // live: a single foreign GraphQL point from a background consumer invalidated a rep
+        // on 2026-07-29), not to implement the frozen matrix discipline.
         if (handle.record.outcome === "invalidated-straddle" || handle.record.outcome === "invalidated-foreign") {
           replays++;
           if (replays > 2) throw new BenchProtocolError(`pilot rep ${rep} invalidated ${replays} times (${handle.record.outcome}) — quiesce the account's other consumers and re-run`);

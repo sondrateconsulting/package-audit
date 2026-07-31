@@ -103,6 +103,42 @@ const aliasPayload = (text: string | null, over: Record<string, unknown> = {}): 
   isBinary: false, isTruncated: false, text, ...over,
 });
 
+describe("analyzeBatchResponse — gh exit semantics (gh exits 1 BY DESIGN on errored envelopes)", () => {
+  // github.ts documents at its graphql() loop: gh exits 1 after a COMPLETE HTTP-200 envelope
+  // whose body carries errors[], and on every non-2xx status. A broad `exitCode !== 0 →
+  // http-failure` guard therefore preempted the ENTIRE transition table for exactly the
+  // envelopes it classifies. These drive the production exit values gh actually produces.
+  test("a 200 envelope with a pathless TIMEOUT and gh exit 1 still takes the split path", () => {
+    expect(analyzeBatchResponse(dispatch({ exitCode: 1, errors: [{ type: "TIMEOUT", message: null, path: null }] }), BATCH, "sha1", CFG))
+      .toEqual({ kind: "batch-timeout" });
+  });
+  test("a 200 RATE_LIMITED body with gh exit 1 still takes the throttle path", () => {
+    expect(analyzeBatchResponse(dispatch({ exitCode: 1, errors: [{ type: "RATE_LIMITED", message: "slow down", path: null }] }), BATCH, "sha1", CFG))
+      .toEqual({ kind: "throttle-retry", cause: "rate-limited-body" });
+  });
+  test("a 503 with empty body and gh exit 1 still arms the pinned 5xx split candidate", () => {
+    expect(analyzeBatchResponse(dispatch({ exitCode: 1, status: 503, bodyText: "", jsonParseable: false, classification: "transient" }), BATCH, "sha1", CFG))
+      .toMatchObject({ kind: "http-failure", fivexxSplitCandidate: true });
+  });
+  test("a 200 with partial data + an alias-attributed error and gh exit 1 resolves per alias", () => {
+    const a = analyzeBatchResponse(dispatch({
+      exitCode: 1,
+      data: { repository: { a0: aliasPayload(TEXT) } },
+      errors: [{ type: "NOT_FOUND", message: "gone", path: ["repository", "a1"] }],
+    }), BATCH, "sha1", CFG);
+    expect(a).toMatchObject({ kind: "per-alias" });
+    if (a.kind !== "per-alias") throw new Error("unreachable");
+    expect(a.outcomes[0]).toMatchObject({ kind: "resolved" });
+    expect(a.outcomes[1]).toMatchObject({ kind: "missing" });
+  });
+  test("the original finding stays closed: a SUCCESS-shaped 200 from a failed gh is http-failure", () => {
+    const a = analyzeBatchResponse(dispatch({ exitCode: 1, data: { repository: { a0: aliasPayload(TEXT), a1: aliasPayload(TEXT) } } }), BATCH, "sha1", CFG);
+    expect(a).toMatchObject({ kind: "http-failure", fivexxSplitCandidate: false });
+    if (a.kind !== "http-failure") throw new Error("unreachable");
+    expect(a.rawCondition).toContain("success-shaped");
+  });
+});
+
 describe("analyzeBatchResponse — exhaustive, closed-default", () => {
   test("HTTP-level failures: 5xx with empty/non-JSON body is the pinned split candidate", () => {
     const a = analyzeBatchResponse(dispatch({ status: 502, bodyText: "", jsonParseable: false, classification: "transient" }), BATCH, "sha1", CFG);

@@ -170,7 +170,7 @@ describe("parseProbeBatch — pinned GraphQL facts are all-or-nothing (F5)", () 
     checkoutSeamSha256: null, gql: null,
   });
   const entries = [entryOf("a.ts"), entryOf("b.ts")];
-  const blob = (over: Record<string, unknown> = {}) => ({ __typename: "Blob", isBinary: false, isTruncated: false, text: "hi", ...over });
+  const blob = (over: Record<string, unknown> = {}) => ({ __typename: "Blob", oid: "c".repeat(40), byteSize: 10, isBinary: false, isTruncated: false, text: "hi", ...over });
 
   test("a fully-resolved batch commits its facts", () => {
     const r = parseProbeBatch({ repository: { a0: blob(), a1: blob({ isBinary: true, text: null }) } }, entries, undefined);
@@ -191,6 +191,18 @@ describe("parseProbeBatch — pinned GraphQL facts are all-or-nothing (F5)", () 
   test("a missing/opaque alias with NO errors[] also rejects — absence is not a measurement", () => {
     const r = parseProbeBatch({ repository: { a0: blob() } }, entries, undefined);
     expect(r.ok).toBe(false);
+  });
+  test("a Blob for a DIFFERENT object rejects — identity is checked, not just shape", () => {
+    // the selection requests oid and byteSize precisely so this is checkable: a wrong-object
+    // Blob with isBinary:true would otherwise permanently pin binary-fallback for this entry
+    const wrongOid = parseProbeBatch({ repository: { a0: blob({ oid: "d".repeat(40), isBinary: true }), a1: blob() } }, entries, undefined);
+    expect(wrongOid.ok).toBe(false);
+    if (wrongOid.ok) throw new Error("unreachable");
+    expect(wrongOid.reason).toMatch(/different object/);
+    const wrongSize = parseProbeBatch({ repository: { a0: blob({ byteSize: 11 }), a1: blob() } }, entries, undefined);
+    expect(wrongSize.ok).toBe(false);
+    if (wrongSize.ok) throw new Error("unreachable");
+    expect(wrongSize.reason).toMatch(/byteSize/);
   });
   test("a non-object repository rejects instead of fabricating facts for every entry", () => {
     const r = parseProbeBatch({ repository: null }, entries, undefined);
@@ -225,5 +237,143 @@ describe("loginFromUserPayload — the §8 credential identity cannot degrade to
     expect(() => loginFromUserPayload({ login: 42 })).toThrow(/no usable login/);
     expect(() => loginFromUserPayload(null)).toThrow(/no object/);
     expect(() => loginFromUserPayload([{ login: "x" }])).toThrow(/no object/);
+  });
+});
+
+// ---- the resume reconstruction (§4.5/§4.8) ---------------------------------------------------
+import { assertAppendOnlyPrefix, reconstructResumeState, evidenceIsRerunnable } from "./benchContentTransport.ts";
+
+describe("reconstructResumeState — resume must honour the frozen §4.5 discipline exactly", () => {
+  const COMMIT = "f".repeat(40);
+  const ENV_HASH = "abcd1234abcd1234";
+  const UNIT = "C2:o/r@main";
+  const KEY = `${UNIT}|T0`;
+  const runRow = (over: Record<string, unknown>): string =>
+    JSON.stringify({
+      type: "run", schemaVersion: 1, phase: "matrix", pos: 1, unit: UNIT, driver: "T0", rep: 1,
+      probe: false, epilogue: false, outcome: "complete", failureEvidence: null, requests: {},
+      acquisitionForm: null, replayKind: null, harnessCommit: COMMIT, envManifestHash: ENV_HASH,
+      ...over,
+    });
+  const marker = (pos: number): string => JSON.stringify({ type: "washout-done", phase: "matrix", pos });
+  const state = (lines: string[]) => reconstructResumeState(lines, COMMIT, ENV_HASH);
+  const R1_EVIDENCE = { kind: "http", code: "no-response", lastClassification: "no-response", requestClass: "rest-content" };
+  const R2_EVIDENCE = { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-content" };
+
+  test("a washed-out R1-rerunnable failure is OWED its replay, never terminal", () => {
+    // The defect: the failed row's washout marker landed, then the process died anywhere inside
+    // the (minutes-long) replay run. The old resume terminalized the pos and silently forfeited
+    // the mandated in-slot replay — the recorded failure stood, G3 failed, and a transient
+    // interrupt became a permanent driver disqualification (instance #7 of the class).
+    const s = state([runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R1_EVIDENCE }), marker(5)]);
+    expect(s.terminalPos.has(5)).toBe(false);
+    expect(s.owedReplays.get(5)).toBe(KEY);
+  });
+  test("R2 is evaluated against the ledger AS OF the failure — later completions never authorize", () => {
+    const failure = runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R2_EVIDENCE });
+    const completedBefore = runRow({ pos: 3, rep: 9, outcome: "complete", requests: { "rest-content": 3 } });
+    const completedAfter = runRow({ pos: 7, rep: 9, outcome: "complete", requests: { "rest-content": 3 } });
+    const owed = state([completedBefore, marker(3), failure, marker(5)]);
+    expect(owed.owedReplays.get(5)).toBe(KEY);
+    // the same completion recorded AFTER the failure must not retroactively grant the replay —
+    // §4.5's "evaluated at failure time" is order-stable, and the live loop decided "no rerun"
+    const notOwed = state([failure, marker(5), completedAfter, marker(7)]);
+    expect(notOwed.owedReplays.size).toBe(0);
+    expect(notOwed.terminalPos.has(5)).toBe(true);
+  });
+  test("a spent allowance is never re-granted: the landed replay row settles the pos", () => {
+    const s = state([
+      runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R1_EVIDENCE }), marker(5),
+      runRow({ pos: 5, outcome: "complete", replayKind: "r1r2", requests: { "rest-content": 2 } }), marker(5),
+    ]);
+    expect(s.terminalPos.has(5)).toBe(true);
+    expect(s.owedReplays.size).toBe(0);
+    expect(s.rerunUsed.has(KEY)).toBe(true);
+  });
+  test("washout markers pair with rows IN ORDER — the first attempt's marker cannot vouch for its replay", () => {
+    // an attempt and its in-slot replay share the pos; a pos-keyed SET let marker #1 terminalize
+    // the replay row whose own washout never completed
+    const s = state([
+      runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R1_EVIDENCE }), marker(5),
+      runRow({ pos: 5, outcome: "complete", replayKind: "r1r2", requests: { "rest-content": 2 } }),
+    ]);
+    expect(s.terminalPos.has(5)).toBe(false); // the replay's washout is unfinished → re-run per the marker rule
+    expect(s.owedReplays.size).toBe(0); // the allowance was spent — no second replay
+    expect(s.rerunUsed.has(KEY)).toBe(true);
+    expect(s.successLedger.has(`${KEY}|rest-content`)).toBe(false); // an unwashed rep is not evidence
+  });
+  test("a completed row without its washout marker is not terminal", () => {
+    const s = state([runRow({ pos: 4, outcome: "complete" })]);
+    expect(s.terminalPos.has(4)).toBe(false);
+  });
+  test("{kind:'unit'} evidence is never owed a replay — the frozen predicate accepts only http shapes", () => {
+    const s = state([runRow({ pos: 5, outcome: "unit-failure", failureEvidence: { kind: "unit" } }), marker(5)]);
+    expect(s.terminalPos.has(5)).toBe(true);
+    expect(s.owedReplays.size).toBe(0);
+  });
+  test("a corrupted evidence line REFUSES resume — a skipped line could hide a terminal halt row", () => {
+    expect(() => state([runRow({ pos: 1 }), "{not json"])).toThrow(/corrupted/);
+  });
+  test("halt-r5/re-pin rows, foreign commits, and foreign environments all refuse", () => {
+    expect(() => state([runRow({ pos: 1, outcome: "halt-r5-breach" })])).toThrow(/freeze-repair/);
+    expect(() => state([runRow({ pos: 1, outcome: "re-pin-required" })])).toThrow(/freeze-repair/);
+    expect(() => reconstructResumeState([runRow({ pos: 1 })], "0".repeat(40), ENV_HASH)).toThrow(/REFUSING to resume/);
+    expect(() => reconstructResumeState([runRow({ pos: 1 })], COMMIT, "other-env")).toThrow(/REFUSING to resume/);
+  });
+  test("drift bookkeeping: main rows of a drifted unit never terminalize; its form is scaffolding", () => {
+    const s = state([
+      runRow({ pos: 1, outcome: "complete", acquisitionForm: "production", requests: { "rest-content": 1 } }), marker(1),
+      runRow({ pos: 2, outcome: "drift-restart", acquisitionForm: "production" }),
+    ]);
+    expect(s.driftedUnits.has(UNIT)).toBe(true);
+    expect(s.terminalPos.has(1)).toBe(false); // discarded reps — the epilogue re-runs the whole unit
+    expect(s.resumeForms.get(UNIT)).toBe("scaffolding");
+    expect(s.successLedger.has(`${KEY}|rest-content`)).toBe(false); // discarded reps are not evidence
+    expect(s.owedReplays.size).toBe(0);
+  });
+});
+
+describe("evidenceIsRerunnable — the frozen R1/R2 predicate over typed evidence", () => {
+  test("R1: no-response is rerunnable with no ledger; R2 needs a transient shape AND a ledger hit", () => {
+    expect(evidenceIsRerunnable({ kind: "http", code: "no-response", lastClassification: null, requestClass: null }, "u|T0", new Set())).toBe(true);
+    const r2 = { kind: "http", code: "http-failure", lastClassification: "transient", requestClass: "rest-content" };
+    expect(evidenceIsRerunnable(r2, "u|T0", new Set())).toBe(false);
+    expect(evidenceIsRerunnable(r2, "u|T0", new Set(["u|T0|rest-content"]))).toBe(true);
+  });
+  test("everything else refuses: unit kind, null, secondary-shaped, unknown codes", () => {
+    expect(evidenceIsRerunnable({ kind: "unit" }, "u|T0", new Set())).toBe(false);
+    expect(evidenceIsRerunnable(null, "u|T0", new Set())).toBe(false);
+    expect(evidenceIsRerunnable({ kind: "http", code: "attempts-exhausted", lastClassification: "secondary", requestClass: "rest-content" }, "u|T0", new Set(["u|T0|rest-content"]))).toBe(false);
+    expect(evidenceIsRerunnable({ kind: "http", code: "truncated-transfer", lastClassification: "truncated", requestClass: "rest-content" }, "u|T0", new Set(["u|T0|rest-content"]))).toBe(false);
+  });
+});
+
+describe("assertFreezeGitState — append-only exemptions are exact, and renames always refuse", () => {
+  const gitOk2 = (stdout = ""): { exitCode: number; stdout: Uint8Array; stderr: Uint8Array } =>
+    ({ exitCode: 0, stdout: new TextEncoder().encode(stdout), stderr: new TextEncoder().encode("") });
+  test("a stray sibling of an exempt file refuses — prefix matching let runs.jsonl.bak through", () => {
+    expect(() => assertFreezeGitState(gitOk2("?? docs/adrs/0001-benchmark/runs.jsonl.bak\n"), gitOk2(), APPEND_ONLY))
+      .toThrow(/dirty tracked files/);
+  });
+  test("a staged RENAME of an evidence log refuses — its porcelain payload starts with the exempt path", () => {
+    expect(() => assertFreezeGitState(gitOk2("R  docs/adrs/0001-benchmark/runs.jsonl -> README.md\n"), gitOk2(), APPEND_ONLY))
+      .toThrow(/dirty tracked files/);
+  });
+  test("directory exemptions still match by prefix; exact files still pass", () => {
+    expect(() => assertFreezeGitState(gitOk2("?? data/bench-run-caches/x.sqlite\n M docs/adrs/0001-benchmark/fidelity.jsonl\n"), gitOk2(), APPEND_ONLY)).not.toThrow();
+  });
+});
+
+describe("assertAppendOnlyPrefix — the exemption's append-only CLAIM is verified, not assumed", () => {
+  const b = (s: string): Uint8Array => new TextEncoder().encode(s);
+  test("appending passes; identity passes", () => {
+    expect(() => assertAppendOnlyPrefix("runs.jsonl", b("a\nb\n"), b("a\nb\nc\n"))).not.toThrow();
+    expect(() => assertAppendOnlyPrefix("runs.jsonl", b("a\nb\n"), b("a\nb\n"))).not.toThrow();
+  });
+  test("truncation refuses — deleting prior evidence is not appending", () => {
+    expect(() => assertAppendOnlyPrefix("runs.jsonl", b("a\nb\n"), b("a\n"))).toThrow(/truncated or rewritten/);
+  });
+  test("an edited byte refuses — rewriting prior evidence is not appending", () => {
+    expect(() => assertAppendOnlyPrefix("runs.jsonl", b("a\nb\n"), b("a\nX\nc\n"))).toThrow(/edited, not appended/);
   });
 });
