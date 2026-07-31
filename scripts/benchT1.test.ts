@@ -137,6 +137,22 @@ describe("analyzeBatchResponse — gh exit semantics (gh exits 1 BY DESIGN on er
     expect(analyzeBatchResponse(dispatch({ errors: [...timeoutThenUnknown].reverse() }), BATCH, "sha1", CFG)).toMatchObject({ kind: "default-failure" });
     expect(analyzeBatchResponse(dispatch({ errors: [{ type: "TIMEOUT", message: null, path: null }, { type: "TIMEOUT", message: null, path: null }] }), BATCH, "sha1", CFG)).toEqual({ kind: "batch-timeout" });
   });
+  test("the complete-set rule spans containers: a pathless TIMEOUT cannot mask an ATTRIBUTED forbidden sibling", () => {
+    // continuation-loop round 3: the pathless all-TIMEOUT short-circuit returned batch-timeout
+    // without ever examining the attributed set, so a FORBIDDEN alias error rode a transient
+    // batch-timeout verdict into the split/fallback path the closed default exists to deny
+    const mixed = [
+      { type: "TIMEOUT", message: null, path: null },
+      { type: "FORBIDDEN", message: "nope", path: ["repository", "a0"] as Array<string | number> },
+    ];
+    expect(analyzeBatchResponse(dispatch({ errors: mixed }), BATCH, "sha1", CFG)).toMatchObject({ kind: "default-failure" });
+    // the carve-out survives when the attributed set is ALSO all-timeout
+    const allTimeout = [
+      { type: "TIMEOUT", message: null, path: null },
+      { type: "TIMEOUT", message: null, path: ["repository", "a0"] as Array<string | number> },
+    ];
+    expect(analyzeBatchResponse(dispatch({ errors: allTimeout }), BATCH, "sha1", CFG)).toEqual({ kind: "batch-timeout" });
+  });
   test("alias attribution is STRICT: wrong subtree and leading-zero names are unattributable, not alias 0", () => {
     // ["rateLimit","a0"] names a different subtree; "a00" is not a generated alias name — both
     // previously attributed to alias 0, misrouting another alias's error

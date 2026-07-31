@@ -118,6 +118,7 @@ export interface BenchConfig {
     diskSamplerHz: number;
     g4: { warnAtMost: number; failAt: number };
     rerunAllowancePerUnitDriver: number;
+    fidelityBattery: { repsPerFixtureDriver: number };
   };
   budget: {
     pMaxPointsPerGraphqlAttempt: number;
@@ -316,6 +317,9 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
         failAt: num(g4, "protocol.g4", "failAt", { min: 1 }),
       },
       rerunAllowancePerUnitDriver: num(protocol, "protocol", "rerunAllowancePerUnitDriver", { min: 0 }),
+      fidelityBattery: {
+        repsPerFixtureDriver: num(section(protocol, "fidelityBattery", "protocol.fidelityBattery"), "protocol.fidelityBattery", "repsPerFixtureDriver", { min: 1 }),
+      },
     },
     budget: {
       pMaxPointsPerGraphqlAttempt: num(budget, "budget", "pMaxPointsPerGraphqlAttempt", { min: 1 }),
@@ -353,6 +357,11 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
   if (cfg.frame.frameCeilingBytes !== cfg.spawn.outputCapBytes)
     fail("frame.frameCeilingBytes must equal spawn.outputCapBytes (the plan pins the ceiling to production's spawn cap)");
   if (cfg.pilot.reps !== cfg.reps) fail("pilot.reps must equal reps (the pilot calibrates the same K)");
+  // the battery is single-pass by construction (recorded passes skip on re-run, §4.2) — a
+  // different pin here without the implementing code change would be a frozen-config claim no
+  // code honours, the exact class the removed "when: after-matrix" field exemplified
+  if (cfg.protocol.fidelityBattery.repsPerFixtureDriver !== 1)
+    fail("protocol.fidelityBattery: repsPerFixtureDriver must be 1 — the battery is single-pass; a different K requires the implementing code change with its §8 amendment");
   return cfg;
 }
 

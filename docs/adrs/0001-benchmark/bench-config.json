@@ -101,7 +101,7 @@
     },
     "rerunAllowancePerUnitDriver": 1,
     "fidelityBattery": {
-      "when": "after-matrix",
+      "$comment": "K per (fixture, driver) — validated to equal exactly 1: the battery is single-pass by construction (recorded passes skip on re-run, §4.2), so a different pin requires the implementing code change with its §8 amendment. Execution ORDER relative to the matrix is DELIBERATELY not pinned: the append-only ledger discipline and the digest gate govern re-runs on both sides, and an earlier draft's 'when: after-matrix' field here was enforced by nothing — a frozen config must not claim what no code checks, so the claim was removed rather than invented into the protocol.",
       "repsPerFixtureDriver": 1
     }
   },

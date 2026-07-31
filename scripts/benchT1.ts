@@ -234,9 +234,15 @@ export function analyzeBatchResponse(
     attributed.set(idx, list);
   }
   if (pathless.length > 0) {
-    if (pathless.every(isTimeoutError)) return { kind: "batch-timeout" };
-    const first = pathless.find((e) => !isTimeoutError(e))!;
-    return { kind: "default-failure", rawCondition: `pathless/batch-global error ${first.type ?? "?"}: ${(first.message ?? "").slice(0, 200)}` };
+    // the complete-set rule spans BOTH containers: a pathless all-TIMEOUT set must not mask an
+    // attributed non-timeout sibling — this branch returns without ever running the per-alias
+    // walk, so a forbidden alias error would ride a transient batch-timeout verdict into the
+    // split/fallback path the closed default exists to deny (the same masking codex R2
+    // finding 12 removed within each set)
+    const attributedAll = [...attributed.values()].flat();
+    const firstNonTimeout = pathless.find((e) => !isTimeoutError(e)) ?? attributedAll.find((e) => !isTimeoutError(e));
+    if (firstNonTimeout === undefined) return { kind: "batch-timeout" };
+    return { kind: "default-failure", rawCondition: `pathless/batch-global error set contains ${firstNonTimeout.type ?? "?"}: ${(firstNonTimeout.message ?? "").slice(0, 200)}` };
   }
 
   const repo = d.data?.["repository"];

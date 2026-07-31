@@ -315,6 +315,25 @@ export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, u
   return { data, errors, malformedErrorEntries, jsonParseable: true };
 }
 
+// The RECORD's classification for a GraphQL dispatch, extracted PURE so CI can drive it.
+// classifyGraphql's "ok" only means "no errors it could read" — an envelope that cannot
+// support success (unparseable body, no data OBJECT, or malformed errors[] evidence) must not
+// be recorded as an "ok" attempt: the analyzer rejects exactly those dispatches (benchT1's
+// non-JSON http-failure and malformed-errors default-failure arms), and the §4.5 R2 ledger
+// mints replay-authorizing successes from "ok" records. Degenerate-but-parseable envelopes
+// ({}, {"data":null}, non-object data, errors:[]) are spec-invalid responses a proxy can
+// fabricate with exit 0. Non-"ok" verdicts (fatal/throttle/transient) pass through — they are
+// already excluded from the ledger and carry the honest status-based story of their record.
+export function graphqlRecordClassification(
+  status: number,
+  clsKind: string,
+  envelope: { jsonParseable: boolean; data: Record<string, unknown> | null; malformedErrorEntries: number },
+): string {
+  if (status !== 200 || clsKind !== "ok") return clsKind;
+  if (!envelope.jsonParseable || envelope.data === null || envelope.malformedErrorEntries > 0) return "malformed-body";
+  return clsKind;
+}
+
 export async function benchGraphqlDispatch(
   ctx: BenchGhContext,
   query: string,
@@ -360,12 +379,7 @@ export async function benchGraphqlDispatch(
   ctx.record({
     type: "http-attempt", atMs: startedAt, wallMs: now - startedAt, kind: "graphql",
     requestClass: "graphql-batch", label, attempt: attemptOrdinal, status: parsed.status, exitCode: res.exitCode,
-    // a 200 whose body the envelope parser cannot read is NOT an "ok" record, whatever
-    // classifyGraphql concluded from its (empty) error list — the analyzer treats exactly this
-    // dispatch as an http-failure (benchT1's "200 non-JSON body" arm), so recording "ok" would
-    // mint §4.5 R2 ledger successes from rejected dispatches. Non-200 statuses keep the
-    // classifier's status-based verdict (a 502's HTML body is not the story of that record).
-    classification: parsed.status === 200 && !full.jsonParseable ? "malformed-body" : cls.kind,
+    classification: graphqlRecordClassification(parsed.status, cls.kind, full),
     secondarySignal: signal, pointsCost,
     remaining: headerInt(parsed.headers["x-ratelimit-remaining"]),
     resetEpochSec: headerInt(parsed.headers["x-ratelimit-reset"]),

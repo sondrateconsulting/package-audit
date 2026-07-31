@@ -14,7 +14,7 @@ import {
 import { InlineDiskSampler, WorkerDiskSampler, parseDiskWalkReply } from "./benchDiskSampler.ts";
 import { parseDiskWalkRequest } from "./benchDiskWorker.ts";
 import { DiskWalkError, duBytes, duBytesStrict, extraBytesStrict } from "./benchDiskWalk.ts";
-import { parseGraphqlBodyFull, parseRateLimitBucket, type BenchHttpAttemptRecord } from "./benchGh.ts";
+import { graphqlRecordClassification, parseGraphqlBodyFull, parseRateLimitBucket, type BenchHttpAttemptRecord } from "./benchGh.ts";
 import { buildUnitWorkload, seamStringSha256, type WorkloadEntry } from "./benchWorkload.ts";
 import type { EntryDelivery } from "./benchDrivers.ts";
 
@@ -597,6 +597,28 @@ describe("parseGraphqlBodyFull — present-but-wrong-typed members are malformed
   test("a non-string type counts as malformed too; clean members do not", () => {
     expect(parseGraphqlBodyFull(JSON.stringify({ data: {}, errors: [{ type: 42, message: "x" }] })).malformedErrorEntries).toBe(1);
     expect(parseGraphqlBodyFull(JSON.stringify({ data: {}, errors: [{ type: "NOT_FOUND", message: "x", path: ["repository", "a1"] }] })).malformedErrorEntries).toBe(0);
+  });
+});
+
+describe("graphqlRecordClassification — degenerate envelopes never record 'ok' (continuation R3)", () => {
+  // classifyGraphql's "ok" only means "no errors it could read": {}, {"data":null}, non-object
+  // data, and errors:[] are spec-invalid responses a proxy can fabricate with exit 0, the
+  // analyzer rejects the dispatch, and an "ok" record would mint a §4.5 R2 ledger success
+  test("parseable-but-degenerate 200 envelopes record malformed-body", () => {
+    expect(graphqlRecordClassification(200, "ok", parseGraphqlBodyFull("{}"))).toBe("malformed-body");
+    expect(graphqlRecordClassification(200, "ok", parseGraphqlBodyFull('{"data":null}'))).toBe("malformed-body");
+    expect(graphqlRecordClassification(200, "ok", parseGraphqlBodyFull('{"data":"nope"}'))).toBe("malformed-body");
+    expect(graphqlRecordClassification(200, "ok", parseGraphqlBodyFull('{"data":{},"errors":[]}'))).toBe("malformed-body");
+  });
+  test("a non-JSON 200 body records malformed-body", () => {
+    expect(graphqlRecordClassification(200, "ok", parseGraphqlBodyFull("<html>proxy error</html>"))).toBe("malformed-body");
+  });
+  test("a well-formed success envelope keeps 'ok'", () => {
+    expect(graphqlRecordClassification(200, "ok", parseGraphqlBodyFull('{"data":{"repository":{}}}'))).toBe("ok");
+  });
+  test("non-'ok' verdicts pass through untouched — they carry the honest status-based story", () => {
+    expect(graphqlRecordClassification(200, "fatal", parseGraphqlBodyFull('{"data":null,"errors":[{"type":"FORBIDDEN","message":"x"}]}'))).toBe("fatal");
+    expect(graphqlRecordClassification(502, "transient", parseGraphqlBodyFull("<html>bad gateway</html>"))).toBe("transient");
   });
 });
 
