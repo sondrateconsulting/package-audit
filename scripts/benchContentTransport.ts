@@ -144,8 +144,12 @@ function frozenSurfaceDigest(): string {
 async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>; digest: string }> {
   // §8 binds ONE network for all timed data; the placeholder default would hash every network
   // identically (codex R4) — gate-relevant runs demand an explicit operator-set description
-  if ((process.env["BENCH_NETWORK_DESC"] ?? "") === "")
-    throw new Error("REFUSING: BENCH_NETWORK_DESC is unset — §8 requires a concrete network-location description; every timed row binds to it via the environment manifest");
+  // TRIMMED: a whitespace-only value passed the emptiness check and was hashed VERBATIM into the
+  // environment manifest, so two runs on DIFFERENT networks that both used " " shared one
+  // environment hash and could be silently merged on resume — the exact §8 one-network violation
+  // this gate exists to prevent (login validation two blocks down already trims for this reason)
+  if ((process.env["BENCH_NETWORK_DESC"] ?? "").trim() === "")
+    throw new Error("REFUSING: BENCH_NETWORK_DESC is unset or blank — §8 requires a concrete network-location description; every timed row binds to it via the environment manifest");
   if (!existsSync(RATIFICATION_PATH))
     throw new Error(`REFUSING: ${RATIFICATION_PATH} does not exist — §8 ratification (the four sign-off points) must be recorded before any gate-relevant run (Step C)`);
   const rat = JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>;

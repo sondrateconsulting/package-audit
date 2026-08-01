@@ -998,7 +998,9 @@ function headerInt(value: string | undefined): number | null {
 }
 
 const RAW_ACCEPT = "application/vnd.github.raw+json";
-const MAX_ATTEMPTS = 6;
+// EXPORTED for the same reason as unitPipeline's MAX_SCAN_BYTES: the frozen bench config mirrors
+// this value (rest.attemptCap) and the mirror was previously asserted only by a test COMMENT.
+export const MAX_ATTEMPTS = 6;
 const SECONDARY_BASE_WAIT_MS = 60_000; // §4: no Retry-After → wait at LEAST 60s, then backoff
 const TRANSIENT_BASE_WAIT_MS = 2_000;
 // §4 hardening: a poisoned endpoint can hang by PACING the response (trickling bytes) instead

@@ -6,6 +6,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { SPAWN_KILL_GRACE_MS, SPAWN_TIMEOUT_MS } from "./github.ts";
 import { BenchConfigError, loadBenchConfig, noiseBandFrom, parseBenchConfig, restFallbackBudgetFor } from "./benchConfig.ts";
+import { MAX_SCAN_BYTES } from "./unitPipeline.ts";
+import { MAX_ATTEMPTS } from "./github.ts";
 import {
   BenchScheduleError, DRIVERS, buildSchedule, interleaveUnits, probeDriversFor,
   validateSchedule, validateWilliamsRows, type ScheduleUnit,
@@ -44,13 +46,19 @@ describe("the committed bench-config.json", () => {
   test("mirrored production literals stay in sync where the symbol is exported", () => {
     expect(CFG.spawn.timeoutMs).toBe(SPAWN_TIMEOUT_MS);
     expect(CFG.spawn.killGraceMs).toBe(SPAWN_KILL_GRACE_MS);
-    // module-local production literals, pinned by value (github.ts / unitPipeline.ts):
+    // BOUND to the production symbols, not merely annotated with their names. bench-config's own
+    // $comment said maxScanBytes "MIRRORS the module-local production gate" while nothing enforced
+    // it: a §8 amendment could lower it (recording a path as BOTH read and size-gate-skip) or
+    // raise it (silently dropping the no-read entries production skips), biasing the very workload
+    // the benchmark exists to reproduce. attemptCap had the same weakness — the only "binding" was
+    // a test COMMENT. Both constants are now exported and asserted, so drift on EITHER side fails.
+    expect(CFG.selection.maxScanBytes).toBe(MAX_SCAN_BYTES);
+    expect(CFG.rest.attemptCap).toBe(MAX_ATTEMPTS);
+    // still pinned by value — the symbol is module-local and unexported (github.ts):
     expect(CFG.spawn.outputCapBytes).toBe(110 * 1024 * 1024); // MAX_SPAWN_OUTPUT_BYTES
-    expect(CFG.rest.attemptCap).toBe(6); // MAX_ATTEMPTS
     expect(CFG.rest.secondaryBaseWaitMs).toBe(60_000);
     expect(CFG.rest.transientBaseWaitMs).toBe(2_000);
     expect(CFG.rest.rawAccept).toBe("application/vnd.github.raw+json");
-    expect(CFG.selection.maxScanBytes).toBe(2 * 1024 * 1024); // MAX_SCAN_BYTES
     expect(CFG.frame.frameCeilingBytes).toBe(CFG.spawn.outputCapBytes);
     expect(CFG.frame.childPoolSize).toBe(8); // the subprocess semaphore's production default
   });

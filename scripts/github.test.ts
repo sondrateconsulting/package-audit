@@ -2833,8 +2833,10 @@ describe("temp sweep (§0)", () => {
   });
 });
 
-// ---- the §6 spawn-site guarantee: two allowlisted files, one spawn each (grep-enforced) -------
-describe("spawn-site allowlist (grep-enforced)", () => {
+// ---- the §6 spawn-site guarantee: two allowlisted files, one spawn each — PLUS two scanner
+// test files exempted wholesale by exact path (this file and tuiPurity.test.ts), which must
+// spell the tokens they assert on; this file itself spawns twice (grep-enforced) ------------
+describe("spawn-site allowlist (grep-enforced, with two exact-path scanner-test exemptions)", () => {
   // A best-effort textual tripwire, NOT a semantic proof. It fails on the common direct routes
   // to a spawn surface — a dotted/optional-chained/whitespaced `Bun.spawn|spawnSync|$`; a
   // `"bun"`-module import (quote or backtick); `Bun` aliased, parenthesized, bracket-indexed,
