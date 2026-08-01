@@ -1352,7 +1352,23 @@ async function cmdFidelity(): Promise<void> {
               delivered = await fidelityRestRead(fixture, entry.path, "rest-fallback");
               route = "symlink-fallback";
             } else if (driver === "T2a") {
-              delivered = seamDecode(readFileSync(join(dir, entry.path)));
+              // The live enumeration JUST listed this path as a regular blob in the checkout T2a
+              // itself produced, so its ABSENCE on disk is that driver failing its own
+              // completeness claim — the same condition runT2c's store branch below types as a
+              // UnitFailure, not a harness fault. Untyped, a raw ENOENT fell through
+              // classifyFidelityAbort's unknown default to "operational-abort", which carries the
+              // ≤1 rerun allowance: a later checkout that happened to be complete would then
+              // launder a real T2a completeness failure into a pass. Scoped to ENOENT ONLY —
+              // EACCES/EIO and friends stay on the unknown-shape path, because widening this to
+              // every read error would turn a genuine local hardware fault into a permanent,
+              // never-rerunnable driver disqualification.
+              try {
+                delivered = seamDecode(readFileSync(join(dir, entry.path)));
+              } catch (readErr) {
+                if ((readErr as NodeJS.ErrnoException)?.code === "ENOENT")
+                  throw new UnitFailure(`fidelity T2a: ${entry.path} is listed by the checkout's own enumeration but absent from the checkout — a driver completeness failure, no rerun (§4.5)`);
+                throw readErr;
+              }
               route = "primary";
             } else {
               // a stale fixture pin is a CORPUS-ARTIFACT defect, and a store that cannot serve

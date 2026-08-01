@@ -159,6 +159,14 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
   if (cached?.etag != null && cached.responseBody !== null) args.push("-H", `If-None-Match: ${cached.etag}`);
 
   let lastClass = "unknown";
+  // the WEAKEST classification seen across this attempt chain (see replayRank). Carrying the LAST
+  // one let {429 secondary, status 0, status 0} throw bare "no-response" and buy an unconditional
+  // R1 replay for a chain containing a signal §4.5 never replays, while the same attempts in the
+  // reverse order were correctly refused.
+  let weakestClass: string | null = null;
+  const foldWeakest = (cls: string): void => {
+    if (weakestClass === null || replayRank(cls) < replayRank(weakestClass)) weakestClass = cls;
+  };
   for (let attempt = 0; attempt < ctx.cfg.rest.attemptCap; attempt++) {
     await waitBucket(ctx, ctx.core);
     const startedAt = ctx.now();
@@ -179,11 +187,24 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
     };
     if (parsed.status === 0) {
       emit("no-response", null);
+      foldWeakest("no-response");
       if (attempt < ctx.cfg.rest.attemptCap - 1) {
         await ctx.sleep(backoffWait(ctx.cfg, "transient", attempt, null));
         continue;
       }
-      throw new BenchHttpError("no-response", `gh api produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`, 0, { lastClassification: "no-response", requestClass: opts.requestClass });
+      // BOTH fields must move together: evidenceIsRerunnable grants R1 on the evidence CODE, so
+      // demoting only the classification would change nothing. A chain whose weakest member is
+      // still R1 keeps code "no-response"; anything weaker becomes "attempts-exhausted" (which it
+      // literally is) carrying that weaker class, so an earlier secondary or transient is not
+      // laundered away by whichever attempt happened to land last. The message is unchanged — it
+      // still names the condition that terminated the chain.
+      const weakest = weakestClass ?? "no-response";
+      throw new BenchHttpError(
+        replayRank(weakest) === 2 ? "no-response" : "attempts-exhausted",
+        `gh api produced no HTTP response: ${res.stderr.trim().slice(0, 300)}`,
+        0,
+        { lastClassification: weakest, requestClass: opts.requestClass },
+      );
     }
     if (parsed.status === 304 && cached !== null && cached.responseBody !== null) {
       emit("not-modified", null);
@@ -199,6 +220,7 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
     }
     const cls = classifyRest(parsed.status, parsed.headers, parsed.body, now);
     lastClass = cls.kind;
+    foldWeakest(cls.kind);
     const signal = detectRestSecondarySignal(parsed.status, parsed.headers, parsed.body);
     if (cls.kind === "ok") {
       emit("ok", signal);
@@ -230,7 +252,9 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
     // (the secondary horizon above is armed either way — the next CALL's waitBucket honours it)
     if (attempt < ctx.cfg.rest.attemptCap - 1) await ctx.sleep(waitMs);
   }
-  throw new BenchHttpError("attempts-exhausted", `REST attempts exhausted for ${opts.endpoint}`, 0, { lastClassification: lastClass, requestClass: opts.requestClass });
+  // the chain's WEAKEST class, not its last: a 429 followed by transient 5xx through the cap is
+  // still a chain containing a secondary signal, which §4.5 never replays
+  throw new BenchHttpError("attempts-exhausted", `REST attempts exhausted for ${opts.endpoint}`, 0, { lastClassification: weakestClass ?? lastClass, requestClass: opts.requestClass });
 }
 
 export async function benchRestJson(ctx: BenchGhContext, opts: BenchRestOptions): Promise<unknown> {
@@ -263,6 +287,28 @@ export interface BenchGraphqlDispatch {
   secondaryLike: boolean; // RATE_LIMITED body or secondary classification (G4 + backoff input)
   primaryUntilMs: number | null;
   pointsCost: number | null; // rateLimit.cost when the rider was readable
+}
+
+// How replayable ONE attempt's evidence is under §4.5, most permissive first. The two admitted
+// shapes are NOT interchangeable:
+//   2 = R1, a network-layer failure outside any HTTP response — rerunnable UNCONDITIONALLY;
+//   1 = R2, a transient-5xx exhaustion — rerunnable ONLY where the §4.5 success ledger carries
+//       the request class, so it is strictly weaker than R1;
+//   0 = never replayable — a throttle (primary/secondary), a closed default, or a refused shape
+//       (non-json, truncated). §4.5's default for everything outside R1/R2 is "driver failure,
+//       no rerun", and secondary signals it names as never replayable at all.
+// A multi-attempt CHAIN must surface its WEAKEST member, never its last. Both this module's REST
+// attempt loop and runT1's circuit breaker had the same laundering bug: {429 secondary, status 0}
+// and {transient, transient, status 0} each ended on a no-response and bought a free
+// unconditional replay, while the SAME multiset in a different order was correctly refused —
+// dispatch order alone decided whether a mandated failure got a replacement attempt.
+// NB evidenceIsRerunnable keys R1 on the evidence CODE and R2 on the lastClassification; this
+// rank keys on the classification alone, which is sound only because both call sites move the two
+// together (status 0 sets BOTH to "no-response"). Keep them in lockstep.
+export function replayRank(lastClassification: string | null | undefined): 0 | 1 | 2 {
+  if (lastClassification === "no-response") return 2;
+  if (lastClassification === "transient") return 1;
+  return 0;
 }
 
 export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, unknown> | null; errors: BenchGraphqlErrorEntry[]; malformedErrorEntries: number; jsonParseable: boolean } {

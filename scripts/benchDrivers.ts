@@ -16,7 +16,7 @@ import type { CorpusUnit, PerformanceSlot } from "./benchCorpus.ts";
 import { BatchChild, runBenchGit, type BatchChildDisposal, type BenchSpawnObserver } from "./benchSpawn.ts";
 import { parseLsTreeZ, type LsTreeEntry } from "./benchFrame.ts";
 import {
-  BenchHttpError, benchRestGet, gitBlobOid, type BenchGhContext,
+  BenchHttpError, benchRestGet, gitBlobOid, replayRank, type BenchGhContext,
 } from "./benchGh.ts";
 import {
   analyzeBatchResponse, buildBatchQuery, fivexxSplitConditionMet, packBatches, planRounds,
@@ -219,18 +219,6 @@ export function parseLsRemoteProbe(stdout: Uint8Array, branch: string, oidLength
   if (oid === undefined || oid.length !== oidLength || !/^[0-9a-f]+$/.test(oid))
     throw new UnitFailure(`ls-remote probe oid is not a full ${oidLength}-hex object id`);
   return oid;
-}
-
-// The ONLY two evidence shapes §4.5's rerun predicate admits: R1 (a network-layer failure outside
-// any HTTP response) and R2 (a transient-5xx exhaustion). Everything else — a null-evidence
-// dispatch (throttle, batch-timeout, closed default) and a non-null but never-replayable one
-// (secondary, non-json) — is replay-poison for the streak it belongs to. NB evidenceIsRerunnable
-// itself keys R1 on the evidence CODE and R2 on the lastClassification; this rule can key on the
-// classification alone only because runT1 moves the two together (status 0 sets BOTH to
-// "no-response"). Keep them in lockstep. Exported PURE so CI can drive the circuit breaker's
-// streak rule without standing up a whole DriverRunContext.
-export function replaySafeClassification(lastClassification: string | null | undefined): boolean {
-  return lastClassification === "no-response" || lastClassification === "transient";
 }
 
 // Probe the live head (scaffolding lane; outside any timed window). The engine probes before a
@@ -438,9 +426,12 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
   // streak. The throw previously carried only the LAST dispatch's evidence, so a streak of
   // {RATE_LIMITED, closed default, status 0} surfaced as bare "no-response" and bought an
   // unconditional R1 replay — laundering both a secondary-limit signal (§4.5: "not replayable
-  // under any category") and a closed-default condition. Sticky across the streak, cleared only
-  // where the counter is (a per-alias result).
-  let streakReplaySafe = true;
+  // under any category") and a closed-default condition. A safe/unsafe BOOLEAN was not enough
+  // either: R1 and R2 are both admitted but not interchangeable, so {transient, transient,
+  // status 0} still escaped the R2 ledger gate. Both are sticky across the streak and cleared
+  // only where the counter is (a per-alias result).
+  let streakPoisoned = false; // a member §4.5 never replays — the whole verdict carries no evidence
+  let streakWeakest: { code: string; lastClassification: string | null } | null = null; // least replayable member so far
   const dispatchChain = async (original: PlannedBatch): Promise<void> => {
     let attempts = 0;
     let descendants = 0;
@@ -471,13 +462,20 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
       // rawCondition-bearing default-failure throw could).
       const failedDispatch = (evidence: { code: string; lastClassification: string | null } | null = null, lastCondition: string | null = null): void => {
         consecutiveFailedDispatches++;
-        if (!replaySafeClassification(evidence?.lastClassification)) streakReplaySafe = false;
-        if (consecutiveFailedDispatches >= ctx.cfg.t1.circuitBreakerConsecutiveFailedDispatches)
+        // keep the WEAKEST member's own evidence, not merely a safe/unsafe verdict: R2 is
+        // ledger-gated and R1 is not, so a streak that contained a transient 5xx must surface as
+        // transient even when its final dispatch was a no-response
+        const rank = replayRank(evidence?.lastClassification);
+        if (rank === 0 || evidence === null) streakPoisoned = true;
+        else if (streakWeakest === null || rank < replayRank(streakWeakest.lastClassification)) streakWeakest = evidence;
+        if (consecutiveFailedDispatches >= ctx.cfg.t1.circuitBreakerConsecutiveFailedDispatches) {
+          const carried = streakPoisoned || streakWeakest === null ? null : { ...streakWeakest, requestClass: "graphql-batch" };
           throw new UnitFailure(
             `circuit breaker: ${consecutiveFailedDispatches} consecutive failed dispatches${lastCondition === null ? "" : ` (last: ${lastCondition.slice(0, 200)})`}` +
-              (streakReplaySafe ? "" : " — the streak contained a condition §4.5 does not replay; no rerunnable evidence is carried"),
-            evidence === null || !streakReplaySafe ? null : { ...evidence, requestClass: "graphql-batch" },
+              (carried === null ? " — the streak contained a condition §4.5 does not replay; no rerunnable evidence is carried" : ""),
+            carried,
           );
+        }
       };
       const canSplit = (q: QueueItem): boolean =>
         q.entries.length >= 2 && q.depth < ctx.cfg.t1.split.maxDepth &&
@@ -496,7 +494,7 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
         // R2's evidence is 5xx-only (plan §4.5): a 200 whose body is not a JSON OBJECT is NOT a
         // rerunnable shape (codex R4). The recorded token stays the terse "non-json" — it is a
         // durable evidence string in committed rows, and evidenceIsRerunnable rejects it by
-        // exclusion either way.. SECONDARY SHAPE OUTRANKS THE STATUS: analyzeBatchResponse
+        // exclusion either way. SECONDARY SHAPE OUTRANKS THE STATUS: analyzeBatchResponse
         // takes its HTTP-level branch before the throttle arms, so a 5xx carrying a RATE_LIMITED
         // body (or classified secondary) arrives here too — deriving the label from the status
         // alone relabelled it "transient" and made it R2-rerunnable, which §4.5 ("secondary-limit
@@ -546,7 +544,8 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
       }
       // per-alias
       consecutiveFailedDispatches = 0;
-      streakReplaySafe = true; // a delivered result ends the streak, so its poison ends with it
+      streakPoisoned = false; // a delivered result ends the streak, so its poison ends with it
+      streakWeakest = null;
       // §4.4's "the conflict recorded" and the alias-timeout events were computed by the
       // analyzer and then dropped here — they now land in the run record via the live mirror
       if (st.live !== undefined) {

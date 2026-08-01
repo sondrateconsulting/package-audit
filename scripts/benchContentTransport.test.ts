@@ -11,8 +11,8 @@ import {
   BenchOperationalError, assertFreezeGitState, classifyFidelityAbort,
   classifyFidelityEnumeration, harnessCommitFromGitResult, loginFromUserPayload, parseProbeBatch,
 } from "./benchContentTransport.ts";
-import { RePinRequired, UnitFailure, describeDisposal, replaySafeClassification } from "./benchDrivers.ts";
-import { BenchHttpError } from "./benchGh.ts";
+import { RePinRequired, UnitFailure, describeDisposal } from "./benchDrivers.ts";
+import { BenchHttpError, replayRank } from "./benchGh.ts";
 import { BenchSpawnError } from "./benchSpawn.ts";
 import type { WorkloadEntry } from "./benchWorkload.ts";
 
@@ -461,22 +461,41 @@ describe("evidenceIsRerunnable — the frozen R1/R2 predicate over typed evidenc
   });
 });
 
-describe("replaySafeClassification — the T1 breaker's streak rule (santa-2 R2)", () => {
+describe("replayRank — the T1 breaker's streak rule (santa-2 R2/R3)", () => {
   // The breaker throw carried only the LAST dispatch's evidence, so a streak of
   // {RATE_LIMITED, closed default, status 0} surfaced as bare "no-response" and bought an
-  // unconditional R1 replay — laundering a secondary-limit signal §4.5 never replays AND a
-  // closed-default condition. A streak is replay-safe only if EVERY member is.
-  test("exactly the two shapes evidenceIsRerunnable admits are replay-safe", () => {
-    expect(replaySafeClassification("no-response")).toBe(true);
-    expect(replaySafeClassification("transient")).toBe(true);
+  // unconditional R1 replay. R2 made it sticky — but as a BOOLEAN, which conflated the two
+  // admitted shapes: {transient, transient, status 0} still surfaced as R1 and escaped the
+  // ledger gate both transient members required. The rank orders them so the streak can carry
+  // its WEAKEST member.
+  test("R1 (no-response) outranks R2 (transient) — they are admitted but NOT interchangeable", () => {
+    expect(replayRank("no-response")).toBe(2);
+    expect(replayRank("transient")).toBe(1);
+    expect(replayRank("no-response") > replayRank("transient")).toBe(true);
   });
-  test("a null-evidence dispatch (throttle, batch-timeout, closed default) poisons the streak", () => {
-    expect(replaySafeClassification(null)).toBe(false);
-    expect(replaySafeClassification(undefined)).toBe(false);
+  test("a null-evidence dispatch (throttle, batch-timeout, closed default) ranks 0 — poison", () => {
+    expect(replayRank(null)).toBe(0);
+    expect(replayRank(undefined)).toBe(0);
   });
-  test("non-null but never-replayable shapes poison it too — a later transient must not relabel them", () => {
+  test("non-null but never-replayable shapes rank 0 too — a later transient must not relabel them", () => {
     for (const cls of ["secondary", "primary", "non-json", "truncated", "fatal", "malformed-body", "unaccepted-2xx"])
-      expect(replaySafeClassification(cls)).toBe(false);
+      expect(replayRank(cls)).toBe(0);
+  });
+  test("a REST chain's weakest attempt governs too — the same rule, the other call site", () => {
+    // {429 secondary, status 0, status 0} threw bare no-response and bought an unconditional R1
+    // replay; the SAME attempts ending on the 429 were correctly refused. Order alone decided it.
+    const weakest = (chain: readonly string[]): number => Math.min(...chain.map(replayRank));
+    expect(weakest(["secondary", "no-response", "no-response"])).toBe(0);
+    expect(weakest(["transient", "no-response"])).toBe(1);
+    expect(weakest(["no-response", "no-response"])).toBe(2);
+  });
+  test("the weakest member of a mixed streak is the one that governs", () => {
+    // the exact streaks the last two rounds found: the first must carry NO evidence, the second
+    // must carry transient (ledger-gated), NOT the final dispatch's unconditional no-response
+    const weakest = (streak: readonly (string | null)[]): number => Math.min(...streak.map(replayRank));
+    expect(weakest(["secondary", null, "no-response"])).toBe(0);
+    expect(weakest(["transient", "transient", "no-response"])).toBe(1);
+    expect(weakest(["no-response", "no-response", "no-response"])).toBe(2);
   });
   test("it stays in lockstep with evidenceIsRerunnable over the evidence runT1 actually builds", () => {
     // NB evidenceIsRerunnable keys R1 on the CODE and R2 on the lastClassification. runT1 moves
@@ -492,7 +511,7 @@ describe("replaySafeClassification — the T1 breaker's streak rule (santa-2 R2)
       expect(evidenceIsRerunnable(ev("http-failure", cls), "u|T1", ledger)).toBe(false);
     // and every shape the streak rule calls poison is one the predicate also refuses
     for (const cls of ["secondary", "primary", "non-json", "truncated", "fatal"])
-      expect(replaySafeClassification(cls) || evidenceIsRerunnable(ev("http-failure", cls), "u|T1", ledger)).toBe(false);
+      expect(replayRank(cls) > 0 || evidenceIsRerunnable(ev("http-failure", cls), "u|T1", ledger)).toBe(false);
   });
 });
 
