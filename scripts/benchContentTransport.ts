@@ -12,7 +12,9 @@
 //                    never move)
 //   verify-corpus    offline parse + summary of the pinned corpus and workloads (strict-parse
 //                    consistency; it re-runs no live verifyC* predicate)
-//   diagnostics      §4.4 acquisition diagnostics (production vs scaffolding forms, 3× each)
+//   diagnostics      §4.4 acquisition diagnostics (production vs scaffolding, 3× per ELIGIBLE arm:
+//                    a drifted head drops the production form, an escape-tripped untruncated unit
+//                    drops the checkout/T2a arms)
 //   budget           print per-(unit × driver) worst-case spend + the schedule's total
 //   digest           print the §8 frozen-surface digest the ratification gate binds
 //   pilot            §8's pre-ratification diagnostic pilot (K reps of T0 on C2) → noise band

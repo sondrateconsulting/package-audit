@@ -132,7 +132,7 @@ describe("one-shot byte capture", () => {
       pin(["cat-file", "blob", blobOid], REPO, { limits: { ...LIMITS, maxStdoutBytes: 4 } }),
     ).rejects.toThrow(BenchSpawnError);
   });
-  test("the observer records lane, argv, exit and byte counts", async () => {
+  test("the observer records lane and exit for each launch", async () => {
     const records: BenchSpawnRecord[] = [];
     await pin(["rev-parse", "--git-dir"], REPO, { onRecord: (r) => records.push(r) });
     expect(records.length).toBe(1);
@@ -161,7 +161,7 @@ describe("BatchChild — the unit-lived interactive seam", () => {
     expect(disposal.protocolError).toBeNull();
     await expect(child.readObject({ oid: blobOid, size: 5 })).rejects.toThrow(BenchSpawnError);
   });
-  test("an oid git does not serve yields a missing frame (the driver fails the unit on it)", async () => {
+  test("an oid git does not serve yields a missing frame", async () => {
     const child = new BatchChild(childOpts());
     const frame = await child.readObject({ oid: "0123456789".repeat(4), size: 1 });
     expect(frame).toEqual({ kind: "missing", oid: "0123456789".repeat(4) });

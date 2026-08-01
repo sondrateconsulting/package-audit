@@ -12,8 +12,12 @@
 //                     launched argv itself (caller-supplied argv is rejected). Bench
 //                     scaffolding, not proposed production grammar (plan §4.1).
 //   • "pinning"     — pinning/diagnostic tooling, deliberately unconstrained by grammar
-//                     (plan §4.3 "pinning tooling is unconstrained") but still recorded,
-//                     containment-checked, and byte-capped.
+//                     (plan §4.3 "pinning tooling is unconstrained"), byte-capped, cwd-contained,
+//                     and reported to the spawn observer WHEN ONE IS SUPPLIED (onRecord is
+//                     optional; several pinning call sites pass none, or a no-op). NB the
+//                     containment check covers cwd plus the write destinations it recognises
+//                     (clone/init) — it is not a general write-containment proof for every argv
+//                     this lane accepts.
 //
 // Streams are consumed as BYTES — no UTF-8 decode ever happens here (the production path's
 // irreversible decode is exactly what the framed seam exists to avoid, plan §3.2). Write
@@ -62,7 +66,9 @@ export function substituteTuple(tuple: readonly string[], slots: Readonly<Record
   }));
 }
 
-// Every launch is reported here (argv is the exact vector launched, never a joined string).
+// The shape reported for a launch WHEN AN OBSERVER IS SUPPLIED — onRecord is optional and
+// optional-chained at both emit sites, so a call with no observer reports nothing (argv is the
+// exact vector launched, never a joined string).
 export interface BenchSpawnRecord {
   lane: BenchLane["lane"];
   argv: readonly string[];
@@ -158,7 +164,7 @@ function assertLane(argv: readonly string[], lane: BenchLane): void {
   // "scaffolding": argv was DERIVED from the pinned tuple inside runBenchGit (see BenchLane) —
   // construction from the single pinned source replaces an equality assertion, which the old
   // caller-substituted shape had reduced to a tautology.
-  // "pinning": unconstrained by design, recorded by the observer.
+  // "pinning": unconstrained by design, recorded by the observer where one is installed.
 }
 
 // The write destinations a git argv implies, for containment: a clone's <dest> positional and
@@ -354,8 +360,11 @@ interface PendingRead {
 // BOUNDED — close stdin → await exit under a deadline → escalate → join the pumps — so the caller
 // may delete the clone directory once dispose() RESOLVES (plan §3.1 "Teardown is owned and
 // ordered"). A child whose exit never settles is SIGKILLed, group-killed and unref'd, and
-// REPORTED as an unclean disposal rather than waited on indefinitely: callers treat an unclean
-// verdict as a harness fault, they do not get a proof of termination.
+// REPORTED as an unclean disposal rather than waited on indefinitely: the caller gets a verdict,
+// never a proof of termination. How an unclean verdict is CLASSIFIED is the caller's own decision
+// and the two callers differ — the matrix driver makes it a permanent UnitFailure, the fidelity
+// battery a rerunnable operational abort. That asymmetry is recorded open in ratification.json;
+// do not restate either disposition as though it were universal here.
 export class BatchChild {
   private readonly child: LaunchedChild;
   private readonly outReader: ByteReader;
@@ -513,7 +522,8 @@ export class BatchChild {
   // Ordered, idempotent teardown, every wait BOUNDED. Once this RESOLVES the caller may delete the
   // clone directory and release the child-pool permit (plan §3.1). Resolution is not a proof of
   // termination: a child whose exit never settles is escalated and unref'd, and the pumps may still
-  // be unsettled — that case resolves with an UNCLEAN verdict, which callers treat as a harness fault.
+  // be unsettled — that case resolves with an UNCLEAN verdict, which each caller classifies for
+// itself (the matrix and fidelity lanes deliberately differ; see the class comment above).
   dispose(): Promise<BatchChildDisposal> {
     if (this.disposed !== null) return this.disposed;
     this.disposed = (async (): Promise<BatchChildDisposal> => {

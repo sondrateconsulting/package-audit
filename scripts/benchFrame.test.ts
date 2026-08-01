@@ -71,7 +71,7 @@ describe("BatchFrameParser — content frames", () => {
 });
 
 describe("BatchFrameParser — missing records and violations", () => {
-  test("`<oid> missing` yields a missing frame (the DRIVER fails the unit on it)", () => {
+  test("`<oid> missing` yields a missing frame", () => {
     const p = new BatchFrameParser("sha1", LIMITS);
     p.arm({ oid: OID, size: 9 });
     const frame = p.push(bytes(`${OID} missing\n`));

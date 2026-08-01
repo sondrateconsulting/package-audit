@@ -6,7 +6,10 @@
 // production hides: per-attempt status/headers/bodies, secondary-limit signals classified as
 // production classifies them (github.ts:541), per-request GraphQL point costs, and
 // errors[].path attribution (the production graphql() drops partial data by design, ADR §3).
-// Every attempt is recorded; the recorder feeds runs.jsonl and the G4 signal classifier.
+// Every attempt that RETURNS from the spawn layer is recorded — including every failure it can
+// describe. An attempt whose spawn REJECTS outright (production's byte-cap/stream diagnostics)
+// throws past the recorder, so it leaves no row. The recorder feeds runs.jsonl and the G4 signal
+// classifier.
 
 import { createHash } from "node:crypto";
 import {
@@ -379,9 +382,11 @@ export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, u
 // mints replay-authorizing successes from "ok" records. Degenerate-but-parseable envelopes
 // ({}, {"data":null}, non-object data, errors:[]) are spec-invalid responses a proxy can
 // fabricate with exit 0. At a NONZERO status, non-"ok" verdicts (fatal/throttle/transient) pass
-// through — they are already excluded from the ledger and carry the honest status-based story of
-// their record. Status 0 is the one exception, rewritten to "no-response" below: classifyGraphql
-// has no status-0 arm, so its terminal `fatal` there is not an honest story at all.
+// through — they are already excluded from the ledger and carry the classifier's own honest
+// verdict (which classifyGraphql derives from the body's errors[] and the response headers, NOT
+// from the status alone: a 200 carrying RATE_LIMITED is primary or secondary). Status 0 is the one
+// exception, rewritten to "no-response" below: classifyGraphql has no status-0 arm, so its
+// terminal `fatal` there is not an honest verdict at all.
 export function graphqlRecordClassification(
   status: number,
   clsKind: string,

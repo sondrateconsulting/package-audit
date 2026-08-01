@@ -147,7 +147,7 @@ describe("WallClock + child pool", () => {
     t = 650;
     expect(clock.stop()).toBe(250);
   });
-  test("the child pool is a fixed-size counting pool with FIFO handoff", async () => {
+  test("the child pool is a fixed-size counting pool that hands a released permit to a waiter", async () => {
     const pool = makeChildPool(1);
     const r1 = await pool.acquire();
     let acquired2 = false;
@@ -167,7 +167,7 @@ describe("WallClock + child pool", () => {
   });
 });
 
-describe("summarizeTraffic — one control-plane rule for EVERY record (F7)", () => {
+describe("summarizeTraffic — the shared control-plane rule for every record that summarises traffic (F7)", () => {
   // The bug: the R5 halt record summed httpBodyBytes WITHOUT the rest-meta exclusion that the
   // normal record applies, contradicting the invariant this module states twice ("control-plane
   // probes never count as driver traffic"). Two literals computing the same metric two ways is
@@ -387,7 +387,7 @@ describe("WorkerDiskSampler — the real worker-backed sampler (santa round 2)",
     expect(snap.sampleError).toBeNull();
     rmSync(root, { recursive: true, force: true });
   }, 15_000);
-  test("finish() is idempotent and terminates the worker", async () => {
+  test("finish() is idempotent — a second call returns the first snapshot", async () => {
     const root = mkdtempSync(join(tmpdir(), "pa-bench-worker-"));
     const s = new WorkerDiskSampler();
     const a = await s.finish(root, null);
@@ -395,7 +395,7 @@ describe("WorkerDiskSampler — the real worker-backed sampler (santa round 2)",
     expect(b).toEqual(a);
     rmSync(root, { recursive: true, force: true });
   });
-  test("a reply that never arrives is bounded by the deadline, not an infinite hang", async () => {
+  test("a reply that never arrives surfaces a sampleError and a null store size, not an infinite hang", async () => {
     const root = mkdtempSync(join(tmpdir(), "pa-bench-worker-"));
     const s = new WorkerDiskSampler(50); // 50ms deadline
     // point the walk at a path the worker will answer for, but starve the reply by terminating
@@ -407,7 +407,7 @@ describe("WorkerDiskSampler — the real worker-backed sampler (santa round 2)",
     expect(snap.cloneObjectStoreBytes).toBeNull();
     rmSync(root, { recursive: true, force: true });
   }, 10_000);
-  test("an UNSOLICITED or stale reply cannot fabricate a peak", async () => {
+  test("an UNSOLICITED (out-of-sequence) reply cannot fabricate a peak", async () => {
     // Previously any well-shaped reply with an unrecognised sequence was folded into the peak as
     // "an unawaited tick", so a duplicate, stale, or spurious message could invent a disk figure
     // the filesystem never held. Only the ONE outstanding tick sequence may contribute.
@@ -424,7 +424,7 @@ describe("WorkerDiskSampler — the real worker-backed sampler (santa round 2)",
     s.abandon();
     rmSync(root, { recursive: true, force: true });
   });
-  test("a malformed worker reply is rejected rather than folded into the peak as NaN", () => {
+  test("parseDiskWalkReply rejects malformed replies, so none can reach the peak as NaN", () => {
     expect(parseDiskWalkReply({ seq: 1, bytes: 10 })).toEqual({ seq: 1, bytes: 10 });
     expect(parseDiskWalkReply({ seq: 1, bytes: "10" })).toBeNull();
     expect(parseDiskWalkReply({ seq: 1, bytes: Number.NaN })).toBeNull();
@@ -435,7 +435,7 @@ describe("WorkerDiskSampler — the real worker-backed sampler (santa round 2)",
     expect(parseDiskWalkReply([1, 2])).toBeNull();
     expect(parseDiskWalkReply(null)).toBeNull();
   });
-  test("the WORKER validates its inbound request too — the main thread is not privileged input", () => {
+  test("parseDiskWalkRequest — the worker's inbound validator treats the main thread as unprivileged input", () => {
     expect(parseDiskWalkRequest({ seq: 0, dir: "/x", extras: [], strict: false })).toEqual({ seq: 0, dir: "/x", extras: [], strict: false });
     expect(parseDiskWalkRequest({ seq: 0, dir: "", extras: [], strict: false })).toBeNull();
     expect(parseDiskWalkRequest({ seq: 0, dir: "/x", extras: [1], strict: false })).toBeNull();
@@ -541,7 +541,8 @@ describe("reclaimRunResources — teardown owns the DB, not the happy path (F6)"
   // AFTER the driver try-block. The mid-unit drift branch returned earlier and leaked the handle
   // plus its -wal/-shm sidecars, while the drift record still claimed diskReclaimFailed:false.
   // Several pre-driver throws (probeLiveHead, reserve, readRateLimit, planning) escape the same
-  // way, so reclamation lives in one helper that every exit path runs.
+  // way, so reclamation lives in one helper that every exit path AFTER THE RUN-CACHE DB OPENS
+  // runs (an AuditDb.open throw exits earlier and sweeps only its own DB debris).
   const mkdirp = (p: string): string => { mkdirSync(p, { recursive: true }); return p; };
   test("closes the handle and removes runDir plus every sqlite sidecar", () => {
     const root = mkdtempSync(join(tmpdir(), "pa-bench-reclaim-"));
@@ -591,7 +592,7 @@ describe("reclaimRunResources — teardown owns the DB, not the happy path (F6)"
   });
 });
 
-describe("summarizeSpawns — §4.6 item 5's git-side evidence reaches the record", () => {
+describe("summarizeSpawns — the §4.6 item 5 git-side evidence SUMMARY the record is built from", () => {
   test("counts lanes, timeouts, non-zero exits, and never-settled children", () => {
     const rec = (over: Partial<import("./benchSpawn.ts").BenchSpawnRecord>): import("./benchSpawn.ts").BenchSpawnRecord => ({
       lane: "transport", argv: ["ls-tree"], cwd: null, startedAtMs: 0, wallMs: 1,
@@ -685,7 +686,7 @@ describe("parseRateLimitBucket — R3/R4 verdicts must not ride unvalidated coun
   });
 });
 
-describe("extraBytesStrict — a present-but-unreadable sidecar fails the measurement", () => {
+describe("extraBytesStrict — an absent sidecar is skipped and a readable one is counted", () => {
   test("absent sidecars contribute nothing (they legitimately come and go)", () => {
     expect(extraBytesStrict(["/definitely/not/a/real/sidecar-wal"])).toBe(0);
   });

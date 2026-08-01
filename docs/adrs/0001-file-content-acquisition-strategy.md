@@ -330,7 +330,8 @@ design-surface judgment stays with the decision-maker, and every Step-D outcome 
 challenger win, no-dominator judgment, or remain-proposed-with-remediation — passes one further
 adversarial review round before this ADR changes state. An override of the rule's recommendation
 requires written rationale recorded in the Review history; an ineligible driver can never be
-chosen. Every number in the table above is single-sample and is superseded by the benchmark.
+chosen. Every MEASURED number in the table above is single-sample, and M1 is derived rather than
+run at all; the benchmark supersedes them once it executes, which it has not yet done.
 
 Post-implementation checks:
 

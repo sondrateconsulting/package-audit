@@ -77,7 +77,7 @@ const readEntry = (over: Partial<WorkloadEntry> = {}): WorkloadEntry => ({
 });
 const CTX: UnitContext = { truncatedTree: false, escapeTripped: false, batchContentBytesCap: 1_572_864 };
 
-describe("deriveRoutes — the §4.3 matrix over the complete vocabulary", () => {
+describe("deriveRoutes — the §4.3 matrix over the routes these fixtures exercise", () => {
   test("regular text entry: T0/T2c canonical, T1 primary + 4 permitted operational fallbacks, T2a checkout", () => {
     const r = deriveRoutes(readEntry(), CTX);
     expect(r.T0).toEqual({ primary: "primary", declaredCaveat: false, permittedFallbacks: [], expected: { primary: { seamSha256: HASHES.canonicalSeamSha256 } } });

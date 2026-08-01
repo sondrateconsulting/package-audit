@@ -31,7 +31,7 @@
     "transientBaseWaitMs": 2000
   },
   "restFallbackBudget": {
-    "$comment": "Per-unit REST fallback budget, EVERY driver (§4.4): max(floor, ceil(fractionOfSelected × selected)). Exhaustion is a unit failure (G2).",
+    "$comment": "Per-unit REST fallback budget, EVERY driver (§4.3; §4.4 restates the formula inside T1's failure policy): max(floor, ceil(fractionOfSelected × selected)). Exhaustion is a unit failure (G2).",
     "floor": 20,
     "fractionOfSelected": 0.1,
     "rounding": "ceil"

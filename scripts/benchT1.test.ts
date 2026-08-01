@@ -276,7 +276,7 @@ describe("split machinery", () => {
   });
 });
 
-describe("analyzeBatchResponse — a failed subprocess is not data (santa round 4)", () => {
+describe("analyzeBatchResponse — a failed subprocess cannot supply success-shaped 200 data (santa round 4)", () => {
   // benchGraphqlDispatch records `gh`'s exit code, and the analyzer ignored it. A subprocess that
   // FAILED but happened to emit a parseable 200-shaped body therefore produced resolved aliases —
   // content accepted from a call that did not succeed. The exit code is now checked first.
@@ -299,7 +299,7 @@ describe("analyzeBatchResponse — a failed subprocess is not data (santa round 
   });
 });
 
-describe("analyzeBatchResponse — production-REALISTIC classifications (a 200 with errors[] classifies fatal)", () => {
+describe("analyzeBatchResponse — production-REALISTIC classifications (a 200 with NON-THROTTLE errors[] classifies fatal)", () => {
   // classifyGraphql marks EVERY 200 envelope carrying non-throttle errors[] as fatal (its own
   // drop-partial-data design). An unscoped fatal-preempt therefore dead-coded this table for
   // exactly the envelopes it attributes — the fixtures here carry the classification production
@@ -383,7 +383,7 @@ describe("analyzeBatchResponse — the pinned split trigger is 'empty or non-JSO
   });
 });
 
-describe("analyzeBatchResponse — a FATAL classification is never throttle-like", () => {
+describe("analyzeBatchResponse — a NON-200 FATAL classification is never throttle-like", () => {
   test("an SSO-enforcement 403 carrying a RATE_LIMITED body takes the closed default, not the throttle path", () => {
     // production short-circuits SSO before the RATE_LIMITED branch; routing it to throttle-retry
     // retried a fatal auth condition and let it feed G4's irreversible secondary-signal count
