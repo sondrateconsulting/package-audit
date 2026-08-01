@@ -146,8 +146,8 @@ export type AliasOutcome =
 
 export type BatchAnalysis =
   | {
-      kind: "http-failure"; // 5xx / no HTTP response / non-JSON body → whole-batch attempt failure
-      fivexxSplitCandidate: boolean; // status ∈ pinned {502,503,504} with empty or non-JSON body
+      kind: "http-failure"; // 5xx / no HTTP response / non-JSON-object body → whole-batch attempt failure
+      fivexxSplitCandidate: boolean; // status ∈ pinned {502,503,504} with empty or non-JSON-object body
       rawCondition: string;
     }
   | { kind: "throttle-retry"; cause: "primary" | "secondary" | "rate-limited-body" } // whole-batch backoff retry
@@ -195,13 +195,17 @@ export function analyzeBatchResponse(
   // guard was written for — and stays a whole-batch http-failure.
   if (d.exitCode !== 0 && d.status === 200 && d.jsonParseable && d.errors.length === 0 && d.malformedErrorEntries === 0)
     return { kind: "http-failure", fivexxSplitCandidate: false, rawCondition: `gh exited ${d.exitCode} with a success-shaped 200 envelope` };
-  // HTTP-level failure first: 5xx / no response / a 200 whose body is not JSON.
+  // HTTP-level failure first: 5xx / no response / a 200 whose body is not a JSON OBJECT.
+  // jsonParseable is false for an unparseable body AND for one that parses to a non-object root
+  // ([], null, a bare string/number) — none of which can carry a GraphQL envelope. That is the
+  // pinned `bodies: "empty-or-non-json-object"` condition, named precisely: the earlier
+  // "non-JSON" wording described a narrower predicate than the one measured at pinning.
   if (d.status === 0 || d.status >= 500 || (d.status === 200 && !d.jsonParseable)) {
-    const bodyEmptyOrNonJson = d.bodyText.trim() === "" || !d.jsonParseable;
+    const bodyEmptyOrNonJsonObject = d.bodyText.trim() === "" || !d.jsonParseable;
     return {
       kind: "http-failure",
-      fivexxSplitCandidate: cfg.t1.splitTriggers.consecutive5xx.statuses.includes(d.status) && bodyEmptyOrNonJson,
-      rawCondition: `HTTP ${d.status}${d.jsonParseable ? "" : " non-JSON body"}`,
+      fivexxSplitCandidate: cfg.t1.splitTriggers.consecutive5xx.statuses.includes(d.status) && bodyEmptyOrNonJsonObject,
+      rawCondition: `HTTP ${d.status}${d.jsonParseable ? "" : " non-JSON-object body"}`,
     };
   }
   // throttle semantics next (classifyGraphql already ran): primary/secondary/RATE_LIMITED body.

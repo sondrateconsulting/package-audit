@@ -645,6 +645,30 @@ describe("graphqlRecordClassification — degenerate envelopes never record 'ok'
     expect(graphqlRecordClassification(200, "fatal", parseGraphqlBodyFull('{"data":null,"errors":[{"type":"FORBIDDEN","message":"x"}]}'))).toBe("fatal");
     expect(graphqlRecordClassification(502, "transient", parseGraphqlBodyFull("<html>bad gateway</html>"))).toBe("transient");
   });
+  test("a status-0 dispatch records no-response, never fatal (santa-2 R1)", () => {
+    // classifyGraphql has no status-0 arm, so a network-layer failure reaches its TERMINAL fatal
+    // branch. Recording that as "fatal" reported a transient condition as a permanent one, and
+    // disagreed with both the REST lane (which emits "no-response" for the identical condition)
+    // and runT1's own "no-response" R1 evidence built from the same dispatch.
+    expect(graphqlRecordClassification(0, "fatal", parseGraphqlBodyFull(""))).toBe("no-response");
+  });
+});
+
+describe("parseGraphqlBodyFull — a present errors[].message:null is malformed EVIDENCE (santa-2 R1)", () => {
+  // production flags every PRESENT non-string message (Object.hasOwn + typeof !== "string"),
+  // null included; the bench parser exempted null while the adjacent `type` line did not.
+  test("message:null counts a malformed entry", () => {
+    const parsed = parseGraphqlBodyFull('{"data":{"repository":{}},"errors":[{"type":"NOT_FOUND","message":null,"path":["repository","a1"]}]}');
+    expect(parsed.malformedErrorEntries).toBe(1);
+  });
+  test("type:null is counted the same way — the two lines stay symmetric", () => {
+    const parsed = parseGraphqlBodyFull('{"data":{"repository":{}},"errors":[{"type":null,"message":"x","path":["repository","a1"]}]}');
+    expect(parsed.malformedErrorEntries).toBe(1);
+  });
+  test("an ABSENT message is still fine — only a present one is evidence", () => {
+    const parsed = parseGraphqlBodyFull('{"data":{"repository":{}},"errors":[{"type":"NOT_FOUND","path":["repository","a1"]}]}');
+    expect(parsed.malformedErrorEntries).toBe(0);
+  });
 });
 
 describe("parseRateLimitBucket — R3/R4 verdicts must not ride unvalidated counters", () => {

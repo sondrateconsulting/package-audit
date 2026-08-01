@@ -302,7 +302,12 @@ export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, u
       // envelope parser treats it — sanitizing it to null and proceeding accepted (e.g. routed a
       // TIMEOUT with an object-valued message through the split path) what production rejects
       if (eo["type"] !== undefined && typeof eo["type"] !== "string") malformedErrorEntries++;
-      if (eo["message"] !== undefined && eo["message"] !== null && typeof eo["message"] !== "string") malformedErrorEntries++;
+      // NO null exemption: production flags every PRESENT non-string message (Object.hasOwn +
+      // typeof !== "string" → note()), null included, and the `type` line above already counts a
+      // present null. Exempting message:null let a partial-data 200 carrying
+      // {type:"NOT_FOUND",message:null,path:[…]} resolve its valid aliases and record the batch
+      // as a success — malformed transport evidence entering the §4.5 R2 ledger.
+      if (eo["message"] !== undefined && typeof eo["message"] !== "string") malformedErrorEntries++;
       const type = typeof eo["type"] === "string" ? (eo["type"] as string) : null;
       const message = typeof eo["message"] === "string" ? (eo["message"] as string) : null;
       if (type === null && message === null && path === null) {
@@ -329,6 +334,12 @@ export function graphqlRecordClassification(
   clsKind: string,
   envelope: { jsonParseable: boolean; data: Record<string, unknown> | null; malformedErrorEntries: number },
 ): string {
+  // NO HTTP RESPONSE FIRST, ahead of the clsKind pass-through: classifyGraphql has no status-0
+  // arm, so a network-layer failure falls to its terminal `fatal` branch and would be RECORDED
+  // as fatal — the REST lane emits "no-response" for the identical condition, runT1 builds
+  // "no-response" R1 evidence from the same dispatch, and a runs.jsonl row calling a network
+  // failure fatal misreports a transient condition as a permanent one.
+  if (status === 0) return "no-response";
   if (clsKind !== "ok") return clsKind;
   // benchT1's table accepts ONLY status-200 envelopes: production's classifier calls any
   // errorless 2xx "ok" (a proxy-transformed 203/206 included, with gh exiting 0), but the

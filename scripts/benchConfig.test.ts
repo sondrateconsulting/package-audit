@@ -29,7 +29,7 @@ describe("the committed bench-config.json", () => {
     expect(CFG.t1.split).toEqual({ maxDepth: 2, maxDescendantsPerOriginal: 4 });
     expect(CFG.t1.circuitBreakerConsecutiveFailedDispatches).toBe(3);
     expect(CFG.t1.splitTriggers.graphqlErrorType).toBe("TIMEOUT");
-    expect(CFG.t1.splitTriggers.consecutive5xx).toEqual({ count: 2, statuses: [502, 503, 504], bodies: "empty-or-non-json", capUtilisationFloor: 0.8 });
+    expect(CFG.t1.splitTriggers.consecutive5xx).toEqual({ count: 2, statuses: [502, 503, 504], bodies: "empty-or-non-json-object", capUtilisationFloor: 0.8 });
     expect(CFG.restFallbackBudget).toEqual({ floor: 20, fractionOfSelected: 0.1 });
     expect(CFG.budget.pMaxPointsPerGraphqlAttempt).toBe(10); // never the 1-point floor
     expect(CFG.budget.headroomFactor).toBe(1.1);

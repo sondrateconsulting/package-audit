@@ -320,6 +320,41 @@ describe("analyzeBatchResponse — production-REALISTIC classifications (a 200 w
   });
 });
 
+describe("analyzeBatchResponse — a SECONDARY-shaped 5xx still takes the HTTP-level branch (santa-2 R1)", () => {
+  // The HTTP-level arm runs BEFORE the throttle arms, so a 502 carrying a RATE_LIMITED body
+  // (classifyGraphql: secondary) never reaches throttle-retry — it lands in runT1's http-failure
+  // handler. That is by design, but it means the failure evidence built there sees a
+  // secondary-signalled dispatch: labelling it from the STATUS alone recorded "transient", which
+  // evidenceIsRerunnable accepts as R2 evidence, laundering a signal §4.5 says is never
+  // replayable. runT1 now derives the label from secondaryLike first; this pins the ordering the
+  // defect depended on so a future reshuffle cannot silently reopen it.
+  test("a 502 with a RATE_LIMITED body is an http-failure, not a throttle-retry", () => {
+    const a = analyzeBatchResponse(dispatch({
+      status: 502, exitCode: 1, classification: "secondary", secondaryLike: true,
+      bodyText: '{"errors":[{"type":"RATE_LIMITED"}]}',
+      errors: [{ type: "RATE_LIMITED", message: null, path: null }],
+    }), BATCH, "sha1", CFG);
+    expect(a).toMatchObject({ kind: "http-failure" });
+  });
+});
+
+describe("analyzeBatchResponse — the pinned split trigger is 'empty or non-JSON-OBJECT' (santa-2 R1)", () => {
+  // parseGraphqlBodyFull reports jsonParseable:false for a body that PARSES but whose root is not
+  // a non-array object, so these qualify the pinned 502/503/504 trigger. The frozen config said
+  // "empty-or-non-json", a narrower claim than the predicate measured at pinning; the label is
+  // now "empty-or-non-json-object" and the behaviour is unchanged.
+  test("a valid-JSON non-object body ([] / null / bare string) is a split candidate", () => {
+    for (const body of ["[]", "null", '"proxy error"']) {
+      const a = analyzeBatchResponse(dispatch({ status: 503, exitCode: 1, classification: "transient", bodyText: body, jsonParseable: false, data: null }), BATCH, "sha1", CFG);
+      expect(a).toMatchObject({ kind: "http-failure", fivexxSplitCandidate: true });
+    }
+  });
+  test("a 5xx carrying a well-formed JSON OBJECT body is NOT a split candidate", () => {
+    const a = analyzeBatchResponse(dispatch({ status: 503, exitCode: 1, classification: "transient", bodyText: '{"data":null,"errors":[{"type":"X","message":"y"}]}', jsonParseable: true, errors: [{ type: "X", message: "y", path: null }] }), BATCH, "sha1", CFG);
+    expect(a).toMatchObject({ kind: "http-failure", fivexxSplitCandidate: false });
+  });
+});
+
 describe("analyzeBatchResponse — a FATAL classification is never throttle-like", () => {
   test("an SSO-enforcement 403 carrying a RATE_LIMITED body takes the closed default, not the throttle path", () => {
     // production short-circuits SSO before the RATE_LIMITED branch; routing it to throttle-retry

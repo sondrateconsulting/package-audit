@@ -1829,6 +1829,17 @@ export class AuditDb {
     // undone.
     const userVersion = initWritableConnection(db, path);
 
+    // Everything from here to `new AuditDb(db)` — the --fresh drop, schema creation, the v2→v4
+    // migrations and the run_unit_head self-heal — can throw (a failed migration, a damaged page
+    // surfacing mid-DDL, ENOSPC). Until the AuditDb wrapper exists NO caller owns this handle, so
+    // a throw here previously leaked an OPEN connection (and its WAL lock) until process exit.
+    // initWritableConnection closes on its own failure and openReadOnly closes on its validation
+    // failure; this span was the one writable gap between them. It matters most for short-lived
+    // per-call databases (the ADR-0001 bench opens one run-cache DB per repetition): that caller
+    // can unlink the files it named, but it cannot close a handle it was never handed. Close,
+    // then rethrow the ORIGINAL error unchanged — it already carries its own remediation, and
+    // re-wrapping would bury it.
+    try {
     if (opts.fresh === true) {
       // Count what --fresh erases INSIDE the drop transaction (a count taken outside could
       // race a concurrent writer), but warn only AFTER the transaction commits — the warning
@@ -1888,6 +1899,15 @@ export class AuditDb {
       })();
     }
     return new AuditDb(db);
+    } catch (e) {
+      try {
+        db.close();
+      } catch {
+        // the original failure is the one worth reporting — a close failure on an already-broken
+        // handle must not mask it (the same posture initWritableConnection's catch takes)
+      }
+      throw e;
+    }
   }
 
   // The read-command open seam (report/export/compare/--html): {readonly:true}, busy_timeout

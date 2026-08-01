@@ -54,7 +54,7 @@
           503,
           504
         ],
-        "bodies": "empty-or-non-json",
+        "bodies": "empty-or-non-json-object",
         "capUtilisationFloor": 0.8
       }
     },

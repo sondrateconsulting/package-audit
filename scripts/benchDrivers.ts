@@ -473,10 +473,16 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
       const retryRemains = attempts < ctx.cfg.rest.attemptCap;
       if (analysis.kind === "http-failure") {
         // R2's evidence is 5xx-only (plan §4.5): a 200-with-non-JSON parse failure is NOT a
-        // rerunnable shape (codex R4)
+        // rerunnable shape (codex R4). SECONDARY SHAPE OUTRANKS THE STATUS: analyzeBatchResponse
+        // takes its HTTP-level branch before the throttle arms, so a 5xx carrying a RATE_LIMITED
+        // body (or classified secondary) arrives here too — deriving the label from the status
+        // alone relabelled it "transient" and made it R2-rerunnable, which §4.5 ("secondary-limit
+        // signals are not replayable under any category") and evidenceIsRerunnable's own contract
+        // both forbid. PRIMARY is deliberately NOT rerouted: an exhausted-window 5xx stays
+        // "transient" so a budget condition cannot permanently disqualify the driver.
         failedDispatch({
           code: d.status === 0 ? "no-response" : "http-failure",
-          lastClassification: d.status === 0 ? "no-response" : d.status >= 500 ? "transient" : "non-json",
+          lastClassification: d.status === 0 ? "no-response" : d.secondaryLike ? "secondary" : d.status >= 500 ? "transient" : "non-json",
         }, analysis.rawCondition);
         consecutive5xx = analysis.fivexxSplitCandidate ? consecutive5xx + 1 : 0;
         if (fivexxSplitConditionMet(batch, consecutive5xx, ctx.cfg) && canSplit(item)) enqueueSplit(item);

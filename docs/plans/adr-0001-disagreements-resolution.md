@@ -414,7 +414,7 @@ cause `content-cap-singleton`, counted. Failure policy, all constants literal: t
 bounded retry within **6 total attempts** (the literal value of production `MAX_ATTEMPTS`,
 [github.ts:1000](../../scripts/github.ts#L1000)), never split on first failure; split trigger —
 a GraphQL error whose `type` is `TIMEOUT` (or message matching the pinned timeout regex in
-`bench-config.json`), or two consecutive HTTP 502/503/504 responses with empty or non-JSON bodies
+`bench-config.json`), or two consecutive HTTP 502/503/504 responses with empty or non-JSON-object bodies
 on a batch whose alias count or query bytes are ≥ 80% of cap; binary split with descendant depth
 ≤ 2 and ≤ 4 descendants per original batch, each dispatch (original or descendant) drawing from
 the same 6-attempt total; circuit breaker — 3 consecutive failed dispatches abort the unit (a G2

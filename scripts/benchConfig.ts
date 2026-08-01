@@ -315,9 +315,9 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
       diskGateBytes: num(protocol, "protocol", "diskGateBytes", { min: 1 }),
       diskSamplerHz: num(protocol, "protocol", "diskSamplerHz", { min: 1 }),
       g4: {
-        pass: num(g4, "protocol.g4", "pass", { min: 0 }),
-        warnAtMost: num(g4, "protocol.g4", "warnAtMost", { min: 0 }),
-        failAt: num(g4, "protocol.g4", "failAt", { min: 1 }),
+        pass: num(g4, "protocol.g4AttributableSecondarySignals", "pass", { min: 0 }),
+        warnAtMost: num(g4, "protocol.g4AttributableSecondarySignals", "warnAtMost", { min: 0 }),
+        failAt: num(g4, "protocol.g4AttributableSecondarySignals", "failAt", { min: 1 }),
       },
       rerunAllowancePerUnitDriver: num(protocol, "protocol", "rerunAllowancePerUnitDriver", { min: 0 }),
       fidelityBattery: {
@@ -356,14 +356,26 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
 
   // cross-field coherence the formulas rely on
   if (cfg.protocol.g4.failAt !== cfg.protocol.g4.warnAtMost + 1)
-    fail("protocol.g4: failAt must be warnAtMost + 1 (pass/warn/fail is a partition)");
-  // pass is the partition's lower bound and the classifier treats "no attributable signal" as the
-  // only passing count, so any other value would be a frozen-config claim no code honours
-  if (cfg.protocol.g4.pass !== 0) fail("protocol.g4: pass must be 0 — the partition's passing band is exactly zero attributable secondary signals");
-  // benchT1 hardcodes the qualifying-body condition (empty or non-JSON); pinning the literal keeps
-  // the preregistered value and the implemented predicate from drifting apart silently
-  if (cfg.t1.splitTriggers.consecutive5xx.bodies !== "empty-or-non-json")
-    fail("t1.splitTriggers.consecutive5xx.bodies must be 'empty-or-non-json' — the implemented split predicate hardcodes that condition; a different value requires the implementing code change with its §8 amendment");
+    fail("protocol.g4AttributableSecondarySignals: failAt must be warnAtMost + 1 (pass/warn/fail is a partition)");
+  // These three numbers are the PREREGISTERED G4 partition (plan §4.7: zero attributable signals =
+  // pass, exactly one = pass WITH a recorded warning, two or more = fail). Stated narrowly, because
+  // an overstated claim here is the same defect the removed fidelityBattery.when field was: the
+  // harness itself only COUNTS attributable signals (summarizeTraffic's secondarySignals) and
+  // records the count per run — the pass/warn/fail judgment is applied at analysis time, not by any
+  // classifier in this module. The loader therefore pins the partition's SHAPE: pass is its
+  // clean-pass count, fixed at zero by §4.7, and a nonzero value would silently redefine a
+  // ratified gate. It does NOT claim the passing band is zero alone — one signal still passes,
+  // with a warning, which is what warnAtMost carries.
+  if (cfg.protocol.g4.pass !== 0)
+    fail("protocol.g4AttributableSecondarySignals: pass must be 0 — §4.7 fixes the clean-pass count at zero attributable secondary signals (one still passes, with a recorded warning: that is warnAtMost)");
+  // benchT1 hardcodes the qualifying-body condition; pinning the literal keeps the preregistered
+  // value and the implemented predicate from drifting apart silently. The literal says JSON
+  // OBJECT deliberately: parseGraphqlBodyFull reports jsonParseable:false for a body that parses
+  // but whose root is not a non-array object ([], null, a bare string/number), so benchT1's
+  // `trim() === "" || !jsonParseable` qualifies those too. The earlier "empty-or-non-json" label
+  // therefore described a NARROWER predicate than the one measured at pinning.
+  if (cfg.t1.splitTriggers.consecutive5xx.bodies !== "empty-or-non-json-object")
+    fail("t1.splitTriggers.consecutive5xx.bodies must be 'empty-or-non-json-object' — the implemented split predicate hardcodes that condition (an empty body, or one whose JSON root is not an object); a different value requires the implementing code change with its §8 amendment");
   if (cfg.frame.frameCeilingBytes !== cfg.spawn.outputCapBytes)
     fail("frame.frameCeilingBytes must equal spawn.outputCapBytes (the plan pins the ceiling to production's spawn cap)");
   if (cfg.pilot.reps !== cfg.reps) fail("pilot.reps must equal reps (the pilot calibrates the same K)");
