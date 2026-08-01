@@ -1407,7 +1407,8 @@ async function cmdFidelity(): Promise<void> {
               } finally {
                 // the fidelity battery reads bytes through this child, so an unclean teardown
                 // means the bytes it just delivered cannot be vouched for. Raised as a HARNESS
-                // fault, never as a transport divergence — §4.7 disqualification is permanent.
+                // fault, never as a transport divergence — §4.7 disqualification is permanent. This applies only
+                // where the disposal is the SOLE failure; otherwise the verdict is appended below.
                 // When a readObject error is ALREADY propagating, a throw here would REPLACE it
                 // (the same evidence-masking runT2c's teardown annotation prevents), so the
                 // disposal verdict is appended to the in-flight error instead.
@@ -1644,7 +1645,7 @@ export function reconstructResumeState(
     // only R1/R2 replays charge the driver allowance; R3/R4 in-slot replays do not (f.23)
     if (rec["replayKind"] === "r1r2") rerunUsed.add(`${unit}|${expected.driver}`);
     if (outcome === "complete") {
-      // §4.5 R2 needs classes that SUCCEEDED — `requests` counts every attempt including
+      // §4.5 R2 needs classes that SUCCEEDED — `requests` counts recorded non-cache, non-rest-meta attempts including
       // failures (a completed run can carry a class that only ever failed, e.g. every batch
       // drained to fallback), so the ledger reads the ok-classes field
       const okClasses = rec["okRequestClasses"];

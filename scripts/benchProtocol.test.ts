@@ -167,7 +167,7 @@ describe("WallClock + child pool", () => {
   });
 });
 
-describe("summarizeTraffic — the shared control-plane rule for every record that summarises traffic (F7)", () => {
+describe("summarizeTraffic — the shared control-plane rule, called directly (F7)", () => {
   // The bug: the R5 halt record summed httpBodyBytes WITHOUT the rest-meta exclusion that the
   // normal record applies, contradicting the invariant this module states twice ("control-plane
   // probes never count as driver traffic"). Two literals computing the same metric two ways is
@@ -424,7 +424,7 @@ describe("WorkerDiskSampler — the real worker-backed sampler (santa round 2)",
     s.abandon();
     rmSync(root, { recursive: true, force: true });
   });
-  test("parseDiskWalkReply rejects malformed replies, so none can reach the peak as NaN", () => {
+  test("parseDiskWalkReply rejects malformed replies", () => {
     expect(parseDiskWalkReply({ seq: 1, bytes: 10 })).toEqual({ seq: 1, bytes: 10 });
     expect(parseDiskWalkReply({ seq: 1, bytes: "10" })).toBeNull();
     expect(parseDiskWalkReply({ seq: 1, bytes: Number.NaN })).toBeNull();
@@ -592,7 +592,7 @@ describe("reclaimRunResources — teardown owns the DB, not the happy path (F6)"
   });
 });
 
-describe("summarizeSpawns — the §4.6 item 5 git-side evidence SUMMARY the record is built from", () => {
+describe("summarizeSpawns — the §4.6 item 5 git-side evidence SUMMARY object", () => {
   test("counts lanes, timeouts, non-zero exits, and never-settled children", () => {
     const rec = (over: Partial<import("./benchSpawn.ts").BenchSpawnRecord>): import("./benchSpawn.ts").BenchSpawnRecord => ({
       lane: "transport", argv: ["ls-tree"], cwd: null, startedAtMs: 0, wallMs: 1,
@@ -642,7 +642,7 @@ describe("graphqlRecordClassification — degenerate envelopes never record 'ok'
     expect(graphqlRecordClassification(203, "ok", parseGraphqlBodyFull('{"data":{"repository":{}}}'))).toBe("unaccepted-2xx");
     expect(graphqlRecordClassification(206, "ok", parseGraphqlBodyFull('{"data":{"repository":{}}}'))).toBe("unaccepted-2xx");
   });
-  test("at a NONZERO status, non-'ok' verdicts pass through untouched — they carry the honest status-based story", () => {
+  test("at a NONZERO status, non-'ok' verdicts pass through untouched — they carry the classifier's own verdict", () => {
     expect(graphqlRecordClassification(200, "fatal", parseGraphqlBodyFull('{"data":null,"errors":[{"type":"FORBIDDEN","message":"x"}]}'))).toBe("fatal");
     expect(graphqlRecordClassification(502, "transient", parseGraphqlBodyFull("<html>bad gateway</html>"))).toBe("transient");
   });

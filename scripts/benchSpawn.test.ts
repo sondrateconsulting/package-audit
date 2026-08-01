@@ -132,7 +132,7 @@ describe("one-shot byte capture", () => {
       pin(["cat-file", "blob", blobOid], REPO, { limits: { ...LIMITS, maxStdoutBytes: 4 } }),
     ).rejects.toThrow(BenchSpawnError);
   });
-  test("the observer records lane and exit for each launch", async () => {
+  test("the observer records lane and exit for a successful launch", async () => {
     const records: BenchSpawnRecord[] = [];
     await pin(["rev-parse", "--git-dir"], REPO, { onRecord: (r) => records.push(r) });
     expect(records.length).toBe(1);

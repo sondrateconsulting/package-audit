@@ -385,7 +385,8 @@ export class RunsLog {
 export interface TrafficSummary {
   requests: Record<string, number>;
   // classes with at least one SUCCESSFUL attempt — §4.5 R2's ledger input ("succeeded in at
-  // least one other repetition"): `requests` counts every RECORDED attempt including failures, and a
+  // least one other repetition"): `requests` counts recorded attempts that are neither cache-served
+  // nor rest-meta control-plane probes, failures included, and a
   // completed run can contain a class that only ever failed (e.g. every batch drained to
   // batch-error-fallback), which must not authorize an R2 replay. TWO sources feed it: the
   // record classification (an "ok"/"not-modified" the envelope supports), and the caller's
@@ -403,8 +404,8 @@ export interface TrafficSummary {
 // attempts crossed no wire, and rest-meta probes are the harness's own book-keeping — neither is
 // driver evidence (§4.6). Every run record that HAS traffic to summarise — the normal, the
 // finalisation-failure and the R5 halt records — derives its figures here so the rule cannot
-// drift between them; the drift-restart record hardcodes empty counters instead, having measured
-// nothing. It is NOT the only expression of the rest-meta rule in this module either: live R5
+// drift between them; the PRE-REP drift-restart record hardcodes empty counters instead, having
+// measured nothing (a DriftSignal raised mid-run takes the normal tail and DOES summarise here). It is NOT the only expression of the rest-meta rule in this module either: live R5
 // accounting and R3 foreign-consumption reconciliation each re-encode it against their own scans.
 export function summarizeTraffic(httpRecords: readonly BenchHttpAttemptRecord[], tableAcceptedClasses: readonly string[] = []): TrafficSummary {
   const requests: Record<string, number> = {};

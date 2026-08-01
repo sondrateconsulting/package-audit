@@ -33,7 +33,7 @@ describe("assertFreezeGitState — the §8 dirty-tree leg must fail closed (F2)"
     expect(() => assertFreezeGitState(gitFail(128), gitOk(), APPEND_ONLY))
       .toThrow(/git status --porcelain failed/);
   });
-  test("the refusal carries the exit code and the stderr tail for the operator", () => {
+  test("the refusal carries the exit code and a bounded stderr excerpt for the operator", () => {
     let msg = "";
     try {
       assertFreezeGitState(gitFail(128, "fatal: detected dubious ownership"), gitOk(), APPEND_ONLY);
@@ -141,11 +141,11 @@ describe("describeDisposal — the batch child's teardown verdict survives", () 
   });
 });
 
-describe("UnitFailure.annotateTeardown — the cause2 field the run record is built from", () => {
+describe("UnitFailure.annotateTeardown — the cause2 field it sets", () => {
   // The engine writes `failureCause = e.cause2`, not `e.message`. A previous fix annotated
   // `message` only, so the batch child's disposal diagnosis was preserved in an error nobody
   // read and still absent from runs.jsonl — the exact discard it was meant to fix.
-  test("the annotation lands on cause2, which is what the run record reads", () => {
+  test("the annotation lands on cause2", () => {
     const f = new UnitFailure("batch child died twice: deadline expired");
     f.annotateTeardown("batch child teardown was also unclean: protocol fault: poisoned");
     expect(f.cause2).toContain("died twice");
@@ -497,7 +497,7 @@ describe("replayRank — the T1 breaker's streak rule (santa-2 R2/R3)", () => {
     expect(weakest(["transient", "transient", "no-response"])).toBe(1);
     expect(weakest(["no-response", "no-response", "no-response"])).toBe(2);
   });
-  test("it stays in lockstep with evidenceIsRerunnable over synthetic evidence shaped as runT1 builds it", () => {
+  test("it stays in lockstep with evidenceIsRerunnable over synthetic run-record evidence pairs", () => {
     // NB evidenceIsRerunnable keys R1 on the CODE and R2 on the lastClassification. runT1 moves
     // the two together (status 0 sets BOTH to "no-response"), so the streak rule can key on the
     // classification alone — but the pairing is the thing under test, not the classification in

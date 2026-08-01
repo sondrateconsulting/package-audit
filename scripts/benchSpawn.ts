@@ -12,7 +12,8 @@
 //                     launched argv itself (caller-supplied argv is rejected). Bench
 //                     scaffolding, not proposed production grammar (plan §4.1).
 //   • "pinning"     — pinning/diagnostic tooling, deliberately unconstrained by grammar
-//                     (plan §4.3 "pinning tooling is unconstrained"), byte-capped, cwd-contained,
+//                     (plan §4.3 "pinning tooling is unconstrained"), byte-capped, contained where
+//                     a cwd is supplied (it is optional, and some pinning calls omit it),
 //                     and reported to the spawn observer WHEN ONE IS SUPPLIED (onRecord is
 //                     optional; several pinning call sites pass none, or a no-op). NB the
 //                     containment check covers cwd plus the write destinations it recognises
@@ -362,9 +363,11 @@ interface PendingRead {
 // ordered"). A child whose exit never settles is SIGKILLed, group-killed and unref'd, and
 // REPORTED as an unclean disposal rather than waited on indefinitely: the caller gets a verdict,
 // never a proof of termination. How an unclean verdict is CLASSIFIED is the caller's own decision
-// and the two callers differ — the matrix driver makes it a permanent UnitFailure, the fidelity
-// battery a rerunnable operational abort. That asymmetry is recorded open in ratification.json;
-// do not restate either disposition as though it were universal here.
+// and the two callers differ — WHERE THE UNCLEAN DISPOSAL IS THE SOLE FAILURE, the matrix driver
+// makes it a permanent UnitFailure and the fidelity battery a rerunnable operational abort; where
+// another error is already propagating, each APPENDS the verdict to that error rather than
+// replacing it. That asymmetry is recorded open in ratification.json; do not restate either
+// disposition as though it were universal here.
 export class BatchChild {
   private readonly child: LaunchedChild;
   private readonly outReader: ByteReader;
