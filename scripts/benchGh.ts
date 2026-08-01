@@ -212,6 +212,11 @@ export async function benchRestGet(ctx: BenchGhContext, opts: BenchRestOptions):
     }
     if (parsed.status === 200 && res.exitCode !== 0) {
       emit("truncated", null);
+      // fold it like every other recorded attempt: a truncated transfer is rank 0 (§4.5 replays
+      // neither R1 nor R2 on it), so a chain of {truncated, truncated, status 0} must NOT throw
+      // bare no-response and buy an unconditional replay. Missing this fold was the same
+      // laundering one branch over — the branch RETRIES, so it can precede any later throw.
+      foldWeakest("truncated");
       if (attempt < ctx.cfg.rest.attemptCap - 1) {
         await ctx.sleep(backoffWait(ctx.cfg, "transient", attempt, null));
         continue;

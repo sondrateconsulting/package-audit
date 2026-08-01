@@ -366,8 +366,18 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
   // clean-pass count, fixed at zero by §4.7, and a nonzero value would silently redefine a
   // ratified gate. It does NOT claim the passing band is zero alone — one signal still passes,
   // with a warning, which is what warnAtMost carries.
+  // ALL THREE are pinned, not just `pass` plus the partition-shape rule: `failAt === warnAtMost+1`
+  // alone accepted 0/2/3, which moves driver disqualification from two attributable signals to
+  // three while the SIGNED answer ("G4 attributable-secondary-signal partition pass/warn/fail at
+  // 0/1/≥2") stays byte-identical and the freeze gate — which only checks that the answer string
+  // is non-empty — cannot notice. These numbers have no consumer outside this loader, so nothing
+  // downstream would have repaired the mismatch either.
   if (cfg.protocol.g4.pass !== 0)
     fail("protocol.g4AttributableSecondarySignals: pass must be 0 — §4.7 fixes the clean-pass count at zero attributable secondary signals (one still passes, with a recorded warning: that is warnAtMost)");
+  if (cfg.protocol.g4.warnAtMost !== 1)
+    fail("protocol.g4AttributableSecondarySignals: warnAtMost must be 1 — the ratified partition is exactly 0/1/≥2; widening the warn band would move driver disqualification without touching the signed answer");
+  if (cfg.protocol.g4.failAt !== 2)
+    fail("protocol.g4AttributableSecondarySignals: failAt must be 2 — the ratified partition is exactly 0/1/≥2; a different threshold requires a §8 amendment that re-states the ratified constant");
   // benchT1 hardcodes the qualifying-body condition; pinning the literal keeps the preregistered
   // value and the implemented predicate from drifting apart silently. The literal says JSON
   // OBJECT deliberately: parseGraphqlBodyFull reports jsonParseable:false for a body that parses

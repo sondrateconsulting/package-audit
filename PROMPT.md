@@ -1181,7 +1181,9 @@ audit product; the ADR-0001 benchmark harness adds ONE further, separately-gated
 audit entrypoint;
 each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
 (`assertReadOnlyGh`/`assertReadOnlyGit`/`assertReadOnlyTar`) on the argv ARRAY before
-spawning. A test greps the repo as a best-effort tripwire asserting NO file other than those two reaches a
+spawning. A test greps the repo as a best-effort tripwire asserting that — apart from two SCANNER
+test files exempted wholesale by exact path, `github.test.ts` and `tuiPurity.test.ts`, which must
+spell the very tokens they assert on (and `github.test.ts` does itself spawn) — no file other than those two reaches a
 spawn surface (`Bun.spawn`/`Bun.spawnSync`/`Bun.$` — dotted, optional-chained, or whitespaced;
 imported from the `"bun"` module; aliased, parenthesized, bracket-accessed, or reached via
 `globalThis.Bun`), uses `child_process` in any form, imports a dynamic specifier that is a bare

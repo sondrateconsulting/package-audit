@@ -80,6 +80,19 @@ describe("loader fail-closed behaviour", () => {
     })).toThrow(BenchConfigError);
     expect(mutate((o) => { (o["frame"] as Record<string, unknown>)["frameCeilingBytes"] = 1; })).toThrow(BenchConfigError);
     expect(mutate((o) => { ((o["protocol"] as Record<string, unknown>)["g4AttributableSecondarySignals"] as Record<string, unknown>)["failAt"] = 5; })).toThrow(BenchConfigError);
+    // the ratified partition is EXACTLY 0/1/>=2: a self-consistent-but-shifted band (0/2/3) kept
+    // failAt === warnAtMost + 1 and so parsed, moving driver disqualification from two signals to
+    // three while the signed protocolConstants answer stayed byte-identical (santa-2 R4)
+    expect(mutate((o) => {
+      const g4 = (o["protocol"] as Record<string, unknown>)["g4AttributableSecondarySignals"] as Record<string, unknown>;
+      g4["warnAtMost"] = 2;
+      g4["failAt"] = 3;
+    })).toThrow(/warnAtMost must be 1/);
+    expect(mutate((o) => {
+      const g4 = (o["protocol"] as Record<string, unknown>)["g4AttributableSecondarySignals"] as Record<string, unknown>;
+      g4["warnAtMost"] = 0;
+      g4["failAt"] = 1;
+    })).toThrow(/warnAtMost must be 1/);
     expect(mutate((o) => { o["reps"] = 4; })).toThrow(BenchConfigError); // must equal declared orders
     expect(mutate((o) => { ((o["t1"] as Record<string, unknown>)["splitTriggers"] as Record<string, unknown>)["timeoutMessageRegex"] = "("; })).toThrow(BenchConfigError);
     expect(mutate((o) => { (o["restFallbackBudget"] as Record<string, unknown>)["rounding"] = "floor"; })).toThrow(BenchConfigError);
