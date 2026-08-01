@@ -180,9 +180,6 @@ export function analyzeBatchResponse(
   const isTimeoutError = (e: { type: string | null; message: string | null }): boolean =>
     e.type === cfg.t1.splitTriggers.graphqlErrorType ||
     (e.message !== null && cfg.t1.splitTriggers.timeoutMessageRe.test(e.message));
-  // malformed errors[] members carry no attributable signal — the closed default, never a drop
-  if (d.malformedErrorEntries > 0 && d.status === 200 && d.jsonParseable)
-    return { kind: "default-failure", rawCondition: `${d.malformedErrorEntries} malformed errors[] member(s)` };
   // gh exits 1 BY DESIGN after a COMPLETE HTTP-200 envelope whose body carries errors[] — and
   // on every non-2xx status (github.ts documents exactly this at its graphql() attempt loop,
   // and deliberately avoids a broad nonzero-exit guard there because it would blind-retry real
@@ -226,6 +223,19 @@ export function analyzeBatchResponse(
   if (d.status !== 200)
     return { kind: "default-failure", rawCondition: `unhandled HTTP ${d.status} (classification ${d.classification})` };
 
+  // Malformed errors[] members carry no attributable signal — the closed default, never a silent
+  // drop (codex R1 finding 5). It sits HERE, after every classification-derived branch, because
+  // production's envelope contract makes `errors` and `malformed` INDEPENDENT (github.ts's
+  // GraphqlEnvelope: "a consumer must classify off `errors` FIRST and treat `malformed` only as
+  // 'do not accept as success', never as 'the errors are worthless'"), and production's graphql()
+  // consults `malformed` only on the `ok` outcome. Preempting the whole table on it inverted that:
+  // a readable RATE_LIMITED beside ONE junk sibling (errors:[null,{type:"RATE_LIMITED"}], or a
+  // present message:null) took the closed default instead of the throttle path, turning a
+  // secondary-limit condition into a permanent T1 driver failure — the transient-becomes-permanent
+  // class again, from an ordering rather than a predicate. Every non-throttle outcome is unchanged:
+  // a malformed 200 that classifies fatal, or carries no readable signal at all, still lands here.
+  if (d.malformedErrorEntries > 0 && d.status === 200 && d.jsonParseable)
+    return { kind: "default-failure", rawCondition: `${d.malformedErrorEntries} malformed errors[] member(s)` };
   // pathless / unattributable errors: collected FIRST, then classified as a set — returning on
   // the first member made the verdict order-dependent, so a recognized TIMEOUT could mask a
   // forbidden sibling that the closed default exists to catch (the same complete-set rule the

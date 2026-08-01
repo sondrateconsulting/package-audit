@@ -324,7 +324,7 @@ export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, u
 // classifyGraphql's "ok" only means "no errors it could read" — an envelope that cannot
 // support success (unparseable body, no data OBJECT, or malformed errors[] evidence) must not
 // be recorded as an "ok" attempt: the analyzer rejects exactly those dispatches (benchT1's
-// non-JSON http-failure and malformed-errors default-failure arms), and the §4.5 R2 ledger
+// non-JSON-object http-failure and malformed-errors default-failure arms), and the §4.5 R2 ledger
 // mints replay-authorizing successes from "ok" records. Degenerate-but-parseable envelopes
 // ({}, {"data":null}, non-object data, errors:[]) are spec-invalid responses a proxy can
 // fabricate with exit 0. Non-"ok" verdicts (fatal/throttle/transient) pass through — they are

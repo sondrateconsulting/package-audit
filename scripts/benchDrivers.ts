@@ -221,6 +221,18 @@ export function parseLsRemoteProbe(stdout: Uint8Array, branch: string, oidLength
   return oid;
 }
 
+// The ONLY two evidence shapes §4.5's rerun predicate admits: R1 (a network-layer failure outside
+// any HTTP response) and R2 (a transient-5xx exhaustion). Everything else — a null-evidence
+// dispatch (throttle, batch-timeout, closed default) and a non-null but never-replayable one
+// (secondary, non-json) — is replay-poison for the streak it belongs to. NB evidenceIsRerunnable
+// itself keys R1 on the evidence CODE and R2 on the lastClassification; this rule can key on the
+// classification alone only because runT1 moves the two together (status 0 sets BOTH to
+// "no-response"). Keep them in lockstep. Exported PURE so CI can drive the circuit breaker's
+// streak rule without standing up a whole DriverRunContext.
+export function replaySafeClassification(lastClassification: string | null | undefined): boolean {
+  return lastClassification === "no-response" || lastClassification === "transient";
+}
+
 // Probe the live head (scaffolding lane; outside any timed window). The engine probes before a
 // unit's FIRST clone-involving rep and before each later PRODUCTION-form one; once a unit's form
 // is frozen as scaffolding (first probe drifted, or a mid-unit drift restart), later reps are
@@ -422,6 +434,13 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
     await restRead(ctx, st, entry, route as RouteId, "rest-fallback");
   }
   let consecutiveFailedDispatches = 0; // the unit-level circuit breaker (§4.4)
+  // A breaker verdict must never be MORE replayable than the least replayable dispatch in its
+  // streak. The throw previously carried only the LAST dispatch's evidence, so a streak of
+  // {RATE_LIMITED, closed default, status 0} surfaced as bare "no-response" and bought an
+  // unconditional R1 replay — laundering both a secondary-limit signal (§4.5: "not replayable
+  // under any category") and a closed-default condition. Sticky across the streak, cleared only
+  // where the counter is (a per-alias result).
+  let streakReplaySafe = true;
   const dispatchChain = async (original: PlannedBatch): Promise<void> => {
     let attempts = 0;
     let descendants = 0;
@@ -452,10 +471,12 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
       // rawCondition-bearing default-failure throw could).
       const failedDispatch = (evidence: { code: string; lastClassification: string | null } | null = null, lastCondition: string | null = null): void => {
         consecutiveFailedDispatches++;
+        if (!replaySafeClassification(evidence?.lastClassification)) streakReplaySafe = false;
         if (consecutiveFailedDispatches >= ctx.cfg.t1.circuitBreakerConsecutiveFailedDispatches)
           throw new UnitFailure(
-            `circuit breaker: ${consecutiveFailedDispatches} consecutive failed dispatches${lastCondition === null ? "" : ` (last: ${lastCondition.slice(0, 200)})`}`,
-            evidence === null ? null : { ...evidence, requestClass: "graphql-batch" },
+            `circuit breaker: ${consecutiveFailedDispatches} consecutive failed dispatches${lastCondition === null ? "" : ` (last: ${lastCondition.slice(0, 200)})`}` +
+              (streakReplaySafe ? "" : " — the streak contained a condition §4.5 does not replay; no rerunnable evidence is carried"),
+            evidence === null || !streakReplaySafe ? null : { ...evidence, requestClass: "graphql-batch" },
           );
       };
       const canSplit = (q: QueueItem): boolean =>
@@ -472,8 +493,10 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
       // driver-correlated idle to the scored wall for a dispatch that can never happen
       const retryRemains = attempts < ctx.cfg.rest.attemptCap;
       if (analysis.kind === "http-failure") {
-        // R2's evidence is 5xx-only (plan §4.5): a 200-with-non-JSON parse failure is NOT a
-        // rerunnable shape (codex R4). SECONDARY SHAPE OUTRANKS THE STATUS: analyzeBatchResponse
+        // R2's evidence is 5xx-only (plan §4.5): a 200 whose body is not a JSON OBJECT is NOT a
+        // rerunnable shape (codex R4). The recorded token stays the terse "non-json" — it is a
+        // durable evidence string in committed rows, and evidenceIsRerunnable rejects it by
+        // exclusion either way.. SECONDARY SHAPE OUTRANKS THE STATUS: analyzeBatchResponse
         // takes its HTTP-level branch before the throttle arms, so a 5xx carrying a RATE_LIMITED
         // body (or classified secondary) arrives here too — deriving the label from the status
         // alone relabelled it "transient" and made it R2-rerunnable, which §4.5 ("secondary-limit
@@ -523,6 +546,7 @@ export async function runT1(ctx: DriverRunContext): Promise<DriverRunOutcome> {
       }
       // per-alias
       consecutiveFailedDispatches = 0;
+      streakReplaySafe = true; // a delivered result ends the streak, so its poison ends with it
       // §4.4's "the conflict recorded" and the alias-timeout events were computed by the
       // analyzer and then dropped here — they now land in the run record via the live mirror
       if (st.live !== undefined) {

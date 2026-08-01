@@ -172,7 +172,7 @@ describe("analyzeBatchResponse — gh exit semantics (gh exits 1 BY DESIGN on er
 });
 
 describe("analyzeBatchResponse — exhaustive, closed-default", () => {
-  test("HTTP-level failures: 5xx with empty/non-JSON body is the pinned split candidate", () => {
+  test("HTTP-level failures: 5xx with empty/non-JSON-object body is the pinned split candidate", () => {
     const a = analyzeBatchResponse(dispatch({ status: 502, bodyText: "", jsonParseable: false, classification: "transient" }), BATCH, "sha1", CFG);
     expect(a).toMatchObject({ kind: "http-failure", fivexxSplitCandidate: true });
     const b = analyzeBatchResponse(dispatch({ status: 500, bodyText: "oops", jsonParseable: false, classification: "transient" }), BATCH, "sha1", CFG);
@@ -317,6 +317,34 @@ describe("analyzeBatchResponse — production-REALISTIC classifications (a 200 w
     expect(a).toMatchObject({ kind: "per-alias" });
     if (a.kind !== "per-alias") throw new Error("unreachable");
     expect(a.outcomes[1]).toMatchObject({ kind: "missing" });
+  });
+});
+
+describe("analyzeBatchResponse — malformed siblings never erase readable throttle evidence (santa-2 R2)", () => {
+  // production's envelope contract makes `errors` and `malformed` INDEPENDENT and its graphql()
+  // consults malformed ONLY on the ok outcome (github.ts GraphqlEnvelope + the "junk errors entry
+  // does NOT erase readable throttle evidence" test). The malformed preempt used to run before the
+  // throttle arms, so one junk sibling turned a secondary-limit condition into a permanent T1
+  // driver failure.
+  test("a readable RATE_LIMITED beside a junk sibling still takes the throttle path", () => {
+    const a = analyzeBatchResponse(dispatch({
+      classification: "secondary", secondaryLike: true, malformedErrorEntries: 1,
+      errors: [{ type: "RATE_LIMITED", message: null, path: null }],
+    }), BATCH, "sha1", CFG);
+    expect(a).toEqual({ kind: "throttle-retry", cause: "rate-limited-body" });
+  });
+  test("a PRIMARY classification beside a malformed sibling still takes the throttle path", () => {
+    const a = analyzeBatchResponse(dispatch({
+      classification: "primary", malformedErrorEntries: 1,
+      errors: [{ type: "RATE_LIMITED", message: null, path: null }],
+    }), BATCH, "sha1", CFG);
+    expect(a).toEqual({ kind: "throttle-retry", cause: "primary" });
+  });
+  test("a malformed 200 with NO readable throttle signal still takes the closed default", () => {
+    const a = analyzeBatchResponse(dispatch({ classification: "fatal", malformedErrorEntries: 2, errors: [] }), BATCH, "sha1", CFG);
+    expect(a).toMatchObject({ kind: "default-failure" });
+    if (a.kind !== "default-failure") throw new Error("unreachable");
+    expect(a.rawCondition).toContain("malformed errors[] member(s)");
   });
 });
 

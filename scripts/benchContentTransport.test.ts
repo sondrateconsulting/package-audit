@@ -11,7 +11,7 @@ import {
   BenchOperationalError, assertFreezeGitState, classifyFidelityAbort,
   classifyFidelityEnumeration, harnessCommitFromGitResult, loginFromUserPayload, parseProbeBatch,
 } from "./benchContentTransport.ts";
-import { RePinRequired, UnitFailure, describeDisposal } from "./benchDrivers.ts";
+import { RePinRequired, UnitFailure, describeDisposal, replaySafeClassification } from "./benchDrivers.ts";
 import { BenchHttpError } from "./benchGh.ts";
 import { BenchSpawnError } from "./benchSpawn.ts";
 import type { WorkloadEntry } from "./benchWorkload.ts";
@@ -458,6 +458,41 @@ describe("evidenceIsRerunnable — the frozen R1/R2 predicate over typed evidenc
     expect(evidenceIsRerunnable(null, "u|T0", new Set())).toBe(false);
     expect(evidenceIsRerunnable({ kind: "http", code: "attempts-exhausted", lastClassification: "secondary", requestClass: "rest-content" }, "u|T0", new Set(["u|T0|rest-content"]))).toBe(false);
     expect(evidenceIsRerunnable({ kind: "http", code: "truncated-transfer", lastClassification: "truncated", requestClass: "rest-content" }, "u|T0", new Set(["u|T0|rest-content"]))).toBe(false);
+  });
+});
+
+describe("replaySafeClassification — the T1 breaker's streak rule (santa-2 R2)", () => {
+  // The breaker throw carried only the LAST dispatch's evidence, so a streak of
+  // {RATE_LIMITED, closed default, status 0} surfaced as bare "no-response" and bought an
+  // unconditional R1 replay — laundering a secondary-limit signal §4.5 never replays AND a
+  // closed-default condition. A streak is replay-safe only if EVERY member is.
+  test("exactly the two shapes evidenceIsRerunnable admits are replay-safe", () => {
+    expect(replaySafeClassification("no-response")).toBe(true);
+    expect(replaySafeClassification("transient")).toBe(true);
+  });
+  test("a null-evidence dispatch (throttle, batch-timeout, closed default) poisons the streak", () => {
+    expect(replaySafeClassification(null)).toBe(false);
+    expect(replaySafeClassification(undefined)).toBe(false);
+  });
+  test("non-null but never-replayable shapes poison it too — a later transient must not relabel them", () => {
+    for (const cls of ["secondary", "primary", "non-json", "truncated", "fatal", "malformed-body", "unaccepted-2xx"])
+      expect(replaySafeClassification(cls)).toBe(false);
+  });
+  test("it stays in lockstep with evidenceIsRerunnable over the evidence runT1 actually builds", () => {
+    // NB evidenceIsRerunnable keys R1 on the CODE and R2 on the lastClassification. runT1 moves
+    // the two together (status 0 sets BOTH to "no-response"), so the streak rule can key on the
+    // classification alone — but the pairing is the thing under test, not the classification in
+    // isolation.
+    const ledger = new Set(["u|T1|graphql-batch"]);
+    const ev = (code: string, cls: string): Record<string, unknown> =>
+      ({ kind: "http", code, lastClassification: cls, requestClass: "graphql-batch" });
+    expect(evidenceIsRerunnable(ev("no-response", "no-response"), "u|T1", ledger)).toBe(true);
+    expect(evidenceIsRerunnable(ev("http-failure", "transient"), "u|T1", ledger)).toBe(true);
+    for (const cls of ["secondary", "primary", "non-json", "truncated"])
+      expect(evidenceIsRerunnable(ev("http-failure", cls), "u|T1", ledger)).toBe(false);
+    // and every shape the streak rule calls poison is one the predicate also refuses
+    for (const cls of ["secondary", "primary", "non-json", "truncated", "fatal"])
+      expect(replaySafeClassification(cls) || evidenceIsRerunnable(ev("http-failure", cls), "u|T1", ledger)).toBe(false);
   });
 });
 

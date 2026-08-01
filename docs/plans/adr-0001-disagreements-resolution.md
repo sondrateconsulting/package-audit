@@ -420,7 +420,7 @@ on a batch whose alias count or query bytes are ≥ 80% of cap; binary split wit
 the same 6-attempt total; circuit breaker — 3 consecutive failed dispatches abort the unit (a G2
 event); per-unit REST fallback budget — max(20, 10% of selected), exceeded → unit failure.
 **Response handling is an exhaustive transition table with a closed default, no observation-time
-discretion:** HTTP-level failure (5xx / timeout / non-JSON) → whole-batch attempt failure →
+discretion:** HTTP-level failure (5xx / timeout / non-JSON-object) → whole-batch attempt failure →
 bounded retry → split trigger evaluation → circuit breaker → surviving aliases to
 `batch-error-fallback` only if the batch's dispatches are exhausted without a terminal unit event
 (each fallback counted against the budget — a persistent whole-batch failure therefore terminates
