@@ -378,8 +378,10 @@ export function parseGraphqlBodyFull(bodyText: string): { data: Record<string, u
 // non-JSON-object http-failure and malformed-errors default-failure arms), and the §4.5 R2 ledger
 // mints replay-authorizing successes from "ok" records. Degenerate-but-parseable envelopes
 // ({}, {"data":null}, non-object data, errors:[]) are spec-invalid responses a proxy can
-// fabricate with exit 0. Non-"ok" verdicts (fatal/throttle/transient) pass through — they are
-// already excluded from the ledger and carry the honest status-based story of their record.
+// fabricate with exit 0. At a NONZERO status, non-"ok" verdicts (fatal/throttle/transient) pass
+// through — they are already excluded from the ledger and carry the honest status-based story of
+// their record. Status 0 is the one exception, rewritten to "no-response" below: classifyGraphql
+// has no status-0 arm, so its terminal `fatal` there is not an honest story at all.
 export function graphqlRecordClassification(
   status: number,
   clsKind: string,

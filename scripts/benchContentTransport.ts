@@ -103,9 +103,12 @@ const gitFailure = (what: string, res: { exitCode: number; stderr: Uint8Array })
 // digest nor the frozen surface (codex R2 finding 1).
 function frozenSurfaceDigest(): string {
   const files: string[] = [];
-  // EVERY non-test script — the bench modules AND the production modules they execute through
-  // (github.ts, readOnlyGuard.ts, db.ts, the selection pipeline…) all drive measurement
-  // (codex R3 f.1); plus both normative documents and the preregistered artifacts.
+  // EVERY non-test script, taken CONSERVATIVELY: the bench modules and the production modules they
+  // execute through (github.ts, readOnlyGuard.ts, db.ts, the selection pipeline…) do drive
+  // measurement (codex R3 f.1), and the walk has no reader/executor classification with which to
+  // exclude the post-hoc readers (report/compare/TUI) it also sweeps in — over-inclusion binds
+  // more than measurement needs, which is the safe direction for a freeze. Plus both normative
+  // documents and the preregistered artifacts.
   // RECURSIVE: the original readdirSync was flat and silently omitted every nested module
   // (scripts/tui/*), so the digest bound less than the comment above claimed. A freeze that
   // does not cover what it says it covers is worse than no freeze — it reads as assurance.

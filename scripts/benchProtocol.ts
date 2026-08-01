@@ -399,10 +399,12 @@ export interface TrafficSummary {
   httpBodyBytes: number;
 }
 
-// The SINGLE place the control-plane exclusion is expressed. Cache-served attempts crossed no
-// wire, and rest-meta probes are the harness's own book-keeping — neither is driver evidence
-// (§4.6). Every run record, including the R5 halt record, derives its traffic figures here so
-// the rule cannot drift between them.
+// The place the control-plane exclusion is expressed FOR RECORDED TRAFFIC SUMMARIES. Cache-served
+// attempts crossed no wire, and rest-meta probes are the harness's own book-keeping — neither is
+// driver evidence (§4.6). Every run record, including the R5 halt record, derives its traffic
+// figures here so the rule cannot drift between them. It is NOT the only expression of the
+// rest-meta rule in this module: live R5 accounting and R3 foreign-consumption reconciliation
+// each re-encode it against their own record scans.
 export function summarizeTraffic(httpRecords: readonly BenchHttpAttemptRecord[], tableAcceptedClasses: readonly string[] = []): TrafficSummary {
   const requests: Record<string, number> = {};
   const okClasses = new Set<string>(tableAcceptedClasses);
@@ -456,8 +458,11 @@ export async function finishMeasuredRun(opts: {
   return { wallMs: opts.wall.stop(), disk, diskReclaimFailed };
 }
 
-// Per-run resource reclamation, run by EVERY exit path (normal, drift-restart, and the throws
-// that escape before the driver's try-block). The run cache DB is documented as "one file per
+// Per-run resource reclamation, run by every exit path ONCE THE RUN-CACHE DB IS OPEN (normal,
+// drift-restart, and the throws that escape before the driver's try-block). The one earlier exit
+// — a throw from AuditDb.open itself — runs at its own call site instead, and sweeps only the DB
+// file and its sidecars: it leaves the already-created runDir behind. The run cache DB is
+// documented as "one file per
 // run, deleted at teardown", so a path that returns without closing it leaks both the handle and
 // its -wal/-shm sidecars while the emitted record still claims a clean reclaim.
 // Returns whether anything failed to reclaim — verified, never assumed (finding 18).

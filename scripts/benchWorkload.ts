@@ -64,7 +64,8 @@ export interface RecordedSelection {
   noReads: Array<{ path: string; reason: NoReadReason }>;
 }
 
-// mirror of unitPipeline.ts's module-local SCANNABLE_EXT / MAX_SCAN_BYTES gate inputs — needed
+// mirror of unitPipeline.ts's gate inputs — SCANNABLE_EXT is module-local there; MAX_SCAN_BYTES is
+// exported and CI-asserted against the frozen config (bench-config selection.maxScanBytes) — needed
 // only to enumerate what the pipeline SKIPPED (it never calls the reader for those); the read
 // set itself comes from the real pipeline, never from this mirror.
 const SCANNABLE_EXT_MIRROR = /\.(mts|cts|ts|tsx|mjs|cjs|js|jsx)$/;

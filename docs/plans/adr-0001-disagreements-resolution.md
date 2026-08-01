@@ -661,8 +661,9 @@ each bucket the run consumed from, `bucketCeiling(r) = 5000 × files ÷ units(r)
 zero consumption imposes no ceiling); `T(r) = min(wallThroughput(r), min over consuming buckets of
 bucketCeiling(r))` — each run pairs its own wall with its own consumption; walls and units are
 never mixed across runs. Per (unit, driver) the score is the **median of T(r) over the K runs**,
-with worst-of-K reported beside it. Tree acquisition counts toward units (T0/T1 pay it; T2a/T2c do
-not); discovery (repo/branch listing) is excluded as identical across drivers. Results are
+with worst-of-K reported beside it. Tree acquisition counts toward units (T0/T1 pay it, as does an
+api-escaped T2a, which resolves with full T0 semantics; clone-form T2a and T2c do not);
+discovery (repo/branch listing) is excluded as identical across drivers. Results are
 reported per bucket size so 15,000-point credentials read off the same data.
 
 > **Scope, stated plainly:** this is a per-scenario serial cost profile, *not* an estate

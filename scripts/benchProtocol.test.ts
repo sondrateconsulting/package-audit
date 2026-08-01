@@ -641,7 +641,7 @@ describe("graphqlRecordClassification — degenerate envelopes never record 'ok'
     expect(graphqlRecordClassification(203, "ok", parseGraphqlBodyFull('{"data":{"repository":{}}}'))).toBe("unaccepted-2xx");
     expect(graphqlRecordClassification(206, "ok", parseGraphqlBodyFull('{"data":{"repository":{}}}'))).toBe("unaccepted-2xx");
   });
-  test("non-'ok' verdicts pass through untouched — they carry the honest status-based story", () => {
+  test("at a NONZERO status, non-'ok' verdicts pass through untouched — they carry the honest status-based story", () => {
     expect(graphqlRecordClassification(200, "fatal", parseGraphqlBodyFull('{"data":null,"errors":[{"type":"FORBIDDEN","message":"x"}]}'))).toBe("fatal");
     expect(graphqlRecordClassification(502, "transient", parseGraphqlBodyFull("<html>bad gateway</html>"))).toBe("transient");
   });

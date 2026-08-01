@@ -370,8 +370,12 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
   // alone accepted 0/2/3, which moves driver disqualification from two attributable signals to
   // three while the SIGNED answer ("G4 attributable-secondary-signal partition pass/warn/fail at
   // 0/1/≥2") stays byte-identical and the freeze gate — which only checks that the answer string
-  // is non-empty — cannot notice. These numbers have no consumer outside this loader, so nothing
-  // downstream would have repaired the mismatch either.
+  // is non-empty — cannot notice. These numbers have no RUNTIME consumer outside this loader (the
+  // pass/warn/fail judgment is applied at analysis time), so the loader pins are the only place
+  // the partition's VALUES are enforced at run time; benchConfig.test.ts's exact-equality
+  // assertion on {pass,warnAtMost,failAt} is a second, CI-only line of defence that predates
+  // these pins — an earlier version of this note claimed nothing downstream could have caught the
+  // shift, which that test disproves.
   if (cfg.protocol.g4.pass !== 0)
     fail("protocol.g4AttributableSecondarySignals: pass must be 0 — §4.7 fixes the clean-pass count at zero attributable secondary signals (one still passes, with a recorded warning: that is warnAtMost)");
   if (cfg.protocol.g4.warnAtMost !== 1)
@@ -385,7 +389,7 @@ export function parseBenchConfig(jsonText: string): BenchConfig {
   // `trim() === "" || !jsonParseable` qualifies those too. The earlier "empty-or-non-json" label
   // therefore described a NARROWER predicate than the one measured at pinning.
   if (cfg.t1.splitTriggers.consecutive5xx.bodies !== "empty-or-non-json-object")
-    fail("t1.splitTriggers.consecutive5xx.bodies must be 'empty-or-non-json-object' — the implemented split predicate hardcodes that condition (an empty body, or one whose JSON root is not an object); a different value requires the implementing code change with its §8 amendment");
+    fail("t1.splitTriggers.consecutive5xx.bodies must be 'empty-or-non-json-object' — the implemented split predicate hardcodes that condition (an empty body, one that does not parse as JSON at all, or one whose JSON root parses but is not an object); a different value requires the implementing code change with its §8 amendment");
   if (cfg.frame.frameCeilingBytes !== cfg.spawn.outputCapBytes)
     fail("frame.frameCeilingBytes must equal spawn.outputCapBytes (the plan pins the ceiling to production's spawn cap)");
   if (cfg.pilot.reps !== cfg.reps) fail("pilot.reps must equal reps (the pilot calibrates the same K)");

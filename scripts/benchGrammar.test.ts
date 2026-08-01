@@ -1,6 +1,7 @@
 // benchGrammar.test.ts — accept/reject tables for the PROPOSED guard grammars (ADR-0001
-// resolution plan §3.2). Mirrors the readOnlyGuard test posture: every rejection is an exact
-// structural property of the tuple, not a denylist hit.
+// resolution plan §3.2). Mirrors the readOnlyGuard test posture: rejections are exact structural
+// properties of the tuple — with one deliberate denylist, the `-c`/`-u` config-injection option
+// prefixes, which are refused on ANY verb (benchGrammar.ts, mirroring the production guard).
 import { describe, expect, test } from "bun:test";
 import {
   BenchGrammarViolation, assertProposedReadOnlyGit, isFullOid, OID_LENGTH,

@@ -154,7 +154,11 @@ export function buildSchedule(
 
 // ---- committed-table validation --------------------------------------------------------------
 // Validates a (possibly hand-edited) committed schedule against the preregistration rules.
-// Returns violations (empty = compliant) so CI can report every defect at once.
+// Returns violations (empty = compliant) rather than throwing on the first one, so CI can report
+// several defects at once. NOT exhaustive by design: structural failures short-circuit the
+// property checks below them (a non-permutation row makes them meaningless), the main-block scan
+// stops at the first short/noncontiguous block, and traversal-order checks are skipped when any
+// earlier violation exists.
 export function validateSchedule(
   schedule: Schedule,
   units: readonly ScheduleUnit[],

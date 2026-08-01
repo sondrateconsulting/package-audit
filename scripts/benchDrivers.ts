@@ -330,7 +330,8 @@ function readCheckoutDelivery(ctx: DriverRunContext, cloneDir: string, st: RunSt
   deliver(st, { path: entry.path, route, delivered: seamDecode(bytes), rawVerified: null });
 }
 
-// ---- the REST tree fetch T0/T1 pay (§4.6: tree acquisition counts toward units) --------------
+// ---- the REST tree fetch T0/T1 pay — and an api-escaped T2a, which runs full T0 semantics
+// ---- (§4.6: tree acquisition counts toward units) --------------------------------------------
 async function fetchRestTree(ctx: DriverRunContext, st: RunState): Promise<{ truncated: boolean }> {
   const endpoint = `repos/${encodeURIComponent(ctx.slot.owner)}/${encodeURIComponent(ctx.slot.repo)}/git/trees/${encodeURIComponent(ctx.unit.treeOid)}?recursive=1`;
   let res: { body: string };
