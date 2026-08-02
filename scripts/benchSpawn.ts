@@ -585,7 +585,7 @@ export class BatchChild {
       if (pumpsWedged) {
         // a pump that never settled means the stream state cannot be vouched for — cancel the
         // readers and REQUEST the cancellations and wait only for a BOUNDED interval (a timeout can win, leaving them pending: an unbounded join would recreate the
-        // hang) so nothing stays attached when the caller deletes the store and releases the
+        // hang) so that in the normal case nothing stays attached when the caller deletes the store and releases the
         // permit (§3.1's ordered teardown), and surface the wedge as an UNCLEAN disposal
         let cancelTimer: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([

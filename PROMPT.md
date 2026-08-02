@@ -230,8 +230,10 @@ introspected_at, cached_at) are persisted in ONE canonical fixed-width ISO-8601 
 (`new Date().toISOString()`), so lexicographic ordering equals chronological ordering
 everywhere (§7 MAX/COALESCE, §3 earliest-timestamp synthesis). Enable:
 ```sql
-PRAGMA busy_timeout = 5000;   -- FIRST: it must protect the very next statement (the WAL
-                              -- pragma takes a lock). Single-writer, but report.ts / cache
+PRAGMA busy_timeout = 5000;   -- FIRST: it must protect EVERY later lock-taking statement in
+                              -- the span, the WAL pragma included (which the real open runs
+                              -- after its ownership/compatibility gates, not immediately
+                              -- after this). Single-writer, but report.ts / cache
                               -- reads can still hit transient locks; back off, don't error
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;

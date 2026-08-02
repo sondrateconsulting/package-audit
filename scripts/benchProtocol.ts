@@ -546,9 +546,11 @@ function stillOnDisk(p: string, io: RunFsIo): boolean {
 // created above it, and this check itself lstats; what it guards is the per-run residue set.) benchRoot
 // is a fresh per-process mkdtemp and dbPath carries pid + wall clock + attempt counter, so this
 // cannot fire in normal operation — which is exactly why it is an assertion and not a recovery
-// path. It is what makes ownership UNCONDITIONAL downstream: every residue path is provably this
-// run's, so both reclamation paths may delete all of them without a per-path ownership token, and
-// no pre-existing foreign database can be destroyed by a sweep. An earlier version instead
+// path. It is what lets both reclamation paths delete the residue set without a per-path
+// ownership token. NB the honest limit: only runDir is RESERVED (atomically, by the non-recursive
+// mkdir below) — the DB paths are CHECKED here and not reserved until AuditDb.open creates them,
+// so an actor writing dbPath between this check and that open could still have a foreign file
+// swept. Closing that needs an atomic DB reservation, recorded as not done. An earlier version instead
 // derived a nullable ownership token from mkdirSync's return, which protected the open-failure
 // path only — the successful-open reclamation still deleted the same directory unconditionally.
 export function assertRunPathsFresh(runDir: string, dbPath: string, io: RunFsIo = REAL_FS): void {
@@ -746,9 +748,10 @@ export class BenchEngine {
     // the only statement that can throw while a run directory of ours is on disk. An earlier
     // version created runDir first, leaving mkdir(runCacheDir) and the now()-stamped dbPath as
     // two uncaught throws that leaked exactly the directory this catch exists to reclaim. NB the
-    // scope: the open is the only throw that is UNRECLAIMED — later throws (probeLiveHead,
-    // reserve, the rate-limit read, planning) also occur while runDir exists, but reclaimOnce and
-    // the outer finally own them by then.
+    // scope: the open throw is the only one whose reclamation this catch has to perform itself.
+    // It IS reclaimed (by the sweep below); later throws — probeLiveHead, reserve, the rate-limit
+    // read, planning, the R5 accounting — also occur while runDir exists and are reclaimed by
+    // reclaimOnce and the outer finally, which do not exist yet at this point.
     mkdirSync(this.o.runCacheDir, { recursive: true });
     // collision-resistant durable attempt identity (pid + wall clock): a crashed process's
     // counter can never resurrect a warm cache; purgeCache drops api_cache rows outright
