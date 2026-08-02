@@ -596,9 +596,9 @@ describe("classifyGitTransportFailure — §4.5's typed git-transport variant is
   });
   test("exit 128 with a DNS failure classifies as dns for every network-facing op", () => {
     const stderr = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com";
-    expect(classifyGitTransportFailure("clone", settled(128, stderr))?.networkClass).toBe("dns");
-    expect(classifyGitTransportFailure("scaffold-fetch", settled(128, stderr))?.op).toBe("scaffold-fetch");
-    expect(classifyGitTransportFailure("ls-remote-probe", settled(128, stderr))?.op).toBe("ls-remote-probe");
+    for (const op of ["clone", "scaffold-fetch", "ls-remote-probe"] as const) {
+      expect(classifyGitTransportFailure(op, settled(128, stderr))).toEqual({ op, exitCode: 128, networkClass: "dns" });
+    }
   });
   test("TLS and connect failures classify to their groups, case-insensitively", () => {
     expect(classifyGitTransportFailure("clone", settled(128, "fatal: unable to access 'https://x/': gnutls_handshake() failed: terminated")))
@@ -615,6 +615,21 @@ describe("classifyGitTransportFailure — §4.5's typed git-transport variant is
     // from ever becoming replayable, so the status guard outranks every positive pattern
     expect(classifyGitTransportFailure("clone", settled(128, "fatal: unable to access 'https://x/': The requested URL returned error: 403"))).toBeNull();
     expect(classifyGitTransportFailure("clone", settled(128, "error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502\nfatal: early EOF"))).toBeNull();
+    // older git's status shape carries no "requested URL" text — the second frozen needle
+    expect(classifyGitTransportFailure("clone", settled(128, "error: RPC failed; result=22, HTTP code = 502\nfatal: early EOF"))).toBeNull();
+  });
+  test("the status guard outranks the deadline arm too: a timed-out child with a status line is NOT timeout evidence", () => {
+    // a slow-walled 403/5xx that stalls past the spawn deadline settles as the synthetic 124
+    // with its status line retained in stderr — the status is the governing shape, and typing
+    // it as timeout would launder a secondary/budget condition into an R1 replay
+    expect(classifyGitTransportFailure("clone", settled(124, "fatal: unable to access 'https://x/': The requested URL returned error: 403", true))).toBeNull();
+    expect(classifyGitTransportFailure("scaffold-fetch", settled(124, "error: RPC failed; result=22, HTTP code = 429", true))).toBeNull();
+  });
+  test("an HTTP/2 protocol breakage carries no status and stays in the admitted reset class", () => {
+    // "RPC failed; HTTP/2 stream …" must NOT be swallowed by the status guard — it is a
+    // mid-transfer network breakage, exactly the condition §4.5's reset class admits
+    const stderr = "error: RPC failed; HTTP/2 stream 0 was not closed cleanly: CANCEL (err 8)\nfatal: early EOF";
+    expect(classifyGitTransportFailure("clone", settled(128, stderr))).toEqual({ op: "clone", exitCode: 128, networkClass: "reset" });
   });
   test("unrecognised stderr and non-124/128 exits fail closed to null", () => {
     expect(classifyGitTransportFailure("clone", settled(128, "fatal: repository 'https://x/' not found"))).toBeNull();
@@ -626,9 +641,12 @@ describe("classifyGitTransportFailure — §4.5's typed git-transport variant is
 
 describe("evidenceIsRerunnable — the git-transport kind is R1, validated fail-closed", () => {
   const ledger = new Set<string>(); // R1 is unconditional: the empty ledger must not matter
-  test("every frozen (op × networkClass) pair is rerunnable with no prior evidence", () => {
+  test("every mintable (op × networkClass × exitCode) shape is rerunnable with no prior evidence", () => {
+    // the classifier mints EXACTLY these pairings: timeout only as the synthetic 124, the
+    // stderr-classified shapes only as 128 — the predicate honours the same pairing
     for (const op of ["clone", "scaffold-fetch", "ls-remote-probe"]) {
-      for (const networkClass of ["timeout", "dns", "tls", "connect", "reset"]) {
+      expect(evidenceIsRerunnable({ kind: "git-transport", op, exitCode: 124, networkClass: "timeout" }, "u|T2a", ledger)).toBe(true);
+      for (const networkClass of ["dns", "tls", "connect", "reset"]) {
         expect(evidenceIsRerunnable({ kind: "git-transport", op, exitCode: 128, networkClass }, "u|T2a", ledger)).toBe(true);
       }
     }
@@ -637,6 +655,12 @@ describe("evidenceIsRerunnable — the git-transport kind is R1, validated fail-
     expect(evidenceIsRerunnable({ kind: "git-transport", op: "rev-parse", exitCode: 128, networkClass: "dns" }, "u|T2a", ledger)).toBe(false);
     expect(evidenceIsRerunnable({ kind: "git-transport", op: "clone", exitCode: 128, networkClass: "secondary" }, "u|T2a", ledger)).toBe(false);
     expect(evidenceIsRerunnable({ kind: "git-transport" }, "u|T2a", ledger)).toBe(false);
+  });
+  test("a mismatched (class, exit) pairing is refused — the classifier can never mint it", () => {
+    expect(evidenceIsRerunnable({ kind: "git-transport", op: "clone", exitCode: 128, networkClass: "timeout" }, "u|T2a", ledger)).toBe(false);
+    expect(evidenceIsRerunnable({ kind: "git-transport", op: "clone", exitCode: 124, networkClass: "dns" }, "u|T2a", ledger)).toBe(false);
+    expect(evidenceIsRerunnable({ kind: "git-transport", op: "clone", exitCode: 0, networkClass: "reset" }, "u|T2a", ledger)).toBe(false);
+    expect(evidenceIsRerunnable({ kind: "git-transport", op: "clone", networkClass: "reset" }, "u|T2a", ledger)).toBe(false);
   });
   test("a persisted git-transport unit-failure row reconstructs as an OWED replay, not terminal", () => {
     // the row-level proof that the amendment reaches resume: before it, this row's evidence was
@@ -689,10 +713,27 @@ describe("orderEpilogueRows — the R6 epilogue preserves §4.5's repository int
     expect(orderEpilogueRows(rows, UNITS).map((r) => r.pos)).toEqual([5, 6, 10]);
     expect(orderEpilogueRows([], UNITS)).toEqual([]);
   });
-  test("only same-repository blocks remaining REFUSES before any row executes — freeze-repair, never a biased traversal", () => {
+  test("only same-repository blocks remaining REFUSES — freeze-repair territory, never a biased order", () => {
     const rows = [R(1, C1A.unitId), R(5, C1B.unitId)];
     expect(() => orderEpilogueRows(rows, UNITS)).toThrow(/REFUSING to run the R6 epilogue: no adjacency-free order/);
     expect(() => orderEpilogueRows(rows, UNITS)).toThrow(/freeze-repair/);
+  });
+  test("resume continues the SAME sequence: order over the FULL drifted set, drop terminal rows after", () => {
+    // the call-site discipline (cmdMatrix): the order is a fixed function of the drifted set,
+    // so the resumed rows are exactly the interrupted sequence minus its completed prefix —
+    // and a unit's owed replay (its lowest non-terminal pos) stays first among its rows.
+    const full = [R(1, C1A.unitId), R(2, C1A.unitId), R(5, C1B.unitId), R(6, C1B.unitId), R(7, C5.unitId), R(8, C5.unitId)];
+    const fixedOrder = orderEpilogueRows(full, UNITS).map((r) => r.pos); // [1,2,7,8,5,6]
+    const terminal = new Set([1, 2]); // interrupted right after C1A's block completed
+    const resumed = orderEpilogueRows(full, UNITS).filter((r) => !terminal.has(r.pos)).map((r) => r.pos);
+    expect(resumed).toEqual([7, 8, 5, 6]); // the fixed order's suffix — C5 still separates the siblings
+    expect(resumed).toEqual(fixedOrder.filter((p) => !terminal.has(p)));
+    // ordering the REMAINING subset instead re-interleaves: {C1B, C5} alone puts C1B first,
+    // i.e. prom/prom straight across the resume boundary (C1A, also prom, just executed) —
+    // the exact adjacency the fixed sequence prevents
+    const subsetOrder = orderEpilogueRows(full.filter((r) => !terminal.has(r.pos)), UNITS).map((r) => r.pos);
+    expect(subsetOrder).toEqual([5, 6, 7, 8]);
+    expect(subsetOrder).not.toEqual(resumed);
   });
   test("a drifted unit missing from the schedule-unit set REFUSES — its adjacency key is unknown", () => {
     expect(() => orderEpilogueRows([R(1, "C9:ghost/ghost@main")], UNITS)).toThrow(/adjacency key — is unknown|is not in the schedule-unit set/);

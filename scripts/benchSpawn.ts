@@ -372,7 +372,8 @@ interface PendingRead {
 // and the two callers differ — WHERE THE UNCLEAN DISPOSAL IS THE SOLE FAILURE, the matrix driver
 // makes it a permanent UnitFailure and the fidelity battery a rerunnable operational abort; where
 // another error is already propagating, each APPENDS the verdict to that error rather than
-// replacing it. That asymmetry is recorded open in ratification.json; do not restate either
+// replacing it. That asymmetry is recorded in ratification.json — rvo declined aligning it
+// (2026-08-02): it stands as deliberate design; do not restate either
 // disposition as though it were universal here.
 export class BatchChild {
   private readonly child: LaunchedChild;

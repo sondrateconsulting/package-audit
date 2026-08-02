@@ -553,7 +553,12 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   unit blocks run in the order produced by the **same** deterministic no-two-adjacent
   construction that built the main `unitOrder` (`interleaveUnits`, applied to the drifted
   subset) — never in raw filtered schedule order, which can place two same-repository units
-  adjacent when the units that separated them in the frozen sequence did not drift. Within a
+  adjacent when the units that separated them in the frozen sequence did not drift. The order
+  is computed over the **full** drifted subset with already-terminal rows dropped only
+  afterward, so it is a fixed function of the drifted set and a resumed epilogue continues the
+  same sequence its interrupted predecessor was executing (ordering only the remaining rows
+  would re-interleave differently across the resume boundary and could run another unit ahead
+  of an owed in-slot replay). Within a
   block, rows keep their frozen relative order; the drifted units' checkout-config probe rows
   run after **all** of the epilogue's main-rep rows, in the same interleaved unit order,
   mirroring the frozen schedule's own probe placement. If no adjacency-free order of the drifted
@@ -562,7 +567,7 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   takes — rather than collecting rows this section's interleaving rule pre-declares biased. The
   junction between the main traversal's tail and the epilogue's first block is unchanged by this
   amendment (the epilogue was already appended after the main traversal); that residual is
-  recorded in ratification.json rather than constrained here.
+  recorded in ratification.json's decision-batch amendment entry rather than constrained here.
 - **Completion discipline — one frozen replay/invalidation taxonomy** (referenced everywhere
   else; no section defines its own): eligibility requires all K runs complete (G3).
   **R1/R2, the driver rerun allowance (≤1 per unit × driver):** a network-layer error outside any
@@ -577,12 +582,19 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   and the ls-remote probe — attach typed spawn evidence to their unit failure when the child
   **settles** with the transport-failure shape: the harness's synthetic deadline exit **124**,
   or exit **128** whose stderr matches the frozen network-failure pattern set (DNS resolution,
-  TLS negotiation/transfer, TCP connect, connection reset / hang-up / EOF mid-transfer). The
+  TLS negotiation/validation/transfer, TCP connect, connection reset / hang-up / EOF
+  mid-transfer). The
   rerun predicate accepts that evidence as R1 — the same ≤1 allowance, one pool with the HTTP
-  shapes, never an additional allowance. Everything else stays outside the variant by
+  shapes, never an additional allowance — and validates the exact (class, exit) pairing the
+  classifier can mint, so a persisted row outside those shapes is refused on resume.
+  Everything else stays outside the variant by
   construction and remains a non-rerunnable driver failure: auth/permission failures,
-  HTTP-status-bearing git failures (`The requested URL returned error: …` — a secondary-limit
-  403 over the git transport takes this shape and must never become replayable), local git
+  HTTP-status-bearing git failures — the two frozen numeric-status stderr shapes,
+  `The requested URL returned error: …` and `… HTTP code = …`, excluded **before every
+  positive arm, the deadline arm included**, because a secondary-limit 403 over the git
+  transport takes exactly these shapes and must never become replayable (an `RPC failed;
+  HTTP/2 stream …` protocol breakage carries no status and stays in the admitted reset
+  class) — local git
   operations (init / remote-add / checkout / rev-parse / ls-tree, and the cat-file batch
   reader), unrecognised stderr, and budget conditions. A child that **never settles** inside
   the bounded deadline+grace wait is also outside the variant — it surfaces through the generic

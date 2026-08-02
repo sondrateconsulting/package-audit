@@ -232,8 +232,12 @@ export interface GitTransportEvidence {
 }
 
 // Frozen pattern sets, matched case-insensitively against the settled child's stderr. Literal
-// substrings, no regexes: every entry is auditable against the git/curl message it names.
-const GIT_HTTP_STATUS_BEARING: readonly string[] = ["the requested url returned error", "rpc failed; http"];
+// substrings, no regexes: every entry is auditable against the git/curl message it names. The
+// status-bearing needles are the two shapes that carry a NUMERIC HTTP status ("The requested
+// URL returned error: NNN"; older git's "result=22, HTTP code = NNN") — deliberately NOT a
+// bare "rpc failed; http", which would also match "RPC failed; HTTP/2 stream …", an HTTP/2
+// protocol breakage that carries no status and belongs to the admitted reset class.
+const GIT_HTTP_STATUS_BEARING: readonly string[] = ["the requested url returned error", "http code ="];
 const GIT_NETWORK_PATTERNS: ReadonlyArray<{ networkClass: GitTransportNetworkClass; needles: readonly string[] }> = [
   { networkClass: "dns", needles: ["could not resolve host", "couldn't resolve host", "name or service not known", "temporary failure in name resolution", "no address associated with hostname"] },
   { networkClass: "tls", needles: ["ssl connect error", "ssl_connect", "ssl_read", "ssl_write", "ssl handshake", "gnutls_handshake", "ssl certificate problem", "server certificate verification failed", "unable to get local issuer certificate"] },
@@ -245,12 +249,15 @@ export function classifyGitTransportFailure(
   op: GitTransportOp,
   res: { exitCode: number; timedOut: boolean; stderr: Uint8Array },
 ): GitTransportEvidence | null {
-  if (res.timedOut && res.exitCode === 124) return { op, exitCode: 124, networkClass: "timeout" };
-  if (res.exitCode !== 128) return null;
+  const isSyntheticTimeout = res.timedOut && res.exitCode === 124;
+  if (!isSyntheticTimeout && res.exitCode !== 128) return null;
   const stderr = new TextDecoder("utf-8", { fatal: false }).decode(res.stderr).toLowerCase();
-  // status-bearing failures are excluded BEFORE any positive match: a 5xx mid-pack can print a
-  // reset-class curl detail beside its status line, and the status is the governing shape
+  // status-bearing failures are excluded BEFORE every positive arm, the timeout arm included:
+  // a deadline-killed child whose retained stderr already shows a status line (a slow-walled
+  // 403/5xx) is a status-governed condition, and a 5xx mid-pack can print a reset-class curl
+  // detail beside its status line — in both cases the status is the governing shape
   for (const needle of GIT_HTTP_STATUS_BEARING) if (stderr.includes(needle)) return null;
+  if (isSyntheticTimeout) return { op, exitCode: 124, networkClass: "timeout" };
   for (const group of GIT_NETWORK_PATTERNS) {
     for (const needle of group.needles) {
       if (stderr.includes(needle)) return { op, exitCode: 128, networkClass: group.networkClass };

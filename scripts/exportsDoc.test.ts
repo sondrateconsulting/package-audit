@@ -53,9 +53,10 @@ const EXPORTS_PROSE = EXPORTS_MD.replace(/\s+/g, " ");
 
 describe("EXPORTS.md prose claims ↔ code reality", () => {
   test("run_unit_head's coverage claim keeps its terminal-disposition qualifier and absence caveat", () => {
-    // code reality: a scan error or throttle requeue exits through the setUnitStatus error/
-    // pending arms BEFORE the terminal upsert, so no run_unit_head row exists for that branch —
-    // only the scanned path reaches db.upsertRunUnitHead (orchestrate.ts)
+    // code reality: every TERMINAL disposition upserts a row (orchestrate.ts carries upsert
+    // sites for policy-excluded, skipped-cutoff, past-cap and scanned), but the scan-error and
+    // throttle-requeue arms exit through setUnitStatus BEFORE any upsert — so those branches
+    // have no row, exactly as the caveat says
     expect(EXPORTS_PROSE).toContain("every branch that REACHED a terminal disposition");
     expect(EXPORTS_PROSE).toContain("A branch whose scan errored or was throttle-requeued before the row was written has none");
   });

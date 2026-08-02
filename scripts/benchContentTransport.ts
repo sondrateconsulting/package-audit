@@ -72,8 +72,8 @@ const log = (line: string): void => {
 };
 const text = (b: Uint8Array): string => new TextDecoder().decode(b);
 
-// The ONE bench-root reclamation used by every command teardown and both construction-failure
-// catches (2026-08-02 decision batch). GUARDED: these sites run in `finally`/`catch` blocks, so
+// The ONE bench-root reclamation used by every command's bench-root teardown and both
+// construction-failure catches (2026-08-02 decision batch). GUARDED: these sites run in `finally`/`catch` blocks, so
 // a throwing rmSync would REPLACE whatever error is already propagating — the exact masking the
 // run-level reclamation refuses (benchProtocol's open-failure discipline). A reclamation failure
 // is put in the operator's face instead, with the path to remove by hand; the log itself is
@@ -1170,8 +1170,9 @@ export function classifyFidelityAbort(e: unknown): "re-pin-required" | "operatio
 // the battery's own accounting unit, the analogue of runT2c's per-run scope — the respawn
 // triggers ONLY on a rejected read (the missing-frame and hash checks stay outside it, as in
 // runT2c), and a second death is the same died-twice UnitFailure carrying the FIRST child's
-// disposal diagnosis. Extracted PURE over the reader shape so CI can drive every arm with fakes
-// (the real path spawns a live child per entry, which no test constructs). The holder pattern is
+// disposal diagnosis. Extracted over the reader SHAPE — engine-free and fake-drivable, though
+// not pure: it mutates the holder and the allowance state by design — so CI can drive every
+// arm (the real path spawns a live child per entry, which no test constructs). The holder pattern is
 // runT2c's own: on a second death the failed REPLACEMENT is left in holder.child, so the
 // caller's finally still disposes it — returning the child instead would orphan it on exactly
 // the throwing path.
@@ -1491,8 +1492,9 @@ async function cmdFidelity(): Promise<void> {
                 // (the same evidence-masking runT2c's teardown annotation prevents), so the
                 // disposal verdict is appended to the in-flight error instead. holder.child is
                 // the child that DELIVERED (or last attempted) the bytes: after a respawn it is
-                // the replacement — the first child was already disposed inside the respawn, and
-                // its verdict rides the died-twice diagnosis, not this check.
+                // the replacement — the first child was already disposed inside the respawn, its
+                // verdict RETAINED for a later died-twice diagnosis and not surfaced by this
+                // check (on a successful respawn it surfaces nowhere, exactly as in runT2c).
                 const d = await holder.child.dispose();
                 if (!disposalIsClean(d)) {
                   if (fidelityThrown !== null) fidelityThrown.message = `${fidelityThrown.message} — batch child teardown was also unclean: ${describeDisposal(d)}`;
@@ -1587,13 +1589,17 @@ export function evidenceIsRerunnable(ev: unknown, unitDriverKey: string, ledger:
   const e = ev as Record<string, unknown>;
   // §4.5 amended 2026-08-02: a SETTLED network-shaped git-transport failure on one of the three
   // network-facing operations is R1 — same ≤1 allowance pool as the HTTP shapes. Validated
-  // fail-closed against the frozen vocabularies (this predicate also re-decides from persisted
-  // rows on resume, so a hand-edited or foreign value must never widen the allowance).
+  // fail-closed against the frozen vocabularies INCLUDING the exact exitCode pairing the
+  // classifier can mint (timeout ⇔ the synthetic 124; the stderr-classified shapes ⇔ 128) —
+  // this predicate also re-decides from persisted rows on resume, so a hand-edited or foreign
+  // value must never widen the allowance.
   if (e["kind"] === "git-transport") {
     const opOk = e["op"] === "clone" || e["op"] === "scaffold-fetch" || e["op"] === "ls-remote-probe";
-    const classOk = e["networkClass"] === "timeout" || e["networkClass"] === "dns" || e["networkClass"] === "tls"
+    if (!opOk) return false;
+    if (e["networkClass"] === "timeout") return e["exitCode"] === 124; // R1
+    const classOk = e["networkClass"] === "dns" || e["networkClass"] === "tls"
       || e["networkClass"] === "connect" || e["networkClass"] === "reset";
-    return opOk && classOk; // R1
+    return classOk && e["exitCode"] === 128; // R1
   }
   if (e["kind"] !== "http") return false;
   if (e["code"] === "no-response") return true; // R1
@@ -1616,12 +1622,16 @@ export function evidenceIsRerunnable(ev: unknown, unitDriverKey: string, ledger:
 // the resume ledger keeps a NON-drifted unit's epilogue rows alongside its main rows (double
 // evidence), and a separator spends live budget measuring nothing the matrix needs.
 // When no adjacency-free order exists (only same-repository blocks remain), interleaveUnits
-// throws and this REFUSES before any epilogue row executes — §8 freeze-repair territory, the
-// fail-closed posture the second R4 straddle already takes.
+// throws and this REFUSES — §8 freeze-repair territory, the fail-closed posture the second R4
+// straddle already takes. The caller invokes this over the FULL drifted subset and filters
+// already-terminal rows from the RESULT, so the sequence is a fixed function of the drifted
+// set and a resumed epilogue continues where the interrupted one stopped.
 // Reordering blocks does NOT break §4.5's "evaluated at failure time" reconstruction, which
-// uses pos as a time proxy (ledgerBefore): R2 evidence must come from the SAME unit × driver,
-// a unit's rows all live inside its own block, and within a block this function preserves pos
-// order — so pos order and execution order still agree exactly where the predicate can look.
+// uses pos as a time proxy (ledgerBefore): R2 evidence must come from the SAME unit × driver;
+// a unit's main-rep rows live inside its own contiguous block and its probe rows inside its
+// own probe group, and within EACH this function preserves pos order — so pos order and
+// execution order still agree everywhere the same-unit predicate can look (a unit's probe
+// rows also carry strictly higher pos than its main rows and execute after all of them).
 // Cross-unit completions can never satisfy a same-unit key, whatever their order.
 export function orderEpilogueRows(
   rows: readonly ScheduleRow[],
@@ -1983,11 +1993,16 @@ async function cmdMatrix(): Promise<void> {
     if (driftedUnits.size > 0) {
       log(`epilogue: restarting ${driftedUnits.size} drifted unit(s) on the scaffolding form (R6 branch arm)`);
       // interleaved block order, never the raw filter (§4.5 amended 2026-08-02) — REFUSES
-      // before any epilogue row executes when no adjacency-free order exists
+      // before any epilogue row executes when no adjacency-free order exists. The order is
+      // computed over the FULL drifted subset and terminal rows are dropped AFTERWARD, so a
+      // resumed epilogue continues the same fixed sequence as its interrupted predecessor —
+      // ordering only the remaining rows would re-interleave a different sequence, could place
+      // same-repository blocks adjacent across the resume boundary, and could push another
+      // unit's rows ahead of a reconstructed owed replay.
       const epilogue = orderEpilogueRows(
-        cfg.schedule.rows.filter((r) => driftedUnits.has(r.unit) && !terminalPos.has(r.pos)),
+        cfg.schedule.rows.filter((r) => driftedUnits.has(r.unit)),
         scheduleUnitsFrom(corpus),
-      );
+      ).filter((r) => !terminalPos.has(r.pos));
       engine.setEpilogueMode(true);
       try {
         await executeRows(epilogue, "epilogue");

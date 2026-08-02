@@ -804,8 +804,8 @@ export class BenchEngine {
       // decision batch the commands' own `finally` blocks guard their rmSync(benchRoot)
       // reclamations too (reclaimBenchRoot: logged, never substituted for a propagating error).
       // Still not an end-to-end claim: the single-writer lock release in each command's
-      // outermost `finally` remains capable of replacing a propagating error if its own rmSync
-      // throws.
+      // outermost `finally` catches its own rmSync but calls log() UNGUARDED inside that catch,
+      // so a throwing logger there can still replace a propagating error.
       try {
         this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run-cache DB failed to initialise (${openErr instanceof Error ? openErr.message : String(openErr)}) — ${describeUnopenedSweep(runDir, dbPath, residue)} before rethrowing`);
       } catch {
