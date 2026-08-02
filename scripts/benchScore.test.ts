@@ -73,8 +73,8 @@ const rowLines = (spec: RowSpec): string[] => {
     rep: spec.rep, probe: spec.probe === true, phase: "matrix", epilogue: false, acquisitionForm: null,
     startedAtIso: "2026-07-29T00:00:00Z", wallMs: spec.wallMs ?? 1000, segments: 1, outcome: "complete",
     failureCause: null, failureEvidence: null, requests: { "rest-content": 1 },
-    requestClassSuccesses: { "rest-content": 1 },
-    attempts: { fivexx: 0, retries: 0, noResponse: 0, secondaryByKind: {} }, straddledReset: false, secondarySignals: 0,
+    okRequestClasses: ["rest-content"],
+    attempts: { fivexx: 0, retries: 0, secondaryByKind: {} }, straddledReset: false, secondarySignals: 0,
     points: { measuredCostSum: 0, imputed: 0 },
     bucketDeltas: { core: { valid: true, used: 0 }, graphql: { valid: true, used: 0 } },
     bucketSnapshots: [], expectedConsumption: { core: 0, graphql: 0 },
@@ -88,7 +88,7 @@ const rowLines = (spec: RowSpec): string[] => {
   };
   return [
     JSON.stringify(base),
-    JSON.stringify({ type: "washout-done", forAttemptId: attemptId, pos: spec.pos, rep: spec.rep, probe: spec.probe === true, phase: "matrix", unit: spec.unit, driver: spec.driver }),
+    JSON.stringify({ type: "washout-done", forAttemptId: (base as Record<string, unknown>)["attemptId"], pos: spec.pos, rep: spec.rep, probe: spec.probe === true, phase: "matrix", unit: spec.unit, driver: spec.driver }),
   ];
 };
 

@@ -56,13 +56,10 @@ import { BenchHttpError, benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuc
 import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts";
 import {
   BenchEngine, RunsLog, applyPendingTransition, buildEnvManifest, computeWorstCase,
-  isRerunnableEvidence, planSegments, reconstructMatrixState,
+  evidenceIsRerunnable, planSegments, reconstructMatrixState,
 } from "./benchProtocol.ts";
 import { RePinRequired, UnitFailure, acquireStore, describeDisposal, disposalIsClean, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
 import { noiseBandFrom } from "./benchConfig.ts";
-import {
-  judgeFidelity, reconstructFidelityLedger, shouldAttemptCell, type FidelityOutcome,
-} from "./benchFidelity.ts";
 import { scoreMatrix, type ScoreBundle, type ScoreOutput } from "./benchScore.ts";
 import { buildReport } from "./benchReport.ts";
 import { planBoundaryCells, runBoundaryProbe } from "./benchBoundary.ts";
@@ -220,47 +217,82 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
     benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
   });
   assertFreezeGitState(statusOut, lsFiles, [...APPEND_ONLY, ...REGENERATED_OUTPUTS]);
-  // Verify the append-only CLAIM for each tracked evidence log: committed bytes must be a
-  // byte-exact prefix of the working copy. Presence-in-HEAD is probed with `ls-tree HEAD --`,
-  // whose contract is exit 0 with empty output for an absent path — so a NON-ZERO exit from
-  // either probe or show is a git failure and REFUSES (an earlier draft skipped on any show
-  // failure, which failed OPEN for exactly the rewritten-log case this check exists to catch).
-  // KNOWN LIMIT, stated plainly: this proves no COMMITTED evidence was edited or truncated;
-  // rows appended since the last commit have no committed baseline and are protected only by
-  // committing them — commit the evidence logs early and often during Step C.
-  for (const rel of APPEND_ONLY) {
-    if (rel.endsWith("/")) continue; // directory exemptions are untracked scratch space
-    const gitLimits = { maxStdoutBytes: 512 * 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 };
-    const probe = await runBenchGit({
-      argv: ["ls-tree", "HEAD", "--", rel], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
-      benchRoot: repoRoot, cwd: repoRoot, limits: gitLimits,
-    });
-    if (probe.exitCode !== 0)
-      throw new Error(`REFUSING: ${gitFailure(`git ls-tree HEAD -- ${rel}`, probe)} — the append-only verification cannot run, so it fails closed (§8)`);
-    if (text(probe.stdout).trim() === "") continue; // not in HEAD yet (first run of a log) — nothing to prefix-check
-    const abs = join(REPO_ROOT, rel);
-    if (!existsSync(abs))
-      throw new Error(`REFUSING: ${rel} is committed in HEAD but ABSENT from the working tree — deleting an evidence log is not appending (§8)`);
-    const show = await runBenchGit({
-      argv: ["show", `HEAD:${rel}`], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
-      benchRoot: repoRoot, cwd: repoRoot, limits: gitLimits,
-    });
-    if (show.exitCode !== 0)
-      throw new Error(`REFUSING: ${gitFailure(`git show HEAD:${rel}`, show)} — the committed evidence baseline is unreadable, so the append-only claim cannot be verified (§8)`);
-    const working = readFileSync(abs);
-    assertAppendOnlyPrefix(rel, show.stdout, working);
-    // the INDEX is a third copy a later plain `git commit` would persist: a staged REWRITE
-    // beside an appended working file passed the HEAD↔working check alone. The staged copy
-    // must itself extend HEAD and be a prefix of the working bytes (the chain HEAD ⊑ index ⊑
-    // working is exactly "only appends, everywhere").
-    const staged = await runBenchGit({
-      argv: ["show", `:${rel}`], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
-      benchRoot: repoRoot, cwd: repoRoot, limits: gitLimits,
-    });
-    if (staged.exitCode !== 0)
-      throw new Error(`REFUSING: ${gitFailure(`git show :${rel}`, staged)} — the staged copy of an evidence log is unreadable, so the append-only claim cannot be verified (§8)`);
-    assertAppendOnlyPrefix(`${rel} (staged)`, show.stdout, staged.stdout);
-    assertAppendOnlyPrefix(`${rel} (staged vs working)`, staged.stdout, working);
+  // The append-only CLAIM for each tracked evidence log is verified (and a crash-torn tail
+  // repaired) by the ONE shared helper — writers repair, readers never mutate (C0-R3 f.7).
+  await assertAppendOnlyLogs({ repairTornTail: true });
+  return { rat, digest };
+}
+// The ONE append-only verifier for the two evidence logs (matrix gate AND the pure readers):
+// committed existence is decided from HEAD, never the index — a staged deletion would make
+// ls-files call a HEAD-protected log "untracked" and bypass the prefix check entirely
+// (codex C0-R3 finding 1); any OTHER git failure is fail-closed (C0-R2 finding 10). The staged
+// copy must itself extend HEAD and be a prefix of the working bytes (the chain
+// HEAD ⊑ index ⊑ working is exactly "only appends, everywhere"). KNOWN LIMIT, stated plainly:
+// this proves no COMMITTED evidence was edited or truncated; rows appended since the last
+// commit have no committed baseline and are protected only by committing them — commit the
+// evidence logs early and often during Step C.
+async function assertAppendOnlyLogs(opts: { repairTornTail: boolean }): Promise<void> {
+  const repoRoot = realpathSync(REPO_ROOT);
+  const env = buildGitEnv(process.env, "/dev/null");
+  const gitRO = (argv: string[], maxStdoutBytes: number): ReturnType<typeof runBenchGit> => runBenchGit({
+    argv, lane: { lane: "pinning" }, env, benchRoot: repoRoot, cwd: repoRoot,
+    limits: { maxStdoutBytes, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  for (const logRel of ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl"]) {
+    let prefix = Buffer.alloc(0);
+    let inHead = false;
+    const exists = await gitRO(["cat-file", "-e", `HEAD:${logRel}`], 4096);
+    if (exists.exitCode === 0) {
+      inHead = true;
+      const committed = await gitRO(["show", `HEAD:${logRel}`], 256 * 1024 * 1024);
+      if (committed.exitCode !== 0)
+        throw new Error(`REFUSING: cannot read HEAD:${logRel} to verify the append-only prefix (${text(committed.stderr).trim().slice(0, 160)}) — failing closed`);
+      prefix = Buffer.from(committed.stdout);
+    } else {
+      const err = text(exists.stderr);
+      if (!/does not exist|Not a valid object name|invalid object name|bad revision|path .* does not exist/i.test(err))
+        throw new Error(`REFUSING: cannot establish HEAD:${logRel}'s existence (${err.trim().slice(0, 160)}) — failing closed (codex C0-R3 finding 1)`);
+      // genuinely absent at HEAD — nothing committed to protect
+    }
+    const workingPath = join(REPO_ROOT, logRel);
+    if (inHead && !existsSync(workingPath))
+      throw new Error(`REFUSING: ${logRel} is committed in HEAD but ABSENT from the working tree — deleting an evidence log is not appending (§8)`);
+    const working = existsSync(workingPath) ? readFileSync(workingPath) : Buffer.alloc(0);
+    assertAppendOnlyPrefix(logRel, prefix, working);
+    // writers repair a torn tail — including on files not yet at HEAD (a first battery run's
+    // fidelity.jsonl, codex C0-R3 finding 7). A tail that parses as complete JSON lost only
+    // its newline to the crash: SEAL it (truncating would silently delete a recorded outcome);
+    // only genuinely malformed bytes are truncated, and only beyond the committed prefix.
+    if (opts.repairTornTail && working.byteLength > 0 && working[working.byteLength - 1] !== 0x0a) {
+      const tailStart = working.lastIndexOf(0x0a) + 1;
+      if (tailStart < prefix.byteLength)
+        throw new Error(`REFUSING: ${logRel}'s torn tail overlaps the committed prefix — corruption, not a crash artifact`);
+      const tail = working.subarray(tailStart);
+      let sealable = false;
+      try {
+        JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(tail));
+        sealable = true;
+      } catch {
+        sealable = false;
+      }
+      if (sealable) {
+        appendFileSync(workingPath, "\n");
+        log(`repaired ${logRel}: sealed a complete final record that lost only its newline`);
+      } else {
+        truncateSync(workingPath, tailStart);
+        log(`repaired ${logRel}: truncated a ${tail.byteLength}-byte torn uncommitted tail (crash mid-append)`);
+      }
+    }
+    if (inHead) {
+      // the INDEX is a third copy a later plain `git commit` would persist: a staged REWRITE
+      // beside an appended working file passed the HEAD↔working check alone.
+      const staged = await gitRO(["show", `:${logRel}`], 256 * 1024 * 1024);
+      if (staged.exitCode !== 0)
+        throw new Error(`REFUSING: ${gitFailure(`git show :${logRel}`, staged)} — the staged copy of an evidence log is unreadable, so the append-only claim cannot be verified (§8)`);
+      const workingNow = readFileSync(workingPath);
+      assertAppendOnlyPrefix(`${logRel} (staged)`, prefix, staged.stdout);
+      assertAppendOnlyPrefix(`${logRel} (staged vs working)`, staged.stdout, workingNow);
+    }
   }
 }
 
@@ -1064,10 +1096,10 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
   const runsLog = new RunsLog(join(ARTIFACTS, "runs.jsonl"), manifest);
   const engine = new BenchEngine({
     cfg, corpus, workloads, benchRoot, artifactsDir: ARTIFACTS,
-    frozenSurfaceDigest: frozenSurfaceDigest(), // every row binds to its freeze (codex C0-R2 f.2)
+    // every ratified-phase row binds to its freeze (codex C0-R2 f.2); null before ratification (the pilot)
+    frozenSurfaceDigest,
     runCacheDir: join(REPO_ROOT, "data", "bench-run-caches"),
     runsLog,
-    frozenSurfaceDigest,
     client: metaClient,
     makeClient: (db) => new GithubClient({ githubHost: cfg.githubHost, db, tempRoot: benchRoot }),
     log,
@@ -1706,34 +1738,8 @@ async function cmdFidelity(): Promise<void> {
   }
 }
 
-// ---- matrix resumability (codex R1 f.17), extracted PURE so CI can drive it ------------------
-// The frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7): R1 = a network-layer
-// failure outside any HTTP response, rerunnable unconditionally (≤1); R2 = a transient-5xx
-// exhaustion within caps whose request class SUCCEEDED in at least one other completed
-// repetition of this unit × driver. Secondary-shaped failures are NEVER rerunnable.
-export function evidenceIsRerunnable(ev: unknown, unitDriverKey: string, ledger: ReadonlySet<string>): boolean {
-  if (typeof ev !== "object" || ev === null) return false;
-  const e = ev as Record<string, unknown>;
-  // §4.5 amended 2026-08-02: a SETTLED network-shaped git-transport failure on one of the three
-  // network-facing operations is R1 — same ≤1 allowance pool as the HTTP shapes. Validated
-  // fail-closed against the frozen vocabularies INCLUDING the exact exitCode pairing the
-  // classifier can mint (timeout ⇔ the synthetic 124; the stderr-classified shapes ⇔ 128) —
-  // this predicate also re-decides from persisted rows on resume, so a hand-edited or foreign
-  // value must never widen the allowance.
-  if (e["kind"] === "git-transport") {
-    const opOk = e["op"] === "clone" || e["op"] === "scaffold-fetch" || e["op"] === "ls-remote-probe";
-    if (!opOk) return false;
-    if (e["networkClass"] === "timeout") return e["exitCode"] === 124; // R1
-    const classOk = e["networkClass"] === "dns" || e["networkClass"] === "tls"
-      || e["networkClass"] === "connect" || e["networkClass"] === "reset";
-    return classOk && e["exitCode"] === 128; // R1
-  }
-  if (e["kind"] !== "http") return false;
-  if (e["code"] === "no-response") return true; // R1
-  if ((e["code"] === "attempts-exhausted" || e["code"] === "http-failure") && e["lastClassification"] === "transient")
-    return ledger.has(`${unitDriverKey}|${typeof e["requestClass"] === "string" ? e["requestClass"] : ""}`); // R2
-  return false;
-}
+// ---- matrix resumability: the shared rule lives in benchProtocol (reconstructMatrixState +
+// evidenceIsRerunnable) so resume, scoring, and the live loop can never drift ---------------
 
 // The R6 epilogue's execution order (§4.5, amended 2026-08-02). The raw drifted-row filter
 // preserves frozen positions but DESTROYS the interleaving guarantee: remove the units that
@@ -1799,210 +1805,6 @@ export function orderEpilogueRows(
   return [...main, ...probe];
 }
 
-export interface ResumeState {
-  terminalPos: Set<number>;
-  rerunUsed: Set<string>; // unit|driver keys whose ≤1 R1/R2 allowance is spent
-  straddled: Set<string>; // units with a recorded R4 straddle (a second one halts)
-  // unit|driver|requestClass a completed rep SUCCEEDED on — wider than "a record classified ok":
-  // it is that rep's okRequestClasses, i.e. records classified ok/not-modified PLUS the frozen T1
-  // table's accepted class, which a partial-data 200 mints with every record classified fatal
-  // (see summarizeTraffic's tableAcceptedClasses), plus the implied rest-meta entry the
-  // reconstruction inserts for every completed rep's accounting read
-  successLedger: Set<string>;
-  driftedUnits: Set<string>;
-  resumeForms: Map<string, "production" | "scaffolding">;
-  // pos → unit|driver: a rerunnable unit-failure whose MANDATED in-slot R1/R2 replay (§4.5)
-  // never landed a row — the traversal owes it, it is not terminal
-  owedReplays: Map<number, string>;
-  // pos set whose LAST row is an R3/R4 invalidation: the in-slot replay §4.5 mandates is still
-  // owed, and the caller must dispatch it AS an r3r4 replay so its record carries the
-  // physical-predecessor bookkeeping ("a replay's physical predecessor is the failed attempt
-  // itself — recorded as such") — a resumed re-execution previously ran unmarked
-  owedInSlotReplays: Set<number>;
-  // non-null when the log's FINAL event is a run row whose washout marker never landed: the
-  // washout was interrupted, and the caller COMPLETES it (sleep, then append the marker)
-  // before executing anything — §4.5's separation is satisfied without re-running a transport
-  // attempt that already measured (an earlier design re-ran the row, which duplicated
-  // measurements and consumed budget for an owed IDLE period)
-  owedWashout: { pos: number; ms: number } | null;
-}
-
-// the identity a resume row must match — the frozen schedule's own row at that position
-export interface ScheduleRowIdentity {
-  unit: string;
-  driver: string;
-  rep: number;
-  probe: boolean;
-}
-
-const RESUME_OUTCOMES = new Set([
-  "complete", "unit-failure", "invalidated-straddle", "invalidated-foreign",
-  "invalidated-finalisation", "halt-r5-breach", "drift-restart", "re-pin-required",
-]);
-
-// Reconstruct the traversal state from runs.jsonl. The properties that matter beyond
-// bookkeeping:
-//   • every run row is validated against the FROZEN schedule's identity at its position —
-//     a parseable-but-wrong row (garbage unit/driver, an unknown outcome) must refuse, never
-//     silently terminalize a position it does not describe;
-//   • washout markers pair with run rows by LOG ORDER (a marker certifies the row it follows;
-//     the live engine appends row-then-marker before anything else runs, so at most the FINAL
-//     event may be an unmarked row). An interrupted washout is returned as owedWashout for the
-//     caller to COMPLETE (sleep + append the marker) — never a reason to re-run a transport
-//     attempt that already measured, which duplicated measurements and consumed budget for an
-//     owed idle period;
-//   • a unit-failure whose live traversal had decided an R1/R2 replay — and was then
-//     interrupted anywhere in the replay run — must NOT terminalize: the frozen §4.5 discipline
-//     mandated that replay. It is re-decided here with the SAME predicate over the ledger AS OF
-//     the failure's position (a completion recorded after it must not retroactively authorize —
-//     §4.5's "evaluated at failure time" is order-stable), so a live "no rerun" decision
-//     reconstructs identically and is never granted a replay resume-side;
-//   • two recorded R4 straddles on one unit mean the live traversal already halted for freeze
-//     repair — resume REFUSES rather than quietly executing a third attempt past that halt.
-export function reconstructResumeState(
-  lines: readonly string[],
-  currentDigest: string,
-  currentEnvHash: string,
-  schedule: ReadonlyMap<number, ScheduleRowIdentity>,
-): ResumeState {
-  const rowsAtPos = new Map<number, Array<Record<string, unknown>>>();
-  const straddleRows = new Map<string, number>();
-  const driftedUnits = new Set<string>();
-  const rerunUsed = new Set<string>();
-  const resumeForms = new Map<string, "production" | "scaffolding">();
-  const ledgerEntries: Array<{ pos: number; key: string; unit: string; epilogue: boolean }> = [];
-  let pendingUnmarked: { pos: number; rec: Record<string, unknown>; line: number } | null = null;
-  for (const [i, line] of lines.entries()) {
-    if (line.trim() === "") continue;
-    let rec: Record<string, unknown>;
-    try {
-      rec = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      // an unreadable line in the evidence log is freeze-repair territory: skipping it could
-      // silently drop a terminal halt-r5/re-pin row and resume straight past a frozen-
-      // assumption breach
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} is not valid JSON — the append-only evidence log is corrupted; that is §8 freeze-repair territory, never a silent skip`);
-    }
-    if (rec["type"] === "washout-done" && rec["phase"] === "matrix") {
-      // a marker certifies the row it follows — one with no unmarked row, or the wrong pos,
-      // describes a log the live engine cannot have written
-      if (pendingUnmarked === null || rec["pos"] !== pendingUnmarked.pos)
-        throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} carries a washout marker with no matching preceding run row — the evidence log violates the row/marker invariant`);
-      pendingUnmarked = null;
-      continue;
-    }
-    if (rec["type"] !== "run" || rec["phase"] !== "matrix") continue;
-    // resume only trusts records from THIS frozen measurement surface — rows from another
-    // surface/machine must not silently mix into one traversal (codex R2 f.21). The binding is
-    // the §8 CONTENT digest, not the commit: an evidence-only or test-only commit moves HEAD
-    // without changing the frozen surface, and must not orphan every prior row (the commit
-    // stays stamped per row as provenance).
-    if (rec["frozenSurfaceDigest"] !== currentDigest)
-      throw new Error(`REFUSING to resume: runs.jsonl carries matrix rows from frozen surface ${String(rec["frozenSurfaceDigest"]).slice(0, 12)} != current ${currentDigest.slice(0, 12)} — a changed measurement surface restarts the matrix (§8)`);
-    // one machine, one network, one credential for ALL timed data (§8) — a foreign
-    // environment's rows must never mix into this traversal (codex R3 f.2)
-    if (rec["envManifestHash"] !== currentEnvHash)
-      throw new Error(`REFUSING to resume: runs.jsonl carries rows from environment ${String(rec["envManifestHash"])} != current ${currentEnvHash}`);
-    const outcome = rec["outcome"];
-    if (outcome === "halt-r5-breach" || outcome === "re-pin-required")
-      throw new Error(`REFUSING to resume: runs.jsonl carries a terminal ${outcome} row — that is freeze-repair/amendment territory (§4.5 R5/R6), never a silent retry`);
-    if (typeof outcome !== "string" || !RESUME_OUTCOMES.has(outcome))
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} carries unknown outcome ${JSON.stringify(outcome)} — a row this scan cannot classify must not be skimmed past`);
-    const pos = rec["pos"];
-    if (typeof pos !== "number")
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} is a matrix run row with no numeric pos`);
-    // the row must describe the FROZEN schedule's own identity at its position — a garbage
-    // unit/driver would otherwise terminalize a position it does not describe
-    const expected = schedule.get(pos);
-    if (expected === undefined)
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} names pos ${pos}, which the frozen schedule does not contain`);
-    if (rec["unit"] !== expected.unit || rec["driver"] !== expected.driver || rec["rep"] !== expected.rep || rec["probe"] !== expected.probe)
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} at pos ${pos} does not match the frozen schedule row (${expected.unit} ${expected.driver} rep${expected.rep}${expected.probe ? " probe" : ""})`);
-    if (pendingUnmarked !== null)
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} appends a run row while line ${pendingUnmarked.line} is still awaiting its washout marker — the evidence log violates the row/marker invariant`);
-    pendingUnmarked = { pos, rec, line: i + 1 };
-    const list = rowsAtPos.get(pos) ?? [];
-    list.push(rec);
-    rowsAtPos.set(pos, list);
-    const unit = expected.unit;
-    if (outcome === "invalidated-straddle") straddleRows.set(unit, (straddleRows.get(unit) ?? 0) + 1);
-    if (outcome === "drift-restart") driftedUnits.add(unit); // pending R6 epilogue survives interruption (f.20)
-    const form = rec["acquisitionForm"];
-    if (form === "scaffolding") resumeForms.set(unit, "scaffolding");
-    else if (form === "production" && !resumeForms.has(unit)) resumeForms.set(unit, "production");
-    // only R1/R2 replays charge the driver allowance; R3/R4 in-slot replays do not (f.23)
-    if (rec["replayKind"] === "r1r2") rerunUsed.add(`${unit}|${expected.driver}`);
-    if (outcome === "complete") {
-      // §4.5 R2 needs classes that SUCCEEDED — `requests` counts recorded non-cache, non-rest-meta attempts including
-      // failures (a completed run can carry a class that only ever failed, e.g. every batch
-      // drained to fallback), so the ledger reads the ok-classes field
-      const okClasses = rec["okRequestClasses"];
-      for (const cls of Array.isArray(okClasses) ? okClasses.filter((c): c is string => typeof c === "string") : [])
-        ledgerEntries.push({ pos, key: `${unit}|${expected.driver}|${cls}`, unit, epilogue: rec["epilogue"] === true });
-      // every completed run READ rate_limit successfully before and after (its accounting
-      // depends on it), but rest-meta is control-plane and excluded from `requests` — without
-      // this implied entry a pre-run rate_limit exhaustion could never satisfy R2's
-      // prior-success predicate and became a permanent G3 failure
-      ledgerEntries.push({ pos, key: `${unit}|${expected.driver}|rest-meta`, unit, epilogue: rec["epilogue"] === true });
-    }
-  }
-  // §4.5 R4: the SECOND straddle on a unit halts the matrix for freeze repair — a log carrying
-  // two straddle rows records a traversal that already halted; resume must not run a third
-  for (const [unit, n] of straddleRows) {
-    if (n >= 2)
-      throw new Error(`REFUSING to resume: runs.jsonl records ${n} R4 straddles on ${unit} — the second one halted the matrix for freeze repair (§4.5); never a silent third attempt`);
-  }
-  const straddled = new Set(straddleRows.keys());
-  // a drifted unit's form is scaffolding regardless of what its pre-drift rows recorded
-  for (const unit of driftedUnits) resumeForms.set(unit, "scaffolding");
-  // drift may have landed AFTER a completion entered the ledger above — a drifted unit's
-  // non-epilogue reps are discarded and their evidence with them
-  const filteredLedger = ledgerEntries.filter((e) => !driftedUnits.has(e.unit) || e.epilogue);
-  const successLedger = new Set(filteredLedger.map((e) => e.key));
-  const ledgerBefore = (pos: number): Set<string> => new Set(filteredLedger.filter((e) => e.pos < pos).map((e) => e.key));
-
-  // the final event may legitimately be an unmarked row: its washout was interrupted and is
-  // OWED — the caller completes it before executing anything
-  const washoutMsOf = (rec: Record<string, unknown>): number => {
-    const v = rec["washoutAppliedMs"];
-    return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
-  };
-  const owedWashout = pendingUnmarked === null ? null : { pos: pendingUnmarked.pos, ms: washoutMsOf(pendingUnmarked.rec) };
-
-  const terminalPos = new Set<number>();
-  const owedReplays = new Map<number, string>();
-  const owedInSlotReplays = new Set<number>();
-  for (const [pos, rows] of rowsAtPos) {
-    // a SECOND invalidated-finalisation at one position means the post-run accounting read is
-    // failing persistently — an unbounded silent retry class; the operator investigates
-    const finalisationFailures = rows.filter((r) => r["outcome"] === "invalidated-finalisation").length;
-    if (finalisationFailures >= 2)
-      throw new Error(`REFUSING to resume: pos ${pos} carries ${finalisationFailures} invalidated-finalisation rows — the post-run accounting is failing persistently; investigate before re-running`);
-    const last = rows[rows.length - 1]!;
-    const outcome = last["outcome"] as string;
-    if (outcome === "invalidated-straddle" || outcome === "invalidated-foreign") {
-      // the §4.5 in-slot replay is owed AND must carry its replay bookkeeping when dispatched
-      owedInSlotReplays.add(pos);
-      continue;
-    }
-    if (outcome !== "complete" && outcome !== "unit-failure") continue; // finalisation/drift rows never terminalize
-    const unit = last["unit"] as string;
-    if (driftedUnits.has(unit) && last["epilogue"] !== true) continue; // discarded main reps; the epilogue re-runs them (f.4)
-    // the owed-replay reconstruction applies to EPILOGUE failures of drifted units too — an
-    // interrupt during an epilogue R1/R2 replay must not forfeit it (the ledger already keeps
-    // only the drifted unit's epilogue evidence)
-    if (outcome === "unit-failure" && (!driftedUnits.has(unit) || last["epilogue"] === true)) {
-      const key = `${unit}|${last["driver"] as string}`;
-      if (!rerunUsed.has(key) && evidenceIsRerunnable(last["failureEvidence"], key, ledgerBefore(pos))) {
-        owedReplays.set(pos, key);
-        continue;
-      }
-    }
-    terminalPos.add(pos);
-  }
-  return { terminalPos, rerunUsed, straddled, successLedger, driftedUnits, resumeForms, owedReplays, owedInSlotReplays, owedWashout };
-}
-
 async function cmdMatrix(): Promise<void> {
   // the lock comes FIRST — the pre-lock window previously ran workload parsing and the freeze
   // gate's git scans concurrently with whatever held the lock
@@ -2021,7 +1823,8 @@ async function cmdMatrix(): Promise<void> {
     const runsPath = join(ARTIFACTS, "runs.jsonl");
     const state = reconstructMatrixState(
       existsSync(runsPath) ? readFileSync(runsPath, "utf8").split("\n") : [],
-      { harnessCommit: engine.harnessCommit(), envManifestHash: engine.envManifestHashValue(), frozenSurfaceDigest: digest },
+      { envManifestHash: engine.envManifestHashValue(), frozenSurfaceDigest: digest },
+      new Map(cfg.schedule.rows.map((r) => [r.pos, { unit: r.unit, driver: r.driver, rep: r.rep, probe: r.probe }])),
     );
     const { terminalPos, rerunUsed, straddleCounts, driftedUnits, successLedger, pendingReplays } = state;
     if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
@@ -2048,7 +1851,7 @@ async function cmdMatrix(): Promise<void> {
     // SUCCEEDED in at least one other completed repetition of this unit × driver.
     // Secondary-shaped failures are NEVER rerunnable.
     const isRerunnable = (record: import("./benchProtocol.ts").RunRecord): boolean =>
-      isRerunnableEvidence(record.failureEvidence, record.unit, record.driver, successLedger);
+      evidenceIsRerunnable(record.failureEvidence, `${record.unit}|${record.driver}`, successLedger);
     const executeRows = async (rows: NonNullable<typeof cfg.schedule>["rows"], phaseNote: string): Promise<void> => {
       for (const row of rows) {
         if (terminalPos.has(row.pos) && phaseNote === "main") continue;

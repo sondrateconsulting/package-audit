@@ -244,177 +244,12 @@ describe("loginFromUserPayload — the §8 credential identity cannot degrade to
 });
 
 // ---- the resume reconstruction (§4.5/§4.8) ---------------------------------------------------
-import { assertAppendOnlyPrefix, classifyFidelityLog, reconstructResumeState, evidenceIsRerunnable } from "./benchContentTransport.ts";
+import { assertAppendOnlyPrefix, classifyFidelityLog } from "./benchContentTransport.ts";
+import { evidenceIsRerunnable, reconstructMatrixState } from "./benchProtocol.ts";
 
-describe("reconstructResumeState — resume must honour the frozen §4.5 discipline exactly", () => {
-  const DIGEST = "f".repeat(64);
-  const ENV_HASH = "abcd1234abcd1234";
-  const UNIT = "C2:o/r@main";
-  const KEY = `${UNIT}|T0`;
-  // the frozen schedule identity the rows must match: rep = pos for these fixtures
-  const SCHED = new Map(
-    Array.from({ length: 9 }, (_, i) => [i + 1, { unit: UNIT, driver: "T0", rep: i + 1, probe: false }] as const),
-  );
-  const runRow = (over: Record<string, unknown>): string => {
-    const pos = typeof over["pos"] === "number" ? (over["pos"] as number) : 1;
-    return JSON.stringify({
-      type: "run", schemaVersion: 1, phase: "matrix", pos, unit: UNIT, driver: "T0", rep: pos,
-      probe: false, epilogue: false, outcome: "complete", failureEvidence: null, requests: {},
-      acquisitionForm: null, replayKind: null, washoutAppliedMs: 60_000,
-      harnessCommit: "c".repeat(40), frozenSurfaceDigest: DIGEST, envManifestHash: ENV_HASH,
-      ...over,
-    });
-  };
-  const marker = (pos: number): string => JSON.stringify({ type: "washout-done", phase: "matrix", pos });
-  const state = (lines: string[]) => reconstructResumeState(lines, DIGEST, ENV_HASH, SCHED);
-  const R1_EVIDENCE = { kind: "http", code: "no-response", lastClassification: "no-response", requestClass: "rest-content" };
-  const R2_EVIDENCE = { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-content" };
-
-  test("a washed-out R1-rerunnable failure is OWED its replay, never terminal", () => {
-    // The defect: the failed row's washout marker landed, then the process died anywhere inside
-    // the (minutes-long) replay run. The old resume terminalized the pos and silently forfeited
-    // the mandated in-slot replay — the recorded failure stood, G3 failed, and a transient
-    // interrupt became a permanent driver disqualification (instance #7 of the class).
-    const s = state([runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R1_EVIDENCE }), marker(5)]);
-    expect(s.terminalPos.has(5)).toBe(false);
-    expect(s.owedReplays.get(5)).toBe(KEY);
-    expect(s.owedWashout).toBeNull();
-  });
-  test("R2 is evaluated against the ledger AS OF the failure — later completions never authorize", () => {
-    const failure = runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R2_EVIDENCE });
-    const completedBefore = runRow({ pos: 3, outcome: "complete", requests: { "rest-content": 3 }, okRequestClasses: ["rest-content"] });
-    const completedAfter = runRow({ pos: 7, outcome: "complete", requests: { "rest-content": 3 }, okRequestClasses: ["rest-content"] });
-    const owed = state([completedBefore, marker(3), failure, marker(5)]);
-    expect(owed.owedReplays.get(5)).toBe(KEY);
-    // the same completion recorded AFTER the failure must not retroactively grant the replay —
-    // §4.5's "evaluated at failure time" is order-stable, and the live loop decided "no rerun"
-    const notOwed = state([failure, marker(5), completedAfter, marker(7)]);
-    expect(notOwed.owedReplays.size).toBe(0);
-    expect(notOwed.terminalPos.has(5)).toBe(true);
-  });
-  test("a spent allowance is never re-granted: the landed replay row settles the pos", () => {
-    const s = state([
-      runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R1_EVIDENCE }), marker(5),
-      runRow({ pos: 5, outcome: "complete", replayKind: "r1r2", requests: { "rest-content": 2 }, okRequestClasses: ["rest-content"] }), marker(5),
-    ]);
-    expect(s.terminalPos.has(5)).toBe(true);
-    expect(s.owedReplays.size).toBe(0);
-    expect(s.rerunUsed.has(KEY)).toBe(true);
-  });
-  test("an interrupted washout is OWED as idle time — the measured attempt is never re-run", () => {
-    // The earlier design re-ran any row whose marker was missing, which duplicated a completed
-    // measurement, consumed live budget for an owed IDLE period, and (because the re-run added
-    // one row and one marker) left the marker count permanently one behind the row count — the
-    // position could never terminalize across any number of resumes.
-    const s = state([
-      runRow({ pos: 5, outcome: "unit-failure", failureEvidence: R1_EVIDENCE }), marker(5),
-      runRow({ pos: 5, outcome: "complete", replayKind: "r1r2", requests: { "rest-content": 2 }, okRequestClasses: ["rest-content"], washoutAppliedMs: 90_000 }),
-    ]);
-    expect(s.owedWashout).toEqual({ pos: 5, ms: 90_000 }); // the caller sleeps this, then appends the marker
-    expect(s.terminalPos.has(5)).toBe(true); // the replay STANDS — it measured; only its washout is owed
-    expect(s.owedReplays.size).toBe(0);
-    expect(s.rerunUsed.has(KEY)).toBe(true);
-  });
-  test("only the FINAL event may be unmarked — an interior unmarked row refuses as a violated invariant", () => {
-    expect(() => state([
-      runRow({ pos: 4, outcome: "complete" }), // no marker
-      runRow({ pos: 5, outcome: "complete" }), marker(5),
-    ])).toThrow(/row\/marker invariant/);
-  });
-  test("a stray or mismatched washout marker refuses — the live engine cannot have written it", () => {
-    expect(() => state([marker(3)])).toThrow(/row\/marker invariant/);
-    expect(() => state([runRow({ pos: 4, outcome: "complete" }), marker(6)])).toThrow(/row\/marker invariant/);
-  });
-  test("rows are validated against the FROZEN schedule — wrong identity or unknown pos refuses", () => {
-    expect(() => state([runRow({ pos: 99 })])).toThrow(/schedule does not contain/);
-    expect(() => state([runRow({ pos: 2, driver: "T1" })])).toThrow(/does not match the frozen schedule/);
-    expect(() => state([runRow({ pos: 2, rep: 1 })])).toThrow(/does not match the frozen schedule/);
-    expect(() => state([runRow({ pos: 2, outcome: "made-up-outcome" })])).toThrow(/unknown outcome/);
-  });
-  test("two recorded R4 straddles on one unit refuse — the live traversal already halted for freeze repair", () => {
-    expect(() => state([
-      runRow({ pos: 2, outcome: "invalidated-straddle" }), marker(2),
-      runRow({ pos: 2, outcome: "invalidated-straddle" }), marker(2),
-    ])).toThrow(/R4 straddles/);
-  });
-  test("{kind:'unit'} evidence is never owed a replay — the frozen predicate accepts only http shapes", () => {
-    const s = state([runRow({ pos: 5, outcome: "unit-failure", failureEvidence: { kind: "unit" } }), marker(5)]);
-    expect(s.terminalPos.has(5)).toBe(true);
-    expect(s.owedReplays.size).toBe(0);
-  });
-  test("a corrupted evidence line REFUSES resume — a skipped line could hide a terminal halt row", () => {
-    expect(() => state([runRow({ pos: 1 }), "{not json"])).toThrow(/corrupted/);
-  });
-  test("halt-r5/re-pin rows, foreign surfaces, and foreign environments all refuse", () => {
-    expect(() => state([runRow({ pos: 1, outcome: "halt-r5-breach" })])).toThrow(/freeze-repair/);
-    expect(() => state([runRow({ pos: 1, outcome: "re-pin-required" })])).toThrow(/freeze-repair/);
-    expect(() => reconstructResumeState([runRow({ pos: 1 })], "0".repeat(64), ENV_HASH, SCHED)).toThrow(/changed measurement surface/);
-    expect(() => reconstructResumeState([runRow({ pos: 1 })], DIGEST, "other-env", SCHED)).toThrow(/REFUSING to resume/);
-  });
-  test("a class that only ever FAILED inside a completed rep never authorizes R2", () => {
-    // `requests` counts attempts; §4.5 R2 needs SUCCESS — a completed run whose batches all
-    // drained to fallback carries graphql-batch attempts with zero successes
-    const completed = runRow({ pos: 3, outcome: "complete", requests: { "graphql-batch": 6, "rest-fallback": 4 }, okRequestClasses: ["rest-fallback"] });
-    const failure = runRow({ pos: 5, outcome: "unit-failure", failureEvidence: { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "graphql-batch" } });
-    const s = state([completed, marker(3), failure, marker(5)]);
-    expect(s.owedReplays.size).toBe(0); // graphql-batch never SUCCEEDED — no R2
-    expect(s.terminalPos.has(5)).toBe(true);
-  });
-  test("a completed rep implies rest-meta success — a pre-run rate_limit exhaustion stays R2-rerunnable", () => {
-    // rest-meta is control-plane and excluded from `requests`, so the only ledger that can
-    // authorize an R2 replay never saw it succeed — even though every completed run's
-    // accounting read rate_limit before and after by construction
-    const completed = runRow({ pos: 3, outcome: "complete", requests: { "rest-content": 3 }, okRequestClasses: ["rest-content"] });
-    const metaFailure = runRow({ pos: 5, outcome: "unit-failure", failureEvidence: { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-meta" } });
-    const s = state([completed, marker(3), metaFailure, marker(5)]);
-    expect(s.successLedger.has(`${KEY}|rest-meta`)).toBe(true);
-    expect(s.owedReplays.get(5)).toBe(KEY);
-  });
-  test("the binding is the frozen-surface DIGEST, never the commit — an evidence-only commit must not orphan rows", () => {
-    // rows carry a different harnessCommit (HEAD moved when the evidence log was committed)
-    // but the SAME digest — the frozen surface is unchanged and resume must accept them
-    const s = state([runRow({ pos: 1, harnessCommit: "d".repeat(40), requests: { "rest-content": 1 }, okRequestClasses: ["rest-content"] }), marker(1)]);
-    expect(s.terminalPos.has(1)).toBe(true);
-  });
-  test("an R3/R4-invalidated last row owes its IN-SLOT replay with r3r4 bookkeeping", () => {
-    // a resumed re-execution previously ran unmarked, losing §4.5's physical-predecessor record
-    const s = state([runRow({ pos: 3, outcome: "invalidated-foreign" }), marker(3)]);
-    expect(s.owedInSlotReplays.has(3)).toBe(true);
-    expect(s.terminalPos.has(3)).toBe(false);
-    const straddle = state([runRow({ pos: 3, outcome: "invalidated-straddle" }), marker(3)]);
-    expect(straddle.owedInSlotReplays.has(3)).toBe(true);
-    expect(straddle.straddled.has(UNIT)).toBe(true);
-  });
-  test("a second invalidated-finalisation at one pos refuses — persistent accounting failure is not a silent retry loop", () => {
-    expect(() => state([
-      runRow({ pos: 4, outcome: "invalidated-finalisation" }), marker(4),
-      runRow({ pos: 4, outcome: "invalidated-finalisation" }), marker(4),
-    ])).toThrow(/failing persistently/);
-    // one is fine: re-run (unmarked as any §4.5 category — the accounting simply never landed)
-    const one = state([runRow({ pos: 4, outcome: "invalidated-finalisation" }), marker(4)]);
-    expect(one.terminalPos.has(4)).toBe(false);
-    expect(one.owedInSlotReplays.has(4)).toBe(false);
-  });
-  test("an epilogue R1/R2 failure of a DRIFTED unit is still owed its replay", () => {
-    const s = state([
-      runRow({ pos: 1, outcome: "drift-restart", acquisitionForm: "production" }), marker(1),
-      runRow({ pos: 2, outcome: "unit-failure", epilogue: true, acquisitionForm: "scaffolding", failureEvidence: R1_EVIDENCE }), marker(2),
-    ]);
-    expect(s.owedReplays.get(2)).toBe(KEY);
-    expect(s.terminalPos.has(2)).toBe(false);
-  });
-  test("drift bookkeeping: main rows of a drifted unit never terminalize; its form is scaffolding", () => {
-    const s = state([
-      runRow({ pos: 1, outcome: "complete", acquisitionForm: "production", requests: { "rest-content": 1 }, okRequestClasses: ["rest-content"] }), marker(1),
-      runRow({ pos: 2, outcome: "drift-restart", acquisitionForm: "production" }), marker(2),
-    ]);
-    expect(s.driftedUnits.has(UNIT)).toBe(true);
-    expect(s.terminalPos.has(1)).toBe(false); // discarded reps — the epilogue re-runs the whole unit
-    expect(s.resumeForms.get(UNIT)).toBe("scaffolding");
-    expect(s.successLedger.has(`${KEY}|rest-content`)).toBe(false); // discarded reps are not evidence
-    expect(s.owedReplays.size).toBe(0);
-  });
-});
+// The resume-discipline suite lives beside the ONE shared rule in benchProtocol.test.ts
+// (reconstructMatrixState) — the pos-keyed reconstructResumeState it exercised was replaced
+// at the Step-C restack by the attempt-keyed shared rule, which carries these semantics.
 
 describe("classifyFidelityLog — the battery's own append-only discipline (§4.2)", () => {
   const DIGEST = "d".repeat(64);
@@ -696,16 +531,17 @@ describe("evidenceIsRerunnable — the git-transport kind is R1, validated fail-
     const UNIT = "C2:o/r@main";
     const sched = new Map([[5, { unit: UNIT, driver: "T2a", rep: 5, probe: false }]]);
     const row = JSON.stringify({
-      type: "run", schemaVersion: 1, phase: "matrix", pos: 5, unit: UNIT, driver: "T2a", rep: 5,
+      type: "run", schemaVersion: 1, phase: "matrix", pos: 5, attemptId: "a-gt", unit: UNIT, driver: "T2a", rep: 5,
       probe: false, epilogue: false, outcome: "unit-failure",
       failureEvidence: { kind: "git-transport", op: "clone", exitCode: 124, networkClass: "timeout" },
       requests: {}, acquisitionForm: "production", replayKind: null, washoutAppliedMs: 60_000,
       harnessCommit: "c".repeat(40), frozenSurfaceDigest: DIGEST, envManifestHash: ENV_HASH,
     });
-    const marker = JSON.stringify({ type: "washout-done", phase: "matrix", pos: 5 });
-    const s = reconstructResumeState([row, marker], DIGEST, ENV_HASH, sched);
+    const marker = JSON.stringify({ type: "washout-done", forAttemptId: "a-gt", phase: "matrix", pos: 5 });
+    const s = reconstructMatrixState([row, marker], { envManifestHash: ENV_HASH, frozenSurfaceDigest: DIGEST }, sched);
     expect(s.terminalPos.has(5)).toBe(false);
-    expect(s.owedReplays.get(5)).toBe(`${UNIT}|T2a`);
+    expect(s.pendingReplays.get(5)).toBe("r1r2");
+    expect(s.rerunUsed.has(`${UNIT}|T2a`)).toBe(true);
   });
 });
 

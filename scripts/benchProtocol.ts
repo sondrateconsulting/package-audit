@@ -332,9 +332,6 @@ export interface RunRecord {
   // FACT independent of which outcome won precedence, so the durable per-pos cap counts every
   // occurrence (codex C0-R2 finding 3)
   controlPlaneFailed: boolean;
-  // the frozen-surface digest the attempt ran under: rows bind to their freeze, so evidence
-  // from different freezes can never be presented as one matrix (codex C0-R2 finding 2)
-  frozenSurfaceDigest: string;
   secondarySignals: number; // attributable (driver-own matrix traffic) — G4's classifier input
   points: { measuredCostSum: number; imputed: number };
   bucketDeltas: { core: BucketDelta; graphql: BucketDelta };
@@ -479,22 +476,55 @@ export interface MatrixResumeState {
   matrixRowsSeen: number;
 }
 
-export function isRerunnableEvidence(
-  evidence: RunRecord["failureEvidence"],
-  unit: string,
-  driver: string,
-  ledger: ReadonlySet<string>,
-): boolean {
-  if (evidence === null || evidence.kind !== "http") return false;
-  if (evidence.code === "no-response") return true; // R1
-  if ((evidence.code === "attempts-exhausted" || evidence.code === "http-failure") && evidence.lastClassification === "transient")
-    return ledger.has(`${unit}|${driver}|${evidence.requestClass ?? ""}`); // R2
+// The frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7): R1 = a network-layer
+// failure outside any HTTP response, rerunnable unconditionally (≤1); R2 = a transient-5xx
+// exhaustion within caps whose request class SUCCEEDED in at least one other completed
+// repetition of this unit × driver. Secondary-shaped failures are NEVER rerunnable. ONE
+// definition — the live loop, this reconstruction, and the scoring reader all call it, so the
+// three can never drift (relocated verbatim from the ratified Step-B surface at the Step-C
+// restack; the relocation is recorded in the §8 amendment).
+export function evidenceIsRerunnable(ev: unknown, unitDriverKey: string, ledger: ReadonlySet<string>): boolean {
+  if (typeof ev !== "object" || ev === null) return false;
+  const e = ev as Record<string, unknown>;
+  // §4.5 amended 2026-08-02: a SETTLED network-shaped git-transport failure on one of the three
+  // network-facing operations is R1 — same ≤1 allowance pool as the HTTP shapes. Validated
+  // fail-closed against the frozen vocabularies INCLUDING the exact exitCode pairing the
+  // classifier can mint (timeout ⇔ the synthetic 124; the stderr-classified shapes ⇔ 128) —
+  // this predicate also re-decides from persisted rows on resume, so a hand-edited or foreign
+  // value must never widen the allowance.
+  if (e["kind"] === "git-transport") {
+    const opOk = e["op"] === "clone" || e["op"] === "scaffold-fetch" || e["op"] === "ls-remote-probe";
+    if (!opOk) return false;
+    if (e["networkClass"] === "timeout") return e["exitCode"] === 124; // R1
+    const classOk = e["networkClass"] === "dns" || e["networkClass"] === "tls"
+      || e["networkClass"] === "connect" || e["networkClass"] === "reset";
+    return classOk && e["exitCode"] === 128; // R1
+  }
+  if (e["kind"] !== "http") return false;
+  if (e["code"] === "no-response") return true; // R1
+  if ((e["code"] === "attempts-exhausted" || e["code"] === "http-failure") && e["lastClassification"] === "transient")
+    return ledger.has(`${unitDriverKey}|${typeof e["requestClass"] === "string" ? e["requestClass"] : ""}`); // R2
   return false;
 }
 
+// every outcome the engine can persist — a row outside these shapes is refused on resume
+// (the plan's §4.5 evidence-vocabulary rule; ported from the ratified Step-B resume scan)
+const RESUME_OUTCOMES = new Set([
+  "complete", "unit-failure", "invalidated-straddle", "invalidated-foreign",
+  "invalidated-finalisation", "invalidated-control-plane", "halt-r5-breach", "drift-restart",
+  "re-pin-required",
+]);
+
+export interface ScheduleRowIdentity { unit: string; driver: string; rep: number; probe: boolean }
+
 export function reconstructMatrixState(
   lines: readonly string[],
-  expect: { harnessCommit: string; envManifestHash: string; frozenSurfaceDigest?: string } | null,
+  // the CONTENT binding is the frozen-surface digest, never the commit id: an evidence-only
+  // commit moves HEAD but not the digest, and must not orphan rows (ratified Step-B rule).
+  // harnessCommit stays ON the rows as provenance; null = the scoring reader, which derives
+  // and enforces ONE digest|environment identity across every row instead.
+  expect: { envManifestHash: string; frozenSurfaceDigest: string } | null,
+  schedule: ReadonlyMap<number, ScheduleRowIdentity>,
 ): MatrixResumeState {
   const state: MatrixResumeState = {
     terminalPos: new Set(), terminalRowByPos: new Map(), rerunUsed: new Set(),
@@ -504,6 +534,7 @@ export function reconstructMatrixState(
   };
   const identities = new Set<string>(); // harnessCommit|envManifestHash pairs (expect === null mode)
   const marked = new Set<string>(); // washout-marker attemptIds
+  let pendingUnmarked: { attemptId: string; line: number } | null = null; // row/marker interleave
   const pendingLedger = new Map<string, string[]>(); // attemptId → ledger keys, admitted at marker time
   type Attempt = {
     row: Record<string, unknown>; pos: number; unit: string; driver: string;
@@ -532,6 +563,12 @@ export function reconstructMatrixState(
     if (rec["type"] === "washout-done" && rec["phase"] === "matrix") {
       const forId = rec["forAttemptId"];
       if (typeof forId !== "string") continue; // markers without attempt identity bind nothing
+      // a marker certifies the row it follows — one with no unmarked row, or naming a different
+      // attempt, describes a log the live engine cannot have written (ported from the ratified
+      // Step-B resume scan's row/marker invariant)
+      if (pendingUnmarked === null || pendingUnmarked.attemptId !== forId)
+        throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} carries a washout marker with no matching preceding run row — the evidence log violates the row/marker invariant`);
+      pendingUnmarked = null;
       marked.add(forId);
       for (const key of pendingLedger.get(forId) ?? []) state.successLedger.add(key);
       pendingLedger.delete(forId);
@@ -544,7 +581,7 @@ export function reconstructMatrixState(
         const key = `${attempt.unit}|${attempt.driver}`;
         const evidenceRaw = attempt.row["failureEvidence"];
         const evidence = (typeof evidenceRaw === "object" ? evidenceRaw : null) as RunRecord["failureEvidence"];
-        if (isRerunnableEvidence(evidence, attempt.unit, attempt.driver, state.successLedger) && !state.rerunUsed.has(key)) {
+        if (evidenceIsRerunnable(evidence, key, state.successLedger) && !state.rerunUsed.has(key)) {
           state.rerunUsed.add(key);
           attempt.supersededByRerun = true;
         }
@@ -558,24 +595,39 @@ export function reconstructMatrixState(
     // R3 f.2). With expect === null (the scoring reader) the same rule is enforced by
     // demanding ONE identity across every row.
     if (expect !== null) {
-      if (rec["harnessCommit"] !== expect.harnessCommit)
-        throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from harness ${String(rec["harnessCommit"]).slice(0, 12)} != current ${expect.harnessCommit.slice(0, 12)} — a re-ratified matrix starts a fresh log`);
       if (rec["envManifestHash"] !== expect.envManifestHash)
         throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from environment ${String(rec["envManifestHash"])} != current ${expect.envManifestHash}`);
-      if (expect.frozenSurfaceDigest !== undefined && rec["frozenSurfaceDigest"] !== expect.frozenSurfaceDigest)
+      if (rec["frozenSurfaceDigest"] !== expect.frozenSurfaceDigest)
         throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from frozen surface ${String(rec["frozenSurfaceDigest"]).slice(0, 12)} != current ${expect.frozenSurfaceDigest.slice(0, 12)} — a re-frozen matrix starts a fresh log (§8)`);
     } else {
-      identities.add(`${String(rec["harnessCommit"])}|${String(rec["envManifestHash"])}`);
+      identities.add(`${String(rec["frozenSurfaceDigest"])}|${String(rec["envManifestHash"])}`);
       if (identities.size > 1)
-        throw new BenchProtocolError(`matrix rows span ${identities.size} harness/environment identities — §8 requires one machine, one network, one credential, one revision for all timed data`);
+        throw new BenchProtocolError(`matrix rows span ${identities.size} freeze/environment identities — §8 requires one machine, one network, one credential, one frozen surface for all timed data`);
     }
     const outcome = String(rec["outcome"]);
+    if (!RESUME_OUTCOMES.has(outcome))
+      throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} carries unknown outcome ${JSON.stringify(rec["outcome"])} — a row this scan cannot classify must not be skimmed past`);
     const pos = typeof rec["pos"] === "number" ? (rec["pos"] as number) : -1;
     const unit = String(rec["unit"]);
     const driver = String(rec["driver"]);
     const attemptId = typeof rec["attemptId"] === "string" ? (rec["attemptId"] as string) : "";
+    // the row must describe the FROZEN schedule's own identity at its position — a garbage
+    // unit/driver would otherwise terminalize a position it does not describe (ported from the
+    // ratified Step-B resume scan)
+    const expectedRow = schedule.get(pos);
+    if (expectedRow === undefined)
+      throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} names pos ${pos}, which the frozen schedule does not contain`);
+    if (unit !== expectedRow.unit || driver !== expectedRow.driver || rec["rep"] !== expectedRow.rep || rec["probe"] !== expectedRow.probe)
+      throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} at pos ${pos} does not match the frozen schedule row (${expectedRow.unit} ${expectedRow.driver} rep${expectedRow.rep}${expectedRow.probe ? " probe" : ""})`);
+    if (pendingUnmarked !== null)
+      throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} appends a run row while line ${pendingUnmarked.line} is still awaiting its washout marker — the evidence log violates the row/marker invariant`);
     if (outcome === "halt-r5-breach" || outcome === "re-pin-required")
       throw new BenchProtocolError(`REFUSING: runs.jsonl carries a terminal ${outcome} row — that is freeze-repair/amendment territory (§4.5 R5/R6), never a silent retry`);
+    // halt/re-pin/finalisation rows never receive a marker (they throw past the washout);
+    // every other outcome's row is followed by its marker — the drift path writes its own
+    // inline, the normal tail writes one after the washout sleep
+    if (outcome !== "invalidated-finalisation")
+      pendingUnmarked = { attemptId, line: lineIndex + 1 };
     // recurrence counts read the recorded FACTS, never the outcome — precedence collisions
     // (straddle over drift, straddle over control-plane) must not hide either event (C0-R2
     // findings 1/3); rows predating the fact fields fall back to their outcome
@@ -593,10 +645,14 @@ export function reconstructMatrixState(
       epilogue: rec["epilogue"] === true, supersededByRerun: false,
     };
     if (outcome === "complete") {
-      // the R2 ledger admits only classes with a recorded SUCCESS, never mere attempts
-      // (codex C0-R1 finding 2); rows predating the field admit nothing — strict
-      const classes = Object.keys((rec["requestClassSuccesses"] as Record<string, number> | undefined) ?? {});
-      pendingLedger.set(attemptId, classes.map((cls) => `${unit}|${driver}|${cls}`));
+      // the R2 ledger admits only classes with a recorded SUCCESS, never mere attempts (codex
+      // C0-R1 finding 2, carried by the ratified okRequestClasses field); a completed run's
+      // accounting read rate_limit successfully, so rest-meta is implied — EXACTLY the live
+      // loop's admission rule, or resume and the running traversal would disagree on R2
+      const classes = Array.isArray(rec["okRequestClasses"])
+        ? (rec["okRequestClasses"] as unknown[]).filter((c): c is string => typeof c === "string")
+        : [];
+      pendingLedger.set(attemptId, [...classes, "rest-meta"].map((cls) => `${unit}|${driver}|${cls}`));
     }
     const list = byPos.get(pos) ?? [];
     list.push(attempt);
@@ -609,6 +665,12 @@ export function reconstructMatrixState(
   }
   for (const unit of state.driftedUnits) state.resumeForms.set(unit, "scaffolding");
   for (const [pos, attempts] of byPos) {
+    // a SECOND invalidated-finalisation at one position means the post-run accounting read is
+    // failing persistently — an unbounded silent retry class; the operator investigates
+    // (ported from the ratified Step-B resume scan)
+    const finalisationFailures = attempts.filter((a) => a.outcome === "invalidated-finalisation").length;
+    if (finalisationFailures >= 2)
+      throw new BenchProtocolError(`REFUSING: pos ${pos} carries ${finalisationFailures} invalidated-finalisation rows — the post-run accounting read is failing persistently; investigate before resuming`);
     const last = attempts[attempts.length - 1]!;
     const driftBlocked = state.driftedUnits.has(last.unit) && !last.epilogue;
     const terminalShape = last.outcome === "complete" || (last.outcome === "unit-failure" && !last.supersededByRerun);
@@ -617,7 +679,7 @@ export function reconstructMatrixState(
       state.terminalRowByPos.set(pos, last.row);
       continue;
     }
-    if (last.outcome === "invalidated-straddle" || last.outcome === "invalidated-foreign" || last.outcome === "invalidated-control-plane")
+    if (last.outcome === "invalidated-straddle" || last.outcome === "invalidated-foreign" || last.outcome === "invalidated-control-plane" || last.outcome === "invalidated-finalisation")
       state.pendingReplays.set(pos, "r3r4");
     else if (last.supersededByRerun && marked.has(last.attemptId))
       state.pendingReplays.set(pos, "r1r2");
@@ -646,8 +708,10 @@ export function applyPendingTransition(state: MatrixResumeState, transition: { p
   const driver = String(row["driver"]);
   const outcome = String(row["outcome"]);
   if (outcome === "complete") {
-    for (const cls of Object.keys((row["requestClassSuccesses"] as Record<string, number> | undefined) ?? {}))
-      state.successLedger.add(`${unit}|${driver}|${cls}`);
+    const classes = Array.isArray(row["okRequestClasses"])
+      ? (row["okRequestClasses"] as unknown[]).filter((c): c is string => typeof c === "string")
+      : [];
+    for (const cls of [...classes, "rest-meta"]) state.successLedger.add(`${unit}|${driver}|${cls}`);
     state.terminalPos.add(transition.pos);
     state.terminalRowByPos.set(transition.pos, row);
     return;
@@ -655,7 +719,7 @@ export function applyPendingTransition(state: MatrixResumeState, transition: { p
   const key = `${unit}|${driver}`;
   const evidenceRaw = row["failureEvidence"];
   const evidence = (typeof evidenceRaw === "object" ? evidenceRaw : null) as RunRecord["failureEvidence"];
-  if (isRerunnableEvidence(evidence, unit, driver, state.successLedger) && !state.rerunUsed.has(key)) {
+  if (evidenceIsRerunnable(evidence, key, state.successLedger) && !state.rerunUsed.has(key)) {
     state.rerunUsed.add(key);
     state.pendingReplays.set(transition.pos, "r1r2");
     return;
@@ -913,7 +977,6 @@ export interface EngineOptions {
   workloads: Map<string, UnitWorkload>; // unitId → pinned workload
   benchRoot: string;
   artifactsDir: string;
-  frozenSurfaceDigest: string; // stamped into every row (codex C0-R2 finding 2)
   // per-run cache DBs live here — inside the repo's §0-permitted ./data root (AuditDb's write
   // containment demands it; the bench temp root is NOT a permitted sqlite home), one file per
   // run, deleted at teardown. NEVER the production sqlite path.
@@ -976,9 +1039,6 @@ export class BenchEngine {
   setReplayOf(pos: number | null, kind: "r1r2" | "r3r4" | null = null): void {
     this.replayOfPos = pos;
     this.replayKind = pos === null ? null : kind;
-  }
-  harnessCommit(): string {
-    return this.o.runsLog.manifest.harnessCommit;
   }
   envManifestHashValue(): string {
     return this.manifestHash;
@@ -1187,7 +1247,7 @@ export class BenchEngine {
     sampler.extraFiles([dbPath, `${dbPath}-wal`, `${dbPath}-shm`]); // runDir PLUS the run-cache DB and its sidecars, which live outside it (R2 f.29)
     sampler.start(runDir, cfg.protocol.diskSamplerHz);
     if (this.childPool.pool === null) this.childPool.pool = makeChildPool(cfg.frame.childPoolSize);
-    const liveState = { fallbackSpend: 0, routesDelivered: {} as Record<string, number>, cloneDir: null as string | null, t1Conflicts: 0, t1BodyTimeouts: 0 };
+    const liveState: NonNullable<DriverRunContext["liveState"]> = { fallbackSpend: 0, routesDelivered: {}, cloneDir: null, t1Conflicts: 0, t1BodyTimeouts: 0 };
     // §4.5 R2's ledger must also see the success the frozen table accepts and production's
     // classifier does not: a partial-data 200 (some aliases resolved, some attributed-errored)
     // is classification "fatal" on every http record (production drops partial data BY DESIGN),
@@ -1225,7 +1285,7 @@ export class BenchEngine {
             this.unitForms.set(row.unit, "scaffolding");
             const driftReclaimFailed = reclaimOnce();
             const driftRecord: RunRecord = {
-              type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+              type: "run", schemaVersion: 1, pos: row.pos, attemptId, unit: row.unit, driver: row.driver, rep: row.rep,
               probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: "production", startedAtIso: new Date(this.now()).toISOString(),
               wallMs: 0, segments: 1, outcome: "drift-restart", failureCause: `live head ${live.slice(0, 12)} moved off the pinned SHA at the pre-rep probe`,
               failureEvidence: null, requests: {}, okRequestClasses: [], attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
@@ -1242,8 +1302,9 @@ export class BenchEngine {
               diskReclaimFailed: driftReclaimFailed,
               probeDivergences: 0, httpBodyBytes: 0, cloneObjectStoreBytes: null,
               diskSampledPeakBytes: 0, diskSamples: 0, diskSampleError: null, fallbackSpend: 0, routesDelivered: {},
-              g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
-              spawns: summarizeSpawns(spawnRecords), t1Conflicts: 0, t1BodyTimeouts: 0, washoutAppliedMs: 0,
+              g1Failures: 0, g2Failures: 0, g2PositiveFailures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
+              straddledReset: false, controlPlaneFailed: false,
+              spawns: summarizeSpawns(spawnRecords), t1Conflicts: 0, t1BodyTimeouts: 0, washoutAppliedMs: 0, washoutUntilEpochMs: 0,
               envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
               frozenSurfaceDigest: this.o.frozenSurfaceDigest,
             };
@@ -1256,8 +1317,9 @@ export class BenchEngine {
               this.replayOfPos = null;
               this.replayKind = null;
               // no washout is owed (the probe consumed no API traffic), but the marker-per-row
-              // invariant the resume scan enforces must hold for THIS row too
-              this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
+              // invariant the resume scan enforces must hold for THIS row too — attempt-keyed,
+              // like every marker (pos alone is ambiguous across in-slot replays, residual 1)
+              this.o.runsLog.appendMarker({ type: "washout-done", forAttemptId: attemptId, pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
             } finally {
               // in a finally, mirroring the R5 path: an ENOSPC/EACCES on either append must not
               // skip the release — this early return bypasses finishMeasuredRun, and an armed
@@ -1298,11 +1360,19 @@ export class BenchEngine {
                 sizes: segmentSizes,
                 gate: async (nextSegmentIndex: number): Promise<void> => {
                   wall.pause(); // the clock pauses between segments (§4.8)
-                  const segAfter = await readRateLimit(ghMeta);
-                  bucketSnapshots.push({ before: segBefore!, after: segAfter });
-                  segmentDeltas.push({ core: bucketDelta(segBefore!.core, segAfter.core), graphql: bucketDelta(segBefore!.graphql, segAfter.graphql) });
-                  await this.reserve(ghMeta, segmentWc(segmentSizes, nextSegmentIndex));
-                  segBefore = await readRateLimit(ghMeta);
+                  // the gate is CONTROL PLANE executing inside the driver's call stack: its
+                  // snapshot/reservation failures must not surface as driver unit-failures
+                  // and consume the R1/R2 allowance (Step-C residual 3)
+                  try {
+                    const segAfter = await readRateLimit(ghMeta);
+                    bucketSnapshots.push({ before: segBefore!, after: segAfter });
+                    segmentDeltas.push({ core: bucketDelta(segBefore!.core, segAfter.core), graphql: bucketDelta(segBefore!.graphql, segAfter.graphql) });
+                    await this.reserve(ghMeta, segmentWc(segmentSizes, nextSegmentIndex));
+                    segBefore = await readRateLimit(ghMeta);
+                  } catch (e) {
+                    if (e instanceof BenchHttpError) throw new ControlPlaneFailure(`segment gate ${nextSegmentIndex}: ${e.code}: ${e.message}`);
+                    throw e;
+                  }
                   wall.start();
                 },
               },
@@ -1364,6 +1434,7 @@ export class BenchEngine {
         // traffic it actually observed rather than zeroes — through the SAME control-plane rule
         // the normal record uses, which this literal previously contradicted
         requests: r5traffic.requests, okRequestClasses: r5traffic.okRequestClasses, attempts: r5traffic.attempts, straddledReset: false, controlPlaneFailed: false,
+        g2PositiveFailures: 0,
         secondarySignals: r5traffic.secondarySignals, points: r5traffic.points,
         bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
         bucketSnapshots,
@@ -1377,7 +1448,7 @@ export class BenchEngine {
         diskSampleError: "not sampled: R5 halt records before any fallible post-run work",
         fallbackSpend: liveState.fallbackSpend, routesDelivered: liveState.routesDelivered,
         g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
-        spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts, t1BodyTimeouts: liveState.t1BodyTimeouts, washoutAppliedMs: 0, washoutUntilEpochMs: 0,
+        spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts ?? 0, t1BodyTimeouts: liveState.t1BodyTimeouts ?? 0, washoutAppliedMs: 0, washoutUntilEpochMs: 0,
         envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
         frozenSurfaceDigest: this.o.frozenSurfaceDigest,
       };
@@ -1421,7 +1492,19 @@ export class BenchEngine {
     // globally irreversible evidence, and appending the invalidated-finalisation row with
     // zeroed failure counts let a wrong-bytes run whose rate-limit read then failed be
     // re-executed and ERASED by a clean replay
-    if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
+    if (outcome !== null) {
+      verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
+    } else if ((liveState.deliveries ?? []).length > 0) {
+      // a thrown driver's PARTIAL deliveries still carry POSITIVE evidence — wrong bytes,
+      // duplicates, forbidden routes delivered before the failure must reach the gates (codex
+      // C0-R2 re f.10; C0-R3 finding 4). Only ABSENCE-shaped g2 noise is discarded: an
+      // interrupted set is by definition full of it and the terminal/rerun discipline owns it.
+      const partial = verifyDeliveries(workload, liveState.deliveries ?? [], row.driver, {
+        probeRep: row.probe,
+        ...(liveState.acquiredPaths === undefined ? {} : { acquiredPaths: liveState.acquiredPaths }),
+      });
+      verification = { ...partial, g2Failures: partial.g2Failures.filter((f) => f.kind === "positive") };
+    }
     let after: RateLimitSnapshot | null = null;
     try {
       after = await readRateLimit(ghMeta);
@@ -1436,8 +1519,9 @@ export class BenchEngine {
       controlPlaneFailed = true;
       if (runOutcome === "complete") {
         const partial = summarizeTraffic(httpRecords, t1TableAccepted());
+        const finalisationWashoutMs = washoutMs(cfg, outstandingHorizonMs(gh), this.now());
         this.o.runsLog.append({
-          type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+          type: "run", schemaVersion: 1, pos: row.pos, attemptId, unit: row.unit, driver: row.driver, rep: row.rep,
           probe: row.probe, phase, epilogue: this.epilogueMode,
           acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
           startedAtIso, wallMs, segments: segmentSizes.length,
@@ -1460,13 +1544,18 @@ export class BenchEngine {
           fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
           routesDelivered: liveState.routesDelivered,
           g1Failures: verification?.g1Failures.length ?? 0, g2Failures: verification?.g2Failures.length ?? 0,
+          g2PositiveFailures: verification?.g2Failures.filter((f) => f.kind === "positive").length ?? 0,
           g1Details: verification?.g1Failures.slice(0, DETAIL_CAP) ?? [], g2Details: verification?.g2Failures.slice(0, DETAIL_CAP) ?? [],
           probeDivergenceDetails: verification?.probeDivergences.slice(0, DETAIL_CAP) ?? [],
-          spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts, t1BodyTimeouts: liveState.t1BodyTimeouts,
+          // the after-snapshot never arrived, so no reset move was OBSERVED; the accounting
+          // failure itself is the control-plane FACT this row records
+          straddledReset: false, controlPlaneFailed: true,
+          spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts ?? 0, t1BodyTimeouts: liveState.t1BodyTimeouts ?? 0,
           // this row throws before any washout sleep, so resume completes the OWED washout
-          // from this field — a hardcoded 0 collapsed a live Retry-After horizon (e.g. the
+          // from these fields — a hardcoded 0 collapsed a live Retry-After horizon (e.g. the
           // throttle that broke the accounting read) to the 60 s floor
-          washoutAppliedMs: washoutMs(cfg, outstandingHorizonMs(gh), this.now()),
+          washoutAppliedMs: finalisationWashoutMs,
+          washoutUntilEpochMs: this.now() + finalisationWashoutMs,
           envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
           frozenSurfaceDigest: this.o.frozenSurfaceDigest,
         });
@@ -1567,8 +1656,8 @@ export class BenchEngine {
       g2Details: verification?.g2Failures.slice(0, DETAIL_CAP) ?? [],
       probeDivergenceDetails: verification?.probeDivergences.slice(0, DETAIL_CAP) ?? [],
       spawns: summarizeSpawns(spawnRecords),
-      t1Conflicts: liveState.t1Conflicts,
-      t1BodyTimeouts: liveState.t1BodyTimeouts,
+      t1Conflicts: liveState.t1Conflicts ?? 0,
+      t1BodyTimeouts: liveState.t1BodyTimeouts ?? 0,
       washoutAppliedMs,
       washoutUntilEpochMs: this.now() + washoutAppliedMs,
       envManifestHash: this.manifestHash,

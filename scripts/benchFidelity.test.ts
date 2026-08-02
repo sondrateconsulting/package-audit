@@ -46,6 +46,37 @@ describe("reconstructFidelityLedger", () => {
   });
 });
 
+describe("reconstructFidelityLedger — the LIVE battery's record vocabulary (post-restack surface)", () => {
+  // the ratified battery (benchContentTransport cmdFidelity) writes per-entry rows carrying
+  // `pass` (no `outcome` field) plus group-level marker records the ledger must TOLERATE:
+  // fidelity-driver-failure, fidelity-operational-abort, fidelity-respawn, fidelity-summary
+  const liveRow = (pass: boolean): string =>
+    JSON.stringify({
+      type: "fidelity", generatedAtIso: "2026-08-02T00:00:00Z", frozenSurfaceDigest: DIGEST,
+      fixture: "clone-symlink", driver: "T2c", entry: "a/link.sh", route: "primary",
+      pass, rawVerified: true, gotHash: "h".repeat(64), expected: "h".repeat(64),
+    });
+  const markerRec = (type: string): string =>
+    JSON.stringify({ type, generatedAtIso: "2026-08-02T00:00:00Z", frozenSurfaceDigest: DIGEST, fixture: "clone-symlink", driver: "T2c" });
+  test("a live pass row reads as a match; the marker record types are tolerated, never counted as cells", () => {
+    const ledger = reconstructFidelityLedger([
+      liveRow(true),
+      markerRec("fidelity-operational-abort"),
+      markerRec("fidelity-driver-failure"),
+      markerRec("fidelity-respawn"),
+      JSON.stringify({ type: "fidelity-summary", generatedAtIso: "2026-08-02T00:00:00Z", frozenSurfaceDigest: DIGEST, failures: 0 }),
+    ], DIGEST);
+    expect(ledger.cells.get("clone-symlink|T2c|a/link.sh")?.matches).toBe(1);
+    expect(ledger.cells.size).toBe(1); // no marker minted a cell
+    expect(ledger.groupAttemptErrors.size).toBe(0); // group markers are the BATTERY's discipline, not the scorer's
+  });
+  test("a live pass:false row reads as a mismatch — G1 flows through to the verdict", () => {
+    const ledger = reconstructFidelityLedger([liveRow(false)], DIGEST);
+    const verdict = judgeFidelity(FIXTURES, ledger);
+    expect(verdict.mismatchDrivers.has("T2c")).toBe(true);
+  });
+});
+
 describe("cellFinalState + shouldAttemptCell — the §4.2 discipline", () => {
   test("mismatch is permanent, even beside a later match (tamper evidence, not recovery)", () => {
     const ledger = reconstructFidelityLedger([rec({ outcome: "mismatch", pass: false }), rec({})], DIGEST);

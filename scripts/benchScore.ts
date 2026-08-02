@@ -196,7 +196,11 @@ export interface ScoreBundle {
 export function scoreMatrix(bundle: ScoreBundle): ScoreOutput {
   const { cfg, corpus, workloads, noiseBand } = bundle;
   const schedule = cfg.schedule ?? fail("bench-config.json carries no pinned schedule — nothing to score");
-  const state = reconstructMatrixState(bundle.runsLines, null);
+  const state = reconstructMatrixState(
+    bundle.runsLines,
+    null,
+    new Map(schedule.rows.map((r) => [r.pos, { unit: r.unit, driver: r.driver, rep: r.rep, probe: r.probe }])),
+  );
   if (state.matrixRowsSeen === 0) fail("runs.jsonl carries no matrix rows — run the matrix before scoring");
   const rowByPos = new Map<number, ScheduleRow>(schedule.rows.map((r) => [r.pos, r]));
 
