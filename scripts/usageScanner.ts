@@ -5,7 +5,7 @@
 // SYNTACTICALLY (createSourceFile + walk; never a Program/typecheck/execution) — Bun.Transpiler
 // is too coarse (no binding names / line numbers / form). No network, no fs.
 
-import ts from "typescript";
+import ts from "./tsCompilerApi.ts"; // `typescript`, surface-checked at load (never import it directly)
 import { buildPermalink } from "./permalink.ts";
 import type { UsageType } from "./db.ts";
 
