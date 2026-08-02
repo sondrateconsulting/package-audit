@@ -1,0 +1,209 @@
+{
+  "generatedAtIso": "2026-08-02T23:47:46.368Z",
+  "frozenSurfaceDigest": "8b67a31418531d4da69d044c19d644805c6c910b30cc4037d61edf0b35b80255",
+  "streams": 4,
+  "drivers": [
+    {
+      "driver": "T0",
+      "admittedAtIso": "2026-08-02T23:44:11.064Z",
+      "before": {
+        "core": {
+          "remaining": 5000,
+          "reset": 1785717850,
+          "used": 0
+        },
+        "graphql": {
+          "remaining": 4966,
+          "reset": 1785716574,
+          "used": 34
+        },
+        "atMs": 1785714251064
+      },
+      "after": {
+        "core": {
+          "remaining": 5000,
+          "reset": 1785717935,
+          "used": 0
+        },
+        "graphql": {
+          "remaining": 4966,
+          "reset": 1785716574,
+          "used": 34
+        },
+        "atMs": 1785714335918
+      },
+      "streams": [
+        {
+          "unit": "C1:prometheus/prometheus@main",
+          "outcome": "complete",
+          "failureCause": null,
+          "wallMs": 84063,
+          "requests": {
+            "rest-tree": 1,
+            "rest-content": 255
+          },
+          "fivexx": 0,
+          "retries": 0,
+          "secondarySignals": 0,
+          "secondarySignalDetail": [],
+          "g1Failures": 0,
+          "g2Failures": 0,
+          "httpBodyBytes": 2434856
+        },
+        {
+          "unit": "C1:prometheus/prometheus@release-3.13",
+          "outcome": "complete",
+          "failureCause": null,
+          "wallMs": 80069,
+          "requests": {
+            "rest-tree": 1,
+            "rest-content": 251
+          },
+          "fivexx": 0,
+          "retries": 0,
+          "secondarySignals": 0,
+          "secondarySignalDetail": [],
+          "g1Failures": 0,
+          "g2Failures": 0,
+          "httpBodyBytes": 2398140
+        },
+        {
+          "unit": "C1:prometheus/prometheus@release-3.12",
+          "outcome": "complete",
+          "failureCause": null,
+          "wallMs": 81793,
+          "requests": {
+            "rest-tree": 1,
+            "rest-content": 250
+          },
+          "fivexx": 0,
+          "retries": 0,
+          "secondarySignals": 0,
+          "secondarySignalDetail": [],
+          "g1Failures": 0,
+          "g2Failures": 0,
+          "httpBodyBytes": 2934638
+        },
+        {
+          "unit": "C1:prometheus/prometheus@release-3.11",
+          "outcome": "complete",
+          "failureCause": null,
+          "wallMs": 84472,
+          "requests": {
+            "rest-tree": 1,
+            "rest-content": 258
+          },
+          "fivexx": 0,
+          "retries": 0,
+          "secondarySignals": 0,
+          "secondarySignalDetail": [],
+          "g1Failures": 0,
+          "g2Failures": 0,
+          "httpBodyBytes": 2946503
+        }
+      ]
+    },
+    {
+      "driver": "T1",
+      "admittedAtIso": "2026-08-02T23:46:36.614Z",
+      "before": {
+        "core": {
+          "remaining": 5000,
+          "reset": 1785717996,
+          "used": 0
+        },
+        "graphql": {
+          "remaining": 4966,
+          "reset": 1785716574,
+          "used": 34
+        },
+        "atMs": 1785714396614
+      },
+      "after": {
+        "core": {
+          "remaining": 5000,
+          "reset": 1785718006,
+          "used": 0
+        },
+        "graphql": {
+          "remaining": 4954,
+          "reset": 1785716574,
+          "used": 46
+        },
+        "atMs": 1785714406365
+      },
+      "streams": [
+        {
+          "unit": "C1:prometheus/prometheus@main",
+          "outcome": "complete",
+          "failureCause": null,
+          "wallMs": 8097,
+          "requests": {
+            "rest-tree": 1,
+            "graphql-batch": 3
+          },
+          "fivexx": 0,
+          "retries": 0,
+          "secondarySignals": 0,
+          "secondarySignalDetail": [],
+          "g1Failures": 0,
+          "g2Failures": 0,
+          "httpBodyBytes": 2548332
+        },
+        {
+          "unit": "C1:prometheus/prometheus@release-3.13",
+          "outcome": "complete",
+          "failureCause": null,
+          "wallMs": 8533,
+          "requests": {
+            "rest-tree": 1,
+            "graphql-batch": 3
+          },
+          "fivexx": 0,
+          "retries": 0,
+          "secondarySignals": 0,
+          "secondarySignalDetail": [],
+          "g1Failures": 0,
+          "g2Failures": 0,
+          "httpBodyBytes": 2509685
+        },
+        {
+          "unit": "C1:prometheus/prometheus@release-3.12",
+          "outcome": "complete",
+          "failureCause": null,
+          "wallMs": 9416,
+          "requests": {
+            "rest-tree": 1,
+            "graphql-batch": 3,
+            "rest-fallback": 1
+          },
+          "fivexx": 0,
+          "retries": 0,
+          "secondarySignals": 0,
+          "secondarySignalDetail": [],
+          "g1Failures": 0,
+          "g2Failures": 0,
+          "httpBodyBytes": 3619266
+        },
+        {
+          "unit": "C1:prometheus/prometheus@release-3.11",
+          "outcome": "complete",
+          "failureCause": null,
+          "wallMs": 9447,
+          "requests": {
+            "rest-tree": 1,
+            "graphql-batch": 3,
+            "rest-fallback": 1
+          },
+          "fivexx": 0,
+          "retries": 0,
+          "secondarySignals": 0,
+          "secondarySignalDetail": [],
+          "g1Failures": 0,
+          "g2Failures": 0,
+          "httpBodyBytes": 3632882
+        }
+      ]
+    }
+  ]
+}
