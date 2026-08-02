@@ -705,7 +705,7 @@ describe("describeUnopenedSweep — the open-failure log never claims a sweep it
   test("a clean sweep names both reclaimed paths", () => {
     const m = describeUnopenedSweep("/b/run", "/c/x.sqlite", []);
     expect(m).toContain("swept /b/run");
-    expect(m).toContain("/c/x.sqlite[-wal/-shm]");
+    expect(m).toContain("/c/x.sqlite[-wal/-shm/-journal]");
     expect(m).not.toContain("STILL PRESENT");
   });
   test("residue is named and the line does NOT read as a clean sweep", () => {
@@ -716,7 +716,7 @@ describe("describeUnopenedSweep — the open-failure log never claims a sweep it
 });
 
 describe("runResiduePaths — the residue set is stated in ONE place", () => {
-  test("both reclamation paths consume the same four paths", () => {
+  test("both reclamation paths consume the same five paths", () => {
     expect(runResiduePaths("/b/run", "/c/x.sqlite")).toEqual(["/b/run", "/c/x.sqlite", "/c/x.sqlite-wal", "/c/x.sqlite-shm", "/c/x.sqlite-journal"]);
     // -journal is load-bearing: the WAL transition runs in rollback mode, so it can be left behind
     expect(runResiduePaths("/b/run", "/c/x.sqlite")).toContain("/c/x.sqlite-journal");

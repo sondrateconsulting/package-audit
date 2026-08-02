@@ -527,14 +527,23 @@ function stillOnDisk(p: string, io: RunFsIo): boolean {
     io.lstat(p);
     return true;
   } catch (e) {
-    // null/undefined/non-object throws must not crash the "non-throwing" contract this helper
-    // advertises over its injectable seam — anything that is not a recognisable ENOENT is
-    // unverifiable, which counts as residue.
-    return (e as NodeJS.ErrnoException | null | undefined)?.code !== "ENOENT";
+    // Nothing about the thrown value may crash the "non-throwing" contract this helper advertises
+    // over its injectable seam: null/undefined, a non-object, or an object whose `code` is a
+    // THROWING GETTER (a reviewer demonstrated the last one). Anything not a recognisable ENOENT
+    // is unverifiable, which counts as residue.
+    let code: unknown;
+    try {
+      code = (e as NodeJS.ErrnoException | null | undefined)?.code;
+    } catch {
+      return true; // could not even read the errno — unverifiable
+    }
+    return code !== "ENOENT";
   }
 }
 
-// FAIL CLOSED before a run touches the disk: nothing a run will own may already exist. benchRoot
+// FAIL CLOSED before a run CREATES anything it will later reclaim: no path in the residue set
+// may already exist. (It is not the first disk touch in runOne — the shared run-cache DIRECTORY is
+// created above it, and this check itself lstats; what it guards is the per-run residue set.) benchRoot
 // is a fresh per-process mkdtemp and dbPath carries pid + wall clock + attempt counter, so this
 // cannot fire in normal operation — which is exactly why it is an assertion and not a recovery
 // path. It is what makes ownership UNCONDITIONAL downstream: every residue path is provably this
@@ -546,7 +555,7 @@ export function assertRunPathsFresh(runDir: string, dbPath: string, io: RunFsIo 
   const present = runResiduePaths(runDir, dbPath).filter((p) => stillOnDisk(p, io));
   if (present.length > 0)
     throw new BenchProtocolError(
-      `refusing to start a run over paths that already exist: ${present.join(", ")} — benchRoot is a per-process temp directory and the run-cache DB name carries pid, wall clock and attempt counter, so these cannot pre-exist unless a harness invariant is broken or something outside the harness created them. Measuring inside, or reclaiming, a path this run did not create is never safe; clear it and retry`,
+      `refusing to start a run over paths that already exist, or that cannot be verified absent: ${present.join(", ")} — benchRoot is a per-process temp directory and the run-cache DB name carries pid, wall clock and attempt counter, so these cannot pre-exist unless a harness invariant is broken or something outside the harness created them. Measuring inside, or reclaiming, a path this run did not create is never safe; clear it and retry`,
     );
 }
 
@@ -556,8 +565,10 @@ export function assertRunPathsFresh(runDir: string, dbPath: string, io: RunFsIo 
 // so the residue SET cannot drift; they still differ in what else they do (that one closes a
 // handle and returns a boolean, this one returns the residue), and that difference is deliberate.
 // Deleting every residue path unconditionally is safe ONLY because assertRunPathsFresh ran first.
-// Best-effort and NON-THROWING by design: the caller rethrows the original open error, which
-// carries the operator's remediation, and a sweep failure must not mask it.
+// Best-effort and NON-THROWING over the real filesystem AND over any injected seam, including
+// pathological ones (a thrown null, or an error whose `code` getter itself throws): the caller
+// rethrows the original open error, which carries the operator's remediation, and a sweep failure
+// must not mask it.
 export function sweepUnopenedRunDebris(runDir: string, dbPath: string, io: RunFsIo = REAL_FS): string[] {
   const paths = runResiduePaths(runDir, dbPath);
   for (const p of paths) {
@@ -578,7 +589,7 @@ export function sweepUnopenedRunDebris(runDir: string, dbPath: string, io: RunFs
 // (nothing in the suite constructs one). Never claims a clean sweep it did not verify.
 export function describeUnopenedSweep(runDir: string, dbPath: string, residue: readonly string[]): string {
   return residue.length === 0
-    ? `swept ${runDir} and ${dbPath}[-wal/-shm]`
+    ? `swept ${runDir} and ${dbPath}[-wal/-shm/-journal]`
     : `swept what it could; STILL PRESENT OR UNVERIFIABLE: ${residue.join(", ")}`;
 }
 
@@ -734,19 +745,24 @@ export class BenchEngine {
     // ORDER IS LOAD-BEARING: every fallible setup step runs BEFORE runDir exists, so the open is
     // the only statement that can throw while a run directory of ours is on disk. An earlier
     // version created runDir first, leaving mkdir(runCacheDir) and the now()-stamped dbPath as
-    // two uncaught throws that leaked exactly the directory this catch exists to reclaim.
+    // two uncaught throws that leaked exactly the directory this catch exists to reclaim. NB the
+    // scope: the open is the only throw that is UNRECLAIMED — later throws (probeLiveHead,
+    // reserve, the rate-limit read, planning) also occur while runDir exists, but reclaimOnce and
+    // the outer finally own them by then.
     mkdirSync(this.o.runCacheDir, { recursive: true });
     // collision-resistant durable attempt identity (pid + wall clock): a crashed process's
     // counter can never resurrect a warm cache; purgeCache drops api_cache rows outright
     // (production --fresh preserves them by design) (codex R2 f.24)
     const dbPath = join(this.o.runCacheDir, `bench-run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-${process.pid}-${this.now()}-${this.runCounter}.sqlite`);
-    // FAIL CLOSED before anything is created: no path this run will own may already exist. That
+    // FAIL CLOSED before any PER-RUN path is created: no path this run will own may already exist.
+    // (The shared run-cache directory above is not per-run and is never reclaimed by a run.) That
     // single assertion is what makes every later deletion safe without an ownership token — both
     // the sweep below and reclaimRunResources delete the whole residue set unconditionally, and
     // neither can destroy a foreign directory or a pre-existing database, because there was none.
     assertRunPathsFresh(runDir, dbPath);
     // ATOMIC, not check-then-create: benchRoot already exists (a per-process mkdtemp), so a
-    // NON-recursive mkdir either creates runDir or fails EEXIST in one syscall. assertRunPathsFresh
+    // NON-recursive mkdir atomically creates runDir or throws; EEXIST is the collision case it
+    // exists to catch, though permission/space/IO failures reach the same catch. assertRunPathsFresh
     // above is a fail-fast diagnostic with a good message; THIS is the ownership proof. An earlier
     // version used recursive:true, which silently adopts an existing directory and left the
     // freshness check as the only guard — a check-then-create race a reviewer correctly rejected.
@@ -923,7 +939,7 @@ export class BenchEngine {
               // the ratified reclaim-failure disposition promises an operator log wherever a
               // row records diskReclaimFailed:true — this early return bypasses the normal tail
               if (driftReclaimFailed)
-                this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (run dir ${runDir}; cache DB ${dbPath}[-wal/-shm]; diskReclaimFailed:true on the row)`);
+                this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (run dir ${runDir}; cache DB ${dbPath}[-wal/-shm/-journal]; diskReclaimFailed:true on the row)`);
               this.replayOfPos = null;
               this.replayKind = null;
               // no washout is owed (the probe consumed no API traffic), but the marker-per-row
@@ -1133,7 +1149,7 @@ export class BenchEngine {
         });
         // same promise as the drift path: a diskReclaimFailed:true row is always operator-logged
         if (diskReclaimFailed)
-          this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (run dir ${runDir}; cache DB ${dbPath}[-wal/-shm]; diskReclaimFailed:true on the row)`);
+          this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (run dir ${runDir}; cache DB ${dbPath}[-wal/-shm/-journal]; diskReclaimFailed:true on the row)`);
         throw e;
       }
       failureCause = `${failureCause ?? "(no recorded cause)"} — post-run rate-limit read also failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`;
@@ -1235,7 +1251,7 @@ export class BenchEngine {
     if (disk.sampleError !== null)
       this.o.log(`${row.unit} ${row.driver} rep${row.rep}: DISK INSTRUMENTATION DEGRADED — ${disk.sampleError} (diskSampledPeakBytes/cloneObjectStoreBytes are not measurements for this row)`);
     if (diskReclaimFailed)
-      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (run dir ${runDir}; cache DB ${dbPath}[-wal/-shm]; diskReclaimFailed:true on the row)`);
+      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: RECLAMATION FAILED — the run directory and/or its run-cache DB sidecars did not fully release (run dir ${runDir}; cache DB ${dbPath}[-wal/-shm/-journal]; diskReclaimFailed:true on the row)`);
     this.replayOfPos = null;
     this.replayKind = null;
     if (verification !== null && (verification.g1Failures.length > 0 || verification.g2Failures.length > 0)) {
@@ -1255,7 +1271,7 @@ export class BenchEngine {
       // before the scored teardown is reached. A failure HERE has no record to land on (the
       // throw is on its way out), so it is logged rather than dropped silently.
       if (reclaimOnce())
-        this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run resources did not fully reclaim (run dir ${runDir} and/or cache DB ${dbPath}[-wal/-shm])`);
+        this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run resources did not fully reclaim (run dir ${runDir} and/or cache DB ${dbPath}[-wal/-shm/-journal])`);
     }
   }
 

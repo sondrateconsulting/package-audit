@@ -169,7 +169,9 @@ function assertLane(argv: readonly string[], lane: BenchLane): void {
 }
 
 // The write destinations a git argv implies, for containment: a clone's <dest> positional and
-// an init's <dir> positional. cwd containment covers everything else the lanes can launch.
+// an init's <dir> positional. cwd containment covers the transport and scaffolding lanes; for the
+// deliberately unconstrained pinning lane it checks cwd plus the clone/init destinations it
+// recognises, which is NOT a general write-containment proof for every argv that lane accepts.
 function writeDestinations(argv: readonly string[]): string[] {
   const verb = argv[0];
   if (verb === "clone") {
@@ -582,7 +584,7 @@ export class BatchChild {
       clearTimeout(pumpTimer);
       if (pumpsWedged) {
         // a pump that never settled means the stream state cannot be vouched for — cancel the
-        // readers and AWAIT the cancellations (bounded: an unbounded join would recreate the
+        // readers and REQUEST the cancellations and wait only for a BOUNDED interval (a timeout can win, leaving them pending: an unbounded join would recreate the
         // hang) so nothing stays attached when the caller deletes the store and releases the
         // permit (§3.1's ordered teardown), and surface the wedge as an UNCLEAN disposal
         let cancelTimer: ReturnType<typeof setTimeout> | undefined;

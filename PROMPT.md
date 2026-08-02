@@ -242,8 +242,10 @@ FK must change, which SQLite's ALTER cannot do in place) may DROP an old table, 
 inside a transaction and only after every row has been copied into its replacement.
 OWNERSHIP (§0 — the read-only premise extends to the database FILE itself). This tool must
 NEVER write to a SQLite file it does not own: a misdirected `sqlitePath` (an ordinary operator
-typo onto another application's `.db`) must cost nothing. The writable open's very first pragma,
-`PRAGMA journal_mode = WAL`, rewrites the file header and spawns `-wal`/`-shm` siblings — itself
+typo onto another application's `.db`) must cost nothing. The writable open's `PRAGMA journal_mode
+= WAL` — which runs after `busy_timeout` and after the ownership/compatibility gates, never first —
+rewrites the file header and spawns `-wal`/`-shm` siblings (and the delete→wal transition itself
+runs in rollback mode, so a `-journal` can appear beside them) — itself
 an unacceptable mutation of a stranger's file — so ownership MUST be proven on a READ-ONLY handle
 BEFORE the writable open, by reading the file's BYTES and inspecting the base image in memory
 (`Database.deserialize`; the journal-mode header bytes are patched 2→1 on the private copy because
