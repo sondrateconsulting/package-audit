@@ -1,0 +1,2016 @@
+{
+  "unit": "C5:PowerShell/PowerShell@master",
+  "sha": "f3648da945a3289d37214601368205b1af2b8354",
+  "treeOid": "90fd99013e097af5dced2bd1e6cbcb65137ef77b",
+  "objectFormat": "sha1",
+  "generatedAtIso": "2026-07-29T03:26:46.698Z",
+  "truncatedTree": false,
+  "escapeTripped": false,
+  "batchContentBytesCap": 1572864,
+  "entries": [
+    {
+      "path": ".devcontainer/Dockerfile",
+      "mode": "100644",
+      "blobOid": "c849a9f78e5a355791f32625f76cdc64a9b35992",
+      "size": 1113,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408",
+      "rawSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/analyze-reusable.yml",
+      "mode": "100644",
+      "blobOid": "3ef564eba90a088c47686ef97f303c1239e8c6da",
+      "size": 2493,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8",
+      "rawSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/copilot-setup-steps.yml",
+      "mode": "100644",
+      "blobOid": "d78e745a4a9cfcf2cc3ccceb7d5311cea9af1f77",
+      "size": 1985,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642",
+      "rawSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/dependency-review.yml",
+      "mode": "100644",
+      "blobOid": "84f0b03fa321bbaa58e9e967cf8efd85f8520072",
+      "size": 803,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d",
+      "rawSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/labels.yml",
+      "mode": "100644",
+      "blobOid": "27ceac59bbdc1c2bbc3e2f67ab76630c6a5619be",
+      "size": 927,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23",
+      "rawSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/linux-ci.yml",
+      "mode": "100644",
+      "blobOid": "3277b8a0c17d91c8cb424a52045c59bb2f9d34f2",
+      "size": 8196,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c",
+      "rawSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/macos-ci.yml",
+      "mode": "100644",
+      "blobOid": "f89ce8caa83de0bc4f942c4e7caa1bb2ff3ea41d",
+      "size": 8276,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc",
+      "rawSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/scorecards.yml",
+      "mode": "100644",
+      "blobOid": "935c8ff93bbad62258b84b2f7b75759638cfd90e",
+      "size": 2944,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc",
+      "rawSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/verify-markdown-links.yml",
+      "mode": "100644",
+      "blobOid": "19da648a959b43773cf3b2ab5fc661f21417c478",
+      "size": 824,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8",
+      "rawSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/windows-ci.yml",
+      "mode": "100644",
+      "blobOid": "42347d2e12f1bb87666e8909fdd51f6a728022ca",
+      "size": 6155,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb",
+      "rawSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/windows-packaging-reusable.yml",
+      "mode": "100644",
+      "blobOid": "8d0255d4443d120a96bcf5a159b9428b628dd3bf",
+      "size": 2585,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879",
+      "rawSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/xunit-tests.yml",
+      "mode": "100644",
+      "blobOid": "c643917edd044fbfc8d92542b0eac6419f3bbbdc",
+      "size": 1574,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180",
+      "rawSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "docker/InstallTarballPackage.sh",
+      "mode": "100644",
+      "blobOid": "08c7923c6ebf875816c2238c680c8caf1a7c5a87",
+      "size": 1185,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80",
+      "rawSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/AttackSurfaceAnalyzer/docker/Dockerfile",
+      "mode": "100644",
+      "blobOid": "3e4aaa3b717ec04a91640c3ff32facbecb3f23f8",
+      "size": 6945,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376",
+      "rawSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/debug.sh",
+      "mode": "100755",
+      "blobOid": "68a22edc36feca6e7d938d50ba795e8b9cc3ba0f",
+      "size": 772,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755",
+      "rawSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/download.sh",
+      "mode": "100644",
+      "blobOid": "f1e8c42cdc36f6545c4ce5a79c80c8c8a3c5ce5e",
+      "size": 334,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67",
+      "rawSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/generate-icns.sh",
+      "mode": "100755",
+      "blobOid": "e4acd592e59b9fcd97370aecc40204da874603fe",
+      "size": 2094,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500",
+      "rawSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/install-powershell.sh",
+      "mode": "100755",
+      "blobOid": "91425c183a8aa4ce47182206aa2d2b7e27f97850",
+      "size": 7919,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c",
+      "rawSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/installpsh-amazonlinux.sh",
+      "mode": "100755",
+      "blobOid": "48768549fc555ffd1b3f4bd0b955e5d5155dc971",
+      "size": 7307,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868",
+      "rawSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/installpsh-debian.sh",
+      "mode": "100755",
+      "blobOid": "cc771dfd7535ac441c37a6d0bf0f32ef4a622048",
+      "size": 9229,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c",
+      "rawSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/installpsh-gentoo.sh",
+      "mode": "100755",
+      "blobOid": "36b07d06834cddeb84bbe25d2c36ccbd27fa35b5",
+      "size": 7791,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501",
+      "rawSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/installpsh-mariner.sh",
+      "mode": "100644",
+      "blobOid": "e274f0b67144016d5e809528ce00966df5a350cc",
+      "size": 7533,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561",
+      "rawSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/installpsh-osx.sh",
+      "mode": "100755",
+      "blobOid": "dcc65dfc2a40c11510f3630aa81ed201bccc99a9",
+      "size": 6483,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf",
+      "rawSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/installpsh-redhat.sh",
+      "mode": "100755",
+      "blobOid": "631e120690f9432e920d32785ae6562374c8ac1b",
+      "size": 6425,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88",
+      "rawSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/installpsh-suse.sh",
+      "mode": "100755",
+      "blobOid": "5c1dd857b9d44e52552c0cad59bd59fa11b99f69",
+      "size": 9081,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7",
+      "rawSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/releaseBuild/setReleaseTag.sh",
+      "mode": "100644",
+      "blobOid": "842ba1e755bc9dd8c7e69703e5d91ee23a458f3d",
+      "size": 39,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6",
+      "rawSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    }
+  ],
+  "routes": {
+    ".devcontainer/Dockerfile": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408"
+          },
+          "validation-fallback": {
+            "seamSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408"
+          },
+          "timeout-singleton": {
+            "seamSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a25562e7ef02d1868e352d7f8c29e3c3f56fdf6f2c7ce64fd02a46d9d53c2408"
+          }
+        }
+      }
+    },
+    ".github/workflows/analyze-reusable.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8"
+          },
+          "validation-fallback": {
+            "seamSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8"
+          },
+          "timeout-singleton": {
+            "seamSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9576efe55181eddf5fcdbc07d63480f91410caeed2d1baad2018270aa5ca20c8"
+          }
+        }
+      }
+    },
+    ".github/workflows/copilot-setup-steps.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642"
+          },
+          "validation-fallback": {
+            "seamSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642"
+          },
+          "timeout-singleton": {
+            "seamSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7c10a4e28fd74967c71e566e6f56de3f138e08409d08b73ba44196685b213642"
+          }
+        }
+      }
+    },
+    ".github/workflows/dependency-review.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d"
+          },
+          "validation-fallback": {
+            "seamSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d"
+          },
+          "timeout-singleton": {
+            "seamSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "6db19d2f4a91e0a2a413052841ec32daa4b898029d0bd516adfd15791f8cb25d"
+          }
+        }
+      }
+    },
+    ".github/workflows/labels.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23"
+          },
+          "validation-fallback": {
+            "seamSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23"
+          },
+          "timeout-singleton": {
+            "seamSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "31eaadf1a7820a06bc46ab9de096cddf7e3fd00935f844b893b1a7ba97c59b23"
+          }
+        }
+      }
+    },
+    ".github/workflows/linux-ci.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c"
+          },
+          "validation-fallback": {
+            "seamSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c"
+          },
+          "timeout-singleton": {
+            "seamSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "35f136da51f9a9f5625f7c597aa38cb21532524d86896b54ee012d3304ad279c"
+          }
+        }
+      }
+    },
+    ".github/workflows/macos-ci.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc"
+          },
+          "validation-fallback": {
+            "seamSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc"
+          },
+          "timeout-singleton": {
+            "seamSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "3daf9c0fbdf67b4147d776e3f3bc50de34c87c278dd7805cf8b205aa04e9fadc"
+          }
+        }
+      }
+    },
+    ".github/workflows/scorecards.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc"
+          },
+          "validation-fallback": {
+            "seamSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc"
+          },
+          "timeout-singleton": {
+            "seamSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "652880ece1a4c2158e6e7bce6be30e1ef593a00632463493dc6f3dc1f123aadc"
+          }
+        }
+      }
+    },
+    ".github/workflows/verify-markdown-links.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8"
+          },
+          "validation-fallback": {
+            "seamSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8"
+          },
+          "timeout-singleton": {
+            "seamSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "88095a634e7031a8cbaabd5b8b946c4310228ca3ad4ef05736903820d9f7d5d8"
+          }
+        }
+      }
+    },
+    ".github/workflows/windows-ci.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb"
+          },
+          "validation-fallback": {
+            "seamSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb"
+          },
+          "timeout-singleton": {
+            "seamSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a171ce9187ebda752c3f3511d313294d4c80eeb85720e1ce93a7949d317b12eb"
+          }
+        }
+      }
+    },
+    ".github/workflows/windows-packaging-reusable.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879"
+          },
+          "validation-fallback": {
+            "seamSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879"
+          },
+          "timeout-singleton": {
+            "seamSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "e792b53cb7e5895de09ae3bbdad0413315d76d05202884316d631f29ef103879"
+          }
+        }
+      }
+    },
+    ".github/workflows/xunit-tests.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180"
+          },
+          "validation-fallback": {
+            "seamSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180"
+          },
+          "timeout-singleton": {
+            "seamSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2ba95576634b7923940956192d671fb179c40a270f2691a8bcdd22b18b326180"
+          }
+        }
+      }
+    },
+    "docker/InstallTarballPackage.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80"
+          },
+          "validation-fallback": {
+            "seamSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80"
+          },
+          "timeout-singleton": {
+            "seamSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "8b1e4960de17462642091c63227fcc436ef5b092b7afce1b4451adde58a1ed80"
+          }
+        }
+      }
+    },
+    "tools/AttackSurfaceAnalyzer/docker/Dockerfile": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376"
+          },
+          "validation-fallback": {
+            "seamSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376"
+          },
+          "timeout-singleton": {
+            "seamSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a9e408eb8d6b49e482bff745802c734bb0023811d3bbb9cc4528eb23f7d54376"
+          }
+        }
+      }
+    },
+    "tools/debug.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755"
+          },
+          "validation-fallback": {
+            "seamSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755"
+          },
+          "timeout-singleton": {
+            "seamSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "6fa1dadd4cf1d6db94407cb2aa840dd34e29bcf5627160d86b8851d47ad6b755"
+          }
+        }
+      }
+    },
+    "tools/download.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67"
+          },
+          "validation-fallback": {
+            "seamSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67"
+          },
+          "timeout-singleton": {
+            "seamSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "b4ae3b769edfeddd61b271cd69474a4961955b3759e5b93070d8de064c106e67"
+          }
+        }
+      }
+    },
+    "tools/generate-icns.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500"
+          },
+          "validation-fallback": {
+            "seamSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500"
+          },
+          "timeout-singleton": {
+            "seamSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "3256158244a21bdaad5d0f3c354ddbed02d167d97ca044dbe989786255ad7500"
+          }
+        }
+      }
+    },
+    "tools/install-powershell.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c"
+          },
+          "validation-fallback": {
+            "seamSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c"
+          },
+          "timeout-singleton": {
+            "seamSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "36edcaef16211755ed3bb7eff97a03a811c5adff628781859d1bec5639bfaf6c"
+          }
+        }
+      }
+    },
+    "tools/installpsh-amazonlinux.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868"
+          },
+          "validation-fallback": {
+            "seamSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868"
+          },
+          "timeout-singleton": {
+            "seamSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "f472e07432f95949d6972c88e870d3a781d41abeaa403f49e7a8780b9e1aa868"
+          }
+        }
+      }
+    },
+    "tools/installpsh-debian.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c"
+          },
+          "validation-fallback": {
+            "seamSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c"
+          },
+          "timeout-singleton": {
+            "seamSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "1e0b2b707990d7039664e30dbbe2f1cf51fb7fef9d7929e18ea2f83b191efc0c"
+          }
+        }
+      }
+    },
+    "tools/installpsh-gentoo.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501"
+          },
+          "validation-fallback": {
+            "seamSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501"
+          },
+          "timeout-singleton": {
+            "seamSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "280ed2e67cd627718c415269a1f33506506031f9236dc6b8e12ef96f6ca84501"
+          }
+        }
+      }
+    },
+    "tools/installpsh-mariner.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561"
+          },
+          "validation-fallback": {
+            "seamSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561"
+          },
+          "timeout-singleton": {
+            "seamSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "8b02a2103a7ba9b94fb367f94be109a5362f1a24ee620b89bea44ebf5ea3b561"
+          }
+        }
+      }
+    },
+    "tools/installpsh-osx.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf"
+          },
+          "validation-fallback": {
+            "seamSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf"
+          },
+          "timeout-singleton": {
+            "seamSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "fbb582fe2a8d2549896d53717f256c49e43adb786311908d0198fad59bc798bf"
+          }
+        }
+      }
+    },
+    "tools/installpsh-redhat.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88"
+          },
+          "validation-fallback": {
+            "seamSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88"
+          },
+          "timeout-singleton": {
+            "seamSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7a08c5cd290ed8d610459a479515ca2b3174a53e61ed6a0666f8bcc50193dd88"
+          }
+        }
+      }
+    },
+    "tools/installpsh-suse.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7"
+          },
+          "validation-fallback": {
+            "seamSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7"
+          },
+          "timeout-singleton": {
+            "seamSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0694dc3a794bb5d4e7a0312d5aafc88c2521eaf649b23cce5ce5f5507f528ec7"
+          }
+        }
+      }
+    },
+    "tools/releaseBuild/setReleaseTag.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6"
+          },
+          "validation-fallback": {
+            "seamSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6"
+          },
+          "timeout-singleton": {
+            "seamSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "72d5d2c0d372e939997757e6d39e7e7ec9ea120f1b4eab5cce4669c77209fdc6"
+          }
+        }
+      }
+    }
+  }
+}

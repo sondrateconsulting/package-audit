@@ -43,6 +43,32 @@ describe("EXPORTS.md ↔ export registry sync", () => {
   });
 });
 
+// ---- prose claims (2026-08-02 decision batch) ------------------------------------------------
+// The column/row-order sync above pins identifiers only, so it cannot detect PROSE drift — which
+// is how two false absolutes survived in EXPORTS.md until the round that corrected them
+// (ratification.json records both). These pin the corrected qualifiers: weakening either claim
+// back toward its old absolute fails CI and forces a review-visible edit here. Matching is over
+// whitespace-normalised text so an innocent re-wrap does not trip it; the WORDS are the pin.
+const EXPORTS_PROSE = EXPORTS_MD.replace(/\s+/g, " ");
+
+describe("EXPORTS.md prose claims ↔ code reality", () => {
+  test("run_unit_head's coverage claim keeps its terminal-disposition qualifier and absence caveat", () => {
+    // code reality: every TERMINAL disposition upserts a row (orchestrate.ts carries upsert
+    // sites for policy-excluded, skipped-cutoff, past-cap and scanned), but the scan-error and
+    // throttle-requeue arms exit through setUnitStatus BEFORE any upsert — so those branches
+    // have no row, exactly as the caveat says
+    expect(EXPORTS_PROSE).toContain("every branch that REACHED a terminal disposition");
+    expect(EXPORTS_PROSE).toContain("A branch whose scan errored or was throttle-requeued before the row was written has none");
+  });
+  test("the determinism claim keeps its starting-xray/ qualifier and the adoption sentence", () => {
+    // code reality: ArtifactBundle.finalize folds adoptableEntries — still-present same-run
+    // manifest entries of the OTHER kind — into manifest.json (artifactWrite.ts), so identical
+    // database + identical arguments alone do NOT pin the manifest bytes
+    expect(EXPORTS_PROSE).toContain("byte-identical artifacts, GIVEN an identical starting `xray/`");
+    expect(EXPORTS_PROSE).toContain("The bundle adopts still-present manifest entries from other kinds of the SAME run");
+  });
+});
+
 // ---- README recipes: extraction + identifier sync ------------------------------------------
 // Recipe EXECUTION happens in CI via a SHA-pinned DuckDB CLI (spawning binaries from this
 // codebase is confined to the audited gh/git/tar chokepoint by the repo-wide scan, so bun test

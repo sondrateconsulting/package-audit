@@ -2833,8 +2833,10 @@ describe("temp sweep (§0)", () => {
   });
 });
 
-// ---- the §6 single-chokepoint guarantee (grep-enforced) --------------------------------------
-describe("single chokepoint (grep-enforced)", () => {
+// ---- the §6 spawn-site guarantee: two allowlisted files, one spawn each — PLUS two scanner
+// test files exempted wholesale by exact path (this file and tuiPurity.test.ts), which must
+// spell the tokens they assert on; this file itself spawns twice (grep-enforced) ------------
+describe("spawn-site allowlist (grep-enforced, with two exact-path scanner-test exemptions)", () => {
   // A best-effort textual tripwire, NOT a semantic proof. It fails on the common direct routes
   // to a spawn surface — a dotted/optional-chained/whitespaced `Bun.spawn|spawnSync|$`; a
   // `"bun"`-module import (quote or backtick); `Bun` aliased, parenthesized, bracket-indexed,
@@ -2845,7 +2847,7 @@ describe("single chokepoint (grep-enforced)", () => {
   // several intermediate bindings (`const g = globalThis; const b = g.Bun; b.spawn(...)`).
   // Defense against those deliberately-evasive forms is code review, not this grep. This file
   // is exempt from the scan — it must name the very tokens it asserts about.
-  test("no file other than github.ts reaches a spawn surface; github.ts has exactly one spawn site", () => {
+  test("outside the two exact-path scanner-test exemptions, only the two allowlisted SOURCE files reach a spawn surface; each has exactly one spawn site", () => {
     // Walk the WHOLE repo (the locked guarantee is repo-wide), skipping only non-code dirs.
     const skip = new Set(["node_modules", ".git", "data", "output"]);
     // dotted call, tolerating whitespace and optional chaining before the member (Bun?.spawn,
@@ -2911,12 +2913,26 @@ describe("single chokepoint (grep-enforced)", () => {
         dynNonliteral: (src.match(DYN_NONLITERAL_RE) ?? []).length,
       };
       const zero = { bun: 0, cp: 0, bunModule: 0, bunIndirect: 0, dynAssembly: 0, dynNonliteral: 0 };
-      if (f.endsWith("scripts/github.ts")) {
-        // the single realSpawn site; zero on every other surface
+      if (f === "scripts/github.ts" || f === join("scripts", "github.ts")) {
+        // the single realSpawn site; zero on every other surface. EXACT repo-relative path,
+        // matching the benchSpawn entry below — a suffix match would let a nested
+        // evil/scripts/github.ts inherit the sanctioned-chokepoint allowance.
         expect({ file: f, ...counts }).toEqual({ file: f, ...zero, bun: 1 });
-      } else if (f.endsWith("scripts/github.test.ts") || f.endsWith("scripts/tuiPurity.test.ts")) {
+      } else if (f === "scripts/benchSpawn.ts" || f === join("scripts", "benchSpawn.ts")) {
+        // EXACT repo-relative path (never a suffix match — a nested evil/scripts/benchSpawn.ts
+        // must not inherit the allowlist entry).
+        // ADR-0001 Step B (resolution plan §4.1): the benchmark's framed binary seam. Its ONE
+        // launch site drives the evaluated-transport / scaffolding / pinning git children,
+        // gated by benchGrammar's proposed grammars and the config-pinned scaffolding tuples.
+        // This allowlist entry is the FIRST of the plan's two sanctioned test-list changes
+        // (the second is cliErrors.test.ts's operator-error-registry exclusions) — production
+        // code (github.ts, readOnlyGuard.ts) is untouched by Step B.
+        expect({ file: f, ...counts }).toEqual({ file: f, ...zero, bun: 1 });
+      } else if (f === "scripts/github.test.ts" || f === join("scripts", "github.test.ts") || f === "scripts/tuiPurity.test.ts" || f === join("scripts", "tuiPurity.test.ts")) {
         // these SCANNER test files name the patterns in their own assertions — exempt them
-        // (tuiPurity.test.ts is the display-layer purity scan; it must spell the same tokens)
+        // (tuiPurity.test.ts is the display-layer purity scan; it must spell the same tokens).
+        // EXACT paths for the same reason as the allowlist entries: a suffix-matched exemption
+        // was a total scan bypass for any nested file that borrowed these names.
       } else {
         expect({ file: f, ...counts }).toEqual({ file: f, ...zero });
       }

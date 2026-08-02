@@ -1,0 +1,4326 @@
+{
+  "unit": "C2:nestjs/nest@master",
+  "sha": "fafe503bd8ca073f2fdd41ed7138081af84c478e",
+  "treeOid": "389e928dc19666d41295fb22d48736827e6ca2b0",
+  "objectFormat": "sha1",
+  "generatedAtIso": "2026-07-29T03:25:32.963Z",
+  "truncatedTree": false,
+  "escapeTripped": false,
+  "batchContentBytesCap": 1572864,
+  "entries": [
+    {
+      "path": "package.json",
+      "mode": "100644",
+      "blobOid": "353568ba113ae46d5abc67bcd494cc397ef69462",
+      "size": 8799,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1",
+      "rawSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "packages/common/package.json",
+      "mode": "100644",
+      "blobOid": "96a51e87515d3a477f5f2138ea1f8b25a3192b73",
+      "size": 1003,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3",
+      "rawSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "packages/core/package.json",
+      "mode": "100644",
+      "blobOid": "02dc459f186b83ec045753d317d6164bcd507189",
+      "size": 1265,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e",
+      "rawSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "packages/microservices/package.json",
+      "mode": "100644",
+      "blobOid": "412f081a1d3f1e341b15d7457135907dc75df12a",
+      "size": 1599,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451",
+      "rawSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "packages/platform-express/package.json",
+      "mode": "100644",
+      "blobOid": "efea4fdbb3292ea4ef36c59d736b178a3d22542c",
+      "size": 909,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8",
+      "rawSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "packages/platform-fastify/package.json",
+      "mode": "100644",
+      "blobOid": "0d12e22c4bcac1d7eda7fc4af9fd80b41c5585da",
+      "size": 1225,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c",
+      "rawSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "packages/platform-socket.io/package.json",
+      "mode": "100644",
+      "blobOid": "d8a39810d1267ba8752ddaa5037fe09b8339d4d4",
+      "size": 779,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e",
+      "rawSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "packages/platform-ws/package.json",
+      "mode": "100644",
+      "blobOid": "76de6800ad7921f835905e9405d3f42842eb7600",
+      "size": 752,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644",
+      "rawSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "packages/testing/package.json",
+      "mode": "100644",
+      "blobOid": "2ac27ceb5a24f6e18fab37f8937d2c7f2b9d71de",
+      "size": 932,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5",
+      "rawSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "packages/websockets/package.json",
+      "mode": "100644",
+      "blobOid": "20ca8c4dcc1c3a38d560fe837d67b0ad55789f71",
+      "size": 923,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3",
+      "rawSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/01-cats-app/package.json",
+      "mode": "100644",
+      "blobOid": "2be48e9f27186db2273d0fbb07d347805d6fa5bb",
+      "size": 2006,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba",
+      "rawSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/02-gateways/package.json",
+      "mode": "100644",
+      "blobOid": "1a257a10e40a513faccf65cc360fca0602f79017",
+      "size": 2204,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e",
+      "rawSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/03-microservices/package.json",
+      "mode": "100644",
+      "blobOid": "4e7ee957bff6d59b493b0a5291afc40422b1b2c4",
+      "size": 1718,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe",
+      "rawSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/04-grpc/package.json",
+      "mode": "100644",
+      "blobOid": "6fa30376cf0bd4ec2964bcaacd3424022d227f65",
+      "size": 1750,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2",
+      "rawSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/05-sql-typeorm/package.json",
+      "mode": "100644",
+      "blobOid": "945ef986e2686dcd8c43630d3a68feef4a60cc51",
+      "size": 2017,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33",
+      "rawSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/06-mongoose/package.json",
+      "mode": "100644",
+      "blobOid": "8d9070c418ca93c5232c888d32178539437be410",
+      "size": 1995,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e",
+      "rawSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/07-sequelize/package.json",
+      "mode": "100644",
+      "blobOid": "58e1435cfbbd5d482c4b2bf2e9f46c1536adb82b",
+      "size": 2086,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a",
+      "rawSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/08-webpack/package.json",
+      "mode": "100644",
+      "blobOid": "cf7adeebb43874f344288e9827090600d5c8addf",
+      "size": 1185,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87",
+      "rawSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/09-babel-example/package.json",
+      "mode": "100644",
+      "blobOid": "e16054d27ab15f07c4d64cdc9ab06e1f7ea2fdf1",
+      "size": 1284,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2",
+      "rawSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/10-fastify/package.json",
+      "mode": "100644",
+      "blobOid": "af13e63961c9a2b636d3d85eef1281038dd55904",
+      "size": 1615,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35",
+      "rawSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/11-swagger/package.json",
+      "mode": "100644",
+      "blobOid": "50b2c1b16842dfb89b693969d88393cc896fe1b2",
+      "size": 1679,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46",
+      "rawSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/12-graphql-schema-first/package.json",
+      "mode": "100644",
+      "blobOid": "f38860688c840bbbd8ec4354d1f73a84d91336b7",
+      "size": 2628,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f",
+      "rawSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/13-mongo-typeorm/package.json",
+      "mode": "100644",
+      "blobOid": "a5861abd1ded0ddb7998168917d1d46f87f437b0",
+      "size": 2023,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0",
+      "rawSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/14-mongoose-base/package.json",
+      "mode": "100644",
+      "blobOid": "3596f47980b459d8264332322ba70b5d97d490a2",
+      "size": 1961,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820",
+      "rawSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/15-mvc/package.json",
+      "mode": "100644",
+      "blobOid": "433af5f7c2debd0f6565e15c4a0114e37c197c92",
+      "size": 1599,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468",
+      "rawSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/16-gateways-ws/package.json",
+      "mode": "100644",
+      "blobOid": "e3064e5cadda62f3a272ab0a60070bb7c21a0321",
+      "size": 1768,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b",
+      "rawSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/17-mvc-fastify/package.json",
+      "mode": "100644",
+      "blobOid": "900cc244712821d474889306203943f55c8ea16e",
+      "size": 1670,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110",
+      "rawSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/18-context/package.json",
+      "mode": "100644",
+      "blobOid": "ecdb0970f9bfdd1cdee932be2c094adeabefff22",
+      "size": 1471,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f",
+      "rawSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/19-auth-jwt/package.json",
+      "mode": "100644",
+      "blobOid": "1029508f44738081f3ff4f647513e1f28fae51b9",
+      "size": 1916,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4",
+      "rawSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/20-cache/package.json",
+      "mode": "100644",
+      "blobOid": "178d55a8a272f53268701fa68603c7cdda056133",
+      "size": 1792,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838",
+      "rawSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/21-serializer/package.json",
+      "mode": "100644",
+      "blobOid": "3a7a1dd522885d94371fc4d4c89f25c872e2f4e9",
+      "size": 1691,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9",
+      "rawSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/22-graphql-prisma/package.json",
+      "mode": "100644",
+      "blobOid": "bd70a23ab66d08686ce9dc73965709706e7cc884",
+      "size": 2159,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd",
+      "rawSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/23-graphql-code-first/package.json",
+      "mode": "100644",
+      "blobOid": "2ac5b23a1d0ccc7b16680121765c846c7b03bb89",
+      "size": 1884,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76",
+      "rawSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/24-serve-static/package.json",
+      "mode": "100644",
+      "blobOid": "1f92d4e79a90ec51e6d8fb6dae239f7ef49a7157",
+      "size": 1683,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8",
+      "rawSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/25-dynamic-modules/package.json",
+      "mode": "100644",
+      "blobOid": "9511bd92aa9c3a68b4fdf38fe6cc0c28a088ef13",
+      "size": 1924,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c",
+      "rawSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/26-queues/package.json",
+      "mode": "100644",
+      "blobOid": "02f15eba5523fec72c35ae0e2ee9d05b44962d86",
+      "size": 2007,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d",
+      "rawSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/27-scheduling/package.json",
+      "mode": "100644",
+      "blobOid": "f303276ecc61ff0522a8a4a7b2af0b47b7a8c91e",
+      "size": 1986,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030",
+      "rawSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/28-sse/package.json",
+      "mode": "100644",
+      "blobOid": "1ebc767c3fb461bc7b7e4c45228da66b8967ea6d",
+      "size": 1958,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe",
+      "rawSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/29-file-upload/package.json",
+      "mode": "100644",
+      "blobOid": "092cbea49b7fc9e5471b33fe607294eb13ab3c01",
+      "size": 2165,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87",
+      "rawSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/30-event-emitter/package.json",
+      "mode": "100644",
+      "blobOid": "f7c8f6ffcf8955ee5456962d6f24146c410be28d",
+      "size": 1920,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465",
+      "rawSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/31-graphql-federation-code-first/gateway/package.json",
+      "mode": "100644",
+      "blobOid": "cf7ac47d5235633bf384aa6f16a3b732b507046a",
+      "size": 2165,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427",
+      "rawSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/31-graphql-federation-code-first/posts-application/package.json",
+      "mode": "100644",
+      "blobOid": "14b3b2814605e1d8585836df64dfe4aa8b4a54b1",
+      "size": 2234,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8",
+      "rawSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/31-graphql-federation-code-first/users-application/package.json",
+      "mode": "100644",
+      "blobOid": "5940ab8ee2820b9bf7dd32e83bd8c1fd454d4d51",
+      "size": 2249,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa",
+      "rawSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/32-graphql-federation-schema-first/gateway/package.json",
+      "mode": "100644",
+      "blobOid": "3282be9dde6c6b4b5b34f76bc1b98bf300941e42",
+      "size": 2188,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0",
+      "rawSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/32-graphql-federation-schema-first/posts-application/package.json",
+      "mode": "100644",
+      "blobOid": "6cbbce614d29f02d21feed9a1cc6484b8545664f",
+      "size": 2234,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f",
+      "rawSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/32-graphql-federation-schema-first/users-application/package.json",
+      "mode": "100644",
+      "blobOid": "66426c09091b4e3a86129d2b90f95b156bfaf215",
+      "size": 2190,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98",
+      "rawSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/33-graphql-mercurius/package.json",
+      "mode": "100644",
+      "blobOid": "63f4b0a68157e776faf81a49a407dd7e173a2dfa",
+      "size": 1767,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4",
+      "rawSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/34-using-esm-packages/package.json",
+      "mode": "100644",
+      "blobOid": "70b2625f8b8d5ef20a6f8cd8abb7a58a6f3a28f2",
+      "size": 2280,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77",
+      "rawSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/35-use-esm-package-after-node22/package.json",
+      "mode": "100644",
+      "blobOid": "075ae793a3cc2165b55591d996a9a471face28c2",
+      "size": 1482,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1",
+      "rawSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "sample/36-hmr-esm/package.json",
+      "mode": "100644",
+      "blobOid": "e1beebab96315cc00b10c99f31807c37d0839c8e",
+      "size": 2258,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024",
+      "rawSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "tools/benchmarks/package.json",
+      "mode": "100644",
+      "blobOid": "a05a66302a88b60f425a1cdc1df956339fb57125",
+      "size": 631,
+      "class": "manifest",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135",
+      "rawSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": ".github/workflows/codeql-analysis.yml",
+      "mode": "100644",
+      "blobOid": "6a8dd6672c6788882637f43e80fe130131a12b37",
+      "size": 1817,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863",
+      "rawSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "scripts/prepare.sh",
+      "mode": "100644",
+      "blobOid": "8f7abdb64b7838102278c57e9608772e053165bf",
+      "size": 266,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1",
+      "rawSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "scripts/run-integration.sh",
+      "mode": "100755",
+      "blobOid": "345a98fff2da562475c1a5e8ef32f3650352ead2",
+      "size": 297,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b",
+      "rawSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "scripts/test.sh",
+      "mode": "100644",
+      "blobOid": "4cccf55636e6dac55b0c7d28e61b8c9486764252",
+      "size": 75,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca",
+      "rawSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    },
+    {
+      "path": "scripts/update-samples.sh",
+      "mode": "100644",
+      "blobOid": "89f90d1d9371eea9a3a3f359bcb53e2d8645fa03",
+      "size": 96,
+      "class": "cli",
+      "read": true,
+      "noReadReason": null,
+      "canonicalSeamSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60",
+      "rawSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60",
+      "restDerefSeamSha256": null,
+      "checkoutSeamSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60",
+      "gql": {
+        "isBinary": false,
+        "isTruncated": false,
+        "textNull": false
+      }
+    }
+  ],
+  "routes": {
+    "package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1"
+          },
+          "validation-fallback": {
+            "seamSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1"
+          },
+          "timeout-singleton": {
+            "seamSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9108e5cc459159acd2da43e85e01b3b745ab30399c52531b2907b807ee650bd1"
+          }
+        }
+      }
+    },
+    "packages/common/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3"
+          },
+          "validation-fallback": {
+            "seamSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3"
+          },
+          "timeout-singleton": {
+            "seamSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "cbf9d6432546c7ec7bf17a52ea2a429f63e1c4f9b64756f952c07f80f778aee3"
+          }
+        }
+      }
+    },
+    "packages/core/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e"
+          },
+          "validation-fallback": {
+            "seamSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e"
+          },
+          "timeout-singleton": {
+            "seamSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "99de093c0d6d63357f51ed0aa126bf9b18574fbf9c1e8fb66137b5eec63e944e"
+          }
+        }
+      }
+    },
+    "packages/microservices/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451"
+          },
+          "validation-fallback": {
+            "seamSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451"
+          },
+          "timeout-singleton": {
+            "seamSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d84296b85afc9d653e643dc0bc00bd16b211ffd5debbc2bd5854596c04fbc451"
+          }
+        }
+      }
+    },
+    "packages/platform-express/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8"
+          },
+          "validation-fallback": {
+            "seamSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8"
+          },
+          "timeout-singleton": {
+            "seamSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "4ef629802329d4199e7d2217a1cf8c1593481126b665a4238b09dd7bdee927d8"
+          }
+        }
+      }
+    },
+    "packages/platform-fastify/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c"
+          },
+          "validation-fallback": {
+            "seamSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c"
+          },
+          "timeout-singleton": {
+            "seamSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "335ee0b5be78454b82d452d0a6c2c6ca6bc7c7dc9a711a923dc3723f7b942b4c"
+          }
+        }
+      }
+    },
+    "packages/platform-socket.io/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e"
+          },
+          "validation-fallback": {
+            "seamSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e"
+          },
+          "timeout-singleton": {
+            "seamSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "5fb31e74b69b17385a8a54b575ca7791d3d30fd6f8f9f8bbdc336f885f31b83e"
+          }
+        }
+      }
+    },
+    "packages/platform-ws/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644"
+          },
+          "validation-fallback": {
+            "seamSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644"
+          },
+          "timeout-singleton": {
+            "seamSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9c074f65b448dbfc71ea8381f28ed148799d9db8ea160e9318f3b709fcbf0644"
+          }
+        }
+      }
+    },
+    "packages/testing/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5"
+          },
+          "validation-fallback": {
+            "seamSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5"
+          },
+          "timeout-singleton": {
+            "seamSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "ce1e358775694cd5ca2f98e9b95adbfe4f072f9b4ef480b33c1950442dbca8e5"
+          }
+        }
+      }
+    },
+    "packages/websockets/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3"
+          },
+          "validation-fallback": {
+            "seamSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3"
+          },
+          "timeout-singleton": {
+            "seamSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "33d9ab5d0e1632db944088575d6c84e1d1685fd4eafb9e6aa61e353e03bfd6e3"
+          }
+        }
+      }
+    },
+    "sample/01-cats-app/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba"
+          },
+          "validation-fallback": {
+            "seamSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba"
+          },
+          "timeout-singleton": {
+            "seamSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "17a4ff80331481ee9a4c7cbd81a4270491c1419e631fd6525d3da98a472057ba"
+          }
+        }
+      }
+    },
+    "sample/02-gateways/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e"
+          },
+          "validation-fallback": {
+            "seamSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e"
+          },
+          "timeout-singleton": {
+            "seamSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "f5b74ff4e6525163353cd5ed8cad8ac9545a2c6c136041c0946559aa8bcacd6e"
+          }
+        }
+      }
+    },
+    "sample/03-microservices/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe"
+          },
+          "validation-fallback": {
+            "seamSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe"
+          },
+          "timeout-singleton": {
+            "seamSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dee8981e1b9e79a8089a5a040ed0908fc64758247b4b09dfb8b6005b444c9fbe"
+          }
+        }
+      }
+    },
+    "sample/04-grpc/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2"
+          },
+          "validation-fallback": {
+            "seamSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2"
+          },
+          "timeout-singleton": {
+            "seamSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "404d5c278dcbb60a5b1b02783dbf6f6e10b044f2dc5a44722fbc5dad3f7ec1e2"
+          }
+        }
+      }
+    },
+    "sample/05-sql-typeorm/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33"
+          },
+          "validation-fallback": {
+            "seamSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33"
+          },
+          "timeout-singleton": {
+            "seamSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9c5d6ed1d8964b7b4b13d985f7260d11f5bcd13ecdce4d260e906fbe269b9e33"
+          }
+        }
+      }
+    },
+    "sample/06-mongoose/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e"
+          },
+          "validation-fallback": {
+            "seamSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e"
+          },
+          "timeout-singleton": {
+            "seamSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d69c9ce6b4ae28ce8ae064ca2e27eb2c6edaaffb5b327961ecb7d02195f86a5e"
+          }
+        }
+      }
+    },
+    "sample/07-sequelize/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a"
+          },
+          "validation-fallback": {
+            "seamSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a"
+          },
+          "timeout-singleton": {
+            "seamSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0d45a1515b0c193296036d2c7fdbd83bacdaddec8c3ae96fcf7637be1721b04a"
+          }
+        }
+      }
+    },
+    "sample/08-webpack/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87"
+          },
+          "validation-fallback": {
+            "seamSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87"
+          },
+          "timeout-singleton": {
+            "seamSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "84b1230468304dac7da0468de58a9e3a7ad78047a50d3a7d456f21f4010e0d87"
+          }
+        }
+      }
+    },
+    "sample/09-babel-example/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2"
+          },
+          "validation-fallback": {
+            "seamSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2"
+          },
+          "timeout-singleton": {
+            "seamSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "11c607b26d3b4e24a22003a3ace54b4c8f475e8af4e72e5f81cb07a8310eb3d2"
+          }
+        }
+      }
+    },
+    "sample/10-fastify/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35"
+          },
+          "validation-fallback": {
+            "seamSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35"
+          },
+          "timeout-singleton": {
+            "seamSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "57696ec0abb62ea5299069bec2fdb117e06afd14cc8ed5f061f06d44cd2a5a35"
+          }
+        }
+      }
+    },
+    "sample/11-swagger/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46"
+          },
+          "validation-fallback": {
+            "seamSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46"
+          },
+          "timeout-singleton": {
+            "seamSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9f568a1678da8840f49ba5618ff5d61503a8489b9d414b24bdb011b3b7f1bd46"
+          }
+        }
+      }
+    },
+    "sample/12-graphql-schema-first/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f"
+          },
+          "validation-fallback": {
+            "seamSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f"
+          },
+          "timeout-singleton": {
+            "seamSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "a0bd7abbd6062f54994a26d41e76ab0de0bd54488041e1274539eb847f77392f"
+          }
+        }
+      }
+    },
+    "sample/13-mongo-typeorm/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0"
+          },
+          "validation-fallback": {
+            "seamSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0"
+          },
+          "timeout-singleton": {
+            "seamSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "389f0a527476bb8e3825620bf0820ee97fa25ad8b22cf9c20580ddda61939bf0"
+          }
+        }
+      }
+    },
+    "sample/14-mongoose-base/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820"
+          },
+          "validation-fallback": {
+            "seamSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820"
+          },
+          "timeout-singleton": {
+            "seamSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "715893168245d46eda8400bc6a549606b4864548c2454ccfaa1d8391c674d820"
+          }
+        }
+      }
+    },
+    "sample/15-mvc/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468"
+          },
+          "validation-fallback": {
+            "seamSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468"
+          },
+          "timeout-singleton": {
+            "seamSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "82826972058b1d889ddb824886a57fb4148d314f321c92b2374445fdcf96a468"
+          }
+        }
+      }
+    },
+    "sample/16-gateways-ws/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b"
+          },
+          "validation-fallback": {
+            "seamSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b"
+          },
+          "timeout-singleton": {
+            "seamSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "1eaba639e10a6278961dcf056f08dcf33dee7d2b9af3be56fc6e90a6e5c18d0b"
+          }
+        }
+      }
+    },
+    "sample/17-mvc-fastify/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110"
+          },
+          "validation-fallback": {
+            "seamSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110"
+          },
+          "timeout-singleton": {
+            "seamSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7c0efa8b67df738b9938623bb052f6e6faf711f6c9a0adf24f257317dccb1110"
+          }
+        }
+      }
+    },
+    "sample/18-context/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f"
+          },
+          "validation-fallback": {
+            "seamSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f"
+          },
+          "timeout-singleton": {
+            "seamSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0e013addedb9e3d5fe8ce5e6f5ae080415552a87a4d06eb81b11ab72e57f3e3f"
+          }
+        }
+      }
+    },
+    "sample/19-auth-jwt/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4"
+          },
+          "validation-fallback": {
+            "seamSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4"
+          },
+          "timeout-singleton": {
+            "seamSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "b9de8ac607971e7a85e19b0d7d834f06fbb3f20a831f94440dd5039003bfbac4"
+          }
+        }
+      }
+    },
+    "sample/20-cache/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838"
+          },
+          "validation-fallback": {
+            "seamSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838"
+          },
+          "timeout-singleton": {
+            "seamSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "6c26211d48a797c2b20a06a183aea0580a33afc4fbdd362c8123cca4697b4838"
+          }
+        }
+      }
+    },
+    "sample/21-serializer/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9"
+          },
+          "validation-fallback": {
+            "seamSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9"
+          },
+          "timeout-singleton": {
+            "seamSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "5df8e345622c97b2bacb1fe7e1a3a8a5fb9d6b4f297366251526706576d3c2e9"
+          }
+        }
+      }
+    },
+    "sample/22-graphql-prisma/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd"
+          },
+          "validation-fallback": {
+            "seamSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd"
+          },
+          "timeout-singleton": {
+            "seamSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "ac41db85744bb0238a22d605f7cd186d12caf52cadc4f9b9c5815023d36309fd"
+          }
+        }
+      }
+    },
+    "sample/23-graphql-code-first/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76"
+          },
+          "validation-fallback": {
+            "seamSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76"
+          },
+          "timeout-singleton": {
+            "seamSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d4a4aba2227459786b19c62b9f0924a371e2db0cc9e5ddef087737395b8a3b76"
+          }
+        }
+      }
+    },
+    "sample/24-serve-static/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8"
+          },
+          "validation-fallback": {
+            "seamSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8"
+          },
+          "timeout-singleton": {
+            "seamSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "23a95ed5f0b81a02b4d74c39ef3fd388a67020f20c3edea4b582985f4bb9eeb8"
+          }
+        }
+      }
+    },
+    "sample/25-dynamic-modules/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c"
+          },
+          "validation-fallback": {
+            "seamSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c"
+          },
+          "timeout-singleton": {
+            "seamSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "98d60ef092a42c678b559a301eab1c13ecd626c3a0ab311bc1ef7db7b7b3747c"
+          }
+        }
+      }
+    },
+    "sample/26-queues/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d"
+          },
+          "validation-fallback": {
+            "seamSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d"
+          },
+          "timeout-singleton": {
+            "seamSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "b018c24474a6f9f7f249bd196ece53601dd75e6b6e9717f35e1add837c8d732d"
+          }
+        }
+      }
+    },
+    "sample/27-scheduling/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030"
+          },
+          "validation-fallback": {
+            "seamSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030"
+          },
+          "timeout-singleton": {
+            "seamSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d721272a7a78b21b450d4cc55df2c8ec2a863231121f8faf4aba3f4131c92030"
+          }
+        }
+      }
+    },
+    "sample/28-sse/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe"
+          },
+          "validation-fallback": {
+            "seamSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe"
+          },
+          "timeout-singleton": {
+            "seamSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "4702315af09ef2b5bb0c9999e5fec7fe4e9901f58fb2f68c568ab2ffec0a09fe"
+          }
+        }
+      }
+    },
+    "sample/29-file-upload/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87"
+          },
+          "validation-fallback": {
+            "seamSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87"
+          },
+          "timeout-singleton": {
+            "seamSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "fdc7966c59f05d1142bf6dcba7fb9f301a6430c81b47f7f111d797ec73f86a87"
+          }
+        }
+      }
+    },
+    "sample/30-event-emitter/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465"
+          },
+          "validation-fallback": {
+            "seamSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465"
+          },
+          "timeout-singleton": {
+            "seamSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "5f737e68c41577dd3d8b8cd29d58e9206ed836527c747822c6f30da2d3f83465"
+          }
+        }
+      }
+    },
+    "sample/31-graphql-federation-code-first/gateway/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427"
+          },
+          "validation-fallback": {
+            "seamSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427"
+          },
+          "timeout-singleton": {
+            "seamSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "37b9d40583fc1f65cb099504feaee0282749dcde36604f6514d3ab3e7f2d9427"
+          }
+        }
+      }
+    },
+    "sample/31-graphql-federation-code-first/posts-application/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8"
+          },
+          "validation-fallback": {
+            "seamSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8"
+          },
+          "timeout-singleton": {
+            "seamSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "21e7c67bc937d035472055538efb615f65a5c14ee5f7c0318fb81fc904aa5ee8"
+          }
+        }
+      }
+    },
+    "sample/31-graphql-federation-code-first/users-application/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa"
+          },
+          "validation-fallback": {
+            "seamSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa"
+          },
+          "timeout-singleton": {
+            "seamSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2aa6d58d07a2b4e649607fd39d1aa58e14175e6c2966d207aa530df0893903aa"
+          }
+        }
+      }
+    },
+    "sample/32-graphql-federation-schema-first/gateway/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0"
+          },
+          "validation-fallback": {
+            "seamSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0"
+          },
+          "timeout-singleton": {
+            "seamSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "bf6c17e6dfb790cc53036ce28603d67dc1d19670e69994fdcaaefb78feaaccf0"
+          }
+        }
+      }
+    },
+    "sample/32-graphql-federation-schema-first/posts-application/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f"
+          },
+          "validation-fallback": {
+            "seamSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f"
+          },
+          "timeout-singleton": {
+            "seamSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2444a6f122b7c20d2c5a310246fb25b261f63db485d301003287ad9a239f042f"
+          }
+        }
+      }
+    },
+    "sample/32-graphql-federation-schema-first/users-application/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98"
+          },
+          "validation-fallback": {
+            "seamSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98"
+          },
+          "timeout-singleton": {
+            "seamSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "80c4d0e286b01d8436044ee41166d8c37438dd649df1d9e022feab280d29aa98"
+          }
+        }
+      }
+    },
+    "sample/33-graphql-mercurius/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4"
+          },
+          "validation-fallback": {
+            "seamSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4"
+          },
+          "timeout-singleton": {
+            "seamSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dc154f18f73330c8d6a0524a47134996f126d74156319fd69d053685bcc703a4"
+          }
+        }
+      }
+    },
+    "sample/34-using-esm-packages/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77"
+          },
+          "validation-fallback": {
+            "seamSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77"
+          },
+          "timeout-singleton": {
+            "seamSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "44a67c45c13452c9e6daa285c7d150c33f7c716c4a919dd08dbab5ff68344a77"
+          }
+        }
+      }
+    },
+    "sample/35-use-esm-package-after-node22/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1"
+          },
+          "validation-fallback": {
+            "seamSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1"
+          },
+          "timeout-singleton": {
+            "seamSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "0a34cba1df8b293a653af49b3327c74b67e15b6661e35f963a8be685aca7c5a1"
+          }
+        }
+      }
+    },
+    "sample/36-hmr-esm/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024"
+          },
+          "validation-fallback": {
+            "seamSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024"
+          },
+          "timeout-singleton": {
+            "seamSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "82bb27432c04e1315b853595074f5a274d81a1ea698414dd1072e65005228024"
+          }
+        }
+      }
+    },
+    "tools/benchmarks/package.json": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135"
+          },
+          "validation-fallback": {
+            "seamSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135"
+          },
+          "timeout-singleton": {
+            "seamSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dcb8cc8c8d145a69f27f034012e247dcda224e660318c400b8adab0d0f538135"
+          }
+        }
+      }
+    },
+    ".github/workflows/codeql-analysis.yml": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863"
+          },
+          "validation-fallback": {
+            "seamSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863"
+          },
+          "timeout-singleton": {
+            "seamSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "9acd4ab755073c35660421f506e506f93c127f590401b9905f4139141da08863"
+          }
+        }
+      }
+    },
+    "scripts/prepare.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1"
+          },
+          "validation-fallback": {
+            "seamSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1"
+          },
+          "timeout-singleton": {
+            "seamSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "dfad1e288b7524826349806510ca9b9c48f18b4d8e18cc3b125cde71859544c1"
+          }
+        }
+      }
+    },
+    "scripts/run-integration.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b"
+          },
+          "validation-fallback": {
+            "seamSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b"
+          },
+          "timeout-singleton": {
+            "seamSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "2dfd4f75c33edf3fe1a8de65d419260b8931edc9c7950ef8414e65e5b3ddd08b"
+          }
+        }
+      }
+    },
+    "scripts/test.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca"
+          },
+          "validation-fallback": {
+            "seamSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca"
+          },
+          "timeout-singleton": {
+            "seamSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "7708b61045a5786593d1abf10c66dcf9404dc9547b8ae621dc2f865b1c210dca"
+          }
+        }
+      }
+    },
+    "scripts/update-samples.sh": {
+      "T0": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60"
+          }
+        }
+      },
+      "T1": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [
+          "batch-error-fallback",
+          "validation-fallback",
+          "timeout-singleton",
+          "missing-alias-fallback"
+        ],
+        "expected": {
+          "primary": {
+            "seamSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60"
+          },
+          "batch-error-fallback": {
+            "seamSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60"
+          },
+          "validation-fallback": {
+            "seamSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60"
+          },
+          "timeout-singleton": {
+            "seamSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60"
+          },
+          "missing-alias-fallback": {
+            "seamSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60"
+          }
+        }
+      },
+      "T2a": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60"
+          }
+        }
+      },
+      "T2c": {
+        "primary": "primary",
+        "declaredCaveat": false,
+        "permittedFallbacks": [],
+        "expected": {
+          "primary": {
+            "seamSha256": "d10f063fa520255dfc48dcd25f0492f5e699d0c34e745d0311ce5bd750ce7f60"
+          }
+        }
+      }
+    }
+  }
+}

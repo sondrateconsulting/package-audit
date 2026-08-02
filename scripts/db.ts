@@ -1562,8 +1562,12 @@ export interface OpenDbOptions {
 export function initWritableConnection(db: Database, path: string): number {
   try {
     // busy_timeout FIRST — it is per-connection and must protect every later lock-taking
-    // statement in this span. journal_mode runs LAST, after the gates (it is what persists a
-    // delete→wal conversion in the file header); foreign_keys is per-connection. All pragmas
+    // statement in this span. journal_mode runs after the GATES — not first, and not last either:
+    // foreign_keys follows it, and AuditDb.open continues past this function into the OPTIONAL
+    // --fresh drop and then exactly ONE of schema creation, migration or self-heal — not all
+    // three in sequence (it is what persists a delete→wal
+    // conversion in the file header, and that transition itself runs in rollback mode, so a
+    // -journal can appear beside the file); foreign_keys is per-connection. All pragmas
     // run OUTSIDE any transaction (journal_mode cannot change inside one).
     db.exec("PRAGMA busy_timeout = 5000;");
     const userVersion = readUserVersion(db);
@@ -1829,6 +1833,17 @@ export class AuditDb {
     // undone.
     const userVersion = initWritableConnection(db, path);
 
+    // Everything from here to `new AuditDb(db)` — the --fresh drop, schema creation, the v2→v4
+    // migrations and the run_unit_head self-heal — can throw (a failed migration, a damaged page
+    // surfacing mid-DDL, ENOSPC). Until the AuditDb wrapper exists NO caller owns this handle, so
+    // a throw here previously leaked an OPEN connection (and its WAL lock) until process exit.
+    // initWritableConnection closes on its own failure and openReadOnly closes on its validation
+    // failure; this span was the one writable gap between them. It matters most for short-lived
+    // per-call databases (the ADR-0001 bench opens one run-cache DB per repetition): that caller
+    // can unlink the files it named, but it cannot close a handle it was never handed. Close,
+    // then rethrow the ORIGINAL error unchanged — it already carries its own remediation, and
+    // re-wrapping would bury it.
+    try {
     if (opts.fresh === true) {
       // Count what --fresh erases INSIDE the drop transaction (a count taken outside could
       // race a concurrent writer), but warn only AFTER the transaction commits — the warning
@@ -1888,6 +1903,15 @@ export class AuditDb {
       })();
     }
     return new AuditDb(db);
+    } catch (e) {
+      try {
+        db.close();
+      } catch {
+        // the original failure is the one worth reporting — a close failure on an already-broken
+        // handle must not mask it (the same posture initWritableConnection's catch takes)
+      }
+      throw e;
+    }
   }
 
   // The read-command open seam (report/export/compare/--html): {readonly:true}, busy_timeout

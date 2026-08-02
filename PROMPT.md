@@ -32,7 +32,7 @@ every run as "continue the job," not "start over," unless the user passes `--fre
   `--template=` blocks init.templateDir hooks, `GIT_TERMINAL_PROMPT=0` prevents
   credential-prompt hangs. Record `git rev-parse HEAD` so permalinks pin the fetched
   SHA. Never write inside a repo working tree.
-- All `gh`/`git`/`tar` shell-outs go through the single wrapper module (§6) that
+- All `gh`/`git`/`tar` shell-outs in the audit product go through the single wrapper module (§6) that
   invokes `readOnlyGuard` on the argv ARRAY — never a joined string (naive substring
   matching false-positives on a repo named `create-x` and, worse, lets `gh api -X
   DELETE` through). The guard is an ALLOWLIST of read-only `gh`/`git` verbs+argv
@@ -230,8 +230,10 @@ introspected_at, cached_at) are persisted in ONE canonical fixed-width ISO-8601 
 (`new Date().toISOString()`), so lexicographic ordering equals chronological ordering
 everywhere (§7 MAX/COALESCE, §3 earliest-timestamp synthesis). Enable:
 ```sql
-PRAGMA busy_timeout = 5000;   -- FIRST: it must protect the very next statement (the WAL
-                              -- pragma takes a lock). Single-writer, but report.ts / cache
+PRAGMA busy_timeout = 5000;   -- FIRST: it must protect EVERY later lock-taking statement in
+                              -- the span, the WAL pragma included (which the real open runs
+                              -- after its ownership/compatibility gates, not immediately
+                              -- after this). Single-writer, but report.ts / cache
                               -- reads can still hit transient locks; back off, don't error
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -242,8 +244,10 @@ FK must change, which SQLite's ALTER cannot do in place) may DROP an old table, 
 inside a transaction and only after every row has been copied into its replacement.
 OWNERSHIP (§0 — the read-only premise extends to the database FILE itself). This tool must
 NEVER write to a SQLite file it does not own: a misdirected `sqlitePath` (an ordinary operator
-typo onto another application's `.db`) must cost nothing. The writable open's very first pragma,
-`PRAGMA journal_mode = WAL`, rewrites the file header and spawns `-wal`/`-shm` siblings — itself
+typo onto another application's `.db`) must cost nothing. The writable open's `PRAGMA journal_mode
+= WAL` — which runs after `busy_timeout` and after the ownership/compatibility gates, never first —
+rewrites the file header and spawns `-wal`/`-shm` siblings (and the delete→wal transition itself
+runs in rollback mode, so a `-journal` can appear beside them) — itself
 an unacceptable mutation of a stranger's file — so ownership MUST be proven on a READ-ONLY handle
 BEFORE the writable open, by reading the file's BYTES and inspecting the base image in memory
 (`Database.deserialize`; the journal-mode header bytes are patched 2→1 on the private copy because
@@ -1175,10 +1179,16 @@ Entrypoints:
   bun run scripts/compare.ts <runIdA> <runIdB> [--config <path>] [--help]
     # deterministic run-to-run usage diff (two COMPLETED run ids) — one JSON line on stdout
 
-The wrapper module (github.ts) is the ONLY place `Bun.spawn` touches `gh`/`git`/`tar`;
+The wrapper module (github.ts) is the ONLY place `Bun.spawn` touches `gh`/`git`/`tar` in the
+audit product; the ADR-0001 benchmark harness adds ONE further, separately-gated git launcher
+(benchSpawn.ts), allowlisted by exact repo-relative path in the same scan and imported by no
+audit entrypoint;
 each exported `gh(args)`/`git(args)`/`tar(args)` calls the matching guard
 (`assertReadOnlyGh`/`assertReadOnlyGit`/`assertReadOnlyTar`) on the argv ARRAY before
-spawning. A test greps the repo as a best-effort tripwire asserting NO other file reaches a
+spawning. A test greps the repo as a best-effort tripwire asserting that — apart from two SCANNER
+test files exempted wholesale by exact path, `github.test.ts` and `tuiPurity.test.ts`, which must
+spell the very tokens they assert on (and `github.test.ts` does itself spawn) — no file other than
+the two allowlisted SOURCE files named above (`github.ts`, `benchSpawn.ts`) reaches a
 spawn surface (`Bun.spawn`/`Bun.spawnSync`/`Bun.$` — dotted, optional-chained, or whitespaced;
 imported from the `"bun"` module; aliased, parenthesized, bracket-accessed, or reached via
 `globalThis.Bun`), uses `child_process` in any form, imports a dynamic specifier that is a bare
@@ -1187,7 +1197,7 @@ common direct wrapper-bypasses and fails them in CI, but it is a textual lint, n
 proof: deliberately evasive forms — comment-hidden tokens, a module name assembled by other
 means (`.concat`, char codes), or the Bun global routed through several intermediate bindings — are out of
 its scope (caught by code review). The load-bearing read-only guarantee is the argv allowlist
-below, of which github.ts is the single chokepoint; it enforces the
+below, of which github.ts is the single chokepoint for every audit command; it enforces the
 read-only allowlist including tar's command-execution options
 (`--checkpoint-action=exec=…`, `--to-command`, `--use-compress-program`/`-I`, `-F`). Every invocation runs with a sanitized env
 (`GH_HOST=<githubHost>`, `GIT_TERMINAL_PROMPT=0`, no pager/prompt/extension

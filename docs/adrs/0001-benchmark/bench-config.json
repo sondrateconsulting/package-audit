@@ -1,0 +1,1400 @@
+{
+  "$comment": "ADR-0001 content-transport benchmark — the preregistered constants (resolution plan §4.3 step 1, §4.4, §4.5, §4.8). Every value is LITERAL by design: the workload is a function of (config, repo, SHA) and all three are pinned. Values marked 'production literal' mirror module-local constants in scripts/*.ts and are cross-checked by benchConfig.test.ts where the production symbol is exported. After §8 ratification this file is FROZEN — any change invalidates affected timing data and requires a plan amendment plus one adversarial review round.",
+  "benchmark": "adr-0001-content-transport",
+  "planRef": "docs/plans/adr-0001-disagreements-resolution.md",
+  "githubHost": "github.com",
+  "reps": 5,
+  "drivers": [
+    "T0",
+    "T1",
+    "T2a",
+    "T2c"
+  ],
+  "selection": {
+    "$comment": "The production selection function's pinned inputs (§4.3): scanUnit/locateManifests/classifyFile are reused directly, so the classifier terms are the production code itself; trackedPackages and excludeDirGlobs are the inputs the production selection takes, while maxScanBytes MIRRORS the production gate — unitPipeline's EXPORTED MAX_SCAN_BYTES, cross-checked against this value by benchConfig.test.ts so drift either way fails CI (the bench uses it only to enumerate the no-read outcomes the pipeline skips before reading). trackedPackages was finalised at corpus pinning (pre-freeze, plan §4.2's C2 ≤~500 preference): react resolves in C1/prometheus's web/ui (a genuine source class); pino was chosen as a second, deliberately LOW-yield tracked name — no selected artifact resolves it, so it exercises the tracked-set machinery without inflating any workload (an earlier note here claimed 'fastify-ecosystem coverage', which no committed evidence supports); typescript/eslint/semver were deliberately EXCLUDED — C2/nest declares them, which made every .ts file source-selected (1,785 reads measured) and would have pushed C2's ONE segmentable run — T0 — into multi-window segmentation. NB neither of C2's other API-shaped runs segments: T1 never segments at all (planSegments admits only the per-file REST shape), and C2's T2a clones rather than api-escaping (486,063 KB is below the 1,048,576 KB threshold), so it is not a REST shape either.",
+    "trackedPackages": [
+      "react",
+      "pino"
+    ],
+    "excludeDirGlobs": [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/vendor/**"
+    ],
+    "maxScanBytes": 2097152
+  },
+  "rest": {
+    "rawAccept": "application/vnd.github.raw+json",
+    "attemptCap": 6,
+    "secondaryBaseWaitMs": 60000,
+    "transientBaseWaitMs": 2000
+  },
+  "restFallbackBudget": {
+    "$comment": "Per-unit REST fallback budget, EVERY driver (§4.3; §4.4 restates the formula inside T1's failure policy): max(floor, ceil(fractionOfSelected × selected)). Exhaustion is a unit failure (G2).",
+    "floor": 20,
+    "fractionOfSelected": 0.1,
+    "rounding": "ceil"
+  },
+  "t1": {
+    "aliasCap": 250,
+    "queryDocBytesCap": 49152,
+    "batchContentBytesCap": 1572864,
+    "argvBytesCap": 131072,
+    "aliasSelection": "object(expression: $EXPR) { __typename ... on Blob { oid byteSize isBinary isTruncated text } }",
+    "rateLimitRider": "rateLimit { cost remaining resetAt }",
+    "splitTriggers": {
+      "graphqlErrorType": "TIMEOUT",
+      "timeoutMessageRegex": "\\btimed?[ -]?out\\b",
+      "timeoutMessageRegexFlags": "i",
+      "consecutive5xx": {
+        "count": 2,
+        "statuses": [
+          502,
+          503,
+          504
+        ],
+        "bodies": "empty-or-non-json-object",
+        "capUtilisationFloor": 0.8
+      }
+    },
+    "split": {
+      "maxDepth": 2,
+      "maxDescendantsPerOriginal": 4
+    },
+    "circuitBreakerConsecutiveFailedDispatches": 3
+  },
+  "t2a": {
+    "$comment": "Size-based api-escape (§4.4): a unit whose PINNED REST repository size (KB, recorded in corpus.json at pinning — size rides discovery, which the benchmark excludes as identical across drivers) exceeds this threshold routes to per-file REST with T0 semantics — EXCEPT truncated trees, which must clone anyway (the oversized-and-truncated hole is exhibited, not patched). Derivation: predicted clone+checkout disk ≈ 2 × size, so the escape aligns with the 2 GiB G4 gate at size > 1 GiB = 1048576 KB.",
+    "apiEscapeRepoSizeKb": 1048576
+  },
+  "spawn": {
+    "$comment": "production literals: SPAWN_TIMEOUT_MS / SPAWN_KILL_GRACE_MS are exported and cross-checked; outputCapBytes mirrors github.ts's module-local MAX_SPAWN_OUTPUT_BYTES (110 MiB).",
+    "timeoutMs": 900000,
+    "killGraceMs": 2000,
+    "outputCapBytes": 115343360
+  },
+  "frame": {
+    "$comment": "Framed seam limits (§3.1/§3.2). frameCeilingBytes = production's spawn-output cap, the absolute per-frame ceiling; the per-frame bound is the ls-tree-declared size exactly. childPoolSize = the subprocess semaphore's production default (§3.1 — a small fixed pool, never one-per-unit).",
+    "maxHeaderBytes": 256,
+    "frameCeilingBytes": 115343360,
+    "stderrRingBytes": 65536,
+    "readDeadlineMs": 60000,
+    "disposeDeadlineMs": 10000,
+    "childPoolSize": 8
+  },
+  "lsTree": {
+    "maxEntries": 1000000,
+    "maxRecordBytes": 65536,
+    "maxOutputBytes": 115343360
+  },
+  "protocol": {
+    "$comment": "§4.5. Cold = no api_cache rows, no reused clones, no HTTP cache; DNS/TLS warmth is ambient. Washout = max(floorMs, longest outstanding throttle horizon from the previous run). Temp prefix pa-bench-* — NOT pkg-audit-*, which production's startup sweep deletes unconditionally (github.ts:2096).",
+    "tempPrefix": "pa-bench-",
+    "washoutFloorMs": 60000,
+    "diskGateBytes": 2147483648,
+    "diskSamplerHz": 1,
+    "g4AttributableSecondarySignals": {
+      "pass": 0,
+      "warnAtMost": 1,
+      "failAt": 2
+    },
+    "rerunAllowancePerUnitDriver": 1,
+    "fidelityBattery": {
+      "$comment": "K per (fixture, driver) — validated to equal exactly 1: the battery is single-pass by construction (recorded passes skip on re-run, §4.2), so a different pin requires the implementing code change with its §8 amendment. Execution ORDER relative to the matrix is DELIBERATELY not pinned: the append-only ledger discipline and the digest gate govern re-runs on both sides, and an earlier draft's 'when: after-matrix' field here was enforced by nothing — a frozen config must not claim what no code checks, so the claim was removed rather than invented into the protocol.",
+      "repsPerFixtureDriver": 1
+    }
+  },
+  "budget": {
+    "$comment": "§4.8 worst-case reservation. P_max is a FROZEN ASSUMPTION: any measured per-request cost above it, or any run overrunning its own WC, halts the matrix (R5 freeze repair). rate_limit reads are excluded (documented as not counting against the REST primary limit). Formulas (evaluated by computeWorstCase/planSegments in benchProtocol.ts): REST WC_core = (contentRequests + treeRequests + fallbackBudget) × attemptCap + attemptCap (the §4.4 SHA-classifier attempt-loop allowance) + fixedPerRunOverheadRequests; GraphQL WC_graphql = plannedBatches × (1 + maxDescendantsPerOriginal) × attemptCap × pMax.",
+    "pMaxPointsPerGraphqlAttempt": 10,
+    "headroomFactor": 1.1,
+    "bucketCapacityPerHour": 5000,
+    "fixedPerRunOverheadRequests": 0
+  },
+  "noiseBand": {
+    "$comment": "§4.7: band = max(floor, pilot max/min wall ratio rounded UP to the next roundUpTo). Exactly, per noiseBandFrom: the ratio is first rounded to 4 decimal places (an integer-domain guard so 1.3000000000000003 cannot round to 1.35), THEN ceilinged to the step — so a value just above a boundary, e.g. 1.25001, resolves to 1.25 rather than 1.30. (The plan's §4.7 text and noiseBandFrom's own header state the same pre-rounding rule.)",
+    "floor": 1.25,
+    "roundUpTo": 0.05
+  },
+  "pilot": {
+    "driver": "T0",
+    "slot": "C2",
+    "reps": 5
+  },
+  "williamsRows": [
+    [
+      "T0",
+      "T1",
+      "T2c",
+      "T2a"
+    ],
+    [
+      "T1",
+      "T2a",
+      "T0",
+      "T2c"
+    ],
+    [
+      "T2a",
+      "T2c",
+      "T1",
+      "T0"
+    ],
+    [
+      "T2c",
+      "T0",
+      "T2a",
+      "T1"
+    ],
+    [
+      "T0",
+      "T2a",
+      "T1",
+      "T2c"
+    ]
+  ],
+  "williamsFifthRowNote": "Rows 1-4 are a digram-balanced 4×4 Williams square (each driver once per position; each ordered predecessor pair exactly once). Row 5 is the declared fifth order: its three digrams (T0→T2a, T2a→T1, T1→T2c) each already occur exactly once in rows 1-4, so no ordered pair reaches three occurrences — the minimum any fifth row can achieve.",
+  "scaffolding": {
+    "$comment": "SHA-pinned acquisition scaffolding (§4.4) — bench scaffolding, NOT proposed production grammar. Slots in {braces} are substituted INSIDE the spawn module, which derives the launched argv from this pinned tuple itself (caller-supplied scaffolding argv is rejected). The gitconfig is the bench's pinned generated config (mirroring production's ensureGitConfig approach: credential helper delegating to gh, https-only protocol) plus the ONE probe-varied knob, core.autocrlf (baseline false; the checkout-config probe rep runs true).",
+    "tuples": {
+      "init": [
+        "init",
+        "--template=",
+        "--object-format={objectFormat}",
+        "{dest}"
+      ],
+      "remoteAdd": [
+        "remote",
+        "add",
+        "origin",
+        "{url}"
+      ],
+      "fetch": [
+        "fetch",
+        "--depth",
+        "1",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "origin",
+        "{sha}"
+      ],
+      "checkoutDetach": [
+        "checkout",
+        "--detach",
+        "FETCH_HEAD"
+      ],
+      "lsRemoteProbe": [
+        "ls-remote",
+        "{url}",
+        "refs/heads/{branch}"
+      ]
+    },
+    "gitconfigBaseline": "[credential]\n\thelper = !{ghBin} auth git-credential\n[protocol]\n\tallow = never\n[protocol \"https\"]\n\tallow = always\n[core]\n\tautocrlf = false\n",
+    "gitconfigProbeAutocrlfTrue": "[credential]\n\thelper = !{ghBin} auth git-credential\n[protocol]\n\tallow = never\n[protocol \"https\"]\n\tallow = always\n[core]\n\tautocrlf = true\n"
+  },
+  "schedule": {
+    "unitOrder": [
+      "C1:prometheus/prometheus@main",
+      "C5:PowerShell/PowerShell@master",
+      "C1:prometheus/prometheus@release-3.11",
+      "C3:kubernetes/kubernetes@master",
+      "C1:prometheus/prometheus@release-3.12",
+      "C4:llvm/llvm-project@main",
+      "C2:nestjs/nest@master",
+      "C1:prometheus/prometheus@release-3.13"
+    ],
+    "rows": [
+      {
+        "pos": 1,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T0",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 2,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T1",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 3,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2c",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 4,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2a",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 5,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T1",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 6,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2a",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 7,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T0",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 8,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2c",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 9,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2a",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 10,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2c",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 11,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T1",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 12,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T0",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 13,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2c",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 14,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T0",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 15,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2a",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 16,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T1",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 17,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T0",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 18,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2a",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 19,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T1",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 20,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2c",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 21,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T0",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 22,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T1",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 23,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2c",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 24,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2a",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 25,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T1",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 26,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2a",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 27,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T0",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 28,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2c",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 29,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2a",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 30,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2c",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 31,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T1",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 32,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T0",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 33,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2c",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 34,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T0",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 35,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2a",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 36,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T1",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 37,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T0",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 38,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2a",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 39,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T1",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 40,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2c",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 41,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T0",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 42,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T1",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 43,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2c",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 44,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2a",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 45,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T1",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 46,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2a",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 47,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T0",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 48,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2c",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 49,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2a",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 50,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2c",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 51,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T1",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 52,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T0",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 53,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2c",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 54,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T0",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 55,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2a",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 56,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T1",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 57,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T0",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 58,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2a",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 59,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T1",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 60,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2c",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 61,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T0",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 62,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T1",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 63,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2c",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 64,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2a",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 65,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T1",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 66,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2a",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 67,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T0",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 68,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2c",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 69,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2a",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 70,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2c",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 71,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T1",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 72,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T0",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 73,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2c",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 74,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T0",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 75,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2a",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 76,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T1",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 77,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T0",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 78,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2a",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 79,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T1",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 80,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2c",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 81,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T0",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 82,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T1",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 83,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2c",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 84,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2a",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 85,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T1",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 86,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2a",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 87,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T0",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 88,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2c",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 89,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2a",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 90,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2c",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 91,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T1",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 92,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T0",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 93,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2c",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 94,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T0",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 95,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2a",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 96,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T1",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 97,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T0",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 98,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2a",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 99,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T1",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 100,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2c",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 101,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T0",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 102,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T1",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 103,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2c",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 104,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2a",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 105,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T1",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 106,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2a",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 107,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T0",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 108,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2c",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 109,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2a",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 110,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2c",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 111,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T1",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 112,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T0",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 113,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2c",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 114,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T0",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 115,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2a",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 116,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T1",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 117,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T0",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 118,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2a",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 119,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T1",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 120,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2c",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 121,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T0",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 122,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T1",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 123,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2c",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 124,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2a",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 125,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T1",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 126,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2a",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 127,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T0",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 128,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2c",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 129,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2a",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 130,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2c",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 131,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T1",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 132,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T0",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 133,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2c",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 134,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T0",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 135,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2a",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 136,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T1",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 137,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T0",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 138,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2a",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 139,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T1",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 140,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2c",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 141,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T0",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 142,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T1",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 143,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2c",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 144,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2a",
+        "rep": 1,
+        "probe": false
+      },
+      {
+        "pos": 145,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T1",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 146,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2a",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 147,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T0",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 148,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2c",
+        "rep": 2,
+        "probe": false
+      },
+      {
+        "pos": 149,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2a",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 150,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2c",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 151,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T1",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 152,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T0",
+        "rep": 3,
+        "probe": false
+      },
+      {
+        "pos": 153,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2c",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 154,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T0",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 155,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2a",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 156,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T1",
+        "rep": 4,
+        "probe": false
+      },
+      {
+        "pos": 157,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T0",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 158,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2a",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 159,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T1",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 160,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2c",
+        "rep": 5,
+        "probe": false
+      },
+      {
+        "pos": 161,
+        "unit": "C1:prometheus/prometheus@main",
+        "driver": "T2a",
+        "rep": 6,
+        "probe": true
+      },
+      {
+        "pos": 162,
+        "unit": "C5:PowerShell/PowerShell@master",
+        "driver": "T2a",
+        "rep": 6,
+        "probe": true
+      },
+      {
+        "pos": 163,
+        "unit": "C1:prometheus/prometheus@release-3.11",
+        "driver": "T2a",
+        "rep": 6,
+        "probe": true
+      },
+      {
+        "pos": 164,
+        "unit": "C3:kubernetes/kubernetes@master",
+        "driver": "T2a",
+        "rep": 6,
+        "probe": true
+      },
+      {
+        "pos": 165,
+        "unit": "C1:prometheus/prometheus@release-3.12",
+        "driver": "T2a",
+        "rep": 6,
+        "probe": true
+      },
+      {
+        "pos": 166,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T0",
+        "rep": 6,
+        "probe": true
+      },
+      {
+        "pos": 167,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T1",
+        "rep": 6,
+        "probe": true
+      },
+      {
+        "pos": 168,
+        "unit": "C4:llvm/llvm-project@main",
+        "driver": "T2a",
+        "rep": 6,
+        "probe": true
+      },
+      {
+        "pos": 169,
+        "unit": "C2:nestjs/nest@master",
+        "driver": "T2a",
+        "rep": 6,
+        "probe": true
+      },
+      {
+        "pos": 170,
+        "unit": "C1:prometheus/prometheus@release-3.13",
+        "driver": "T2a",
+        "rep": 6,
+        "probe": true
+      }
+    ]
+  }
+}

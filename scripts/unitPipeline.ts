@@ -88,7 +88,9 @@ const NON_REGISTRY_DECLARED = /^(git\+|git:|file:|link:|portal:|patch:|workspace
 
 // Source extensions the import scanner understands (§5.F). Other blobs are not import-scanned.
 const SCANNABLE_EXT = /\.(mts|cts|ts|tsx|mjs|cjs|js|jsx)$/;
-const MAX_SCAN_BYTES = 2 * 1024 * 1024; // skip a huge (minified/generated) file — not real source
+// EXPORTED so the ADR-0001 bench config's mirror of this gate is bound to it in CI: bench-config's
+// selection.maxScanBytes only DESCRIBED itself as mirroring this value, with nothing enforcing it.
+export const MAX_SCAN_BYTES = 2 * 1024 * 1024; // skip a huge (minified/generated) file — not real source
 
 // Build a path-exclusion predicate from config.excludeDirGlobs using Bun.Glob.
 export function makeExcluder(globs: string[]): (path: string) => boolean {

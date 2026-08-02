@@ -69,6 +69,25 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       // entrypoint sees it. (Its OTHER error, RepoPolicyMatchError, DOES surface directly and IS
       // registered above — same split as branchPolicy's BranchPolicyError vs PolicyMatchError.)
       "RepositoryPolicyError",
+      // ADR-0001 Step B benchmark harness (resolution plan §4.1): bench-internal error classes.
+      // They surface only through `bun run bench:content`'s own top-level catch (which prints
+      // name + message), never through the production CLIs' renderFatal, so they are not
+      // operator-error-registry material. They must stay EXPORTED (cross-module instanceof:
+      // benchProtocol catches benchDrivers' UnitFailure/DriftSignal/RePinRequired; benchSpawn
+      // wraps benchFrame's BenchFrameError), so the exclusion list is the correct home. This is
+      // the second sanctioned bench test-list accommodation, declared in the plan alongside the
+      // github.test.ts chokepoint-allowlist entry.
+      "BenchGrammarViolation", "BenchFrameError", "BenchSpawnError", "BenchConfigError",
+      "BenchScheduleError", "BenchCorpusError", "BenchWorkloadError", "BenchT1Error",
+      "BenchHttpError", "BenchProtocolError", "UnitFailure", "DriftSignal", "RePinRequired",
+      // a HARNESS fault (a failed local git/tooling call) as opposed to an observation about a
+      // transport — kept distinct so it can never be recorded as a driver's fidelity divergence
+      "BenchOperationalError",
+      // the disk sampler's own failure: degrades the run record's disk fields, never the run
+      "DiskSamplerError",
+      // the STRICT disk walk's refusal — a recorded measurement that could not be taken, as
+      // opposed to the tolerant sampling walk which is allowed to skip what it cannot read
+      "DiskWalkError",
     ]);
     const declared = new Set<string>();
     // recursive: scripts/tui/ declares operator-facing classes too (TuiActivationError)
