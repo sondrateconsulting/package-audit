@@ -534,7 +534,8 @@ describe("evidenceIsRerunnable — the git-transport kind is R1, validated fail-
       type: "run", schemaVersion: 1, phase: "matrix", pos: 5, attemptId: "a-gt", unit: UNIT, driver: "T2a", rep: 5,
       probe: false, epilogue: false, outcome: "unit-failure",
       failureEvidence: { kind: "git-transport", op: "clone", exitCode: 124, networkClass: "timeout" },
-      requests: {}, acquisitionForm: "production", replayKind: null, washoutAppliedMs: 60_000,
+      requests: {}, okRequestClasses: [], g2PositiveFailures: 0, straddledReset: false, controlPlaneFailed: false,
+      acquisitionForm: "production", replayKind: null, washoutAppliedMs: 60_000, washoutUntilEpochMs: 0,
       harnessCommit: "c".repeat(40), frozenSurfaceDigest: DIGEST, envManifestHash: ENV_HASH,
     });
     const marker = JSON.stringify({ type: "washout-done", forAttemptId: "a-gt", phase: "matrix", pos: 5 });

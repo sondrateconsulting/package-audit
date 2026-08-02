@@ -80,7 +80,7 @@ const rowLines = (spec: RowSpec): string[] => {
     bucketSnapshots: [], expectedConsumption: { core: 0, graphql: 0 },
     replayOfPos: null, replayKind: null, diskReclaimFailed: false, probeDivergences: 0,
     httpBodyBytes: 100, cloneObjectStoreBytes: null, diskSampledPeakBytes: 1000, diskSamples: 3,
-    fallbackSpend: 0, routesDelivered: {}, g1Failures: 0, g2Failures: 0,
+    fallbackSpend: 0, routesDelivered: {}, g1Failures: 0, g2Failures: 0, g2PositiveFailures: 0,
     washoutAppliedMs: 60_000, washoutUntilEpochMs: 0, controlPlaneFailed: false,
     frozenSurfaceDigest: DIGEST,
     envManifestHash: IDENTITY.envManifestHash, harnessCommit: IDENTITY.harnessCommit,
@@ -277,6 +277,15 @@ describe("scoreMatrix — gates and the §4.7 rule", () => {
     const t2a = out.gates.find((g) => g.driver === "T2a")!;
     expect(t2a.g1).toBe("fail");
     expect(t2a.reasons.some((r) => r.includes("invalidated-foreign"))).toBe(true);
+    // positive-kind G2 (duplicates, forbidden routes) on an invalidated attempt survives the
+    // invalidation exactly like G1 — the count must be READ, not defaulted (review round 1 F5)
+    const g2pos = rowLines({
+      pos: 3, unit: UNITS[0]!, driver: "T2a", rep: 1, wallMs: 1500,
+      over: { attemptId: "a-3-g2p", outcome: "invalidated-foreign", g2PositiveFailures: 1 },
+    });
+    const out2 = scoreMatrix({ ...bundle, runsLines: [...g2pos, ...bundle.runsLines] });
+    const t2a2 = out2.gates.find((g) => g.driver === "T2a")!;
+    expect(t2a2.g2).toBe("fail");
     // same for a disk breach on a replaced attempt
     const diskRow = rowLines({
       pos: 3, unit: UNITS[0]!, driver: "T2a", rep: 1, wallMs: 1500,

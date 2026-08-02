@@ -1843,7 +1843,7 @@ async function cmdMatrix(): Promise<void> {
     for (const transition of state.pendingTransitions) {
       engine.appendPendingWashoutMarker(transition.row);
       applyPendingTransition(state, transition);
-      log(`restored the interrupted washout transition at pos ${transition.pos} (${String(transition.row["outcome"])}${state.pendingReplays.has(transition.pos) ? " → R1/R2 replay owed" : " → terminal"})`);
+      log(`restored the interrupted washout transition at pos ${transition.pos} (${String(transition.row["outcome"])}${state.pendingReplays.get(transition.pos) === "r1r2" ? " → R1/R2 replay owed" : state.pendingReplays.get(transition.pos) === "r3r4" ? " → in-slot replay owed" : " → terminal"})`);
     }
     // the frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7), shared with the
     // reconstruction: R1 = a network-layer failure outside any HTTP response, rerunnable
@@ -2097,14 +2097,19 @@ async function loadScoreBundle(): Promise<{ bundle: ScoreBundle; rat: Record<str
   const runsBlob = (await gitObjectText("HEAD", "docs/adrs/0001-benchmark/runs.jsonl")) ?? "";
   const fidelityBlob = (await gitObjectText("HEAD", "docs/adrs/0001-benchmark/fidelity.jsonl")) ?? "";
   const runsLines = runsBlob.split("\n");
+  // the CONTENT binding is the rows' frozen-surface digest; the harnessCommit is provenance —
+  // any row's commit supplies digest-identical frozen inputs (they are all digest inputs), so
+  // the FIRST row's commit is content-safe once the digest set is proven singular below and
+  // the loaded ratification's own recorded binding is cross-checked against it.
   let harnessCommit: string | null = null;
+  const rowDigests = new Set<string>();
   for (const line of runsLines) {
     if (line.trim() === "") continue;
     try {
       const rec = JSON.parse(line) as Record<string, unknown>;
-      if (rec["type"] === "run" && rec["phase"] === "matrix" && typeof rec["harnessCommit"] === "string") {
-        harnessCommit = rec["harnessCommit"] as string;
-        break;
+      if (rec["type"] === "run" && rec["phase"] === "matrix") {
+        if (harnessCommit === null && typeof rec["harnessCommit"] === "string") harnessCommit = rec["harnessCommit"] as string;
+        rowDigests.add(String(rec["frozenSurfaceDigest"]));
       }
     } catch {
       continue;
@@ -2112,9 +2117,13 @@ async function loadScoreBundle(): Promise<{ bundle: ScoreBundle; rat: Record<str
   }
   if (harnessCommit === null)
     throw new Error("no COMMITTED matrix rows in HEAD:runs.jsonl — commit the evidence log first (scoring reads committed blobs only; codex C0-R3 finding 2)");
+  if (rowDigests.size !== 1)
+    throw new Error(`committed matrix rows span ${rowDigests.size} frozen-surface digests — §8 requires one frozen surface for all timed data; a re-frozen matrix starts a fresh log`);
+  const rowsDigest = [...rowDigests][0]!;
   const showAt = async (rel: string): Promise<string> => {
     const content = await gitObjectText(harnessCommit, rel);
-    if (content === null) throw new Error(`${rel} is absent at the rows' harness commit ${harnessCommit.slice(0, 12)} — the frozen inputs must ride the same revision as the rows`);
+    if (content === null)
+      throw new Error(`${rel} is absent at the rows' harness commit ${harnessCommit.slice(0, 12)} — the frozen inputs must ride the same revision as the rows. If that commit was rewritten away by a restack, restore resolvability via the evidence archive tag (e.g. archive/step-c-pre-restack) instead of re-scoring against a different revision`);
     return content;
   };
   const cfg = parseBenchConfig(await showAt("docs/adrs/0001-benchmark/bench-config.json"));
@@ -2145,6 +2154,12 @@ async function loadScoreBundle(): Promise<{ bundle: ScoreBundle; rat: Record<str
   const ratifiedDigest = rat["frozenSurfaceDigest"];
   if (typeof ratifiedDigest !== "string" || ratifiedDigest.length === 0)
     throw new Error("ratification.json carries no frozenSurfaceDigest — scoring cannot scope the fidelity ledger");
+  // fail-closed content check: the commit that supplies the frozen inputs must RECORD the very
+  // digest the rows are stamped with — a commit whose recorded binding differs cannot be the
+  // surface those rows ran under, whatever its id says (the commit is provenance, never the
+  // binding)
+  if (ratifiedDigest !== rowsDigest)
+    throw new Error(`the rows are stamped with frozen-surface digest ${rowsDigest.slice(0, 12)}… but the ratification at their harness commit records ${ratifiedDigest.slice(0, 12)}… — the frozen inputs at that commit are not the surface the rows ran under; refuse rather than mis-score`);
   return {
     bundle: { cfg, corpus, workloads, runsLines, fidelityLines: fidelityBlob.split("\n"), noiseBand, ratifiedDigest },
     rat,

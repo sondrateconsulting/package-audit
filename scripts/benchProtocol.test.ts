@@ -1028,6 +1028,51 @@ describe("reconstructMatrixState — attempt-keyed terminalization (Step-C resid
   });
 });
 
+describe("reconstructMatrixState — restack review round 1 fixes", () => {
+  test("drift DISCARDS the unit's pre-drift ledger evidence, exactly like the live loop (F1)", () => {
+    const transientFailure = {
+      outcome: "unit-failure",
+      failureEvidence: { kind: "http", code: "attempts-exhausted", lastClassification: "transient", requestClass: "rest-content" },
+    };
+    const state = reconstruct([
+      row({ pos: 1, attemptId: "a-ok" }), marker("a-ok", 1),
+      row({ pos: 2, attemptId: "a-d", outcome: "drift-restart", acquisitionForm: "production" }), marker("a-d", 2),
+      // the epilogue re-runs the unit; a transient failure there must NOT cite the discarded rep
+      row({ pos: 1, attemptId: "a-epi", epilogue: true, acquisitionForm: "scaffolding", ...transientFailure }), marker("a-epi", 1),
+    ]);
+    expect(state.successLedger.has("U1|T0|rest-content")).toBe(false); // discarded at the drift row
+    expect(state.rerunUsed.has("U1|T0")).toBe(false); // so no R2 was granted
+  });
+  test("an unmarked invalidated tail owes its MARKER as a transition; the restored log reconstructs cleanly (F2)", () => {
+    const state = reconstruct([
+      row({ pos: 6, attemptId: "a-s", outcome: "invalidated-control-plane", controlPlaneFailed: true }),
+    ]);
+    expect(state.pendingReplays.get(6)).toBe("r3r4");
+    expect(state.pendingTransitions.map((t) => t.pos)).toEqual([6]);
+    applyPendingTransition(state, state.pendingTransitions[0]!);
+    expect(state.terminalPos.has(6)).toBe(false);
+    expect(state.pendingReplays.get(6)).toBe("r3r4"); // the replay linkage survives the transition
+    expect(state.rerunUsed.size).toBe(0); // never charged to the R1/R2 allowance
+    // the caller appends the missing marker; the log the engine then produces (marker + the
+    // in-slot replay row) must reconstruct without an interior-unmarked refusal
+    const restored = reconstruct([
+      row({ pos: 6, attemptId: "a-s", outcome: "invalidated-control-plane", controlPlaneFailed: true }), marker("a-s", 6),
+      row({ pos: 6, attemptId: "a-r", replayOfPos: 6, replayKind: "r3r4" }), marker("a-r", 6),
+    ]);
+    expect(restored.terminalPos.has(6)).toBe(true);
+  });
+  test("non-run records may sit between a row and its marker — the resumed invocation's own shape (F3)", () => {
+    // resume order is: reconstruct → append env-manifest → sleep → restore the missing marker,
+    // so the manifest line legally interleaves; attribution is by forAttemptId, not adjacency
+    const state = reconstruct([
+      row({ pos: 1, attemptId: "a-1" }),
+      JSON.stringify({ type: "env-manifest", hash: "E1" }),
+      marker("a-1", 1),
+    ]);
+    expect(state.terminalPos.has(1)).toBe(true);
+  });
+});
+
 describe("reconstructMatrixState — codex C0-R1 remediations", () => {
   test("an unmarked non-rerunnable failure becomes a pending TRANSITION, never a silent re-run (f.1)", () => {
     const state = reconstruct([

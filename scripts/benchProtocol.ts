@@ -4,7 +4,7 @@
 // matrix, washout, reset-window straddle detection, and the runs.jsonl record shape. The pure decision pieces (WC formulas, segmentation, washout,
 // straddle, verification) are exported for CI tests; the live engine composes them.
 
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, arch, cpus, platform, release } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -12,7 +12,7 @@ import { AuditDb } from "./db.ts";
 import { GithubClient, buildGitEnv } from "./github.ts";
 import type { BenchConfig } from "./benchConfig.ts";
 import { restFallbackBudgetFor } from "./benchConfig.ts";
-import type { Corpus, PerformanceSlot, CorpusUnit } from "./benchCorpus.ts";
+import type { Corpus } from "./benchCorpus.ts";
 import { findUnit } from "./benchCorpus.ts";
 import { packBatches, planRounds } from "./benchT1.ts";
 import {
@@ -532,7 +532,7 @@ export function reconstructMatrixState(
     successLedger: new Set(), resumeForms: new Map(), pendingReplays: new Map(),
     pendingWashoutUntilMs: 0, pendingTransitions: [], matrixRowsSeen: 0,
   };
-  const identities = new Set<string>(); // harnessCommit|envManifestHash pairs (expect === null mode)
+  const identities = new Set<string>(); // frozenSurfaceDigest|envManifestHash pairs (expect === null mode)
   const marked = new Set<string>(); // washout-marker attemptIds
   let pendingUnmarked: { attemptId: string; line: number } | null = null; // row/marker interleave
   const pendingLedger = new Map<string, string[]>(); // attemptId → ledger keys, admitted at marker time
@@ -563,9 +563,11 @@ export function reconstructMatrixState(
     if (rec["type"] === "washout-done" && rec["phase"] === "matrix") {
       const forId = rec["forAttemptId"];
       if (typeof forId !== "string") continue; // markers without attempt identity bind nothing
-      // a marker certifies the row it follows — one with no unmarked row, or naming a different
-      // attempt, describes a log the live engine cannot have written (ported from the ratified
-      // Step-B resume scan's row/marker invariant)
+      // a marker certifies the PENDING attempt, matched by id — one with no unmarked row, or
+      // naming a different attempt, describes a log the live engine cannot have written (ported
+      // from the ratified Step-B resume scan's row/marker invariant). Non-run records may sit
+      // between the row and its marker: a resumed invocation appends its env-manifest line
+      // after reconstruction ACCEPTS the log and only then restores the missing marker.
       if (pendingUnmarked === null || pendingUnmarked.attemptId !== forId)
         throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} carries a washout marker with no matching preceding run row — the evidence log violates the row/marker invariant`);
       pendingUnmarked = null;
@@ -635,7 +637,14 @@ export function reconstructMatrixState(
       state.straddleCounts.set(unit, (state.straddleCounts.get(unit) ?? 0) + 1);
     if (rec["controlPlaneFailed"] === true || (rec["controlPlaneFailed"] === undefined && outcome === "invalidated-control-plane"))
       state.controlPlaneCounts.set(pos, (state.controlPlaneCounts.get(pos) ?? 0) + 1);
-    if (outcome === "drift-restart") state.driftedUnits.add(unit);
+    if (outcome === "drift-restart") {
+      state.driftedUnits.add(unit);
+      // §4.4 discards the unit's collected reps — including their SUCCESS-LEDGER evidence: a
+      // later epilogue R2 decision must not cite a discarded rep. Stream order here IS the
+      // live order (the live loop deletes at the drift row), so live and resumed traversals
+      // agree on exactly which admissions survive.
+      for (const k of [...state.successLedger]) if (k.startsWith(`${unit}|`)) state.successLedger.delete(k);
+    }
     const form = rec["acquisitionForm"];
     if (form === "scaffolding") state.resumeForms.set(unit, "scaffolding");
     else if (form === "production" && !state.resumeForms.has(unit)) state.resumeForms.set(unit, "production");
@@ -690,7 +699,15 @@ export function reconstructMatrixState(
     if (!marked.has(last.attemptId)) {
       const until = typeof last.row["washoutUntilEpochMs"] === "number" ? (last.row["washoutUntilEpochMs"] as number) : 0;
       if (until > state.pendingWashoutUntilMs) state.pendingWashoutUntilMs = until;
-      if ((last.outcome === "complete" || last.outcome === "unit-failure") && !driftBlocked && last.attemptId !== "")
+      // marker-owed shapes: complete/unit-failure transition to terminal-or-replay; the three
+      // in-slot invalidated shapes owe ONLY their marker (the replay is already owed above) —
+      // without it, the resumed replay row would turn this tail into an interior unmarked row
+      // and the NEXT reconstruction would refuse a log the engine itself produced.
+      // invalidated-finalisation stays excluded: it throws past the washout BY DESIGN and is
+      // the one legitimately marker-less row shape.
+      const markerOwed = last.outcome === "complete" || last.outcome === "unit-failure"
+        || last.outcome === "invalidated-straddle" || last.outcome === "invalidated-foreign" || last.outcome === "invalidated-control-plane";
+      if (markerOwed && !driftBlocked && last.attemptId !== "")
         state.pendingTransitions.push({ pos, row: last.row });
     }
   }
@@ -714,6 +731,13 @@ export function applyPendingTransition(state: MatrixResumeState, transition: { p
     for (const cls of [...classes, "rest-meta"]) state.successLedger.add(`${unit}|${driver}|${cls}`);
     state.terminalPos.add(transition.pos);
     state.terminalRowByPos.set(transition.pos, row);
+    return;
+  }
+  if (outcome === "invalidated-straddle" || outcome === "invalidated-foreign" || outcome === "invalidated-control-plane") {
+    // the caller appended the missing marker; the in-slot replay linkage is already owed by
+    // the reconstruction (r3r4) — an invalidated row never terminalizes, never feeds the
+    // ledger, and never touches the R1/R2 allowance
+    state.pendingReplays.set(transition.pos, "r3r4");
     return;
   }
   const key = `${unit}|${driver}`;
