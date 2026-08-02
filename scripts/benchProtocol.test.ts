@@ -2,14 +2,14 @@
 // segmentation, washout, bucket-delta/straddle, delivery verification, the active-wall clock,
 // and the fixed-size child pool.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadBenchConfig, restFallbackBudgetFor } from "./benchConfig.ts";
 import {
   BenchProtocolError, WallClock, bucketDelta, computeWorstCase, finishMeasuredRun, makeChildPool,
   planSegments, reclaimRunResources, requireToolVersion, summarizeSpawns, summarizeTraffic,
-  sweepUnopenedRunDebris, describeUnopenedSweep,
+  sweepUnopenedRunDebris, describeUnopenedSweep, assertRunPathsFresh, runResiduePaths,
   verifyDeliveries, washoutMs,
 } from "./benchProtocol.ts";
 import { InlineDiskSampler, WorkerDiskSampler, parseDiskWalkReply } from "./benchDiskSampler.ts";
@@ -587,7 +587,7 @@ describe("reclaimRunResources — teardown owns the DB, not the happy path (F6)"
     writeFileSync(dbPath, "x");
     // removal that silently does nothing — no throw, so ONLY the post-removal verification can
     // catch it. Delete that verification and this test goes red.
-    const failed = reclaimRunResources({ close: () => {} }, runDir, dbPath, { rm: () => {} });
+    const failed = reclaimRunResources({ close: () => {} }, runDir, dbPath, { rm: () => {}, lstat: lstatSync });
     expect(failed).toBe(true);
     expect(existsSync(runDir)).toBe(true); // it really did survive
     rmSync(root, { recursive: true, force: true });
@@ -599,20 +599,19 @@ describe("sweepUnopenedRunDebris — the AuditDb.open-throws exit reclaims the S
   // that call site and swept only the DB file and its -wal/-shm sidecars, so every failed open
   // leaked one directory under benchRoot — while the reclamation helper's own contract claimed
   // every exit path reclaims. This exit cannot use reclaimRunResources (no handle to close, and
-  // reclaimOnce is not defined until after the open returns).
-  // Each test below is MUTATION-INDEPENDENT where it can be: the first drives the runDir removal
-  // AND the residue verification in one assertion, so deleting either makes it red.
+  // reclaimOnce is not defined until after the open returns); both now consume runResiduePaths,
+  // and deleting that set unconditionally is safe only because assertRunPathsFresh ran first.
   const mkdirp = (p: string): string => { mkdirSync(p, { recursive: true }); return p; };
   test("removes runDir for real AND reports the residue it could not remove", () => {
-    // rm is REAL for runDir and a silent no-op for anything else. Delete the runDir removal and
+    // rm is REAL for runDir and a silent no-op for everything else. Delete the removal loop and
     // runDir appears in the residue (red); delete the post-removal verification and the residue
-    // comes back empty (red). One test, both mutations.
+    // comes back empty (red). One test, both mutations — verified by running them.
     const root = mkdtempSync(join(tmpdir(), "pa-bench-sweep-"));
     const runDir = mkdirp(join(root, "run"));
     writeFileSync(join(runDir, "partial.txt"), "x"); // non-empty: removal must be recursive
     const dbPath = join(root, "run.sqlite");
     writeFileSync(dbPath, "x");
-    const io = { rm: (p: string, o: { recursive?: boolean; force: boolean }): void => { if (p === runDir) rmSync(p, o); } };
+    const io = { rm: (p: string, o: { recursive?: boolean; force: boolean }): void => { if (p === runDir) rmSync(p, o); }, lstat: lstatSync };
     expect(sweepUnopenedRunDebris(runDir, dbPath, io)).toEqual([dbPath]);
     expect(existsSync(runDir)).toBe(false);
     rmSync(root, { recursive: true, force: true });
@@ -627,18 +626,6 @@ describe("sweepUnopenedRunDebris — the AuditDb.open-throws exit reclaims the S
     for (const suffix of ["", "-wal", "-shm"]) expect(existsSync(`${dbPath}${suffix}`)).toBe(false);
     rmSync(root, { recursive: true, force: true });
   });
-  test("a runDir we did NOT create is never deleted — a crashed predecessor keeps its evidence", () => {
-    // null means mkdirSync reported the path already existed. runDir's name is not
-    // collision-resistant, so adopting it would destroy another process's directory.
-    const root = mkdtempSync(join(tmpdir(), "pa-bench-sweep-"));
-    const foreign = mkdirp(join(root, "run"));
-    writeFileSync(join(foreign, "predecessor-evidence.txt"), "keep me");
-    const dbPath = join(root, "run.sqlite");
-    writeFileSync(dbPath, "x");
-    expect(sweepUnopenedRunDebris(null, dbPath)).toEqual([]);
-    expect(existsSync(join(foreign, "predecessor-evidence.txt"))).toBe(true); // untouched
-    rmSync(root, { recursive: true, force: true });
-  });
   test("a DB file that was never created is not an error — the open can fail before touching it", () => {
     const root = mkdtempSync(join(tmpdir(), "pa-bench-sweep-"));
     expect(sweepUnopenedRunDebris(mkdirp(join(root, "run")), join(root, "never-made.sqlite"))).toEqual([]);
@@ -649,7 +636,7 @@ describe("sweepUnopenedRunDebris — the AuditDb.open-throws exit reclaims the S
     const runDir = mkdirp(join(root, "run"));
     const dbPath = join(root, "run.sqlite");
     writeFileSync(dbPath, "x");
-    expect(sweepUnopenedRunDebris(runDir, dbPath, { rm: () => {} })).toEqual([runDir, dbPath]);
+    expect(sweepUnopenedRunDebris(runDir, dbPath, { rm: () => {}, lstat: lstatSync })).toEqual([runDir, dbPath]);
     rmSync(root, { recursive: true, force: true });
   });
   test("a throwing rm does not propagate — the caller must rethrow the ORIGINAL open error", () => {
@@ -657,9 +644,52 @@ describe("sweepUnopenedRunDebris — the AuditDb.open-throws exit reclaims the S
     const runDir = mkdirp(join(root, "run"));
     const dbPath = join(root, "run.sqlite");
     writeFileSync(dbPath, "x");
-    const thrower = { rm: (): never => { throw new Error("EACCES"); } };
-    expect(() => sweepUnopenedRunDebris(runDir, dbPath, thrower)).not.toThrow();
-    expect(sweepUnopenedRunDebris(runDir, dbPath, thrower)).toEqual([runDir, dbPath]);
+    const io = { rm: (): never => { throw new Error("EACCES"); }, lstat: lstatSync };
+    expect(() => sweepUnopenedRunDebris(runDir, dbPath, io)).not.toThrow();
+    expect(sweepUnopenedRunDebris(runDir, dbPath, io)).toEqual([runDir, dbPath]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("an UNSTATTABLE path is residue, not a clean sweep — the existsSync trap", () => {
+    // existsSync answers false for EACCES/EIO exactly as it does for absence, so the pre-fix
+    // check reported a path it could not stat as successfully reclaimed. Only ENOENT is clean.
+    const eacces = Object.assign(new Error("permission denied"), { code: "EACCES" });
+    const io = { rm: () => {}, lstat: (): never => { throw eacces; } };
+    expect(sweepUnopenedRunDebris("/x/run", "/x/db.sqlite", io)).toEqual(["/x/run", "/x/db.sqlite", "/x/db.sqlite-wal", "/x/db.sqlite-shm"]);
+    // and an error with NO code is still unverifiable, never "gone"
+    const io2 = { rm: () => {}, lstat: (): never => { throw new Error("no code"); } };
+    expect(sweepUnopenedRunDebris("/x/run", "/x/db.sqlite", io2).length).toBe(4);
+    // ENOENT alone proves absence
+    const io3 = { rm: () => {}, lstat: (): never => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } };
+    expect(sweepUnopenedRunDebris("/x/run", "/x/db.sqlite", io3)).toEqual([]);
+  });
+});
+
+describe("assertRunPathsFresh — nothing a run will own may pre-exist", () => {
+  // This assertion is what makes every later deletion safe WITHOUT a per-path ownership token:
+  // an earlier design derived a nullable token from mkdirSync's return, which protected only the
+  // open-failure path while the successful-open reclamation still deleted the same directory.
+  const mkdirp = (p: string): string => { mkdirSync(p, { recursive: true }); return p; };
+  test("fresh paths pass", () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-fresh-"));
+    expect(() => assertRunPathsFresh(join(root, "run"), join(root, "run.sqlite"))).not.toThrow();
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("a pre-existing run directory refuses the run and names it", () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-fresh-"));
+    const runDir = mkdirp(join(root, "run"));
+    expect(() => assertRunPathsFresh(runDir, join(root, "run.sqlite"))).toThrow(BenchProtocolError);
+    expect(() => assertRunPathsFresh(runDir, join(root, "run.sqlite"))).toThrow(runDir);
+    expect(existsSync(runDir)).toBe(true); // refused, never adopted or deleted
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("a pre-existing DB or sidecar refuses the run — a foreign database is never swept", () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-fresh-"));
+    const dbPath = join(root, "run.sqlite");
+    writeFileSync(dbPath, "someone else's data");
+    expect(() => assertRunPathsFresh(join(root, "run"), dbPath)).toThrow(dbPath);
+    rmSync(dbPath, { force: true });
+    writeFileSync(`${dbPath}-wal`, "x");
+    expect(() => assertRunPathsFresh(join(root, "run"), dbPath)).toThrow(`${dbPath}-wal`);
     rmSync(root, { recursive: true, force: true });
   });
 });
@@ -668,19 +698,21 @@ describe("describeUnopenedSweep — the open-failure log never claims a sweep it
   // Extracted PURE because nothing in this suite constructs a BenchEngine, so runOne's catch has
   // no test seam; this pins both log branches instead.
   test("a clean sweep names both reclaimed paths", () => {
-    const m = describeUnopenedSweep("/b/run", "/b/run", "/c/x.sqlite", []);
+    const m = describeUnopenedSweep("/b/run", "/c/x.sqlite", []);
     expect(m).toContain("swept /b/run");
     expect(m).toContain("/c/x.sqlite[-wal/-shm]");
     expect(m).not.toContain("STILL PRESENT");
   });
   test("residue is named and the line does NOT read as a clean sweep", () => {
-    const m = describeUnopenedSweep("/b/run", "/b/run", "/c/x.sqlite", ["/b/run"]);
+    const m = describeUnopenedSweep("/b/run", "/c/x.sqlite", ["/b/run"]);
     expect(m).toContain("STILL PRESENT OR UNVERIFIABLE: /b/run");
     expect(m.startsWith("swept /b/run and")).toBe(false);
   });
-  test("a pre-existing runDir is disclosed as left in place, not reported as swept", () => {
-    const m = describeUnopenedSweep(null, "/b/run", "/c/x.sqlite", []);
-    expect(m).toContain("/b/run pre-existed this process and was LEFT IN PLACE");
+});
+
+describe("runResiduePaths — the residue set is stated in ONE place", () => {
+  test("both reclamation paths consume the same four paths", () => {
+    expect(runResiduePaths("/b/run", "/c/x.sqlite")).toEqual(["/b/run", "/c/x.sqlite", "/c/x.sqlite-wal", "/c/x.sqlite-shm"]);
   });
 });
 

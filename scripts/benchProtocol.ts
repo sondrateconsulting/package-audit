@@ -475,7 +475,7 @@ export function reclaimRunResources(
   dbPath: string,
   // seam for CI: lets a test drive the case where removal SILENTLY fails to remove, which is the
   // only case the post-removal verification below actually exists to catch
-  io: { rm: (path: string, opts: { recursive?: boolean; force: boolean }) => void } = { rm: rmSync },
+  io: RunFsIo = REAL_FS,
 ): boolean {
   let failed = false;
   try {
@@ -483,80 +483,91 @@ export function reclaimRunResources(
   } catch {
     failed = true; // a close failure must not mask the run outcome, but it IS a reclaim failure
   }
-  try {
-    io.rm(runDir, { recursive: true, force: true });
-    for (const suffix of ["", "-wal", "-shm"]) io.rm(`${dbPath}${suffix}`, { force: true });
-  } catch {
-    failed = true;
+  // the SAME residue set the open-failure sweep uses (runResiduePaths), removed one path at a
+  // time: grouping them under one try let a throwing runDir removal skip the sidecars entirely.
+  for (const p of runResiduePaths(runDir, dbPath)) {
+    try {
+      io.rm(p, { recursive: true, force: true });
+    } catch {
+      failed = true;
+    }
   }
-  if (existsSync(runDir)) failed = true;
-  for (const suffix of ["", "-wal", "-shm"]) if (existsSync(`${dbPath}${suffix}`)) failed = true;
+  // error-aware, matching the sweep: existsSync reported a present-but-unstattable path as GONE,
+  // so an EACCES/EIO reclaim failure recorded diskReclaimFailed:false. Now only ENOENT is clean.
+  for (const p of runResiduePaths(runDir, dbPath)) if (stillOnDisk(p, io)) failed = true;
   return failed;
 }
 
+// The paths ONE run owns on disk, stated in exactly one place and consumed by BOTH reclamation
+// paths (reclaimRunResources after a successful open, sweepUnopenedRunDebris when the open
+// throws). Earlier versions hardcoded this list in each helper and the comments claimed they
+// could not drift; they could, and did.
+export function runResiduePaths(runDir: string, dbPath: string): readonly string[] {
+  return [runDir, dbPath, `${dbPath}-wal`, `${dbPath}-shm`];
+}
+
+export interface RunFsIo {
+  rm: (path: string, opts: { recursive?: boolean; force: boolean }) => void;
+  lstat: (path: string) => unknown;
+}
+const REAL_FS: RunFsIo = { rm: rmSync, lstat: lstatSync };
+
 // "Is this path still on disk?", ERROR-AWARE. existsSync answers false both for "absent" and for
 // "present but unstattable" (EACCES on a parent, EIO), which would let a failed removal report a
-// CLEAN sweep. Only ENOENT proves absence; every other errno means the state is unverifiable and
-// must be reported as residue — fail loud, never silently claim the disk is clean.
-function stillOnDisk(p: string): boolean {
+// CLEAN sweep. Only ENOENT proves absence; every other errno — and any error without a code —
+// means the state is unverifiable and must be reported as residue. Fail loud, never silently
+// claim the disk is clean. lstat, not stat: a dangling symlink IS residue.
+function stillOnDisk(p: string, io: RunFsIo): boolean {
   try {
-    lstatSync(p);
+    io.lstat(p);
     return true;
   } catch (e) {
     return (e as NodeJS.ErrnoException).code !== "ENOENT";
   }
 }
 
-// The reclamation for the one exit that happens before a run owns anything: AuditDb.open itself
-// throwing. reclaimRunResources cannot serve it — there is no handle to close, and its caller
-// (reclaimOnce) is not defined until after the open returns — so the sweep is extracted here
-// rather than inlined, both so CI can drive it and so the two paths' RESIDUE SET is stated once.
-// It is NOT otherwise identical to reclaimRunResources: that helper closes a handle, returns a
-// boolean, and groups its removals under one try (so a throwing runDir rm skips the sidecars);
-// this one takes no handle, returns the residue, and isolates each removal. Do not describe them
-// as unable to drift — they already differ in error sequencing.
-//
-// `runDirCreated` is the run directory ONLY IF THIS PROCESS CREATED IT (mkdirSync's recursive
-// return, undefined when the path already existed), else null. A recursive force-rm needs a
-// stronger warrant than "the name looks right": runDir's name is not collision-resistant (a
-// resumed run in a new process restarts the attempt counter), so adopting and then deleting a
-// directory we did not create could destroy a crashed predecessor's evidence. Passing null skips
-// it and reports it as not-ours.
-//
+// FAIL CLOSED before a run touches the disk: nothing a run will own may already exist. benchRoot
+// is a fresh per-process mkdtemp and dbPath carries pid + wall clock + attempt counter, so this
+// cannot fire in normal operation — which is exactly why it is an assertion and not a recovery
+// path. It is what makes ownership UNCONDITIONAL downstream: every residue path is provably this
+// run's, so both reclamation paths may delete all of them without a per-path ownership token, and
+// no pre-existing foreign database can be destroyed by a sweep. An earlier version instead
+// derived a nullable ownership token from mkdirSync's return, which protected the open-failure
+// path only — the successful-open reclamation still deleted the same directory unconditionally.
+export function assertRunPathsFresh(runDir: string, dbPath: string, io: RunFsIo = REAL_FS): void {
+  const present = runResiduePaths(runDir, dbPath).filter((p) => stillOnDisk(p, io));
+  if (present.length > 0)
+    throw new BenchProtocolError(
+      `refusing to start a run over paths that already exist: ${present.join(", ")} — benchRoot is a per-process temp directory and the run-cache DB name carries pid, wall clock and attempt counter, so these cannot pre-exist unless a harness invariant is broken or something outside the harness created them. Measuring inside, or reclaiming, a path this run did not create is never safe; clear it and retry`,
+    );
+}
+
+// The reclamation for the one exit that happens before a run owns a DB handle: AuditDb.open
+// itself throwing. reclaimRunResources cannot serve it — there is no handle to close, and its
+// caller (reclaimOnce) is not defined until after the open returns. Both consume runResiduePaths,
+// so the residue SET cannot drift; they still differ in what else they do (that one closes a
+// handle and returns a boolean, this one returns the residue), and that difference is deliberate.
+// Deleting every residue path unconditionally is safe ONLY because assertRunPathsFresh ran first.
 // Best-effort and NON-THROWING by design: the caller rethrows the original open error, which
 // carries the operator's remediation, and a sweep failure must not mask it.
-export function sweepUnopenedRunDebris(
-  runDirCreated: string | null,
-  dbPath: string,
-  io: { rm: (path: string, opts: { recursive?: boolean; force: boolean }) => void } = { rm: rmSync },
-): string[] {
-  const residue: string[] = [];
-  if (runDirCreated !== null) {
+export function sweepUnopenedRunDebris(runDir: string, dbPath: string, io: RunFsIo = REAL_FS): string[] {
+  const paths = runResiduePaths(runDir, dbPath);
+  for (const p of paths) {
     try {
-      io.rm(runDirCreated, { recursive: true, force: true });
+      io.rm(p, { recursive: true, force: true });
     } catch {
       // best-effort — verified below and named in the caller's log either way
     }
   }
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try {
-      io.rm(`${dbPath}${suffix}`, { force: true });
-    } catch {
-      // best-effort — verified below
-    }
-  }
-  if (runDirCreated !== null && stillOnDisk(runDirCreated)) residue.push(runDirCreated);
-  for (const suffix of ["", "-wal", "-shm"]) if (stillOnDisk(`${dbPath}${suffix}`)) residue.push(`${dbPath}${suffix}`);
-  return residue;
+  return paths.filter((p) => stillOnDisk(p, io));
 }
 
 // The open-failure log line, extracted PURE so CI can drive BOTH branches without a BenchEngine
 // (nothing in the suite constructs one). Never claims a clean sweep it did not verify.
-export function describeUnopenedSweep(runDirCreated: string | null, runDir: string, dbPath: string, residue: string[]): string {
-  const notOurs = runDirCreated === null ? `; ${runDir} pre-existed this process and was LEFT IN PLACE` : "";
+export function describeUnopenedSweep(runDir: string, dbPath: string, residue: readonly string[]): string {
   return residue.length === 0
-    ? `swept ${runDirCreated ?? "(no run dir of ours)"} and ${dbPath}[-wal/-shm]${notOurs}`
-    : `swept what it could; STILL PRESENT OR UNVERIFIABLE: ${residue.join(", ")}${notOurs}`;
+    ? `swept ${runDir} and ${dbPath}[-wal/-shm]`
+    : `swept what it could; STILL PRESENT OR UNVERIFIABLE: ${residue.join(", ")}`;
 }
 
 // The PRIMARY scored metric accumulates through this clock, so its time source must be
@@ -717,11 +728,12 @@ export class BenchEngine {
     // counter can never resurrect a warm cache; purgeCache drops api_cache rows outright
     // (production --fresh preserves them by design) (codex R2 f.24)
     const dbPath = join(this.o.runCacheDir, `bench-run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-${process.pid}-${this.now()}-${this.runCounter}.sqlite`);
-    // recursive:true returns the first path CREATED and undefined when runDir already existed —
-    // the only warrant this code has for recursively deleting it below. runDir's name is not
-    // collision-resistant (a resumed run in a new process restarts the attempt counter), so a
-    // pre-existing directory belongs to a crashed predecessor and is left alone.
-    const runDirCreated = mkdirSync(runDir, { recursive: true }) === undefined ? null : runDir;
+    // FAIL CLOSED before anything is created: no path this run will own may already exist. That
+    // single assertion is what makes every later deletion safe without an ownership token — both
+    // the sweep below and reclaimRunResources delete the whole residue set unconditionally, and
+    // neither can destroy a foreign directory or a pre-existing database, because there was none.
+    assertRunPathsFresh(runDir, dbPath);
+    mkdirSync(runDir, { recursive: true });
     // the open itself can CREATE the file and then fail (WAL/schema initialisation, ENOSPC):
     // nothing downstream owns anything yet — reclaimOnce and the outer finally both live past
     // this line — so a mid-initialisation throw must sweep its own debris here, with the paths
@@ -733,11 +745,15 @@ export class BenchEngine {
     try {
       db = AuditDb.open({ sqlitePath: dbPath, fresh: true, purgeCache: true });
     } catch (openErr) {
-      const residue = sweepUnopenedRunDebris(runDirCreated, dbPath);
+      const residue = sweepUnopenedRunDebris(runDir, dbPath);
       // the log is GUARDED: it runs before the rethrow, so an injected or broken logger that
       // throws here would replace openErr — the operator's remediation — with a logging error.
+      // SCOPE OF THE GUARANTEE: nothing in THIS catch can mask openErr. It is not an end-to-end
+      // claim — the commands' own `finally` blocks call rmSync(benchRoot) unguarded, and a
+      // failure there would still replace whatever error is propagating. That is a pre-existing
+      // property of the command teardown, recorded rather than changed at the review cap.
       try {
-        this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run-cache DB failed to initialise (${openErr instanceof Error ? openErr.message : String(openErr)}) — ${describeUnopenedSweep(runDirCreated, runDir, dbPath, residue)} before rethrowing`);
+        this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run-cache DB failed to initialise (${openErr instanceof Error ? openErr.message : String(openErr)}) — ${describeUnopenedSweep(runDir, dbPath, residue)} before rethrowing`);
       } catch {
         // a diagnostic failure must never mask the fault it describes
       }
