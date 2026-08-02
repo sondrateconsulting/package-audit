@@ -561,7 +561,12 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   of an owed in-slot replay). Within a
   block, rows keep their frozen relative order; the drifted units' checkout-config probe rows
   run after **all** of the epilogue's main-rep rows, in the same interleaved unit order,
-  mirroring the frozen schedule's own probe placement. If no adjacency-free order of the drifted
+  mirroring the frozen schedule's own probe placement — including that placement's accepted
+  main→probe seam: the interleaving rule binds consecutive unit *blocks*, and the frozen
+  schedule itself pairs same-repository units across that seam (its last main row, pos 160
+  `C1…release-3.13`, is followed by the pos 161 `C1…main` probe row), so the epilogue's seam
+  mirrors a property the ratified artifact already exhibits rather than tightening it. If no
+  adjacency-free order of the drifted
   subset exists (only same-repository blocks remain), the matrix **halts for §8 freeze repair
   before executing any epilogue row** — the fail-closed posture the second R4 straddle already
   takes — rather than collecting rows this section's interleaving rule pre-declares biased. The
@@ -587,16 +592,20 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   rerun predicate accepts that evidence as R1 — the same ≤1 allowance, one pool with the HTTP
   shapes, never an additional allowance — and validates the exact (class, exit) pairing the
   classifier can mint, so a persisted row outside those shapes is refused on resume.
-  Everything else stays outside the variant by
-  construction and remains a non-rerunnable driver failure: auth/permission failures,
-  HTTP-status-bearing git failures — the two frozen numeric-status stderr shapes,
-  `The requested URL returned error: …` and `… HTTP code = …`, excluded **before every
-  positive arm, the deadline arm included**, because a secondary-limit 403 over the git
-  transport takes exactly these shapes and must never become replayable (an `RPC failed;
+  Everything else stays outside the variant and remains a non-rerunnable driver failure,
+  enforced by two frozen NEGATIVE sets checked **before every positive arm, the deadline arm
+  included**: the status-line stderr shapes (`The requested URL returned error: …` and
+  `… HTTP code = …` — a secondary-limit 403 over the git transport takes exactly these
+  shapes), and the forbidden-condition set (authentication/credential/permission text and
+  secondary-limit/abuse text), so a forbidden condition governs even when a positive needle
+  co-occurs beside it or the child was deadline-killed after printing it. An `RPC failed;
   HTTP/2 stream …` protocol breakage carries no status and stays in the admitted reset
-  class) — local git
+  class. Local git
   operations (init / remote-add / checkout / rev-parse / ls-tree, and the cat-file batch
-  reader), unrecognised stderr, and budget conditions. A child that **never settles** inside
+  reader), unrecognised stderr, and budget conditions are likewise outside the variant. For
+  the scaffolding fetch, the §4.4 pinned-object classifier still adjudicates FIRST — its
+  probe's own failure replaces the fetch's evidence with the probe's (the pre-existing §4.4
+  chain, unchanged by this amendment). A child that **never settles** inside
   the bounded deadline+grace wait is also outside the variant — it surfaces through the generic
   harness-error arm with `failureEvidence: null` — so this amendment narrows the untyped
   git-transport gap; it does not close it. The C6 fidelity battery's abort classification

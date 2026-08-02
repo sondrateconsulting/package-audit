@@ -637,6 +637,15 @@ describe("classifyGitTransportFailure — §4.5's typed git-transport variant is
     expect(classifyGitTransportFailure("clone", settled(1, "Could not resolve host: github.com"))).toBeNull();
     expect(classifyGitTransportFailure("clone", settled(0, ""))).toBeNull();
   });
+  test("a forbidden condition governs even beside a positive needle or under the deadline arm", () => {
+    // §4.5 names auth/permission/secondary excluded — the explicit negative set makes that
+    // hold when a network-class needle CO-OCCURS (mid-transfer text after an auth line) or the
+    // child was deadline-killed after printing the forbidden line
+    expect(classifyGitTransportFailure("clone", settled(128, "fatal: Authentication failed for 'https://x/'\nfatal: early EOF"))).toBeNull();
+    expect(classifyGitTransportFailure("clone", settled(128, "You have exceeded a secondary rate limit\nerror: RPC failed; curl 56 Recv failure: Connection reset by peer"))).toBeNull();
+    expect(classifyGitTransportFailure("clone", settled(124, "fatal: could not read Username for 'https://x/': terminal prompts disabled", true))).toBeNull();
+    expect(classifyGitTransportFailure("scaffold-fetch", settled(124, "fatal: Authentication failed for 'https://x/'", true))).toBeNull();
+  });
 });
 
 describe("evidenceIsRerunnable — the git-transport kind is R1, validated fail-closed", () => {

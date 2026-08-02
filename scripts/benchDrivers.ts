@@ -238,6 +238,17 @@ export interface GitTransportEvidence {
 // bare "rpc failed; http", which would also match "RPC failed; HTTP/2 stream …", an HTTP/2
 // protocol breakage that carries no status and belongs to the admitted reset class.
 const GIT_HTTP_STATUS_BEARING: readonly string[] = ["the requested url returned error", "http code ="];
+// The frozen forbidden-condition set: auth/permission/credential and secondary-limit text.
+// §4.5 names these excluded BY CONSTRUCTION; without an explicit negative set that held only
+// while no positive needle co-occurred — an auth failure beside a mid-transfer "early EOF", or
+// a deadline-killed child whose retained stderr shows an auth line, would have classified.
+// Checked with the status needles, before every positive arm.
+const GIT_FORBIDDEN_CONDITIONS: readonly string[] = [
+  "authentication failed", "could not read username", "could not read password",
+  "invalid username or password", "terminal prompts disabled", "permission denied",
+  "access denied", "secondary rate limit", "abuse detection", "rate limit exceeded",
+  "support for password authentication was removed",
+];
 const GIT_NETWORK_PATTERNS: ReadonlyArray<{ networkClass: GitTransportNetworkClass; needles: readonly string[] }> = [
   { networkClass: "dns", needles: ["could not resolve host", "couldn't resolve host", "name or service not known", "temporary failure in name resolution", "no address associated with hostname"] },
   { networkClass: "tls", needles: ["ssl connect error", "ssl_connect", "ssl_read", "ssl_write", "ssl handshake", "gnutls_handshake", "ssl certificate problem", "server certificate verification failed", "unable to get local issuer certificate"] },
@@ -252,11 +263,13 @@ export function classifyGitTransportFailure(
   const isSyntheticTimeout = res.timedOut && res.exitCode === 124;
   if (!isSyntheticTimeout && res.exitCode !== 128) return null;
   const stderr = new TextDecoder("utf-8", { fatal: false }).decode(res.stderr).toLowerCase();
-  // status-bearing failures are excluded BEFORE every positive arm, the timeout arm included:
-  // a deadline-killed child whose retained stderr already shows a status line (a slow-walled
-  // 403/5xx) is a status-governed condition, and a 5xx mid-pack can print a reset-class curl
-  // detail beside its status line — in both cases the status is the governing shape
+  // status-bearing and forbidden conditions are excluded BEFORE every positive arm, the
+  // timeout arm included: a deadline-killed child whose retained stderr already shows a status
+  // or auth/secondary line is governed by THAT condition, and a 5xx mid-pack can print a
+  // reset-class curl detail beside its status line — in every such mix the forbidden shape is
+  // the governing one, and §4.5 forbids it from ever becoming replayable
   for (const needle of GIT_HTTP_STATUS_BEARING) if (stderr.includes(needle)) return null;
+  for (const needle of GIT_FORBIDDEN_CONDITIONS) if (stderr.includes(needle)) return null;
   if (isSyntheticTimeout) return { op, exitCode: 124, networkClass: "timeout" };
   for (const group of GIT_NETWORK_PATTERNS) {
     for (const needle of group.needles) {
