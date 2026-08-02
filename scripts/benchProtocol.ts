@@ -503,8 +503,10 @@ export function reclaimRunResources(
 // throws). Earlier versions hardcoded this list in each helper and the comments claimed they
 // could not drift; they could, and did.
 export function runResiduePaths(runDir: string, dbPath: string): readonly string[] {
-  // -journal is NOT optional here: AuditDb.open ends with `PRAGMA journal_mode = WAL`, and the
-  // delete->wal transition itself runs in ROLLBACK mode, so a failure across that pragma can
+  // -journal is NOT optional here: AuditDb.open runs `PRAGMA journal_mode = WAL` partway through
+  // (inside initWritableConnection, after the gates and before `PRAGMA foreign_keys = ON`; open
+  // then continues into the optional --fresh drop and exactly one of schema creation, migration
+  // or self-heal), and the delete->wal transition itself runs in ROLLBACK mode, so a failure across that pragma can
   // leave a rollback journal beside the file. db.ts already treats `-journal` as a real sidecar
   // in its own recovery path; omitting it here left exactly the class of unreported residue this
   // whole fix exists to close.
@@ -745,7 +747,7 @@ export class BenchEngine {
     this.runCounter++;
     const runDir = join(this.o.benchRoot, `run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-a${this.runCounter}`);
     // ORDER IS LOAD-BEARING: every fallible setup step runs BEFORE runDir exists, so the open is
-    // the only statement that can throw while a run directory of ours is on disk. An earlier
+    // the only throw whose reclamation this catch must perform itself. An earlier
     // version created runDir first, leaving mkdir(runCacheDir) and the now()-stamped dbPath as
     // two uncaught throws that leaked exactly the directory this catch exists to reclaim. NB the
     // scope: the open throw is the only one whose reclamation this catch has to perform itself.
@@ -759,7 +761,8 @@ export class BenchEngine {
     const dbPath = join(this.o.runCacheDir, `bench-run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-${process.pid}-${this.now()}-${this.runCounter}.sqlite`);
     // FAIL CLOSED before any PER-RUN path is created: no path this run will own may already exist.
     // (The shared run-cache directory above is not per-run and is never reclaimed by a run.) That
-    // single assertion is what makes every later deletion safe without an ownership token — both
+    // single assertion, plus the atomic mkdir below, is what lets the residue set be deleted
+    // without a per-path token — for runDir. The DB paths are checked here, not reserved. Both
     // the sweep below and reclaimRunResources delete the whole residue set unconditionally, and
     // neither can destroy a foreign directory or a pre-existing database, because there was none.
     assertRunPathsFresh(runDir, dbPath);

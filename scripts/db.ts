@@ -1563,8 +1563,9 @@ export function initWritableConnection(db: Database, path: string): number {
   try {
     // busy_timeout FIRST — it is per-connection and must protect every later lock-taking
     // statement in this span. journal_mode runs after the GATES — not first, and not last either:
-    // foreign_keys follows it, and AuditDb.open continues past this function into the --fresh
-    // drop, schema creation, migrations and the self-heal (it is what persists a delete→wal
+    // foreign_keys follows it, and AuditDb.open continues past this function into the OPTIONAL
+    // --fresh drop and then exactly ONE of schema creation, migration or self-heal — not all
+    // three in sequence (it is what persists a delete→wal
     // conversion in the file header, and that transition itself runs in rollback mode, so a
     // -journal can appear beside the file); foreign_keys is per-connection. All pragmas
     // run OUTSIDE any transaction (journal_mode cannot change inside one).

@@ -22,7 +22,11 @@
 //
 // Streams are consumed as BYTES — no UTF-8 decode ever happens here (the production path's
 // irreversible decode is exactly what the framed seam exists to avoid, plan §3.2). Write
-// containment (cwd, clone/init destinations) is asserted against the bench root before launch,
+// containment is asserted against the bench root before launch, but only over what it can see:
+// a SUPPLIED cwd (it is optional) plus clone/init destinations. The scaffolding and pinning lanes
+// accept argv the grammar does not constrain, so a write-capable tuple with no cwd and no
+// recognised destination passes uncontained — the transport lane is the only one whose argv is
+// fully constrained. Recorded rather than claimed away.
 // and the kill path copies the production escalation shape: deadline → terminate → grace →
 // SIGKILL + best-effort group kill + reader cancellation + unref.
 
@@ -585,7 +589,7 @@ export class BatchChild {
       if (pumpsWedged) {
         // a pump that never settled means the stream state cannot be vouched for — cancel the
         // readers and REQUEST the cancellations and wait only for a BOUNDED interval (a timeout can win, leaving them pending: an unbounded join would recreate the
-        // hang) so that in the normal case nothing stays attached when the caller deletes the store and releases the
+        // hang) so cancellation is REQUESTED before the caller deletes the store and releases the
         // permit (§3.1's ordered teardown), and surface the wedge as an UNCLEAN disposal
         let cancelTimer: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([

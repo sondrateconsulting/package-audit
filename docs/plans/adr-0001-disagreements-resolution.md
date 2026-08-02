@@ -477,7 +477,9 @@ except an escape-tripped untruncated one — C3 api-escapes and clones nothing;
 T0/T1 on C4), while T2c addresses objects by the pinned SHA directly (`ls-tree … <sha>`;
 `rev-parse FETCH_HEAD` asserted equal to `<sha>`, since a bare fetch leaves no `HEAD`). Every run
 records which form it used. **All bench git operations — timed transport, scaffolding, and probes
-alike — run under the bench's sanitized environment and pinned generated gitconfig** (mirroring
+alike — run under the bench's sanitized environment and pinned generated gitconfig** (the MEASURED
+transport and scaffolding operations, that is; several harness-side probes — the repo-state and
+`rev-parse` reads — deliberately run with `GIT_CONFIG_GLOBAL=/dev/null` instead) (mirroring
 production's `buildGitEnv`/`ensureGitConfig` approach): argv alone does not pin git behaviour,
 and an inherited `~/.gitconfig` URL rewrite, filter, credential helper, or line-ending default
 would confound acquisition invisibly. The checkout-config probe varies exactly one pinned knob.

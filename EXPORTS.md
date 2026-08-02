@@ -39,7 +39,7 @@ multiple runs and configurations — never treat a raw dump as any single run's 
 | `dependency_findings.csv` / `.jsonl` | manifest/lockfile declarations of tracked packages |
 | `usage_findings.csv` / `.jsonl` | usage sites (imports/requires/re-exports/CLI invocations) |
 | `package_api_surface.csv` / `.jsonl` | introspected exports/bins per (package, version) |
-| `run_unit_head.csv` / `.jsonl` | the run's per-branch disposition snapshot — every branch (scanned / cutoff-skipped / past-cap / policy-excluded) with its branch-policy attribution |
+| `run_unit_head.csv` / `.jsonl` | the run's per-branch disposition snapshot — every branch that REACHED a terminal disposition (scanned / cutoff-skipped / past-cap / policy-excluded) with its branch-policy attribution. A branch whose scan errored or was throttle-requeued before the row was written has none; see the errors table §Rows that may be absent |
 | `runs.csv` / `.jsonl` | the selected run's metadata row |
 | `manifest.json` | `{formatVersion, runId, artifacts:[{path, kind, sha256, bytes}]}` — written **last**; artifacts in `xray/` not listed in a coherent manifest are swept by the next generation |
 
@@ -68,7 +68,10 @@ source of truth for identifiers; treat the CSV as the spreadsheet-facing view.
 byte-faithful (no formula defense — JSONL consumers are not spreadsheets); SQL `NULL` is
 JSON `null`; numbers are JSON numbers.
 
-**Determinism**: identical database + identical arguments → byte-identical artifacts.
+**Determinism**: identical database + identical arguments → byte-identical artifacts, GIVEN an
+identical starting `xray/`. The bundle adopts still-present manifest entries from other kinds of
+the SAME run, so exporting into a directory that already holds same-run artifacts yields a
+different `manifest.json` than exporting into an empty one.
 Row order is total (each table's full unique key) and documented per table below.
 
 ## Versioning
