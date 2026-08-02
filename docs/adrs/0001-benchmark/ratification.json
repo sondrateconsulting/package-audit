@@ -20,6 +20,10 @@
     "answersNote": "answers.noiseBandAndDominance records the 2026-07-28 ratification (band 1.25, spread 1.034) and is preserved byte-identical as history; THIS field and the top-level noiseBand/pilotSpread supersede its band value. The matrix gate compares the top-level noiseBand to pilot.json's calibrated band."
   },
   "frozenSurfaceDigest": "6cd995f9d9550238f686a3772e5cf1871e6f785a78510674b02dc924b9bd9bae",
+  "reaffirmedBy": "rvo (decision-maker; plan §4.7/§8)",
+  "reaffirmedAtIso": "2026-08-02T16:18:24Z",
+  "reaffirmedDigest": "6cd995f9d9550238f686a3772e5cf1871e6f785a78510674b02dc924b9bd9bae",
+  "reaffirmationNote": "rvo re-affirmed the AMENDED surface at the digest above on 2026-08-02, with the caveats disclosed at the ask: the surface had moved through thirteen digests and seven campaigns since the four answers were signed (2026-07-28), the decision-batch santa loop closed NOT CONVERGED (A PASS x3 / B FAIL x3 / C FAIL x3), and its round-3 fixes are post-cap and unreviewed by any round. The four answers stay byte-identical to e648ab9 — this re-affirmation is recorded in these NEW fields, exactly as the post-ratification review's reaffirmation note asked (recorded, not mechanised: no gate checks these fields). The merge of PR #29 was HELD by rvo in the same exchange.",
   "amendments": [
     {
       "at": "Step B, the 2026-08-02 ratified decision batch: nine blocker decisions were put to rvo and answered on 2026-08-02; the approved ones were executed as ONE batch so the frozen-surface digest moves ONCE (the prior session moved it ten times, invalidating matrix evidence each time). Sequencing was deliberate and is part of the record: source batch first, adversarial santa-loop rounds 1-2 over the batch BEFORE this digest was recorded (so review fixes could not force a second recorded move), the K=5 pilot re-run after those fixes (so its pilot.json rewrite rides the same single move), then this record; a final santa round runs over the COMPLETE state including this entry after it lands.",
