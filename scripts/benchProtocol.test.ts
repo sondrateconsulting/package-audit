@@ -9,6 +9,7 @@ import { loadBenchConfig, restFallbackBudgetFor } from "./benchConfig.ts";
 import {
   BenchProtocolError, WallClock, bucketDelta, computeWorstCase, finishMeasuredRun, makeChildPool,
   planSegments, reclaimRunResources, requireToolVersion, summarizeSpawns, summarizeTraffic,
+  sweepUnopenedRunDebris,
   verifyDeliveries, washoutMs,
 } from "./benchProtocol.ts";
 import { InlineDiskSampler, WorkerDiskSampler, parseDiskWalkReply } from "./benchDiskSampler.ts";
@@ -542,7 +543,8 @@ describe("reclaimRunResources — teardown owns the DB, not the happy path (F6)"
   // plus its -wal/-shm sidecars, while the drift record still claimed diskReclaimFailed:false.
   // Several pre-driver throws (probeLiveHead, reserve, readRateLimit, planning) escape the same
   // way, so reclamation lives in one helper that every exit path AFTER THE RUN-CACHE DB OPENS
-  // runs (an AuditDb.open throw exits earlier and sweeps only its own DB debris).
+  // runs; an AuditDb.open throw exits earlier and reclaims the same residue — runDir plus the DB
+  // file and sidecars — through sweepUnopenedRunDebris instead.
   const mkdirp = (p: string): string => { mkdirSync(p, { recursive: true }); return p; };
   test("closes the handle and removes runDir plus every sqlite sidecar", () => {
     const root = mkdtempSync(join(tmpdir(), "pa-bench-reclaim-"));
@@ -588,6 +590,52 @@ describe("reclaimRunResources — teardown owns the DB, not the happy path (F6)"
     const failed = reclaimRunResources({ close: () => {} }, runDir, dbPath, { rm: () => {} });
     expect(failed).toBe(true);
     expect(existsSync(runDir)).toBe(true); // it really did survive
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe("sweepUnopenedRunDebris — the AuditDb.open-throws exit reclaims the SAME residue", () => {
+  // The bug: runOne creates runDir, then opens the run-cache DB. An open failure was caught at
+  // that call site and swept only the DB file and its -wal/-shm sidecars, so every failed open
+  // leaked one empty directory under benchRoot — while the reclamation helper's own contract
+  // claimed every exit path reclaims. This exit cannot use reclaimRunResources (no handle to
+  // close, and reclaimOnce is not defined until after the open returns), so the two paths are
+  // pinned to the same residue set here.
+  const mkdirp = (p: string): string => { mkdirSync(p, { recursive: true }); return p; };
+  test("removes runDir AND every sqlite sidecar, reporting nothing left behind", () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-sweep-"));
+    const runDir = mkdirp(join(root, "run"));
+    writeFileSync(join(runDir, "partial.txt"), "x"); // non-empty: removal must be recursive
+    const dbPath = join(root, "run.sqlite");
+    for (const suffix of ["", "-wal", "-shm"]) writeFileSync(`${dbPath}${suffix}`, "x");
+    expect(sweepUnopenedRunDebris(runDir, dbPath)).toEqual([]);
+    expect(existsSync(runDir)).toBe(false); // the defect: this was previously left behind
+    for (const suffix of ["", "-wal", "-shm"]) expect(existsSync(`${dbPath}${suffix}`)).toBe(false);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("a DB file that was never created is not an error — the open can fail before touching it", () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-sweep-"));
+    expect(sweepUnopenedRunDebris(mkdirp(join(root, "run")), join(root, "never-made.sqlite"))).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("residue that SURVIVES removal is returned, not assumed gone", () => {
+    // removal that silently does nothing — no throw, so only the post-removal verification can
+    // catch it. This is what lets the caller's log name what is still on disk.
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-sweep-"));
+    const runDir = mkdirp(join(root, "run"));
+    const dbPath = join(root, "run.sqlite");
+    writeFileSync(dbPath, "x");
+    expect(sweepUnopenedRunDebris(runDir, dbPath, { rm: () => {} })).toEqual([runDir, dbPath]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("a throwing rm does not propagate — the caller must rethrow the ORIGINAL open error", () => {
+    const root = mkdtempSync(join(tmpdir(), "pa-bench-sweep-"));
+    const runDir = mkdirp(join(root, "run"));
+    const dbPath = join(root, "run.sqlite");
+    writeFileSync(dbPath, "x");
+    const thrower = { rm: (): never => { throw new Error("EACCES"); } };
+    expect(() => sweepUnopenedRunDebris(runDir, dbPath, thrower)).not.toThrow();
+    expect(sweepUnopenedRunDebris(runDir, dbPath, thrower)).toEqual([runDir, dbPath]);
     rmSync(root, { recursive: true, force: true });
   });
 });

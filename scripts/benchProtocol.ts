@@ -462,8 +462,9 @@ export async function finishMeasuredRun(opts: {
 
 // Per-run resource reclamation, run by every exit path ONCE THE RUN-CACHE DB IS OPEN (normal,
 // drift-restart, and the throws that escape before the driver's try-block). The one earlier exit
-// — a throw from AuditDb.open itself — runs at its own call site instead, and sweeps only the DB
-// file and its sidecars: it leaves the already-created runDir behind. The run cache DB is
+// — a throw from AuditDb.open itself — cannot use this helper (there is no handle to close), and
+// reclaims through sweepUnopenedRunDebris at its own call site instead; that path removes the
+// same filesystem residue, runDir included. The run cache DB is
 // documented as "one file per
 // run, deleted at teardown", so a path that returns without closing it leaks both the handle and
 // its -wal/-shm sidecars while the emitted record still claims a clean reclaim.
@@ -491,6 +492,39 @@ export function reclaimRunResources(
   if (existsSync(runDir)) failed = true;
   for (const suffix of ["", "-wal", "-shm"]) if (existsSync(`${dbPath}${suffix}`)) failed = true;
   return failed;
+}
+
+// The reclamation for the ONE exit that happens before a run owns anything: AuditDb.open itself
+// throwing. reclaimRunResources cannot serve it — there is no handle to close, and its caller
+// (reclaimOnce) is not defined until after the open returns — so the sweep is extracted here
+// rather than inlined, both so CI can drive it and so the two reclamation paths cannot drift.
+// It removes the SAME filesystem residue reclaimRunResources does: the run directory (created
+// before the open, and per-run scratch that every teardown path removes wholesale) plus the DB
+// file and its -wal/-shm sidecars, which the open can create and then fail to initialise.
+// Best-effort and non-throwing BY DESIGN: the caller rethrows the original open error, which
+// carries the operator's remediation, and a sweep failure must not mask it. Returns the paths it
+// could not remove so the caller's log can name them.
+export function sweepUnopenedRunDebris(
+  runDir: string,
+  dbPath: string,
+  io: { rm: (path: string, opts: { recursive?: boolean; force: boolean }) => void } = { rm: rmSync },
+): string[] {
+  const unremoved: string[] = [];
+  try {
+    io.rm(runDir, { recursive: true, force: true });
+  } catch {
+    // best-effort — verified below and named in the caller's log either way
+  }
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      io.rm(`${dbPath}${suffix}`, { force: true });
+    } catch {
+      // best-effort — verified below
+    }
+  }
+  if (existsSync(runDir)) unremoved.push(runDir);
+  for (const suffix of ["", "-wal", "-shm"]) if (existsSync(`${dbPath}${suffix}`)) unremoved.push(`${dbPath}${suffix}`);
+  return unremoved;
 }
 
 // The PRIMARY scored metric accumulates through this clock, so its time source must be
@@ -649,21 +683,21 @@ export class BenchEngine {
     // (production --fresh preserves them by design) (codex R2 f.24)
     const dbPath = join(this.o.runCacheDir, `bench-run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-${process.pid}-${this.now()}-${this.runCounter}.sqlite`);
     // the open itself can CREATE the file and then fail (WAL/schema initialisation, ENOSPC):
-    // nothing downstream owns the path yet — reclaimOnce and the outer finally both live past
-    // this line — so a mid-initialisation throw must sweep its own debris here, with the path
-    // in the operator's face, before rethrowing
+    // nothing downstream owns anything yet — reclaimOnce and the outer finally both live past
+    // this line — so a mid-initialisation throw must sweep its own debris here, with the paths
+    // in the operator's face, before rethrowing. That debris is BOTH the DB file with its
+    // sidecars AND runDir, which was created above: an earlier version swept only the former, so
+    // an open failure leaked one empty directory per attempt under benchRoot while the reclaim
+    // helper's own contract claimed every exit path reclaims.
     let db: AuditDb;
     try {
       db = AuditDb.open({ sqlitePath: dbPath, fresh: true, purgeCache: true });
     } catch (openErr) {
-      for (const suffix of ["", "-wal", "-shm"]) {
-        try {
-          rmSync(`${dbPath}${suffix}`, { force: true });
-        } catch {
-          // best-effort — the log below names the path either way
-        }
-      }
-      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run-cache DB failed to initialise (${openErr instanceof Error ? openErr.message : String(openErr)}) — swept ${dbPath}[-wal/-shm] best-effort before rethrowing`);
+      const unremoved = sweepUnopenedRunDebris(runDir, dbPath);
+      const swept = unremoved.length === 0
+        ? `swept ${runDir} and ${dbPath}[-wal/-shm]`
+        : `swept what it could; STILL PRESENT: ${unremoved.join(", ")}`;
+      this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run-cache DB failed to initialise (${openErr instanceof Error ? openErr.message : String(openErr)}) — ${swept} before rethrowing`);
       throw openErr;
     }
     // The run's resources are owned from HERE, not from the driver's try-block. Several paths
