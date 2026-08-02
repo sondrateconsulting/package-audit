@@ -548,7 +548,21 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   taxonomy above). A drift-triggered unit restart (R6) re-executes the unit's whole block as a
   **preregistered epilogue** appended after the main traversal — mid-schedule re-insertion would
   shift every successor's predecessor structure, destroying the ordering controls the schedule
-  exists to provide.
+  exists to provide. *(Amended 2026-08-02, ratified decision batch: the epilogue preserves
+  repository interleaving.)* When more than one unit is owed an epilogue restart, the epilogue's
+  unit blocks run in the order produced by the **same** deterministic no-two-adjacent
+  construction that built the main `unitOrder` (`interleaveUnits`, applied to the drifted
+  subset) — never in raw filtered schedule order, which can place two same-repository units
+  adjacent when the units that separated them in the frozen sequence did not drift. Within a
+  block, rows keep their frozen relative order; the drifted units' checkout-config probe rows
+  run after **all** of the epilogue's main-rep rows, in the same interleaved unit order,
+  mirroring the frozen schedule's own probe placement. If no adjacency-free order of the drifted
+  subset exists (only same-repository blocks remain), the matrix **halts for §8 freeze repair
+  before executing any epilogue row** — the fail-closed posture the second R4 straddle already
+  takes — rather than collecting rows this section's interleaving rule pre-declares biased. The
+  junction between the main traversal's tail and the epilogue's first block is unchanged by this
+  amendment (the epilogue was already appended after the main traversal); that residual is
+  recorded in ratification.json rather than constrained here.
 - **Completion discipline — one frozen replay/invalidation taxonomy** (referenced everywhere
   else; no section defines its own): eligibility requires all K runs complete (G3).
   **R1/R2, the driver rerun allowance (≤1 per unit × driver):** a network-layer error outside any
@@ -557,7 +571,24 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   against repetitions already completed* (amended at Step B): replays execute in-slot, so a
   qualifying 5xx that precedes any completed repetition of its class is a recorded failure, not
   a rerun — conservative and order-stable, since the first repetition of every unit × driver
-  has no prior evidence by construction. **R3, foreign consumption:** an
+  has no prior evidence by construction. *(Amended 2026-08-02, ratified decision batch: R1's
+  network-layer class is typed for the git transport too, not only for HTTP attempts.)* The
+  three network-facing git operations — the production clone, the SHA-pinned scaffolding fetch,
+  and the ls-remote probe — attach typed spawn evidence to their unit failure when the child
+  **settles** with the transport-failure shape: the harness's synthetic deadline exit **124**,
+  or exit **128** whose stderr matches the frozen network-failure pattern set (DNS resolution,
+  TLS negotiation/transfer, TCP connect, connection reset / hang-up / EOF mid-transfer). The
+  rerun predicate accepts that evidence as R1 — the same ≤1 allowance, one pool with the HTTP
+  shapes, never an additional allowance. Everything else stays outside the variant by
+  construction and remains a non-rerunnable driver failure: auth/permission failures,
+  HTTP-status-bearing git failures (`The requested URL returned error: …` — a secondary-limit
+  403 over the git transport takes this shape and must never become replayable), local git
+  operations (init / remote-add / checkout / rev-parse / ls-tree, and the cat-file batch
+  reader), unrecognised stderr, and budget conditions. A child that **never settles** inside
+  the bounded deadline+grace wait is also outside the variant — it surfaces through the generic
+  harness-error arm with `failureEvidence: null` — so this amendment narrows the untyped
+  git-transport gap; it does not close it. The C6 fidelity battery's abort classification
+  (§4.2) is deliberately unchanged by this amendment. **R3, foreign consumption:** an
   observed bucket delta the harness's own accounting cannot explain — run invalid, replayed in
   its own slot, *not* charged to the driver allowance (verified external interference).
   **R4, reset-window straddle:** run invalid, replayed in its own slot, not charged to the driver

@@ -58,11 +58,21 @@ export class UnitFailure extends Error {
   // when the terminal condition was HTTP-shaped (e.g. the circuit breaker tripped on repeated
   // no-response dispatches), the typed R1/R2 evidence survives the breaker (codex R2 f.14)
   readonly httpEvidence: { code: string; lastClassification: string | null; requestClass: string | null } | null;
-  constructor(cause: string, httpEvidence: { code: string; lastClassification: string | null; requestClass: string | null } | null = null) {
+  // when the terminal condition was a SETTLED network-shaped git-transport failure on one of the
+  // three network-facing operations, the typed R1 evidence rides here (§4.5, amended 2026-08-02).
+  // At most one of httpEvidence/gitEvidence is ever non-null: each throw site supplies its own
+  // layer's evidence and no site observes both layers failing on one terminal condition.
+  readonly gitEvidence: GitTransportEvidence | null;
+  constructor(
+    cause: string,
+    httpEvidence: { code: string; lastClassification: string | null; requestClass: string | null } | null = null,
+    gitEvidence: GitTransportEvidence | null = null,
+  ) {
     super(`UNIT FAILURE: ${cause}`);
     this.name = "UnitFailure";
     this.mutableCause = cause;
     this.httpEvidence = httpEvidence;
+    this.gitEvidence = gitEvidence;
   }
   /** Append teardown evidence found AFTER this was thrown — the batch child's disposal verdict,
    *  which is only available in the finally that runs on the way out. */
@@ -203,6 +213,52 @@ function pushNoReads(ctx: DriverRunContext, st: RunState): void {
   }
 }
 
+// ---- §4.5 typed git-transport evidence (amended 2026-08-02) ----------------------------------
+// The network-facing subset of a SETTLED git-transport failure, typed so the frozen R1 predicate
+// can read it (evidenceIsRerunnable) instead of leaving every git-transport failure a permanent
+// {kind:"unit"} driver disqualification. STRICT SCOPE, fail-closed: only the three operations
+// below, only a settled child (the harness's synthetic deadline exit 124, or git's fatal exit
+// 128), and for 128 only a stderr matching the frozen network patterns. An HTTP-status-bearing
+// git failure is EXCLUDED FIRST — a secondary-limit 403 over the git transport prints
+// "The requested URL returned error: 403", and §4.5 forbids secondary/budget conditions from
+// ever becoming replayable. A child that never settles takes the generic harness-error arm and
+// stays outside this variant (the amendment narrows the untyped gap; it does not close it).
+export type GitTransportOp = "clone" | "scaffold-fetch" | "ls-remote-probe";
+export type GitTransportNetworkClass = "timeout" | "dns" | "tls" | "connect" | "reset";
+export interface GitTransportEvidence {
+  op: GitTransportOp;
+  exitCode: number;
+  networkClass: GitTransportNetworkClass;
+}
+
+// Frozen pattern sets, matched case-insensitively against the settled child's stderr. Literal
+// substrings, no regexes: every entry is auditable against the git/curl message it names.
+const GIT_HTTP_STATUS_BEARING: readonly string[] = ["the requested url returned error", "rpc failed; http"];
+const GIT_NETWORK_PATTERNS: ReadonlyArray<{ networkClass: GitTransportNetworkClass; needles: readonly string[] }> = [
+  { networkClass: "dns", needles: ["could not resolve host", "couldn't resolve host", "name or service not known", "temporary failure in name resolution", "no address associated with hostname"] },
+  { networkClass: "tls", needles: ["ssl connect error", "ssl_connect", "ssl_read", "ssl_write", "ssl handshake", "gnutls_handshake", "ssl certificate problem", "server certificate verification failed", "unable to get local issuer certificate"] },
+  { networkClass: "connect", needles: ["failed to connect", "couldn't connect to server", "connection refused", "connection timed out", "operation timed out", "network is unreachable", "no route to host"] },
+  { networkClass: "reset", needles: ["connection reset", "recv failure", "send failure", "remote end hung up unexpectedly", "early eof", "unexpected disconnect while reading sideband packet", "transfer closed with outstanding read data remaining"] },
+];
+
+export function classifyGitTransportFailure(
+  op: GitTransportOp,
+  res: { exitCode: number; timedOut: boolean; stderr: Uint8Array },
+): GitTransportEvidence | null {
+  if (res.timedOut && res.exitCode === 124) return { op, exitCode: 124, networkClass: "timeout" };
+  if (res.exitCode !== 128) return null;
+  const stderr = new TextDecoder("utf-8", { fatal: false }).decode(res.stderr).toLowerCase();
+  // status-bearing failures are excluded BEFORE any positive match: a 5xx mid-pack can print a
+  // reset-class curl detail beside its status line, and the status is the governing shape
+  for (const needle of GIT_HTTP_STATUS_BEARING) if (stderr.includes(needle)) return null;
+  for (const group of GIT_NETWORK_PATTERNS) {
+    for (const needle of group.needles) {
+      if (stderr.includes(needle)) return { op, exitCode: 128, networkClass: group.networkClass };
+    }
+  }
+  return null; // unrecognised stderr fails closed: no evidence, no rerun
+}
+
 // ---- acquisition (§4.4: production argv by default, SHA-pinned scaffolding on drift) ---------
 // Scaffolding argv is DERIVED inside runBenchGit from the config-pinned tuple + slots (the lane
 // carries both) — this module never hand-builds a scaffolding vector, so the pinned tuple is the
@@ -234,11 +290,12 @@ export async function probeLiveHead(ctx: Pick<DriverRunContext, "cfg" | "slot" |
     limits: { maxStdoutBytes: 1024 * 1024, maxStderrBytes: 1024 * 1024, deadlineMs: ctx.cfg.spawn.timeoutMs },
     onRecord: ctx.spawnObserver,
   });
-  if (res.exitCode !== 0) throw new UnitFailure(`ls-remote probe failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`);
+  if (res.exitCode !== 0)
+    throw new UnitFailure(`ls-remote probe failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`, null, classifyGitTransportFailure("ls-remote-probe", res));
   return parseLsRemoteProbe(res.stdout, ctx.unit.branch, ctx.slot.objectFormat === "sha1" ? 40 : 64);
 }
 
-async function transportGit(ctx: DriverRunContext, argv: string[], opts: { cwd?: string; cloneShape?: "checkout" | "no-checkout"; maxStdoutBytes?: number }): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array }> {
+async function transportGit(ctx: DriverRunContext, argv: string[], opts: { cwd?: string; cloneShape?: "checkout" | "no-checkout"; maxStdoutBytes?: number }): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array; timedOut: boolean }> {
   return runBenchGit({
     argv,
     lane: { lane: "transport", objectFormat: ctx.slot.objectFormat, ...(opts.cloneShape === undefined ? {} : { cloneShape: opts.cloneShape }) },
@@ -258,9 +315,14 @@ async function scaffoldGit(ctx: DriverRunContext, tuple: readonly string[], slot
   if (res.exitCode !== 0) {
     // a FAILED SHA-pinned fetch runs the pinned-object classifier (§4.4): the frozen SHA no
     // longer served → the R6 SHA arm (re-pin, a freeze amendment), never a generic driver
-    // failure (codex R1 finding 19)
+    // failure (codex R1 finding 19). Only the fetch is network-facing, so only it may carry
+    // §4.5's typed git-transport evidence — the local tuples (init/remote-add/checkout) never do.
     if (tuple[0] === "fetch") await classifyPinnedObjectAbsence(ctx, `scaffolding fetch of ${ctx.unit.sha} failed`);
-    throw new UnitFailure(`scaffolding ${tuple[0]} failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`);
+    throw new UnitFailure(
+      `scaffolding ${tuple[0]} failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`,
+      null,
+      tuple[0] === "fetch" ? classifyGitTransportFailure("scaffold-fetch", res) : null,
+    );
   }
 }
 
@@ -279,7 +341,8 @@ export async function acquireStore(ctx: DriverRunContext, opts: { checkout: bool
       ...(opts.checkout ? [] : ["--no-checkout"]), url, dir,
     ];
     const res = await transportGit(ctx, argv, { cloneShape: opts.checkout ? "checkout" : "no-checkout" });
-    if (res.exitCode !== 0) throw new UnitFailure(`clone failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`);
+    if (res.exitCode !== 0)
+      throw new UnitFailure(`clone failed: ${seamDecode(res.stderr).trim().slice(0, 300)}`, null, classifyGitTransportFailure("clone", res));
     // mirrored the moment the store EXISTS: the coherence checks below are fallible, and a
     // post-clone failure must still let the engine measure the store it actually acquired
     if (ctx.liveState !== undefined) ctx.liveState.cloneDir = dir;

@@ -44,14 +44,14 @@ import {
   verifyC6NonUtf8, verifyC6Symlink,
   type Corpus, type PerformanceSlot, type C6Fixture, type CorpusUnit, type SlotVerdict,
 } from "./benchCorpus.ts";
-import { buildSchedule } from "./benchSchedule.ts";
+import { BenchScheduleError, buildSchedule, interleaveUnits, type ScheduleRow, type ScheduleUnit } from "./benchSchedule.ts";
 import {
   buildUnitWorkload, countReplacementChars, parseUnitWorkload, recordSelection, seamDecode, seamSha256, sha256Hex,
   type UnitWorkload, type WorkloadEntry,
 } from "./benchWorkload.ts";
 import { classifyFile } from "./cliScanner.ts";
-import { parseLsTreeZ, type LsTreeEntry } from "./benchFrame.ts";
-import { BatchChild, BenchSpawnError, runBenchGit, type BenchSpawnRecord } from "./benchSpawn.ts";
+import { parseLsTreeZ, type BatchExpectation, type BatchFrame, type LsTreeEntry } from "./benchFrame.ts";
+import { BatchChild, BenchSpawnError, runBenchGit, type BatchChildDisposal, type BenchSpawnRecord } from "./benchSpawn.ts";
 import { BenchHttpError, benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuckets, readRateLimit, type BenchGhContext } from "./benchGh.ts";
 import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts";
 import {
@@ -71,6 +71,27 @@ const log = (line: string): void => {
   process.stderr.write(`${line}\n`);
 };
 const text = (b: Uint8Array): string => new TextDecoder().decode(b);
+
+// The ONE bench-root reclamation used by every command teardown and both construction-failure
+// catches (2026-08-02 decision batch). GUARDED: these sites run in `finally`/`catch` blocks, so
+// a throwing rmSync would REPLACE whatever error is already propagating — the exact masking the
+// run-level reclamation refuses (benchProtocol's open-failure discipline). A reclamation failure
+// is put in the operator's face instead, with the path to remove by hand; the log itself is
+// guarded because a diagnostic failure must never mask the fault it describes.
+export function reclaimBenchRoot(
+  root: string,
+  rm: (path: string, opts: { recursive: true; force: true }) => void = rmSync,
+): void {
+  try {
+    rm(root, { recursive: true, force: true });
+  } catch (e) {
+    try {
+      log(`BENCH ROOT NOT RECLAIMED: ${root} (${e instanceof Error ? e.message : String(e)}) — remove it by hand; nothing sweeps pa-bench-* roots`);
+    } catch {
+      // swallowed deliberately: the propagating error (if any) is the one the operator needs
+    }
+  }
+}
 
 // A HARNESS failure, as opposed to an observation about a transport. The distinction is
 // load-bearing: §4.7 disqualifies a driver globally on an observed divergence and a fidelity
@@ -426,8 +447,9 @@ function makePinRuntime(cfg: BenchConfig): PinRuntime {
   return { cfg, benchRoot, client, gh, gitEnv, gitEnvProbe, spawnObs: () => {} };
   } catch (e) {
     // construction failed before any caller could own benchRoot — reclaim it here or the
-    // pa-bench-* root (which nothing sweeps) leaks on every failed startup
-    rmSync(benchRoot, { recursive: true, force: true });
+    // pa-bench-* root (which nothing sweeps) leaks on every failed startup. Guarded so a
+    // failing reclamation never replaces the construction error being rethrown.
+    reclaimBenchRoot(benchRoot);
     throw e;
   }
 }
@@ -963,8 +985,9 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
   return { engine, benchRoot };
   } catch (e) {
     // construction failed before the caller could own benchRoot — reclaim it here or the
-    // temp root (pa-bench-*, which nothing sweeps) leaks on every failed startup
-    rmSync(benchRoot, { recursive: true, force: true });
+    // temp root (pa-bench-*, which nothing sweeps) leaks on every failed startup. Guarded so a
+    // failing reclamation never replaces the construction error being rethrown.
+    reclaimBenchRoot(benchRoot);
     throw e;
   }
 }
@@ -1031,7 +1054,7 @@ async function cmdPinCorpus(): Promise<void> {
     log(`pinned: corpus.json, ${workloads.size} selected/*.json, schedule (${schedule.rows.length} rows)`);
     log(`next: bun run bench:content diagnostics (§4.4 acquisition diagnostics, separately restartable)`);
   } finally {
-    rmSync(rt.benchRoot, { recursive: true, force: true });
+    reclaimBenchRoot(rt.benchRoot);
   }
   } finally {
     releaseLock();
@@ -1092,7 +1115,7 @@ async function cmdPilot(): Promise<void> {
     writeFileSync(join(ARTIFACTS, "pilot.json"), `${JSON.stringify(pilot, null, 2)}\n`);
     log(`pilot: walls ${walls.join("/")}ms, spread ${spread.toFixed(4)} → noise band ${band}`);
   } finally {
-    rmSync(benchRoot, { recursive: true, force: true });
+    reclaimBenchRoot(benchRoot);
   }
   } finally {
     releaseLock();
@@ -1109,7 +1132,7 @@ async function cmdDiagnostics(): Promise<void> {
     writeFileSync(join(ARTIFACTS, "acquisition-diagnostics.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), results: diagnostics }, null, 2)}\n`);
     log("acquisition-diagnostics.json written");
   } finally {
-    rmSync(rt.benchRoot, { recursive: true, force: true });
+    reclaimBenchRoot(rt.benchRoot);
   }
   } finally {
     releaseLock();
@@ -1136,6 +1159,55 @@ export function classifyFidelityAbort(e: unknown): "re-pin-required" | "operatio
   if (e instanceof BenchOperationalError || (e instanceof BenchHttpError && e.code === "no-response")) return "operational-abort";
   if (e instanceof UnitFailure || e instanceof BenchSpawnError || e instanceof BenchHttpError) return "driver-failure";
   return "operational-abort";
+}
+
+// The fidelity surrogate's one-respawn recovery (2026-08-02 decision batch): runT2c disposes a
+// first dead batch child and retries once, and a successful replacement yields a successful run
+// (§3.1 "at most one respawn per unit; a second child death fails the unit"); the surrogate
+// previously constructed a single child with no equivalent, so a first child death became a
+// PERMANENT fidelity-driver-failure for a condition the ratified driver explicitly recovers
+// from. Mirrored exactly, and no wider: the allowance is one respawn per (fixture, driver) —
+// the battery's own accounting unit, the analogue of runT2c's per-run scope — the respawn
+// triggers ONLY on a rejected read (the missing-frame and hash checks stay outside it, as in
+// runT2c), and a second death is the same died-twice UnitFailure carrying the FIRST child's
+// disposal diagnosis. Extracted PURE over the reader shape so CI can drive every arm with fakes
+// (the real path spawns a live child per entry, which no test constructs). The holder pattern is
+// runT2c's own: on a second death the failed REPLACEMENT is left in holder.child, so the
+// caller's finally still disposes it — returning the child instead would orphan it on exactly
+// the throwing path.
+export interface BatchReaderLike {
+  readObject(expected: BatchExpectation): Promise<BatchFrame>;
+  dispose(): Promise<BatchChildDisposal>;
+}
+export interface FidelityRespawnState {
+  respawns: number;
+  firstDisposal: BatchChildDisposal | null;
+}
+export async function readObjectWithOneRespawn<C extends BatchReaderLike>(
+  holder: { child: C },
+  spawnReplacement: () => C,
+  expected: BatchExpectation,
+  state: FidelityRespawnState,
+): Promise<BatchFrame> {
+  try {
+    return await holder.child.readObject(expected);
+  } catch (e) {
+    // the FIRST child's disposal carries the actual diagnosis (git's own stderr, the fatal
+    // condition that poisoned it) — without it the surviving message is only the second
+    // failure's (runT2c's own discipline, mirrored verbatim)
+    if (state.respawns >= 1)
+      throw new UnitFailure(`batch child died twice: ${e instanceof Error ? e.message : String(e)}${state.firstDisposal === null ? "" : ` — first child: ${describeDisposal(state.firstDisposal)}`}`);
+    state.respawns++;
+    state.firstDisposal = await holder.child.dispose();
+    holder.child = spawnReplacement();
+    try {
+      return await holder.child.readObject(expected);
+    } catch (e2) {
+      // an immediately-failing replacement is the same double death — the first child's
+      // retained diagnosis must survive on exactly the path where it matters most
+      throw new UnitFailure(`batch child died twice: ${e2 instanceof Error ? e2.message : String(e2)}${state.firstDisposal === null ? "" : ` — first child: ${describeDisposal(state.firstDisposal)}`}`);
+    }
+  }
 }
 
 // The fidelity battery's resume discipline over its own append-only log (§4.2: "§4.5's
@@ -1247,6 +1319,8 @@ async function cmdFidelity(): Promise<void> {
         const abortKey = `${fixture.kind}|${driver}`;
         if ((logState.operationalAborts.get(abortKey) ?? 0) >= 2)
           throw new Error(`REFUSING: fidelity.jsonl records ${logState.operationalAborts.get(abortKey)} operational aborts for ${abortKey} at the current surface — the ≤1 rerun allowance (§4.2/§4.5) is spent; investigate the harness fault`);
+        // one respawn per (fixture, driver), spanning its entries — runT2c's per-run allowance
+        const respawnState: FidelityRespawnState = { respawns: 0, firstDisposal: null };
         for (const entry of fixture.entries) {
           if (logState.passed.has(`${fixture.kind}|${driver}|${entry.path}`)) {
             log(`fidelity ${fixture.kind} ${driver} ${entry.path}: already recorded PASS at this surface — skipping`);
@@ -1386,14 +1460,18 @@ async function cmdFidelity(): Promise<void> {
               // neither may append a permanent pass:false row (the wrong §4.7 channel)
               if (liveEntry.oid !== entry.oid || (liveEntry.size ?? 0) !== entry.size)
                 throw new BenchOperationalError(`fixture ${fixture.kind} pin is stale for ${entry.path} (live ${liveEntry.oid.slice(0, 12)}…/${String(liveEntry.size)} != pinned ${entry.oid.slice(0, 12)}…/${entry.size}) — repair corpus.json, never record a verdict from it`);
-              const child = new BatchChild({
+              const spawnFidelityChild = (): BatchChild => new BatchChild({
                 objectFormat: fixture.objectFormat, env: rt.gitEnv, cwd: dir, benchRoot: rt.benchRoot,
                 limits: { maxHeaderBytes: cfg.frame.maxHeaderBytes, frameCeiling: cfg.frame.frameCeilingBytes, stderrRingBytes: cfg.frame.stderrRingBytes, readDeadlineMs: cfg.frame.readDeadlineMs, disposeDeadlineMs: cfg.frame.disposeDeadlineMs },
                 onRecord: rt.spawnObs,
               });
+              const holder = { child: spawnFidelityChild() };
               let fidelityThrown: Error | null = null;
               try {
-                const frame = await child.readObject({ oid: liveEntry.oid, size: liveEntry.size ?? 0 });
+                // one-respawn recovery on a rejected read ONLY (2026-08-02 decision batch,
+                // mirroring runT2c §3.1); the missing-frame and hash checks below sit outside
+                // the respawn exactly as they do in the driver
+                const frame = await readObjectWithOneRespawn(holder, spawnFidelityChild, { oid: liveEntry.oid, size: liveEntry.size ?? 0 }, respawnState);
                 if (frame.kind === "missing")
                   throw new UnitFailure(`object-store corruption: ${entry.path}'s enumerated oid is missing from the acquired store`);
                 if (gitBlobOid(frame.body, fixture.objectFormat) !== liveEntry.oid)
@@ -1411,8 +1489,11 @@ async function cmdFidelity(): Promise<void> {
                 // where the disposal is the SOLE failure; otherwise the verdict is appended below.
                 // When a readObject error is ALREADY propagating, a throw here would REPLACE it
                 // (the same evidence-masking runT2c's teardown annotation prevents), so the
-                // disposal verdict is appended to the in-flight error instead.
-                const d = await child.dispose();
+                // disposal verdict is appended to the in-flight error instead. holder.child is
+                // the child that DELIVERED (or last attempted) the bytes: after a respawn it is
+                // the replacement — the first child was already disposed inside the respawn, and
+                // its verdict rides the died-twice diagnosis, not this check.
+                const d = await holder.child.dispose();
                 if (!disposalIsClean(d)) {
                   if (fidelityThrown !== null) fidelityThrown.message = `${fidelityThrown.message} — batch child teardown was also unclean: ${describeDisposal(d)}`;
                   else throw new BenchOperationalError(`fidelity batch child teardown was not clean: ${describeDisposal(d)}`);
@@ -1488,7 +1569,7 @@ async function cmdFidelity(): Promise<void> {
     }
     throw e;
   } finally {
-    rmSync(rt.benchRoot, { recursive: true, force: true });
+    reclaimBenchRoot(rt.benchRoot);
   }
   } finally {
     // in its OWN finally: a failing temp-root removal above must never strand the lock
@@ -1504,11 +1585,81 @@ async function cmdFidelity(): Promise<void> {
 export function evidenceIsRerunnable(ev: unknown, unitDriverKey: string, ledger: ReadonlySet<string>): boolean {
   if (typeof ev !== "object" || ev === null) return false;
   const e = ev as Record<string, unknown>;
+  // §4.5 amended 2026-08-02: a SETTLED network-shaped git-transport failure on one of the three
+  // network-facing operations is R1 — same ≤1 allowance pool as the HTTP shapes. Validated
+  // fail-closed against the frozen vocabularies (this predicate also re-decides from persisted
+  // rows on resume, so a hand-edited or foreign value must never widen the allowance).
+  if (e["kind"] === "git-transport") {
+    const opOk = e["op"] === "clone" || e["op"] === "scaffold-fetch" || e["op"] === "ls-remote-probe";
+    const classOk = e["networkClass"] === "timeout" || e["networkClass"] === "dns" || e["networkClass"] === "tls"
+      || e["networkClass"] === "connect" || e["networkClass"] === "reset";
+    return opOk && classOk; // R1
+  }
   if (e["kind"] !== "http") return false;
   if (e["code"] === "no-response") return true; // R1
   if ((e["code"] === "attempts-exhausted" || e["code"] === "http-failure") && e["lastClassification"] === "transient")
     return ledger.has(`${unitDriverKey}|${typeof e["requestClass"] === "string" ? e["requestClass"] : ""}`); // R2
   return false;
+}
+
+// The R6 epilogue's execution order (§4.5, amended 2026-08-02). The raw drifted-row filter
+// preserves frozen positions but DESTROYS the interleaving guarantee: remove the units that
+// separated two same-repository siblings and the siblings become adjacent, handing the later
+// one the server-side pack-cache warmth §4.5's adjacency rule exists to prevent. The epilogue's
+// unit blocks are therefore ordered by the SAME deterministic no-two-adjacent construction that
+// built the main unitOrder (interleaveUnits over the drifted subset) — a preregistered FUNCTION
+// of the drifted set, not an improvisation. Within a block, rows keep frozen pos order; probe
+// rows run after ALL of the epilogue's main-rep rows, in the same interleaved unit order,
+// mirroring buildSchedule's own probe placement. Separator re-runs of non-drifted units were
+// REJECTED: the frozen schedule has no row identity for an extra run (resume validates every
+// row against the schedule's identity at its pos, and the last row at a pos terminalizes it),
+// the resume ledger keeps a NON-drifted unit's epilogue rows alongside its main rows (double
+// evidence), and a separator spends live budget measuring nothing the matrix needs.
+// When no adjacency-free order exists (only same-repository blocks remain), interleaveUnits
+// throws and this REFUSES before any epilogue row executes — §8 freeze-repair territory, the
+// fail-closed posture the second R4 straddle already takes.
+// Reordering blocks does NOT break §4.5's "evaluated at failure time" reconstruction, which
+// uses pos as a time proxy (ledgerBefore): R2 evidence must come from the SAME unit × driver,
+// a unit's rows all live inside its own block, and within a block this function preserves pos
+// order — so pos order and execution order still agree exactly where the predicate can look.
+// Cross-unit completions can never satisfy a same-unit key, whatever their order.
+export function orderEpilogueRows(
+  rows: readonly ScheduleRow[],
+  scheduleUnits: readonly ScheduleUnit[],
+): ScheduleRow[] {
+  if (rows.length === 0) return [];
+  const unitIds: string[] = [];
+  const byUnit = new Map<string, ScheduleRow[]>();
+  for (const row of rows) {
+    const list = byUnit.get(row.unit);
+    if (list === undefined) {
+      unitIds.push(row.unit);
+      byUnit.set(row.unit, [row]);
+    } else {
+      list.push(row);
+    }
+  }
+  const knownUnits = new Map(scheduleUnits.map((u) => [u.unitId, u]));
+  const subset = unitIds.map((id) => {
+    const u = knownUnits.get(id);
+    if (u === undefined)
+      throw new Error(`REFUSING to run the R6 epilogue: drifted unit ${id} is not in the schedule-unit set, so its repository — the §4.5 adjacency key — is unknown`);
+    return u;
+  });
+  let order: ScheduleUnit[];
+  try {
+    order = interleaveUnits(subset);
+  } catch (e) {
+    if (e instanceof BenchScheduleError)
+      throw new Error(`REFUSING to run the R6 epilogue: no adjacency-free order of the ${subset.length} drifted unit(s) exists (${e.message}) — executing them adjacent would violate §4.5's repository-interleaving rule; §8 freeze-repair territory, never a silently biased traversal`);
+    throw e;
+  }
+  const main: ScheduleRow[] = [];
+  const probe: ScheduleRow[] = [];
+  for (const u of order) {
+    for (const r of [...byUnit.get(u.unitId)!].sort((a, b) => a.pos - b.pos)) (r.probe ? probe : main).push(r);
+  }
+  return [...main, ...probe];
 }
 
 export interface ResumeState {
@@ -1831,7 +1982,12 @@ async function cmdMatrix(): Promise<void> {
     await executeRows(cfg.schedule.rows, "main");
     if (driftedUnits.size > 0) {
       log(`epilogue: restarting ${driftedUnits.size} drifted unit(s) on the scaffolding form (R6 branch arm)`);
-      const epilogue = cfg.schedule.rows.filter((r) => driftedUnits.has(r.unit) && !terminalPos.has(r.pos));
+      // interleaved block order, never the raw filter (§4.5 amended 2026-08-02) — REFUSES
+      // before any epilogue row executes when no adjacency-free order exists
+      const epilogue = orderEpilogueRows(
+        cfg.schedule.rows.filter((r) => driftedUnits.has(r.unit) && !terminalPos.has(r.pos)),
+        scheduleUnitsFrom(corpus),
+      );
       engine.setEpilogueMode(true);
       try {
         await executeRows(epilogue, "epilogue");
@@ -1841,7 +1997,7 @@ async function cmdMatrix(): Promise<void> {
     }
     log("matrix complete — runs.jsonl carries every record (scoring/report generation reads it downstream, plan §8's read-only-analysis carve-out)");
   } finally {
-    rmSync(benchRoot, { recursive: true, force: true });
+    reclaimBenchRoot(benchRoot);
   }
   } finally {
     releaseLock();
@@ -1943,7 +2099,7 @@ async function cmdRefreshEvidence(): Promise<void> {
     writeFileSync(CORPUS_PATH, `${JSON.stringify(corpus, null, 2)}\n`);
     log("corpus.json evidence refreshed (performance-slot pins unmoved; C6 fixtures re-pinned only if the unification search succeeded)");
   } finally {
-    rmSync(rt.benchRoot, { recursive: true, force: true });
+    reclaimBenchRoot(rt.benchRoot);
   }
   } finally {
     releaseLock();

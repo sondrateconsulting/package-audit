@@ -569,3 +569,242 @@ describe("classifyFidelityAbort — fail-closed §4.2 abort taxonomy (continuati
       .toBe("re-pin-required");
   });
 });
+
+// ---- the 2026-08-02 decision batch -----------------------------------------------------------
+import {
+  orderEpilogueRows, readObjectWithOneRespawn, reclaimBenchRoot, type FidelityRespawnState,
+} from "./benchContentTransport.ts";
+import { classifyGitTransportFailure } from "./benchDrivers.ts";
+import type { BatchChildDisposal } from "./benchSpawn.ts";
+import type { BatchFrame } from "./benchFrame.ts";
+import type { ScheduleRow, ScheduleUnit } from "./benchSchedule.ts";
+
+describe("classifyGitTransportFailure — §4.5's typed git-transport variant is strictly scoped", () => {
+  // The gap: a settled network-shaped clone/fetch/probe failure carried NO typed evidence, so
+  // {kind:"unit"} permanently disqualified the driver for a condition §4.5's R1 prose already
+  // named rerunnable (DNS/TLS/connect/reset). The classifier types EXACTLY that subset and
+  // fails closed on everything else — an over-wide match would let an auth or secondary-limit
+  // condition become replayable, the inverse defect.
+  const settled = (exitCode: number, stderr: string, timedOut = false) =>
+    ({ exitCode, timedOut, stderr: bytes(stderr) });
+  test("the harness's synthetic deadline shape (124 + timedOut) is timeout evidence", () => {
+    expect(classifyGitTransportFailure("clone", settled(124, "", true)))
+      .toEqual({ op: "clone", exitCode: 124, networkClass: "timeout" });
+  });
+  test("exit 124 WITHOUT the timedOut flag is not evidence — only the synthetic shape counts", () => {
+    expect(classifyGitTransportFailure("clone", settled(124, "anything"))).toBeNull();
+  });
+  test("exit 128 with a DNS failure classifies as dns for every network-facing op", () => {
+    const stderr = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com";
+    expect(classifyGitTransportFailure("clone", settled(128, stderr))?.networkClass).toBe("dns");
+    expect(classifyGitTransportFailure("scaffold-fetch", settled(128, stderr))?.op).toBe("scaffold-fetch");
+    expect(classifyGitTransportFailure("ls-remote-probe", settled(128, stderr))?.op).toBe("ls-remote-probe");
+  });
+  test("TLS and connect failures classify to their groups, case-insensitively", () => {
+    expect(classifyGitTransportFailure("clone", settled(128, "fatal: unable to access 'https://x/': gnutls_handshake() failed: terminated")))
+      .toEqual({ op: "clone", exitCode: 128, networkClass: "tls" });
+    expect(classifyGitTransportFailure("clone", settled(128, "fatal: unable to access 'https://x/': FAILED TO CONNECT to github.com port 443: Connection refused")))
+      .toEqual({ op: "clone", exitCode: 128, networkClass: "connect" });
+  });
+  test("a mid-transfer reset classifies as reset — curl-numbered RPC failures carry no status", () => {
+    const stderr = "error: RPC failed; curl 56 Recv failure: Connection reset by peer\nfatal: early EOF";
+    expect(classifyGitTransportFailure("clone", settled(128, stderr))?.networkClass).toBe("reset");
+  });
+  test("an HTTP-status-bearing failure is excluded FIRST, even beside a network-class detail", () => {
+    // a secondary-limit 403 over the git transport prints exactly this shape — §4.5 forbids it
+    // from ever becoming replayable, so the status guard outranks every positive pattern
+    expect(classifyGitTransportFailure("clone", settled(128, "fatal: unable to access 'https://x/': The requested URL returned error: 403"))).toBeNull();
+    expect(classifyGitTransportFailure("clone", settled(128, "error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502\nfatal: early EOF"))).toBeNull();
+  });
+  test("unrecognised stderr and non-124/128 exits fail closed to null", () => {
+    expect(classifyGitTransportFailure("clone", settled(128, "fatal: repository 'https://x/' not found"))).toBeNull();
+    expect(classifyGitTransportFailure("clone", settled(128, "fatal: Authentication failed for 'https://x/'"))).toBeNull();
+    expect(classifyGitTransportFailure("clone", settled(1, "Could not resolve host: github.com"))).toBeNull();
+    expect(classifyGitTransportFailure("clone", settled(0, ""))).toBeNull();
+  });
+});
+
+describe("evidenceIsRerunnable — the git-transport kind is R1, validated fail-closed", () => {
+  const ledger = new Set<string>(); // R1 is unconditional: the empty ledger must not matter
+  test("every frozen (op × networkClass) pair is rerunnable with no prior evidence", () => {
+    for (const op of ["clone", "scaffold-fetch", "ls-remote-probe"]) {
+      for (const networkClass of ["timeout", "dns", "tls", "connect", "reset"]) {
+        expect(evidenceIsRerunnable({ kind: "git-transport", op, exitCode: 128, networkClass }, "u|T2a", ledger)).toBe(true);
+      }
+    }
+  });
+  test("values outside the frozen vocabularies are refused — resume re-decides from persisted rows", () => {
+    expect(evidenceIsRerunnable({ kind: "git-transport", op: "rev-parse", exitCode: 128, networkClass: "dns" }, "u|T2a", ledger)).toBe(false);
+    expect(evidenceIsRerunnable({ kind: "git-transport", op: "clone", exitCode: 128, networkClass: "secondary" }, "u|T2a", ledger)).toBe(false);
+    expect(evidenceIsRerunnable({ kind: "git-transport" }, "u|T2a", ledger)).toBe(false);
+  });
+  test("a persisted git-transport unit-failure row reconstructs as an OWED replay, not terminal", () => {
+    // the row-level proof that the amendment reaches resume: before it, this row's evidence was
+    // {kind:"unit"} and the pos terminalized — a transient network failure became a permanent
+    // driver disqualification across an interrupt
+    const DIGEST = "f".repeat(64);
+    const ENV_HASH = "abcd1234abcd1234";
+    const UNIT = "C2:o/r@main";
+    const sched = new Map([[5, { unit: UNIT, driver: "T2a", rep: 5, probe: false }]]);
+    const row = JSON.stringify({
+      type: "run", schemaVersion: 1, phase: "matrix", pos: 5, unit: UNIT, driver: "T2a", rep: 5,
+      probe: false, epilogue: false, outcome: "unit-failure",
+      failureEvidence: { kind: "git-transport", op: "clone", exitCode: 124, networkClass: "timeout" },
+      requests: {}, acquisitionForm: "production", replayKind: null, washoutAppliedMs: 60_000,
+      harnessCommit: "c".repeat(40), frozenSurfaceDigest: DIGEST, envManifestHash: ENV_HASH,
+    });
+    const marker = JSON.stringify({ type: "washout-done", phase: "matrix", pos: 5 });
+    const s = reconstructResumeState([row, marker], DIGEST, ENV_HASH, sched);
+    expect(s.terminalPos.has(5)).toBe(false);
+    expect(s.owedReplays.get(5)).toBe(`${UNIT}|T2a`);
+  });
+});
+
+describe("orderEpilogueRows — the R6 epilogue preserves §4.5's repository interleaving", () => {
+  // The defect (recorded confirmedButNotFixed in the santa-loop entry, ratified for fix
+  // 2026-08-02): filtering the frozen schedule to drifted units removes the separating units,
+  // so two same-repository C1 siblings become adjacent — the exact warmth channel the
+  // interleaving rule exists to close.
+  const U = (unitId: string, repoKey: string): ScheduleUnit => ({ unitId, repoKey, slot: unitId.split(":")[0]! });
+  const R = (pos: number, unit: string, probe = false): ScheduleRow => ({ pos, unit, driver: "T0", rep: probe ? 2 : 1, probe });
+  const C1A = U("C1:prom/prom@main", "prom/prom");
+  const C1B = U("C1:prom/prom@rel", "prom/prom");
+  const C5 = U("C5:pwsh/pwsh@master", "pwsh/pwsh");
+  const UNITS = [C1A, C1B, C5];
+  test("a different-repository drifted unit is placed BETWEEN same-repository siblings", () => {
+    // frozen order here is C1A(1,2), C1B(5,6), C5(7,8): the raw filter would run the two
+    // prom/prom blocks back to back; the interleaved order separates them with the pwsh block
+    const rows = [R(1, C1A.unitId), R(2, C1A.unitId), R(5, C1B.unitId), R(6, C1B.unitId), R(7, C5.unitId), R(8, C5.unitId)];
+    expect(orderEpilogueRows(rows, UNITS).map((r) => r.pos)).toEqual([1, 2, 7, 8, 5, 6]);
+  });
+  test("probe rows run after ALL main-rep rows, in the same interleaved unit order", () => {
+    const rows = [
+      R(1, C1A.unitId), R(2, C1A.unitId), R(5, C1B.unitId), R(6, C1B.unitId), R(7, C5.unitId), R(8, C5.unitId),
+      R(9, C1A.unitId, true), R(10, C1B.unitId, true), R(11, C5.unitId, true),
+    ];
+    expect(orderEpilogueRows(rows, UNITS).map((r) => r.pos)).toEqual([1, 2, 7, 8, 5, 6, 9, 11, 10]);
+  });
+  test("a single drifted unit passes through in frozen pos order", () => {
+    const rows = [R(5, C1B.unitId), R(6, C1B.unitId), R(10, C1B.unitId, true)];
+    expect(orderEpilogueRows(rows, UNITS).map((r) => r.pos)).toEqual([5, 6, 10]);
+    expect(orderEpilogueRows([], UNITS)).toEqual([]);
+  });
+  test("only same-repository blocks remaining REFUSES before any row executes — freeze-repair, never a biased traversal", () => {
+    const rows = [R(1, C1A.unitId), R(5, C1B.unitId)];
+    expect(() => orderEpilogueRows(rows, UNITS)).toThrow(/REFUSING to run the R6 epilogue: no adjacency-free order/);
+    expect(() => orderEpilogueRows(rows, UNITS)).toThrow(/freeze-repair/);
+  });
+  test("a drifted unit missing from the schedule-unit set REFUSES — its adjacency key is unknown", () => {
+    expect(() => orderEpilogueRows([R(1, "C9:ghost/ghost@main")], UNITS)).toThrow(/adjacency key — is unknown|is not in the schedule-unit set/);
+  });
+  test("deterministic: the same drifted set always yields the same order", () => {
+    const rows = [R(1, C1A.unitId), R(5, C1B.unitId), R(7, C5.unitId)];
+    const a = orderEpilogueRows(rows, UNITS).map((r) => r.pos);
+    expect(orderEpilogueRows(rows, UNITS).map((r) => r.pos)).toEqual(a);
+  });
+});
+
+describe("readObjectWithOneRespawn — the fidelity surrogate mirrors runT2c's §3.1 allowance", () => {
+  // The asymmetry (recorded confirmedButNotFixed, ratified for fix 2026-08-02): runT2c disposes
+  // a first dead child and retries once; the surrogate had no equivalent, so ONE child death
+  // became a permanent fidelity-driver-failure for a condition the ratified driver recovers from.
+  const frame: BatchFrame = { kind: "content", oid: "a".repeat(40), size: 1, body: bytes("x") };
+  const EXPECT = { oid: "a".repeat(40), size: 1 };
+  const mkDisposal = (tag: string): BatchChildDisposal =>
+    ({ exitCode: 1, stderrTail: bytes(`fatal: ${tag}`), stderrDroppedBytes: 0, protocolError: `child exited (1) mid-conversation` });
+  class FakeReader {
+    disposed = false;
+    constructor(private script: Array<"ok" | "die">, private tag: string) {}
+    readObject(): Promise<BatchFrame> {
+      const step = this.script.shift();
+      if (step === "ok") return Promise.resolve(frame);
+      return Promise.reject(new BenchSpawnError("batch-fatal", `child exited (1) mid-conversation [${this.tag}]`));
+    }
+    dispose(): Promise<BatchChildDisposal> {
+      this.disposed = true;
+      return Promise.resolve(mkDisposal(this.tag));
+    }
+  }
+  const freshState = (): FidelityRespawnState => ({ respawns: 0, firstDisposal: null });
+  test("a clean first read spawns nothing and leaves the allowance intact", async () => {
+    const first = new FakeReader(["ok"], "first");
+    const holder = { child: first as FakeReader };
+    let spawned = 0;
+    const state = freshState();
+    const got = await readObjectWithOneRespawn(holder, () => { spawned++; return new FakeReader(["ok"], "spare"); }, EXPECT, state);
+    expect(got).toBe(frame);
+    expect(spawned).toBe(0);
+    expect(state).toEqual({ respawns: 0, firstDisposal: null });
+    expect(holder.child).toBe(first);
+  });
+  test("a first death disposes the dead child, respawns once, and a successful replacement succeeds", async () => {
+    const first = new FakeReader(["die"], "first");
+    const replacement = new FakeReader(["ok"], "replacement");
+    const holder = { child: first as FakeReader };
+    const state = freshState();
+    const got = await readObjectWithOneRespawn(holder, () => replacement, EXPECT, state);
+    expect(got).toBe(frame);
+    expect(first.disposed).toBe(true); // the diagnosis was captured before the replacement ran
+    expect(state.respawns).toBe(1);
+    expect(state.firstDisposal?.stderrTail).toEqual(bytes("fatal: first"));
+    expect(holder.child).toBe(replacement); // the caller's finally disposes the replacement
+  });
+  test("a dying replacement is the died-twice UnitFailure carrying the FIRST child's diagnosis", async () => {
+    const first = new FakeReader(["die"], "first");
+    const replacement = new FakeReader(["die"], "replacement");
+    const holder = { child: first as FakeReader };
+    let thrown: unknown;
+    try {
+      await readObjectWithOneRespawn(holder, () => replacement, EXPECT, freshState());
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(UnitFailure);
+    expect((thrown as Error).message).toContain("batch child died twice");
+    expect((thrown as Error).message).toContain("fatal: first"); // retained diagnosis, not just the second failure
+    expect(holder.child).toBe(replacement); // left for the caller's finally — never orphaned
+    expect(replacement.disposed).toBe(false); // disposing it is the caller's finally, not the helper
+  });
+  test("a spent allowance fails a later death immediately — one respawn per (fixture, driver), as runT2c per run", async () => {
+    const later = new FakeReader(["die"], "later");
+    const holder = { child: later as FakeReader };
+    const state: FidelityRespawnState = { respawns: 1, firstDisposal: mkDisposal("first") };
+    let spawned = 0;
+    let thrown: unknown;
+    try {
+      await readObjectWithOneRespawn(holder, () => { spawned++; return new FakeReader(["ok"], "spare"); }, EXPECT, state);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(UnitFailure);
+    expect((thrown as Error).message).toContain("batch child died twice");
+    expect((thrown as Error).message).toContain("fatal: first"); // the earlier death's retained diagnosis
+    expect(spawned).toBe(0);
+  });
+  test("the died-twice failure classifies as a durable driver failure, exactly as before the respawn existed", () => {
+    expect(classifyFidelityAbort(new UnitFailure("batch child died twice: x"))).toBe("driver-failure");
+  });
+});
+
+describe("reclaimBenchRoot — command teardowns must never substitute a cleanup failure", () => {
+  // The masking (recorded at the santa-loop cap, ratified for fix 2026-08-02): eight
+  // rmSync(benchRoot) sites ran unguarded in finally/catch blocks, so an EACCES/EBUSY there
+  // REPLACED whatever error was already propagating out of a command.
+  test("a throwing removal is contained and never propagates", () => {
+    expect(() => reclaimBenchRoot("/tmp/pa-bench-test-root", () => {
+      throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+    })).not.toThrow();
+  });
+  test("the removal receives the root with the recursive+force options", () => {
+    const calls: Array<{ path: string; opts: unknown }> = [];
+    reclaimBenchRoot("/tmp/pa-bench-test-root", (path, opts) => {
+      calls.push({ path, opts });
+    });
+    expect(calls).toEqual([{ path: "/tmp/pa-bench-test-root", opts: { recursive: true, force: true } }]);
+  });
+  test("a pathological throw (a non-Error) is contained too", () => {
+    expect(() => reclaimBenchRoot("/tmp/pa-bench-test-root", () => {
+      throw null;
+    })).not.toThrow();
+  });
+});

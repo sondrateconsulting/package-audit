@@ -18,6 +18,7 @@ import { packBatches, planRounds } from "./benchT1.ts";
 import {
   DriftSignal, RePinRequired, UnitFailure, probeLiveHead, runDriver,
   type AcquisitionForm, type DriverRunContext, type DriverRunOutcome, type EntryDelivery,
+  type GitTransportNetworkClass, type GitTransportOp,
 } from "./benchDrivers.ts";
 import {
   BenchHttpError, makeBuckets, outstandingHorizonMs, readRateLimit,
@@ -288,8 +289,14 @@ export interface RunRecord {
   // measurement is worse than recording one that cannot be scored.
   outcome: "complete" | "unit-failure" | "invalidated-straddle" | "invalidated-foreign" | "invalidated-finalisation" | "halt-r5-breach" | "drift-restart" | "re-pin-required";
   failureCause: string | null;
-  // typed R1/R2 evidence (§4.5): the rerun predicate reads THIS, never a message regex
-  failureEvidence: { kind: "http"; code: string; lastClassification: string | null; requestClass: string | null } | { kind: "unit" } | null;
+  // typed R1/R2 evidence (§4.5): the rerun predicate reads THIS, never a message regex. The
+  // git-transport variant (§4.5, amended 2026-08-02) types the SETTLED network-facing subset of
+  // clone / scaffolding-fetch / ls-remote failures; a never-settled child still records null.
+  failureEvidence:
+    | { kind: "http"; code: string; lastClassification: string | null; requestClass: string | null }
+    | { kind: "git-transport"; op: GitTransportOp; exitCode: number; networkClass: GitTransportNetworkClass }
+    | { kind: "unit" }
+    | null;
   requests: Record<string, number>;
   okRequestClasses: string[]; // §4.5 R2 ledger input: classes with ≥1 SUCCESSFUL attempt
   attempts: { fivexx: number; retries: number; secondaryByKind: Record<string, number> };
@@ -793,10 +800,12 @@ export class BenchEngine {
       const residue = sweepUnopenedRunDebris(runDir, dbPath);
       // the log is GUARDED: it runs before the rethrow, so an injected or broken logger that
       // throws here would replace openErr — the operator's remediation — with a logging error.
-      // SCOPE OF THE GUARANTEE: nothing in THIS catch can mask openErr. It is not an end-to-end
-      // claim — the commands' own `finally` blocks call rmSync(benchRoot) unguarded, and a
-      // failure there would still replace whatever error is propagating. That is a pre-existing
-      // property of the command teardown, recorded rather than changed at the review cap.
+      // SCOPE OF THE GUARANTEE: nothing in THIS catch can mask openErr. Since the 2026-08-02
+      // decision batch the commands' own `finally` blocks guard their rmSync(benchRoot)
+      // reclamations too (reclaimBenchRoot: logged, never substituted for a propagating error).
+      // Still not an end-to-end claim: the single-writer lock release in each command's
+      // outermost `finally` remains capable of replacing a propagating error if its own rmSync
+      // throws.
       try {
         this.o.log(`${row.unit} ${row.driver} rep${row.rep}: run-cache DB failed to initialise (${openErr instanceof Error ? openErr.message : String(openErr)}) — ${describeUnopenedSweep(runDir, dbPath, residue)} before rethrowing`);
       } catch {
@@ -1021,7 +1030,9 @@ export class BenchEngine {
         failureCause = e.cause2;
         failureEvidence = e.httpEvidence !== null
           ? { kind: "http", code: e.httpEvidence.code, lastClassification: e.httpEvidence.lastClassification, requestClass: e.httpEvidence.requestClass }
-          : { kind: "unit" };
+          : e.gitEvidence !== null
+            ? { kind: "git-transport", op: e.gitEvidence.op, exitCode: e.gitEvidence.exitCode, networkClass: e.gitEvidence.networkClass }
+            : { kind: "unit" };
       } else if (e instanceof BenchHttpError) {
         runOutcome = "unit-failure";
         failureCause = `${e.code}: ${e.message}`;
