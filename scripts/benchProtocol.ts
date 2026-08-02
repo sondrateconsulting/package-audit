@@ -1065,9 +1065,6 @@ export class BenchEngine {
   }
   // resume support: the caller COMPLETES an interrupted washout (sleep, then this marker) —
   // §4.5's separation is satisfied without re-running an attempt that already measured
-  appendLogMarker(marker: Record<string, unknown>): void {
-    this.o.runsLog.appendMarker(marker);
-  }
   constructor(o: EngineOptions) {
     this.o = o;
     this.manifestHash = o.runsLog.envManifestHash();
