@@ -1182,13 +1182,18 @@ export interface BatchReaderLike {
 }
 export interface FidelityRespawnState {
   respawns: number;
-  firstDisposal: BatchChildDisposal | null;
+  firstDisposalNote: string | null; // describeDisposal of the first dead child, for died-twice
 }
 export async function readObjectWithOneRespawn<C extends BatchReaderLike>(
   holder: { child: C },
   spawnReplacement: () => C,
   expected: BatchExpectation,
   state: FidelityRespawnState,
+  // called AFTER the dead child's disposal is captured and BEFORE the replacement spawns: the
+  // battery persists a fidelity-respawn marker here so the ≤1 allowance is DURABLE before it
+  // is spent — an interrupted invocation must not refund it on resume. A throw from this
+  // callback aborts the read (no replacement spawns) and propagates as a battery abort.
+  onRespawn?: (firstDisposalNote: string) => void,
 ): Promise<BatchFrame> {
   try {
     return await holder.child.readObject(expected);
@@ -1197,16 +1202,17 @@ export async function readObjectWithOneRespawn<C extends BatchReaderLike>(
     // condition that poisoned it) — without it the surviving message is only the second
     // failure's (runT2c's own discipline, mirrored verbatim)
     if (state.respawns >= 1)
-      throw new UnitFailure(`batch child died twice: ${e instanceof Error ? e.message : String(e)}${state.firstDisposal === null ? "" : ` — first child: ${describeDisposal(state.firstDisposal)}`}`);
+      throw new UnitFailure(`batch child died twice: ${e instanceof Error ? e.message : String(e)}${state.firstDisposalNote === null ? "" : ` — first child: ${state.firstDisposalNote}`}`);
     state.respawns++;
-    state.firstDisposal = await holder.child.dispose();
+    state.firstDisposalNote = describeDisposal(await holder.child.dispose());
+    onRespawn?.(state.firstDisposalNote);
     holder.child = spawnReplacement();
     try {
       return await holder.child.readObject(expected);
     } catch (e2) {
       // an immediately-failing replacement is the same double death — the first child's
       // retained diagnosis must survive on exactly the path where it matters most
-      throw new UnitFailure(`batch child died twice: ${e2 instanceof Error ? e2.message : String(e2)}${state.firstDisposal === null ? "" : ` — first child: ${describeDisposal(state.firstDisposal)}`}`);
+      throw new UnitFailure(`batch child died twice: ${e2 instanceof Error ? e2.message : String(e2)}${state.firstDisposalNote === null ? "" : ` — first child: ${state.firstDisposalNote}`}`);
     }
   }
 }
@@ -1223,12 +1229,17 @@ export interface FidelityLogState {
   // would launder them
   driverFailures: Set<string>;
   operationalAborts: Map<string, number>; // "kind|driver" → recorded operational-abort count
+  // "kind|driver" → the first dead child's recorded disposal note: the ≤1 respawn allowance is
+  // DURABLE (2026-08-02 decision batch, round-3 fix) — a fidelity-respawn marker lands before
+  // the replacement spawns, so an interrupted invocation cannot refund the allowance on resume
+  respawnsUsed: Map<string, string>;
 }
 export function classifyFidelityLog(lines: readonly string[], digest: string): FidelityLogState {
   const passed = new Set<string>();
   const failed = new Set<string>();
   const driverFailures = new Set<string>();
   const operationalAborts = new Map<string, number>();
+  const respawnsUsed = new Map<string, string>();
   for (const [i, line] of lines.entries()) {
     if (line.trim() === "") continue;
     let rec: Record<string, unknown>;
@@ -1247,9 +1258,11 @@ export function classifyFidelityLog(lines: readonly string[], digest: string): F
       operationalAborts.set(key, (operationalAborts.get(key) ?? 0) + 1);
     } else if (rec["type"] === "fidelity-driver-failure") {
       driverFailures.add(`${String(rec["fixture"])}|${String(rec["driver"])}`);
+    } else if (rec["type"] === "fidelity-respawn") {
+      respawnsUsed.set(`${String(rec["fixture"])}|${String(rec["driver"])}`, typeof rec["firstChild"] === "string" ? rec["firstChild"] : "");
     }
   }
-  return { passed, failed, driverFailures, operationalAborts };
+  return { passed, failed, driverFailures, operationalAborts, respawnsUsed };
 }
 
 // The C6 fidelity battery (§4.2): untimed, once per (fixture, driver), gate-relevant — a
@@ -1289,7 +1302,7 @@ async function cmdFidelity(): Promise<void> {
   // spent — the operator investigates the harness fault rather than retrying forever).
   const logState: FidelityLogState = existsSync(fidelityLogPath)
     ? classifyFidelityLog(readFileSync(fidelityLogPath, "utf8").split("\n"), digest)
-    : { passed: new Set<string>(), failed: new Set<string>(), driverFailures: new Set<string>(), operationalAborts: new Map<string, number>() };
+    : { passed: new Set<string>(), failed: new Set<string>(), driverFailures: new Set<string>(), operationalAborts: new Map<string, number>(), respawnsUsed: new Map<string, string>() };
   if (logState.failed.size > 0)
     throw new Error(`REFUSING: fidelity.jsonl records ${logState.failed.size} pass:false row(s) at the current frozen surface — a fidelity mismatch is never rerunnable (§4.2); the G1 verdict stands`);
   if (logState.driverFailures.size > 0)
@@ -1321,7 +1334,24 @@ async function cmdFidelity(): Promise<void> {
         if ((logState.operationalAborts.get(abortKey) ?? 0) >= 2)
           throw new Error(`REFUSING: fidelity.jsonl records ${logState.operationalAborts.get(abortKey)} operational aborts for ${abortKey} at the current surface — the ≤1 rerun allowance (§4.2/§4.5) is spent; investigate the harness fault`);
         // one respawn per (fixture, driver), spanning its entries — runT2c's per-run allowance
-        const respawnState: FidelityRespawnState = { respawns: 0, firstDisposal: null };
+        // — and DURABLE across invocations: a fidelity-respawn marker recorded at the current
+        // surface seeds the state, so a resumed battery cannot refund a spent allowance
+        // (round-3 fix). The recorded first-child note survives into a resumed died-twice.
+        const respawnState: FidelityRespawnState = {
+          respawns: logState.respawnsUsed.has(abortKey) ? 1 : 0,
+          firstDisposalNote: logState.respawnsUsed.get(abortKey) ?? null,
+        };
+        const persistRespawn = (firstDisposalNote: string): void => {
+          // durable BEFORE the replacement spawns: a marker that cannot land must abort the
+          // read — spending the allowance unrecorded would let an interrupt refund it
+          const marker = { type: "fidelity-respawn", generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, fixture: fixture.kind, driver, firstChild: firstDisposalNote };
+          try {
+            appendFileSync(fidelityLogPath, `${JSON.stringify(marker)}\n`);
+          } catch (appendErr) {
+            log(`RESPAWN MARKER COULD NOT BE APPENDED: ${JSON.stringify(marker)}`);
+            throw new Error(`REFUSING: could not append the fidelity-respawn marker (${appendErr instanceof Error ? appendErr.message : String(appendErr)}) — the ≤1 respawn allowance must be durable before it is spent; the marker is printed above, repair the log medium before re-running`);
+          }
+        };
         for (const entry of fixture.entries) {
           if (logState.passed.has(`${fixture.kind}|${driver}|${entry.path}`)) {
             log(`fidelity ${fixture.kind} ${driver} ${entry.path}: already recorded PASS at this surface — skipping`);
@@ -1472,7 +1502,7 @@ async function cmdFidelity(): Promise<void> {
                 // one-respawn recovery on a rejected read ONLY (2026-08-02 decision batch,
                 // mirroring runT2c §3.1); the missing-frame and hash checks below sit outside
                 // the respawn exactly as they do in the driver
-                const frame = await readObjectWithOneRespawn(holder, spawnFidelityChild, { oid: liveEntry.oid, size: liveEntry.size ?? 0 }, respawnState);
+                const frame = await readObjectWithOneRespawn(holder, spawnFidelityChild, { oid: liveEntry.oid, size: liveEntry.size ?? 0 }, respawnState, persistRespawn);
                 if (frame.kind === "missing")
                   throw new UnitFailure(`object-store corruption: ${entry.path}'s enumerated oid is missing from the acquired store`);
                 if (gitBlobOid(frame.body, fixture.objectFormat) !== liveEntry.oid)

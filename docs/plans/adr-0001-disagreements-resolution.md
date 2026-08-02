@@ -570,9 +570,11 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   subset exists (only same-repository blocks remain), the matrix **halts for §8 freeze repair
   before executing any epilogue row** — the fail-closed posture the second R4 straddle already
   takes — rather than collecting rows this section's interleaving rule pre-declares biased. The
-  junction between the main traversal's tail and the epilogue's first block is unchanged by this
-  amendment (the epilogue was already appended after the main traversal); that residual is
-  recorded in ratification.json's decision-batch amendment entry rather than constrained here.
+  junction between the main traversal's tail and the epilogue's first block remains
+  UNCONSTRAINED by this amendment — the epilogue was already appended after the main traversal,
+  and which drifted block runs first is the interleave construction's own choice; that residual
+  is recorded in ratification.json's decision-batch amendment entry rather than constrained
+  here.
 - **Completion discipline — one frozen replay/invalidation taxonomy** (referenced everywhere
   else; no section defines its own): eligibility requires all K runs complete (G3).
   **R1/R2, the driver rerun allowance (≤1 per unit × driver):** a network-layer error outside any
@@ -594,13 +596,17 @@ deliberately stay clear of. Not scored; evidence for the production caps ADR-000
   classifier can mint, so a persisted row outside those shapes is refused on resume.
   Everything else stays outside the variant and remains a non-rerunnable driver failure,
   enforced by two frozen NEGATIVE sets checked **before every positive arm, the deadline arm
-  included**: the status-line stderr shapes (`The requested URL returned error: …` and
-  `… HTTP code = …` — a secondary-limit 403 over the git transport takes exactly these
-  shapes), and the forbidden-condition set (authentication/credential/permission text and
-  secondary-limit/abuse text), so a forbidden condition governs even when a positive needle
+  included**: the status-line stderr shapes (`The requested URL returned error: …`, and
+  `… HTTP code = …` with a status-driven code — curl's `HTTP code = 0` (no HTTP response at
+  all) and `HTTP code = 200` (breakage after a successful status) are exempt, since the
+  transport class governs those two, while a secondary-limit 403 over the git transport takes
+  exactly the status-driven shapes), and the forbidden-condition set
+  (authentication/credential/permission text, plus production's secondary-limit vocabulary
+  verbatim: `secondary rate limit` / `abuse detection` / `abuse rate limit`), so a forbidden
+  condition governs even when a positive needle
   co-occurs beside it or the child was deadline-killed after printing it. An `RPC failed;
-  HTTP/2 stream …` protocol breakage carries no status and stays in the admitted reset
-  class. Local git
+  HTTP/2 stream …` protocol breakage carries no status and is itself a frozen reset-class
+  needle. Local git
   operations (init / remote-add / checkout / rev-parse / ls-tree, and the cat-file batch
   reader), unrecognised stderr, and budget conditions are likewise outside the variant. For
   the scaffolding fetch, the §4.4 pinned-object classifier still adjudicates FIRST — its
@@ -942,9 +948,10 @@ the environment hash on `phase:"matrix"` rows; the pilot artifact carries no env
 there it is a discipline rather than a gate), with an environment manifest (OS and
 version, hardware identifier hash, git/Bun/gh versions, network location description, credential
 type, and the authenticated-login fingerprint from §4.8) written as an `env-manifest` row at each
-engine start (five in the committed log; the fidelity battery produces gate-relevant evidence
-without one). Those five are NOT byte-identical — each carries the harness commit of the invocation
-that wrote it, so the pre-remediation pilot rows differ from the later ones in commit and hash — and stamped BY HASH into every `runs.jsonl` run record alongside the harness commit
+engine start (one per recorded invocation in the committed log; the fidelity battery produces
+gate-relevant evidence
+without one). Those manifests are NOT byte-identical — each carries the harness commit of the invocation
+that wrote it, so the pre-remediation pilot rows differ from the later ones in commit and hash (and the decision-batch pilot re-run additionally in login and network description) — and stamped BY HASH into every `runs.jsonl` run record alongside the harness commit
 SHA, which is provenance only: resume refuses any row whose stamped environment hash or
 frozen-surface digest differs from the current one.
 Local-subprocess wall times and remote-API wall times are only comparable when both were measured

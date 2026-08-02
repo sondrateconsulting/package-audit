@@ -625,11 +625,24 @@ describe("classifyGitTransportFailure — §4.5's typed git-transport variant is
     expect(classifyGitTransportFailure("clone", settled(124, "fatal: unable to access 'https://x/': The requested URL returned error: 403", true))).toBeNull();
     expect(classifyGitTransportFailure("scaffold-fetch", settled(124, "error: RPC failed; result=22, HTTP code = 429", true))).toBeNull();
   });
-  test("an HTTP/2 protocol breakage carries no status and stays in the admitted reset class", () => {
-    // "RPC failed; HTTP/2 stream …" must NOT be swallowed by the status guard — it is a
-    // mid-transfer network breakage, exactly the condition §4.5's reset class admits
-    const stderr = "error: RPC failed; HTTP/2 stream 0 was not closed cleanly: CANCEL (err 8)\nfatal: early EOF";
-    expect(classifyGitTransportFailure("clone", settled(128, stderr))).toEqual({ op: "clone", exitCode: 128, networkClass: "reset" });
+  test("an HTTP/2 protocol breakage is a frozen reset needle, with or without a companion line", () => {
+    // "RPC failed; HTTP/2 stream …" carries no status: it must not be swallowed by the status
+    // guard AND must classify on its own — the round-1 fixture only classified because its
+    // companion "early EOF" matched (a round-3 reviewer proved the bare shape fell to null)
+    const bare = "error: RPC failed; HTTP/2 stream 0 was not closed cleanly: CANCEL (err 8)";
+    expect(classifyGitTransportFailure("clone", settled(128, bare))).toEqual({ op: "clone", exitCode: 128, networkClass: "reset" });
+    expect(classifyGitTransportFailure("clone", settled(128, `${bare}\nfatal: early EOF`))).toEqual({ op: "clone", exitCode: 128, networkClass: "reset" });
+  });
+  test("curl's code-0 and code-200 'HTTP code =' shapes are NOT status-driven — the transport class governs", () => {
+    // "HTTP code = 0" means curl got NO HTTP response; "HTTP code = 200" means the transfer
+    // broke AFTER a successful status. Excluding those (as the blanket needle did) wrongly
+    // permanent-ized genuine network transients; every other code on that line still excludes.
+    expect(classifyGitTransportFailure("clone", settled(128, "error: RPC failed; result=56, HTTP code = 200\nfatal: early EOF")))
+      .toEqual({ op: "clone", exitCode: 128, networkClass: "reset" });
+    expect(classifyGitTransportFailure("clone", settled(128, "error: RPC failed; result=6, HTTP code = 0\nfatal: Could not resolve host: github.com")))
+      .toEqual({ op: "clone", exitCode: 128, networkClass: "dns" });
+    expect(classifyGitTransportFailure("clone", settled(128, "error: RPC failed; result=22, HTTP code = 502\nfatal: early EOF"))).toBeNull();
+    expect(classifyGitTransportFailure("clone", settled(128, "error: RPC failed; result=22, HTTP code = 403\nfatal: early EOF"))).toBeNull();
   });
   test("unrecognised stderr and non-124/128 exits fail closed to null", () => {
     expect(classifyGitTransportFailure("clone", settled(128, "fatal: repository 'https://x/' not found"))).toBeNull();
@@ -643,6 +656,9 @@ describe("classifyGitTransportFailure — §4.5's typed git-transport variant is
     // child was deadline-killed after printing the forbidden line
     expect(classifyGitTransportFailure("clone", settled(128, "fatal: Authentication failed for 'https://x/'\nfatal: early EOF"))).toBeNull();
     expect(classifyGitTransportFailure("clone", settled(128, "You have exceeded a secondary rate limit\nerror: RPC failed; curl 56 Recv failure: Connection reset by peer"))).toBeNull();
+    // production's SECONDARY_BODY_RE trio, verbatim — a round-3 reviewer found the third
+    // phrase missing, which let the canonical abuse wording classify beside a reset needle
+    expect(classifyGitTransportFailure("clone", settled(128, "You have triggered an abuse rate limit\nfatal: early EOF"))).toBeNull();
     expect(classifyGitTransportFailure("clone", settled(124, "fatal: could not read Username for 'https://x/': terminal prompts disabled", true))).toBeNull();
     expect(classifyGitTransportFailure("scaffold-fetch", settled(124, "fatal: Authentication failed for 'https://x/'", true))).toBeNull();
   });
@@ -775,7 +791,7 @@ describe("readObjectWithOneRespawn — the fidelity surrogate mirrors runT2c's �
       return Promise.resolve(mkDisposal(this.tag));
     }
   }
-  const freshState = (): FidelityRespawnState => ({ respawns: 0, firstDisposal: null });
+  const freshState = (): FidelityRespawnState => ({ respawns: 0, firstDisposalNote: null });
   test("a clean first read spawns nothing and leaves the allowance intact", async () => {
     const first = new FakeReader(["ok"], "first");
     const holder = { child: first as FakeReader };
@@ -784,7 +800,7 @@ describe("readObjectWithOneRespawn — the fidelity surrogate mirrors runT2c's �
     const got = await readObjectWithOneRespawn(holder, () => { spawned++; return new FakeReader(["ok"], "spare"); }, EXPECT, state);
     expect(got).toBe(frame);
     expect(spawned).toBe(0);
-    expect(state).toEqual({ respawns: 0, firstDisposal: null });
+    expect(state).toEqual({ respawns: 0, firstDisposalNote: null });
     expect(holder.child).toBe(first);
   });
   test("a first death disposes the dead child, respawns once, and a successful replacement succeeds", async () => {
@@ -796,8 +812,43 @@ describe("readObjectWithOneRespawn — the fidelity surrogate mirrors runT2c's �
     expect(got).toBe(frame);
     expect(first.disposed).toBe(true); // the diagnosis was captured before the replacement ran
     expect(state.respawns).toBe(1);
-    expect(state.firstDisposal?.stderrTail).toEqual(bytes("fatal: first"));
+    expect(state.firstDisposalNote).toContain("fatal: first");
     expect(holder.child).toBe(replacement); // the caller's finally disposes the replacement
+  });
+  test("onRespawn persists the spent allowance BEFORE the replacement spawns, and its throw aborts the read", async () => {
+    // the durability contract (round-3 fix): the battery appends a fidelity-respawn marker in
+    // this callback, so the allowance is on disk before it is used — an interrupt between the
+    // marker and the retry must burn the allowance, never refund it
+    const order: string[] = [];
+    const holder1 = { child: new FakeReader(["die"], "first") as FakeReader };
+    const state1 = freshState();
+    await readObjectWithOneRespawn(
+      holder1,
+      () => { order.push("spawn"); return new FakeReader(["ok"], "replacement"); },
+      EXPECT, state1,
+      (note) => { order.push(`persist:${note.includes("fatal: first")}`); },
+    );
+    expect(order).toEqual(["persist:true", "spawn"]);
+    // a marker that cannot land aborts: no replacement spawns, the persist error propagates
+    const holder2 = { child: new FakeReader(["die"], "first") as FakeReader };
+    let spawned = 0;
+    let thrown: unknown;
+    try {
+      await readObjectWithOneRespawn(holder2, () => { spawned++; return new FakeReader(["ok"], "spare"); }, EXPECT, freshState(), () => {
+        throw new Error("REFUSING: could not append the fidelity-respawn marker");
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect((thrown as Error).message).toContain("fidelity-respawn marker");
+    expect(spawned).toBe(0);
+  });
+  test("classifyFidelityLog reconstructs a spent respawn allowance from the marker, digest-scoped", () => {
+    const digest = "e".repeat(64);
+    const marker = (d: string): string => JSON.stringify({ type: "fidelity-respawn", frozenSurfaceDigest: d, fixture: "clone-symlink", driver: "T2c", firstChild: "exit 1; stderr: fatal: gone" });
+    const s = classifyFidelityLog([marker(digest), marker("f".repeat(64))], digest);
+    expect(s.respawnsUsed.get("clone-symlink|T2c")).toBe("exit 1; stderr: fatal: gone");
+    expect(s.respawnsUsed.size).toBe(1); // the other surface's marker neither counts nor blocks
   });
   test("a dying replacement is the died-twice UnitFailure carrying the FIRST child's diagnosis", async () => {
     const first = new FakeReader(["die"], "first");
@@ -818,7 +869,7 @@ describe("readObjectWithOneRespawn — the fidelity surrogate mirrors runT2c's �
   test("a spent allowance fails a later death immediately — one respawn per (fixture, driver), as runT2c per run", async () => {
     const later = new FakeReader(["die"], "later");
     const holder = { child: later as FakeReader };
-    const state: FidelityRespawnState = { respawns: 1, firstDisposal: mkDisposal("first") };
+    const state: FidelityRespawnState = { respawns: 1, firstDisposalNote: describeDisposal(mkDisposal("first")) };
     let spawned = 0;
     let thrown: unknown;
     try {

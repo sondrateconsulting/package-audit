@@ -232,28 +232,50 @@ export interface GitTransportEvidence {
 }
 
 // Frozen pattern sets, matched case-insensitively against the settled child's stderr. Literal
-// substrings, no regexes: every entry is auditable against the git/curl message it names. The
-// status-bearing needles are the two shapes that carry a NUMERIC HTTP status ("The requested
-// URL returned error: NNN"; older git's "result=22, HTTP code = NNN") — deliberately NOT a
+// substrings (plus two literal code exemptions): every entry is auditable against the git/curl
+// message it names. The status-bearing shapes carry a status-driven failure ("The requested
+// URL returned error: NNN"; older git's "result=NN, HTTP code = NNN") — deliberately NOT a
 // bare "rpc failed; http", which would also match "RPC failed; HTTP/2 stream …", an HTTP/2
-// protocol breakage that carries no status and belongs to the admitted reset class.
-const GIT_HTTP_STATUS_BEARING: readonly string[] = ["the requested url returned error", "http code ="];
+// protocol breakage that carries no status and belongs to the admitted reset class. Two
+// "HTTP code =" values are exempted as NON-status-driven: code 0 (curl got no HTTP response
+// at all — the network class governs) and code 200 (the transfer broke AFTER a successful
+// status — likewise). Every other code on that line is a status-driven failure and excludes.
+const GIT_STATUS_EXEMPT_CODES: readonly string[] = ["http code = 0", "http code = 200"];
+function isStatusBearing(stderr: string): boolean {
+  if (stderr.includes("the requested url returned error")) return true;
+  if (!stderr.includes("http code =")) return false;
+  let stripped = stderr;
+  for (const exempt of GIT_STATUS_EXEMPT_CODES) {
+    // strip only WHOLE exempt codes: "http code = 200" must not swallow "http code = 2001"'s
+    // prefix (no real status starts with 0 or extends 200, but the guard costs nothing)
+    for (;;) {
+      const at = stripped.indexOf(exempt);
+      if (at === -1) break;
+      const next = stripped.charCodeAt(at + exempt.length);
+      const nextIsDigit = next >= 48 && next <= 57;
+      if (nextIsDigit) break; // a longer code — status-bearing; stop stripping this needle
+      stripped = stripped.slice(0, at) + stripped.slice(at + exempt.length);
+    }
+  }
+  return stripped.includes("http code =");
+}
 // The frozen forbidden-condition set: auth/permission/credential and secondary-limit text.
 // §4.5 names these excluded BY CONSTRUCTION; without an explicit negative set that held only
 // while no positive needle co-occurred — an auth failure beside a mid-transfer "early EOF", or
 // a deadline-killed child whose retained stderr shows an auth line, would have classified.
-// Checked with the status needles, before every positive arm.
+// Checked with the status shapes, before every positive arm. The secondary-limit trio mirrors
+// production's SECONDARY_BODY_RE vocabulary (github.ts) verbatim.
 const GIT_FORBIDDEN_CONDITIONS: readonly string[] = [
   "authentication failed", "could not read username", "could not read password",
   "invalid username or password", "terminal prompts disabled", "permission denied",
-  "access denied", "secondary rate limit", "abuse detection", "rate limit exceeded",
-  "support for password authentication was removed",
+  "access denied", "secondary rate limit", "abuse detection", "abuse rate limit",
+  "rate limit exceeded", "support for password authentication was removed",
 ];
 const GIT_NETWORK_PATTERNS: ReadonlyArray<{ networkClass: GitTransportNetworkClass; needles: readonly string[] }> = [
   { networkClass: "dns", needles: ["could not resolve host", "couldn't resolve host", "name or service not known", "temporary failure in name resolution", "no address associated with hostname"] },
   { networkClass: "tls", needles: ["ssl connect error", "ssl_connect", "ssl_read", "ssl_write", "ssl handshake", "gnutls_handshake", "ssl certificate problem", "server certificate verification failed", "unable to get local issuer certificate"] },
   { networkClass: "connect", needles: ["failed to connect", "couldn't connect to server", "connection refused", "connection timed out", "operation timed out", "network is unreachable", "no route to host"] },
-  { networkClass: "reset", needles: ["connection reset", "recv failure", "send failure", "remote end hung up unexpectedly", "early eof", "unexpected disconnect while reading sideband packet", "transfer closed with outstanding read data remaining"] },
+  { networkClass: "reset", needles: ["connection reset", "recv failure", "send failure", "remote end hung up unexpectedly", "early eof", "unexpected disconnect while reading sideband packet", "transfer closed with outstanding read data remaining", "http/2 stream"] },
 ];
 
 export function classifyGitTransportFailure(
@@ -268,7 +290,7 @@ export function classifyGitTransportFailure(
   // or auth/secondary line is governed by THAT condition, and a 5xx mid-pack can print a
   // reset-class curl detail beside its status line — in every such mix the forbidden shape is
   // the governing one, and §4.5 forbids it from ever becoming replayable
-  for (const needle of GIT_HTTP_STATUS_BEARING) if (stderr.includes(needle)) return null;
+  if (isStatusBearing(stderr)) return null;
   for (const needle of GIT_FORBIDDEN_CONDITIONS) if (stderr.includes(needle)) return null;
   if (isSyntheticTimeout) return { op, exitCode: 124, networkClass: "timeout" };
   for (const group of GIT_NETWORK_PATTERNS) {
