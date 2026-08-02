@@ -556,7 +556,7 @@ describe("reclaimRunResources — teardown owns the DB, not the happy path (F6)"
     expect(closed).toBe(1);
     expect(failed).toBe(false);
     expect(existsSync(runDir)).toBe(false);
-    for (const suffix of ["", "-wal", "-shm"]) expect(existsSync(`${dbPath}${suffix}`)).toBe(false);
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) expect(existsSync(`${dbPath}${suffix}`)).toBe(false);
     rmSync(root, { recursive: true, force: true });
   });
   test("absent sidecars are not an error — only some of them ever exist", () => {
@@ -620,7 +620,7 @@ describe("sweepUnopenedRunDebris — the AuditDb.open-throws exit reclaims the S
     const root = mkdtempSync(join(tmpdir(), "pa-bench-sweep-"));
     const runDir = mkdirp(join(root, "run"));
     const dbPath = join(root, "run.sqlite");
-    for (const suffix of ["", "-wal", "-shm"]) writeFileSync(`${dbPath}${suffix}`, "x");
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) writeFileSync(`${dbPath}${suffix}`, "x");
     expect(sweepUnopenedRunDebris(runDir, dbPath)).toEqual([]);
     expect(existsSync(runDir)).toBe(false); // the defect: this was previously left behind
     for (const suffix of ["", "-wal", "-shm"]) expect(existsSync(`${dbPath}${suffix}`)).toBe(false);
@@ -654,13 +654,17 @@ describe("sweepUnopenedRunDebris — the AuditDb.open-throws exit reclaims the S
     // check reported a path it could not stat as successfully reclaimed. Only ENOENT is clean.
     const eacces = Object.assign(new Error("permission denied"), { code: "EACCES" });
     const io = { rm: () => {}, lstat: (): never => { throw eacces; } };
-    expect(sweepUnopenedRunDebris("/x/run", "/x/db.sqlite", io)).toEqual(["/x/run", "/x/db.sqlite", "/x/db.sqlite-wal", "/x/db.sqlite-shm"]);
+    expect(sweepUnopenedRunDebris("/x/run", "/x/db.sqlite", io)).toEqual(["/x/run", "/x/db.sqlite", "/x/db.sqlite-wal", "/x/db.sqlite-shm", "/x/db.sqlite-journal"]);
     // and an error with NO code is still unverifiable, never "gone"
     const io2 = { rm: () => {}, lstat: (): never => { throw new Error("no code"); } };
-    expect(sweepUnopenedRunDebris("/x/run", "/x/db.sqlite", io2).length).toBe(4);
+    expect(sweepUnopenedRunDebris("/x/run", "/x/db.sqlite", io2).length).toBe(5);
     // ENOENT alone proves absence
     const io3 = { rm: () => {}, lstat: (): never => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } };
     expect(sweepUnopenedRunDebris("/x/run", "/x/db.sqlite", io3)).toEqual([]);
+    // a NON-OBJECT rejection must not crash the advertised non-throwing contract
+    const io4 = { rm: () => {}, lstat: (): never => { throw null; } };
+    expect(() => sweepUnopenedRunDebris("/x/run", "/x/db.sqlite", io4)).not.toThrow();
+    expect(sweepUnopenedRunDebris("/x/run", "/x/db.sqlite", io4).length).toBe(5);
   });
 });
 
@@ -687,6 +691,7 @@ describe("assertRunPathsFresh — nothing a run will own may pre-exist", () => {
     const dbPath = join(root, "run.sqlite");
     writeFileSync(dbPath, "someone else's data");
     expect(() => assertRunPathsFresh(join(root, "run"), dbPath)).toThrow(dbPath);
+    expect(existsSync(dbPath)).toBe(true); // REFUSED, never deleted — a foreign DB survives intact
     rmSync(dbPath, { force: true });
     writeFileSync(`${dbPath}-wal`, "x");
     expect(() => assertRunPathsFresh(join(root, "run"), dbPath)).toThrow(`${dbPath}-wal`);
@@ -712,7 +717,9 @@ describe("describeUnopenedSweep — the open-failure log never claims a sweep it
 
 describe("runResiduePaths — the residue set is stated in ONE place", () => {
   test("both reclamation paths consume the same four paths", () => {
-    expect(runResiduePaths("/b/run", "/c/x.sqlite")).toEqual(["/b/run", "/c/x.sqlite", "/c/x.sqlite-wal", "/c/x.sqlite-shm"]);
+    expect(runResiduePaths("/b/run", "/c/x.sqlite")).toEqual(["/b/run", "/c/x.sqlite", "/c/x.sqlite-wal", "/c/x.sqlite-shm", "/c/x.sqlite-journal"]);
+    // -journal is load-bearing: the WAL transition runs in rollback mode, so it can be left behind
+    expect(runResiduePaths("/b/run", "/c/x.sqlite")).toContain("/c/x.sqlite-journal");
   });
 });
 

@@ -503,7 +503,12 @@ export function reclaimRunResources(
 // throws). Earlier versions hardcoded this list in each helper and the comments claimed they
 // could not drift; they could, and did.
 export function runResiduePaths(runDir: string, dbPath: string): readonly string[] {
-  return [runDir, dbPath, `${dbPath}-wal`, `${dbPath}-shm`];
+  // -journal is NOT optional here: AuditDb.open ends with `PRAGMA journal_mode = WAL`, and the
+  // delete->wal transition itself runs in ROLLBACK mode, so a failure across that pragma can
+  // leave a rollback journal beside the file. db.ts already treats `-journal` as a real sidecar
+  // in its own recovery path; omitting it here left exactly the class of unreported residue this
+  // whole fix exists to close.
+  return [runDir, dbPath, `${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`];
 }
 
 export interface RunFsIo {
@@ -522,7 +527,10 @@ function stillOnDisk(p: string, io: RunFsIo): boolean {
     io.lstat(p);
     return true;
   } catch (e) {
-    return (e as NodeJS.ErrnoException).code !== "ENOENT";
+    // null/undefined/non-object throws must not crash the "non-throwing" contract this helper
+    // advertises over its injectable seam — anything that is not a recognisable ENOENT is
+    // unverifiable, which counts as residue.
+    return (e as NodeJS.ErrnoException | null | undefined)?.code !== "ENOENT";
   }
 }
 
@@ -554,6 +562,10 @@ export function sweepUnopenedRunDebris(runDir: string, dbPath: string, io: RunFs
   const paths = runResiduePaths(runDir, dbPath);
   for (const p of paths) {
     try {
+      // recursive is applied UNIFORMLY, including to the DB paths, which an earlier version
+      // removed non-recursively. rmSync ignores it for ordinary files; it matters only if a
+      // DIRECTORY were ever found at a DB path, which assertRunPathsFresh plus the atomic runDir
+      // creation exist to rule out. Stated because it is a real widening, not a no-op.
       io.rm(p, { recursive: true, force: true });
     } catch {
       // best-effort — verified below and named in the caller's log either way
@@ -733,7 +745,18 @@ export class BenchEngine {
     // the sweep below and reclaimRunResources delete the whole residue set unconditionally, and
     // neither can destroy a foreign directory or a pre-existing database, because there was none.
     assertRunPathsFresh(runDir, dbPath);
-    mkdirSync(runDir, { recursive: true });
+    // ATOMIC, not check-then-create: benchRoot already exists (a per-process mkdtemp), so a
+    // NON-recursive mkdir either creates runDir or fails EEXIST in one syscall. assertRunPathsFresh
+    // above is a fail-fast diagnostic with a good message; THIS is the ownership proof. An earlier
+    // version used recursive:true, which silently adopts an existing directory and left the
+    // freshness check as the only guard — a check-then-create race a reviewer correctly rejected.
+    try {
+      mkdirSync(runDir);
+    } catch (e) {
+      throw new BenchProtocolError(
+        `could not exclusively create the run directory ${runDir} (${(e as Error).message}) — it must not already exist; measuring inside, or reclaiming, a directory this run did not create is never safe`,
+      );
+    }
     // the open itself can CREATE the file and then fail (WAL/schema initialisation, ENOSPC):
     // nothing downstream owns anything yet — reclaimOnce and the outer finally both live past
     // this line — so a mid-initialisation throw must sweep its own debris here, with the paths
