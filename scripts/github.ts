@@ -1213,8 +1213,17 @@ export const CLONE_GATE_SPACING_MS = 200;
 // sweep reclaims under the SAME ownership rule (see STAGING_PREFIX handling there).
 export const OWNER_MARKER_NAME = ".pkg-audit-owner.json";
 export const STAGING_PREFIX = ".pkg-audit-stage-";
+// The one marker shape, shared by the writer and the reader so the two cannot silently drift
+// apart on a field name (the reader still validates at runtime — an on-disk marker is external
+// data — and keys on `pid` alone: `startedAtIso` is diagnostic, so older or hand-edited markers
+// that carry only a valid pid stay owned).
+export interface OwnerMarker {
+  pid: number;
+  startedAtIso: string;
+}
 function writeOwnerMarker(dir: string): void {
-  writeFileSync(join(dir, OWNER_MARKER_NAME), JSON.stringify({ pid: process.pid, startedAtIso: new Date().toISOString() }), { mode: 0o600 });
+  const marker: OwnerMarker = { pid: process.pid, startedAtIso: new Date().toISOString() };
+  writeFileSync(join(dir, OWNER_MARKER_NAME), JSON.stringify(marker), { mode: 0o600 });
 }
 // Create an owned dir with the given final prefix (e.g. "pkg-audit-"): staged mkdtemp → marker
 // → atomic same-dir rename. Returns the FINAL path.
@@ -1226,13 +1235,31 @@ function makeOwnedDir(root: string, finalPrefix: string): string {
   renameSync(staged, final);
   return final;
 }
-// null = no readable/parseable marker (an unowned dir, swept); a number = the recorded owner pid.
-function readOwnerPid(dir: string): number | null {
+// The marker read is THREE-way, because "no valid marker" conflates two states with opposite
+// safe answers. `unowned` is a PROVEN absence of a live claim: the file does not exist (ENOENT —
+// a legacy dir), or it was read and its content carries no valid pid (publication is atomic via
+// the staged rename above, so a torn write cannot exist — garbage content is a dead writer's
+// residue, never a live sibling's marker mid-write). `unreadable` is everything else: the file
+// may exist but the READ itself failed (EMFILE under fan-out, a transient EACCES/EIO), which
+// proves nothing about ownership — the sweep must retain and warn, the same fail-safe posture
+// `ownerIsAlive` documents below. Collapsing these to one value was fail-OPEN: a read blip on a
+// live sibling's valid marker deleted its clone mid-run, silently.
+type OwnerRead = { kind: "owned"; pid: number } | { kind: "unowned" } | { kind: "unreadable"; error: unknown };
+function readOwnerPid(dir: string): OwnerRead {
+  let raw: string;
   try {
-    const raw = JSON.parse(readFileSync(join(dir, OWNER_MARKER_NAME), "utf8")) as { pid?: unknown };
-    return typeof raw.pid === "number" && Number.isSafeInteger(raw.pid) && raw.pid > 0 ? raw.pid : null;
+    raw = readFileSync(join(dir, OWNER_MARKER_NAME), "utf8");
+  } catch (e) {
+    if (typeof e === "object" && e !== null && (e as { code?: unknown }).code === "ENOENT") return { kind: "unowned" };
+    return { kind: "unreadable", error: e };
+  }
+  try {
+    const parsed = JSON.parse(raw) as { pid?: unknown };
+    return typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0
+      ? { kind: "owned", pid: parsed.pid }
+      : { kind: "unowned" };
   } catch {
-    return null;
+    return { kind: "unowned" }; // the read succeeded; invalid content is a dead writer's residue
   }
 }
 // Is the recorded owner still alive? kill(pid, 0) probes without signalling: ESRCH = dead;
@@ -2664,13 +2691,20 @@ export class GithubClient {
           // dead-owner dirs sweep as before. This process's OWN dirs are also retained by the
           // same rule (their marker carries this live pid), which is correct: its per-unit
           // teardown owns them.
-          const ownerPid = readOwnerPid(full);
-          if (ownerPid !== null && ownerIsAlive(ownerPid)) continue;
+          const owner = readOwnerPid(full);
+          if (owner.kind === "unreadable") {
+            // fail SAFE, the same posture as ownerIsAlive: a marker whose READ failed proves
+            // nothing, and deleting on it would let a transient blip take out a live sibling's
+            // clone. Retain and surface; a genuinely stale dir sweeps on a later startup.
+            warnFailure("owner-marker", full, owner.error, false);
+            continue;
+          }
+          if (owner.kind === "owned" && ownerIsAlive(owner.pid)) continue;
           // A MARKER-LESS staging dir is a sibling MID-CREATION (the marker lands one syscall
           // after mkdtemp) — deleting it would fail the sibling's publication. Retain it; only
           // a staged dir whose recorded owner is DEAD sweeps. The residue this accepts is an
           // EMPTY staged dir per crash inside the two-syscall window — bytes, not clones.
-          if (isStaging && ownerPid === null) continue;
+          if (isStaging && owner.kind === "unowned") continue;
           rmSync(full, { recursive: true, force: true });
         } else {
           unlinkSync(full);

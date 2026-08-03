@@ -3038,6 +3038,36 @@ describe("sweepStaleTempDirs observability (§0)", () => {
     const removeWarnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed" && e.operation === "remove" && String(e.target).endsWith("pkg-audit-stuck"));
     expect(removeWarnings.length).toBe(1); // the non-ENOENT removal failure is surfaced (not the suppressed root path)
   });
+  test("rvo Q2: an UNREADABLE owner marker (transient read failure) RETAINS the dir and warns — never fail-open", () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root ignores modes
+    const root = mkdtempSync(join(tmpdir(), "sweep-marker-"));
+    // The marker records a DEAD owner: if the sweep could read it, the dir would sweep. Retention
+    // therefore proves the unreadable-marker classification, not owner liveness — and it must be
+    // the classification, because the same EACCES/EMFILE/EIO blip on a LIVE sibling's marker
+    // would otherwise delete its clone mid-run (the exact hazard the ownership gate closes).
+    const dir = join(root, "pkg-audit-blip1");
+    mkdirSync(dir);
+    const marker = join(dir, ".pkg-audit-owner.json");
+    writeFileSync(marker, JSON.stringify({ pid: 999_999_999, startedAtIso: "2026-01-01T00:00:00Z" }));
+    chmodSync(marker, 0o000); // readFileSync → EACCES (a stand-in for any transient read failure)
+    const { client } = makeClient([], { tempRoot: root });
+    let removed: string[] = ["sentinel"];
+    let events: Record<string, unknown>[] = [];
+    try {
+      events = captureStdout(() => { removed = client.sweepStaleTempDirs(); });
+    } finally {
+      // best-effort restore so the trailing rmSync can recurse — on the fail-open path under
+      // test the sweep has already deleted the marker, and that deletion is the finding itself
+      try { chmodSync(marker, 0o600); } catch { void 0; }
+    }
+    expect(removed).toEqual([]); // retained: the sweep cannot prove unowned-or-dead
+    expect(existsSync(dir)).toBe(true);
+    const markerWarnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed" && e.operation === "owner-marker");
+    expect(markerWarnings.length).toBe(1); // ...and the ambiguity is surfaced, never silent
+    expect(markerWarnings[0]!.target).toBe(dir);
+    expect(typeof markerWarnings[0]!.message).toBe("string"); // the errno rides along
+    rmSync(root, { recursive: true, force: true });
+  });
 });
 
 // ---- ADR-0001 T2c spawn seam (gitBytes / launchBatchChild / the child permit pool) ------------
@@ -3530,7 +3560,10 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     // marker-less: a legacy leftover from a pre-ownership version
     const legacy = join(root, "pkg-audit-legacy1");
     mkdirSync(legacy);
-    // malformed marker: unreadable ownership is UNOWNED, not retained
+    // malformed marker CONTENT (the read itself succeeded): UNOWNED, not retained — atomic
+    // marker publication means a torn write cannot exist, so garbage is a dead writer's
+    // residue. (A marker whose READ fails is the opposite case: retained — see the
+    // unreadable-marker test in the observability block.)
     const garbled = join(root, "pkg-audit-garbled1");
     mkdirSync(garbled);
     writeFileSync(join(garbled, ".pkg-audit-owner.json"), "not json");
