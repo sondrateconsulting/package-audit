@@ -470,6 +470,39 @@ past tense — a form true after the merge), bench module headers if §4(a).
     exists for an unclean close riding beside a DIFFERENT primary error, which is the
     `finally` path, so no diagnosis is lost. The README sentence tolerates B's reading, so a
     wording tightening is queued for the doc sweep instead of a code change.
-  - Round 2: (running — the round-1 fix commit is itself unreviewed and is the round's
-    priority target)
+  - **Round 2 (A PASS, B FAIL, C FAIL — again not unanimous), verified + fixed at `3cbc59c`.**
+    Aimed at the round-1 fix commit, and it found that fix INCOMPLETE. **P0 (C):** the
+    round-1 copy read caller-controlled ACCESSORS, so a getter could run mid-copy and mutate
+    what the guard consults afterwards (C's scenario overrides `Array.prototype.flatMap`,
+    which `canon()` used, making the guard judge a different argv than the one captured); a
+    prototype-backed hole was also silently materialised into a dense copy, turning a shape
+    `readOnlyGuard` deliberately REFUSES into one it accepts — my round-1 fix had converted a
+    deny into a silent normalise (A found that half independently, rated P3). `copiedArgv` now
+    requires own STRING DATA properties, and `canon()` is an index loop so a polluted
+    `Array.prototype` cannot hand the grammar a token list the spawned argv lacks. **P1 (B):**
+    `gitBytes` still returned on a REJECTED exit promise without settling — `Promise.all` is
+    fail-fast, so the rejection short-circuited the join and left through the `finally` with
+    the pumps unjoined while the caller's failure path deletes the clone; `508e820` had
+    claimed this lane and delivered only its sibling. **P1 (C):** transport counters were
+    emitted only for units that SCANNED, so a unit whose clone exhausted its attempts reported
+    none of the network starts it made — exactly what check 9's accounting exists to show;
+    the event now rides every path with a new `outcome` field (`scanned`/`failed`).
+    **Five P2s, all real:** a child killed after a construction failure was forgotten (dispose
+    reported the "no child was ever needed" clean verdict for a unit whose only child died);
+    the REPLACEMENT child's setup failures still routed through the died-twice wrap; check 7's
+    fan-out demonstration used 4 units against a pool of 2 rather than the configured 64×64
+    ceiling; the production fallback budget was pinned only where the floor of 20 binds (a
+    hardcoded 20 would have passed); and **the previously unlocatable "clean-scan unsubscribe"
+    thread arrived with its citation and was CORRECT** — that fixture drove a head-coherence
+    error on every iteration (`nodesN` pins `hexOid("o0")` while the shim's `rev-parse`
+    defaults to `hexOid("o-main")`), so only the error-path unsubscribe was ever exercised.
+    Also fixed: README's "at most `repositories` subprocesses ever run at once", which this
+    PR's own second pool falsified (now stated as both pools, worst case `repositories × 2`).
+    **The abort-subscription scope `db2c348` fixed was itself UNPINNED** — the existing fixture
+    parks its sibling mid-clone, before any store exists — so a new fixture sequences the
+    sibling's fatal INTO the teardown window. New tests for the `gitBytes` settle, that
+    subscription scope, the computed budget term and the unsubscribe fixture were all
+    **mutation-verified** against the production code they claim to pin. A's remaining
+    findings were P3 notes it self-refuted or doc-sweep items already queued.
+  - Round 3: (running)
 - Doc-sweep codex prose pass: (pending)
