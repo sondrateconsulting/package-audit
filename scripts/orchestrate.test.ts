@@ -2,12 +2,12 @@ import { expect, test, describe, spyOn } from "bun:test";
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { cloneReader, walkClone, discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
-import type { TreeEntry } from "./unitPipeline.ts";
+import { discoverCliTerms, discoverOwnerRepos, planSummaryText, processOwner, processRepo, reconcileIntrospection, resolveOwnersWithDiscovery, runPlan, runScan, runSummaryText, type AuditRuntime, type PlanTotals } from "./orchestrate.ts";
 import { classifyBranchPlan } from "./branchPlanner.ts";
 import { compileBranchPolicy, PolicyMatchError } from "./branchPolicy.ts";
 import { compileRepositoryPolicy, RepoPolicyMatchError } from "./repositoryPolicy.ts";
-import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type RepoInfo, type SpawnFn } from "./github.ts";
+import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type LaunchedChild, type LaunchFn, type RepoInfo, type SpawnFn, type StreamReader } from "./github.ts";
+import { gitBlobOid } from "./gitFrame.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
 import { Aborter } from "./boundedPool.ts";
 import type { Config } from "./config.ts";
@@ -38,11 +38,177 @@ const rt = (config: Config, configHash = "hash"): AuditRuntime => ({
 // An empty repository denylist for the discoverOwnerRepos call sites that don't exercise repo policy.
 const NO_DENY = compileRepositoryPolicy([]);
 
+// ---- T2c content-seam fakes (the acquisition + enumeration + framed child) -------------------
+// The scan path no longer fetches trees/contents over REST: units clone (a git spawn), then
+// enumerate and read through the interactive seams. These fakes serve that path structurally.
+const te = new TextEncoder();
+
+// A pull-queue byte stream matching the structural reader shape.
+function byteQueueStream(): { feed: (b: Uint8Array | string) => void; close: () => void; getReader: () => StreamReader } {
+  const pending: Array<(r: { done?: boolean; value?: Uint8Array }) => void> = [];
+  const queue: Uint8Array[] = [];
+  let closed = false;
+  return {
+    feed(b) {
+      const bytes = typeof b === "string" ? te.encode(b) : b;
+      const w = pending.shift();
+      if (w !== undefined) w({ value: bytes });
+      else queue.push(bytes);
+    },
+    close() {
+      closed = true;
+      for (const w of pending.splice(0)) w({ done: true });
+    },
+    getReader: () => ({
+      read: () =>
+        new Promise((resolve) => {
+          const it = queue.shift();
+          if (it !== undefined) return resolve({ value: it });
+          if (closed) return resolve({ done: true });
+          pending.push(resolve);
+        }),
+      cancel: async () => undefined,
+    }),
+  };
+}
+
+// A minimal well-behaved batch child: each stdin oid line yields one frame from `bodies`
+// (or a missing record); stdin close exits 0. The pid sits above the platform pid ceiling.
+function frameChildFor(bodies: Map<string, Uint8Array>): LaunchedChild {
+  const out = byteQueueStream();
+  const errS = byteQueueStream();
+  let exitResolve!: (c: number) => void;
+  const exited = new Promise<number>((r) => (exitResolve = r));
+  let exitDone = false;
+  const exit = (c: number): void => {
+    if (exitDone) return;
+    exitDone = true;
+    exitResolve(c);
+    out.close();
+    errS.close();
+  };
+  return {
+    pid: 4_242_424,
+    stdout: { getReader: () => out.getReader() },
+    stderr: { getReader: () => errS.getReader() },
+    stdin: {
+      write: (d: Uint8Array) => {
+        const oid = new TextDecoder().decode(d).trim();
+        const body = bodies.get(oid);
+        if (body === undefined) out.feed(`${oid} missing\n`);
+        else {
+          out.feed(`${oid} blob ${body.byteLength}\n`);
+          out.feed(body);
+          out.feed("\n");
+        }
+        return d.byteLength;
+      },
+      flush: () => undefined,
+      end: () => exit(0),
+    },
+    exited,
+    kill: () => exit(137),
+    unref: () => undefined,
+  };
+}
+
+// `ls-tree -r -z -l` bytes + the frame bodies for a file map (mode 100644) and optional
+// mode-120000 symlink paths (whose content travels the REST fallback, never a frame).
+function lsFixture(files: Record<string, string>, symlinks: string[] = []): { bytes: Uint8Array; bodies: Map<string, Uint8Array> } {
+  const bodies = new Map<string, Uint8Array>();
+  let listing = "";
+  for (const [path, text] of Object.entries(files)) {
+    const body = te.encode(text);
+    const oid = gitBlobOid(body, "sha1");
+    bodies.set(oid, body);
+    listing += `100644 blob ${oid} ${body.byteLength}\t${path}\0`;
+  }
+  for (const p of symlinks) listing += `120000 blob ${"ab".repeat(20)} 17\t${p}\0`;
+  return { bytes: te.encode(listing), bodies };
+}
+
+// The content-seam stubs a partial (`as unknown as GithubClient`) test client needs so
+// processUnit's capability wiring works end to end: a REAL contained clone dir, the
+// enumeration bytes, the framed child, and a free child permit.
+function contentSeams(root: string, files: Record<string, string>, symlinks: string[] = []) {
+  const { bytes, bodies } = lsFixture(files, symlinks);
+  return {
+    tempRoot: root,
+    cloneNoCheckout: async (): Promise<{ dir: string; cloneAttempts: number }> => {
+      const dir = join(mkdtempSync(join(root, "pkg-audit-")), "clone");
+      mkdirSync(dir, { recursive: true });
+      return { dir, cloneAttempts: 1 };
+    },
+    gitBytes: async (): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array; timedOut: boolean }> => ({
+      exitCode: 0, stdout: bytes, stderr: new Uint8Array(0), timedOut: false,
+    }),
+    launchBatchChild: (): LaunchedChild => frameChildFor(bodies),
+    acquireChildPermit: async (): Promise<() => void> => () => undefined,
+  };
+}
+
 // Scripted client factory — every test client shares this boilerplate (offline binPaths, noop
 // sleep, tempRoot under the test dir) and differs ONLY in its spawn script and cache role.
-function makeClient(root: string, spawnImpl: SpawnFn, opts: { db?: AuditDb | null } = {}): GithubClient {
+// Since the T2c cutover the scan path's git spawns (clone + rev-parse) and enumeration
+// (ls-tree via the interactive seam) are answered by DEFAULT shims here: a clone materialises
+// its dest and records its branch; rev-parse echoes the discovery convention's oid for that
+// clone's branch (override per test via headOidFor); ls-tree serves `repoFiles` (default: an
+// empty listing = an empty repo, the pre-cutover treeBody(args) parity); cat-file serves the
+// same fixture's bodies. gh argv still flows to the test's own spawnImpl untouched.
+function makeClient(
+  root: string,
+  spawnImpl: SpawnFn,
+  opts: {
+    db?: AuditDb | null;
+    repoFiles?: Record<string, string>;
+    symlinks?: string[];
+    headOidFor?: (branch: string) => string;
+    afterClone?: (dest: string) => void;
+    launchImpl?: LaunchFn;
+  } = {},
+): GithubClient {
+  const headOidFor = opts.headOidFor ?? ((b: string) => hexOid(`o-${b}`));
+  const { bytes, bodies } = lsFixture(opts.repoFiles ?? {}, opts.symlinks ?? []);
+  const branchByDest = new Map<string, string>();
+  const gitShim: SpawnFn = async (bin, args, sOpts) => {
+    if (args[0] === "clone") {
+      const dest = args[args.length - 1]!;
+      const branchAt = args.indexOf("--branch");
+      branchByDest.set(dest, branchAt === -1 ? "" : (args[branchAt + 1] ?? ""));
+      mkdirSync(dest, { recursive: true });
+      opts.afterClone?.(dest);
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "rev-parse") {
+      const branch = branchByDest.get(sOpts.cwd ?? "") ?? "";
+      return { exitCode: 0, stdout: `${headOidFor(branch)}\n`, stderr: "" };
+    }
+    return spawnImpl(bin, args, sOpts);
+  };
+  const launchImpl: LaunchFn =
+    opts.launchImpl ??
+    ((_bin, args) => {
+      if (args[0] === "ls-tree") {
+        // a completed one-shot child: the full listing queued, both streams closed, exit 0
+        const out = byteQueueStream();
+        const errS = byteQueueStream();
+        out.feed(bytes);
+        out.close();
+        errS.close();
+        return {
+          pid: 4_242_424,
+          stdout: { getReader: () => out.getReader() },
+          stderr: { getReader: () => errS.getReader() },
+          stdin: null,
+          exited: Promise.resolve(0),
+          kill: () => undefined,
+          unref: () => undefined,
+        };
+      }
+      return frameChildFor(bodies);
+    });
   return new GithubClient({
-    githubHost: "github.com", db: opts.db ?? null, spawnImpl,
+    githubHost: "github.com", db: opts.db ?? null, spawnImpl: gitShim, launchImpl,
     sleepImpl: async () => {},
     env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
   });
@@ -1015,27 +1181,26 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("clone-fallback with a MOVED branch: both run_unit_head AND work_queue pin the clone HEAD's sha+date", async () => {
+  test("a MOVED branch (clone HEAD != discovery pin) fails the unit CLOSED — the disclosed §7.2 change from the retired accept-moved fallback", async () => {
     const root = mkdtempSync(join(tmpdir(), "clone-move-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
-    // discovery: main@o-main dated 2025-06-01. The tree is TRUNCATED → clone fallback, and the clone
-    // HEAD has MOVED to o-moved dated 2025-06-15 (branch advanced between discovery and the clone).
+    // discovery: main@o-main. The clone lands on a HEAD that moved to o-moved: the ratified
+    // §3.1(2) coherence gate refuses it (the retired checkout fallback ACCEPTED the moved head
+    // and recorded the clone's real HEAD — that behavior is deliberately gone). Transient:
+    // self-heals via the next run's re-discovery.
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
-      if (args[0] === "clone") { const dest = args[args.length - 1]!; mkdirSync(dest, { recursive: true }); writeFileSync(join(dest, "package.json"), "{}"); return { exitCode: 0, stderr: "", stdout: "" }; }
-      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: hexOid("o-moved") + "\n" };
-      if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
-      return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // REST tree → truncated
-    });
-    await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
-    // the durable row pins the SCANNED (clone) commit + its OWN date — never the stale discovered date
-    expect(headRowsOf(db, runId)).toEqual([
-      { branch: "main", status: "scanned", sha: hexOid("o-moved"), d: 1, ps: null, pat: null, scd: "2025-06-15T09:00:00+00:00" },
-    ]);
-    const unit = db.getUnit(key("main")); // the work-queue pair matches (the stale-date fix)
-    expect(unit?.lastCommitSha).toBe(hexOid("o-moved"));
-    expect(unit?.lastCommitDate).toBe("2025-06-15T09:00:00+00:00");
+      throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
+    }, { headOidFor: () => hexOid("o-moved") });
+    const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(db.getUnit(key("main"))?.status).toBe("error"); // failed closed, never scanned at either head
+    const errs = db.read(`SELECT message FROM errors WHERE run_id = ? AND scope = 'scan'`).all(runId) as Array<{ message: string }>;
+    expect(errs.length).toBe(1);
+    expect(errs[0]!.message).toMatch(/does not match the discovery-pinned/);
+    // no run_unit_head row is written for the failed unit (the scan-error arm writes none)
+    expect(headRowsOf(db, runId)).toEqual([]);
+    expect(events.filter((e) => e.event === "unit" && e.action === "error").length).toBe(1);
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -1046,11 +1211,8 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const runId = startScanRun(db);
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
-      if (args[0] === "clone") { const dest = args[args.length - 1]!; mkdirSync(dest, { recursive: true }); writeFileSync(join(dest, "package.json"), "{}"); return { exitCode: 0, stderr: "", stdout: "" }; }
-      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: "not-a-hex-sha\n" }; // hostile/garbled clone HEAD
-      if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
-      return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // truncated → clone fallback
-    });
+      throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
+    }, { headOidFor: () => "not-a-hex-sha" }); // hostile/garbled clone HEAD
     await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
     expect(db.getUnit(key("main"))?.status).toBe("error"); // rejected loud — never persisted as the scanned commit
     expect((db.read(`SELECT COUNT(*) AS n FROM errors WHERE run_id = ? AND scope = 'scan'`).get(runId) as { n: number }).n).toBeGreaterThan(0);
@@ -1058,20 +1220,60 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("a walkClone failure on a TRUNCATED tree fails the unit LOUD and still reclaims the clone temp dir (no leak)", async () => {
+  test("check 8: the per-unit content-transport event separates canonical reads, symlink fallbacks, budget, and clone attempts", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ct-event-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      if (args.some((a) => a.includes("/contents/"))) return { exitCode: 0, stderr: "", stdout: "HTTP/2.0 200 X\r\n\r\n#!/bin/sh\n" };
+      throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
+    }, {
+      repoFiles: { "package.json": "{}" }, // read canonically (manifest pass + the CLI-kind pass)
+      symlinks: ["tools/run.sh"], // a CLI-kind SYMLINK: its read rides the REST fallback lane
+    });
+    const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(db.getUnit(key("main"))?.status).toBe("done");
+    const ct = events.filter((e) => e.event === "content-transport");
+    expect(ct.length).toBe(1); // ONE event per scanned unit
+    expect(ct[0]).toMatchObject({
+      org: "org-a", repo: "svc", branch: "main", commit: hexOid("o-main"),
+      localCanonicalReads: 2, // package.json: the manifest pass + the CLI-kind pass
+      symlinkFallbackReads: 1, // tools/run.sh via the REST dereference lane
+      fallbackBudgetSpend: 1,
+      fallbackBudget: 20, // max(20, ceil(10% of 2 eligible)) — the floor binds
+      cloneAttempts: 1, cloneRetries: 0, childRespawns: 0,
+    });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a FAILED enumeration (store open) fails the unit LOUD and still reclaims the clone temp dir (no leak)", async () => {
     const root = mkdtempSync(join(tmpdir(), "clone-leak-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
-    // truncated tree → clone fallback; the clone "succeeds" but the dest dir is never materialized, so
-    // walkClone's readdirSync throws (a deterministic stand-in for an EACCES/EIO walk failure on a real
-    // large clone). Since walkClone now throws, the clone temp dir must be reclaimed by processUnit's
-    // cleanup, not leaked until the next startup sweep.
+    // the clone succeeds; the guarded enumeration then exits nonzero, so openUnitContentStore
+    // refuses BEFORE parsing (a failed capture must never read as an empty repo). Since the
+    // store never opens, processUnit's teardown path must reclaim the clone temp dir itself,
+    // not leak it until the next startup sweep.
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
-      if (args[0] === "clone") return { exitCode: 0, stderr: "", stdout: "" }; // exits 0 but creates no dest
-      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: hexOid("o-moved") + "\n" };
-      if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
-      return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // truncated → clone fallback
+      throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
+    }, {
+      launchImpl: (_bin, args) => {
+        if (args[0] !== "ls-tree") throw new Error(`unexpected interactive launch: ${args.join(" ")}`);
+        const out = byteQueueStream();
+        const errS = byteQueueStream();
+        errS.feed("fatal: not a git repository\n");
+        out.close();
+        errS.close();
+        return {
+          pid: 4_242_424,
+          stdout: { getReader: () => out.getReader() },
+          stderr: { getReader: () => errS.getReader() },
+          stdin: null, exited: Promise.resolve(128), kill: () => undefined, unref: () => undefined,
+        };
+      },
     });
     await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
     expect(db.getUnit(key("main"))?.status).toBe("error"); // failed loud, never silently marked scanned
@@ -1092,17 +1294,12 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     let runDir = "";
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
-      if (args[0] === "clone") {
-        const dest = args[args.length - 1]!;
-        mkdirSync(dest, { recursive: true });
-        writeFileSync(join(dest, "package.json"), "{}");
+      throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
+    }, {
+      afterClone: (dest) => {
         runDir = dirname(dest);
-        chmodSync(runDir, 0o555); // read+exec but NOT writable → the finally's rmSync can't unlink → EACCES
-        return { exitCode: 0, stderr: "", stdout: "" };
-      }
-      if (args[0] === "rev-parse") return { exitCode: 0, stderr: "", stdout: hexOid("o-moved") + "\n" };
-      if (args[0] === "show") return { exitCode: 0, stderr: "", stdout: "2025-06-15T09:00:00+00:00\n" };
-      return { exitCode: 0, stderr: "", stdout: treeBody(args, true) }; // truncated → clone fallback
+        chmodSync(runDir, 0o555); // read+exec but NOT writable → the teardown's rmSync can't unlink → EACCES
+      },
     });
     try {
       const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
@@ -1549,11 +1746,12 @@ const config = Object.freeze({
 }) as unknown as Config;
 const KEY: WorkUnitKey = { configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "main" };
 
-// only the methods each function touches before the injected failure fires.
+// only the methods each function touches before the injected failure fires — the earliest
+// content-path seam is now the unit's acquisition (cloneNoCheckout).
 const fakeClient = (failure: Error): GithubClient =>
   ({
     listBranchHeads: async () => liveSnapshot,
-    fetchTreeRecursive: async () => { throw failure; },
+    cloneNoCheckout: async () => { throw failure; },
   }) as unknown as GithubClient;
 
 const openRun = (): { db: AuditDb; runId: string } => {
@@ -1596,12 +1794,14 @@ describe("processRepo throttle requeue (§4)", () => {
       excludeDirGlobs: [],
     } as unknown as Config;
     const { db, runId } = openRun();
+    const root = mkdtempSync(join(tmpdir(), "stub-throttle-"));
     const client = {
       listBranchHeads: async () => liveSnapshot,
-      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      ...contentSeams(root, {}, ["package.json"]), // the manifest is a SYMLINK: its read rides the REST fallback lane
       fetchFileRaw: async () => { throw new ThrottleExhausted("core bucket"); },
     } as unknown as GithubClient;
     await processRepo(db, client, rt(scanConfig, "hash"), runId, "o", repo, [], new Set());
+    rmSync(root, { recursive: true, force: true });
     expect(db.getUnit(KEY)?.status).toBe("pending"); // requeued: a later run re-reads the head
     expect(db.read("SELECT message FROM errors").all().length).toBe(0);
     db.close();
@@ -1618,12 +1818,14 @@ describe("processRepo throttle requeue (§4)", () => {
       excludeDirGlobs: [],
     } as unknown as Config;
     const { db, runId } = openRun();
+    const root = mkdtempSync(join(tmpdir(), "stub-403-"));
     const client = {
       listBranchHeads: async () => liveSnapshot,
-      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      ...contentSeams(root, {}, ["package.json"]), // symlink manifest: the read rides the REST fallback lane
       fetchFileRaw: async () => { throw new GithubApiError("HTTP 403 (permission/forbidden) (repos/o/r/contents/package.json)", { status: 403 }); },
     } as unknown as GithubClient;
     await processRepo(db, client, rt(scanConfig, "hash"), runId, "o", repo, [], new Set());
+    rmSync(root, { recursive: true, force: true });
     expect(db.getUnit(KEY)?.status).toBe("error");
     const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all() as Array<{ message: string }>;
     expect(errs.length).toBe(1);
@@ -1641,12 +1843,14 @@ describe("processRepo throttle requeue (§4)", () => {
       excludeDirGlobs: [],
     } as unknown as Config;
     const { db, runId } = openRun();
+    const root = mkdtempSync(join(tmpdir(), "stub-noresp-"));
     const client = {
       listBranchHeads: async () => liveSnapshot,
-      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      ...contentSeams(root, {}, ["package.json"]), // symlink manifest: the read rides the REST fallback lane
       fetchFileRaw: async () => { throw new GithubApiError("gh api produced no HTTP response: spawn timed out", { status: 0 }); },
     } as unknown as GithubClient;
     await processRepo(db, client, rt(scanConfig, "hash"), runId, "o", repo, [], new Set());
+    rmSync(root, { recursive: true, force: true });
     expect(db.getUnit(KEY)?.status).toBe("error");
     expect(db.read("SELECT message FROM errors WHERE scope='scan'").all().length).toBe(1);
     db.close();
@@ -1662,12 +1866,14 @@ describe("processRepo throttle requeue (§4)", () => {
       excludeDirGlobs: [],
     } as unknown as Config;
     const { db, runId } = openRun();
+    const root = mkdtempSync(join(tmpdir(), "stub-404-"));
     const client = {
       listBranchHeads: async () => liveSnapshot,
-      fetchTreeRecursive: async () => ({ truncated: false, paths: [{ path: "package.json", type: "blob", sha: "c".repeat(40), size: 20 }] }),
+      ...contentSeams(root, {}, ["package.json"]), // symlink manifest: the read rides the REST fallback lane
       fetchFileRaw: async () => { throw new GithubApiError("HTTP 404 (repos/o/r/contents/package.json)", { status: 404 }); },
     } as unknown as GithubClient;
     await processRepo(db, client, rt(scanConfig, "hash"), runId, "o", repo, [], new Set());
+    rmSync(root, { recursive: true, force: true });
     expect(db.getUnit(KEY)?.status).toBe("done");
     expect(db.read("SELECT message FROM errors").all().length).toBe(0);
     db.close();
@@ -1701,11 +1907,11 @@ describe("same-name stale-head retention is DISPOSITION-AGNOSTIC", () => {
       ],
       defaultBranch: "main",
     };
-    const treesRequested: string[] = [];
+    const clonesRequested: string[] = [];
     const client = {
       listBranchHeads: async () => snapshot,
-      fetchTreeRecursive: async (_o: string, _r: string, treeOid: string) => {
-        treesRequested.push(treeOid);
+      cloneNoCheckout: async (_o: string, _r: string, branch: string, pinnedOid: string) => {
+        clonesRequested.push(`${branch}@${pinnedOid}`);
         throw new GithubApiError("scan boom", { endpoint: "x" });
       },
     } as unknown as GithubClient;
@@ -1723,7 +1929,7 @@ describe("same-name stale-head retention is DISPOSITION-AGNOSTIC", () => {
       defaultBranch: "main",
     };
     await processRepo(db, client, rt(cutoffConfig, "hash"), runId, "o", repo, [], new Set());
-    expect(treesRequested).toContain("f".repeat(40)); // the ADVANCED head really was scan-attempted (toScan, not re-skipped)
+    expect(clonesRequested).toContain(`feat@${"e".repeat(40)}`); // the ADVANCED head really was scan-attempted (toScan, not re-skipped)
     const row2 = db.read("SELECT status, commit_sha, scanned_commit_date, policy_status, policy_matched_pattern FROM run_unit_head WHERE branch='feat'").get() as { status: string; commit_sha: string; scanned_commit_date: string; policy_status: string | null; policy_matched_pattern: string | null };
     expect(row2.status).toBe("skipped-cutoff"); // the PRIOR disposition survives — neither scanned nor pruned
     expect(row2.commit_sha).toBe(""); // still the non-scanned sentinel
@@ -1827,65 +2033,8 @@ describe("runScan owner-discovery throttle (§4, site a — consumer wiring)", (
   });
 });
 
-describe("clone-fallback readers fail closed (§5.C)", () => {
-  const dummyEntry: TreeEntry = { path: "x", type: "blob", sha: "", size: 0 };
-
-  test("cloneReader PROPAGATES a read failure (a dir at the blob path → EISDIR) instead of degrading to null", async () => {
-    // A file the walk just enumerated from a completed clone is never a benign 404; a read failure
-    // means the snapshot was not fully read. The old blanket catch returned null → under-report.
-    const dir = mkdtempSync(join(tmpdir(), "clonereader-"));
-    mkdirSync(join(dir, "notafile"));
-    try {
-      await expect(cloneReader(dir)("notafile", dummyEntry)).rejects.toThrow();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-  test("cloneReader returns a real file's contents", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "clonereader-"));
-    writeFileSync(join(dir, "f.txt"), "hello");
-    try {
-      expect(await cloneReader(dir)("f.txt", dummyEntry)).toBe("hello");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-  test("cloneReader fails loud on a containment violation (never reads outside the clone dir)", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "clonereader-"));
-    try {
-      await expect(cloneReader(dir)("../escape", dummyEntry)).rejects.toThrow();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-  test("walkClone PROPAGATES a readdir failure on an unreadable subdir instead of silently skipping it", () => {
-    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root ignores modes
-    const root = mkdtempSync(join(tmpdir(), "walkclone-"));
-    mkdirSync(join(root, "sub"));
-    writeFileSync(join(root, "sub", "deep.txt"), "x");
-    chmodSync(join(root, "sub"), 0o111); // execute-only: readdir(sub) throws EACCES
-    try {
-      expect(() => walkClone(root)).toThrow();
-    } finally {
-      chmodSync(join(root, "sub"), 0o755); // restore so rmSync can recurse
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-  test("walkClone enumerates a normal tree (blobs only; skips .git)", () => {
-    const root = mkdtempSync(join(tmpdir(), "walkclone-"));
-    mkdirSync(join(root, "src"));
-    writeFileSync(join(root, "a.txt"), "a");
-    writeFileSync(join(root, "src", "b.txt"), "bb");
-    mkdirSync(join(root, ".git"));
-    writeFileSync(join(root, ".git", "config"), "ignored");
-    try {
-      expect(walkClone(root).map((e) => e.path).sort()).toEqual(["a.txt", "src/b.txt"]);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-});
-
+// (the checkout-walk reader describes moved to benchContentTransport.test.ts with the
+// functions at the T2c cutover — their only consumers are the bench's checkout lanes now.)
 describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
   const heads = (nodes: Array<{ name: string; oid: string; date: string }>): string =>
     `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ data: { repository: {
@@ -1905,7 +2054,8 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
     const runId = startRun(db);
     const nodes = nodesN(8); // 1 default + 7 non-default, all within the cap of 25
     const client = makeClient(root, async (_bin, args) =>
-      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) },
+      { headOidFor: (b) => nodes.find((n) => n.name === b)!.oid });
     await captureJsonl(() => processRepo(db, client, rt(fanoutConfig(root), "h"), runId, "org-a", repo, [], new Set()));
     const rows = db.read(`SELECT branch, status FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<{ branch: string; status: string }>;
     expect(rows.length).toBe(8); // exactly one row per branch — no dupes, none lost
@@ -1929,7 +2079,8 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
       return realUpsert(h);
     };
     const client = makeClient(root, async (_bin, args) =>
-      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) },
+      { headOidFor: (b) => nodes.find((n) => n.name === b)!.oid });
     // branches:1 makes dispatch strictly sequential, so the fail-fast is deterministic: units BEFORE b3
     // drain, b3 throws the fatal → trips the local Aborter → no unit AFTER b3 is ever dispatched.
     const seqConfig = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 1 } };

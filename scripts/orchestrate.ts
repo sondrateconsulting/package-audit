@@ -39,7 +39,9 @@ import { parseArgs, ORCHESTRATE_HELP, ORCHESTRATE_USAGE, type OrchestrateArgs } 
 import { renderFatal } from "./cliErrors.ts";
 import { runPreflight } from "./preflight.ts";
 import { resolveEffectiveOwners, type OwnersSource } from "./ownerResolve.ts";
-import { scanUnit, type TreeEntry, type UnitLocation } from "./unitPipeline.ts";
+import { scanUnit, makeExcluder, countBudgetEligible, restFallbackBudgetFromEligible, type TreeEntry, type UnitLocation } from "./unitPipeline.ts";
+import { openUnitContentStore, type ContentStoreCaps, type UnitContentStore } from "./contentStore.ts";
+import { oidFormatOf } from "./gitFrame.ts";
 import { parseSemver, maxSatisfying } from "./semver.ts";
 import { parseAlias, type DependencyType } from "./manifest.ts";
 import { introspectVersion, fetchPackument, resolveRangeToVersion, type Packument } from "./apiSurface.ts";
@@ -100,14 +102,15 @@ export interface AuditRuntime {
 }
 
 // ---- per-unit read helpers ------------------------------------------------------------------
-// API reader: SHA-pinned raw fetch (≤100MB) for blob entries. Non-blobs (submodule/symlink)
-// and a 404 return null — the one genuinely-benign miss (the tree listed a path the contents
-// API no longer serves, e.g. a force-push race), where skipping the file is correct. EVERY
-// other failure RETHROWS: the unit was never fully read, and degrading to null would mark a
-// partially-read head `done` (the §3 skip predicate then skips it forever) with its findings
-// silently under-reported. A ThrottleExhausted reaches processRepo's requeue catch (§4,
-// pending); a fatal GithubApiError (SSO/permission 403, exhausted no-response) lands as a
-// visible scan error. SHA-pinned reads are served from api_cache with zero network on re-read.
+// The REST dereference reader — since the T2c cutover this is the SYMLINK FALLBACK lane only
+// (the ratified mode-120000 policy preserves today's dereferenced-bytes findings; regular blobs
+// are served canonically by the unit's content store). Non-blobs and a 404 return null — the
+// one genuinely-benign miss (a force-push race on the dereference target), where skipping the
+// file is correct. EVERY other failure RETHROWS: a ThrottleExhausted reaches processRepo's
+// requeue catch (§4, pending); a fatal GithubApiError (SSO/permission 403, exhausted
+// no-response) lands as a visible scan error. SHA-pinned reads are served from api_cache with
+// zero network on re-read. (The checkout-walk readers this file used to export moved to the
+// bench with the T2c cutover — benchDrivers.ts — where their only consumers live.)
 function apiReader(client: GithubClient, org: string, repo: string, commitSha: string) {
   return async (path: string, entry: TreeEntry): Promise<string | null> => {
     if (entry.type !== "blob") return null;
@@ -118,42 +121,6 @@ function apiReader(client: GithubClient, org: string, repo: string, commitSha: s
       throw e;
     }
   };
-}
-
-// Clone-fallback reader: read a file from the walked clone dir, contained to that dir. Every failure
-// PROPAGATES — unlike apiReader (whose 404→null models a benign force-push race), a file the walk
-// just enumerated from a COMPLETED local clone is never legitimately absent, so any read error
-// (ENOENT/EACCES/EISDIR/EIO/…) or containment violation means the snapshot was not fully read and
-// must surface as a scan error, not degrade to null and mark a partially-read head `done`.
-export function cloneReader(cloneDir: string) {
-  return async (path: string, _entry: TreeEntry): Promise<string | null> => {
-    const abs = join(cloneDir, path);
-    assertContained(abs, [cloneDir]);
-    return readFileSync(abs, "utf8");
-  };
-}
-
-// Walk a cloned working tree into TreeEntry rows (blobs only; size from lstat). Skips .git and
-// symlinks (never followed). Paths are repo-relative POSIX. A readdir/lstat failure PROPAGATES: on a
-// completed clone it means the tree was not fully enumerated, and a silent skip would under-report
-// the unit's files as `done` (the same fail-open hazard cloneReader closes on the read side).
-export function walkClone(root: string): TreeEntry[] {
-  const out: TreeEntry[] = [];
-  const stack: string[] = [""];
-  while (stack.length > 0) {
-    const rel = stack.pop()!;
-    const abs = rel === "" ? root : join(root, rel);
-    const names = readdirSync(abs);
-    for (const name of names) {
-      if (rel === "" && name === ".git") continue;
-      const childRel = rel === "" ? name : `${rel}/${name}`;
-      const st = lstatSync(join(root, childRel));
-      if (st.isSymbolicLink()) continue;
-      if (st.isDirectory()) stack.push(childRel);
-      else if (st.isFile()) out.push({ path: childRel, type: "blob", sha: "", size: st.size });
-    }
-  }
-  return out;
 }
 
 // ---- coordinator ----------------------------------------------------------------------------
@@ -687,7 +654,7 @@ export async function processRepo(
         if (hasProgressSink()) emitProgress({ type: "unit-start", owner: repo.organization, repo: repo.name, branch: h.name });
         db.setUnitStatus(key, { status: "in_progress", runId });
         try {
-          const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen);
+          const scanned = await processUnit(db, client, config, runId, repo, d, cliTermSets, nonRegistrySkipSeen, branchAbort);
           db.setUnitStatus(key, { status: "done", runId, lastCommitSha: scanned.commitSha, lastCommitDate: scanned.committedDate, errorMessage: null });
         } catch (e) {
           // A PolicyMatchError is FATAL by contract — never downgraded to a per-unit scan error. It
@@ -795,44 +762,84 @@ export async function processRepo(
   return plan.coverage; // a SUCCESSFULLY-discovered repo (even if empty) — folds into the run's warnings
 }
 
-// Scan ONE branch unit: fetch the tree (clone fallback on truncation), run the §5.C-H pipeline,
-// and WRITE every finding + the run_unit_head snapshot. All writes here are an await-free synchronous
-// block AFTER the last await (scanUnit), and target THIS unit's distinct rows — so under branch
-// fan-out they never race a sibling unit's writes.
+// Scan ONE branch unit on the T2c default path (ADR-0001): no-checkout clone → head coherence →
+// local canonical enumeration → unit-lived cat-file child serving the reads (symlinks
+// mode-routed to the REST dereference fallback under the per-unit budget) — then WRITE every
+// finding + the run_unit_head snapshot. All writes are an await-free synchronous block AFTER
+// the store teardown, and target THIS unit's distinct rows — so under branch fan-out they never
+// race a sibling unit's writes.
 async function processUnit(
   db: AuditDb, client: GithubClient, config: Config, runId: string,
   repo: RepoInfo, decision: BranchDecision, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
+  branchAbort?: AbortLike,
 ): Promise<{ commitSha: string; committedDate: string }> {
   const h = decision.head;
-  const tree = await client.fetchTreeRecursive(repo.organization, repo.name, h.treeOid);
-  let cloneDir: string | null = null;
-  // The ACTUAL scanned commit + its date: the discovery head (h.oid / h.committedDate) for the API
-  // path, or the clone's real HEAD for the fallback (the branch may have moved between GraphQL
-  // discovery and the clone; all findings/permalinks/run_unit_head AND the persisted
-  // scanned_commit_date must pin to what was truly scanned, §5.C/§4).
-  let commitSha = h.oid;
-  let committedDate = h.committedDate;
-  // The clone-fallback setup (cloneShallow → walkClone → cloneReader) runs INSIDE this try so a
-  // walkClone/reader throw AFTER cloneShallow succeeds still reaches the finally's (best-effort,
-  // warns-on-failure) clone-dir reclaim — otherwise a completed (multi-GB) clone would be left for the
-  // next startup sweep instead. cloneShallow's own failure path cleans up before it sets cloneDir, so
-  // the finally correctly no-ops there.
-  try {
-    let entries: TreeEntry[];
-    let readFile: (path: string, entry: TreeEntry) => Promise<string | null>;
-    if (tree.truncated) {
-      const cloned = await client.cloneShallow(repo.organization, repo.name, h.name);
-      cloneDir = cloned.dir;
-      commitSha = cloned.headSha;
-      committedDate = cloned.headCommittedDate;
-      entries = walkClone(cloned.dir);
-      readFile = cloneReader(cloned.dir);
-    } else {
-      entries = tree.paths.map((p) => ({ path: p.path, type: p.type, sha: p.sha, size: p.size }));
-      readFile = apiReader(client, repo.organization, repo.name, h.oid);
+  // §3.1(2): the unit scans EXACTLY the discovery-pinned head — cloneNoCheckout fails closed on
+  // a moved branch, so the discovered oid and committedDate ARE the scanned commit's identity
+  // (the retired checkout fallback was the only path that could scan a different commit).
+  const commitSha = h.oid;
+  const committedDate = h.committedDate;
+  const format = oidFormatOf(h.oid.toLowerCase());
+  if (format === null)
+    throw new GithubApiError(`discovery-pinned head oid is not a full hex object id: ${JSON.stringify(h.oid.slice(0, 80))}`, {});
+  const cloned = await client.cloneNoCheckout(repo.organization, repo.name, h.name, h.oid);
+  // Best-effort clone reclaim with the §0 containment re-check; a failure surfaces as the
+  // documented warning, never masks a primary error, and leaves the tree to the startup sweep.
+  const deleteRunDir = (): void => {
+    try {
+      const runTempDir = dirname(cloned.dir);
+      assertContained(runTempDir, [client.tempRoot]);
+      rmSync(runTempDir, { recursive: true, force: true });
+    } catch (e) {
+      logLine({ event: "warning", reason: "clone-cleanup-failed", target: cloned.dir, message: e instanceof Error ? e.message : String(e) });
     }
+  };
+  let store: UnitContentStore | null = null;
+  let unsubscribeAbort: (() => void) | undefined;
+  let storeSettled = false;
+  try {
+    const caps: ContentStoreCaps = {
+      runLsTree: (cwd) => client.gitBytes(["ls-tree", "-r", "-z", "-l", "--full-tree", "HEAD"], cwd),
+      launchBatchChild: (cwd) => client.launchBatchChild(cwd),
+      acquireChildPermit: () => client.acquireChildPermit(),
+      readViaRestFallback: apiReader(client, repo.organization, repo.name, h.oid),
+    };
+    const isExcluded = makeExcluder(config.excludeDirGlobs);
+    store = await openUnitContentStore(caps, {
+      cwd: cloned.dir,
+      format,
+      // check 8 / rvo Q6: the budget denominates on the enumerable path-predicate superset
+      restFallbackBudget: (entries) =>
+        restFallbackBudgetFromEligible(countBudgetEligible(entries.filter((e) => e.type === "blob").map((e) => e.path), isExcluded)),
+    });
+    const boundStore = store;
+    // §3.1's abort integration: a run-level/repo-level fatal poisons the in-flight read and the
+    // unit fails through the same ordered teardown. The subscription is DROPPED on unit end
+    // (the run-level accumulation discipline).
+    unsubscribeAbort = branchAbort?.onAbort(() => boundStore.abort("a fatal elsewhere tripped the run"));
+    const entries = store.entries();
+    const readFile = (path: string, entry: TreeEntry): Promise<string | null> => boundStore.read(path, entry);
     const loc: UnitLocation = { githubHost: config.githubHost, organization: repo.organization, repository: repo.name, branch: h.name, commitSha };
     const result = await scanUnit(loc, { trackedPackages: config.packages.map((p) => p.name), excludeDirGlobs: config.excludeDirGlobs }, entries, readFile, cliTermSets);
+    // §3.1: the child terminates when the unit's READ PHASE ends — the ordered teardown (child
+    // → clone deletion → permit release, check 6's exact order) runs BEFORE the write block,
+    // and an unclean close fails the unit rather than recording findings from bytes the child
+    // could not vouch for.
+    const disposal = await store.dispose({ beforePermitRelease: deleteRunDir });
+    storeSettled = true;
+    if (!disposal.clean)
+      throw new GithubApiError(
+        `content child closed unclean for ${repo.organization}/${repo.name}@${h.name} — delivered bytes cannot be vouched for: ${disposal.detail ?? ""}`,
+        {},
+      );
+    // check 8: the separated per-unit counters as ONE vocab-pinned event
+    const c = store.counters;
+    logLine({
+      event: "content-transport", org: repo.organization, repo: repo.name, branch: h.name, commit: commitSha,
+      localCanonicalReads: c.localCanonicalReads, symlinkFallbackReads: c.restFallbackReads.symlink,
+      fallbackBudgetSpend: c.fallbackBudgetSpend, fallbackBudget: store.restFallbackBudget,
+      cloneAttempts: cloned.cloneAttempts, cloneRetries: cloned.cloneAttempts - 1, childRespawns: c.childRespawns,
+    });
     const now = nowIso();
     for (const d of result.dependencyFindings) {
       db.upsertDependencyFinding({
@@ -882,18 +889,23 @@ async function processUnit(
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: commitSha, action: "scanned", deps: result.dependencyFindings.length, usage: result.usageFindings.length, cli: result.cliFindings.length });
     return { commitSha, committedDate };
   } finally {
-    if (cloneDir !== null) {
-      // the clone lives under a run temp dir (pkg-audit-*/clone) — remove that temp dir, but
-      // containment-check the target first so a future refactor can never rm outside tempRoot.
-      try {
-        const runTempDir = dirname(cloneDir);
-        assertContained(runTempDir, [client.tempRoot]);
-        rmSync(runTempDir, { recursive: true, force: true });
-      } catch (e) {
-        // Best-effort reclaim, but NOT silent: a failed cleanup leaves a (multi-GB) clone until the
-        // next startup sweep, so surface it — without masking any primary scan error already
-        // propagating out of the try (the throw continues; this only adds an observability line).
-        logLine({ event: "warning", reason: "clone-cleanup-failed", target: cloneDir, message: e instanceof Error ? e.message : String(e) });
+    unsubscribeAbort?.();
+    if (!storeSettled) {
+      // an exception path (open/read/scan failure, or abort): the same ordered teardown —
+      // child → clone deletion → permit release — with an unclean close surfaced as the
+      // documented warning beside the primary error, never silently dropped and never
+      // replacing it.
+      if (store !== null) {
+        try {
+          const d = await store.dispose({ beforePermitRelease: deleteRunDir });
+          if (!d.clean)
+            logLine({ event: "warning", reason: "content-store-unclean", target: `${repo.organization}/${repo.name}@${h.name}`, message: d.detail ?? "" });
+        } catch (e) {
+          logLine({ event: "warning", reason: "content-store-unclean", target: `${repo.organization}/${repo.name}@${h.name}`, message: e instanceof Error ? e.message : String(e) });
+          deleteRunDir(); // the hook may not have run — the reclaim is idempotent
+        }
+      } else {
+        deleteRunDir(); // the store never opened — no child ever existed, only the clone
       }
     }
   }

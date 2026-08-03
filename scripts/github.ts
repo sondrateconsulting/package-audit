@@ -2182,34 +2182,10 @@ export class GithubClient {
     return HEX_OBJECT_ID_RE.test(ref); // sha1 (40) or sha256 (64) object ids
   }
 
-  async fetchTreeRecursive(org: string, repo: string, treeOid: string): Promise<TreeResponse> {
-    const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(treeOid)}?recursive=1`;
-    const immutable = GithubClient.isSha(treeOid);
-    const res = await this.restGet(endpoint, { immutable });
-    try {
-      // Unreachable through restGet (its contract is exact-200), so this is DELIBERATE
-      // defense-in-depth: a partial 206 body parsed here would read as a complete tree, and
-      // tree completeness must not silently depend on a distant classifier's range staying
-      // narrow. Exercised by a stubbed-restGet test; expected to survive mutation testing.
-      if (res.status !== 200)
-        throw new GithubApiError(`malformed git-tree response from ${endpoint}: HTTP ${res.status} — only exactly 200 is success`, { status: res.status, endpoint });
-      let json: unknown;
-      try {
-        json = JSON.parse(res.body);
-      } catch {
-        throw new GithubApiError(`invalid JSON from ${endpoint}`, { status: res.status, endpoint });
-      }
-      return parseTreeResponse(json, endpoint, immutable ? treeOid : null);
-    } catch (e) {
-      // restGet cached this body BEFORE validation could see it; for a SHA-pinned tree the
-      // immutable path would re-serve the poisoned bytes forever (--purge-cache was the only
-      // remedy). Tombstone the row so the next call goes back to the network — compare-and-delete on
-      // the exact bytes read (res.body) so a sibling's concurrent VALID write of the same SHA is not
-      // clobbered.
-      this.tombstoneApiCache(endpoint, "", res.body);
-      throw e;
-    }
-  }
+  // (fetchTreeRecursive — the per-unit REST tree request — retired at the ADR-0001 T2c
+  // cutover: enumeration is now the local guarded `ls-tree` over the no-checkout store, with
+  // no truncation cliff. parseTreeResponse stays exported above: the bench's T0/T1 drivers
+  // still evaluate the REST-tree route by design.)
 
   async fetchFileRaw(org: string, repo: string, path: string, refSha: string): Promise<string> {
     const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/contents/${encodeContentsPath(path)}?ref=${encodeURIComponent(refSha)}`;
@@ -2285,7 +2261,14 @@ export class GithubClient {
           // transient-style backoff between attempts; a failed attempt may leave a partial
           // dest, so the retry starts from a cleared destination
           await this.sleep(this.backoffWait("transient", attempts - 1, null));
-          rmSync(dest, { recursive: true, force: true });
+          try {
+            rmSync(dest, { recursive: true, force: true });
+          } catch {
+            // the destination cannot be cleared — a retry would only refuse the dirty dest
+            // and REPLACE git's actionable diagnostic with a refusal; stop retrying and
+            // surface the last REAL failure instead
+            break;
+          }
         }
         attempts++;
         const res = await this.git(args);
@@ -2297,7 +2280,7 @@ export class GithubClient {
       }
       if (!cloned)
         throw new GithubApiError(
-          `git clone failed for ${org}/${repo}@${branch} after ${CLONE_MAX_ATTEMPTS} attempts: ${lastFailure}`,
+          `git clone failed for ${org}/${repo}@${branch} after ${attempts} attempt${attempts === 1 ? "" : "s"}: ${lastFailure}`,
           { endpoint: url },
         );
       // §0: cwd inside the clone is permitted for git itself only.
@@ -2327,63 +2310,10 @@ export class GithubClient {
     }
   }
 
-  async cloneShallow(org: string, repo: string, branch: string): Promise<{ dir: string; headSha: string; headCommittedDate: string }> {
-    const runDir = this.makeRunTempDir();
-    const dest = join(runDir, "clone");
-    assertContained(dest, [this.tempRoot]); // §0: clone dest containment BEFORE spawning
-    const url = `https://${this.githubHost}/${encodeURIComponent(org)}/${encodeURIComponent(repo)}.git`;
-    const args = [
-      "clone", "--depth", "1", "--single-branch", "--branch", branch,
-      "--no-tags", "--no-recurse-submodules", "--template=", url, dest,
-    ];
-    try {
-      const res = await this.git(args);
-      if (res.exitCode !== 0)
-        throw new GithubApiError(`git clone failed for ${org}/${repo}@${branch}: ${res.stderr.trim().slice(0, 300)}`, { endpoint: url });
-      // §0: record the fetched SHA. cwd inside the clone is permitted for git itself only.
-      const rev = await this.git(["rev-parse", "HEAD"], dest);
-      if (rev.exitCode !== 0)
-        throw new GithubApiError(`git rev-parse HEAD failed in ${dest}: ${rev.stderr.trim().slice(0, 300)}`, { endpoint: url });
-      const headSha = rev.stdout.trim();
-      // §5.C fail-closed: this clone HEAD is persisted as the scanned commit and built into every
-      // permalink, so it must be a real object id — validate it exactly like the API path's oids (and
-      // like the committer date below), never trust rev-parse's stdout verbatim.
-      if (!HEX_OBJECT_ID_RE.test(headSha))
-        throw new GithubApiError(`git rev-parse HEAD returned a non-hex object id in ${dest}: ${JSON.stringify(headSha.slice(0, 80))}`, { endpoint: url });
-      // §4 (branch allow/deny): the ACTUAL scanned commit's date. The clone HEAD may be AHEAD of the
-      // GraphQL-discovered head (the branch moved between discovery and clone), so its date must be
-      // read from the clone — not reused from discovery. This exact argv is the ONLY `show` form
-      // readOnlyGuard permits (--no-patch/--no-notes/--no-show-signature suppress diff/notes/GPG; %cI
-      // is the strict-ISO committer date). A capture failure reclaims the tree via the catch below.
-      const dateRes = await this.git(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"], dest);
-      if (dateRes.exitCode !== 0)
-        throw new GithubApiError(`git show HEAD committer date failed in ${dest}: ${dateRes.stderr.trim().slice(0, 300)}`, { endpoint: url });
-      const headCommittedDate = dateRes.stdout.trim();
-      // Exactly one strict-ISO line, offset preserved verbatim (NOT normalized to Z/ms — this joins
-      // the committedDate family feeding scanned_commit_date). A garbled read would poison that
-      // durable provenance. isIsoInstant, not a bare shape regex: the shape alone admits impossible
-      // CALENDAR values (2025-02-30, which Date.parse silently rolls over rather than rejecting).
-      // Planning already happened — the cutoff was judged on the DISCOVERED head date, never on this
-      // value — so the poison risk here is the run's durable scan-scope ledger, not selection.
-      if (!isIsoInstant(headCommittedDate))
-        throw new GithubApiError(`git show HEAD returned a non-ISO committer date in ${dest}: ${JSON.stringify(headCommittedDate.slice(0, 80))}`, { endpoint: url });
-      return { dir: dest, headSha, headCommittedDate };
-    } catch (e) {
-      // a failed/timed-out clone can leave a multi-GB partial tree — reclaim it NOW rather
-      // than at the next run's startup sweep (the caller only cleans up on success). The
-      // cleanup is BEST-EFFORT: force only suppresses ENOENT, and an EACCES/EBUSY here must
-      // not replace the actionable git error (a stuck tree is the next sweep's problem).
-      try {
-        rmSync(runDir, { recursive: true, force: true });
-      } catch (cleanupErr) {
-        // best-effort — the ORIGINAL clone/rev-parse/show error (thrown below) is the operator's
-        // diagnostic and must NOT be masked, but the failed reclaim is still surfaced (a stuck tree the
-        // next startup sweep must handle), consistent with processUnit's clone-cleanup-failed warning.
-        logLine({ event: "warning", reason: "clone-cleanup-failed", target: runDir, message: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) });
-      }
-      throw e;
-    }
-  }
+  // (cloneShallow — the truncated-tree CHECKOUT clone fallback — retired at the ADR-0001 T2c
+  // cutover together with its `git show %cI` date read: cloneNoCheckout above refuses a moved
+  // branch, so the discovered committedDate IS the scanned commit's date and no clone-side
+  // date read exists. The bench evaluates checkout semantics through its own lanes.)
 
   // ---- startup sweep (§0): stale pkg-audit-* DIRECT children of the temp root only ----
   sweepStaleTempDirs(): string[] {

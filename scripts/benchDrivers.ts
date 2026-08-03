@@ -6,11 +6,11 @@
 // response-DISCOVERED routes (binary/truncated/validation/timeout/missing) through the frozen
 // §4.4 transition table — never a discretionary post-hoc class.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseTreeResponse } from "./github.ts";
-import { walkClone } from "./orchestrate.ts";
+import type { TreeEntry } from "./unitPipeline.ts";
 import type { BenchConfig } from "./benchConfig.ts";
 import type { CorpusUnit, PerformanceSlot } from "./benchCorpus.ts";
 import { BatchChild, runBenchGit, type BatchChildDisposal, type BenchSpawnObserver } from "./benchSpawn.ts";
@@ -25,6 +25,44 @@ import {
 import { benchGraphqlDispatch } from "./benchGh.ts";
 import { seamDecode, type RouteId, type UnitWorkload, type WorkloadEntry } from "./benchWorkload.ts";
 import type { DriverId } from "./benchSchedule.ts";
+
+// ---- the retired checkout-walk readers (RELOCATED from orchestrate.ts at the T2c cutover) ----
+// Production's default path no longer materialises a working tree, so these live where their
+// only remaining consumers are: the T2a driver and the pinning lane (which evaluate checkout
+// semantics BY DESIGN). Bodies unchanged from the production originals.
+// Walk a cloned working tree into TreeEntry rows (blobs only; size from lstat). Skips .git and
+// symlinks (never followed). Paths are repo-relative POSIX. A readdir/lstat failure PROPAGATES: on a
+// completed clone it means the tree was not fully enumerated, and a silent skip would under-report
+// the unit's files.
+export function walkClone(root: string): TreeEntry[] {
+  const out: TreeEntry[] = [];
+  const stack: string[] = [""];
+  while (stack.length > 0) {
+    const rel = stack.pop()!;
+    const abs = rel === "" ? root : join(root, rel);
+    const names = readdirSync(abs);
+    for (const name of names) {
+      if (rel === "" && name === ".git") continue;
+      const childRel = rel === "" ? name : `${rel}/${name}`;
+      const st = lstatSync(join(root, childRel));
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) stack.push(childRel);
+      else if (st.isFile()) out.push({ path: childRel, type: "blob", sha: "", size: st.size });
+    }
+  }
+  return out;
+}
+
+// Read a file from the walked clone dir, contained to that dir. Every failure PROPAGATES — a
+// file the walk just enumerated from a COMPLETED local clone is never legitimately absent, so
+// any read error or containment violation surfaces rather than degrading to null.
+export function cloneReader(cloneDir: string) {
+  return async (path: string, _entry: TreeEntry): Promise<string | null> => {
+    const abs = join(cloneDir, path);
+    assertContained(abs, [cloneDir]);
+    return readFileSync(abs, "utf8");
+  };
+}
 
 // ---- terminal signals ------------------------------------------------------------------------
 // A unit failure with cause (G2 territory) — recorded, never silently absorbed.

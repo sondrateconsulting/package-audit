@@ -944,6 +944,77 @@ describe("child lifecycle (check 6: deadline, respawn-once, ordered teardown, ab
   });
 });
 
+// ---- check 5: byte-level reader fixtures (raw reader output, never UnitResult) ----------------
+
+describe("check 5: byte-level reader fixtures", () => {
+  test("M9 symlink: mode-routed to REST, delivers EXACTLY the 2,513 dereferenced bytes — never the 17-byte link payload", async () => {
+    const target = "x".repeat(2513); // the dereferenced target's synthesized body (the M9 measurement)
+    const h = makeHarness({
+      rows: [{ mode: "120000", type: "blob", oid: LINK_OID, size: "17", path: "m9-link" }],
+      fallback: async () => target,
+    });
+    const store = await h.open();
+    const text = await store.read("m9-link", entryOf(store, "m9-link"));
+    expect(text).toBe(target);
+    expect(text!.length).toBe(2513);
+    expect(h.launches.length).toBe(0); // the 17-byte link blob is never read canonically
+    expect(store.counters.restFallbackReads.symlink).toBe(1);
+    await store.dispose();
+  });
+  test("a BINARY blob survives the frame + hash check byte-exactly; the seam applies the deliberate replacement decode", async () => {
+    // a PNG-ish prefix: NULs and high bytes that any transcode would mangle
+    const body = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0xff, 0xfe]);
+    const oid = gitBlobOid(body, SHA1);
+    const h = makeHarness({
+      rows: [{ mode: "100644", type: "blob", oid, size: String(body.byteLength), path: "img.png" }],
+      childOpts: [{ onStdinLine: (_l, fc) => fc.serveFrame(oid, body) }],
+    });
+    const store = await h.open();
+    const text = await store.read("img.png", entryOf(store, "img.png"));
+    // the RATIFIED expectation: the UTF-8-with-replacement decode of the CANONICAL bytes —
+    // derived from the standard (seamDecode over the fixture bytes), never from what any
+    // incumbent transport happened to deliver
+    expect(text).toBe(new TextDecoder("utf-8").decode(body));
+    await store.dispose();
+  });
+  test("a non-UTF-8 blob's seam string equals the canonical replacement decode (the battery's pinned expectation)", async () => {
+    const body = new Uint8Array([0x6c, 0x61, 0x74, 0x69, 0x6e, 0x31, 0x3a, 0xe9, 0xe8, 0x0a]); // latin1 bytes, invalid UTF-8
+    const oid = gitBlobOid(body, SHA1);
+    const h = makeHarness({
+      rows: [{ mode: "100644", type: "blob", oid, size: String(body.byteLength), path: "latin1.txt" }],
+      childOpts: [{ onStdinLine: (_l, fc) => fc.serveFrame(oid, body) }],
+    });
+    const store = await h.open();
+    const text = await store.read("latin1.txt", entryOf(store, "latin1.txt"));
+    expect(text).toBe(new TextDecoder("utf-8").decode(body)); // canonical decode, replacement chars included
+    expect(text).toContain("�");
+    await store.dispose();
+  });
+  test("paths containing quote, backslash, TAB, and newline round-trip through the parser and a full read", async () => {
+    // the record splits at the FIRST TAB — path bytes may legally contain TAB and LF themselves
+    const weird = 'we"ird\\back\tslash\npath.ts';
+    const h = makeHarness({
+      rows: [{ mode: "100644", type: "blob", oid: OID_A, size: String(BODY_A.byteLength), path: weird }],
+    });
+    const store = await h.open();
+    expect(store.entries().map((e) => e.path)).toEqual([weird]);
+    expect(await store.read(weird, entryOf(store, weird))).toBe("hello canonical content\n");
+    await store.dispose();
+  });
+  test("an UNKNOWN mode is fatal at open — never treated as a regular blob", async () => {
+    const h = makeHarness({
+      rows: [{ mode: "100645", type: "blob", oid: OID_A, size: "5", path: "odd.bin" }],
+    });
+    await expect(h.open()).rejects.toThrow(GitFrameError);
+  });
+  test("a record with MISSING mode/fields is fatal at open", async () => {
+    const h = makeHarness({
+      lsResult: { stdout: enc.encode(`blob ${OID_A} 5\tno-mode.txt\0`) }, // three fields, no mode
+    });
+    await expect(h.open()).rejects.toThrow(GitFrameError);
+  });
+});
+
 // ---- two-pool discipline through the REAL client seam (check 7) -------------------------------
 
 // Build the store capabilities from a REAL GithubClient (fake one-shot + interactive seams), so

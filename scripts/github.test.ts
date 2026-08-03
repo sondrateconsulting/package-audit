@@ -1037,155 +1037,9 @@ describe("parseGraphqlEnvelope / parseTreeResponse (pure)", () => {
 });
 
 // ---- fetchTreeRecursive envelope validation (§5.C fail-closed) --------------------------------
-// A malformed 200 git/trees response must FAIL LOUD (→ a scan-scope errors row via processUnit's
-// catch), never read as "no files in this branch": `json.tree ?? []` silently produced an empty
-// tree, and a missing/malformed `truncated` flag silently suppressed the clone fallback that is
-// the caller's ONLY complete-tree escape hatch (orchestrate §5.C).
-describe("fetchTreeRecursive envelope validation (§5.C fail-closed)", () => {
-  const TREE_SHA = "f".repeat(40);
-  const tree = (body: string) => ok(http(200, {}, body));
-  const blob = (over: Record<string, unknown> = {}): Record<string, unknown> =>
-    ({ path: "package.json", type: "blob", sha: "a".repeat(40), size: 12, ...over });
-  const body = (over: Record<string, unknown> = {}) =>
-    JSON.stringify({ sha: TREE_SHA, truncated: false, tree: [blob()], ...over });
-
-  test("a 200 response MISSING the tree member fails closed — never an empty tree", async () => {
-    const { client } = makeClient([tree(JSON.stringify({ sha: TREE_SHA, truncated: false }))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/tree member/);
-  });
-  test("a non-array tree member is a clean GithubApiError, not a raw TypeError", async () => {
-    const { client } = makeClient([tree(body({ tree: "nope" }))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-  });
-  test("a MISSING or non-boolean truncated flag fails closed — false would silently disable the clone fallback", async () => {
-    for (const b of [JSON.stringify({ sha: TREE_SHA, tree: [blob()] }), body({ truncated: "yes" })]) {
-      const { client } = makeClient([tree(b)]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/truncated/);
-    }
-  });
-  test("a non-object JSON root (null/array/primitive) is a clean GithubApiError", async () => {
-    for (const b of ["null", "[]", "42", `"tree"`]) {
-      const { client } = makeClient([tree(b)]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-    }
-  });
-  test("a non-object tree entry fails closed", async () => {
-    for (const entry of [null, "x", 7, [1]]) {
-      const { client } = makeClient([tree(body({ tree: [entry] }))]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-    }
-  });
-  test("an entry with a missing/empty/non-canonical path fails closed — it would misaddress every downstream read", async () => {
-    // leading/trailing/double slash and dot segments would silently become the swallowed contents
-    // 404 (orchestrate apiReader); a NUL would corrupt the permalink and the contents URL.
-    const bads: Array<Record<string, unknown>> = [
-      { path: undefined }, { path: "" }, { path: 5 },
-      { path: "/lead" }, { path: "trail/" }, { path: "a//b" }, { path: "a/./b" }, { path: "a/../b" }, { path: "a\u0000b" },
-    ];
-    for (const over of bads) {
-      const { client } = makeClient([tree(body({ tree: [blob(over)] }))]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-    }
-  });
-  test("a DUPLICATE path fails closed — last-wins mapping downstream would let a later entry mask a manifest", async () => {
-    const { client } = makeClient([tree(body({ tree: [blob(), blob({ type: "tree", size: undefined })] }))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/duplicate/);
-  });
-  test("an unknown entry type fails closed — the blob filter downstream would silently discard it", async () => {
-    const { client } = makeClient([tree(body({ tree: [blob({ type: "symlink" })] }))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/type/);
-  });
-  test("a non-hex entry sha fails closed — it addresses the blob fetch", async () => {
-    for (const sha of [undefined, "", "main", "zz".repeat(20)]) {
-      const { client } = makeClient([tree(body({ tree: [blob({ sha })] }))]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-    }
-  });
-  test("a PRESENT size must be a non-negative safe integer — Infinity (1e400), negatives and fractions fail closed", async () => {
-    // typeof-number alone admits JSON.parse("1e400") === Infinity, which would trip the silent
-    // large-file skip downstream instead of failing loud.
-    for (const raw of [`1e400`, `-1`, `1.5`, `"5"`, `null`]) {
-      const { client } = makeClient([tree(`{"sha":"${TREE_SHA}","truncated":false,"tree":[{"path":"p","type":"blob","sha":"${"a".repeat(40)}","size":${raw}}]}`)]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-    }
-  });
-  test("a response whose root sha does not match the requested tree oid fails closed", async () => {
-    const { client } = makeClient([tree(body({ sha: "e".repeat(40) }))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/does not match/);
-  });
-  test("HTTP 2xx-but-not-200 (e.g. 206 Partial Content) is NOT success — a partial tree must not read as complete", async () => {
-    // now trips at classifyRest (restGet fails every non-200 2xx closed); the tree fetcher's own
-    // inner gate is exercised independently by the stubbed-restGet test below.
-    const { client } = makeClient([ok(http(206, {}, body()))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/only exactly 200/);
-  });
-  test("the tree fetcher's OWN exact-200 gate holds even if restGet were to leak a non-200 2xx (defense in depth)", async () => {
-    // classifyRest already fails non-200 2xx closed, so this state is unreachable through the
-    // spawn seam — stub restGet to prove tree completeness never silently depends on a distant
-    // classifier's range staying narrow.
-    const { client } = makeClient([]);
-    client.restGet = async () => ({ status: 206, headers: {}, body: body() });
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/only exactly 200/);
-  });
-  test("a valid response maps entries verbatim; absent size maps to null", async () => {
-    const b = JSON.stringify({ sha: TREE_SHA, truncated: false, tree: [blob(), { path: "src", type: "tree", sha: "b".repeat(40) }] });
-    const { client } = makeClient([tree(b)]);
-    const res = await client.fetchTreeRecursive("o", "r", TREE_SHA);
-    expect(res).toEqual({
-      truncated: false,
-      paths: [
-        { path: "package.json", type: "blob", sha: "a".repeat(40), size: 12 },
-        { path: "src", type: "tree", sha: "b".repeat(40), size: null },
-      ],
-    });
-  });
-  test("truncated:true returns NO paths — the partial list is unusable, and `paths` is a COMPILE error on it", async () => {
-    // per-entry validation is deliberately skipped here: junk inside a partial list must not block
-    // the clone fallback, and nothing downstream may read these entries anyway.
-    const b = JSON.stringify({ sha: TREE_SHA, truncated: true, tree: [{ path: 42 }] });
-    const { client } = makeClient([tree(b)]);
-    const res = await client.fetchTreeRecursive("o", "r", TREE_SHA);
-    expect(res).toEqual({ truncated: true });
-    expect(Object.hasOwn(res, "paths")).toBe(false); // no `paths` key at runtime, not just at the type level
-    if (res.truncated) {
-      // @ts-expect-error — the discriminated union makes `paths` inaccessible on the truncated variant;
-      // this line stops compiling (unused @ts-expect-error) if `paths` is ever added back, guarding the union.
-      void res.paths;
-    }
-  });
-  test("a malformed 200 body does NOT permanently poison the immutable cache — the next call refetches", async () => {
-    // restGet caches the 200 body BEFORE validation sees it; without the tombstone the SHA-pinned
-    // immutable path would serve the malformed body forever (until --purge-cache).
-    const db = AuditDb.open({ sqlitePath: ":memory:" });
-    const { client, calls } = makeClient(
-      [tree(JSON.stringify({ sha: TREE_SHA, truncated: false })), tree(body())],
-      { db },
-    );
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/tree member/);
-    const second = await client.fetchTreeRecursive("o", "r", TREE_SHA);
-    if (second.truncated) throw new Error("expected a non-truncated tree");
-    expect(second.paths.map((p) => p.path)).toEqual(["package.json"]);
-    expect(calls.length).toBe(2); // call 2 went back to the network, not the poisoned cache row
-    const third = await client.fetchTreeRecursive("o", "r", TREE_SHA);
-    expect(third).toEqual(second);
-    expect(calls.length).toBe(2); // …and the VALID body still earns the immutable zero-network hit
-    db.close();
-  });
-  test("a direct 2xx-non-200 tree response is fatal, leaves NO cache row, and the next call refetches cleanly", async () => {
-    // Laundering is doubly closed: restGet persists only exact-200 bodies AND classifyRest now
-    // fails a direct non-200 2xx before any consumer sees it. Pin the recovery shape: the failed
-    // call leaves no poisoned row behind, so the retry serves fresh valid bytes from the network.
-    const db = AuditDb.open({ sqlitePath: ":memory:" });
-    const { client, calls } = makeClient([ok(http(206, {}, body())), tree(body())], { db });
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/only exactly 200/);
-    const afterFailure = db.read("SELECT COUNT(*) AS n FROM api_cache").get() as { n: number };
-    expect(afterFailure.n).toBe(0); // restGet threw before the fetcher ran — not even a tombstone
-    const second = await client.fetchTreeRecursive("o", "r", TREE_SHA);
-    expect(second.truncated).toBe(false);
-    expect(calls.length).toBe(2);
-    db.close();
-  });
-});
+// (the fetchTreeRecursive envelope-validation describe retired with the method at the T2c
+// cutover; parseTreeResponse — the pure validator the bench still consumes — keeps its own
+// describe above.)
 
 describe("throttle wait clamping (§4 hardening)", () => {
   // 10 years past the fake clock — a poisoned response must not command such a pause.
@@ -1779,81 +1633,6 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
   });
 });
 
-describe("cloneShallow temp-dir cleanup on failure", () => {
-  // the shared git-config dir (pkg-audit-gitcfg-*) is a per-client cached resource, NOT a
-  // per-clone leak — the run temp dir holding the partial clone is what must be reclaimed.
-  const cloneRunDirs = (root: string): string[] =>
-    readdirSync(root).filter((n) => n.startsWith("pkg-audit-") && !n.startsWith("pkg-audit-gitcfg-"));
-
-  test("a failed clone leaves no clone run dir behind", async () => {
-    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
-    const { client } = makeClient([err("", "fatal: repository not found", 128)], { tempRoot: root });
-    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/clone failed/);
-    expect(cloneRunDirs(root)).toEqual([]);
-    rmSync(root, { recursive: true, force: true });
-  });
-  test("a clone whose rev-parse fails also cleans up", async () => {
-    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
-    const { client } = makeClient([ok(""), err("", "fatal: bad revision", 128)], { tempRoot: root });
-    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/rev-parse/);
-    expect(cloneRunDirs(root)).toEqual([]);
-    rmSync(root, { recursive: true, force: true });
-  });
-  test("a clone whose date-capture (show) fails also cleans up", async () => {
-    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
-    const { client } = makeClient([ok(""), ok("a".repeat(40) + "\n"), err("", "fatal: bad object", 128)], { tempRoot: root });
-    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/committer date failed/);
-    expect(cloneRunDirs(root)).toEqual([]);
-    rmSync(root, { recursive: true, force: true });
-  });
-  test("a non-ISO committer date is rejected and cleans up (a garbled read must not poison provenance)", async () => {
-    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
-    const { client } = makeClient([ok(""), ok("a".repeat(40) + "\n"), ok("not-a-date\n")], { tempRoot: root });
-    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/non-ISO committer date/);
-    expect(cloneRunDirs(root)).toEqual([]);
-    rmSync(root, { recursive: true, force: true });
-  });
-
-  test("a cleanup failure never masks the original clone error, but IS surfaced as a warning", async () => {
-    // rmSync's force only suppresses ENOENT — an EACCES/EBUSY from the cleanup walk must not
-    // replace the actionable git error (which carries git's stderr): the ORIGINAL error is the
-    // operator's diagnostic. But the failed reclaim is not swallowed silently — it emits a
-    // clone-cleanup-failed warning, consistent with processUnit's success-path reclaim.
-    const root = mkdtempSync(join(tmpdir(), "clone-mask-"));
-    let cloneDest = "";
-    const spawnImpl: SpawnFn = async (_bin, args) => {
-      cloneDest = args[args.length - 1]!; // clone dest is the final argv token
-      mkdirSync(cloneDest, { recursive: true });
-      writeFileSync(join(cloneDest, "partial"), "x");
-      chmodSync(cloneDest, 0o555); // cleanup cannot unlink `partial` → rmSync throws EACCES
-      return { exitCode: 128, stdout: "", stderr: "ORIGINAL_GIT_FAILURE" };
-    };
-    const client = new GithubClient({
-      githubHost: "github.com", spawnImpl,
-      env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: root,
-    });
-    const isRoot = typeof process.getuid === "function" && process.getuid() === 0; // root ignores chmod
-    const lines: string[] = [];
-    const realWrite = process.stdout.write.bind(process.stdout);
-    (process.stdout as unknown as { write: (s: string) => boolean }).write = (s: string) => { lines.push(s); return true; };
-    let thrown: unknown;
-    try {
-      await client.cloneShallow("o", "r", "main");
-    } catch (e) { thrown = e; } finally {
-      (process.stdout as unknown as { write: typeof realWrite }).write = realWrite;
-      // As root the chmod 0o555 is ignored, so rmSync(runDir) already deleted cloneDest — guard the
-      // restore so it doesn't throw ENOENT on an already-removed path.
-      if (cloneDest !== "" && existsSync(cloneDest)) chmodSync(cloneDest, 0o755);
-      rmSync(root, { recursive: true, force: true });
-    }
-    expect(String((thrown as Error | undefined)?.message)).toMatch(/ORIGINAL_GIT_FAILURE/); // never masked
-    if (!isRoot) {
-      const events = lines.join("").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
-      expect(events.filter((e) => e.event === "warning" && e.reason === "clone-cleanup-failed").length).toBe(1); // reclaim failure surfaced
-    }
-  });
-});
-
 // ---- ADR-0001 T2c acquisition: cloneNoCheckout (§3.1(1-2), rvo Q1 bounded retry) ------------
 describe("cloneNoCheckout (T2c acquisition: no-checkout argv, head coherence, bounded retry)", () => {
   const PIN = "a".repeat(40);
@@ -1922,6 +1701,48 @@ describe("cloneNoCheckout (T2c acquisition: no-checkout argv, head coherence, bo
     await expect(c2.cloneNoCheckout("o", "r", "main", PIN)).rejects.toThrow(/non-hex object id/);
     expect(cloneRunDirs(root)).toEqual([]);
     rmSync(root, { recursive: true, force: true });
+  });
+  test("a cleanup failure never masks the original clone error, but IS surfaced as a warning", async () => {
+    // rmSync's force only suppresses ENOENT — an EACCES/EBUSY from the cleanup walk must not
+    // replace the actionable git error (which carries git's stderr): the ORIGINAL error is the
+    // operator's diagnostic. But the failed reclaim is not swallowed silently — it emits a
+    // clone-cleanup-failed warning, consistent with processUnit's teardown-path reclaim.
+    const root = mkdtempSync(join(tmpdir(), "clone-mask-"));
+    let cloneDest = "";
+    let cloneCalls = 0;
+    const spawnImpl: SpawnFn = async (_bin, args) => {
+      if (args[0] === "clone") {
+        cloneCalls++;
+        cloneDest = args[args.length - 1]!; // clone dest is the final argv token
+        if (cloneCalls === 1) {
+          mkdirSync(cloneDest, { recursive: true });
+          writeFileSync(join(cloneDest, "partial"), "x");
+          chmodSync(cloneDest, 0o555); // the retry's dest-clear AND the final reclaim hit EACCES
+        }
+      }
+      return { exitCode: 128, stdout: "", stderr: "ORIGINAL_GIT_FAILURE" };
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl, sleepImpl: async () => {},
+      env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: root,
+    });
+    const isRoot = typeof process.getuid === "function" && process.getuid() === 0; // root ignores modes
+    const lines: string[] = [];
+    const realWrite = process.stdout.write.bind(process.stdout);
+    (process.stdout as unknown as { write: (s: string) => boolean }).write = (s: string) => { lines.push(s); return true; };
+    let thrown: unknown;
+    try {
+      await client.cloneNoCheckout("o", "r", "main", "a".repeat(40));
+    } catch (e) { thrown = e; } finally {
+      (process.stdout as unknown as { write: typeof realWrite }).write = realWrite;
+      if (cloneDest !== "" && existsSync(cloneDest)) chmodSync(cloneDest, 0o755);
+      rmSync(root, { recursive: true, force: true });
+    }
+    expect(String((thrown as Error | undefined)?.message)).toMatch(/ORIGINAL_GIT_FAILURE/); // never masked
+    if (!isRoot) {
+      const events = lines.join("").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+      expect(events.filter((e) => e.event === "warning" && e.reason === "clone-cleanup-failed").length).toBeGreaterThanOrEqual(1);
+    }
   });
 });
 
@@ -2754,49 +2575,8 @@ describe("listBranchHeads (§5.B)", () => {
 });
 
 describe("hardened clone (§0/§5.C)", () => {
-  test("emits exactly the hardened argv, pins git config, and records the fetched SHA + committer date", async () => {
-    const { client, calls } = makeClient([
-      ok(""), // clone
-      ok("a".repeat(40) + "\n"), // rev-parse HEAD
-      ok("2025-06-01T12:34:56+00:00\n"), // show --format=%cI HEAD (the scanned commit's date)
-    ]);
-    const { dir, headSha, headCommittedDate } = await client.cloneShallow("org-a", "repo-b", "release/1.x");
-    expect(headSha).toBe("a".repeat(40));
-    expect(headCommittedDate).toBe("2025-06-01T12:34:56+00:00"); // strict-ISO, offset preserved verbatim
-    expect(dir.startsWith(TEST_TMP)).toBe(true);
-    // a SUCCESSFUL clone must keep its run dir (the failure-only cleanup must not be a finally):
-    // downstream walkClone/cloneReader read this dir, so deleting it would silently zero findings.
-    expect(existsSync(dirname(dir))).toBe(true);
-
-    const clone = calls[0]!;
-    expect(clone.bin).toBe(BINS.git);
-    expect(clone.args).toEqual([
-      "clone", "--depth", "1", "--single-branch", "--branch", "release/1.x",
-      "--no-tags", "--no-recurse-submodules", "--template=",
-      "https://github.com/org-a/repo-b.git", dir,
-    ]);
-    expect(clone.opts.env["GIT_TERMINAL_PROMPT"]).toBe("0");
-    expect(clone.opts.env["GIT_CONFIG_NOSYSTEM"]).toBe("1");
-    expect(clone.opts.env["GIT_ASKPASS"]).toBeUndefined();
-    const cfgPath = clone.opts.env["GIT_CONFIG_GLOBAL"]!;
-    expect(cfgPath.startsWith(TEST_TMP)).toBe(true);
-    const cfg = readFileSync(cfgPath, "utf8");
-    expect(cfg).toContain("auth git-credential"); // pinned helper, no ambient config
-    expect(cfg).toContain("allow = never");
-
-    const rev = calls[1]!;
-    expect(rev.args).toEqual(["rev-parse", "HEAD"]);
-    expect(rev.opts.cwd).toBe(dir); // §0: git itself may run with cwd inside the clone
-
-    const showDate = calls[2]!;
-    // the EXACT commit-date tuple readOnlyGuard permits — cwd inside the clone, no argv -C
-    expect(showDate.args).toEqual(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"]);
-    expect(showDate.opts.cwd).toBe(dir);
-  });
-  test("clone failure surfaces stderr as a GithubApiError", async () => {
-    const { client } = makeClient([err("", "fatal: repository not found")]);
-    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/repository not found/);
-  });
+  // (the cloneShallow argv/failure tests retired with the method at the T2c cutover —
+  // cloneNoCheckout's describe above carries the acquisition coverage now.)
   test("the PUBLIC git() wrapper itself contains a clone destination (chokepoint, not just cloneShallow)", async () => {
     const { client, calls } = makeClient([]);
     await expect(

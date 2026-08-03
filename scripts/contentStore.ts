@@ -80,7 +80,10 @@ export interface ContentStoreCaps {
 export interface ContentStoreOptions {
   cwd: string; // the acquired no-checkout store (already containment-checked by the capabilities)
   format: GitObjectFormat; // derived from the discovery-pinned head oid (oidFormatOf)
-  restFallbackBudget: number; // max REST fallback reads this unit may spend (check 8)
+  // Max REST fallback reads this unit may spend (check 8). The rvo-Q6 denominator is computed
+  // FROM the enumeration, which exists only once the listing is parsed — so a caller may pass
+  // a supplier, resolved exactly once against the parsed entries at open.
+  restFallbackBudget: number | ((entries: readonly TreeEntry[]) => number);
   limits?: ContentStoreLimits;
 }
 
@@ -394,8 +397,6 @@ class FramedChild {
 // fail-closed into the canonical index.
 export async function openUnitContentStore(caps: ContentStoreCaps, opts: ContentStoreOptions): Promise<UnitContentStore> {
   const limits = opts.limits ?? DEFAULT_CONTENT_STORE_LIMITS;
-  if (!Number.isSafeInteger(opts.restFallbackBudget) || opts.restFallbackBudget < 0)
-    throw new ContentStoreError("budget", `restFallbackBudget must be a nonnegative safe integer (got ${opts.restFallbackBudget})`);
   // Probe-validate the FRAME limits now, before any process exists: BatchFrameParser/ByteRing
   // validate their bounds at construction, and discovering an invalid limit only at the first
   // canonical read would burn the unit's respawn allowance on a configuration fault.
@@ -410,7 +411,14 @@ export async function openUnitContentStore(caps: ContentStoreCaps, opts: Content
       `enumeration failed (exit ${res.exitCode}): ${seamDecode(res.stderr).trim().slice(0, 300)}`,
     );
   const entries = parseLsTreeZ(res.stdout, opts.format, limits.lsTree);
-  return new UnitContentStore(caps, opts, limits, new Map(entries.map((e) => [e.path, e])));
+  const index = new Map(entries.map((e) => [e.path, e]));
+  const budget =
+    typeof opts.restFallbackBudget === "function"
+      ? opts.restFallbackBudget(entries.map((e) => ({ path: e.path, type: e.type, sha: e.oid, size: e.size })))
+      : opts.restFallbackBudget;
+  if (!Number.isSafeInteger(budget) || budget < 0)
+    throw new ContentStoreError("budget", `restFallbackBudget must resolve to a nonnegative safe integer (got ${budget})`);
+  return new UnitContentStore(caps, opts, limits, budget, index);
 }
 
 export class UnitContentStore {
@@ -438,13 +446,19 @@ export class UnitContentStore {
   // hung REST fallback would hold the read pending for the transport's full bounded budget
   private readonly teardownWaiters = new Set<() => void>();
 
-  constructor(caps: ContentStoreCaps, opts: ContentStoreOptions, limits: ContentStoreLimits, index: Map<string, LsTreeEntry>) {
+  constructor(caps: ContentStoreCaps, opts: ContentStoreOptions, limits: ContentStoreLimits, budget: number, index: Map<string, LsTreeEntry>) {
     this.caps = caps;
     this.cwd = opts.cwd;
     this.format = opts.format;
-    this.budget = opts.restFallbackBudget;
+    this.budget = budget;
     this.limits = limits;
     this.index = index;
+  }
+
+  // The resolved per-unit fallback bound — surfaced so the per-unit counters event can report
+  // spend AGAINST its bound (check 8), never a bare numerator.
+  get restFallbackBudget(): number {
+    return this.budget;
   }
 
   // The unit's enumeration as the pipeline's TreeEntry rows: canonical ls-tree object sizes

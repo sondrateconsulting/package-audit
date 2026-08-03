@@ -225,29 +225,24 @@ export function assertGraphqlQueryIsReadOnly(rest: string[]): void {
 }
 
 // ---- git ----------------------------------------------------------------------------
-// The tool ONLY ever spawns `git clone` (two exact shapes, below), `git rev-parse HEAD`, ONE
-// fixed `git show` form (the clone-HEAD committer date, §4), and — since ADR-0001's T2c
-// adoption — `git ls-tree` and `git cat-file` as ONE exact tuple each. Because git accepts
-// unambiguous long-option ABBREVIATIONS (`--templ` = `--template`, `--dep` = `--depth`), a
-// denylist is unsafe — so clone uses a strict EXACT-OPTION ALLOWLIST of only the hardening
-// flags the wrapper emits, rev-parse forbids every flag, and show/ls-tree/cat-file are pinned
-// to exact tuples. cat-file is admitted ONLY as the two-token `cat-file --batch` tuple, so
-// `--textconv`/`--filters` (the options whose exclusion once kept the verb out entirely) are
-// STRUCTURALLY absent rather than denylisted; the revs it resolves travel on stdin, which this
-// argv guard cannot see — that containment lives in the caller's OID-only writer (ADR-0001
-// Confirmation check 2). `log` stays excluded entirely.
-const GIT_READ = new Set(["clone", "rev-parse", "show", "ls-tree", "cat-file", "--version"]);
+// The tool ONLY ever spawns `git clone` (two exact shapes, below), `git rev-parse HEAD`, and —
+// since ADR-0001's T2c adoption — `git ls-tree` and `git cat-file` as ONE exact tuple each.
+// Because git accepts unambiguous long-option ABBREVIATIONS (`--templ` = `--template`,
+// `--dep` = `--depth`), a denylist is unsafe — so clone uses a strict EXACT-OPTION ALLOWLIST
+// of only the hardening flags the wrapper emits, rev-parse forbids every flag, and
+// ls-tree/cat-file are pinned to exact tuples. cat-file is admitted ONLY as the two-token
+// `cat-file --batch` tuple, so `--textconv`/`--filters` (the options whose exclusion once kept
+// the verb out entirely) are STRUCTURALLY absent rather than denylisted; the revs it resolves
+// travel on stdin, which this argv guard cannot see — that containment lives in the caller's
+// OID-only writer (ADR-0001 Confirmation check 2). `log` stays excluded entirely, and `show` —
+// once admitted as the checkout fallback's exact commit-date tuple — is excluded again since
+// the T2c cutover retired its only caller (head coherence pins the scanned commit to the
+// discovered oid, whose date discovery already carries).
+const GIT_READ = new Set(["clone", "rev-parse", "ls-tree", "cat-file", "--version"]);
 // ADR-0001 T2c: the exact enumeration tuple. HEAD only — production enumerates after the head
 // coherence gate has already pinned HEAD to the discovery OID; a pathspec is rejected because
 // it would silently narrow the enumeration the scan's completeness rests on.
 const GIT_LS_TREE_ARGV = ["ls-tree", "-r", "-z", "-l", "--full-tree", "HEAD"];
-// The tool runs EXACTLY ONE `show` form: read a cloned HEAD's committer date (the
-// clone-fallback scan). There is NO general show/log parser — that would reopen --output/textconv/
-// --ext-diff/alternate-format/revision surface. Instead an EXACT raw-argv allowlist: --no-patch
-// suppresses diff machinery, --no-show-signature avoids invoking GPG, --no-notes avoids notes
-// lookups, %cI is the strict-ISO committer date. Anything else (reordered, extra args, -C, a
-// different format, a revision other than HEAD) is rejected.
-const GIT_SHOW_DATE_ARGV = ["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"];
 // clone options, split by arity: VALUE flags consume the following token as their value
 // (git does too, even if that token looks like a flag), BOOL flags stand alone.
 const GIT_CLONE_VALUE = new Set(["--depth", "--branch", "--template"]);
@@ -285,16 +280,6 @@ export function assertReadOnlyGit(callerArgs: string[]): void {
     // which any call site emits (santa round-3).
     if (rawArgs.length !== 2 || rawArgs[1] !== "HEAD")
       deny("git rev-parse is restricted to the exact `rev-parse HEAD` tuple");
-    return;
-  }
-
-  if (verb === "show") {
-    // Compare the RAW argv (NOT canon'd — canon splits `--format=%cI` into two tokens): the ONLY
-    // permitted show is the exact commit-date tuple. No option parser, no abbreviations, no reorder.
-    const ok =
-      rawArgs.length === GIT_SHOW_DATE_ARGV.length &&
-      rawArgs.every((a, i) => a === GIT_SHOW_DATE_ARGV[i]);
-    if (!ok) deny("git show is restricted to the exact commit-date form");
     return;
   }
 

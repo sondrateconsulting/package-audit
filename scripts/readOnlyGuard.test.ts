@@ -137,15 +137,12 @@ describe("assertReadOnlyGit", () => {
   test("clone -ufoo throws", () =>
     throws(() => assertReadOnlyGit(sh("clone -ufoo --depth 1 --single-branch --branch m --no-tags --no-recurse-submodules --template= u d"))));
   test("clone missing hardening throws", () => throws(() => assertReadOnlyGit(["clone", "url", "dir"])));
-  // `show` is allowed ONLY as the exact commit-date tuple (the clone-fallback commit date).
+  // `show` is EXCLUDED again since the T2c cutover (its only caller — the checkout fallback's
+  // commit-date read — retired with the fallback): even its once-permitted exact tuple denies.
   const SHOW_DATE = ["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"];
-  test("the exact commit-date show tuple passes", () => ok(() => assertReadOnlyGit(SHOW_DATE)));
-  test("bare `show HEAD` rejected (not the exact tuple)", () => throws(() => assertReadOnlyGit(["show", "HEAD"])));
-  test("show with an extra --output arg rejected", () => throws(() => assertReadOnlyGit(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "--output=/tmp/x", "HEAD"])));
-  test("show with a different format rejected", () => throws(() => assertReadOnlyGit(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%H", "HEAD"])));
-  test("show with a trailing extra revision rejected", () => throws(() => assertReadOnlyGit([...SHOW_DATE, "OTHER"])));
-  test("show reordered rejected", () => throws(() => assertReadOnlyGit(["show", "--format=%cI", "--no-patch", "--no-notes", "--no-show-signature", "HEAD"])));
-  test("git -C before the date tuple rejected (no argv -C)", () => throws(() => assertReadOnlyGit(["-C", "/other", ...SHOW_DATE])));
+  test("show is excluded entirely — even the once-permitted commit-date tuple denies", () => throws(() => assertReadOnlyGit(SHOW_DATE)));
+  test("bare `show HEAD` rejected", () => throws(() => assertReadOnlyGit(["show", "HEAD"])));
+  test("git -C before a show tuple rejected (pre-verb global)", () => throws(() => assertReadOnlyGit(["-C", "/other", ...SHOW_DATE])));
   test("cat-file outside the exact batch tuple rejected (-p form)", () => throws(() => assertReadOnlyGit(["cat-file", "-p", "HEAD"])));
   test("clone non-empty --template override throws", () =>
     throws(() => assertReadOnlyGit(sh("clone --depth 1 --single-branch --branch m --no-tags --no-recurse-submodules --template=/tmp/evil u d"))));
