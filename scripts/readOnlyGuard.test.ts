@@ -124,6 +124,10 @@ describe("assertReadOnlyGit", () => {
   );
   test("hardened clone passes", () => ok(() => assertReadOnlyGit(HARDENED)));
   test("rev-parse HEAD passes", () => ok(() => assertReadOnlyGit(["rev-parse", "HEAD"])));
+  // exact tuple, like show/ls-tree/cat-file — the tool emits no other rev-parse form
+  test("bare rev-parse throws", () => throws(() => assertReadOnlyGit(["rev-parse"])));
+  test("rev-parse of a branch name throws", () => throws(() => assertReadOnlyGit(["rev-parse", "main"])));
+  test("rev-parse with an extra rev throws", () => throws(() => assertReadOnlyGit(["rev-parse", "HEAD", "OTHER"])));
   test("--version passes", () => ok(() => assertReadOnlyGit(["--version"])));
   test("push throws", () => throws(() => assertReadOnlyGit(["push"])));
   test("clone -c injection throws", () =>
@@ -271,6 +275,30 @@ describe("assertReadOnlyGit — the ls-tree tuple", () => {
     sparse[5] = "HEAD";
     throws(() => assertReadOnlyGit(sparse));
   });
+  test("a DENSE argv with an overridden `every` throws (santa round-3: method-override bypass)", () => {
+    // Own string slots spelling a WRITE-capable `show --output=...`, with the tuple sweep
+    // rigged to report agreement. The guard must compare its own copy, never the caller's.
+    const danger = ["show", "--no-patch", "--no-notes", "--no-show-signature", "--output=/tmp/pwned", "HEAD"];
+    const rigged = Object.create(Array.prototype) as Record<string, unknown>;
+    rigged["every"] = () => true;
+    Object.setPrototypeOf(danger, rigged);
+    throws(() => assertReadOnlyGit(danger));
+  });
+  test("a DENSE argv with an overridden `flatMap` throws (canonicalization must run on our copy)", () => {
+    const danger = ["clone", "--upload-pack", "/tmp/pwned", "u", "d"];
+    const rigged = Object.create(Array.prototype) as Record<string, unknown>;
+    rigged["flatMap"] = () => ["--version"]; // pretend to canon into a harmless argv
+    Object.setPrototypeOf(danger, rigged);
+    throws(() => assertReadOnlyGit(danger));
+  });
+  test("an ARRAY-LIKE argv with a lying `length` getter throws (validated argv must equal the spawned one)", () => {
+    // A real Array's length is non-configurable, so this attack needs an array-like: it would
+    // report 2 slots to the guard while carrying a third (`--textconv`) into the spawn. The
+    // guard therefore requires a genuine Array.
+    const danger = { 0: "cat-file", 1: "--batch", 2: "--textconv", get length() { return 2; } };
+    throws(() => assertReadOnlyGit(danger as unknown as string[]));
+  });
+  test("a non-array argv throws", () => throws(() => assertReadOnlyGit("clone" as unknown as string[])));
   test("a PROTOTYPE-BACKED sparse argv throws (santa round-2: holes read through the prototype)", () => {
     // holes serve conforming tokens via a prototype trap while iteration helpers still skip
     // them — value checks and iteration disagree unless own-ness is required.

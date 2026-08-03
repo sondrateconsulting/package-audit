@@ -77,6 +77,17 @@ describe("encodeOidRequest — the OID-only stdin writer's validation core (chec
   reject("a sha1-length oid under the sha256 format (mixed formats)", "a".repeat(40), "sha256");
   reject("a rev expression", "HEAD");
   reject("an oid with a rev suffix", "a".repeat(40) + "^{tree}");
+  test("rejects a STATEFUL non-string oid whose second read differs (validate-then-encode split)", () => {
+    // santa round-3: `length` + regex coerce on each read, so an object could validate as a
+    // full oid and then encode an arbitrary rev onto the child's stdin — the exact breach
+    // Confirmation check 2 exists to prevent.
+    let reads = 0;
+    const stateful = { length: 40, toString: () => (++reads === 1 ? "a".repeat(40) : "HEAD\n") };
+    expect(() => encodeOidRequest(stateful as unknown as string, "sha1")).toThrow(GitFrameError);
+  });
+  test("rejects a boxed String object (only primitives are accepted)", () =>
+    // eslint-disable-next-line no-new-wrappers -- deliberately exercising the boxed form
+    expect(() => encodeOidRequest(new String("a".repeat(40)) as unknown as string, "sha1")).toThrow(GitFrameError));
 });
 
 describe("production re-export coherence", () => {

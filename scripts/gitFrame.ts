@@ -66,7 +66,14 @@ export function gitBlobOid(body: Uint8Array, format: GitObjectFormat): string {
 // format-validated full lowercase oid plus the terminating LF, produced here or nowhere.
 // (JS `$` without the m flag anchors at true end-of-input, so an embedded newline fails the
 // regex rather than smuggling a second request line.)
+// The PRIMITIVE-string requirement is load-bearing, not a type-system formality: a stateful
+// object whose toString() returns a conforming oid on the validating read and an arbitrary rev
+// on the encoding read would validate here and then write `HEAD\n` to the child's stdin —
+// defeating the containment this function exists to provide (santa round-3). Validate and
+// encode ONE captured primitive.
 export function encodeOidRequest(oid: string, format: GitObjectFormat): Uint8Array {
+  if (typeof oid !== "string")
+    throw new GitFrameError("writer-oid", "stdin writer refuses a non-string object id");
   if (oid.length !== OID_LENGTH[format] || !/^[0-9a-f]+$/.test(oid))
     throw new GitFrameError("writer-oid", `stdin writer refuses a non-${format} object id: ${JSON.stringify(oid.slice(0, 80))}`);
   return new TextEncoder().encode(`${oid}\n`);

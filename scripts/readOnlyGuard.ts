@@ -44,6 +44,32 @@ const GH_API_FIRST_SEGMENT = new Set(["repos", "orgs", "user", "rate_limit", "gr
 // resource stays denied. (\d in JS regex is exactly [0-9]; no unicode digits.)
 const GH_ORG_ID_REPOS = /^organizations\/\d+\/repos$/;
 
+// Copy an argv into a FRESH, dense, plain array of primitive strings before any grammar runs.
+// Two attacks this closes, both found by adversarial review:
+//   • sparse / prototype-backed slots — a hole reads through the prototype chain, so indexed
+//     reads and iteration helpers can disagree about what the argv contains;
+//   • overridden array methods — the guards compare tuples and canonicalize with `every`/
+//     `flatMap`, which an argv object may override to report whatever it likes while the
+//     INDEXED argv actually handed to the spawn stays dangerous.
+// Reading only `length` (validated) plus own indexed slots, into an array literal we own,
+// makes every later method call run on OUR array, not on caller-supplied behaviour.
+function trustedArgv(raw: readonly string[], what: string): string[] {
+  // A genuine Array is required, not merely something array-LIKE: an array-like object can
+  // expose a `length` getter that under-reports its slots, so the guard would validate a
+  // SHORTER argv than the caller then spawns. A real Array's `length` is non-configurable and
+  // cannot lie, which is what makes the slot sweep below a complete check.
+  if (!Array.isArray(raw)) deny(`${what} argv is not an array`);
+  const len = raw.length;
+  if (!Number.isSafeInteger(len) || len < 0) deny(`${what} argv length is not a safe nonnegative integer`);
+  const out: string[] = [];
+  for (let i = 0; i < len; i++) {
+    if (!Object.hasOwn(raw, i) || typeof raw[i] !== "string")
+      deny(`${what} argv slot ${i} is not an own string property (sparse or prototype-backed argv)`);
+    out.push(raw[i]!);
+  }
+  return out;
+}
+
 // Normalize BOTH `--flag=value` and attached short forms (`-XDELETE`, `-X=DELETE`,
 // `-fbody=x`) into separate tokens so no attached-value form dodges a `--flag value`
 // check. Bare short flags like `-i` are left intact (the regex requires a value).
@@ -69,7 +95,8 @@ function rejectUnknownGhShort(token: string): void {
   deny(`gh unrecognized/cluster short flag ${token}`);
 }
 
-export function assertReadOnlyGh(rawArgs: string[]): void {
+export function assertReadOnlyGh(callerArgs: string[]): void {
+  const rawArgs = trustedArgv(callerArgs, "gh");
   const args = canon(rawArgs);
   if (args.length === 0) deny("gh with no subcommand");
   const sub = args[0]!;
@@ -232,17 +259,10 @@ const GIT_CLONE_BOOL = new Set(["--single-branch", "--no-tags", "--no-recurse-su
 // first shape is retained deliberately even while caller-less (the ADR bill's letter).
 const GIT_CLONE_NO_CHECKOUT = "--no-checkout";
 
-export function assertReadOnlyGit(rawArgs: string[]): void {
-  // argv DENSITY guard: array-iteration helpers skip sparse-array holes, so a hole in a
-  // mandatory slot could otherwise satisfy an equality sweep over an exact tuple. Checking
-  // the VALUE alone is not enough — a hole reads through the prototype chain, so a
-  // prototype-backed sparse array can serve a conforming token from a slot it does not own
-  // while iteration helpers still skip it (santa round-2). Require an OWN string slot, so
-  // value reads and iteration can never disagree about what the argv contains.
-  for (let i = 0; i < rawArgs.length; i++) {
-    if (!Object.hasOwn(rawArgs, i) || typeof rawArgs[i] !== "string")
-      deny(`git argv slot ${i} is not an own string property (sparse or prototype-backed argv)`);
-  }
+export function assertReadOnlyGit(callerArgs: string[]): void {
+  // Every check below runs on OUR copy (see trustedArgv): own primitive-string slots only, and
+  // no caller-overridable array method can report a shape the spawned argv does not have.
+  const rawArgs = trustedArgv(callerArgs, "git");
   const args = canon(rawArgs);
   if (args.length === 0) deny("git with no subcommand");
   const verb = args[0]!;
@@ -258,9 +278,13 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
   }
 
   if (verb === "rev-parse") {
-    // the tool only runs `git rev-parse HEAD`; NO option is needed, so reject every flag
-    // (incl. --git-dir/--work-tree and any abbreviation) — only bare positionals allowed.
-    for (const a of args.slice(1)) if (a.startsWith("-")) deny(`git rev-parse option ${a}`);
+    // The tool runs EXACTLY `git rev-parse HEAD` (the T2c head-coherence check and nothing
+    // else), so this is an exact two-token tuple like show/ls-tree/cat-file — not merely
+    // "any bare positional". A missing, different, or extra rev is refused: an under-specified
+    // grammar let `rev-parse`, `rev-parse main` and `rev-parse HEAD OTHER` through, none of
+    // which any call site emits (santa round-3).
+    if (rawArgs.length !== 2 || rawArgs[1] !== "HEAD")
+      deny("git rev-parse is restricted to the exact `rev-parse HEAD` tuple");
     return;
   }
 
@@ -371,7 +395,8 @@ const TAR_SAFE_LONG = new Set([
 // write letters (c,r,u,A), exec letters (I,F), path-escape (P), incremental (g).
 const TAR_SAFE_SHORT = new Set(["t", "x", "z", "j", "J", "f", "v"]);
 
-export function assertReadOnlyTar(rawArgs: string[]): void {
+export function assertReadOnlyTar(callerArgs: string[]): void {
+  const rawArgs = trustedArgv(callerArgs, "tar");
   if (rawArgs.length === 0) deny("tar with no arguments");
   // --version / --help are allowed ONLY as the sole argument (preflight flavor detection).
   if (rawArgs.includes("--version") || rawArgs.includes("--help")) {
@@ -405,7 +430,9 @@ function normBin(bin: string): string {
   return base.replace(/\.(cmd|exe|bat|ps1)$/i, "").toLowerCase();
 }
 
-export function assertSpawnAllowed(bin: string, argv: string[] = []): void {
+export function assertSpawnAllowed(bin: string, callerArgv: string[] = []): void {
+  if (typeof bin !== "string") deny("spawn binary is not a string");
+  const argv = trustedArgv(callerArgv, "spawn");
   const name = normBin(bin);
   if (PM_DENYLIST.has(name)) deny(`banned package manager ${name}`);
   if (name === "bun") {
