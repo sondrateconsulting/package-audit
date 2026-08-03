@@ -23,13 +23,16 @@ describe("gitBlobOid — canonical `blob <len>\\0<body>` hashing (check 3 self-v
     expect(gitBlobOid(new Uint8Array(0), "sha256")).toBe("473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813"));
   test("sha256 of `hello world\\n`", () =>
     expect(gitBlobOid(enc.encode("hello world\n"), "sha256")).toBe("0bd69098bd9b9cc5934a610ab65da429b525361147faa7b5b922919e9a23143d"));
-  test("the header length is the BYTE length, not a character count", () => {
-    // a 2-byte UTF-8 body ("é") must hash as `blob 2\0` — a char-count header would corrupt
-    // every non-ASCII self-verification
+  test("the header length is the BYTE length, not a character count (independent non-ASCII pin)", () => {
+    // "é" is 2 UTF-8 bytes, so the canonical object is `blob 2\0é` — pinned to independently
+    // computed hashes (python hashlib, cross-checked). A character-count header (`blob 1\0`)
+    // yields sha1 4abd0d2592c882e7eab96ae8f47f274a56d52042 instead, so this pin genuinely
+    // discriminates the bug (santa round-1: the earlier form only compared the function to
+    // itself).
     const body = enc.encode("é");
     expect(body.byteLength).toBe(2);
-    expect(gitBlobOid(body, "sha1")).toBe(gitBlobOid(new Uint8Array(body), "sha1"));
-    expect(gitBlobOid(body, "sha1")).not.toBe(gitBlobOid(enc.encode("e"), "sha1"));
+    expect(gitBlobOid(body, "sha1")).toBe("4b04fff51468d8ab5201ab02b725dc477bc7cb45");
+    expect(gitBlobOid(body, "sha256")).toBe("8c5d37839f0a8720802a9c1b85aa1958752d66c980e6920c56076707f382f18f");
   });
 });
 

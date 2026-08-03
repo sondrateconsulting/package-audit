@@ -233,6 +233,13 @@ const GIT_CLONE_BOOL = new Set(["--single-branch", "--no-tags", "--no-recurse-su
 const GIT_CLONE_NO_CHECKOUT = "--no-checkout";
 
 export function assertReadOnlyGit(rawArgs: string[]): void {
+  // argv DENSITY guard: array-iteration helpers skip sparse-array holes, so a hole in a
+  // mandatory slot could otherwise satisfy an equality sweep over an exact tuple (santa
+  // round-1 finding). Every slot must be a real string before any grammar logic runs;
+  // indexing (below) then sees only genuine tokens.
+  for (let i = 0; i < rawArgs.length; i++) {
+    if (typeof rawArgs[i] !== "string") deny(`git argv slot ${i} is not a string`);
+  }
   const args = canon(rawArgs);
   if (args.length === 0) deny("git with no subcommand");
   const verb = args[0]!;
@@ -273,12 +280,15 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
   }
 
   if (verb === "ls-tree") {
-    // ONE exact tuple, raw-compared (same discipline as `show`): no reorder, no abbreviations,
-    // no pathspecs, rev pinned to HEAD.
-    const ok =
-      rawArgs.length === GIT_LS_TREE_ARGV.length &&
-      rawArgs.every((a, i) => a === GIT_LS_TREE_ARGV[i]);
-    if (!ok) deny("git ls-tree is restricted to the exact recursive-NUL-long enumeration tuple");
+    // ONE exact tuple, compared SLOT-BY-SLOT with direct indexing (never a hole-skipping
+    // iteration helper — the density guard above already rejects holes; the indexed loop is
+    // belt-and-braces): no reorder, no abbreviations, no pathspecs, rev pinned to HEAD.
+    if (rawArgs.length !== GIT_LS_TREE_ARGV.length)
+      deny("git ls-tree is restricted to the exact recursive-NUL-long enumeration tuple");
+    for (let i = 0; i < GIT_LS_TREE_ARGV.length; i++) {
+      if (rawArgs[i] !== GIT_LS_TREE_ARGV[i])
+        deny("git ls-tree is restricted to the exact recursive-NUL-long enumeration tuple");
+    }
     return;
   }
 
