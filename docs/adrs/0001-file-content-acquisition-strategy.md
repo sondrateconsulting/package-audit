@@ -206,8 +206,9 @@ requirement every option was judged against; the benchmark's fidelity battery an
 probe carried that requirement into the gates that decided this. The evidence is a per-scenario
 serial cost profile, not an estate simulation: concurrent fan-out, the shared REST+GraphQL budget
 under contention, cross-unit cache effects, and aggregate clone disk across parallel units remain
-design-ledger items — the concurrency probe evidences them (4 concurrent streams, zero secondary
-signals) without scoring them.
+design-ledger items. The concurrency probe evidences only the API-side dimension of that ledger —
+T0 and T1, 4 concurrent streams each, zero secondary-limit signals, nothing scored; clone-side
+aggregates (disk, transport) were not probed.
 
 **This is not a drop-in transport swap.** The resolution plan's §3.1 definition and §3.2 ledger
 are the normative implementation bill, in two classes:
@@ -234,9 +235,14 @@ are the normative implementation bill, in two classes:
 
 **Byte semantics under the chosen option.** Regular-blob reads are the committed objects
 themselves, self-verifying against the tree OID before any seam decode; `.gitattributes` never
-executes. The `ReadFile` seam remains a string contract: 2c applies the same UTF-8 decode at the
-seam that the REST path applies today, for findings parity — the transport's lossiness is
-removed, and raw-byte consumers stay future work. Symlinks are mode-routed to REST's dereferenced
+executes. The `ReadFile` seam remains a string contract: 2c applies the same UTF-8-with-replacement
+decode at the seam, now over canonical bytes — so delivered strings match today's REST path
+wherever REST already returned the blob's bytes, and diverge where it did not: on the pinned
+non-UTF-8 fixture the battery measured REST delivering a transcoded string (`gotHash 9c3ea2…`)
+where the canonical decode (`c98204…`) is the ratified expectation (`fidelity.jsonl`). Adopting
+2c therefore changes delivered strings on non-UTF-8 content, from the API's transcode to the
+canonical decode — a disclosed findings change in the fidelity standard's own direction; raw-byte
+consumers stay future work. Symlinks are mode-routed to REST's dereferenced
 bytes (the ratified policy), so symlink reads still spend API budget. There is no truncation
 cliff — `ls-tree` enumerates any tree — so the truncated-tree checkout-clone fallback and its
 checkout-byte caveat retire on this path once the implementation lands; until then production
@@ -261,8 +267,8 @@ keeps today's routing.
 * Bad, because the new surface is real: guard grammar growth, the stdin trust boundary, the
   interactive-child lifecycle with its second permit pool, and the framed binary seam — the
   §3.2 ledger's honest price, now an implementation obligation rather than a hypothetical.
-* Bad, because symlink reads still spend the per-unit REST fallback budget (max(20, 10% of
-  selected)), so symlink-heavy units keep an API dependency and its failure modes.
+* Bad, because symlink reads still spend the per-unit REST fallback budget (max(20, ceil(10% of
+  selected))), so symlink-heavy units keep an API dependency and its failure modes.
 * Neutral, because operational hardening is deferred to implementation **by name**, not
   silently: clone retry policy, pacing under fan-out, and the sweep-ownership fix (the
   residual-risk list above).
@@ -302,10 +308,12 @@ Post-implementation checks (the implementation PR must demonstrate these, not as
 4. **Environment and coherence.** `GIT_NO_REPLACE_OBJECTS=1` is present in the child's sanitized
    environment (asserted — `buildGitEnv` drops unlisted variables), and `rev-parse HEAD` equals
    the discovery-pinned OID, else fail closed.
-5. **Byte-level reader parity.** On raw reader output, not `UnitResult`: the M9 symlink
+5. **Byte-level reader checks.** On raw reader output, not `UnitResult`: the M9 symlink
    (mode-routed to REST, must equal 2,513 bytes), a binary blob, a non-UTF-8 blob whose seam
-   string matches today's REST delivery, a path containing a quote/backslash/newline/TAB, and a
-   tree entry with missing or unknown mode (fatal, never treated as a regular blob).
+   string equals the UTF-8-with-replacement decode of the canonical blob bytes — the battery's
+   pinned expectation, NOT today's REST delivery, which the battery measured as a transcode (the
+   T0/T1 G1 evidence) — a path containing a quote/backslash/newline/TAB, and a tree entry with
+   missing or unknown mode (fatal, never treated as a regular blob).
 6. **Child lifecycle.** Per-read deadline, the single-respawn policy, and ordered teardown —
    stdin close → exit await (kill-escalation on deadline) → disposer → clone deletion → permit
    release — on completion, failure, and abort alike.
@@ -314,7 +322,7 @@ Post-implementation checks (the implementation PR must demonstrate these, not as
    live; maximum configured fan-out spawns no more children than the pool size.
 8. **Separated counters.** Local canonical reads, REST fallback reads by cause, fallback-budget
    spend, clone-transport operations, and retries as distinct metrics; the per-unit fallback
-   budget (max(20, 10% of selected)) trips and terminates as defined.
+   budget (max(20, ceil(10% of selected))) trips and terminates as defined.
 9. **Operational hardening.** The clone retry policy and an owned temp sweep land with the
    implementation, or their explicit risk acceptance is recorded in the implementation PR; git
    transport stays under 15 ops/s/repo by construction, and the implementation shows its
@@ -458,7 +466,10 @@ in the [resolution plan](../plans/adr-0001-disagreements-resolution.md).
 * Good, because symlink policy is mode-routed exactly like Option 1's (modes are explicit in
   ls-tree; no filesystem links exist to traverse), the 2 MiB gate reads canonical sizes rather than
   transformed `lstat` sizes, and binary bytes survive the transport natively — the seam's UTF-8
-  decode becomes a deliberate parity choice instead of a transport loss.
+  decode becomes a deliberate choice at the seam instead of a transport loss. *(Step C later
+  measured the limit of that framing: decode parity is not delivered-string parity — on
+  non-UTF-8 content the API path transcodes and the canonical decode diverges; see Decision
+  Outcome.)*
 * Neutral, because head coherence (`git rev-parse HEAD` against the discovery-pinned OID) is already
   allowlisted ([readOnlyGuard.ts:236](../../scripts/readOnlyGuard.ts#L236)) — the force-push guard
   costs no new verb.
@@ -506,7 +517,9 @@ Key reads and cache rows on blob OID, read through the existing, currently unuse
   (Concurrent occurrences can still both miss, for the same lack of single-flight noted above.)
 * Good, because the change is modest: the `url` column is arbitrary text and the accessors take an
   arbitrary key ([db.ts:386](../../scripts/db.ts#L386), [db.ts:2361](../../scripts/db.ts#L2361)).
-* Good, because it composes with any transport rather than competing.
+* Good, because it composes with other transports rather than competing — though the Step-C warm
+  scenario measured the composition's value as API-path-specific: on the chosen fresh-clone path
+  the wall was unmoved (`option3.json`; the clone dominates).
 * Bad, because it **does not bound the worst case**: when every selected OID is unique, a cold run pays
   the full per-file price. Its value depends on the estate's duplicate-OID ratio, which is unmeasured
   (the pinned corpus's ratio was measured at Step C — `option3.json` — but an operator's estate is its
