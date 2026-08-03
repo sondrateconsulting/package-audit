@@ -56,9 +56,17 @@ export const DEFAULT_CONTENT_STORE_LIMITS: ContentStoreLimits = {
 
 // Unit-scoped failure vehicle (NOT an operator error — see cliErrors.test.ts's exclusion note).
 // `code` is the machine-checkable discriminant the unit-failure taxonomy and the tests key on.
+// The CLOSED set of codes is a literal union rather than a bare string because this module's
+// own teardown routing branches on `.code` (and the tests key on it): with a plain string, a
+// typo at a throw site or in a comparison compiles clean and silently misroutes — with the
+// union, either is a compile error.
+export type ContentStoreErrorCode =
+  | "aborted" | "budget" | "busy" | "child-busy" | "child-died-twice" | "child-disposed"
+  | "child-fatal" | "fallback-budget" | "hash-mismatch" | "internal" | "ls-tree-failed"
+  | "object-missing" | "over-ceiling" | "store-disposed" | "unknown-path";
 export class ContentStoreError extends Error {
-  readonly code: string;
-  constructor(code: string, message: string) {
+  readonly code: ContentStoreErrorCode;
+  constructor(code: ContentStoreErrorCode, message: string) {
     super(`CONTENT STORE: ${message}`);
     this.name = "ContentStoreError";
     this.code = code;

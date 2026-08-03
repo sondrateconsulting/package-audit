@@ -21,10 +21,22 @@
 // irreversible UTF-8 decode would destroy exactly the evidence these parsers must reject on,
 // which is why this seam consumes bytes.
 
+// The CLOSED set of frame-failure codes. A literal union rather than a bare string because
+// production and the tests both branch on `.code`: with a plain string, a typo at a throw site
+// or in a comparison compiles clean and silently never matches — with the union, either is a
+// compile error (a literal outside the set cannot be constructed, and comparing the field to
+// one is a no-overlap comparison).
+export type GitFrameErrorCode =
+  | "arm-oid" | "arm-size" | "busy" | "echo-mismatch" | "entry-bound" | "header-shape"
+  | "header-unterminated" | "limits" | "meta-nonascii" | "meta-shape" | "mode" | "mode-type"
+  | "oid" | "over-ceiling" | "path-canonical" | "path-duplicate" | "path-utf8" | "poisoned"
+  | "record-bound" | "record-shape" | "record-unterminated" | "size-mismatch" | "size-shape"
+  | "trailer" | "trailing" | "type-mismatch" | "unsolicited" | "writer-oid";
+
 export class GitFrameError extends Error {
   // machine-checkable discriminant for tests and the unit-failure taxonomy
-  readonly code: string;
-  constructor(code: string, message: string) {
+  readonly code: GitFrameErrorCode;
+  constructor(code: GitFrameErrorCode, message: string) {
     super(`GIT FRAME: ${message}`);
     this.name = "GitFrameError";
     this.code = code;
@@ -154,7 +166,7 @@ export class BatchFrameParser {
     this.limits = limits;
   }
 
-  private fail(code: string, message: string): never {
+  private fail(code: GitFrameErrorCode, message: string): never {
     this.state = { at: "failed" };
     throw new GitFrameError(code, message);
   }
