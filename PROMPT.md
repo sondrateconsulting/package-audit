@@ -691,8 +691,9 @@ work bounded by `concurrency.*`:
 - one per repo (branch lists, cutoff filter, candidate files),
 - one per branch (fetch manifests/lockfiles, scan usage).
 AS BUILT (§5 fan-out): all three `concurrency.*` values are consumed. `repositories` is the
-GLOBAL in-flight cap on gh/git/tar subprocesses (github.ts's semaphore) — NOT a per-repo
-fan-out degree. `concurrency.organizations` sizes the owner fan-out pool and
+global in-flight cap on ONE-SHOT gh/git/tar subprocesses (github.ts's semaphore) — NOT a
+per-repo fan-out degree — and it also sizes the separate pool bounding the unit-lived
+`cat-file` content children, which deliberately hold no one-shot permit. `concurrency.organizations` sizes the owner fan-out pool and
 `concurrency.branches` the per-repo branch-unit pool; repos within an owner stay SEQUENTIAL
 (each repo's discover→plan→scan→reconcile is atomic per worker). All three are optional and
 default (3 / 8 / 4), capped at 64, and excluded from config_hash (tuning never orphans
@@ -717,8 +718,10 @@ but keep code structured (pure functions) so it could parallelize later.
 
 RATE-LIMIT & THROTTLING (all gh calls go through the github.ts wrapper, so this is
 enforced in one place): the shipped `concurrency.*` fan-out (up to organizations × branches
-units dispatched at once) could trip GitHub's rate limits, so the wrapper caps TOTAL in-flight
-gh/git/tar subprocesses with one GLOBAL semaphore (sized by `concurrency.repositories`).
+units dispatched at once) could trip GitHub's rate limits, so the wrapper caps in-flight
+ONE-SHOT gh/git/tar subprocesses with one global semaphore (sized by
+`concurrency.repositories`); the unit-lived `cat-file` content children are bounded by a
+separate pool of the same size, so the two lanes cannot deadlock against each other.
 Throttle classification and pause-arming happen INSIDE the semaphore lease (so a queued caller
 never spawns into an about-to-open pause), and the per-bucket pause budget is WALL-CLOCK and
 shared, so N concurrent callers waiting out one window charge it once rather than N times. The wrapper reads the relevant response headers

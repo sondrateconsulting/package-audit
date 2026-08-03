@@ -40,7 +40,8 @@ const NO_DENY = compileRepositoryPolicy([]);
 
 // ---- T2c content-seam fakes (the acquisition + enumeration + framed child) -------------------
 // The scan path no longer fetches trees/contents over REST: units clone (a git spawn), then
-// enumerate and read through the interactive seams. These fakes serve that path structurally.
+// enumerate through the one-shot byte seam, and read blob bodies through the interactive
+// cat-file seam. These fakes serve that path structurally.
 const te = new TextEncoder();
 
 // A pull-queue byte stream matching the structural reader shape.

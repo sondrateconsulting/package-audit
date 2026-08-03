@@ -158,8 +158,8 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
       logLine({ event: "config", packages: trackedNames, cutoffDate: config.cutoffDate, githubHost: config.githubHost, organizations: config.organizations, fresh: args.fresh, plan: args.plan });
       // §5 configured fan-out widths. Emitted for both audit and --plan; in --plan runPlan traverses
       // owners/repos SEQUENTIALLY, so organizations/branches are reported but not fanned out there (only
-      // repositories, the gh/git/tar subprocess cap, applies in plan mode). `repositories` is the GLOBAL
-      // in-flight subprocess cap, NOT a repo-loop degree — so at most `repositories` gh/git/tar run at
+      // repositories, the one-shot gh/git/tar subprocess cap, applies in plan mode). `repositories` is
+      // the one-shot in-flight cap, NOT a repo-loop degree — so at most `repositories` one-shot gh/git/tar run at
       // once no matter how organizations×branches compose. Set-vocabulary event (documented in README).
       logLine({ event: "concurrency", organizations: config.concurrency.organizations, branches: config.concurrency.branches, repositories: config.concurrency.repositories });
 

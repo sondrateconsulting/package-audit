@@ -1250,7 +1250,7 @@ function ownerIsAlive(pid: number): boolean {
 export interface GithubClientOptions {
   githubHost: string;
   db?: AuditDb | null; // api_cache home; null disables caching
-  concurrency?: number; // GLOBAL in-flight cap on gh/git/tar subprocesses (§4/§5.6)
+  concurrency?: number; // in-flight cap for ONE-SHOT gh/git/tar spawns; also sizes the separate cat-file child pool (§4/§5.6)
   spawnImpl?: SpawnFn;
   // The T2c byte/interactive launch seam (gitBytes + launchBatchChild). A SEPARATE injectable
   // from spawnImpl on purpose: the one-shot string seam cannot express a live child, and
@@ -1437,8 +1437,8 @@ export class GithubClient {
   }
 
   // ---- guarded low-level spawns (the §6 chokepoint) ----
-  // EVERY guarded subprocess — gh (incl. direct preflight `gh auth status`/`gh --version`), git
-  // (clone), and tar (extract) — acquires the GLOBAL semaphore so §4's "cap TOTAL in-flight
+  // EVERY guarded ONE-SHOT subprocess — gh (incl. direct preflight `gh auth status`/`gh --version`),
+  // git (clone), and tar (extract) — acquires the GLOBAL semaphore so §4's "cap in-flight
   // subprocesses" holds for every path. `gh()` is the BARE form (no rate-limit bucket): it counts
   // against the cap but is not pause-aware. The pause-aware, bucketed path is ghBucketedAttempt
   // below (restGet/graphql), which arms any throttle pause INSIDE the lease so the slot is never
@@ -1557,7 +1557,7 @@ export class GithubClient {
     // gitconfig, so plan mode truly writes nothing and leaks no pkg-audit-gitcfg-* dir.
     const isVersionProbe = args.length === 1 && args[0] === "--version";
     const env = buildGitEnv(this.baseEnv, isVersionProbe ? devNull : this.ensureGitConfig());
-    // Count the clone against the GLOBAL in-flight cap (§4/§5.6): under fan-out a clone per branch-unit
+    // Count the clone against the global ONE-SHOT in-flight cap (§4/§5.6): under fan-out a clone per branch-unit
     // would otherwise reach the composed organizations×branches degree and blow temp-dir/fd/memory.
     // Acquire HERE (not inside spawnBounded, which gh already wraps — a second acquire there would
     // deadlock gh at concurrency 1). Bare slot (no bucket): a clone is network work but consumes no
@@ -1829,7 +1829,7 @@ export class GithubClient {
       if (!args.includes("--no-same-owner") || !args.includes("--no-same-permissions"))
         throw new GithubApiError("tar extract requires --no-same-owner and --no-same-permissions", {});
     }
-    // Count the extraction against the GLOBAL in-flight cap (§4/§5.6), same as git — acquire once at
+    // Count the extraction against the global ONE-SHOT in-flight cap (§4/§5.6), same as git — acquire once at
     // this level, never inside spawnBounded (gh already wraps it → double-acquire deadlock at 1).
     const release = await this.sem.acquire();
     try {

@@ -204,7 +204,7 @@ The presentation commands emit their own events: `report --html` writes one `dos
 
 ### Interactive dashboard
 
-Run `bun run audit` in a plain terminal and a live dashboard renders on **stderr**: current phase, REST/GraphQL rate limits and reset countdowns, throttle pauses (with a sticky notice if the cumulative pause budget is exhausted), subprocess-cap occupancy, active owners/repos/branch-units/introspections, session counters and findings, in-flight `gh`/`git`/`tar` and registry requests, and the last few errors/warnings. It is display-only in v1 — no keybindings — and **the JSONL contract is unchanged**: the vocabulary above, one event per line, exactly as before. Only the interactive *destination* moves.
+Run `bun run audit` in a plain terminal and a live dashboard renders on **stderr**: current phase, REST/GraphQL rate limits and reset countdowns, throttle pauses (with a sticky notice if the cumulative pause budget is exhausted), one-shot subprocess-cap occupancy, active owners/repos/branch-units/introspections, session counters and findings, in-flight `gh`/`git`/`tar` and registry requests, and the last few errors/warnings. It is display-only in v1 — no keybindings — and **the JSONL contract is unchanged**: the vocabulary above, one event per line, exactly as before. Only the interactive *destination* moves.
 
 Activation (`--ui` forces it on and fails fast if the terminal can't host it; `--no-ui` restores today's exact behavior; default is auto):
 
