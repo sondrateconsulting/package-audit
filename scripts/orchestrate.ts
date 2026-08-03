@@ -113,6 +113,11 @@ export interface AuditRuntime {
 // bench with the T2c cutover — benchDrivers.ts — where their only consumers live.)
 function apiReader(client: GithubClient, org: string, repo: string, commitSha: string) {
   return async (path: string, entry: TreeEntry): Promise<string | null> => {
+    // Reader parity with the store's own tree/commit short-circuit. Redundant in the current
+    // production routing — this reader is wired only as the store's symlink (mode-120000)
+    // fallback, whose entries are always blobs — but kept as defensive parity because the guard
+    // reads the caller-supplied `entry`, not the indexed `ls` the store routed on (the repo's
+    // revalidate-at-the-boundary convention, cf. db.ts).
     if (entry.type !== "blob") return null;
     try {
       return await client.fetchFileRaw(org, repo, path, commitSha);

@@ -268,8 +268,9 @@ export function assertGraphqlQueryIsReadOnly(rest: string[]): void {
 }
 
 // ---- git ----------------------------------------------------------------------------
-// The tool ONLY ever spawns `git clone` (two exact shapes, below), `git rev-parse HEAD`, and —
-// since ADR-0001's T2c adoption — `git ls-tree` and `git cat-file` as ONE exact tuple each.
+// The tool ONLY ever spawns `git clone` (two exact shapes, below), `git rev-parse HEAD`, the
+// bare `git --version` preflight probe, and — since ADR-0001's T2c adoption — `git ls-tree` and
+// `git cat-file` as ONE exact tuple each.
 // Because git accepts unambiguous long-option ABBREVIATIONS (`--templ` = `--template`,
 // `--dep` = `--depth`), a denylist is unsafe — so clone uses a strict EXACT-OPTION ALLOWLIST
 // of only the hardening flags the wrapper emits, rev-parse forbids every flag, and
