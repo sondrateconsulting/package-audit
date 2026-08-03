@@ -326,7 +326,14 @@ past tense — a form true after the merge), bench module headers if §4(a).
   2 P2 (a failed `ls-tree` spawn with empty stdout parses as a LEGAL empty listing, so the
   store open must check exit/timeout before `parseLsTreeZ` → pinned in §2 with a named test;
   Q4 omitted the framed-child header-bound and stderr-ring constants → added with the
-  ratified values). Round 5 (the cap): (pending)
+  ratified values).
+- Plan codex loop **round 5** (gpt-5.5 @ xhigh, fresh session; the final capped round —
+  first attempt hit the same pre-flight CLI wedge, killed and relaunched): **CONSULT-PASS,
+  zero findings** — bill coverage, the round-4 fixes, the 7-question batch, and the
+  disclosure list all verified with citations. **Loop outcome: CONVERGED at iteration 5 of
+  5.** (Honest caveat per house practice: a pass at the cap is one reviewer's pass, not
+  proof of cleanliness; Step-B ratification-grade scrutiny arrives with the per-phase and
+  final santa loops.)
 - Per-phase santa loops: (pending)
 - Final whole-diff santa loop (cap 5): (pending)
 - Doc-sweep codex prose pass: (pending)
