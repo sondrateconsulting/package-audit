@@ -103,6 +103,13 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       // catch it). Not operator-error material; the stack-dump consequence on an escape is the
       // right diagnostic, because an escape would be a wiring bug.
       "GitFrameError",
+      // Same rationale, one layer up: the unit content store's own failure vehicle
+      // (contentStore.ts — enumeration refusals, the fallback-budget trip, child double-death,
+      // object-store corruption). Every instance is unit-scoped: processUnit's catch records it
+      // as that unit's errors[] row and the run continues. It stays exported for cross-module
+      // instanceof (orchestrate distinguishes it from transport errors); it never carries
+      // operator remediation, so the registry's clean-message rendering does not apply.
+      "ContentStoreError",
     ]);
     const declared = new Set<string>();
     // recursive: scripts/tui/ declares operator-facing classes too (TuiActivationError)

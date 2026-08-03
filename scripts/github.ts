@@ -65,6 +65,15 @@ export interface SpawnResult {
   stdout: string;
   stderr: string;
 }
+// The byte-typed one-shot capture (gitBytes) — the T2c enumeration path consumes bytes, never
+// a pre-decoded string. `timedOut: true` always pairs with the synthetic exit 124 and EMPTY
+// stdout (a timed-out capture must never surface partial bytes as a complete listing).
+export interface GitBytesResult {
+  exitCode: number;
+  stdout: Uint8Array;
+  stderr: Uint8Array;
+  timedOut: boolean;
+}
 // Minimal, purpose-built abort plumbing: a bespoke { aborted, onAbort } read side fit for the
 // spawn-deadline use — the client flips it on deadline expiry and the spawn impl registers the
 // child-kill — rather than the platform AbortSignal's EventTarget (add/removeEventListener) API.
@@ -132,7 +141,10 @@ export function spawnLabel(tool: SpawnTool, args: readonly string[]): string {
   }
 }
 
-const MAX_SPAWN_OUTPUT_BYTES = 110 * 1024 * 1024; // raw contents cap is 100 MB (§5.C) + slack
+// EXPORTED since the ADR-0001 T2c adoption: the content store's absolute per-frame ceiling is
+// PINNED to this cap by the bill (an ungated manifest can never allocate more than today's REST
+// path could return before the cap kill), and the store's tests assert that binding.
+export const MAX_SPAWN_OUTPUT_BYTES = 110 * 1024 * 1024; // raw contents cap is 100 MB (§5.C) + slack
 // §4 hardening: SIGTERM is refusable — a signal-trapping/wedged child, or a descendant that
 // inherited the pipes, must not orphan the read loop or pin the event loop. This grace period
 // after the deadline's SIGTERM ends in SIGKILL, a best-effort process-group kill (the spawn
@@ -169,47 +181,114 @@ export async function readCapped(reader: StreamReader, cap: number, onExceed: ()
   return Buffer.concat(chunks).toString("utf8");
 }
 
+// Like readCapped but yielding RAW BYTES — the T2c seam consumes `ls-tree -z` output (and the
+// framed child's streams) as bytes, because the string path's irreversible UTF-8 decode would
+// destroy exactly the evidence the byte-level parsers must fail closed on. Same cap semantics:
+// the process is killed the moment the cap is crossed, never after buffering the excess.
+export async function readBytesCapped(reader: StreamReader, cap: number, onExceed: () => void): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (value !== undefined) {
+      total += value.byteLength;
+      if (total > cap) {
+        onExceed();
+        throw new GithubApiError(`spawn output exceeds ${cap} bytes`, {});
+      }
+      chunks.push(value);
+    }
+    if (done) break;
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.byteLength;
+  }
+  return out;
+}
+
+// ---- the single launch primitive (ADR-0001 T2c: parameterized, never duplicated) -------------
+// Structural shapes for the launched child (house precedent: StreamReader) — enough for byte
+// pumps, stdin writes, and the kill path, without runtime-specific generics. The interactive
+// consumers (contentStore.ts's child manager) hold these shapes only, never a runtime handle
+// type, so scripted fakes drive every lifecycle test.
+export interface StdinSink {
+  write(data: Uint8Array): number | Promise<number>;
+  flush(): unknown;
+  end(): unknown;
+}
+export interface LaunchedChild {
+  readonly pid: number;
+  readonly stdout: { getReader(): StreamReader };
+  readonly stderr: { getReader(): StreamReader };
+  readonly stdin: StdinSink | null;
+  readonly exited: Promise<number>;
+  kill(signal?: number): void;
+  unref(): void;
+}
+export interface LaunchRequest {
+  env: Record<string, string>;
+  cwd?: string;
+  stdin: "ignore" | "pipe";
+}
+// The injectable interactive/byte launch seam (GithubClientOptions.launchImpl). The one-shot
+// string SpawnFn seam stays as-is for its existing consumers; interactive children get their
+// own launch type rather than stretching the one-shot seam (plan §6 P3).
+export type LaunchFn = (bin: string, args: readonly string[], req: LaunchRequest) => LaunchedChild;
+
+// THE process-launch site — the only one in the audit product (§6; grep-enforced). Both stdin
+// modes flow through this single call: the one-shot paths pass "ignore", the unit-lived
+// cat-file child passes "pipe".
+const realLaunch: LaunchFn = (bin, args, req) =>
+  Bun.spawn({
+    cmd: [bin, ...args],
+    env: req.env,
+    cwd: req.cwd,
+    stdin: req.stdin,
+    stdout: "pipe",
+    stderr: "pipe",
+  }) as unknown as LaunchedChild;
+
+// Kill with the §4 escalation shape, shared by every consumer of the launch primitive:
+// terminate now; after the grace, SIGKILL + best-effort group kill + reader cancellation +
+// unref — every step a no-op on a clean exit. Escalation fires UNCONDITIONALLY after the grace:
+// SIGKILL cannot be trapped, and cancelling the readers unblocks the capped reads even when a
+// surviving grandchild still holds the inherited pipes open. EXPORTED for contentStore.ts's
+// child manager (which owns per-read deadlines over the same escalation).
+export function killWithEscalation(child: LaunchedChild, readers: StreamReader[]): void {
+  try {
+    child.kill();
+  } catch {
+    // already exited
+  }
+  const escalate = setTimeout(() => {
+    try {
+      child.kill(9); // SIGKILL
+    } catch {
+      // already exited
+    }
+    try {
+      process.kill(-child.pid, 9); // group kill, when the child leads a group
+    } catch {
+      // not a group leader / already gone
+    }
+    for (const r of readers) r.cancel().catch(() => {});
+    child.unref();
+  }, SPAWN_KILL_GRACE_MS);
+  escalate.unref?.();
+}
+
 // Factory so the byte cap is injectable for tests (shipping 110MB through a real child to
 // exercise the cap would be pure test tax); realSpawn — the production SpawnFn — is
 // makeRealSpawn(MAX_SPAWN_OUTPUT_BYTES).
 export function makeRealSpawn(cap: number): SpawnFn {
   return async (bin, args, opts) => {
-    const proc = Bun.spawn({
-      cmd: [bin, ...args],
-      env: opts.env,
-      cwd: opts.cwd,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const proc = realLaunch(bin, args, { env: opts.env, cwd: opts.cwd, stdin: "ignore" });
     const outReader = proc.stdout.getReader();
     const errReader = proc.stderr.getReader();
-    const kill = (): void => {
-      try {
-        proc.kill();
-      } catch {
-        // already exited
-      }
-      // Escalation fires UNCONDITIONALLY after the grace (all steps are no-ops on a clean
-      // exit): SIGKILL cannot be trapped, and cancelling the readers unblocks readCapped even
-      // when a surviving grandchild still holds the inherited pipes open.
-      const escalate = setTimeout(() => {
-        try {
-          proc.kill(9); // SIGKILL
-        } catch {
-          // already exited
-        }
-        try {
-          process.kill(-proc.pid, 9); // group kill, when the child leads a group
-        } catch {
-          // not a group leader / already gone
-        }
-        outReader.cancel().catch(() => {});
-        errReader.cancel().catch(() => {});
-        proc.unref();
-      }, SPAWN_KILL_GRACE_MS);
-      escalate.unref?.();
-    };
+    const kill = (): void => killWithEscalation(proc, [outReader, errReader]);
     opts.signal?.onAbort(kill);
     // ANY reader failure — not only the byte cap's own onExceed — must start the kill
     // escalation: a raw stream error otherwise leaves the child running and pins the
@@ -306,6 +385,12 @@ export function buildGitEnv(base: Env, gitConfigPath: string): Record<string, st
     GIT_CONFIG_SYSTEM: devNull,
     GIT_CONFIG_GLOBAL: gitConfigPath,
     GIT_ALLOW_PROTOCOL: "https", // insteadOf can't smuggle ssh/file even if config slipped
+    // ADR-0001 check 4: EVERY git spawn runs replace-ref-blind, set HERE (the one env builder)
+    // rather than only on the cat-file child — rev-parse/ls-tree running WITH replace refs
+    // while cat-file runs without them would let the coherence check and the enumeration
+    // disagree with the reads. An env var deliberately: the guard treats a pre-verb global
+    // like a no-replace option as the verb and denies it (readOnlyGuard's pre-verb rule).
+    GIT_NO_REPLACE_OBJECTS: "1",
     GIT_PAGER: "cat",
     NO_COLOR: "1",
     TERM: "dumb",
@@ -1014,6 +1099,10 @@ export interface GithubClientOptions {
   db?: AuditDb | null; // api_cache home; null disables caching
   concurrency?: number; // GLOBAL in-flight cap on gh/git/tar subprocesses (§4/§5.6)
   spawnImpl?: SpawnFn;
+  // The T2c byte/interactive launch seam (gitBytes + launchBatchChild). A SEPARATE injectable
+  // from spawnImpl on purpose: the one-shot string seam cannot express a live child, and
+  // stretching it would force every existing scripted test to grow a child shape it never uses.
+  launchImpl?: LaunchFn;
   sleepImpl?: (ms: number) => Promise<void>;
   nowImpl?: () => number;
   spawnTimeoutMs?: number; // wall-clock kill deadline per spawn (default SPAWN_TIMEOUT_MS)
@@ -1043,6 +1132,7 @@ export class GithubClient {
   readonly tempRoot: string;
   private readonly db: AuditDb | null;
   private readonly spawn: SpawnFn;
+  private readonly launch: LaunchFn;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
   private readonly spawnTimeoutMs: number;
@@ -1050,6 +1140,12 @@ export class GithubClient {
   private readonly ghEnv: Record<string, string>;
   private readonly baseEnv: Env;
   private readonly sem: Semaphore;
+  // ADR-0001 T2c check 7: the SECOND permit pool — unit-lived cat-file children draw from
+  // here, never from the one-shot subprocess semaphore (a child HOLDING a one-shot permit
+  // while its unit's symlink read awaits one is a deadlock, certain at capacity 1). Sized to
+  // the subprocess semaphore's own size (rvo Q4: the ratified default), a fixed small constant
+  // independent of unit fan-out.
+  private readonly childPool: Semaphore;
   private readonly core: Bucket = { label: "core", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
   private readonly graphqlBucket: Bucket = { label: "graphql", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
   private gitConfigPath: string | null = null;
@@ -1064,6 +1160,7 @@ export class GithubClient {
     this.githubHost = opts.githubHost;
     this.db = opts.db ?? null;
     this.spawn = opts.spawnImpl ?? realSpawn;
+    this.launch = opts.launchImpl ?? realLaunch;
     this.sleep = opts.sleepImpl ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.now = opts.nowImpl ?? Date.now;
     this.spawnTimeoutMs = opts.spawnTimeoutMs ?? SPAWN_TIMEOUT_MS;
@@ -1090,6 +1187,7 @@ export class GithubClient {
     this.sem = new Semaphore(concurrency, (waiting) => {
       if (hasProgressSink()) emitProgress({ type: "spawn-queue", waiting });
     });
+    this.childPool = new Semaphore(concurrency); // no waiter gauge: the TUI's queue depth is the one-shot lane's
     this.tempRoot = opts.tempRoot ?? realpathSync(tmpdir());
   }
 
@@ -1291,6 +1389,104 @@ export class GithubClient {
     } finally {
       release();
     }
+  }
+
+  // ---- ADR-0001 T2c: the byte-capture one-shot and the unit-lived interactive child ----
+  // One-shot guarded BYTE-capture git spawn (the enumeration path). The store open consumes
+  // `ls-tree -z` output as raw bytes because the string path's irreversible UTF-8 decode would
+  // destroy exactly the evidence parseLsTreeZ must fail closed on. Same §6 discipline as git():
+  // both guards + cwd containment BEFORE anything starts, a GLOBAL semaphore slot (a one-shot
+  // subprocess like any other), the wall-clock deadline with the kill escalation, and a span
+  // through the §U3.1 funnel. On a deadline expiry the result is ALWAYS the synthetic 124 with
+  // EMPTY stdout — a timed-out capture must never surface partial bytes as a complete listing.
+  async gitBytes(args: string[], cwd: string): Promise<GitBytesResult> {
+    assertSpawnAllowed(this.bins.git, args);
+    assertReadOnlyGit(args);
+    assertContained(cwd, [this.tempRoot]); // §0: git is the only process allowed cwd inside a clone
+    const env = buildGitEnv(this.baseEnv, this.ensureGitConfig());
+    const release = await this.sem.acquire();
+    let spanId = 0;
+    if (hasProgressSink()) {
+      spanId = nextProgressId();
+      emitProgress({ type: "spawn-start", id: spanId, tool: "git", label: spawnLabel("git", args) });
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let gaveUpTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const child = this.launch(this.bins.git, args, { env, cwd, stdin: "ignore" });
+      const outReader = child.stdout.getReader();
+      const errReader = child.stderr.getReader();
+      const kill = (): void => killWithEscalation(child, [outReader, errReader]);
+      let timedOut = false;
+      timer = setTimeout(() => {
+        timedOut = true;
+        kill();
+      }, this.spawnTimeoutMs);
+      // ANY reader failure starts the escalation (the string path's posture), and the
+      // temporally-FIRST reader error is retained across the exit join.
+      const guard = (p: Promise<Uint8Array>): Promise<Uint8Array> => {
+        p.catch(() => kill());
+        return p;
+      };
+      const outP = guard(readBytesCapped(outReader, MAX_SPAWN_OUTPUT_BYTES, kill));
+      const errP = guard(readBytesCapped(errReader, MAX_SPAWN_OUTPUT_BYTES, kill));
+      let firstErr: unknown;
+      let failed = false;
+      const capture = (p: Promise<Uint8Array>): Promise<Uint8Array> =>
+        p.catch((e: unknown) => {
+          if (!failed) {
+            failed = true;
+            firstErr = e;
+          }
+          return new Uint8Array(0);
+        });
+      // The exit join is BOUNDED once the deadline could have fired: a wedged exit promise
+      // must not hang the caller past deadline + escalation grace + margin.
+      const joined = Promise.all([capture(outP), capture(errP), child.exited]);
+      const bounded = await Promise.race([
+        joined,
+        new Promise<null>((resolve) => {
+          gaveUpTimer = setTimeout(() => resolve(null), this.spawnTimeoutMs + SPAWN_KILL_GRACE_MS + 2_000);
+        }),
+      ]);
+      if (bounded === null)
+        throw new GithubApiError(`git ${args[0] ?? ""} never settled within the deadline + escalation grace`, {});
+      const [stdout, stderr, exitCode] = bounded;
+      // deadline FIRST: an escalation-induced reader cancellation must surface as the promised
+      // terminal 124, never as a reader error (the bench seam's reviewed ordering)
+      if (timedOut) return { exitCode: 124, stdout: new Uint8Array(0), stderr, timedOut: true };
+      if (failed) throw firstErr;
+      return { exitCode, stdout, stderr, timedOut: false };
+    } finally {
+      clearTimeout(timer);
+      clearTimeout(gaveUpTimer);
+      if (spanId !== 0 && hasProgressSink()) emitProgress({ type: "spawn-end", id: spanId });
+      release();
+    }
+  }
+
+  // Launch the unit-lived `cat-file --batch` child (ADR-0001 §3.1(4)): guarded exactly like
+  // every other spawn (argv guards + cwd containment + the sanitized git env, which carries
+  // GIT_NO_REPLACE_OBJECTS — check 4), launched with a stdin PIPE, and — deliberately — holding
+  // NO permit of the one-shot subprocess semaphore: children draw from the child pool via
+  // acquireChildPermit() (check 7; a child holding a one-shot permit while its unit's symlink
+  // fallback awaits one would deadlock at capacity 1). Lifecycle ownership (pumps, per-read
+  // deadlines, ordered teardown) lives in contentStore.ts; this method is only the guarded
+  // launch capability it injects.
+  launchBatchChild(cwd: string): LaunchedChild {
+    const args = ["cat-file", "--batch"];
+    assertSpawnAllowed(this.bins.git, args);
+    assertReadOnlyGit(args);
+    assertContained(cwd, [this.tempRoot]);
+    const env = buildGitEnv(this.baseEnv, this.ensureGitConfig());
+    return this.launch(this.bins.git, args, { env, cwd, stdin: "pipe" });
+  }
+
+  // The child pool's acquire — a fixed small pool (the subprocess semaphore's size, rvo Q4)
+  // independent of unit fan-out. A unit waiting here holds no permit of EITHER pool, and child
+  // holders never occupy one-shot permits — no cycle exists (§3.1's deadlock argument).
+  acquireChildPermit(): Promise<() => void> {
+    return this.childPool.acquire();
   }
 
   async tar(args: string[]): Promise<SpawnResult> {

@@ -7,8 +7,9 @@ import {
   GithubClient, GithubApiError, ThrottleExhausted, MAX_PAGES, MAX_PAUSE_MS, SPAWN_TIMEOUT_MS, MAX_TOTAL_PAUSE_MS, SPAWN_KILL_GRACE_MS,
   parseGhApiOutput, parseLinkNext, nextEndpointFromLink, parseRetryAfterMs,
   classifyRest, classifyGraphql, parseGraphqlEnvelope, parseTreeResponse, encodeContentsPath, mapRestRepo, filterSortCapRepos,
-  buildGhEnv, buildGitEnv, buildTarEnv, readCapped, makeRealSpawn, joinSpawnOutcome,
+  buildGhEnv, buildGitEnv, buildTarEnv, readCapped, readBytesCapped, makeRealSpawn, joinSpawnOutcome,
   type SpawnFn, type SpawnResult, type RepoInfo, type SpawnAbortSignal, type StreamReader,
+  type LaunchedChild, type LaunchRequest,
 } from "./github.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import { AuditDb } from "./db.ts";
@@ -503,6 +504,9 @@ describe("sanitized env construction", () => {
     expect(env["GIT_CONFIG_NOSYSTEM"]).toBe("1");
     expect(env["GIT_ALLOW_PROTOCOL"]).toBe("https");
     expect(env["GIT_TERMINAL_PROMPT"]).toBe("0");
+    // ADR-0001 check 4: EVERY git spawn runs replace-ref-blind — set here (the one env builder),
+    // not per-call-site, so rev-parse/ls-tree can never disagree with the cat-file child's reads.
+    expect(env["GIT_NO_REPLACE_OBJECTS"]).toBe("1");
     expect(env["GIT_ASKPASS"]).toBeUndefined();
     expect(env["GIT_SSH_COMMAND"]).toBeUndefined();
     // the pinned credential helper runs `gh auth git-credential` under THIS env — token and
@@ -2940,10 +2944,12 @@ describe("spawn-site allowlist (grep-enforced, with two exact-path scanner-test 
   });
   test("every spawn in github.ts flows through a guard-calling wrapper", () => {
     const src = readFileSync("./scripts/github.ts", "utf8");
-    // each guarded spawn path must call assertSpawnAllowed + its read-only guard. FOUR paths now:
+    // each guarded spawn path must call assertSpawnAllowed + its read-only guard. SIX paths now:
     // gh() (bare, e.g. preflight), ghBucketedAttempt() (the pause-aware gh path restGet/graphql use —
-    // a DISTINCT gh spawn that re-runs the guards), git(), and tar().
-    expect(src.match(/assertSpawnAllowed\(/g)?.length).toBe(4);
+    // a DISTINCT gh spawn that re-runs the guards), git(), tar(), and the two ADR-0001 T2c paths:
+    // gitBytes() (the one-shot byte-capture spawn ls-tree rides) and launchBatchChild() (the
+    // unit-lived interactive cat-file child).
+    expect(src.match(/assertSpawnAllowed\(/g)?.length).toBe(6);
     for (const guard of ["assertReadOnlyGh", "assertReadOnlyGit", "assertReadOnlyTar"])
       expect(src.includes(`${guard}(args)`)).toBe(true);
   });
@@ -3004,5 +3010,228 @@ describe("sweepStaleTempDirs observability (§0)", () => {
     expect(removed).toEqual([]); // nothing was successfully removed
     const removeWarnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed" && e.operation === "remove" && String(e.target).endsWith("pkg-audit-stuck"));
     expect(removeWarnings.length).toBe(1); // the non-ENOENT removal failure is surfaced (not the suppressed root path)
+  });
+});
+
+// ---- ADR-0001 T2c spawn seam (gitBytes / launchBatchChild / the child permit pool) ------------
+describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", () => {
+  // Minimal scripted structural child for the interactive-launch seam. The pid sits far above
+  // the platform pid ceiling so the escalation's best-effort group signal can only ESRCH.
+  const byteStream = (chunks: Array<Uint8Array | string>, open = false) => {
+    const queue = chunks.map((c) => (typeof c === "string" ? new TextEncoder().encode(c) : c));
+    let closed = !open;
+    const pending: Array<(r: { done?: boolean; value?: Uint8Array }) => void> = [];
+    return {
+      close(): void {
+        closed = true;
+        for (const w of pending.splice(0)) w({ done: true });
+      },
+      getReader: (): StreamReader => ({
+        read: () =>
+          new Promise((resolve) => {
+            const item = queue.shift();
+            if (item !== undefined) return resolve({ value: item });
+            if (closed) return resolve({ done: true });
+            pending.push(resolve);
+          }),
+        cancel: async () => undefined,
+      }),
+    };
+  };
+  interface FakeLaunch {
+    child: LaunchedChild;
+    kills: Array<number | undefined>;
+    exit: (code: number) => void;
+  }
+  const fakeOneShot = (opts: { stdout?: Array<Uint8Array | string>; stderr?: Array<Uint8Array | string>; exitCode?: number; stayOpen?: boolean }): FakeLaunch => {
+    const stayOpen = opts.stayOpen === true;
+    const out = byteStream(opts.stdout ?? [], stayOpen);
+    const errS = byteStream(opts.stderr ?? [], stayOpen);
+    const kills: Array<number | undefined> = [];
+    let exitResolve!: (code: number) => void;
+    const exited = new Promise<number>((r) => (exitResolve = r));
+    let settled = false;
+    const exit = (code: number): void => {
+      if (settled) return;
+      settled = true;
+      out.close();
+      errS.close();
+      exitResolve(code);
+    };
+    if (!stayOpen) exit(opts.exitCode ?? 0);
+    const child: LaunchedChild = {
+      pid: 4_242_424,
+      stdout: { getReader: () => out.getReader() },
+      stderr: { getReader: () => errS.getReader() },
+      stdin: null,
+      exited,
+      kill: (signal?: number) => {
+        kills.push(signal);
+        exit(137); // a killed fake dies promptly, keeping the settle waits off the escalation timers
+      },
+      unref: () => undefined,
+    };
+    return { child, kills, exit };
+  };
+  const LS_TUPLE = ["ls-tree", "-r", "-z", "-l", "--full-tree", "HEAD"];
+
+  test("gitBytes: a non-allowlisted argv is refused before any launch", async () => {
+    const launches: LaunchRequest[] = [];
+    const { client } = makeClient([], {
+      launchImpl: (_bin, _args, req) => {
+        launches.push(req);
+        return fakeOneShot({}).child;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-guard-"));
+    await expect(client.gitBytes(["log", "-p"], dir)).rejects.toThrow(ReadOnlyViolation);
+    expect(launches.length).toBe(0);
+  });
+  test("gitBytes: the cwd is containment-checked against the temp root before any launch", async () => {
+    const launches: LaunchRequest[] = [];
+    const { client } = makeClient([], {
+      launchImpl: (_bin, _args, req) => {
+        launches.push(req);
+        return fakeOneShot({}).child;
+      },
+    });
+    await expect(client.gitBytes(LS_TUPLE, "/etc")).rejects.toThrow(ReadOnlyViolation);
+    expect(launches.length).toBe(0);
+  });
+  test("gitBytes: stdout/stderr are captured as RAW BYTES (a non-UTF-8 byte survives verbatim), env is the sanitized git env", async () => {
+    const raw = new Uint8Array([0x61, 0xff, 0x00, 0x62]); // would be destroyed by a string decode
+    let seen: { bin: string; args: readonly string[]; req: LaunchRequest } | null = null;
+    const { client } = makeClient([], {
+      launchImpl: (bin, args, req) => {
+        seen = { bin, args, req };
+        return fakeOneShot({ stdout: [raw], stderr: ["warned\n"] }).child;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-bytes-"));
+    const res = await client.gitBytes(LS_TUPLE, dir);
+    expect(res.exitCode).toBe(0);
+    expect(res.timedOut).toBe(false);
+    expect([...res.stdout]).toEqual([...raw]);
+    expect(new TextDecoder().decode(res.stderr)).toBe("warned\n");
+    expect(seen).not.toBeNull();
+    const call = seen!;
+    expect(call.bin).toBe(BINS.git);
+    expect([...call.args]).toEqual(LS_TUPLE);
+    expect(call.req.stdin).toBe("ignore");
+    expect(call.req.cwd).toBe(dir);
+    expect(call.req.env["GIT_NO_REPLACE_OBJECTS"]).toBe("1"); // check 4: every git spawn
+    expect(call.req.env["GIT_TERMINAL_PROMPT"]).toBe("0");
+    expect(call.req.env["GIT_ASKPASS"]).toBeUndefined(); // sanitized, not a raw passthrough
+  });
+  test("gitBytes: counts against the GLOBAL subprocess semaphore (queued behind a held gh slot)", async () => {
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((r) => (releaseFirst = r));
+    const launches: LaunchRequest[] = [];
+    const spawn: SpawnFn = async () => {
+      await gate;
+      return ok(http(200, {}, "{}"));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spawn,
+      launchImpl: (_bin, _args, req) => {
+        launches.push(req);
+        return fakeOneShot({ stdout: ["x"] }).child;
+      },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      concurrency: 1,
+      env: { HOME: "/home/u", PATH: "/bin" },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-sem-"));
+    const p1 = client.gh(["api", "rate_limit"]);
+    const p2 = client.gitBytes(LS_TUPLE, dir);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(launches.length).toBe(0); // queued behind the held slot — the cap covers byte spawns too
+    releaseFirst();
+    await p1;
+    const res = await p2;
+    expect(launches.length).toBe(1);
+    expect(res.exitCode).toBe(0);
+  });
+  test("gitBytes: the wall-clock deadline kills the child and yields the synthetic 124 with timedOut", async () => {
+    let fake: FakeLaunch | null = null;
+    const { client } = makeClient([], {
+      spawnTimeoutMs: 40,
+      launchImpl: () => {
+        fake = fakeOneShot({ stayOpen: true }); // a silent child that never exits on its own
+        return fake.child;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-timeout-"));
+    const res = await client.gitBytes(LS_TUPLE, dir);
+    expect(res.timedOut).toBe(true);
+    expect(res.exitCode).toBe(124);
+    expect(res.stdout.byteLength).toBe(0); // a timed-out capture is never partial data
+    expect(fake!.kills.length).toBeGreaterThan(0);
+  });
+  test("launchBatchChild: guarded + containment-checked, launched with a stdin PIPE, and NEVER holding a global permit", async () => {
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((r) => (releaseFirst = r));
+    const calls: Array<{ args: readonly string[]; req: LaunchRequest }> = [];
+    const spawn: SpawnFn = async () => {
+      await gate;
+      return ok(http(200, {}, "{}"));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spawn,
+      launchImpl: (_bin, args, req) => {
+        calls.push({ args, req });
+        return fakeOneShot({ stayOpen: true }).child;
+      },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      concurrency: 1,
+      env: { HOME: "/home/u", PATH: "/bin", GIT_ASKPASS: "/evil" },
+    });
+    expect(() => client.launchBatchChild("/etc")).toThrow(ReadOnlyViolation); // containment
+    expect(calls.length).toBe(0);
+    const dir = mkdtempSync(join(TEST_TMP, "batch-child-"));
+    const held = client.gh(["api", "rate_limit"]); // occupy the ONLY one-shot slot…
+    const child = client.launchBatchChild(dir); // …and the child still launches: no global permit
+    expect(calls.length).toBe(1);
+    expect([...calls[0]!.args]).toEqual(["cat-file", "--batch"]);
+    expect(calls[0]!.req.stdin).toBe("pipe");
+    expect(calls[0]!.req.cwd).toBe(dir);
+    expect(calls[0]!.req.env["GIT_NO_REPLACE_OBJECTS"]).toBe("1"); // check 4, at the child's own launch
+    expect(calls[0]!.req.env["GIT_ASKPASS"]).toBeUndefined(); // the sanitized env, not process.env
+    expect(typeof child.pid).toBe("number");
+    releaseFirst();
+    await held;
+  });
+  test("the child permit pool is fixed at the subprocess semaphore's size and is INDEPENDENT of it", async () => {
+    const { client } = makeClient([ok(http(200, {}, "{}"))], { concurrency: 1 });
+    const release1 = await client.acquireChildPermit();
+    let secondAcquired = false;
+    const p2 = client.acquireChildPermit().then((r) => {
+      secondAcquired = true;
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(secondAcquired).toBe(false); // pool size 1: the second permit queues
+    // independence: a held CHILD permit must not block the one-shot lane (no shared semaphore)
+    const res = await client.gh(["api", "rate_limit"]);
+    expect(res.exitCode).toBe(0);
+    release1();
+    (await p2)();
+  });
+  test("readBytesCapped: the byte cap kills mid-stream and rejects (never buffers past the cap)", async () => {
+    let cancelled = false;
+    let exceeded = 0;
+    const reader: StreamReader = {
+      read: async () => ({ value: new Uint8Array(64) }), // an endless 64-byte firehose
+      cancel: async () => {
+        cancelled = true;
+      },
+    };
+    await expect(readBytesCapped(reader, 100, () => exceeded++)).rejects.toThrow(/exceeds 100 bytes/);
+    expect(exceeded).toBe(1);
+    expect(cancelled).toBe(false); // the CALLER's kill path owns cancellation, mirroring readCapped
   });
 });
