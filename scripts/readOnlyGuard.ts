@@ -6,6 +6,13 @@
 
 import { lstatSync, readlinkSync } from "node:fs";
 import { isAbsolute, sep } from "node:path";
+import { types as runtimeTypes } from "node:util";
+
+// Captured at module load: the checks that decide whether an argv may be inspected at all must
+// not themselves be replaceable by whoever is being inspected.
+const isArrayIntrinsic = Array.isArray;
+const isProxyIntrinsic = runtimeTypes.isProxy;
+const ownDescriptor = Object.getOwnPropertyDescriptor;
 
 export class ReadOnlyViolation extends Error {
   constructor(message: string) {
@@ -58,14 +65,23 @@ function trustedArgv(raw: readonly string[], what: string): string[] {
   // expose a `length` getter that under-reports its slots, so the guard would validate a
   // SHORTER argv than the caller then spawns. A real Array's `length` is non-configurable and
   // cannot lie, which is what makes the slot sweep below a complete check.
-  if (!Array.isArray(raw)) deny(`${what} argv is not an array`);
+  //
+  // Slots are read as DESCRIPTORS, and a Proxy is refused outright, for the reason github.ts's
+  // own copy does the same: reading through an accessor or a trap runs caller code in the
+  // middle of validation, and that code can mutate what the grammar below consults. Callers
+  // inside this repository already hand us a plain copied argv, so this is the guard holding
+  // its own entry point to the same standard rather than trusting its callers to have done it.
+  if (isProxyIntrinsic(raw)) deny(`${what} argv is a proxy (its traps would run during validation)`);
+  if (!isArrayIntrinsic(raw)) deny(`${what} argv is not an array`);
   const len = raw.length;
   if (!Number.isSafeInteger(len) || len < 0) deny(`${what} argv length is not a safe nonnegative integer`);
   const out: string[] = [];
   for (let i = 0; i < len; i++) {
-    if (!Object.hasOwn(raw, i) || typeof raw[i] !== "string")
-      deny(`${what} argv slot ${i} is not an own string property (sparse or prototype-backed argv)`);
-    out.push(raw[i]!);
+    const slot = ownDescriptor(raw, i);
+    const value: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
+    if (typeof value !== "string")
+      deny(`${what} argv slot ${i} is not an own string data property (sparse, prototype-backed, or accessor argv)`);
+    out.push(value as string);
   }
   return out;
 }

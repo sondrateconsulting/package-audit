@@ -879,7 +879,12 @@ describe("child lifecycle (check 6: deadline, respawn-once, ordered teardown, ab
     );
     expect((err as Error).message).toContain("launch refused");
     expect((err as Error).message).not.toContain("died twice");
-    await store.dispose();
+    // …and the DEAD FIRST child's own diagnosis is what the verdict carries: recording the
+    // replacement's construction fault over it would discard git's actual stderr, which is the
+    // diagnosis 508e820 exists to retain (santa final loop, round 3).
+    const disposal = await store.dispose();
+    expect(disposal.clean).toBe(false);
+    expect(disposal.detail).not.toContain("child manager construction failed");
   });
   test("dispose runs the clone-deletion hook BETWEEN the child teardown and the permit release (check 6's letter)", async () => {
     const h = makeHarness();

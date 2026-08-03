@@ -649,8 +649,10 @@ export class UnitContentStore {
       // A child DID exist and was killed, so the store's teardown verdict must describe it:
       // without this record dispose() finds neither a live child nor a prior disposal and
       // reports the "no child was ever needed" clean verdict, which would vouch for a unit
-      // whose only child died. (The verdict describes the LAST child that existed.)
-      this.firstDisposal = {
+      // whose only child died. Recorded ONLY when nothing is there yet: on the respawn path a
+      // real first-child disposal is already stored, and that diagnosis — git's own stderr —
+      // is the one that matters; overwriting it with this construction fault would discard it.
+      this.firstDisposal ??= {
         exitCode: settledExit,
         stderrTail: new Uint8Array(0),
         stderrDroppedBytes: 0,

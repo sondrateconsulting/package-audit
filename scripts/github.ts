@@ -9,6 +9,7 @@
 import { mkdtempSync, readdirSync, readFileSync, lstatSync, renameSync, rmSync, unlinkSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir, devNull } from "node:os";
 import { join } from "node:path";
+import { types as runtimeTypes } from "node:util";
 import {
   assertReadOnlyGh, assertReadOnlyGit, assertReadOnlyTar, assertSpawnAllowed, assertContained,
 } from "./readOnlyGuard.ts";
@@ -278,20 +279,33 @@ const realLaunch: LaunchFn = (bin, args, req) => {
 //     a reference can swap a validated slot inside that window.
 // Both close the same way: validate and launch one array we own.
 //
-// Every slot must be an OWN DATA property holding a primitive string — the same standard
-// readOnlyGuard's own copy applies, and for two reasons beyond tidiness. Reading a slot through
-// an ACCESSOR would run caller code in the middle of the copy, which is a timing channel: a
-// getter can mutate shared state (an Array.prototype method the guard later calls) so that the
-// guard judges a different argv than the one captured here. And a PROTOTYPE-BACKED hole would be
-// silently materialised into a dense copy, converting a shape the guard deliberately refuses
-// into one it accepts. Refuse both here rather than normalise them away.
+// The overriding rule is that NO CALLER CODE RUNS while an argv is being validated. Anything
+// the caller can make executable during inspection is a channel for changing the decision after
+// it is made — a getter or a Proxy trap can mutate the very prototypes the grammar consults a
+// moment later, so the guard would judge one command and the wrapper would launch another
+// without the argv object itself ever changing. So:
+//   • a Proxy is refused before ANY property is touched (`isProxy` reads no properties, and
+//     `Array.isArray` is true for an Array-backed Proxy, so it cannot stand in for this check);
+//   • every slot must be an OWN DATA property holding a primitive string — accessors are
+//     refused rather than invoked, and a prototype-backed hole is refused rather than silently
+//     materialised into a shape readOnlyGuard deliberately rejects.
+// The intrinsics used here are captured at module load, so a later mutation of `Array.isArray`
+// or `Object.getOwnPropertyDescriptor` cannot weaken the copy itself.
+//
+// Residual, deliberately out of scope: an actor who can mutate shared intrinsics BEFORE the call
+// already executes arbitrary code in this process and could launch a child directly — no argv
+// guard can bound that. What this boundary does guarantee is that a hostile argv OBJECT cannot
+// make the validated command differ from the launched one.
+const isArrayIntrinsic = Array.isArray;
+const ownDescriptor = Object.getOwnPropertyDescriptor;
 function copiedArgv(args: readonly string[], lane: string): string[] {
-  if (!Array.isArray(args)) throw new GithubApiError(`${lane} argv is not an array`, {});
+  if (runtimeTypes.isProxy(args)) throw new GithubApiError(`${lane} argv is a proxy (its traps would run during validation)`, {});
+  if (!isArrayIntrinsic(args)) throw new GithubApiError(`${lane} argv is not an array`, {});
   const len = args.length;
   if (!Number.isSafeInteger(len) || len < 0) throw new GithubApiError(`${lane} argv length is not a safe nonnegative integer`, {});
   const out: string[] = [];
   for (let i = 0; i < len; i++) {
-    const slot = Object.getOwnPropertyDescriptor(args, i);
+    const slot = ownDescriptor(args, i);
     if (slot === undefined || !("value" in slot) || typeof slot.value !== "string")
       throw new GithubApiError(`${lane} argv slot ${i} is not an own string data property (sparse, prototype-backed, or accessor argv)`, {});
     out.push(slot.value);

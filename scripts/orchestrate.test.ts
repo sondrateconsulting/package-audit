@@ -1305,6 +1305,33 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("check 8: a unit that reads fully but fails in the WRITE block reports outcome failed, not scanned", async () => {
+    // The counters event must not label a unit `scanned` before it has actually landed: the
+    // emission used to happen right after dispose, so a write-block throw left a `scanned`
+    // transport line for a unit that errored, and the finally's `failed` emission was
+    // pre-empted by the earlier call (santa final loop, round 3).
+    const root = mkdtempSync(join(tmpdir(), "ct-writefail-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+      if (h.status === "scanned") throw new Error("simulated write-time failure");
+      return realUpsert(h);
+    };
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
+    }, { repoFiles: { "package.json": "{}" } });
+    const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(db.getUnit(key("main"))?.status).toBe("error");
+    const ct = events.filter((e) => e.event === "content-transport");
+    expect(ct.length).toBe(1);
+    // the reads DID happen and are reported (package.json twice: the manifest pass + the CLI-kind pass)
+    expect(ct[0]).toMatchObject({ outcome: "failed", localCanonicalReads: 2 });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("check 8: a retried clone reports cloneAttempts/cloneRetries truthfully in the event", async () => {
     const root = mkdtempSync(join(tmpdir(), "ct-retry-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });

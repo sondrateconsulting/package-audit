@@ -861,8 +861,6 @@ async function processUnit(
         `content child closed unclean for ${repo.organization}/${repo.name}@${h.name} — delivered bytes cannot be vouched for: ${disposal.detail ?? ""}`,
         {},
       );
-    // check 8: the separated per-unit counters as ONE vocab-pinned event
-    logTransport("scanned", store.counters, store.restFallbackBudget);
     const now = nowIso();
     for (const d of result.dependencyFindings) {
       db.upsertDependencyFinding({
@@ -909,6 +907,10 @@ async function processUnit(
       scannedCommitDate: committedDate,
     });
 
+    // check 8: the separated per-unit counters as ONE vocab-pinned event — emitted only once
+    // the unit has actually landed, so `scanned` never labels a unit that then failed in the
+    // write block (the finally's "failed" emission would be pre-empted by an earlier call).
+    logTransport("scanned", store.counters, store.restFallbackBudget);
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: commitSha, action: "scanned", deps: result.dependencyFindings.length, usage: result.usageFindings.length, cli: result.cliFindings.length });
     return { commitSha, committedDate };
   } finally {

@@ -597,6 +597,23 @@ describe("guard wiring", () => {
     }
     expect(calls.length).toBe(0);
   });
+  test("a PROXY argv is refused before any property is touched — its traps must never run during validation", async () => {
+    // Array.isArray is TRUE for an Array-backed Proxy and every inspection (even a descriptor
+    // read) fires a trap, so the caller could run code mid-validation and mutate the prototypes
+    // the grammar consults a moment later — validation and launch would diverge with the argv
+    // object itself unchanged (santa final loop, round 3).
+    const { client, calls } = makeClient([]);
+    let trapRuns = 0;
+    const hostile = new Proxy(["--version"], {
+      getOwnPropertyDescriptor(t, k) { trapRuns++; return Reflect.getOwnPropertyDescriptor(t, k); },
+      get(t, k, r) { trapRuns++; return Reflect.get(t, k, r); },
+    });
+    await expect(client.git(hostile)).rejects.toThrow(/argv is a proxy/);
+    await expect(client.gh(hostile)).rejects.toThrow(/argv is a proxy/);
+    await expect(client.tar(hostile)).rejects.toThrow(/argv is a proxy/);
+    expect(trapRuns).toBe(0); // refused without reading a single property
+    expect(calls.length).toBe(0);
+  });
   test("a denylisted package-manager binary is refused at the chokepoint", async () => {
     const { client, calls } = makeClient([], { binPaths: { ...BINS, gh: "/usr/local/bin/npm" } });
     await expect(client.gh(["api", "rate_limit"])).rejects.toThrow(ReadOnlyViolation);
