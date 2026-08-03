@@ -577,10 +577,24 @@ describe("guard wiring", () => {
     await Promise.all([saturate, queued]);
     expect(spawned[1]).toEqual(["api", "rate_limit"]);
   });
-  test("a non-string argv slot is refused at the wrapper, before any spawn", async () => {
+  test("a slot that is not an OWN STRING DATA property is refused at the wrapper, before any spawn", async () => {
     const { client, calls } = makeClient([]);
-    await expect(client.git(["--version", 7 as unknown as string])).rejects.toThrow(/argv slot 1 is not a string/);
-    await expect(client.tar(["--version", null as unknown as string])).rejects.toThrow(/argv slot 1 is not a string/);
+    await expect(client.git(["--version", 7 as unknown as string])).rejects.toThrow(/argv slot 1 is not an own string/);
+    await expect(client.tar(["--version", null as unknown as string])).rejects.toThrow(/argv slot 1 is not an own string/);
+    // An ACCESSOR slot is refused rather than read: invoking it would run caller code mid-copy,
+    // which is a timing channel for mutating state the guard consults afterwards.
+    const withGetter: string[] = ["--version"];
+    Object.defineProperty(withGetter, 1, { get: () => "--help", enumerable: true, configurable: true });
+    await expect(client.git(withGetter)).rejects.toThrow(/argv slot 1 is not an own string/);
+    // A PROTOTYPE-BACKED hole is refused rather than silently densified into an accepted shape.
+    Object.defineProperty(Array.prototype, 1, { value: "--help", configurable: true, writable: true });
+    try {
+      const holed: string[] = ["--version"];
+      holed.length = 2; // slot 1 is a hole served by the prototype
+      await expect(client.git(holed)).rejects.toThrow(/argv slot 1 is not an own string/);
+    } finally {
+      delete (Array.prototype as unknown as Record<number, unknown>)[1];
+    }
     expect(calls.length).toBe(0);
   });
   test("a denylisted package-manager binary is refused at the chokepoint", async () => {
@@ -3181,6 +3195,45 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     await expect(client.gitBytes(LS_TUPLE, dir)).rejects.toThrow(/reader acquisition failed/);
     expect(kills.length).toBeGreaterThan(0); // the launched child was escalated, not abandoned
   });
+  test("gitBytes: a REJECTED exit promise holds the return until the pumps settle, so the caller cannot delete the clone under a live child", async () => {
+    // `Promise.all` is fail-fast, so a rejected exit promise short-circuited the join and
+    // returned straight through the finally with the pumps unjoined — while the caller's
+    // failure path deletes the clone directory. A rejected exit means the process WAIT failed,
+    // not that the process died (santa final loop, round 2).
+    const order: string[] = [];
+    let releaseReaders!: () => void;
+    const readersGate = new Promise<void>((r) => { releaseReaders = r; });
+    const { client } = makeClient([], {
+      launchImpl: () => {
+        const drain = async (label: string): Promise<{ done: true; value: undefined }> => {
+          await readersGate;
+          order.push(`${label}-settled`);
+          return { done: true, value: undefined };
+        };
+        return {
+          pid: 4_242_424,
+          stdout: { getReader: () => ({ read: () => drain("stdout"), cancel: async () => undefined, releaseLock: () => undefined }) },
+          stderr: { getReader: () => ({ read: () => drain("stderr"), cancel: async () => undefined, releaseLock: () => undefined }) },
+          stdin: null,
+          exited: Promise.reject(new Error("process wait failed")),
+          kill: () => { order.push("killed"); },
+          unref: () => undefined,
+        } as unknown as LaunchedChild;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-exit-reject-"));
+    const call = client.gitBytes(LS_TUPLE, dir).then(
+      () => order.push("returned"),
+      () => order.push("returned"),
+    );
+    await new Promise((r) => setTimeout(r, 20)); // the exit rejection has landed by now
+    expect(order).not.toContain("returned"); // …and the call is STILL held, pumps unsettled
+    releaseReaders();
+    await call;
+    expect(order.indexOf("stdout-settled")).toBeLessThan(order.indexOf("returned"));
+    expect(order.indexOf("stderr-settled")).toBeLessThan(order.indexOf("returned"));
+    expect(order).toContain("killed"); // the escalation still ran
+  });
   test("gitBytes: a non-string argv slot is refused before the guards run", async () => {
     const launches: LaunchRequest[] = [];
     const { client } = makeClient([], {
@@ -3191,7 +3244,7 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     });
     const dir = mkdtempSync(join(TEST_TMP, "gb-nonstring-"));
     const hostile = ["ls-tree", 42, "-z"] as unknown as string[];
-    await expect(client.gitBytes(hostile, dir)).rejects.toThrow(/not a string/);
+    await expect(client.gitBytes(hostile, dir)).rejects.toThrow(/not an own string/);
     expect(launches.length).toBe(0);
   });
   test("binPaths is defensively copied — mutating the caller's object after construction cannot swap the binary", async () => {

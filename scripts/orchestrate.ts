@@ -40,7 +40,7 @@ import { renderFatal } from "./cliErrors.ts";
 import { runPreflight } from "./preflight.ts";
 import { resolveEffectiveOwners, type OwnersSource } from "./ownerResolve.ts";
 import { scanUnit, makeExcluder, countBudgetEligible, restFallbackBudgetFromEligible, type TreeEntry, type UnitLocation } from "./unitPipeline.ts";
-import { openUnitContentStore, type ContentStoreCaps, type UnitContentStore } from "./contentStore.ts";
+import { openUnitContentStore, type ContentStoreCaps, type ContentStoreCounters, type UnitContentStore } from "./contentStore.ts";
 import { oidFormatOf } from "./gitFrame.ts";
 import { parseSemver, maxSatisfying } from "./semver.ts";
 import { parseAlias, type DependencyType } from "./manifest.ts";
@@ -782,7 +782,30 @@ async function processUnit(
   const format = oidFormatOf(h.oid.toLowerCase());
   if (format === null)
     throw new GithubApiError(`discovery-pinned head oid is not a full hex object id: ${JSON.stringify(h.oid.slice(0, 80))}`, {});
-  const cloned = await client.cloneNoCheckout(repo.organization, repo.name, h.name, h.oid);
+  // check 8/9's accounting must cover units that FAIL too: a unit whose clone exhausts its
+  // attempts still made those (pacing-relevant) network starts, so the counters event is
+  // emitted on every path — exactly once, with whatever is known at that point.
+  let cloneAttempts = 0;
+  let transportLogged = false;
+  const logTransport = (outcome: "scanned" | "failed", counters: ContentStoreCounters | null, budget: number | null): void => {
+    if (transportLogged) return;
+    transportLogged = true;
+    logLine({
+      event: "content-transport", org: repo.organization, repo: repo.name, branch: h.name, commit: commitSha, outcome,
+      localCanonicalReads: counters?.localCanonicalReads ?? 0, symlinkFallbackReads: counters?.restFallbackReads.symlink ?? 0,
+      fallbackBudgetSpend: counters?.fallbackBudgetSpend ?? 0, fallbackBudget: budget ?? 0,
+      cloneAttempts, cloneRetries: cloneAttempts === 0 ? 0 : cloneAttempts - 1, childRespawns: counters?.childRespawns ?? 0,
+    });
+  };
+  let cloned: { dir: string; cloneAttempts: number };
+  try {
+    cloned = await client.cloneNoCheckout(repo.organization, repo.name, h.name, h.oid, (n) => {
+      cloneAttempts = n;
+    });
+  } catch (e) {
+    logTransport("failed", null, null); // the attempts happened; the clone never returned them
+    throw e;
+  }
   // Best-effort clone reclaim with the §0 containment re-check; a failure surfaces as the
   // documented warning, never masks a primary error, and leaves the tree to the startup sweep.
   const deleteRunDir = (): void => {
@@ -839,13 +862,7 @@ async function processUnit(
         {},
       );
     // check 8: the separated per-unit counters as ONE vocab-pinned event
-    const c = store.counters;
-    logLine({
-      event: "content-transport", org: repo.organization, repo: repo.name, branch: h.name, commit: commitSha,
-      localCanonicalReads: c.localCanonicalReads, symlinkFallbackReads: c.restFallbackReads.symlink,
-      fallbackBudgetSpend: c.fallbackBudgetSpend, fallbackBudget: store.restFallbackBudget,
-      cloneAttempts: cloned.cloneAttempts, cloneRetries: cloned.cloneAttempts - 1, childRespawns: c.childRespawns,
-    });
+    logTransport("scanned", store.counters, store.restFallbackBudget);
     const now = nowIso();
     for (const d of result.dependencyFindings) {
       db.upsertDependencyFinding({
@@ -896,6 +913,8 @@ async function processUnit(
     return { commitSha, committedDate };
   } finally {
     unsubscribeAbort?.();
+    // a unit that failed after the clone still reports its transport (no-op once logged)
+    logTransport("failed", store?.counters ?? null, store?.restFallbackBudget ?? null);
     if (!storeSettled) {
       // an exception path (open/read/scan failure, or abort): the same ordered teardown —
       // child → clone deletion → permit release — with an unclean close surfaced as the

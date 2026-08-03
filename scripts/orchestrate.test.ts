@@ -1254,6 +1254,52 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       fallbackBudgetSpend: 1,
       fallbackBudget: 20, // max(20, ceil(10% of 2 eligible)) — the floor binds
       cloneAttempts: 1, cloneRetries: 0, childRespawns: 0,
+      outcome: "scanned",
+    });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("check 8: the production budget is the COMPUTED 10% term once it clears the floor of 20", async () => {
+    // The floor-bound fixture above cannot distinguish the real denominator from a hardcoded
+    // 20, so this one drives enough eligible entries that ceil(10%) wins — replacing the
+    // production denominator callback with a constant would fail here (santa final loop,
+    // round 2).
+    const root = mkdtempSync(join(tmpdir(), "ct-budget-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const files: Record<string, string> = { "package.json": "{}" };
+    for (let i = 0; i < 299; i++) files[`s${i}.sh`] = "#!/bin/sh\n"; // CLI-kind → budget-eligible
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
+    }, { repoFiles: files });
+    const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(db.getUnit(key("main"))?.status).toBe("done");
+    const ct = events.filter((e) => e.event === "content-transport");
+    // 300 eligible blobs (package.json + 299 .sh) → ceil(10%) = 30, well clear of the floor
+    expect(ct[0]).toMatchObject({ fallbackBudget: 30, outcome: "scanned" });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("check 8: a unit whose clone never succeeds still reports its transport account", async () => {
+    // A failed clone made real, pacing-relevant network starts; omitting its counters would
+    // leave exactly the failure mode check 9's accounting cares about unmeasured.
+    const root = mkdtempSync(join(tmpdir(), "ct-failed-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
+    }, { cloneExitCodes: [128, 128, 128] }); // every attempt fails → the unit errors
+    const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(db.getUnit(key("main"))?.status).toBe("error");
+    const ct = events.filter((e) => e.event === "content-transport");
+    expect(ct.length).toBe(1); // exactly one, on the failure path too
+    expect(ct[0]).toMatchObject({
+      outcome: "failed", cloneAttempts: 3, cloneRetries: 2,
+      localCanonicalReads: 0, symlinkFallbackReads: 0, // no store ever opened
     });
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -2188,6 +2234,91 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("a sibling fatal landing AFTER the read phase does NOT void a fully-read unit (the abort subscription ends with the reads)", async () => {
+    // processUnit drops its abort subscription the moment scanUnit returns. Without that, a
+    // sibling's fatal arriving while this unit is in its ORDERED TEARDOWN poisons the idle
+    // child mid-dispose, the close reads unclean, and a unit that read every byte it needed is
+    // failed and its findings discarded — contradicting the settled DRAIN adjudication. The
+    // existing promptness fixture parks its sibling MID-CLONE, before any store exists, so it
+    // cannot see this; here the abort is sequenced INTO the teardown window (santa final loop,
+    // round 2).
+    const root = mkdtempSync(join(tmpdir(), "fanout-postread-abort-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startRun(db);
+    const nodes = [
+      { name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }, // reads fully, then tears down
+      { name: "boom", oid: hexOid("o-boom"), date: "2025-06-01T00:00:00Z" }, // fires the fatal in that window
+    ];
+    const injected = new PolicyMatchError("excludeBranches", "x*", "boom", new Error("write-time incoherence"));
+    const realUpsert = db.upsertRunUnitHead.bind(db);
+    (db as unknown as { upsertRunUnitHead: AuditDb["upsertRunUnitHead"] }).upsertRunUnitHead = (h) => {
+      if (h.status === "scanned" && h.branch === "boom") throw injected;
+      return realUpsert(h);
+    };
+    let signalDisposeStarted!: () => void;
+    const disposeStarted = new Promise<void>((r) => { signalDisposeStarted = r; });
+    let releaseExit!: () => void;
+    const exitGate = new Promise<void>((r) => { releaseExit = r; });
+    const { bytes, bodies } = lsFixture({ "package.json": JSON.stringify({ dependencies: { expo: "^50.0.0" } }) });
+    let gatedTeardown = false;
+    const launchImpl: LaunchFn = (_bin, args) => {
+      if (args[0] === "ls-tree") {
+        const out = byteQueueStream();
+        const errS = byteQueueStream();
+        out.feed(bytes);
+        out.close();
+        errS.close();
+        return { pid: 4_242_424, stdout: { getReader: () => out.getReader() }, stderr: { getReader: () => errS.getReader() }, stdin: null, exited: Promise.resolve(0), kill: () => undefined, unref: () => undefined };
+      }
+      const child = frameChildFor(bodies);
+      const sink = child.stdin;
+      if (sink === null || sink === undefined) return child;
+      // The FIRST child to be torn down is main's (boom cannot even clone until main signals).
+      // Hold its exit open so the sibling's fatal lands squarely inside main's dispose.
+      return {
+        ...child,
+        stdin: {
+          write: (d: Uint8Array) => sink.write(d),
+          flush: () => sink.flush(),
+          end: () => {
+            if (gatedTeardown) return sink.end();
+            gatedTeardown = true;
+            signalDisposeStarted();
+            void exitGate.then(() => sink.end());
+            return undefined;
+          },
+        },
+      };
+    };
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads(nodes) };
+      return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+    }, {
+      headOidFor: (b) => nodes.find((n) => n.name === b)!.oid,
+      launchImpl,
+      // boom waits until main is INSIDE its teardown, so the fatal cannot land during main's reads
+      beforeClone: async (_o, _r, branch) => { if (branch === "boom") await disposeStarted; },
+    });
+    const cfg = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 2 } };
+    // onFatal runs the moment the sibling's fatal trips the branch abort — release main's exit
+    // there, so its dispose completes with the abort already delivered.
+    const onFatal = (): void => { releaseExit(); };
+    let thrown: unknown = "unset";
+    await captureJsonl(async () => {
+      try { await processRepo(db, client, rt(cfg, "h"), runId, "org-a", repo, [], new Set(), new Set(), new Aborter(), onFatal); thrown = null; }
+      catch (e) { thrown = e; }
+    });
+    expect(thrown).toBe(injected); // the sibling's fatal still propagates
+    // …and main, which had already read everything, is intact: scanned, not voided.
+    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: "svc", branch: "main" })?.status).toBe("done");
+    const mainRow = db.read(`SELECT status FROM run_unit_head WHERE run_id = ? AND branch = 'main'`).get(runId) as { status: string } | null;
+    expect(mainRow?.status).toBe("scanned");
+    const deps = db.read(`SELECT COUNT(*) AS n FROM dependency_findings WHERE run_id = ? AND branch = 'main'`).get(runId) as { n: number };
+    expect(deps.n).toBeGreaterThan(0); // its findings survived the sibling's fatal
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("processRepo DROPS its run-Aborter callback after each pool settles — no accumulation over a large estate", async () => {
     // Fix 5 end-to-end: each processRepo registers a branchAbort-trip on the run-level Aborter and must
     // unsubscribe it (the .finally) once its branch pool settles, so a run over thousands of repos does
@@ -2198,8 +2329,16 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startRun(db);
     const nodes = nodesN(1); // just the default branch (main) — a clean, fatal-free scan
-    const client = makeClient(root, async (_bin, args) =>
-      args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) });
+    const client = makeClient(
+      root,
+      async (_bin, args) =>
+        args.some((a) => a === "graphql") ? { exitCode: 0, stderr: "", stdout: heads(nodes) } : { exitCode: 0, stderr: "", stdout: treeBody(args) },
+      // The clone's HEAD must equal the DISCOVERED oid or the coherence gate fails every unit
+      // closed and this fixture would only ever exercise the ERROR-path unsubscribe while
+      // claiming to be a clean scan (the success-path callback leak it exists to catch would
+      // pass unnoticed). The status assertion below keeps that honest.
+      { headOidFor: (b) => nodes.find((n) => n.name === b)!.oid },
+    );
     const cfg = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 2 } };
     const runAborter = new Aborter();
     const internal = runAborter as unknown as { callbacks: unknown[] };
@@ -2208,6 +2347,10 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
         // a DISTINCT repo each iteration (fresh scheduledRepoKeys per call), like a large estate
         await processRepo(db, client, rt(cfg, "h"), runId, "org-a", { ...repo, name: `svc${i}` }, [], new Set(), new Set(), runAborter);
         expect(internal.callbacks.length).toBe(0); // this repo unsubscribed once its pool settled
+        // …and it got there by SCANNING, not by erroring: a head-coherence (or any other) unit
+        // failure unsubscribes too, so without this the fixture could drift back to proving only
+        // the error path.
+        expect(db.getUnit({ configHash: "h", scope: "branch", organization: "org-a", repository: `svc${i}`, branch: "main" })?.status).toBe("done");
       }
     });
     expect(runAborter.aborted).toBe(false); // no fatal occurred; the Aborter was only ever registered on and unsubscribed from

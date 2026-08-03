@@ -844,8 +844,42 @@ describe("child lifecycle (check 6: deadline, respawn-once, ordered teardown, ab
     expect((err as Error).message).toContain("reader acquisition failed");
     expect(store.counters.childRespawns).toBe(0);
     expect(killed.length).toBe(1); // exactly one launch, killed rather than orphaned
-    await store.dispose();
+    const disposal = await store.dispose();
+    // A child DID exist and was killed, so the verdict must describe it. Reporting the
+    // "no child was ever needed" clean disposal here would vouch for a unit whose only child
+    // died (santa final loop, round 2).
+    expect(disposal.clean).toBe(false);
+    expect(disposal.detail).toContain("child manager construction failed");
     expect(h.permits.released).toBe(h.permits.acquired); // the permit still came back
+  });
+  test("a REPLACEMENT child's setup failure surfaces RAW — a launch fault is not a second child death", async () => {
+    // 508e820 moved the FIRST attempt's setup out of the respawn wrap; the replacement's was
+    // still inside it, so a launch/construction fault during the respawn was reported as
+    // `child-died-twice` and blamed git for a fault it never had (santa final loop, round 2).
+    const h = makeHarness();
+    let launches = 0;
+    const caps = {
+      ...h.caps,
+      launchBatchChild: (): ReturnType<typeof h.caps.launchBatchChild> => {
+        launches++;
+        if (launches === 1) {
+          const fc = new FakeChild({});
+          queueMicrotask(() => fc.exit(1)); // the first child dies mid-read → one sanctioned respawn
+          return fc.child;
+        }
+        throw new Error("launch refused: too many open files"); // the REPLACEMENT never launches
+      },
+    };
+    const store = await openUnitContentStore(caps, {
+      cwd: join(TEST_TMP, "fake-clone"), format: SHA1, restFallbackBudget: 20, limits: TEST_LIMITS,
+    });
+    const err = await store.read("src/a.txt", entryOf(store, "src/a.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toContain("launch refused");
+    expect((err as Error).message).not.toContain("died twice");
+    await store.dispose();
   });
   test("dispose runs the clone-deletion hook BETWEEN the child teardown and the permit release (check 6's letter)", async () => {
     const h = makeHarness();
@@ -1128,6 +1162,32 @@ describe("two-pool discipline (check 7, through the real GithubClient seam)", ()
     expect(catFileLaunches.length).toBe(4); // every unit got its child eventually…
     expect(h.maxLive()).toBe(2); // …but never more than the pool size at once
   }, 10_000);
+
+  test("check 7 at the CONFIGURED CEILING: 4,096 units against a fixed pool spawn no more children than the pool size", async () => {
+    // Check 7's letter is about MAXIMUM configured fan-out, and the configuration ceiling is
+    // organizations 64 × branches 64 = 4,096 concurrent units. The four-unit fixture above
+    // cannot show that the pool is independent of fan-out at that scale — a per-unit or
+    // per-batch sizing bug would still hold there (santa final loop, round 2). The pool here
+    // is a fixed small constant while the unit count is the ceiling itself.
+    const POOL = 8;
+    const UNITS = 64 * 64;
+    const dirs = Array.from({ length: UNITS }, (_, i) => {
+      const d = join(TEST_TMP, `ceiling-${i}`);
+      mkdirSync(d, { recursive: true });
+      return d;
+    });
+    const h = makeClientHarness({ concurrency: POOL });
+    await Promise.all(
+      dirs.map(async (d) => {
+        const store = await h.openStoreAt(d);
+        expect(await store.read("src/a.txt", entryOf(store, "src/a.txt"))).toBe("hello canonical content\n");
+        const disposal = await store.dispose();
+        expect(disposal.clean).toBe(true);
+      }),
+    );
+    expect(h.launchCalls.filter((c) => c.args[0] === "cat-file").length).toBe(UNITS);
+    expect(h.maxLive()).toBeLessThanOrEqual(POOL); // the pool bound holds at the ceiling
+  }, 120_000);
 
   test("the interactive child is launched with a stdin pipe and the sanitized git env carrying GIT_NO_REPLACE_OBJECTS=1", async () => {
     const cloneDir = join(TEST_TMP, "env-clone");

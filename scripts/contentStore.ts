@@ -636,16 +636,26 @@ export class UnitContentStore {
       // store directory, and the failed launch should be dead — not merely dying — first
       // (the same bound the disposer's escalated exit wait uses)
       let settleTimer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
+      const settledExit = await Promise.race([
         launched.exited.then(
-          () => undefined,
-          () => undefined,
+          (code) => code,
+          () => null,
         ),
-        new Promise<void>((resolve) => {
-          settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
+        new Promise<null>((resolve) => {
+          settleTimer = setTimeout(() => resolve(null), SPAWN_KILL_GRACE_MS + 1_000);
         }),
       ]);
       clearTimeout(settleTimer);
+      // A child DID exist and was killed, so the store's teardown verdict must describe it:
+      // without this record dispose() finds neither a live child nor a prior disposal and
+      // reports the "no child was ever needed" clean verdict, which would vouch for a unit
+      // whose only child died. (The verdict describes the LAST child that existed.)
+      this.firstDisposal = {
+        exitCode: settledExit,
+        stderrTail: new Uint8Array(0),
+        stderrDroppedBytes: 0,
+        protocolError: `child manager construction failed: ${e instanceof Error ? e.message : String(e)}`,
+      };
       throw e;
     }
     return this.child;
@@ -675,8 +685,13 @@ export class UnitContentStore {
     if (this.abortedReason !== null)
       throw new ContentStoreError("aborted", `read of ${path} aborted: ${this.abortedReason}`);
     if (this.disposedP !== null) throw new ContentStoreError("store-disposed", `read of ${path} after dispose()`);
+    // The replacement's SETUP (permit state, launch refusal, manager construction) sits OUTSIDE
+    // the died-twice wrap, exactly as the first attempt's does: a configuration or launch fault
+    // is not a child death, and relabelling it "died twice" would blame git for a fault it never
+    // had. Only a live replacement's READ failure is a second death.
+    const replacement = await this.ensureChild();
     try {
-      return await (await this.ensureChild()).readObject({ oid, size });
+      return await replacement.readObject({ oid, size });
     } catch (e2) {
       // an abort/dispose that landed during the REPLACEMENT read is its own outcome — it must
       // never be relabelled as a double death (the child was poisoned by the abort, not by git)

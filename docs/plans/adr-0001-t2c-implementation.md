@@ -438,5 +438,38 @@ past tense — a form true after the merge), bench module headers if §4(a).
     spawnBounded note), orchestrate.ts reconcile/processUnit notes (clone-real-HEAD,
     scanned_commit_date fallback wording), unitPipeline.ts header (truncated-tree fallback),
     policyIntegration.test.ts intro, PROMPT.md content-path description.
-- Final whole-diff santa loop (cap 5): (pending)
+- **Final whole-diff santa loop (cap 5), over `git diff 8ffad36..HEAD` — the first review of
+  the three post-cap tails (`c899cf9`, `508e820`, `db2c348`).**
+  - **Round 1 (A PASS, B FAIL, C FAIL — not unanimous), verified + fixed at `8c1021b`.**
+    The round found a **P0 in the diff's own earlier hardening**: the argv the guards
+    validated was not the argv that launched. `c899cf9` had hardened `readOnlyGuard` to copy
+    ITS input, but each wrapper passed the CALLER's array onward and the launch built its
+    command vector by spreading it — so an argv whose indexed slots read `--version` while
+    its overridden `Symbol.iterator` yielded other tokens passed both guards and spawned the
+    iterator's tokens. C demonstrated it empirically (spawned `push origin main`); B reached
+    the same root cause from the other side as a P1 TOCTOU (every string lane awaits a
+    semaphore permit between validation and launch, so a caller can swap a validated slot in
+    that window). Fixed once at the boundary: `copiedArgv()` at each wrapper entry (`gh`, the
+    bucketed gh attempt loop, `git`, `tar`; `gitBytes` now shares it rather than duplicating
+    its own copy), with the guards, the containment walks and the spawn all reading that
+    owned copy, plus the launch primitive building its vector by index instead of by spread.
+    Also fixed: production `parseLsTreeZ`'s safe-integer rejection was unpinned (the post-cap
+    case had landed on the retired `parseTreeResponse`), and the retried-clone gate test was
+    vacuous (it asserted a 2,000 ms backoff that already exceeded the 200 ms spacing, so an
+    ungated retry would assert identically) — rewritten with a clock advancing a fixed small
+    step per sleep so the gate's own 175 ms sleep is observable. **Both rewritten tests were
+    mutation-verified** (deleting the production check / disabling the gate consultation each
+    fails the new case). This closes the previously unlocatable "retry-gate consultation
+    timestamp" open thread, which arrived this round with a citation. A's four findings were
+    all P3 documentation staleness and route to the doc sweep (PROMPT.md's §5.C clone-fallback
+    reference is a NEW queue item; EXPORTS.md and the orchestrate.ts reconcile comment were
+    already queued). Adjudicated and DECLINED with recorded rationale (B's P2):
+    `processUnit` sets `storeSettled` before the disposal-clean check, which B read as
+    suppressing the `content-store-unclean` warning — but the unclean close on that path IS
+    the unit's own thrown error, logged with its full detail as the unit error; the warning
+    exists for an unclean close riding beside a DIFFERENT primary error, which is the
+    `finally` path, so no diagnosis is lost. The README sentence tolerates B's reading, so a
+    wording tightening is queued for the doc sweep instead of a code change.
+  - Round 2: (running — the round-1 fix commit is itself unreviewed and is the round's
+    priority target)
 - Doc-sweep codex prose pass: (pending)

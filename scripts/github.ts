@@ -276,15 +276,25 @@ const realLaunch: LaunchFn = (bin, args, req) => {
 //     reaches the launch is still the caller's;
 //   • every wrapper awaits a semaphore permit between validation and launch, so a caller holding
 //     a reference can swap a validated slot inside that window.
-// Both close the same way: validate and launch one array we own. A non-array, or any slot that is
-// not an own primitive string, is refused here rather than carried behind a cast.
+// Both close the same way: validate and launch one array we own.
+//
+// Every slot must be an OWN DATA property holding a primitive string — the same standard
+// readOnlyGuard's own copy applies, and for two reasons beyond tidiness. Reading a slot through
+// an ACCESSOR would run caller code in the middle of the copy, which is a timing channel: a
+// getter can mutate shared state (an Array.prototype method the guard later calls) so that the
+// guard judges a different argv than the one captured here. And a PROTOTYPE-BACKED hole would be
+// silently materialised into a dense copy, converting a shape the guard deliberately refuses
+// into one it accepts. Refuse both here rather than normalise them away.
 function copiedArgv(args: readonly string[], lane: string): string[] {
   if (!Array.isArray(args)) throw new GithubApiError(`${lane} argv is not an array`, {});
+  const len = args.length;
+  if (!Number.isSafeInteger(len) || len < 0) throw new GithubApiError(`${lane} argv length is not a safe nonnegative integer`, {});
   const out: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const token: unknown = args[i];
-    if (typeof token !== "string") throw new GithubApiError(`${lane} argv slot ${i} is not a string`, {});
-    out.push(token);
+  for (let i = 0; i < len; i++) {
+    const slot = Object.getOwnPropertyDescriptor(args, i);
+    if (slot === undefined || !("value" in slot) || typeof slot.value !== "string")
+      throw new GithubApiError(`${lane} argv slot ${i} is not an own string data property (sparse, prototype-backed, or accessor argv)`, {});
+    out.push(slot.value);
   }
   return out;
 }
@@ -1597,12 +1607,26 @@ export class GithubClient {
       // The exit join is BOUNDED once the deadline could have fired: a wedged exit promise
       // must not hang the caller past deadline + escalation grace + margin.
       const joined = Promise.all([capture(outP), capture(errP), exited]);
-      const bounded = await Promise.race([
-        joined,
-        new Promise<null>((resolve) => {
-          gaveUpTimer = setTimeout(() => resolve(null), this.spawnTimeoutMs + SPAWN_KILL_GRACE_MS + 2_000);
-        }),
-      ]);
+      let bounded: [Uint8Array, Uint8Array, number] | null;
+      try {
+        bounded = await Promise.race([
+          joined,
+          new Promise<null>((resolve) => {
+            gaveUpTimer = setTimeout(() => resolve(null), this.spawnTimeoutMs + SPAWN_KILL_GRACE_MS + 2_000);
+          }),
+        ]);
+      } catch (e) {
+        // `Promise.all` is fail-fast, so a REJECTED exit promise short-circuits the join. That
+        // rejection means the process WAIT failed — not that the process died — so returning
+        // straight through the finally would hand the caller a failure while the child may
+        // still be alive with its pumps unjoined, and the caller's failure path deletes the
+        // clone directory. The escalation has already started (the rejection handler above);
+        // hold the return until the pumps settle, bounded by the same grace + margin, since
+        // the escalation cancels the readers and this therefore cannot hang. Same transactional
+        // discipline as the reader-acquisition failure path.
+        await this.settlePumpsBounded(outP, errP);
+        throw e;
+      }
       if (bounded === null)
         throw new GithubApiError(`git ${argv[0] ?? ""} never settled within the deadline + escalation grace`, {});
       const [stdout, stderr, exitCode] = bounded;
@@ -1616,6 +1640,29 @@ export class GithubClient {
       clearTimeout(gaveUpTimer);
       if (spanId !== 0 && hasProgressSink()) emitProgress({ type: "spawn-end", id: spanId });
       release();
+    }
+  }
+
+  // Hold until both output pumps settle, bounded by the escalation grace plus a margin. Used on
+  // the byte lane's failure paths, where the caller may delete the clone directory as soon as we
+  // return: a child that is dying must not still be reading from a tree being removed. Reader
+  // rejections are absorbed — this waits for settlement, it does not diagnose.
+  private async settlePumpsBounded(outP: Promise<Uint8Array>, errP: Promise<Uint8Array>): Promise<void> {
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    const quiet = (p: Promise<Uint8Array>): Promise<void> =>
+      p.then(
+        () => undefined,
+        () => undefined,
+      );
+    try {
+      await Promise.race([
+        Promise.all([quiet(outP), quiet(errP)]),
+        new Promise<void>((resolve) => {
+          settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(settleTimer);
     }
   }
 
@@ -2384,7 +2431,13 @@ export class GithubClient {
   // via the next run's re-discovery (plan §7.2). Because HEAD == the pin on every success, the
   // scanned commit's date is the DISCOVERED committedDate — no clone-side date read exists on
   // this path. `cloneAttempts` feeds the per-unit transport counters (check 8).
-  async cloneNoCheckout(org: string, repo: string, branch: string, pinnedOid: string): Promise<{ dir: string; cloneAttempts: number }> {
+  // `onAttempt` reports each attempt's number as it STARTS, so the caller can account for the
+  // transport even when every attempt fails (the return value never arrives on that path, and a
+  // failed clone's starts are exactly the pacing-relevant ones — check 9's accounting).
+  async cloneNoCheckout(
+    org: string, repo: string, branch: string, pinnedOid: string,
+    onAttempt?: (attempt: number) => void,
+  ): Promise<{ dir: string; cloneAttempts: number }> {
     const runDir = this.makeRunTempDir();
     const dest = join(runDir, "clone");
     assertContained(dest, [this.tempRoot]); // §0: clone dest containment BEFORE spawning
@@ -2421,6 +2474,7 @@ export class GithubClient {
         // semaphore lease, immediately before the spawn — so every start here, retries
         // included, is gated where the start actually happens.)
         attempts++;
+        onAttempt?.(attempts);
         let res: SpawnResult;
         try {
           res = await this.git(args);

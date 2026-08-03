@@ -73,16 +73,28 @@ function trustedArgv(raw: readonly string[], what: string): string[] {
 // Normalize BOTH `--flag=value` and attached short forms (`-XDELETE`, `-X=DELETE`,
 // `-fbody=x`) into separate tokens so no attached-value form dodges a `--flag value`
 // check. Bare short flags like `-i` are left intact (the regex requires a value).
+//
+// Written as an index loop rather than `flatMap`: this canonicalization decides what every
+// later check sees, so it must not route through a mutable `Array.prototype` method. Even a
+// dense array we own inherits its methods from the shared prototype, so a polluted `flatMap`
+// could otherwise hand the grammar a token list the spawned argv does not have.
 function canon(args: string[]): string[] {
-  return args.flatMap((a) => {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
     if (a.startsWith("--") && a.includes("=")) {
       const eq = a.indexOf("=");
-      return [a.slice(0, eq), a.slice(eq + 1)];
+      out.push(a.slice(0, eq), a.slice(eq + 1));
+      continue;
     }
     const m = /^(-[A-Za-z])=?(.+)$/.exec(a); // -Xvalue / -X=value (NOT bare -i)
-    if (m && SHORT_VALUE.has(m[1]!)) return [m[1]!, m[2]!];
-    return [a];
-  });
+    if (m && SHORT_VALUE.has(m[1]!)) {
+      out.push(m[1]!, m[2]!);
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
 }
 
 // Reject a single-dash token that is neither a recognized value/bare short flag nor a
