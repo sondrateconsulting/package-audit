@@ -2980,6 +2980,84 @@ describe("spawn-site allowlist (grep-enforced, with two exact-path scanner-test 
     expect(site).not.toMatch(/cmd\[\w+(\s*\+\s*1)?\]\s*=/); // no plain index assignment
     expect(site).not.toMatch(/cmd:\s*\[bin,\s*\.\.\./);
   });
+  test("RUNTIME: an inherited Array.prototype numeric setter never touches the launched vector, which arrives frozen", async () => {
+    // The source-shape test above pins HOW the launch site builds its vector; this pins the
+    // PROPERTY itself, at runtime, through the real default spawn path (no spawnImpl /
+    // launchImpl — the fake sits at the Bun.spawn boundary, the exact call the production
+    // launch makes). Rounds 2, 3 and 5 of the final review loop each found a
+    // defineProperty-SHAPED build still escapable at runtime; a source regex alone would have
+    // passed every one of those, which is why this test exists.
+    const root = mkdtempSync(join(tmpdir(), "launch-freeze-"));
+    // Everything the fake needs is prebuilt BEFORE the pollution window so no test-infra
+    // allocation walks the poisoned prototype: closed streams + exit 0 = a well-behaved,
+    // instantly-exiting child.
+    const doneReader = { read: async () => ({ done: true as const }), cancel: async () => undefined };
+    const captured: { cmd?: readonly string[] } = {};
+    const fakeProc = {
+      pid: 4_242_424,
+      stdout: { getReader: () => doneReader },
+      stderr: { getReader: () => doneReader },
+      stdin: undefined,
+      exited: Promise.resolve(0),
+      kill: () => undefined,
+      unref: () => undefined,
+    };
+    const fakeSpawn = (opts: { cmd: readonly string[] }): typeof fakeProc => {
+      captured.cmd = opts.cmd;
+      return fakeProc;
+    };
+    const client = new GithubClient({
+      githubHost: "github.com",
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: root,
+    });
+    const bunObj = Bun as unknown as { spawn: unknown };
+    const realBunSpawn = bunObj.spawn;
+    // every receiver the setter catches — the launched vector must never be among them. The
+    // setter stays TRANSPARENT (it completes the write as an own property) because harness
+    // internals may legitimately push through the polluted slot during the window; breaking
+    // them would test the harness, not the launch site.
+    const setterReceivers: unknown[] = [];
+    bunObj.spawn = fakeSpawn;
+    try {
+      // first call OUTSIDE the window: materializes the lazy gitcfg dir so the polluted
+      // window below covers the wrapper + launch alone
+      await client.git(["rev-parse", "HEAD"], undefined);
+      expect(captured.cmd !== undefined && Array.from(captured.cmd).join(" ")).toBe(`${BINS.git} rev-parse HEAD`);
+      // slot 1 is where the first argv token lands in the launch vector and where copiedArgv's
+      // copy writes its second slot — the exact channel the round-5 fix (holes + inherited
+      // numeric setters) closed
+      Object.defineProperty(Array.prototype, 1, {
+        configurable: true,
+        get() {
+          return undefined;
+        },
+        set(v: unknown) {
+          setterReceivers.push(this);
+          Object.defineProperty(this, 1, { value: v, writable: true, enumerable: true, configurable: true });
+        },
+      });
+      let res;
+      try {
+        res = await client.git(["rev-parse", "HEAD"], undefined);
+      } finally {
+        delete (Array.prototype as unknown as Record<number, unknown>)[1];
+      }
+      // window closed — assert on what actually launched
+      expect(res.exitCode).toBe(0);
+      const cmd = captured.cmd!;
+      expect(setterReceivers.includes(cmd)).toBe(false); // no vector write ever consulted the prototype
+      expect(Object.isFrozen(cmd)).toBe(true); // and the vector arrives frozen
+      expect(Array.from(cmd)).toEqual([BINS.git, "rev-parse", "HEAD"]); // carrying exactly the validated tokens
+      const slot = Object.getOwnPropertyDescriptor(cmd, 1);
+      expect(slot !== undefined && "value" in slot && slot.value === "rev-parse").toBe(true); // an own DATA slot, never an accessor
+    } finally {
+      bunObj.spawn = realBunSpawn;
+      delete (Array.prototype as unknown as Record<number, unknown>)[1]; // idempotent belt-and-braces
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("sweepStaleTempDirs observability (§0)", () => {
