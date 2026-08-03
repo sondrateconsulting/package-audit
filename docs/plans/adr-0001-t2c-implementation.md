@@ -361,5 +361,48 @@ past tense — a form true after the merge), bench module headers if §4(a).
     fixed POST-CAP at c899cf9 and are therefore **unreviewed**; the final whole-diff loop
     (cap 5) is their first review. C's R3 verdict itself needed a resume-finalize (its first
     attempt exited clean after 149k tokens without emitting one).
+  - **P3 (spawn seam + content store + two pools), 3 rounds, NOT CONVERGED — corrected,
+    never clean.** A (Opus 4.6 @ xhigh) PASS in all three rounds; B (gpt-5.5 @ xhigh) and C
+    (gpt-5.6-sol @ ultra) FAIL in all three — never a unanimous round, the same shape as
+    P1+P2. R1 (A PASS, B FAIL, C FAIL), verified + fixed at `1098eda`: a read queued on a
+    saturated child pool was not re-checked after the permit grant, so an abort/dispose
+    landing while it queued let it launch a child AFTER dispose() returned a clean verdict
+    (child + permit leak); an in-flight symlink fallback delivered a post-abort result; a
+    hung stdin sink held readObject past the deadline with the rejection unobserved (write
+    detached, deadline governs); a gitBytes argv TOCTOU (guards validated the caller's
+    mutable array, the launch used it after the semaphore await — copy-first); a protocol
+    fault observed while draining during teardown vanished behind the "disposed" poison
+    (teardown-fault slot). REFUTED and recorded rather than obeyed: C's "abort must close
+    stdin before killing" — §3.1's letter is "kill-escalation on unit end or abort"; dispose
+    owns the ordered close, matching the reviewed bench prototype. R2 (A PASS, B FAIL,
+    C FAIL), verified + fixed at `92ff080`: an abort during the REPLACEMENT read was
+    relabelled child-died-twice; the fallback REJECTION path lacked abort-first labelling;
+    the canonical lane lacked the post-await abort check its fallback sibling got in R1; a
+    manager-construction throw orphaned the just-launched child (transactional + open-time
+    limits probe); gitBytes admitted the grammar-legal clone shape without containing its
+    destination (the byte lane now refuses clone structurally); binPaths was retained by
+    caller reference across acquire gaps (defensive copy); an `as string` cast smuggled
+    ghost slots; LaunchedChild.stdin typed the runtime's undefined as null. Adjudicated and
+    DECLINED with recorded rationale: recording sink.end rejections (a child that failed to
+    see EOF cannot exit 0, so the exit-code gate already dirties the verdict — recording
+    spurious end-rejections would dirty the clean disposals of already-dead children on the
+    common respawn path); a consumed first death dirtying a SUCCESSFUL respawn's verdict
+    (the single respawn is sanctioned; counters.childRespawns records it); permit release
+    after a rejected exit promise (the prototype's documented best-effort escalation — the
+    disposal reports unclean). R3, the cap (A PASS, B FAIL, C FAIL): verified findings
+    fixed **POST-CAP at `508e820` and therefore UNREVIEWED — the final whole-diff loop is
+    their first review**: check 6's LETTER orders clone deletion BETWEEN child teardown and
+    permit release (dispose() gained the beforePermitRelease hook so the order stays owned);
+    setup failures no longer route through the respawn wrap (they surfaced as
+    child-died-twice and consumed the allowance); a hung REST fallback ignored abort until
+    the transport's own bound (the fallback lane now races a teardown gate; both lanes'
+    post-await checks cover dispose too); construction/reader-acquisition/exit-promise
+    failures after a successful launch now kill-escalate + boundedly settle instead of
+    orphaning (store and gitBytes); a store whose only-ever child died with the respawn
+    stopped by abort no longer reports a clean disposal (the verdict describes the LAST
+    child that existed; a successful respawn still reports its replacement). Declined,
+    recorded: the disposal verdict does not fold in a consumed first death when a FINAL
+    child exists — the died-twice ERROR carries the first diagnosis, which is the surface
+    that matters.
 - Final whole-diff santa loop (cap 5): (pending)
 - Doc-sweep codex prose pass: (pending)
