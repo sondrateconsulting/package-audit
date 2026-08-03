@@ -81,6 +81,8 @@ interface FakeChildOpts {
   onEnd?: (fc: FakeChild) => void;
   // default: a killed child dies promptly (keeps dispose waits off the escalation timers)
   onKill?: (signal: number | undefined, fc: FakeChild) => void;
+  // the stdin write records the line and then never settles (a stalled structural sink)
+  hangStdinWrite?: boolean;
 }
 
 class FakeChild {
@@ -111,9 +113,10 @@ class FakeChild {
       stdout: { getReader: () => this.out.getReader() },
       stderr: { getReader: () => this.errS.getReader() },
       stdin: {
-        write: (data: Uint8Array) => {
+        write: (data: Uint8Array): number | Promise<number> => {
           const line = new TextDecoder().decode(data);
           this.stdinLines.push(line);
+          if (opts.hangStdinWrite === true) return new Promise<number>(() => undefined);
           opts.onStdinLine?.(line, this);
           return data.byteLength;
         },
@@ -192,6 +195,7 @@ interface HarnessOpts {
   fallback?: (path: string, entry: TreeEntry) => Promise<string | null>;
   budget?: number;
   limits?: Partial<ContentStoreLimits>;
+  manualPermits?: boolean; // permit grants queue until the test calls grantNextPermit()
 }
 
 function makeHarness(opts: HarnessOpts = {}) {
@@ -199,6 +203,7 @@ function makeHarness(opts: HarnessOpts = {}) {
   const launches: FakeChild[] = [];
   const fallbackCalls: string[] = [];
   const permits = { acquired: 0, released: 0 };
+  const permitWaiters: Array<() => void> = [];
   const caps: ContentStoreCaps = {
     runLsTree: async () => ({
       exitCode: 0,
@@ -220,16 +225,21 @@ function makeHarness(opts: HarnessOpts = {}) {
       launches.push(fc);
       return fc.child;
     },
-    acquireChildPermit: async () => {
-      permits.acquired++;
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        permits.released++;
-        events.push("permit-released");
-      };
-    },
+    acquireChildPermit: () =>
+      new Promise<() => void>((resolve) => {
+        const grant = (): void => {
+          permits.acquired++;
+          let released = false;
+          resolve(() => {
+            if (released) return;
+            released = true;
+            permits.released++;
+            events.push("permit-released");
+          });
+        };
+        if (opts.manualPermits === true) permitWaiters.push(grant);
+        else grant();
+      }),
     readViaRestFallback: async (path, entry) => {
       fallbackCalls.push(path);
       return opts.fallback === undefined ? "DEREFERENCED TARGET CONTENT" : opts.fallback(path, entry);
@@ -242,7 +252,8 @@ function makeHarness(opts: HarnessOpts = {}) {
       restFallbackBudget: opts.budget ?? 20,
       limits: { ...TEST_LIMITS, ...opts.limits },
     });
-  return { caps, open, events, launches, fallbackCalls, permits };
+  const grantNextPermit = (): void => permitWaiters.shift()?.();
+  return { caps, open, events, launches, fallbackCalls, permits, grantNextPermit };
 }
 
 const entryOf = (store: UnitContentStore, path: string): TreeEntry => {
@@ -591,6 +602,122 @@ describe("child lifecycle (check 6: deadline, respawn-once, ordered teardown, ab
     expect(disposal).toEqual({ clean: true, detail: null });
     expect(h.permits.acquired).toBe(0);
     expect(h.permits.released).toBe(0);
+  });
+  test("abort while a read is QUEUED on a saturated child pool rejects it, launches NOTHING, and hands the late-granted permit straight back", async () => {
+    const h = makeHarness({ manualPermits: true });
+    const store = await h.open();
+    const outcome = store.read("src/a.txt", entryOf(store, "src/a.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    await new Promise((r) => setTimeout(r, 5)); // the read is now waiting on the permit
+    store.abort("branch aborted");
+    h.grantNextPermit(); // the pool frees only AFTER the abort landed
+    const err = await outcome;
+    expect(err).toBeInstanceOf(ContentStoreError);
+    expect((err as ContentStoreError).code).toBe("aborted");
+    expect(h.launches.length).toBe(0); // a post-abort launch would outlive every teardown
+    expect(h.permits.acquired).toBe(1);
+    expect(h.permits.released).toBe(1); // granted and immediately handed back — never leaked
+    const disposal = await store.dispose();
+    expect(disposal).toEqual({ clean: true, detail: null }); // no child ever existed
+  });
+  test("dispose while a read is QUEUED on a saturated pool: the late grant launches nothing and leaks nothing", async () => {
+    const h = makeHarness({ manualPermits: true });
+    const store = await h.open();
+    const outcome = store.read("src/a.txt", entryOf(store, "src/a.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    await new Promise((r) => setTimeout(r, 5));
+    const disposal = await store.dispose(); // resolves with no child — the read is still queued
+    expect(disposal).toEqual({ clean: true, detail: null });
+    h.grantNextPermit();
+    const err = await outcome;
+    expect(err).toBeInstanceOf(ContentStoreError);
+    expect((err as ContentStoreError).code).toBe("store-disposed");
+    expect(h.launches.length).toBe(0); // a launch here would be a child nothing ever disposes
+    expect(h.permits.acquired).toBe(1);
+    expect(h.permits.released).toBe(1);
+  });
+  test("abort during an in-flight symlink fallback rejects the read — a post-abort result is never delivered", async () => {
+    let resolveFallback!: (v: string | null) => void;
+    const h = makeHarness({ fallback: () => new Promise((r) => (resolveFallback = r)) });
+    const store = await h.open();
+    const outcome = store.read("link.txt", entryOf(store, "link.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    await new Promise((r) => setTimeout(r, 5)); // the fallback request is in flight
+    store.abort("branch aborted");
+    resolveFallback("TOO LATE");
+    const err = await outcome;
+    expect(err).toBeInstanceOf(ContentStoreError);
+    expect((err as ContentStoreError).code).toBe("aborted");
+    expect(store.counters.fallbackBudgetSpend).toBe(1); // the request was already issued — spend stands
+  });
+  test("a hung stdin write cannot hold the read past the deadline — the deadline still governs and the respawn serves", async () => {
+    const h = makeHarness({
+      childOpts: [
+        { hangStdinWrite: true }, // child 1: the request line is recorded but the sink never settles
+        { onStdinLine: (_line, fc) => fc.serveFrame(OID_A, BODY_A) },
+      ],
+      limits: { readDeadlineMs: 25 },
+    });
+    const store = await h.open();
+    const text = await store.read("src/a.txt", entryOf(store, "src/a.txt"));
+    expect(text).toBe("hello canonical content\n");
+    expect(store.counters.childRespawns).toBe(1);
+    expect(h.launches[0]!.events).toContain("kill"); // the deadline killed the stalled child
+    const disposal = await store.dispose();
+    expect(disposal.clean).toBe(true);
+  });
+  test("an abort landing during the dead child's own teardown stops the respawn — no second launch", async () => {
+    const holder: { store: UnitContentStore | null } = { store: null };
+    const h = makeHarness({
+      childOpts: [
+        {
+          onStdinLine: (_line, fc) => {
+            fc.errS.feed("fatal: boom\n");
+            fc.exit(128);
+          },
+          // the dead child's dispose() closes stdin — the abort lands INSIDE that teardown
+          onEnd: (fc) => {
+            holder.store?.abort("abort during teardown");
+            fc.exit(0);
+          },
+        },
+      ],
+    });
+    const store = await h.open();
+    holder.store = store;
+    const err = await store.read("src/a.txt", entryOf(store, "src/a.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ContentStoreError);
+    expect((err as ContentStoreError).code).toBe("aborted");
+    expect(h.launches.length).toBe(1); // the replacement was never launched
+    expect(store.counters.childRespawns).toBe(1); // the allowance was consumed, then the abort stopped it
+    await store.dispose();
+  });
+  test("a protocol fault observed while DRAINING during teardown makes the disposal unclean — never masked by the teardown poison", async () => {
+    const h = makeHarness({
+      childOpts: [
+        {
+          onStdinLine: (_line, fc) => fc.serveFrame(OID_A, BODY_A),
+          onEnd: (fc) => {
+            fc.out.feed("late garbage nobody asked for\n"); // arrives while dispose() drains
+            fc.exit(0); // and the child still exits 0 — the fault is the ONLY dirt
+          },
+        },
+      ],
+    });
+    const store = await h.open();
+    await store.read("src/a.txt", entryOf(store, "src/a.txt"));
+    const disposal = await store.dispose();
+    expect(disposal.clean).toBe(false);
+    expect(disposal.detail).toMatch(/framing violation|no request in flight/);
   });
 });
 

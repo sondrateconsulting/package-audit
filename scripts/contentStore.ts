@@ -141,6 +141,10 @@ class FramedChild {
   private readonly pumpsDone: Promise<void>;
   private pending: PendingRead | null = null;
   private fatal: string | null = null;
+  // a REAL fault observed while draining during teardown: it cannot claim the first-fatal
+  // diagnosis slot (that would replace the original cause), but it must still dirty the
+  // disposal verdict — a child that emitted protocol garbage on the way out is not clean
+  private teardownFault: string | null = null;
   private exitedCode: number | null = null;
   private disposed: Promise<ChildDisposal> | null = null;
 
@@ -158,16 +162,26 @@ class FramedChild {
     this.child.exited.then(
       (code) => {
         this.exitedCode = code;
-        // an exit while a read is pending is a protocol failure for that read
-        this.poison(`child exited (${code}) mid-conversation`);
+        // Before teardown, an exit is a protocol failure for any pending read. DURING
+        // teardown the exit is the goal, not a fault — without this gate the normal
+        // stdin-close exit would land in the teardown-fault slot and dirty every clean
+        // disposal. (dispose() assigns `disposed` synchronously before any exit
+        // notification can run: promise callbacks never fire in the registering tick.)
+        if (this.disposed === null) this.poison(`child exited (${code}) mid-conversation`);
       },
-      () => this.poison("child exit promise rejected"),
+      () => {
+        // same gate: dispose()'s own bounded exit wait already maps a rejected exit promise
+        // to the never-settled (unclean) path
+        if (this.disposed === null) this.poison("child exit promise rejected");
+      },
     );
     this.pumpsDone = Promise.all([this.pumpStdout(), this.pumpStderr()]).then(() => undefined);
   }
 
   private poison(reason: string): void {
     if (this.fatal === null) this.fatal = reason; // first fatal wins — it is the diagnosis
+    else if (this.fatal === "disposed" && reason !== "disposed" && this.teardownFault === null)
+      this.teardownFault = reason; // drain-time fault: preserved for the verdict, never the diagnosis slot
     const p = this.pending;
     if (p !== null) {
       this.pending = null;
@@ -258,16 +272,21 @@ class FramedChild {
     if (sink === null) {
       this.poison("child has no stdin pipe");
     } else {
-      try {
-        // backpressure-aware: write() may complete asynchronously; flush pushes the line out now
-        await sink.write(encodeOidRequest(expected.oid, this.format));
-        await Promise.resolve(sink.flush());
-      } catch (e) {
-        // an encodeOidRequest refusal lands here too: a request that cannot be validated is
-        // never written, and the pending read is rejected through the poison path
-        this.poison(`stdin write failed: ${e instanceof Error ? e.message : String(e)}`);
-        killWithEscalation(this.child, [this.outReader, this.errReader]);
-      }
+      // DETACHED on purpose: the frame promise — governed by the per-read deadline — is
+      // returned immediately, so a stalled structural sink can neither hold readObject past
+      // the deadline nor leave the deadline's rejection unobserved. Write failures (an
+      // encodeOidRequest refusal included: a request that cannot be validated is never
+      // written) still poison through the same path, rejecting the pending read.
+      void (async (): Promise<void> => {
+        try {
+          // backpressure-aware: write() may complete asynchronously; flush pushes the line out
+          await sink.write(encodeOidRequest(expected.oid, this.format));
+          await Promise.resolve(sink.flush());
+        } catch (e) {
+          this.poison(`stdin write failed: ${e instanceof Error ? e.message : String(e)}`);
+          killWithEscalation(this.child, [this.outReader, this.errReader]);
+        }
+      })();
     }
     return frameP;
   }
@@ -346,7 +365,9 @@ class FramedChild {
         exitCode: exit ?? this.exitedCode,
         stderrTail: snap.bytes,
         stderrDroppedBytes: snap.droppedBytes,
-        protocolError: this.fatal === "disposed" ? null : this.fatal,
+        // "disposed" alone is a clean teardown poison — but a fault observed while draining
+        // (teardownFault) still dirties the verdict
+        protocolError: this.fatal === "disposed" ? this.teardownFault : this.fatal,
       };
     })();
     return this.disposed;
@@ -471,7 +492,14 @@ export class UnitContentStore {
     try {
       this.counters.fallbackBudgetSpend++;
       this.counters.restFallbackReads.symlink++;
-      return await this.caps.readViaRestFallback(path, entry);
+      const text = await this.caps.readViaRestFallback(path, entry);
+      // an abort that landed while the request was in flight must reject THIS read — a
+      // post-abort delivery would hand scanUnit content for a unit already being torn down
+      // (the child route gets the same rejection through the poison path). The spend stands:
+      // the request was already issued when the abort arrived.
+      if (this.abortedReason !== null)
+        throw new ContentStoreError("aborted", `read of ${path} aborted: ${this.abortedReason}`);
+      return text;
     } finally {
       this.readInFlight = false;
     }
@@ -482,7 +510,20 @@ export class UnitContentStore {
     // lazy spawn at the unit's first canonical read (§3.1). The permit is acquired ONCE and
     // held across a respawn — the pool bounds LIVE-CHILD-HOLDING UNITS, and a unit between
     // child deaths is still one such unit.
-    if (this.permitRelease === null) this.permitRelease = await this.caps.acquireChildPermit();
+    if (this.permitRelease === null) {
+      const release = await this.caps.acquireChildPermit();
+      // The grant can arrive AFTER an abort/dispose landed (a read queued on a saturated
+      // pool): hand the permit STRAIGHT back and surface the store's state — a child
+      // launched here would outlive every teardown (dispose() has already returned its
+      // verdict) and the permit assignment below would never be released.
+      if (this.abortedReason !== null || this.disposedP !== null) {
+        release();
+        if (this.abortedReason !== null)
+          throw new ContentStoreError("aborted", `child launch abandoned: ${this.abortedReason}`);
+        throw new ContentStoreError("store-disposed", "child launch abandoned: the store is disposed");
+      }
+      this.permitRelease = release;
+    }
     this.child = new FramedChild(this.caps.launchBatchChild(this.cwd), this.format, this.limits);
     return this.child;
   }
@@ -505,6 +546,12 @@ export class UnitContentStore {
     this.counters.childRespawns++;
     this.firstDisposal = this.child === null ? null : await this.child.dispose();
     this.child = null;
+    // an abort/dispose that landed DURING the dead child's teardown stops the respawn — a
+    // replacement launched now would outlive the store's own teardown (the same grant-gap
+    // hazard ensureChild closes at the permit)
+    if (this.abortedReason !== null)
+      throw new ContentStoreError("aborted", `read of ${path} aborted: ${this.abortedReason}`);
+    if (this.disposedP !== null) throw new ContentStoreError("store-disposed", `read of ${path} after dispose()`);
     try {
       return await (await this.ensureChild()).readObject({ oid, size });
     } catch (e2) {

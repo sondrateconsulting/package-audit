@@ -1400,20 +1400,28 @@ export class GithubClient {
   // through the §U3.1 funnel. On a deadline expiry the result is ALWAYS the synthetic 124 with
   // EMPTY stdout — a timed-out capture must never surface partial bytes as a complete listing.
   async gitBytes(args: string[], cwd: string): Promise<GitBytesResult> {
-    assertSpawnAllowed(this.bins.git, args);
-    assertReadOnlyGit(args);
+    // Copy FIRST (an index loop — never an iterator or method a hostile array could
+    // override), then guard and launch THE COPY: validating the caller's array and launching
+    // it later would let a mutation inside the semaphore-acquire gap swap the validated
+    // tuple for something else (the guard hardening's copy-then-check discipline, applied at
+    // the launch layer too). A non-string or ghost slot lands in the copy as-is and the
+    // guard's own-slot sweep rejects it.
+    const argv: string[] = [];
+    for (let i = 0; i < args.length; i++) argv.push(args[i] as string);
+    assertSpawnAllowed(this.bins.git, argv);
+    assertReadOnlyGit(argv);
     assertContained(cwd, [this.tempRoot]); // §0: git is the only process allowed cwd inside a clone
     const env = buildGitEnv(this.baseEnv, this.ensureGitConfig());
     const release = await this.sem.acquire();
     let spanId = 0;
     if (hasProgressSink()) {
       spanId = nextProgressId();
-      emitProgress({ type: "spawn-start", id: spanId, tool: "git", label: spawnLabel("git", args) });
+      emitProgress({ type: "spawn-start", id: spanId, tool: "git", label: spawnLabel("git", argv) });
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     let gaveUpTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const child = this.launch(this.bins.git, args, { env, cwd, stdin: "ignore" });
+      const child = this.launch(this.bins.git, argv, { env, cwd, stdin: "ignore" });
       const outReader = child.stdout.getReader();
       const errReader = child.stderr.getReader();
       const kill = (): void => killWithEscalation(child, [outReader, errReader]);
@@ -1450,7 +1458,7 @@ export class GithubClient {
         }),
       ]);
       if (bounded === null)
-        throw new GithubApiError(`git ${args[0] ?? ""} never settled within the deadline + escalation grace`, {});
+        throw new GithubApiError(`git ${argv[0] ?? ""} never settled within the deadline + escalation grace`, {});
       const [stdout, stderr, exitCode] = bounded;
       // deadline FIRST: an escalation-induced reader cancellation must surface as the promised
       // terminal 124, never as a reader error (the bench seam's reviewed ordering)

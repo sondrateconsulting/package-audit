@@ -3154,6 +3154,40 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     expect(launches.length).toBe(1);
     expect(res.exitCode).toBe(0);
   });
+  test("gitBytes: launches the VALIDATED COPY — mutating the caller argv in the acquire gap cannot change what runs", async () => {
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((r) => (releaseFirst = r));
+    const launched: Array<readonly string[]> = [];
+    const spawn: SpawnFn = async () => {
+      await gate;
+      return ok(http(200, {}, "{}"));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spawn,
+      launchImpl: (_bin, args) => {
+        launched.push(args);
+        return fakeOneShot({ stdout: ["x"] }).child;
+      },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      concurrency: 1,
+      env: { HOME: "/home/u", PATH: "/bin" },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-toctou-"));
+    const held = client.gh(["api", "rate_limit"]); // occupy the only slot: gitBytes queues AFTER its guards ran
+    const args = [...LS_TUPLE];
+    const p = client.gitBytes(args, dir);
+    await new Promise((r) => setTimeout(r, 10));
+    args[0] = "push"; // hostile mutation inside the semaphore-acquire gap
+    args.length = 1;
+    releaseFirst();
+    await held;
+    const res = await p;
+    expect(res.exitCode).toBe(0);
+    expect(launched.length).toBe(1);
+    expect([...launched[0]!]).toEqual(LS_TUPLE); // the validated tuple ran, not the mutated array
+  });
   test("gitBytes: the wall-clock deadline kills the child and yields the synthetic 124 with timedOut", async () => {
     let fake: FakeLaunch | null = null;
     const { client } = makeClient([], {
