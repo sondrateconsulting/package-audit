@@ -1,12 +1,12 @@
 ---
-status: "proposed"
-date: 2026-07-28
+status: "accepted"
+date: 2026-08-03
 decision-makers: rvo (repository owner)
-consulted: Codex (gpt-5.6-sol) — successive adversarial review rounds; see Review history
+consulted: Codex (gpt-5.6-sol / GPT-5.5) — successive adversarial review rounds through Step D; see Review history
 informed: operators running `bun run audit` against large estates
 ---
 
-# Lift the per-file REST rate-limit ceiling by batching file-content reads over GraphQL
+# Lift the per-file REST rate-limit ceiling by acquiring file content from per-unit no-checkout clones (canonical-object reads via guarded cat-file)
 
 ## Context and Problem Statement
 
@@ -110,7 +110,8 @@ credentials: no repetition, no p50/p95, no pinned corpus, workloads deliberately
 | M9 | **Symlink divergence** (below) | one mode-`120000` entry | — | — | **2,513 bytes vs 17 bytes** |
 
 **What these do and do not prove.** M2/M3 fetch a *selected* subset while M6 fetches a *whole tree*,
-so no speed ratio between them is quoted. Option 3 was not measured. M7's `pack_header=2,227` means
+so no speed ratio between them is quoted. Option 3 was not measured in this series (its
+compositional analysis later ran at Step C; see Confirmation and Follow-on work). M7's `pack_header=2,227` means
 pack format **version 2 containing 227 objects** — not 227 blobs — so only the single-subprocess
 observation is claimed, and it does not generalise to arbitrary access patterns. M8's unchanged
 `in-pack` count does not prove full object reuse: loose objects are counted separately and small
@@ -171,194 +172,152 @@ returns. **A symlink policy must be chosen explicitly by whichever option wins.*
 
 ## Decision Outcome
 
-Chosen option: **"Option 1 — Batched blob reads over the GraphQL API, retaining the existing
-per-branch clone for truncated trees"**, because it reduces the cold-run request count while giving
-the tool **verifiable, per-entry control over byte semantics**, and because its substantial new
-surface is entirely in-process, whereas the clone options' surface reaches into the filesystem,
-concurrent processes, and platform-dependent behaviour.
+Chosen option: **"Option 2c — Per-unit clone without checkout, canonical-object reads via guarded
+`git cat-file`"**, because the pre-registered pre-acceptance benchmark ran to completion and its
+§4.7 rule output was **exactly one eligible driver → recommend T2c** (the driver implementing
+Option 2c), and the decision-maker ratified that recommendation on 2026-08-03. The question as
+asked, the verbatim answer, and the disclosures accompanying the ask are recorded in the §8
+record's Step-D entry ([ratification.json](0001-benchmark/ratification.json)); the evidence is the
+committed Step-C set ([report.md](0001-benchmark/report.md) with `runs.jsonl`, `fidelity.jsonl`,
+the probes and `option3.json`), collected at frozen-surface digest `8b67a314…`.
 
-The evidence that fixes the fidelity requirement is M9's hash check, and it must be stated with its
-scope. For a **blob whose `text` is non-null and whose hash validates** — M9's mode-`120000` link
-blob is itself the demonstration, not a regular file — GraphQL demonstrably yields the committed
-object: the 17 returned bytes hash to exactly the tree OID. That makes the read *self-verifying* —
-the tool can prove which bytes it got. (M9 alone no longer decides the whole transport question:
-Option 2c meets the same canonical-bytes standard by construction; between 1 and 2c the decision is
-the surface asymmetry below plus the benchmark.) The chosen design then deliberately routes three
-categories away from that guarantee, and they are exceptions, not oversights:
+**What the rule found** (report §2; the eligibility gates are global per driver, spanning the
+performance corpus and the fidelity battery, and the disqualifiers below are route-specific):
 
-* **symlinks** (by validated mode) go to `fetchFileRaw`, which returns REST's *dereferenced*
-  non-canonical bytes — chosen to preserve today's findings;
-* **binary and indeterminate blobs** go to `fetchFileRaw` too, and that path is itself lossy: spawn
-  output is decoded with `Buffer.concat(chunks).toString("utf8")`
-  ([github.ts:168](../../scripts/github.ts#L168)), so binary bytes do not survive intact today either;
-* **truncated trees** keep the existing clone, with the checkout-transformation caveat below.
+* **T2c is eligible.** G1–G4 pass: both fidelity fixtures pass, zero attributable secondary-limit
+  signals, maximum sampled-peak disk 293.3 MiB (on C4, the truncated-tree unit).
+* **T0 (status quo) and T1 (Option 1) are ineligible.** G1: their delivered strings mismatched
+  the pinned non-UTF-8 fixture — T0 on its REST primary route, T1 via its validation-fallback
+  route (a GraphQL response failing the pinned validation, falling back to REST) — while the
+  clone-path deliveries matched it. G4: sampled-peak disk ~2.6 GB against the ratified 2 GiB
+  gate on C4 rows, where the truncated tree routes both onto the retained checkout-clone
+  fallback. Both passed G2 and G3, with zero attributable secondary signals.
+* **T2a (checkout clone) is ineligible.** G1: the checkout-config probe exhibited `autocrlf`
+  materialisation divergence on seven probe rows (13–1260 diverging deliveries each) — the
+  byte-determinism objection this ADR raised against checkout reads, measured rather than
+  argued. G4: the same C4 checkout disk. It too passed G2 and G3 with zero signals.
 
-By contrast, a checkout gives the tool **no control and no way to detect what it got**. `git checkout`
-applies committed `.gitattributes` transformations (`eol`, `ident`, `working-tree-encoding`), changing
-both the bytes `cloneReader` reads ([orchestrate.ts:128](../../scripts/orchestrate.ts#L128)) and the
-working-tree size `walkClone` records ([orchestrate.ts:140](../../scripts/orchestrate.ts#L140)) — and
-therefore whether the 2 MiB gate fires — with the result varying by platform and repository
-configuration. Reading canonical objects from a clone instead needs `git cat-file`, which
-`readOnlyGuard` currently excludes ([readOnlyGuard.ts:201](../../scripts/readOnlyGuard.ts#L201)). That
-exclusion is not an absolute barrier — plain `git cat-file --batch` returns raw object contents, and
-`--textconv`/`--filters` are separate opt-in flags the guard's exact-argv grammars could exclude, as
-they already do for `show`. It is a real *cost*: new guarded verbs, a validated-OID stdin protocol,
-and binary framing that the current UTF-8 spawn decode cannot provide.
+**What the decision rests on, and what it does not.** The recommendation is the rule's
+sole-eligible case, not a throughput verdict: under the ratified 1.75 noise band T2c led or tied
+every unit, but that reading is informational — T1's raw C5 median was higher (61,912 vs 36,657
+files/hour, a tie under the band), and dominance was never evaluated, since no rival was
+eligible. M9's hash check remains the historical measurement that fixed the byte-semantics
+requirement every option was judged against; the benchmark's fidelity battery and checkout-config
+probe carried that requirement into the gates that decided this. The evidence is a per-scenario
+serial cost profile, not an estate simulation: concurrent fan-out, the shared REST+GraphQL budget
+under contention, cross-unit cache effects, and aggregate clone disk across parallel units remain
+design-ledger items — the concurrency probe evidences them (4 concurrent streams, zero secondary
+signals) without scoring them.
 
-That checkout critique decides against **Option 2a specifically** — it does not decide the clone
-question. Option 2c below pays the `cat-file` cost deliberately and never checks out, dissolving the
-byte-fidelity, symlink, and size-gate objections at once; it is the **strongest challenger** to this
-recommendation. What keeps Option 1 recommended over 2c, provisionally, is a surface asymmetry, not a
-knockout: Option 1's new machinery is in-process and exercisable through the existing injected-spawn
-tests, while 2c's crosses a subprocess protocol boundary — a stdin trust surface the argv guard cannot
-see, a long-lived child lifecycle where every subprocess today is one-shot, and disk on the common
-path. The pre-acceptance benchmark (Confirmation) compares them under a symmetric pre-registered rule
-with no incumbency margin; the surface asymmetry is the decision-maker's ledger, not a numeric
-handicap.
+**This is not a drop-in transport swap.** The resolution plan's §3.1 definition and §3.2 ledger
+are the normative implementation bill, in two classes:
 
-**This is not a drop-in transport swap.** Its cost, stated plainly:
+1. **Specified constraints** — the shape the implementation must have: three new `readOnlyGuard`
+   grammars (a second exact clone shape carrying `--no-checkout`; the `ls-tree -r -z -l
+   --full-tree` tuple; a `cat-file --batch` tuple with `--textconv`/`--filters` structurally
+   absent); the stdin trust boundary confined by a writer that emits only format-validated OIDs
+   (40-hex SHA-1 / 64-hex SHA-256, per the repository's object format); the framed binary spawn
+   seam (bounded pre-LF headers, frame sizes bound to the ls-tree-declared size under the
+   absolute ceiling, capped stderr, streaming consumption); the unit-lived child lifecycle —
+   lazy spawn, per-read deadlines, at most one respawn, ordered teardown before clone deletion —
+   drawing from its own small fixed permit pool, never the subprocess semaphore; the
+   `GIT_NO_REPLACE_OBJECTS` addition to `buildGitEnv`'s allowlist (silently dropped today); head
+   coherence against the discovery-pinned OID; the 2 MiB gate reading canonical `ls-tree` sizes;
+   and the ratified symlink policy — mode-`120000` entries resolve via the REST dereference
+   fallback, preserving today's findings, the canonical link payload staying a latent capability.
+2. **Residual risks** — carried into implementation for remediation or explicit acceptance,
+   never silent inheritance: the unowned `pkg-audit-*` startup sweep
+   ([github.ts:2096](../../scripts/github.ts#L2096)); the single-attempt clone with no retry
+   ([github.ts:2031](../../scripts/github.ts#L2031)); git-transport pacing (15 ops/s/repo,
+   recommended not enforced, with no headroom header); and disk on the common path, whose
+   aggregate under concurrent fan-out the benchmark did not measure.
 
-1. **A batching seam.** `ReadFile` takes one path and each read is awaited
-   ([unitPipeline.ts:46](../../scripts/unitPipeline.ts#L46)), so a reader cannot accumulate requests.
-   The seam becomes `prefetch(paths)`/`readFiles(paths)`, or `scanUnit` splits into planning and
-   consumption phases — unavoidable, because source relevance is decided inside `scanUnit`
-   ([unitPipeline.ts:190](../../scripts/unitPipeline.ts#L190)). This cost is **Option 1's own**, not
-   generic to alternatives: Option 2c's reads are local and on-demand, and leave the one-path seam
-   intact.
-2. **Tree mode preserved *and validated*.** The parser keeps only the object type and drops mode
-   ([github.ts:746](../../scripts/github.ts#L746)). Mode must be carried on `TreeEntry` and validated
-   against the closed mapping `100644`/`100755`/`120000` → blob, `040000` → tree, `160000` → commit.
-   An unvalidated or missing mode fails open straight back into M9.
-3. **A batch-specific client method.** The generic `graphql()` retries the identical query
-   ([github.ts:1673](../../scripts/github.ts#L1673)), discards status behind `ThrottleExhausted`, and
-   and — the real defect — **discards partial `data` on every error-classified path** while dropping
-   `errors[].path` ([github.ts:678](../../scripts/github.ts#L678)), so a per-alias handler can never
-   see it. (Rate-limit body errors *are* classified and retried rather than treated as fatal,
-   [github.ts:595](../../scripts/github.ts#L595); the problem is the lost partial data, not blanket
-   fatality.) GitHub documents partial results under resource exhaustion.
-4. **An API-wide admission scheduler.** The CPU limit is 90 s per 60 s **shared** across REST and
-   GraphQL with a 60 s GraphQL sub-cap, while the client today has only a count semaphore and reactive
-   per-bucket pausing ([github.ts:1049](../../scripts/github.ts#L1049)). A GraphQL-only scheduler
-   cannot enforce a shared limit while tree reads and fallbacks remain on REST.
-5. **Admission caps and failure policy.** Independent caps on alias count, query-document bytes,
-   content bytes (M5 vs M3), and total serialized argv size — the client passes query and variables as
-   separate `-f` argv elements ([github.ts:1658](../../scripts/github.ts#L1658)) and the real spawn does
-   not use stdin ([github.ts:174](../../scripts/github.ts#L174)), so a batch can satisfy a byte cap and
-   still fail with `E2BIG`. Splitting must not be the first response to a 5xx — that turns an upstream
-   outage into an expanding tree of failures. Order: bounded transient retry, then split only on
-   structured timeout/resource evidence or repeated size-correlated failure, with a descendant cap, a
-   circuit breaker, and a batch deadline well inside the 15-minute subprocess deadline
-   ([github.ts:1007](../../scripts/github.ts#L1007)).
-6. **Per-alias fallback with a budget.** Symlinks (routed by validated mode), binary or indeterminate
-   blobs, and `isTruncated` blobs fall back to `fetchFileRaw`. A whole-batch failure must never be read
-   as N benign absences. Because unrestricted fallback regresses to `O(files)` REST, a per-unit
-   fallback budget with defined terminal behaviour is required.
-7. **Query construction and response integrity.** GraphQL **variables, never string interpolation** —
-   `isCanonicalTreePath` rejects only empty, NUL, `.` and `..` segments
-   ([github.ts:774](../../scripts/github.ts#L774)), so a legal path may contain quotes, backslashes or
-   newlines. Validate `__typename === "Blob"`, `oid` against `TreeEntry.sha`, `byteSize` against
-   `TreeEntry.size`, coherent `isBinary`/`isTruncated`/`text`, and exact alias coverage.
-8. **Cache provenance.** `gh3` rows are tied to exact REST-200 bodies
-   ([github.ts:1358](../../scripts/github.ts#L1358)) and the accessors call the table REST-only
-   ([db.ts:2361](../../scripts/db.ts#L2361)). Reusing them for GraphQL text requires
-   `Buffer.byteLength(text) === byteSize`, a local `blob <len>\0<body>` hash check against the tree
-   OID, and a cache-namespace bump. With that, existing rows are probed before aliases are built and
-   validated results persisted via [db.ts:2403](../../scripts/db.ts#L2403).
-
-Rounds: **round 1** batches manifests and CLI-classifiable paths (knowable from the tree alone);
-**round 2** batches the source files round 1's manifests made relevant plus the required nearest
-lockfiles. Either round can legitimately be empty.
-
-The clone/API split stays where the code already puts it: complete tree → batched reads; truncated
-tree → the existing per-branch `cloneShallow`, with its checkout-byte caveat documented rather than
-pretended away.
+**Byte semantics under the chosen option.** Regular-blob reads are the committed objects
+themselves, self-verifying against the tree OID before any seam decode; `.gitattributes` never
+executes. The `ReadFile` seam remains a string contract: 2c applies the same UTF-8 decode at the
+seam that the REST path applies today, for findings parity — the transport's lossiness is
+removed, and raw-byte consumers stay future work. Symlinks are mode-routed to REST's dereferenced
+bytes (the ratified policy), so symlink reads still spend API budget. There is no truncation
+cliff — `ls-tree` enumerates any tree — so the truncated-tree checkout-clone fallback and its
+checkout-byte caveat retire on this path once the implementation lands; until then production
+keeps today's routing.
 
 ### Consequences
 
-* Good, because the cold-run content ceiling rises substantially — M2/M3 resolved 250 and 400 blobs
-  per request for one point each, against one request per file today.
-* Good, because on the **hash-validated primary path** the bytes are the committed object's bytes
-  (M9's standard) — with the symlink, binary/indeterminate, and truncated-tree exceptions routed
-  and documented rather than folded into the claim. Checkout-based reading cannot offer this
-  without reopening `cat-file` — which Option 2c now does, paying that cost explicitly.
-* Good, because it needs **no new `readOnlyGuard` verb**, no working tree, no interprocess
-  coordination, and no platform-dependent filesystem semantics on the batch path. (The SQLite cache
-  still uses disk; what the batch path avoids is materialising repository contents.)
-* Good, because every piece of new surface is in-process and exercisable through the existing
-  injected-`spawn` seam.
-* Bad, because the ceiling reduction is **expected-case, not structural**: an unfavourable selected
-  set (many symlinks, binaries, or truncated blobs) falls back per file and regresses toward
-  `O(files)` REST. Hence the fallback budget.
-* Bad, because **the retained per-unit tree fetch stays on REST**. The precise term is distinct
-  *uncached* `(host, org, repo, treeOid)` values — tree responses are immutable-cached
-  ([github.ts:1943](../../scripts/github.ts#L1943)), so branches sharing a tree share a row — but on a
-  cold estate it approaches one request per branch unit, and roughly 5,000 of those per hour still
-  exhausts core. This ADR reduces the content term and leaves the tree term standing.
-* Bad, because a **per-query point floor** applies: every non-empty query costs ≥1 point. For a
-  5,000-point credential and cold units dispatching one non-empty batch per round, that is roughly
-  2,500 branch units/hour before splits, retries, and discovery. Empty rounds and cache hits raise it;
-  splitting lowers it.
-* Bad, because **admission and partial-failure handling are the hard parts**, and this ADR specifies
-  them only to the level of requirements, not algorithms.
-* Bad, because the point formula is **explicitly subject to change**, so the implementation must read
-  `rateLimit { cost }` rather than assume.
-* Neutral, because the truncated-tree clone is retained, so the chosen option still uses disk on that
-  path and still carries the checkout-byte and temp-sweep hazards described under Option 2a — for the
-  same rare repositories as today, not for the whole estate.
+* Good, because the content path's API cost drops to zero for regular blobs — no REST `contents`
+  requests, no GraphQL points, and no per-unit REST tree request either (local `ls-tree`
+  enumeration), with no 100,000-entry / 7 MB truncation cliff. Measured: T2c's median API
+  consumption across the matrix was zero on every unit except C3, whose one counted fallback read
+  cost one core unit (report §1's consumption table).
+* Good, because the bytes on the primary path are the committed objects, verified against the
+  tree OID before the seam decode — the property this decision turned on, held by construction
+  rather than by validation of a remote response.
+* Good, because the measured envelope held: 293.3 MiB maximum sampled-peak disk per unit
+  (pack-only stores), zero attributable secondary-limit signals across the matrix and the
+  4-stream concurrency probe.
+* Bad, because the common path now touches disk on every unit and transfers the whole branch
+  pack however few files are selected. The per-unit peak is an observation from the pinned
+  corpus, not a bound, and aggregate disk under concurrent fan-out is unmeasured.
+* Bad, because the new surface is real: guard grammar growth, the stdin trust boundary, the
+  interactive-child lifecycle with its second permit pool, and the framed binary seam — the
+  §3.2 ledger's honest price, now an implementation obligation rather than a hypothetical.
+* Bad, because symlink reads still spend the per-unit REST fallback budget (max(20, 10% of
+  selected)), so symlink-heavy units keep an API dependency and its failure modes.
+* Neutral, because operational hardening is deferred to implementation **by name**, not
+  silently: clone retry policy, pacing under fan-out, and the sweep-ownership fix (the
+  residual-risk list above).
+* Neutral, because OID-keyed content caching (Option 3) composes with API read paths, not this
+  one: the frozen warm pair measured 255/255 cache hits with the wall unmoved (1260 → 1274 ms)
+  — cross-run object reuse would be a persisted shared store, a different architecture, not a
+  cache layer over this driver.
 
 ### Confirmation
 
-**Pre-acceptance gate (decision evidence, not implementation verification).** This ADR stays
-`proposed` until the benchmark specified to execution level in the
-[resolution plan](../plans/adr-0001-disagreements-resolution.md) has run and its Step-D decision is
-recorded. The gate, summarised — the plan is normative: a checked-in harness over a six-slot pinned
-public corpus (multi-branch tree sharing, mid-size, path-heavy, truncated-tree, checkout-affecting
-`.gitattributes`, and a symlink/non-UTF-8 fidelity battery) drives pinned selected-path workloads
-through four drivers — status quo, Option 1, Option 2a, and **Option 2c** — under preregistered
-constants, ordering, and worst-case budget reservation. Option 3 is evaluated compositionally
-(offline duplicate-OID analysis plus a warm-run scenario), not as a competing transport. Global
-eligibility gates cover route-scoped byte determinism (with a checkout-config probe), completeness,
-stability, and resource envelope; eligible drivers are compared per scenario on
-budget-normalised serial throughput inside a **calibrated noise band** (`max(1.25, pilot spread)`),
-and a driver is recommended if it dominates — at least one scenario win and no losses against
-every other eligible driver — or if it is the sole eligible driver (with every rival's
-disqualifying evidence attached); with no dominator the full table escalates to the
-decision-maker, and with **zero eligible drivers there is no path to `accepted` on this
-benchmark** (remain-`proposed` with a remediation plan). **The rule is symmetric: no incumbency
-margin protects Option 1**;
-design-surface judgment stays with the decision-maker, and every Step-D outcome — confirmation,
-challenger win, no-dominator judgment, or remain-proposed-with-remediation — passes one further
-adversarial review round before this ADR changes state. An override of the rule's recommendation
-requires written rationale recorded in the Review history; an ineligible driver can never be
-chosen. Every MEASURED number in the table above is single-sample, and M1 is derived rather than
-run at all; the benchmark supersedes them once it executes, which it has not yet done.
+**The pre-acceptance gate ran and is discharged.** The benchmark specified to execution level in
+the [resolution plan](../plans/adr-0001-disagreements-resolution.md) — six-slot pinned corpus,
+four drivers, preregistered constants and ordering, global eligibility gates spanning the
+performance corpus and the fidelity battery, the symmetric no-incumbency-margin comparison rule —
+was ratified and frozen at Step B (§8; PR #29), executed at Step C (PR #32), and decided at
+Step D. Its §4.7 rule output — exactly one eligible driver → recommend T2c, with every rival's
+disqualifying evidence attached — is recorded in [report.md](0001-benchmark/report.md) §3, and
+the decision-maker's ratification of it (2026-08-03: the ask, the verbatim answer, and the
+disclosures) in the §8 record's Step-D entry. Every Step-D outcome carries one further
+adversarial review round before the ADR changes state; this decision's round is recorded in the
+same entry. Every MEASURED number in the table above is single-sample and M1 is derived rather
+than run; the executed benchmark supersedes them as decision evidence.
 
-Post-implementation checks:
+Post-implementation checks (the implementation PR must demonstrate these, not assert them):
 
-1. **Separated counters.** Logical selected identities, usable cache hits, cold misses, concurrent
-   duplicate misses, repeated non-cacheable responses, batched requests, per-alias REST fallbacks,
-   retries, and total HTTP attempts as *distinct* metrics.
-2. **Byte-level reader parity.** Compare readers on **raw reader output**, not `UnitResult` — different
-   bytes can coincidentally yield identical findings. Cases: the M9 symlink (mode-routed to REST, must
-   equal 2,513 bytes), a binary blob, an `isTruncated` blob, a path containing a quote/backslash/newline,
-   a path the tree lists but `contents` 404s, and a tree entry with missing or unknown mode (must be
-   fatal, not treated as a regular blob).
-3. **Request-budget assertion**, stated content-only so the two sides are comparable. GraphQL
-   *content* requests equal dispatched post-cache batches plus split descendants plus retries — not
-   `ceil(bytes / budget)`. REST *content* attempts equal cache-missing per-alias fallbacks plus
-   retries. Tree fetches, repository/owner discovery, and GraphQL branch discovery are counted
-   separately and must not be folded into either side.
-4. **Admission and failure tests.** A batch exceeding any cap (aliases, query bytes, content bytes,
-   argv bytes) splits before dispatch; a simulated 5xx takes the bounded transient retry that
-   `classifyGraphql`'s `transient` branch already provides
-   ([github.ts:614](../../scripts/github.ts#L614)) and is **not** split on the first failure;
-   split descendants are capped; a partial response with `errors[].path` resolves per alias with no
-   whole-batch fatal; the fallback budget trips and terminates as defined.
-5. **Scheduler test.** Aggregate in-flight response time across REST *and* GraphQL stays under the
-   configured shared margin with discovery and content contending at maximum fan-out.
-6. **Cache provenance test.** A GraphQL body failing `byteLength`/blob-hash validation is never
-   persisted; a guarded-write conflict fails closed; the namespace bump prevents old rows being read
-   under new semantics.
+1. **Guard grammars.** Accept/reject tables for the three new tuples — the `--no-checkout` clone
+   shape, `ls-tree -r -z -l --full-tree <rev>`, and `cat-file --batch` — with
+   `--textconv`/`--filters` structurally absent from the grammar, not merely unused.
+2. **Stdin containment.** The `cat-file` writer emits only format-validated OIDs in the
+   repository's object format (SHA-1 and SHA-256 both covered; mixed-format listings rejected);
+   malformed, truncated, and non-OID inputs are refused, with tests driving each rejection.
+3. **Framed reads.** `--batch` frame parsing validates OID echo, type, and size against the
+   ls-tree-declared value under the absolute ceiling; a `<oid> missing` reply for an OID the
+   unit's own enumeration listed fails the unit closed — never the seam's benign `null`; pre-decode
+   frame bytes hash to the tree OID before the UTF-8 seam decode.
+4. **Environment and coherence.** `GIT_NO_REPLACE_OBJECTS=1` is present in the child's sanitized
+   environment (asserted — `buildGitEnv` drops unlisted variables), and `rev-parse HEAD` equals
+   the discovery-pinned OID, else fail closed.
+5. **Byte-level reader parity.** On raw reader output, not `UnitResult`: the M9 symlink
+   (mode-routed to REST, must equal 2,513 bytes), a binary blob, a non-UTF-8 blob whose seam
+   string matches today's REST delivery, a path containing a quote/backslash/newline/TAB, and a
+   tree entry with missing or unknown mode (fatal, never treated as a regular blob).
+6. **Child lifecycle.** Per-read deadline, the single-respawn policy, and ordered teardown —
+   stdin close → exit await (kill-escalation on deadline) → disposer → clone deletion → permit
+   release — on completion, failure, and abort alike.
+7. **Two-pool discipline.** The child pool is a fixed small constant independent of unit fan-out;
+   the deadlock test runs both pools at capacity 1 with a symlink REST fallback while a child is
+   live; maximum configured fan-out spawns no more children than the pool size.
+8. **Separated counters.** Local canonical reads, REST fallback reads by cause, fallback-budget
+   spend, clone-transport operations, and retries as distinct metrics; the per-unit fallback
+   budget (max(20, 10% of selected)) trips and terminates as defined.
+9. **Operational hardening.** The clone retry policy and an owned temp sweep land with the
+   implementation, or their explicit risk acceptance is recorded in the implementation PR; git
+   transport stays under 15 ops/s/repo by construction, and the implementation shows its
+   accounting for that.
 
 ## Pros and Cons of the Options
 
@@ -379,6 +338,15 @@ returning `... on Blob { oid byteSize isBinary isTruncated text }` plus `__typen
 * Bad, because it adds a point floor the status quo does not have.
 * Bad, because seam refactor, mode validation, batch client method, API-wide scheduler, admission caps,
   and cache provenance are all genuinely new work.
+
+*Benchmark outcome (Step C):* T1 was ineligible under the pre-registered gates — G1 via its
+validation-fallback delivery on the pinned non-UTF-8 fixture, G4 via the retained C4
+checkout-clone fallback — with G2/G3 passing and zero attributable secondary signals
+([report §2](0001-benchmark/report.md)). Not chosen. Earlier revisions of this document's
+Decision Outcome specified Option 1's implementation bill to eight numbered items (batching seam,
+mode validation, batch client method, API-wide scheduler, admission caps and failure policy,
+per-alias fallback budget, query/response integrity, cache provenance); that specification lives
+in this document's git history and would govern any future Option-1 adoption.
 
 ### Option 2a — Promote the existing per-unit shallow clone to the default content path
 
@@ -441,6 +409,10 @@ is correct); what still distinguishes it from 2c is that the content *reads* are
   scanned commit unrelated to the eligibility decision unless `cloned.headSha === h.oid` is enforced.
 * Neutral, because "it already exists" is true of the clone *command* but not of the design: the lease,
   router, enumerator, symlink resolver, retry policy, and pacing are all new.
+
+*Benchmark outcome (Step C):* T2a was ineligible — G1 via measured `autocrlf` checkout divergence
+under the config probe (seven probe rows, 13–1260 diverging deliveries each), G4 via the C4
+checkout disk. The byte-determinism objection above is exhibited, no longer argued. Not chosen.
 
 ### Option 2b — Shared partial/sparse/multi-ref repository per repo
 
@@ -518,6 +490,9 @@ in the [resolution plan](../plans/adr-0001-disagreements-resolution.md).
   sweep hazard ([github.ts:2096](../../scripts/github.ts#L2096)), single-attempt clone, whole-branch
   transfer however few files are selected, and 15 ops/s/repo pacing with no headroom header.
 
+*Benchmark outcome (Step C) and decision:* T2c passed every gate — the sole eligible driver —
+and was ratified as the chosen option on 2026-08-03; see Decision Outcome.
+
 ### Option 3 — Content-addressed blob cache keyed on blob OID
 
 Key reads and cache rows on blob OID, read through the existing, currently unused
@@ -532,7 +507,9 @@ Key reads and cache rows on blob OID, read through the existing, currently unuse
   arbitrary key ([db.ts:386](../../scripts/db.ts#L386), [db.ts:2361](../../scripts/db.ts#L2361)).
 * Good, because it composes with any transport rather than competing.
 * Bad, because it **does not bound the worst case**: when every selected OID is unique, a cold run pays
-  the full per-file price. Its value depends on the estate's duplicate-OID ratio, which is unmeasured.
+  the full per-file price. Its value depends on the estate's duplicate-OID ratio, which is unmeasured
+  (the pinned corpus's ratio was measured at Step C — `option3.json` — but an operator's estate is its
+  own question).
 * Bad, because it leaves the per-file request *shape* intact, so secondary-limit and serial-latency
   pressure remain even at good hit rates.
 * Bad, because **M9 makes naive OID caching unsafe**: for mode `120000` the tree OID names the 17-byte
@@ -630,8 +607,8 @@ GraphQL batching when the shared-clone design's unstated cost was exposed; moved
 evaluated; and returned to GraphQL batching when `.gitattributes` checkout transformations were shown
 to break byte determinism for clone-based reading.
 
-Two measurements were taken in response to review challenges and each overturned a claim in the
-then-current draft. M9 disproved an explicit statement that the transport could not change findings.
+Two measurements were taken in response to review challenges during those rounds and each
+overturned a claim in the then-current draft. M9 disproved an explicit statement that the transport could not change findings.
 M3/M4 indicated that GraphQL batch sizing is bound by the 10-second query timeout rather than by
 point cost — one failed sample, so whether that boundary is deterministic is exactly what the
 benchmark's boundary probe tests. A third challenge corrected an overstatement in the reverse
@@ -645,7 +622,7 @@ qualifies for symlinks, binary blobs, and truncated trees. Those corrections are
 guarantee is now scoped to hash-validated regular blobs with its exceptions named.
 
 Two disagreements were recorded rather than resolved at the close of round five. The reviewer would
-have the option-selecting benchmark run **before** acceptance; that is why this ADR stays `proposed`
+have the option-selecting benchmark run **before** acceptance; that is why this ADR stayed `proposed`
 behind a pre-acceptance gate rather than claiming a settled decision. And the reviewer holds that a
 canonical-object clone variant deserves its own evaluation; it was initially listed under Follow-on
 work rather than dismissed.
@@ -662,31 +639,48 @@ interactive child serves the existing one-path seam), and a faithful Option 2a a
 `ls-tree` mode source once its symlink policy is taken seriously. Closure is evidence-based, not
 declarative: the clone-variant disagreement discharges when Option 2c's benchmark row has actually
 run, and the benchmark disagreement discharges when the evidence-based decision is recorded — until
-then this ADR remains `proposed`, which is the reviewer's position honoured.
+then this ADR remained `proposed`, which was the reviewer's position honoured.
+
+**Both disagreements are discharged** (2026-08-03). D2 discharged at Step C: Option 2c ran as
+driver T2c across the full matrix and the fidelity battery. D1 discharged at Step D: the
+benchmark executed under its ratified freeze (Steps B–C; PRs #29 and #32), and the evidence-based
+decision — the §4.7 sole-eligible output, ratified by the decision-maker — is recorded in the §8
+record's Step-D entry, with this document's state change riding the same reviewed PR. The
+provisional Option-1 recommendation this document carried from round five onward is superseded by
+that output: the recommendation's fourth move under evidence, and the first made by the
+pre-registered rule rather than by argument. The reviewer's measure-first position is honoured in
+the strongest form available — the ADR changed state only after the measurement.
 
 ### Follow-on work
 
-**The tree-request term.** Option 1 leaves one REST tree request per distinct uncached tree.
-**Option 2c eliminates this term entirely** (local `ls-tree` enumeration); it needs its own ADR only
-if Option 1 is confirmed, in which case closing it means either local enumeration (a clone, with the
-consequences above) or a budgeting strategy for listing pages.
+**The implementation.** This decision chooses a direction; it implements nothing. The
+implementation PR carries the §3.1/§3.2 bill under this repository's own gates (the Confirmation
+checks above), including the production `readOnlyGuard` changes the benchmark deliberately did
+not make — its proposed grammars and framed-reader prototype live beside the bench until adopted.
 
-**Option 3** should be scheduled on evidence: measure the estate's duplicate-OID ratio from trees
-already fetched — a cheap offline analysis — before committing. The benchmark plan carries the
-concrete vehicle: that offline analysis over the corpus trees plus a warm-run scenario on the
-recommended driver(s), which also has to state honestly what git's native object reuse already
-provides on clone paths. Its symlink exclusion is a hard requirement.
+**The tree-request term** is closed by the chosen option: local `ls-tree` enumeration replaces
+the per-unit recursive REST tree request, so the separate budgeting ADR that an Option-1
+confirmation would have required is moot. Scope stays honest: this removes the per-unit tree
+request, not discovery (repo/branch listing), which is unchanged and was excluded from scoring
+throughout.
 
-**Option 2a** is not dead, but its canonical-read escape hatch is no longer follow-on work — that
-path *is* Option 2c, evaluated above and benchmarked as a first-class driver. What remains open for
-2a specifically: if the benchmark shows Option 1's fallback rate or scheduler overhead dominating
-*and* 2c's child lifecycle proves unacceptable, 2a becomes viable only by accepting
-environment-dependent findings as a documented semantic change.
+**Option 3**'s measurement vehicle ran at Step C (`option3.json`; report §5): the offline
+duplicate-OID analysis over the corpus trees, plus the frozen warm pair on the recommended
+driver — 255/255 cache hits with the wall unmoved (1260 → 1274 ms), because the clone dominates.
+OID-keyed content caching therefore composes with API read paths, not the chosen one; cross-run
+object reuse would be a persisted shared store — a different architecture with its own ADR if
+ever wanted. Its symlink exclusion remains a hard requirement.
 
-**Revisit this decision if:** the pre-acceptance benchmark fails to confirm the recommendation
-under its pre-registered rule; GitHub's GraphQL
-point formula, per-query timeout, or partial-result behaviour changes materially; or GitHub ships a
-first-class bulk content endpoint on REST.
+**Option 2a**'s remaining path closed at Step C: its canonical-read escape hatch *is* Option 2c
+(now chosen), and its own checkout reads were measured G1-divergent under the config probe — the
+"documented semantic change" an adopter would have had to accept is now an exhibited hazard.
+
+**Revisit this decision if:** implementation shows the §3.2 ledger mispriced — the stdin
+containment, child lifecycle, or framed seam proving unworkable under this repository's guard
+and test discipline; GitHub materially changes git-transport terms for clone traffic (enforced
+pacing, or pack-fetch throttling at scale); the estate's operational profile makes per-unit
+clone disk or whole-branch transfer untenable; or GitHub ships a first-class bulk content
+endpoint on REST, which would reopen an API path without the per-file request shape.
 
 **Out of scope, deliberately:** the code-search API as a content source (**10** authenticated
 requests/minute for Search Code, and index freshness is not commit-pinned), and any approach reading
