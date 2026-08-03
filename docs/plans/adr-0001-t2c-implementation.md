@@ -232,14 +232,18 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
    (recommended, a disclosed deviation from the bill's literal `selected`) vs a running ratio
    vs end-of-unit enforcement.
 7. **Aggregate clone disk under fan-out** (a named residual risk — remediate or explicitly
-   accept, never silent): a live store exists for a unit's whole scan, so worst-case aggregate
-   ≈ concurrent units × per-unit store size (defaults 3 orgs × 4 branches = 12 live stores;
-   measured per-unit sampled peak 293.3 MiB on the pinned corpus, most units far smaller; the
-   64×64 config ceiling makes the formula's extreme 4096 stores). Options: accept-risk with
-   the documented formula + config guidance recorded in the PR (recommended — the default
-   envelope is a few GiB worst-case and the startup sweep reclaims crashes), or a third
-   permit pool capping concurrent live stores (units queue before cloning, release after
-   teardown).
+   accept, never silent): a live store exists for a unit's whole scan, so aggregate disk =
+   concurrent live stores × per-unit store size — and the per-unit term is UNBOUNDED in
+   general: the clone transfers the whole branch pack however few files are selected, and the
+   ADR calls the 293.3 MiB sampled peak "an observation from the pinned corpus, not a bound".
+   The store COUNT is what config bounds: 3 orgs × 4 branches = 12 live stores by default,
+   4096 at the 64×64 ceiling. Options: accept-risk with exactly that formula (unbounded
+   per-unit term, the sampled figure quoted only as an example) + config guidance recorded in
+   the PR, or a third permit pool capping concurrent live stores (units queue before cloning,
+   release after teardown) — which bounds the count below the fan-out product but still not
+   the bytes. Neither option bounds bytes; the honest choice is which COUNT bound to stand
+   on. Recommendation: accept-risk with the honest formula at the default fan-out; the pool
+   matters mainly for high-fan-out configs.
 
 ## 6. Phases (TDD; commit before reviewers; santa loop per phase batch)
 
@@ -279,7 +283,9 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
    old fallback scanned would now error (a disclosed regression at that extreme tail).
 4. Symlink reads spend REST budget under a per-unit cap (new, ratified failure mode:
    budget-exhausted units fail with a distinct error).
-5. Every unit touches disk (pack-only store; measured envelope 293.3 MiB max sampled peak).
+5. Every unit touches disk, transferring the whole branch pack however few files are selected
+   (pack-only store; 293.3 MiB max sampled per-unit peak on the pinned corpus — an
+   observation, not a bound; aggregate under fan-out per §5 Q7).
 6. api_cache: per-unit tree rows stop being written; content rows only for symlink fallbacks.
 7. `--fresh`/resume semantics, config hash, report/export schemas: unchanged.
 
@@ -306,7 +312,13 @@ past tense — a form true after the merge), bench module headers if §4(a).
   real superset — §3.8/Q6 rewritten with the containment argument), 2 P2 (aggregate clone
   disk is a named residual risk with no decision → Q7 added; the one-shot ls-tree capture
   needed decided+disclosed enumeration bounds or it recreates a cliff → Q4 + §7.3 updated
-  with the ratified bench trio and the >1M-file regression disclosed). Round 3: (pending)
+  with the ratified bench trio and the >1M-file regression disclosed).
+- Plan codex loop **round 3** (gpt-5.5 @ xhigh, fresh session; NB the first round-3 attempt
+  wedged pre-flight in the codex CLI for 46 minutes without creating a session — killed and
+  relaunched, no model output lost): CONSULT-FAIL — 1 P2 (Q7's accept-risk wording treated
+  the 293.3 MiB sampled peak as a bound; the ADR calls it an observation, and the whole-branch
+  pack transfer makes the per-unit term unbounded — Q7 + §7.5 rewritten with the honest
+  formula). Round 4: (pending)
 - Per-phase santa loops: (pending)
 - Final whole-diff santa loop (cap 5): (pending)
 - Doc-sweep codex prose pass: (pending)
