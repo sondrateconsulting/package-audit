@@ -33,7 +33,7 @@ parameterizing the existing launch primitive rather than adding a second call.
 | `readOnlyGuard.ts` | The three new grammars inside `assertReadOnlyGit` (§3.1 below); the "cat-file excluded by name" comment block rewritten with the code. |
 | `gitFrame.ts` (new) | Production home of the framed parsers: `BatchFrameParser`, `parseLsTreeZ`, `ByteRing` (ported per §4), plus `gitBlobOid(body, format)` (`blob <len>\0<body>` via `Bun.CryptoHasher`, sha1/sha256) and `seamDecode` (UTF-8-with-replacement). Pure; no process machinery. |
 | `contentStore.ts` (new) | `UnitContentStore`: the ls-tree index (path → {mode, oid, size}), the OID-only stdin writer, the child manager (lazy spawn, per-read deadline, single respawn, poisoning, ordered teardown — adapted from `benchSpawn.ts`'s review-hardened `BatchChild`), mode routing (symlink → injected REST fallback), the per-unit fallback budget, and the separated counters. Takes injected capabilities (launch, one-shot byte spawn, REST read, child-pool permit) so it holds no spawn surface itself. |
-| `github.ts` | (a) the single `Bun.spawn` site gains a stdin-mode parameter and a structural `LaunchedChild` return used by two consumers: the existing one-shot UTF-8 path (unchanged behavior) and the new byte/interactive paths; (b) `gitBytes(args, cwd)` — one-shot guarded byte-capture spawn (for `ls-tree`; the current string path's irreversible decode would destroy the evidence the parser fails closed on); (c) `launchBatchChild(cwd)` — guarded (`assertSpawnAllowed` + `assertReadOnlyGit(["cat-file","--batch"])` + cwd containment), env-built, NOT semaphore-held (children draw from the child pool); (d) `cloneNoCheckout(org, repo, branch, pinnedOid)` — production argv + `--no-checkout`, bounded retry (§5 Q1), `rev-parse HEAD` must equal `pinnedOid` else fail closed; (e) `buildGitEnv` sets `GIT_NO_REPLACE_OBJECTS=1` unconditionally — for **every** git spawn, not just the child: `rev-parse`/`ls-tree` running with replace refs while `cat-file` runs without them would let the coherence check and the enumeration disagree with the reads; (f) the child permit pool (a second `Semaphore`; size §5 Q4); (g) the owned temp sweep (§5 Q2); (h) the per-repo clone-transport gate (§3.9 pacing). |
+| `github.ts` | (a) the single `Bun.spawn` site gains a stdin-mode parameter and a structural `LaunchedChild` return used by two consumers: the existing one-shot UTF-8 path (unchanged behavior) and the new byte/interactive paths; (b) `gitBytes(args, cwd)` — one-shot guarded byte-capture spawn (for `ls-tree`; the current string path's irreversible decode would destroy the evidence the parser fails closed on) — and the store open MUST check exit code ≠ 0 / timeout BEFORE `parseLsTreeZ` runs: empty bytes are a LEGAL empty listing, so an unchecked failed spawn would read as an empty repo and record zero findings silently (the bench driver pins exactly this order; a store-open test drives it); (c) `launchBatchChild(cwd)` — guarded (`assertSpawnAllowed` + `assertReadOnlyGit(["cat-file","--batch"])` + cwd containment), env-built, NOT semaphore-held (children draw from the child pool); (d) `cloneNoCheckout(org, repo, branch, pinnedOid)` — production argv + `--no-checkout`, bounded retry (§5 Q1), `rev-parse HEAD` must equal `pinnedOid` else fail closed; (e) `buildGitEnv` sets `GIT_NO_REPLACE_OBJECTS=1` unconditionally — for **every** git spawn, not just the child: `rev-parse`/`ls-tree` running with replace refs while `cat-file` runs without them would let the coherence check and the enumeration disagree with the reads; (f) the child permit pool (a second `Semaphore`; size §5 Q4); (g) the owned temp sweep (§5 Q2); (h) the per-repo clone-transport gate (§3.9 pacing). |
 | `orchestrate.ts` | `processUnit` default path rewired: cloneNoCheckout → store open (ls-tree) → entries from the index → store reader → scanUnit → ordered teardown in `finally` (dispose child → delete clone → release permit). Abort threading: `branchAbort` reaches `processUnit`; on abort the store poisons the in-flight read and the unit fails through the same ordered teardown (§3.1's "kill-escalation on unit end or abort" — ratified, not a new decision). The truncated-tree branch, `walkClone`, `cloneReader` retire per §5 Q3. `apiReader`'s REST read survives as the symlink fallback lane (404 → null parity preserved). |
 | `unitPipeline.ts` | No behavioral change expected: `TreeEntry.size` is now the canonical ls-tree size, so the existing 2 MiB gate reads canonical sizes by construction; manifests/lockfiles stay ungated. `MAX_SCAN_BYTES` export + CI mirror untouched. |
 | `log.ts` + vocab | One new per-unit JSONL event carrying the separated counters (name TBD, e.g. `content-transport`); the log-vocabulary pin and README's event table update together. |
@@ -224,9 +224,11 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
    hard cutover with that inventory.
 4. **Constants**: child pool size (recommend: the subprocess semaphore's size — the ratified
    default), per-read deadline (recommend 60 s, the ratified bench constant; dispose deadline
-   10 s), clone-gate spacing (recommend 200 ms, §3.9), and the ls-tree enumeration bounds
+   10 s), clone-gate spacing (recommend 200 ms, §3.9), the ls-tree enumeration bounds
    (recommend the ratified bench trio: 1,000,000 entries / 64 KiB record / 110 MiB output —
-   see §7 item 3 for what exceeding them means).
+   see §7 item 3 for what exceeding them means), and the framed-child limits (recommend the
+   ratified bench values: 256-byte header bound, 64 KiB stderr ring; the frame ceiling is
+   not a choice — it is pinned to production's spawn-output cap by the bill).
 5. **Prototype adoption mechanics**: §4 (a) move+shim (recommended) / (b) import / (c) copy.
 6. **Fallback-budget denominator**: §3.8 — the enumerable `eligible` upper bound
    (recommended, a disclosed deviation from the bill's literal `selected`) vs a running ratio
@@ -318,7 +320,13 @@ past tense — a form true after the merge), bench module headers if §4(a).
   relaunched, no model output lost): CONSULT-FAIL — 1 P2 (Q7's accept-risk wording treated
   the 293.3 MiB sampled peak as a bound; the ADR calls it an observation, and the whole-branch
   pack transfer makes the per-unit term unbounded — Q7 + §7.5 rewritten with the honest
-  formula). Round 4: (pending)
+  formula).
+- Plan codex loop **round 4** (gpt-5.5 @ xhigh, fresh session; attempt 1 hit the same
+  pre-flight CLI wedge as round 3's first attempt — killed and relaunched): CONSULT-FAIL —
+  2 P2 (a failed `ls-tree` spawn with empty stdout parses as a LEGAL empty listing, so the
+  store open must check exit/timeout before `parseLsTreeZ` → pinned in §2 with a named test;
+  Q4 omitted the framed-child header-bound and stderr-ring constants → added with the
+  ratified values). Round 5 (the cap): (pending)
 - Per-phase santa loops: (pending)
 - Final whole-diff santa loop (cap 5): (pending)
 - Doc-sweep codex prose pass: (pending)
