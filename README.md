@@ -50,8 +50,8 @@ Checked at startup with actionable errors (nothing here is silently assumed):
 | Requirement | Why |
 |---|---|
 | [Bun](https://bun.sh) ≥ 1.1 (CI tests against 1.3.14) | runtime (`bun:sqlite`, shell, glob) |
-| `gh` CLI, authenticated | GitHub API access (`gh auth status` must pass); oversized trees fall back to a hardened shallow `git clone` over HTTPS |
-| git ≥ 2.45.1 | fallback shallow clones; older releases carry the May-2024 clone CVEs |
+| `gh` CLI, authenticated | GitHub API access (`gh auth status` must pass); every scanned branch unit also makes a hardened no-checkout `git clone` over HTTPS |
+| git ≥ 2.45.1 | the per-unit shallow clones; older releases carry the May-2024 clone CVEs |
 | `tar` (GNU or bsdtar) | registry tarball extraction |
 
 ### What the gh token needs
@@ -288,10 +288,10 @@ Apache-2.0 — see [LICENSE](LICENSE). Copyright 2026 Sondrate Consulting.
 
 ## Data, upgrades & privacy
 
-Everything runs locally. Findings live in a local SQLite database (`data/audit.db`) and reports in `output/`; nothing is uploaded anywhere — the only network traffic is read-only GitHub access (through `gh`, plus hardened shallow `git clone` fallbacks for oversized trees) and registry fetches for the packages you track.
+Everything runs locally. Findings live in a local SQLite database (`data/audit.db`) and reports in `output/`; nothing is uploaded anywhere — the only network traffic is read-only GitHub access (through `gh`, plus one hardened no-checkout `git clone` per scanned branch unit) and registry fetches for the packages you track.
 
-- **`data/audit.db` is the durable source of truth.** Weekly re-runs are cheap: unchanged branches are skipped outright; commit-pinned file reads are served from cache with zero network.
-- **Know what the database retains:** the API cache stores response bodies — *including the commit-pinned file contents fetched from scanned repos* (manifests, lockfiles, source files). Treat `audit.db` with the same sensitivity as the source it scanned.
+- **`data/audit.db` is the durable source of truth.** Weekly re-runs are cheap: unchanged branches are skipped outright, and any REST response the run does make is served from cache with zero network when it is commit-pinned.
+- **Know what the database retains:** the API cache stores GitHub REST response bodies. File content reaches it only through the symlink dereference fallback (and, in databases predating this version, the retired per-file content path — those rows are not pruned). Treat `audit.db` with the same sensitivity as the source it scanned.
 - `--fresh` drops runs/findings/queue for a clean rescan but **preserves** the two expensive caches (`api_cache`, `package_api_surface`). `--fresh --purge-cache` is the real full wipe of the live tables — a *logical* wipe, not forensic erasure: prior `output/run-*.json` files stay until you delete them, and SQLite reclaims pages without scrubbing.
 - Changing a package's `registryUrl`? Use `--fresh --purge-cache` (or a separate data directory) — the introspection cache is keyed by name+version, not registry origin.
 - `--rescan-branch <org>/<repo>@<branch>` (repeatable) overrides skip-current for that branch on the next (otherwise normal) audit — other eligible work still runs.

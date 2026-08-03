@@ -10,6 +10,9 @@ informed: operators running `bun run audit` against large estates
 
 ## Context and Problem Statement
 
+*This section states the behavior as it stood when the decision was taken — the problem the
+decision addresses. What replaces it is the Decision Outcome below.*
+
 `package-audit` fetches file content one HTTP request per file — concurrently across branch units, but never batched within one. For each branch unit the
 orchestrator fetches the recursive tree once
 ([orchestrate.ts:807](../../scripts/orchestrate.ts#L807)), then hands `scanUnit` an `apiReader`

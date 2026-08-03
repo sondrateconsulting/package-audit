@@ -1501,8 +1501,8 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
   });
 
   // ---- policy warnings ----
-  // A client serving one org repo (svc) + the given branch heads + an empty tree (so a scanned unit
-  // runs to zero findings). Distinguishes the GraphQL head query, the git-trees fetch, and the repo list.
+  // A client serving one org repo (svc) + the given branch heads + an empty enumeration (so a scanned
+  // unit runs to zero findings). Distinguishes the GraphQL head query from the repo list.
   const fullClient = (root: string, heads: Array<{ name: string; oid: string; date: string }>, defaultBranch: string | null): GithubClient =>
     makeClient(root, async (_bin, args) => {
       const j = args.join(" ");
@@ -1672,10 +1672,10 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const runId = startScanRun(db);
     staleHead(db, runId, "main", { commitSha: "old-sha", status: "scanned", isDefaultBranch: true, scannedCommitDate: "2025-05-01T00:00:00Z" });
-    // re-discovers main at a NEW commit, but the tree fetch (scan) FAILS → no new row written this attempt
+    // re-discovers main at a NEW commit, but the SCAN fails (the clone's HEAD does not match the
+    // newly discovered oid, so the coherence gate fails the unit closed) → no new row this attempt
     const scanFailClient = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("new-sha"), date: "2025-06-01T00:00:00Z" }], "main") };
-      if (args.some((a) => a.includes("git/trees"))) return { exitCode: 1, stderr: "gh: tree boom", stdout: "" };
       return { exitCode: 0, stderr: "", stdout: "HTTP/2.0 200 X\r\n\r\n[]" };
     });
     await captureJsonl(() => processRepo(db, scanFailClient, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));

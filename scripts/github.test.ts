@@ -2543,8 +2543,10 @@ describe("listBranchHeads (§5.B)", () => {
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed branch-head node/);
   });
   test("a non-hex oid / tree.oid is malformed — a ref-looking value would freeze MUTABLE reads into the immutable cache", async () => {
-    // h.oid / h.treeOid flow into SHA-pinned fetches where isSha() earns the zero-network cache
-    // path, and into skip-current persistence; "main" in an oid field must fail loud here.
+    // h.oid pins the clone's coherence gate, the symlink fallback's SHA-pinned fetches (where
+    // isSha() earns the zero-network cache path), and skip-current persistence; h.treeOid is
+    // validated because BranchHead still carries it for the benchmark's REST-tree drivers.
+    // "main" in either oid field must fail loud here.
     for (const target of [
       { oid: "main", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "d".repeat(40) } },
       { oid: "a".repeat(40), committedDate: "2024-01-01T00:00:00Z", tree: { oid: "refs/heads/x" } },

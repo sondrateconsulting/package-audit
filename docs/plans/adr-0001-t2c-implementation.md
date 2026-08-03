@@ -1,7 +1,9 @@
 # Plan: implement ADR-0001 Option 2c (T2c) — per-unit no-checkout clone, canonical-object reads via guarded `cat-file`
 
-Status: draft for the pre-implementation codex loop (process requirement 1; ≤5 iterations,
-outcome recorded in §9). Implementation follows only after rvo's decision batch (§5).
+Status: the implementation PR's plan. Written as a pre-implementation draft for the codex loop
+(process requirement 1; ≤5 iterations, outcome recorded in §9) and carried forward with its design
+sections unchanged, so the record shows what was planned; §5.1 records rvo's ratified decisions and
+§9 records every review round the implementation actually went through.
 
 Governing texts, in order: the ADR's Decision Outcome (specified constraints + residual risks)
 and Confirmation (9 post-implementation checks) in
@@ -36,7 +38,7 @@ parameterizing the existing launch primitive rather than adding a second call.
 | `github.ts` | (a) the single `Bun.spawn` site gains a stdin-mode parameter and a structural `LaunchedChild` return used by two consumers: the existing one-shot UTF-8 path (unchanged behavior) and the new byte/interactive paths; (b) `gitBytes(args, cwd)` — one-shot guarded byte-capture spawn (for `ls-tree`; the current string path's irreversible decode would destroy the evidence the parser fails closed on) — and the store open MUST check exit code ≠ 0 / timeout BEFORE `parseLsTreeZ` runs: empty bytes are a LEGAL empty listing, so an unchecked failed spawn would read as an empty repo and record zero findings silently (the bench driver pins exactly this order; a store-open test drives it); (c) `launchBatchChild(cwd)` — guarded (`assertSpawnAllowed` + `assertReadOnlyGit(["cat-file","--batch"])` + cwd containment), env-built, NOT semaphore-held (children draw from the child pool); (d) `cloneNoCheckout(org, repo, branch, pinnedOid)` — production argv + `--no-checkout`, bounded retry (§5 Q1), `rev-parse HEAD` must equal `pinnedOid` else fail closed; (e) `buildGitEnv` sets `GIT_NO_REPLACE_OBJECTS=1` unconditionally — for **every** git spawn, not just the child: `rev-parse`/`ls-tree` running with replace refs while `cat-file` runs without them would let the coherence check and the enumeration disagree with the reads; (f) the child permit pool (a second `Semaphore`; size §5 Q4); (g) the owned temp sweep (§5 Q2); (h) the per-repo clone-transport gate (§3.9 pacing). |
 | `orchestrate.ts` | `processUnit` default path rewired: cloneNoCheckout → store open (ls-tree) → entries from the index → store reader → scanUnit → ordered teardown in `finally` (dispose child → delete clone → release permit). Abort threading: `branchAbort` reaches `processUnit`; on abort the store poisons the in-flight read and the unit fails through the same ordered teardown (§3.1's "kill-escalation on unit end or abort" — ratified, not a new decision). The truncated-tree branch, `walkClone`, `cloneReader` retire per §5 Q3. `apiReader`'s REST read survives as the symlink fallback lane (404 → null parity preserved). |
 | `unitPipeline.ts` | No behavioral change expected: `TreeEntry.size` is now the canonical ls-tree size, so the existing 2 MiB gate reads canonical sizes by construction; manifests/lockfiles stay ungated. `MAX_SCAN_BYTES` export + CI mirror untouched. |
-| `log.ts` + vocab | One new per-unit JSONL event carrying the separated counters (name TBD, e.g. `content-transport`); the log-vocabulary pin and README's event table update together. |
+| `log.ts` + vocab | One new per-unit JSONL event carrying the separated counters — `content-transport`, as implemented; the log-vocabulary pin and README's event table update together. |
 | `cliErrors.test.ts` | New error classes join `KNOWN_OPERATOR_ERRORS` or the exclusion list with in-place rationale (unit-scoped scan failures are not operator errors). |
 | `github.test.ts` | Wrapper-discipline counts updated (`assertSpawnAllowed` 4 → 6: + `gitBytes`, + `launchBatchChild`); the spawn-site scan itself needs **no** allowlist change (count stays `bun: 1`). |
 
@@ -588,6 +590,7 @@ EXPORTS.md correctly needs no edit.
     no caller code during validation) rather than patched case by case. A further round would
     likely find more; the post-cap tail at `3fdd75b` is unreviewed and is disclosed as such in
     the PR body. Across the whole arc (three per-phase loops + this one, 14 rounds) reviewer A
-    passed every round while the codex reviewers found the P0s — a single PASS is never
-    evidence of cleanliness.
+    returned PASS in every round it completed — 13 of the 14, the exception being the P1+P2
+    round it infra-failed, which was re-run and never counted as approval — while the codex
+    reviewers found every P0. A single PASS is never evidence of cleanliness.
 - Doc-sweep codex prose pass: (pending)

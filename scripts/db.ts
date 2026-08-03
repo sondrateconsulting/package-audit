@@ -3,8 +3,8 @@
 // SQLite is the source of truth. Tool-generated timestamps (found_at/date_fetched/occurred_at) are
 // persisted in ONE canonical fixed-width ISO-8601 UTC form (nowIso), so lexicographic ordering equals
 // chronological ordering (§3/§7). Commit-INSTANT columns (work_queue.last_commit_date,
-// run_unit_head.scanned_commit_date) instead hold what their producers supply — in production, GitHub
-// committedDate / git-%cI instants (second-precision, offset preserved) verbatim, NOT the nowIso
+// run_unit_head.scanned_commit_date) instead hold what their producers supply — in production,
+// GitHub committedDate instants (second-precision, offset preserved) verbatim, NOT the nowIso
 // form — and runs.cutoff_date holds the operator-CONFIGURED bare YYYY-MM-DD cutoff (validated at
 // config load; legacy-migrated rows carry ''). None of these participate in the nowIso MAX/ordering
 // invariant (see assertCanonicalTimestamp).

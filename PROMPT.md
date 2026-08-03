@@ -810,7 +810,8 @@ A. Resolve the effective owner list per the NORMATIVE algorithm in §1 (base set
 B. Discover & prioritize branches: via `gh api graphql` querying
    refs(refPrefix:"refs/heads/", first:100, after:$endCursor) with
    target{...on Commit{committedDate,oid,tree{oid}}} and `pageInfo{hasNextPage endCursor}`
-   (the `tree.oid` is the commit's ROOT TREE SHA, needed by §5.C's git/trees call), PLUS
+   (the `tree.oid` is the commit's ROOT TREE SHA, carried on BranchHead for compatibility and
+   the ADR-0001 benchmark's REST-tree drivers; §5.C's production path enumerates locally), PLUS
    `defaultBranchRef{name}` on the SAME `repository` node — so the default branch is resolved
    from the same snapshot as the heads, at no extra request. The two halves are validated
    TOGETHER and fail closed: `defaultBranchRef` ABSENT from a page is malformed (we asked for
@@ -864,7 +865,13 @@ B. Discover & prioritize branches: via `gh api graphql` querying
    Record `is_default_branch` (1/0, §3) on every `run_unit_head` upsert —
    discovery always knows it, so live runs never write NULL. The `oid` is the live head the §3 skip predicate compares against —
    obtaining it here costs zero extra requests.
-C. Locate manifests read-only. Build the API path in TypeScript (github.ts) —
+C. Locate manifests read-only. **Acquisition changed with ADR-0001 (Option 2c): production
+   clones each branch unit with `--no-checkout`, checks `rev-parse HEAD` against the
+   discovery-pinned OID (failing the unit closed on a mismatch), enumerates locally with
+   `ls-tree -r -z -l --full-tree HEAD`, and reads blobs through one unit-lived
+   `cat-file --batch` child.** The REST mechanics below still govern the one content lane that
+   remains on the API — the symlink dereference fallback, under a per-unit budget — and the
+   benchmark's REST drivers, so they are stated in full. Build the API path in TypeScript (github.ts) —
    `repos/<org>/<repo>/contents/<path>?ref=<sha>` with `encodeURIComponent` applied
    per PATH SEGMENT (preserving `/`) and on the `ref` value; do NOT rely on `gh api`'s
    brace placeholders (`gh` only substitutes `{owner}`/`{repo}`/`{branch}` and fills
@@ -883,17 +890,16 @@ C. Locate manifests read-only. Build the API path in TypeScript (github.ts) —
    distinct `api_cache.variant_hash` values (the Accept media type; §3) so they never
    collide. (Only when you deliberately use the default JSON representation must
    you base64-decode `content`, which contains newlines.)
-   MANIFEST DISCOVERY — one `gh api "repos/<org>/<repo>/git/trees/<tree_oid>?recursive=1"`
-   call (use the commit's ROOT TREE oid from §5.B — the `git/trees` endpoint takes a TREE
-   SHA, not the commit SHA; the commit SHA is still what pins the permalinks)
-   returns the whole tree; filter paths ending in `package.json` and the lockfile
-   names (§5.D) against `excludeDirGlobs` (always skip `**/node_modules/**` and vendored/
-   generated dirs). This finds EVERY manifest — workspace-declared or not (pnpm
+   MANIFEST DISCOVERY — the unit's own local `ls-tree` enumeration returns every entry with
+   its mode, type, OID and canonical size; filter paths ending in `package.json` and the
+   lockfile names (§5.D) against `excludeDirGlobs` (always skip `**/node_modules/**` and
+   vendored/generated dirs). This finds EVERY manifest — workspace-declared or not (pnpm
    monorepos keep globs in `pnpm-workspace.yaml` not package.json; yarn uses the object
    form `workspaces:{packages,nohoist}`; split repos have undeclared nested
-   package.json) — in a single request. If the tree response is `truncated:true`, fall
-   back to the hardened shallow clone from §0 and walk the working tree. Delete any tmp
-   dir in `finally`. Never install, never execute.
+   package.json) — with no request and no 100,000-entry/7 MB truncation cliff (the bound is
+   now an explicit enumeration limit that fails the unit LOUD rather than switching
+   transports). Delete the clone's tmp dir through the store's ordered teardown. Never
+   install, never execute.
 D. Extract dependency facts: a tracked package "appears" in a manifest when the
    dependency KEY equals its registry name, OR the dependency VALUE is an npm-alias
    spec targeting it (`"<anyKey>": "npm:<name>@<range>"`). Persist the manifest key
@@ -1232,7 +1238,7 @@ db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_k
 // readOnlyGuard.ts — ARGV-ARRAY allowlist, not substring/prefix matching.
 // Canonicalize first so `--flag=value` cannot dodge a `--flag value` check.
 const BODY_FLAGS = new Set(["-f","-F","--field","--raw-field","--input"]);
-const GIT_READ = new Set(["clone","rev-parse","ls-tree","cat-file","show","--version"]);
+const GIT_READ = new Set(["clone","rev-parse","ls-tree","cat-file","--version"]);
 // package managers are NEVER spawned (§0). Their binaries are hard-denied here.
 export const PM_DENYLIST = new Set(["npm","npx","yarn","pnpm","bunx"]);
 const BUN_DENY_SUBS = new Set(["install","add","remove","x","pm"]);

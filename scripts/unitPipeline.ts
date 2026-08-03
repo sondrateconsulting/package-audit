@@ -17,7 +17,8 @@ import { scanCli, classifyFile, type CliTermSet, type CliRow } from "./cliScanne
 import type { DependencyType } from "./manifest.ts";
 import type { TreeEntryType } from "./github.ts"; // type-only: the git object types, one source of truth
 
-// A tree entry (from the git/trees API or a walked clone). `type` is the git object type — the
+// A tree entry (production: the unit's local `ls-tree` index; the benchmark and legacy fixtures
+// feed REST-tree and walked-clone shapes through the same type). `type` is the git object type — the
 // same closed set github.ts validates git/trees against, so `e.type === "blob"` typos and any
 // TreeEntry-typed fixture drift are compile errors (a stub cast with `as` still bypasses the type).
 export interface TreeEntry {
