@@ -198,14 +198,22 @@ export function assertGraphqlQueryIsReadOnly(rest: string[]): void {
 }
 
 // ---- git ----------------------------------------------------------------------------
-// The tool ONLY ever spawns `git clone` (§5.C fallback), `git rev-parse HEAD`, and ONE fixed
-// `git show` form (the clone-HEAD committer date, §4). The verb allowlist is exactly those (plus
-// --version). Because git accepts unambiguous long-option ABBREVIATIONS (`--templ` = `--template`,
-// `--dep` = `--depth`), a denylist is unsafe — so clone uses a strict EXACT-OPTION ALLOWLIST of only
-// the hardening flags the wrapper emits, rev-parse forbids every flag, and `show` is pinned to ONE
-// exact raw-argv tuple (below). Other read verbs (cat-file, log) stay excluded entirely — they
-// accept --output/--textconv/--filters, which would breach read-only.
-const GIT_READ = new Set(["clone", "rev-parse", "show", "--version"]);
+// The tool ONLY ever spawns `git clone` (two exact shapes, below), `git rev-parse HEAD`, ONE
+// fixed `git show` form (the clone-HEAD committer date, §4), and — since ADR-0001's T2c
+// adoption — `git ls-tree` and `git cat-file` as ONE exact tuple each. Because git accepts
+// unambiguous long-option ABBREVIATIONS (`--templ` = `--template`, `--dep` = `--depth`), a
+// denylist is unsafe — so clone uses a strict EXACT-OPTION ALLOWLIST of only the hardening
+// flags the wrapper emits, rev-parse forbids every flag, and show/ls-tree/cat-file are pinned
+// to exact tuples. cat-file is admitted ONLY as the two-token `cat-file --batch` tuple, so
+// `--textconv`/`--filters` (the options whose exclusion once kept the verb out entirely) are
+// STRUCTURALLY absent rather than denylisted; the revs it resolves travel on stdin, which this
+// argv guard cannot see — that containment lives in the caller's OID-only writer (ADR-0001
+// Confirmation check 2). `log` stays excluded entirely.
+const GIT_READ = new Set(["clone", "rev-parse", "show", "ls-tree", "cat-file", "--version"]);
+// ADR-0001 T2c: the exact enumeration tuple. HEAD only — production enumerates after the head
+// coherence gate has already pinned HEAD to the discovery OID; a pathspec is rejected because
+// it would silently narrow the enumeration the scan's completeness rests on.
+const GIT_LS_TREE_ARGV = ["ls-tree", "-r", "-z", "-l", "--full-tree", "HEAD"];
 // The tool runs EXACTLY ONE `show` form: read a cloned HEAD's committer date (the
 // clone-fallback scan). There is NO general show/log parser — that would reopen --output/textconv/
 // --ext-diff/alternate-format/revision surface. Instead an EXACT raw-argv allowlist: --no-patch
@@ -217,6 +225,12 @@ const GIT_SHOW_DATE_ARGV = ["show", "--no-patch", "--no-notes", "--no-show-signa
 // (git does too, even if that token looks like a flag), BOOL flags stand alone.
 const GIT_CLONE_VALUE = new Set(["--depth", "--branch", "--template"]);
 const GIT_CLONE_BOOL = new Set(["--single-branch", "--no-tags", "--no-recurse-submodules"]);
+// ADR-0001 T2c: the SECOND exact clone shape — the same hardened tuple plus `--no-checkout`,
+// itself mandatory-exactly-once. It cannot join GIT_CLONE_BOOL: that set's flags are REQUIRED
+// in every clone, which would break the first shape's "exactly the production tuple". The
+// grammar is therefore the union of two exact tuples, selected by the flag's presence; the
+// first shape is retained deliberately even while caller-less (the ADR bill's letter).
+const GIT_CLONE_NO_CHECKOUT = "--no-checkout";
 
 export function assertReadOnlyGit(rawArgs: string[]): void {
   const args = canon(rawArgs);
@@ -250,6 +264,24 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
     return;
   }
 
+  if (verb === "cat-file") {
+    // ONE exact two-token tuple, raw-compared: anything beyond it — --textconv, --filters, a
+    // rev argument, -z, a batch-check variant — is structurally impossible, not merely named.
+    if (rawArgs.length !== 2 || rawArgs[1] !== "--batch")
+      deny("git cat-file is restricted to the exact batch tuple");
+    return;
+  }
+
+  if (verb === "ls-tree") {
+    // ONE exact tuple, raw-compared (same discipline as `show`): no reorder, no abbreviations,
+    // no pathspecs, rev pinned to HEAD.
+    const ok =
+      rawArgs.length === GIT_LS_TREE_ARGV.length &&
+      rawArgs.every((a, i) => a === GIT_LS_TREE_ARGV[i]);
+    if (!ok) deny("git ls-tree is restricted to the exact recursive-NUL-long enumeration tuple");
+    return;
+  }
+
   // verb === "clone": parse the RAW argv (not canon'd) as an exact GRAMMAR. Parsing raw
   // preserves the `--flag=value` vs `--flag value` distinction, so a BOOL flag given a value
   // (`--single-branch=x`) is rejected — canon would have hidden it. A VALUE flag consumes the
@@ -259,6 +291,12 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
   // allowlist (an abbreviation --templ/--dep, an alias --recursive, or a dangerous flag
   // --separate-git-dir/--reference/--output/--mirror/--bare, or ANY short flag) is rejected.
   const raw = rawArgs.slice(1);
+  // Shape selection (ADR-0001 T2c): the presence of `--no-checkout` (bare or attached form —
+  // the attached form still selects shape 2 and is then rejected as a valued bool) commits the
+  // argv to the second exact tuple, where the flag is required-exactly-once alongside every
+  // shape-1 flag. Absent, the argv must be exactly the first tuple. No mixing.
+  const wantsNoCheckout = raw.some((a) => a === GIT_CLONE_NO_CHECKOUT || a.startsWith(`${GIT_CLONE_NO_CHECKOUT}=`));
+  const boolSet = wantsNoCheckout ? new Set([...GIT_CLONE_BOOL, GIT_CLONE_NO_CHECKOUT]) : GIT_CLONE_BOOL;
   const seen: Record<string, number> = {};
   const values: Record<string, string> = {};
   const positionals: string[] = [];
@@ -272,7 +310,7 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
         seen[name] = (seen[name] ?? 0) + 1;
         if (attached !== undefined) values[name] = attached;
         else { values[name] = raw[i + 1] ?? ""; i++; }
-      } else if (GIT_CLONE_BOOL.has(name)) {
+      } else if (boolSet.has(name)) {
         if (attached !== undefined) deny(`git clone ${name} takes no value`);
         seen[name] = (seen[name] ?? 0) + 1;
       } else {
@@ -285,8 +323,9 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
     }
   }
   // §0's hardened shape: --depth 1, --single-branch, --branch <b>, --no-tags,
-  // --no-recurse-submodules, --template= (empty). ALL required, each exactly once.
-  for (const f of [...GIT_CLONE_VALUE, ...GIT_CLONE_BOOL]) {
+  // --no-recurse-submodules, --template= (empty) — plus --no-checkout in shape 2. ALL
+  // required, each exactly once.
+  for (const f of [...GIT_CLONE_VALUE, ...boolSet]) {
     if ((seen[f] ?? 0) === 0) deny(`git clone missing hardening ${f}`);
     if ((seen[f] ?? 0) > 1) deny(`git clone duplicate ${f}`);
   }
