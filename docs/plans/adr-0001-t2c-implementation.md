@@ -584,8 +584,10 @@ EXPORTS.md correctly needs no edit.
     own prose: `canon()`'s comment claimed it avoided mutable prototype methods while using
     `push`.
   - **Loop outcome: CAPPED AT 5 ROUNDS, NOT CONVERGED — corrected, never clean.** Not one
-    unanimous round in five, and every round found a P0, each inside the previous round's fix,
-    on the same "what the guards validated is not what launches" surface. The chain closed
+    unanimous round in five, and every round found a P0 on the same "what the guards validated
+    is not what launches" surface — rounds 2, 3 and 5 inside the previous round's own fix, round
+    1 in the earlier hardening it was reviewing for the first time, round 4 in a channel no
+    earlier round had reached. The chain closed
     only when the property was made structural (defineProperty + freeze + captured binaries +
     no caller code during validation) rather than patched case by case. A further round would
     likely find more; the post-cap tail at `3fdd75b` is unreviewed and is disclosed as such in
