@@ -343,6 +343,23 @@ past tense — a form true after the merge), bench module headers if §4(a).
   5.** (Honest caveat per house practice: a pass at the cap is one reviewer's pass, not
   proof of cleanliness; Step-B ratification-grade scrutiny arrives with the per-phase and
   final santa loops.)
-- Per-phase santa loops: (pending)
+- Per-phase santa loops:
+  - **P1+P2 (guard grammars + gitFrame port), 3 rounds, NOT CONVERGED — corrected, never
+    clean.** R1: A infra-failed mid-review (org subscription block — re-run per the
+    fail-closed rule, never counted as approval), B FAIL, C FAIL; findings = a sparse-argv
+    bypass of the exact-tuple sweep (real), incomplete mutation tables, a self-referential
+    byte-length hash test; B's "clone must be raw-compared" REFUTED from the governing texts
+    (the ADR/plan define clone exactness BY the mandatory-exactly-once parsed grammar) and
+    recorded as an in-test adjudication note. R2: A PASS, B FAIL, C FAIL; two further real
+    bypasses — a prototype-backed sparse argv (my R1 fix checked the value, not own-ness) and
+    a terminal bare `--template` (missing detached value folded to "", and `--template`'s
+    required value IS ""; pre-existing in shape 1, inherited by shape 2). R3 (cap): A PASS,
+    B PASS, C FAIL — a method-override bypass (argv objects may override the array methods
+    the guards compare with), a stdin-containment breach in `encodeOidRequest` (stateful
+    non-string oid validated then encoded a different rev — Confirmation check 2's own
+    weakest point), and an under-specified `rev-parse` grammar. All three reproduced and
+    fixed POST-CAP at c899cf9 and are therefore **unreviewed**; the final whole-diff loop
+    (cap 5) is their first review. C's R3 verdict itself needed a resume-finalize (its first
+    attempt exited clean after 149k tokens without emitting one).
 - Final whole-diff santa loop (cap 5): (pending)
 - Doc-sweep codex prose pass: (pending)
