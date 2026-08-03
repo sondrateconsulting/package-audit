@@ -269,6 +269,12 @@ export class BatchFrameParser {
 
 export const LS_TREE_MODES = ["100644", "100755", "120000", "040000", "160000"] as const;
 export type LsTreeMode = (typeof LS_TREE_MODES)[number];
+// A type PREDICATE, not a bare `.includes` + `as` cast: the narrowing is compiler-linked to the
+// membership check, so a future edit that drops or reorders the guard is a compile error rather
+// than a silent bad LsTreeMode flowing into MODE_TYPE.
+function isLsTreeMode(text: string): text is LsTreeMode {
+  return (LS_TREE_MODES as readonly string[]).includes(text);
+}
 export type LsTreeType = "blob" | "tree" | "commit";
 // exact mode→type coherence over the closed set
 const MODE_TYPE: Record<LsTreeMode, LsTreeType> = {
@@ -332,9 +338,9 @@ export function parseLsTreeZ(bytes: Uint8Array, format: GitObjectFormat, limits:
     const typeText = meta.slice(sp1 + 1, sp2);
     const oid = meta.slice(sp2 + 1, sp3);
     const sizeField = meta.slice(sp3 + 1); // may carry leading SP padding from -l
-    if (!(LS_TREE_MODES as readonly string[]).includes(modeText))
+    if (!isLsTreeMode(modeText))
       throw new GitFrameError("mode", `mode ${JSON.stringify(modeText)} is outside the closed set`);
-    const mode = modeText as LsTreeMode;
+    const mode = modeText; // narrowed to LsTreeMode by the predicate above
     const type = MODE_TYPE[mode];
     if (typeText !== type)
       throw new GitFrameError("mode-type", `mode ${mode} must carry type ${type}, got ${JSON.stringify(typeText)}`);
