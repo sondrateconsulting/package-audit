@@ -2,7 +2,7 @@
 status: "accepted"
 date: 2026-08-03
 decision-makers: rvo (repository owner)
-consulted: Codex (gpt-5.6-sol / GPT-5.5) — successive adversarial review rounds through Step D; see Review history
+consulted: Codex (gpt-5.6-sol / GPT-5.5) — successive adversarial review rounds; see Review history
 informed: operators running `bun run audit` against large estates
 ---
 
@@ -282,9 +282,10 @@ Step D. Its §4.7 rule output — exactly one eligible driver → recommend T2c,
 disqualifying evidence attached — is recorded in [report.md](0001-benchmark/report.md) §3, and
 the decision-maker's ratification of it (2026-08-03: the ask, the verbatim answer, and the
 disclosures) in the §8 record's Step-D entry. Every Step-D outcome carries one further
-adversarial review round before the ADR changes state; this decision's round is recorded in the
-same entry. Every MEASURED number in the table above is single-sample and M1 is derived rather
-than run; the executed benchmark supersedes them as decision evidence.
+adversarial review round before the ADR changes state (§4.7); the same §8 entry carries that
+requirement and records the round's outcome once it has run. Every MEASURED number in the table
+above is single-sample and M1 is derived rather than run; the executed benchmark supersedes them
+as decision evidence.
 
 Post-implementation checks (the implementation PR must demonstrate these, not assert them):
 
@@ -645,7 +646,8 @@ then this ADR remained `proposed`, which was the reviewer's position honoured.
 driver T2c across the full matrix and the fidelity battery. D1 discharged at Step D: the
 benchmark executed under its ratified freeze (Steps B–C; PRs #29 and #32), and the evidence-based
 decision — the §4.7 sole-eligible output, ratified by the decision-maker — is recorded in the §8
-record's Step-D entry, with this document's state change riding the same reviewed PR. The
+record's Step-D entry, with this document's state change riding the same PR, gated by §4.7's
+mandatory adversarial round before merge. The
 provisional Option-1 recommendation this document carried from round five onward is superseded by
 that output: the recommendation's fourth move under evidence, and the first made by the
 pre-registered rule rather than by argument. The reviewer's measure-first position is honoured in
