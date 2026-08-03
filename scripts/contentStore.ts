@@ -312,8 +312,8 @@ class FramedChild {
       }, this.limits.readDeadlineMs);
       this.pending = { resolve, reject, timer };
     });
-    // normalize the runtime's "no pipe" shapes (null AND undefined) before the branch
-    const sink = this.child.stdin ?? null;
+    // null is the ONE "no pipe" shape — realLaunch normalizes at the launch boundary
+    const sink = this.child.stdin;
     if (sink === null) {
       this.poison("child has no stdin pipe");
     } else {
@@ -344,7 +344,7 @@ class FramedChild {
     this.disposed = (async (): Promise<ChildDisposal> => {
       this.poison("disposed"); // rejects any pending read; first-fatal wins if one is already set
       try {
-        const sink = this.child.stdin ?? null; // normalize the runtime's "no pipe" shapes
+        const sink = this.child.stdin; // null is the one "no pipe" shape (normalized at launch)
         // BOUNDED: a wedged async sink.end must not hang disposal — the exit wait below
         // governs teardown either way
         if (sink !== null) {

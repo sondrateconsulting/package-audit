@@ -224,9 +224,10 @@ export interface LaunchedChild {
   readonly pid: number;
   readonly stdout: { getReader(): StreamReader };
   readonly stderr: { getReader(): StreamReader };
-  // honest about the runtime: a non-pipe stdin surfaces as undefined on the real handle and
-  // null on structural fakes — consumers must treat both as "no pipe"
-  readonly stdin: StdinSink | null | undefined;
+  // ONE "no pipe" representation: null. The real runtime handle surfaces undefined for a
+  // non-pipe stdin; realLaunch normalizes that to null at the launch boundary so consumers
+  // and structural fakes never need a two-bottom-values dance.
+  readonly stdin: StdinSink | null;
   readonly exited: Promise<number>;
   kill(signal?: number): void;
   unref(): void;
@@ -268,14 +269,29 @@ const realLaunch: LaunchFn = (bin, args, req) => {
     defineProp(cmd, i + 1, { value: token, writable: false, enumerable: true, configurable: false });
   }
   freezeIntrinsic(cmd);
-  return Bun.spawn({
+  const proc = Bun.spawn({
     cmd,
     env: req.env,
     cwd: req.cwd,
     stdin: req.stdin,
     stdout: "pipe",
     stderr: "pipe",
-  }) as unknown as LaunchedChild;
+  });
+  // A structural pick instead of a double cast: every field the tool consumes is read off the
+  // real subprocess HERE, so a Bun API drift becomes a compile error at the one launch site
+  // rather than a runtime surprise in a consumer. stdin normalizes to null at this boundary
+  // (the real handle surfaces undefined for a non-pipe stdin; structural fakes already use
+  // null), and kill/unref are forwarding closures — an unbound method pick would detach the
+  // subprocess receiver.
+  return {
+    pid: proc.pid,
+    stdout: proc.stdout,
+    stderr: proc.stderr,
+    stdin: proc.stdin ?? null,
+    exited: proc.exited,
+    kill: (signal?: number) => proc.kill(signal),
+    unref: () => proc.unref(),
+  };
 };
 
 // Copy an argv into a fresh, dense array of primitive strings BEFORE the guards run, so that the
