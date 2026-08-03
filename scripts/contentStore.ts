@@ -45,14 +45,17 @@ export interface ContentStoreLimits {
   lsTree: { maxEntries: number; maxRecordBytes: number };
 }
 
-export const DEFAULT_CONTENT_STORE_LIMITS: ContentStoreLimits = {
+// FROZEN (both levels): openUnitContentStore hands this shared object straight to the store when
+// a caller omits limits, so an in-place mutation would corrupt the process-wide default for
+// every later store. The store only ever reads limits, so a frozen default is sufficient.
+export const DEFAULT_CONTENT_STORE_LIMITS: ContentStoreLimits = Object.freeze({
   maxHeaderBytes: CONTENT_FRAME_HEADER_BYTES,
   frameCeiling: MAX_SPAWN_OUTPUT_BYTES,
   stderrRingBytes: CONTENT_STDERR_RING_BYTES,
   readDeadlineMs: CONTENT_READ_DEADLINE_MS,
   disposeDeadlineMs: CONTENT_DISPOSE_DEADLINE_MS,
-  lsTree: { maxEntries: LS_TREE_MAX_ENTRIES, maxRecordBytes: LS_TREE_MAX_RECORD_BYTES },
-};
+  lsTree: Object.freeze({ maxEntries: LS_TREE_MAX_ENTRIES, maxRecordBytes: LS_TREE_MAX_RECORD_BYTES }),
+});
 
 // Unit-scoped failure vehicle (NOT an operator error — see cliErrors.test.ts's exclusion note).
 // `code` is the machine-checkable discriminant the unit-failure taxonomy and the tests key on.
