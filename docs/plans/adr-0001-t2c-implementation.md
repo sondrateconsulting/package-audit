@@ -147,21 +147,25 @@ fallback-budget spend, clone-transport operations, clone retries. Surfaced as on
 per unit (vocab-pinned) and aggregated nowhere else (report schema untouched).
 
 **The budget denominator needs a production definition (§5 Q6).** The bill's formula is
-`max(20, ceil(10% of selected))`, and the bench's `selected` was the recorded read set of an
-actual pipeline run (`recordSelection` drives `scanUnit` under a recording reader) — known
-up-front only because the workload was pre-recorded. Production selection is content-dependent
-(lockfiles read per extracted fact; source reads require a resolving tracked package), so the
-true `selected` exists only after the unit finishes. Options: (a) **denominate on the
-enumerable upper bound** — `eligible` = blob entries passing the pure path/size predicates
-(`locateManifests` + non-binary lockfile kinds + `SCANNABLE_EXT`/`classifyFile` +
-`excludeDirGlobs`/`node_modules` + the 2 MiB gate), fixed at enumeration time; since
-`eligible ⊇ selected` the budget is ≥ the bill's, preserving the bound's purpose (cap per-unit
-API spend, floor 20 intact) deterministically and order-independently — a DISCLOSED deviation
-from the bill's literal denominator, so it goes to rvo; (b) a running ratio over reads issued
-so far — rejected: order-dependent, and symlinks clustered early would fail units the
-end-of-unit formula allows; (c) end-of-unit enforcement only — rejected: never trips
-mid-unit, so it does not "trip and terminate as defined". Recommendation: (a). Exceeding the
-budget fails the unit with a distinct message; a test drives the trip.
+`max(20, ceil(10% of selected))`. The bench denominator was `workload.entries.length`
+(`restFallbackBudgetFor`) over a workload built by RUNNING production selection under a
+recording reader (`recordSelection`) — the reads performed PLUS the two no-read outcomes (the
+elected-but-never-read binary lockfile; 2 MiB size-gate skips) — known up-front only because
+the workload was pre-recorded. Production selection is content-dependent (lockfiles read per
+extracted fact; source reads require a resolving tracked package), so that exact denominator
+exists only after the unit finishes. Options: (a) **denominate on the enumerable upper
+bound** — `eligible` = blob entries passing the pure path predicates alone: `locateManifests`
+manifests ∪ ALL lockfile candidates (binary included — they are the bench's no-read election)
+∪ `SCANNABLE_EXT` source ∪ `classifyFile` CLI kinds, after `excludeDirGlobs`/`node_modules`,
+with NO size filter (size-gate skips count in the bench denominator). Each bench-denominator
+class is contained in one of those terms, so `eligible ⊇ reads ∪ no-reads` and the budget is
+≥ the bill's — the bound's purpose (cap per-unit API spend, floor 20 intact) is preserved,
+deterministically and order-independently. Still a DISCLOSED deviation from the bill's
+literal denominator, so it goes to rvo; (b) a running ratio over reads issued so far —
+rejected: order-dependent, and symlinks clustered early would fail units the end-of-unit
+formula allows; (c) end-of-unit enforcement only — rejected: never trips mid-unit, so it does
+not "trip and terminate as defined". Recommendation: (a). Exceeding the budget fails the unit
+with a distinct message; a test drives the trip.
 
 ### 3.9 Operational hardening (check 9)
 
@@ -219,12 +223,23 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
    checkout clone tuple is retained either way (§3.1 — the bill's letter). Recommendation:
    hard cutover with that inventory.
 4. **Constants**: child pool size (recommend: the subprocess semaphore's size — the ratified
-   default) and per-read deadline (recommend 60 s, the ratified bench constant; dispose
-   deadline 10 s).
+   default), per-read deadline (recommend 60 s, the ratified bench constant; dispose deadline
+   10 s), clone-gate spacing (recommend 200 ms, §3.9), and the ls-tree enumeration bounds
+   (recommend the ratified bench trio: 1,000,000 entries / 64 KiB record / 110 MiB output —
+   see §7 item 3 for what exceeding them means).
 5. **Prototype adoption mechanics**: §4 (a) move+shim (recommended) / (b) import / (c) copy.
 6. **Fallback-budget denominator**: §3.8 — the enumerable `eligible` upper bound
    (recommended, a disclosed deviation from the bill's literal `selected`) vs a running ratio
    vs end-of-unit enforcement.
+7. **Aggregate clone disk under fan-out** (a named residual risk — remediate or explicitly
+   accept, never silent): a live store exists for a unit's whole scan, so worst-case aggregate
+   ≈ concurrent units × per-unit store size (defaults 3 orgs × 4 branches = 12 live stores;
+   measured per-unit sampled peak 293.3 MiB on the pinned corpus, most units far smaller; the
+   64×64 config ceiling makes the formula's extreme 4096 stores). Options: accept-risk with
+   the documented formula + config guidance recorded in the PR (recommended — the default
+   envelope is a few GiB worst-case and the startup sweep reclaims crashes), or a third
+   permit pool capping concurrent live stores (units queue before cloning, release after
+   teardown).
 
 ## 6. Phases (TDD; commit before reviewers; santa loop per phase batch)
 
@@ -255,9 +270,13 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
    clone's real HEAD). Under T2c every unit clones by branch name and fails closed on a HEAD ≠
    pinned-OID mismatch (ratified §3.1(2)) — fast-moving branches will occasionally error a
    unit; transient, self-heals via next-run re-discovery.
-3. The 100k-entry/7 MB truncation cliff and its checkout fallback are gone; huge repos now
+3. The 100k-entry/7 MB truncation cliff and its checkout fallback are gone; large repos now
    enumerate completely — and their symlinks are now visible (walkClone skipped symlinks
    entirely), so symlink findings can APPEAR on repos previously scanned via the fallback.
+   The cliff is replaced by an EXPLICIT enumeration bound (§5 Q4: ~1M entries / 64 KiB
+   record / 110 MiB listing): a repo beyond it fails the unit LOUD instead of silently
+   switching transports — and since walkClone had no such bound, a >1M-file repo that the
+   old fallback scanned would now error (a disclosed regression at that extreme tail).
 4. Symlink reads spend REST budget under a per-unit cap (new, ratified failure mode:
    budget-exhausted units fail with a distinct error).
 5. Every unit touches disk (pack-only store; measured envelope 293.3 MiB max sampled peak).
@@ -280,8 +299,14 @@ past tense — a form true after the merge), bench module headers if §4(a).
   recommendation), 3 P2 (pacing needed a real by-construction gate → the per-repo 200 ms
   clone gate; single-shape guard option reinterpreted the bill → both clone tuples retained;
   moved-branch disclosure missed that the default path has no race today → §7.2 rewritten),
-  1 P3 (option (b)'s "digest unmoved" claim false → corrected). All five applied. Round 2:
-  (pending)
+  1 P3 (option (b)'s "digest unmoved" claim false → corrected). All five applied.
+- Plan codex loop **round 2** (gpt-5.5 @ xhigh, fresh session): CONSULT-FAIL — 1 P1 (the
+  round-1 fix itself was wrong: the bench denominator counts no-read entries too, so the
+  `eligible` set had to include binary lockfile candidates and drop the size filter to be a
+  real superset — §3.8/Q6 rewritten with the containment argument), 2 P2 (aggregate clone
+  disk is a named residual risk with no decision → Q7 added; the one-shot ls-tree capture
+  needed decided+disclosed enumeration bounds or it recreates a cliff → Q4 + §7.3 updated
+  with the ratified bench trio and the >1M-file regression disclosed). Round 3: (pending)
 - Per-phase santa loops: (pending)
 - Final whole-diff santa loop (cap 5): (pending)
 - Doc-sweep codex prose pass: (pending)
