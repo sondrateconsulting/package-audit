@@ -4,7 +4,7 @@
 // matrix, washout, reset-window straddle detection, and the runs.jsonl record shape. The pure decision pieces (WC formulas, segmentation, washout,
 // straddle, verification) are exported for CI tests; the live engine composes them.
 
-import { appendFileSync, existsSync, lstatSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, arch, cpus, platform, release } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -12,7 +12,7 @@ import { AuditDb } from "./db.ts";
 import { GithubClient, buildGitEnv } from "./github.ts";
 import type { BenchConfig } from "./benchConfig.ts";
 import { restFallbackBudgetFor } from "./benchConfig.ts";
-import type { Corpus, PerformanceSlot, CorpusUnit } from "./benchCorpus.ts";
+import type { Corpus } from "./benchCorpus.ts";
 import { findUnit } from "./benchCorpus.ts";
 import { packBatches, planRounds } from "./benchT1.ts";
 import {
@@ -37,6 +37,20 @@ export class BenchProtocolError extends Error {
     super(`BENCH PROTOCOL: ${message}`);
     this.name = "BenchProtocolError";
     this.code = code;
+  }
+}
+
+// A control-plane operation failed — a `rate_limit` snapshot between segments or after the
+// run. The DRIVER did not fail (its transport work may even have completed), but without the
+// snapshot the run's consumption accounting is unprovable, so the run is invalidated and
+// replayed in its own slot, never charged to the R1/R2 driver allowance. Step-C residual 3:
+// before this class existed, a segment-gate snapshot failure surfaced as a driver
+// `unit-failure` (consuming the rerun allowance) and a post-run snapshot failure escaped
+// runOne entirely, losing the completed physical run's record.
+export class ControlPlaneFailure extends Error {
+  constructor(message: string) {
+    super(`CONTROL PLANE: ${message}`);
+    this.name = "ControlPlaneFailure";
   }
 }
 
@@ -134,7 +148,11 @@ export function bucketDelta(before: { remaining: number; reset: number; used: nu
 export interface VerificationReport {
   resolved: number;
   g1Failures: Array<{ path: string; route: string; reason: string }>;
-  g2Failures: Array<{ path: string; reason: string }>;
+  // "absent" = the entry never arrived (an interrupted attempt is FULL of these — the
+  // terminal/rerun discipline owns them); "positive" = something WAS delivered wrongly
+  // (duplicates, forbidden routes, foreign paths) — positive evidence survives invalidation
+  // and partial attempts (codex C0-R3 finding 4)
+  g2Failures: Array<{ path: string; reason: string; kind: "absent" | "positive" }>;
   // checkout-config probe reps: a caveat-route divergence from the pinned baseline is a
   // FIRST-CLASS FINDING for the decision-maker, never an auto-disqualification (§4.7 G1);
   // primary-route divergence under the probe stays a G1 failure (T2a gets no shelter).
@@ -159,24 +177,24 @@ export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly En
   for (const entry of workload.entries) {
     const expectation = workload.routes[entry.path]?.[driver];
     if (expectation === undefined) {
-      report.g2Failures.push({ path: entry.path, reason: "no pinned expectation" });
+      report.g2Failures.push({ path: entry.path, reason: "no pinned expectation", kind: "positive" });
       continue;
     }
     const got = byPath.get(entry.path) ?? [];
     if (got.length !== 1) {
-      report.g2Failures.push({ path: entry.path, reason: `delivered ${got.length} times (expected exactly once)` });
+      report.g2Failures.push({ path: entry.path, reason: `delivered ${got.length} times (expected exactly once)`, kind: got.length === 0 ? "absent" : "positive" });
       continue;
     }
     const d = got[0]!;
     report.routesDelivered[d.route] = (report.routesDelivered[d.route] ?? 0) + 1;
     const permitted = new Set<string>([expectation.primary, ...expectation.permittedFallbacks]);
     if (!permitted.has(d.route)) {
-      report.g2Failures.push({ path: entry.path, reason: `delivered via ${d.route}, outside the pinned permitted set {${[...permitted].join(", ")}}` });
+      report.g2Failures.push({ path: entry.path, reason: `delivered via ${d.route}, outside the pinned permitted set {${[...permitted].join(", ")}}`, kind: "positive" });
       continue;
     }
     const expected = expectation.expected[d.route];
     if (expected === undefined) {
-      report.g2Failures.push({ path: entry.path, reason: `route ${d.route} carries no typed expectation` });
+      report.g2Failures.push({ path: entry.path, reason: `route ${d.route} carries no typed expectation`, kind: "positive" });
       continue;
     }
     if ("nonAcquisition" in expected) {
@@ -191,7 +209,7 @@ export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly En
       continue;
     }
     if (d.delivered === null) {
-      report.g2Failures.push({ path: entry.path, reason: `route ${d.route} delivered nothing` });
+      report.g2Failures.push({ path: entry.path, reason: `route ${d.route} delivered nothing`, kind: "positive" });
       continue;
     }
     const gotHash = seamStringSha256(d.delivered);
@@ -213,7 +231,7 @@ export function verifyDeliveries(workload: UnitWorkload, deliveries: readonly En
   }
   for (const [path, list] of byPath) {
     if (workload.routes[path] === undefined)
-      report.g2Failures.push({ path, reason: `delivered ${list.length}× but absent from the pinned workload` });
+      report.g2Failures.push({ path, reason: `delivered ${list.length}× but absent from the pinned workload`, kind: "positive" });
   }
   return report;
 }
@@ -273,6 +291,11 @@ export interface RunRecord {
   type: "run";
   schemaVersion: 1;
   pos: number;
+  // Durable per-attempt identity (pid + start-epoch + in-process ordinal). The washout marker
+  // binds to THIS, never to pos alone: a pos is re-visited by in-slot replays and by the R6
+  // epilogue, and a marker from an EARLIER attempt at the same pos must not terminalize a
+  // later one (Step-C residual 1).
+  attemptId: string;
   unit: string;
   driver: DriverId;
   rep: number;
@@ -287,7 +310,7 @@ export interface RunRecord {
   // rate-limit read) failed. The wall stands; the consumption figures do not, so the row is
   // invalid for scoring — recorded rather than dropped, since silently losing a completed
   // measurement is worse than recording one that cannot be scored.
-  outcome: "complete" | "unit-failure" | "invalidated-straddle" | "invalidated-foreign" | "invalidated-finalisation" | "halt-r5-breach" | "drift-restart" | "re-pin-required";
+  outcome: "complete" | "unit-failure" | "invalidated-straddle" | "invalidated-foreign" | "invalidated-finalisation" | "invalidated-control-plane" | "halt-r5-breach" | "drift-restart" | "re-pin-required";
   failureCause: string | null;
   // typed R1/R2 evidence (§4.5): the rerun predicate reads THIS, never a message regex. The
   // git-transport variant (§4.5, amended 2026-08-02) types the SETTLED network-facing subset of
@@ -300,6 +323,15 @@ export interface RunRecord {
   requests: Record<string, number>;
   okRequestClasses: string[]; // §4.5 R2 ledger input: classes with ≥1 SUCCESSFUL attempt
   attempts: { fivexx: number; retries: number; secondaryByKind: Record<string, number> };
+  // a reset epoch was OBSERVED to move under a consumed bucket mid-run — recorded even when a
+  // driver failure or control-plane invalidation would otherwise claim the outcome, because
+  // R4 recurrence counting must see every real straddle (codex C0-R1 finding 4). Recurrence
+  // counts read THIS FACT, not the outcome, so precedence collisions cannot hide it (C0-R2).
+  straddledReset: boolean;
+  // a control-plane snapshot failed during this attempt (segment gate or post-run) — again a
+  // FACT independent of which outcome won precedence, so the durable per-pos cap counts every
+  // occurrence (codex C0-R2 finding 3)
+  controlPlaneFailed: boolean;
   secondarySignals: number; // attributable (driver-own matrix traffic) — G4's classifier input
   points: { measuredCostSum: number; imputed: number };
   bucketDeltas: { core: BucketDelta; graphql: BucketDelta };
@@ -312,6 +344,10 @@ export interface RunRecord {
   // path, whose record must be durable before any fallible work — including reclamation)
   diskReclaimFailed: boolean | null;
   probeDivergences: number;
+  // positive-kind G2 failures across THIS attempt (duplicates, forbidden routes, foreign
+  // paths) — scored over every physical attempt, unlike absence-shaped g2Failures which only
+  // terminal rows carry (codex C0-R3 finding 4)
+  g2PositiveFailures: number;
   httpBodyBytes: number;
   cloneObjectStoreBytes: number | null;
   diskSampledPeakBytes: number;
@@ -336,6 +372,11 @@ export interface RunRecord {
   t1Conflicts: number;
   t1BodyTimeouts: number;
   washoutAppliedMs: number;
+  // Absolute epoch until which the API must stay idle before the NEXT run. A crash between the
+  // row append and the washout marker re-runs the row; resume restores the REMAINING horizon
+  // from this field first, so the re-run is not polluted by the interrupted attempt's throttle
+  // residue (Step-C residual 2). 0 = no washout owed (terminal halt / drift records).
+  washoutUntilEpochMs: number;
   envManifestHash: string;
   harnessCommit: string; // per-row provenance stamp (§8); the CONTENT binding is the digest below
   // the §8 frozen-surface digest this row was produced under — resume's content binding: an
@@ -379,11 +420,336 @@ export class RunsLog {
     return createHash("sha256").update(JSON.stringify(environment)).digest("hex").slice(0, 16);
   }
   writeManifestOnce(): void {
-    appendFileSync(this.path, `${JSON.stringify({ type: "env-manifest", schemaVersion: 1, ...this.manifest, hash: this.envManifestHash() })}\n`);
+    // Identical-hash manifests carry identical content, so one copy on record suffices — every
+    // invocation used to append another line, including rejected resumes (Step-C residual 6).
+    // A DIFFERENT hash is a different environment and is appended: rows reference manifests by
+    // hash, and resume separately refuses cross-environment rows.
+    const hash = this.envManifestHash();
+    if (existsSync(this.path)) {
+      for (const line of readFileSync(this.path, "utf8").split("\n")) {
+        if (line.trim() === "") continue;
+        try {
+          const rec = JSON.parse(line) as Record<string, unknown>;
+          if (rec["type"] === "env-manifest" && rec["hash"] === hash) return;
+        } catch {
+          // non-JSON lines never match; the scan is a dedup, not a validator
+        }
+      }
+    }
+    appendFileSync(this.path, `${JSON.stringify({ type: "env-manifest", schemaVersion: 1, ...this.manifest, hash })}\n`);
   }
   append(record: RunRecord): void {
     appendFileSync(this.path, `${JSON.stringify(record)}\n`);
   }
+}
+
+// ---- resume/terminalization reconstruction (§4.5, shared with scoring) -----------------------
+// The ONE rule for "which recorded attempt is a schedule position's terminal outcome", used by
+// BOTH the matrix's resume path and the §4.6/§4.7 scoring reader — two implementations would
+// eventually disagree on exactly the rows that matter (replays, epilogues, crash edges).
+//
+// A run row terminalizes only when its own washout MARKER landed, matched by attemptId — pos
+// alone is ambiguous across in-slot replays and the R6 epilogue (Step-C residual 1). For
+// drifted units only epilogue rows terminalize (pre-drift reps are discarded by R6). A marked
+// unit-failure row whose typed evidence qualified for the ≤1 R1/R2 rerun at its point in the
+// stream does NOT terminalize: the live process would have replayed it, so resume re-runs it
+// and charges the allowance — otherwise a crash between the marker and the rerun would freeze
+// the failure as terminal and forfeit the rerun (the "interrupted replay decision" of codex
+// R3 f.3, now made explicit).
+export interface MatrixResumeState {
+  terminalPos: Set<number>;
+  terminalRowByPos: Map<number, Record<string, unknown>>;
+  rerunUsed: Set<string>; // unit|driver keys whose R1/R2 allowance is spent
+  straddleCounts: Map<string, number>; // per-unit R4 count — TWO on one unit is freeze-repair
+  controlPlaneCounts: Map<number, number>; // per-pos invalidated-control-plane count (durable cap input)
+  driftedUnits: Set<string>;
+  successLedger: Set<string>; // unit|driver|requestClass with ≥1 SUCCESSFUL attempt in a marked completed rep
+  resumeForms: Map<string, AcquisitionForm>;
+  pendingReplays: Map<number, "r1r2" | "r3r4">; // replay linkage owed to the next attempt at pos
+  pendingWashoutUntilMs: number; // 0 = none; else sleep to this epoch before the next run
+  // a recorded complete/unit-failure attempt whose washout marker never landed (crash mid-
+  // washout): the attempt is EVIDENCE, not a do-over — the resumer must append the missing
+  // marker after honouring the horizon and then terminalize or replay it under the frozen
+  // rules, never silently re-run it (codex C0-R1 finding 1: an unmarked NON-rerunnable
+  // failure must not be laundered into a retry).
+  pendingTransitions: Array<{ pos: number; row: Record<string, unknown> }>;
+  matrixRowsSeen: number;
+}
+
+// The frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7): R1 = a network-layer
+// failure outside any HTTP response, rerunnable unconditionally (≤1); R2 = a transient-5xx
+// exhaustion within caps whose request class SUCCEEDED in at least one other completed
+// repetition of this unit × driver. Secondary-shaped failures are NEVER rerunnable. ONE
+// definition — the live loop, this reconstruction, and the scoring reader all call it, so the
+// three can never drift (relocated verbatim from the ratified Step-B surface at the Step-C
+// restack; the relocation is recorded in the §8 amendment).
+export function evidenceIsRerunnable(ev: unknown, unitDriverKey: string, ledger: ReadonlySet<string>): boolean {
+  if (typeof ev !== "object" || ev === null) return false;
+  const e = ev as Record<string, unknown>;
+  // §4.5 amended 2026-08-02: a SETTLED network-shaped git-transport failure on one of the three
+  // network-facing operations is R1 — same ≤1 allowance pool as the HTTP shapes. Validated
+  // fail-closed against the frozen vocabularies INCLUDING the exact exitCode pairing the
+  // classifier can mint (timeout ⇔ the synthetic 124; the stderr-classified shapes ⇔ 128) —
+  // this predicate also re-decides from persisted rows on resume, so a hand-edited or foreign
+  // value must never widen the allowance.
+  if (e["kind"] === "git-transport") {
+    const opOk = e["op"] === "clone" || e["op"] === "scaffold-fetch" || e["op"] === "ls-remote-probe";
+    if (!opOk) return false;
+    if (e["networkClass"] === "timeout") return e["exitCode"] === 124; // R1
+    const classOk = e["networkClass"] === "dns" || e["networkClass"] === "tls"
+      || e["networkClass"] === "connect" || e["networkClass"] === "reset";
+    return classOk && e["exitCode"] === 128; // R1
+  }
+  if (e["kind"] !== "http") return false;
+  if (e["code"] === "no-response") return true; // R1
+  if ((e["code"] === "attempts-exhausted" || e["code"] === "http-failure") && e["lastClassification"] === "transient")
+    return ledger.has(`${unitDriverKey}|${typeof e["requestClass"] === "string" ? e["requestClass"] : ""}`); // R2
+  return false;
+}
+
+// every outcome the engine can persist — a row outside these shapes is refused on resume
+// (the plan's §4.5 evidence-vocabulary rule; ported from the ratified Step-B resume scan)
+const RESUME_OUTCOMES = new Set([
+  "complete", "unit-failure", "invalidated-straddle", "invalidated-foreign",
+  "invalidated-finalisation", "invalidated-control-plane", "halt-r5-breach", "drift-restart",
+  "re-pin-required",
+]);
+
+export interface ScheduleRowIdentity { unit: string; driver: string; rep: number; probe: boolean }
+
+export function reconstructMatrixState(
+  lines: readonly string[],
+  // the CONTENT binding is the frozen-surface digest, never the commit id: an evidence-only
+  // commit moves HEAD but not the digest, and must not orphan rows (ratified Step-B rule).
+  // harnessCommit stays ON the rows as provenance; null = the scoring reader, which derives
+  // and enforces ONE digest|environment identity across every row instead.
+  expect: { envManifestHash: string; frozenSurfaceDigest: string } | null,
+  schedule: ReadonlyMap<number, ScheduleRowIdentity>,
+): MatrixResumeState {
+  const state: MatrixResumeState = {
+    terminalPos: new Set(), terminalRowByPos: new Map(), rerunUsed: new Set(),
+    straddleCounts: new Map(), controlPlaneCounts: new Map(), driftedUnits: new Set(),
+    successLedger: new Set(), resumeForms: new Map(), pendingReplays: new Map(),
+    pendingWashoutUntilMs: 0, pendingTransitions: [], matrixRowsSeen: 0,
+  };
+  const identities = new Set<string>(); // frozenSurfaceDigest|envManifestHash pairs (expect === null mode)
+  const marked = new Set<string>(); // washout-marker attemptIds
+  let pendingUnmarked: { attemptId: string; line: number } | null = null; // row/marker interleave
+  const pendingLedger = new Map<string, string[]>(); // attemptId → ledger keys, admitted at marker time
+  type Attempt = {
+    row: Record<string, unknown>; pos: number; unit: string; driver: string;
+    outcome: string; attemptId: string; epilogue: boolean;
+    supersededByRerun: boolean;
+  };
+  const byPos = new Map<number, Attempt[]>();
+  const attemptById = new Map<string, Attempt>();
+  const lastNonEmpty = ((): number => {
+    for (let i = lines.length - 1; i >= 0; i--) if (lines[i]!.trim() !== "") return i;
+    return -1;
+  })();
+  for (const [lineIndex, line] of lines.entries()) {
+    if (line.trim() === "") continue;
+    let rec: Record<string, unknown>;
+    try {
+      rec = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      // ONLY the final line may be torn (a crash mid-append); a malformed INTERIOR line means
+      // the append-only evidence log was edited or corrupted — refuse rather than silently
+      // skipping records (codex C0-R1 finding 13)
+      if (lineIndex < lastNonEmpty)
+        throw new BenchProtocolError(`runs.jsonl carries a malformed interior line (${lineIndex + 1}) — the append-only evidence log must not be edited; only a torn final append is tolerated`);
+      continue;
+    }
+    if (rec["type"] === "washout-done" && rec["phase"] === "matrix") {
+      const forId = rec["forAttemptId"];
+      if (typeof forId !== "string") continue; // markers without attempt identity bind nothing
+      // a marker certifies the PENDING attempt, matched by id — one with no unmarked row, or
+      // naming a different attempt, describes a log the live engine cannot have written (ported
+      // from the ratified Step-B resume scan's row/marker invariant). Non-run records may sit
+      // between the row and its marker: a resumed invocation appends its env-manifest line
+      // after reconstruction ACCEPTS the log and only then restores the missing marker.
+      if (pendingUnmarked === null || pendingUnmarked.attemptId !== forId)
+        throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} carries a washout marker with no matching preceding run row — the evidence log violates the row/marker invariant`);
+      pendingUnmarked = null;
+      marked.add(forId);
+      for (const key of pendingLedger.get(forId) ?? []) state.successLedger.add(key);
+      pendingLedger.delete(forId);
+      // the marker line IS the live process's decision point for the ≤1 R1/R2 rerun (§4.5's
+      // "at failure time against repetitions already completed"): the running ledger here
+      // contains exactly the completions marked BEFORE this failure — evaluating any later
+      // would let evidence from the future authorize a rerun the live process never granted
+      const attempt = attemptById.get(forId);
+      if (attempt !== undefined && attempt.outcome === "unit-failure") {
+        const key = `${attempt.unit}|${attempt.driver}`;
+        const evidenceRaw = attempt.row["failureEvidence"];
+        const evidence = (typeof evidenceRaw === "object" ? evidenceRaw : null) as RunRecord["failureEvidence"];
+        if (evidenceIsRerunnable(evidence, key, state.successLedger) && !state.rerunUsed.has(key)) {
+          state.rerunUsed.add(key);
+          attempt.supersededByRerun = true;
+        }
+      }
+      continue;
+    }
+    if (rec["type"] !== "run" || rec["phase"] !== "matrix") continue;
+    state.matrixRowsSeen++;
+    // resume only trusts records from THIS frozen harness revision and environment — rows from
+    // another revision/machine must not silently mix into one traversal (§8; codex R2 f.21,
+    // R3 f.2). With expect === null (the scoring reader) the same rule is enforced by
+    // demanding ONE identity across every row.
+    if (expect !== null) {
+      if (rec["envManifestHash"] !== expect.envManifestHash)
+        throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from environment ${String(rec["envManifestHash"])} != current ${expect.envManifestHash}`);
+      if (rec["frozenSurfaceDigest"] !== expect.frozenSurfaceDigest)
+        throw new BenchProtocolError(`REFUSING: runs.jsonl carries matrix rows from frozen surface ${String(rec["frozenSurfaceDigest"]).slice(0, 12)} != current ${expect.frozenSurfaceDigest.slice(0, 12)} — a re-frozen matrix starts a fresh log (§8)`);
+    } else {
+      identities.add(`${String(rec["frozenSurfaceDigest"])}|${String(rec["envManifestHash"])}`);
+      if (identities.size > 1)
+        throw new BenchProtocolError(`matrix rows span ${identities.size} freeze/environment identities — §8 requires one machine, one network, one credential, one frozen surface for all timed data`);
+    }
+    const outcome = String(rec["outcome"]);
+    if (!RESUME_OUTCOMES.has(outcome))
+      throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} carries unknown outcome ${JSON.stringify(rec["outcome"])} — a row this scan cannot classify must not be skimmed past`);
+    const pos = typeof rec["pos"] === "number" ? (rec["pos"] as number) : -1;
+    const unit = String(rec["unit"]);
+    const driver = String(rec["driver"]);
+    const attemptId = typeof rec["attemptId"] === "string" ? (rec["attemptId"] as string) : "";
+    // the row must describe the FROZEN schedule's own identity at its position — a garbage
+    // unit/driver would otherwise terminalize a position it does not describe (ported from the
+    // ratified Step-B resume scan)
+    const expectedRow = schedule.get(pos);
+    if (expectedRow === undefined)
+      throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} names pos ${pos}, which the frozen schedule does not contain`);
+    if (unit !== expectedRow.unit || driver !== expectedRow.driver || rec["rep"] !== expectedRow.rep || rec["probe"] !== expectedRow.probe)
+      throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} at pos ${pos} does not match the frozen schedule row (${expectedRow.unit} ${expectedRow.driver} rep${expectedRow.rep}${expectedRow.probe ? " probe" : ""})`);
+    if (pendingUnmarked !== null)
+      throw new BenchProtocolError(`runs.jsonl line ${lineIndex + 1} appends a run row while line ${pendingUnmarked.line} is still awaiting its washout marker — the evidence log violates the row/marker invariant`);
+    if (outcome === "halt-r5-breach" || outcome === "re-pin-required")
+      throw new BenchProtocolError(`REFUSING: runs.jsonl carries a terminal ${outcome} row — that is freeze-repair/amendment territory (§4.5 R5/R6), never a silent retry`);
+    // halt/re-pin/finalisation rows never receive a marker (they throw past the washout);
+    // every other outcome's row is followed by its marker — the drift path writes its own
+    // inline, the normal tail writes one after the washout sleep
+    if (outcome !== "invalidated-finalisation")
+      pendingUnmarked = { attemptId, line: lineIndex + 1 };
+    // recurrence counts read the recorded FACTS, never the outcome — precedence collisions
+    // (straddle over drift, straddle over control-plane) must not hide either event (C0-R2
+    // findings 1/3); rows predating the fact fields fall back to their outcome
+    if (rec["straddledReset"] === true || (rec["straddledReset"] === undefined && outcome === "invalidated-straddle"))
+      state.straddleCounts.set(unit, (state.straddleCounts.get(unit) ?? 0) + 1);
+    if (rec["controlPlaneFailed"] === true || (rec["controlPlaneFailed"] === undefined && outcome === "invalidated-control-plane"))
+      state.controlPlaneCounts.set(pos, (state.controlPlaneCounts.get(pos) ?? 0) + 1);
+    if (outcome === "drift-restart") {
+      state.driftedUnits.add(unit);
+      // §4.4 discards the unit's collected reps — including their SUCCESS-LEDGER evidence: a
+      // later epilogue R2 decision must not cite a discarded rep. Stream order here IS the
+      // live order (the live loop deletes at the drift row), so live and resumed traversals
+      // agree on exactly which admissions survive.
+      for (const k of [...state.successLedger]) if (k.startsWith(`${unit}|`)) state.successLedger.delete(k);
+    }
+    const form = rec["acquisitionForm"];
+    if (form === "scaffolding") state.resumeForms.set(unit, "scaffolding");
+    else if (form === "production" && !state.resumeForms.has(unit)) state.resumeForms.set(unit, "production");
+    if (rec["replayKind"] === "r1r2") state.rerunUsed.add(`${unit}|${driver}`);
+    const attempt: Attempt = {
+      row: rec, pos, unit, driver, outcome, attemptId,
+      epilogue: rec["epilogue"] === true, supersededByRerun: false,
+    };
+    if (outcome === "complete") {
+      // the R2 ledger admits only classes with a recorded SUCCESS, never mere attempts (codex
+      // C0-R1 finding 2, carried by the ratified okRequestClasses field); a completed run's
+      // accounting read rate_limit successfully, so rest-meta is implied — EXACTLY the live
+      // loop's admission rule, or resume and the running traversal would disagree on R2
+      const classes = Array.isArray(rec["okRequestClasses"])
+        ? (rec["okRequestClasses"] as unknown[]).filter((c): c is string => typeof c === "string")
+        : [];
+      pendingLedger.set(attemptId, [...classes, "rest-meta"].map((cls) => `${unit}|${driver}|${cls}`));
+    }
+    const list = byPos.get(pos) ?? [];
+    list.push(attempt);
+    byPos.set(pos, list);
+    if (attemptId !== "") attemptById.set(attemptId, attempt);
+  }
+  for (const [unit, count] of state.straddleCounts) {
+    if (count >= 2)
+      throw new BenchProtocolError(`REFUSING: ${count} recorded R4 straddles on ${unit} — twice on one unit is a halt for freeze repair (§4.5), never a silent resume (Step-C residual 7)`);
+  }
+  for (const unit of state.driftedUnits) state.resumeForms.set(unit, "scaffolding");
+  for (const [pos, attempts] of byPos) {
+    // a SECOND invalidated-finalisation at one position means the post-run accounting read is
+    // failing persistently — an unbounded silent retry class; the operator investigates
+    // (ported from the ratified Step-B resume scan)
+    const finalisationFailures = attempts.filter((a) => a.outcome === "invalidated-finalisation").length;
+    if (finalisationFailures >= 2)
+      throw new BenchProtocolError(`REFUSING: pos ${pos} carries ${finalisationFailures} invalidated-finalisation rows — the post-run accounting read is failing persistently; investigate before resuming`);
+    const last = attempts[attempts.length - 1]!;
+    const driftBlocked = state.driftedUnits.has(last.unit) && !last.epilogue;
+    const terminalShape = last.outcome === "complete" || (last.outcome === "unit-failure" && !last.supersededByRerun);
+    if (terminalShape && marked.has(last.attemptId) && !driftBlocked) {
+      state.terminalPos.add(pos);
+      state.terminalRowByPos.set(pos, last.row);
+      continue;
+    }
+    if (last.outcome === "invalidated-straddle" || last.outcome === "invalidated-foreign" || last.outcome === "invalidated-control-plane" || last.outcome === "invalidated-finalisation")
+      state.pendingReplays.set(pos, "r3r4");
+    else if (last.supersededByRerun && marked.has(last.attemptId))
+      state.pendingReplays.set(pos, "r1r2");
+    // an UNMARKED last attempt owes the remainder of its washout before anything re-runs
+    // (Step-C residual 2); drift/halt rows record 0 and owe nothing. A recorded but unmarked
+    // complete/unit-failure attempt additionally owes its TRANSITION (marker + terminalize-or-
+    // replay under the frozen rules) — never a silent re-run (codex C0-R1 finding 1).
+    if (!marked.has(last.attemptId)) {
+      const until = typeof last.row["washoutUntilEpochMs"] === "number" ? (last.row["washoutUntilEpochMs"] as number) : 0;
+      if (until > state.pendingWashoutUntilMs) state.pendingWashoutUntilMs = until;
+      // marker-owed shapes: complete/unit-failure transition to terminal-or-replay; the three
+      // in-slot invalidated shapes owe ONLY their marker (the replay is already owed above) —
+      // without it, the resumed replay row would turn this tail into an interior unmarked row
+      // and the NEXT reconstruction would refuse a log the engine itself produced.
+      // invalidated-finalisation stays excluded: it throws past the washout BY DESIGN and is
+      // the one legitimately marker-less row shape.
+      const markerOwed = last.outcome === "complete" || last.outcome === "unit-failure"
+        || last.outcome === "invalidated-straddle" || last.outcome === "invalidated-foreign" || last.outcome === "invalidated-control-plane";
+      if (markerOwed && !driftBlocked && last.attemptId !== "")
+        state.pendingTransitions.push({ pos, row: last.row });
+    }
+  }
+  return state;
+}
+
+// Complete a crash-interrupted washout transition (codex C0-R1 finding 1): the recorded
+// attempt is admitted exactly as the live process would have admitted it after its washout —
+// completes terminalize (and feed the R2 ledger), rerunnable failures charge the allowance and
+// owe an in-slot replay, everything else terminalizes as the recorded failure. The caller has
+// already slept the persisted horizon and appended the missing marker.
+export function applyPendingTransition(state: MatrixResumeState, transition: { pos: number; row: Record<string, unknown> }): void {
+  const row = transition.row;
+  const unit = String(row["unit"]);
+  const driver = String(row["driver"]);
+  const outcome = String(row["outcome"]);
+  if (outcome === "complete") {
+    const classes = Array.isArray(row["okRequestClasses"])
+      ? (row["okRequestClasses"] as unknown[]).filter((c): c is string => typeof c === "string")
+      : [];
+    for (const cls of [...classes, "rest-meta"]) state.successLedger.add(`${unit}|${driver}|${cls}`);
+    state.terminalPos.add(transition.pos);
+    state.terminalRowByPos.set(transition.pos, row);
+    return;
+  }
+  if (outcome === "invalidated-straddle" || outcome === "invalidated-foreign" || outcome === "invalidated-control-plane") {
+    // the caller appended the missing marker; the in-slot replay linkage is already owed by
+    // the reconstruction (r3r4) — an invalidated row never terminalizes, never feeds the
+    // ledger, and never touches the R1/R2 allowance
+    state.pendingReplays.set(transition.pos, "r3r4");
+    return;
+  }
+  const key = `${unit}|${driver}`;
+  const evidenceRaw = row["failureEvidence"];
+  const evidence = (typeof evidenceRaw === "object" ? evidenceRaw : null) as RunRecord["failureEvidence"];
+  if (evidenceIsRerunnable(evidence, key, state.successLedger) && !state.rerunUsed.has(key)) {
+    state.rerunUsed.add(key);
+    state.pendingReplays.set(transition.pos, "r1r2");
+    return;
+  }
+  state.terminalPos.add(transition.pos);
+  state.terminalRowByPos.set(transition.pos, row);
 }
 
 // active-wall accounting: segment sleeps are excluded from the wall term (§4.6 item 1/§4.7 —
@@ -698,11 +1064,23 @@ export class BenchEngine {
     this.replayOfPos = pos;
     this.replayKind = pos === null ? null : kind;
   }
-  harnessCommit(): string {
-    return this.o.runsLog.manifest.harnessCommit;
-  }
   envManifestHashValue(): string {
     return this.manifestHash;
+  }
+  // the manifest append is a CALLER decision, sequenced AFTER identity reconstruction accepts
+  // the log — a rejected resume must not first contaminate runs.jsonl with a foreign-
+  // environment manifest line (codex C0-R1 finding 18)
+  writeManifest(): void {
+    this.o.runsLog.writeManifestOnce();
+  }
+  // complete a crash-interrupted washout: append the marker the crashed process owed its
+  // recorded attempt (codex C0-R1 finding 1); the caller then applies the frozen transition
+  appendPendingWashoutMarker(row: Record<string, unknown>): void {
+    this.o.runsLog.appendMarker({
+      type: "washout-done", forAttemptId: String(row["attemptId"]), pos: row["pos"], rep: row["rep"],
+      probe: row["probe"], phase: "matrix", unit: row["unit"], driver: row["driver"],
+      restoredAtResume: true,
+    });
   }
   // resume support: restore the per-unit frozen acquisition forms reconstructed from durable
   // records (codex R2 f.20)
@@ -711,9 +1089,6 @@ export class BenchEngine {
   }
   // resume support: the caller COMPLETES an interrupted washout (sleep, then this marker) —
   // §4.5's separation is satisfied without re-running an attempt that already measured
-  appendLogMarker(marker: Record<string, unknown>): void {
-    this.o.runsLog.appendMarker(marker);
-  }
   constructor(o: EngineOptions) {
     this.o = o;
     this.manifestHash = o.runsLog.envManifestHash();
@@ -752,6 +1127,9 @@ export class BenchEngine {
       throw new BenchProtocolError(`no pinned workload for ${row.unit}`);
     })();
     this.runCounter++;
+    // durable attempt identity: pid + wall epoch + in-process ordinal — unique across crashes
+    // and restarts, so the washout marker can bind to exactly this attempt (Step-C residual 1)
+    const attemptId = `${process.pid}-${this.now()}-${this.runCounter}`;
     const runDir = join(this.o.benchRoot, `run-${String(row.pos).padStart(4, "0")}-${row.driver}-r${row.rep}${row.probe ? "p" : ""}-a${this.runCounter}`);
     // ORDER IS LOAD-BEARING: every fallible setup step runs BEFORE runDir exists, so the open is
     // the only throw whose reclamation this catch must perform itself. An earlier
@@ -890,7 +1268,7 @@ export class BenchEngine {
     sampler.extraFiles([dbPath, `${dbPath}-wal`, `${dbPath}-shm`]); // runDir PLUS the run-cache DB and its sidecars, which live outside it (R2 f.29)
     sampler.start(runDir, cfg.protocol.diskSamplerHz);
     if (this.childPool.pool === null) this.childPool.pool = makeChildPool(cfg.frame.childPoolSize);
-    const liveState = { fallbackSpend: 0, routesDelivered: {} as Record<string, number>, cloneDir: null as string | null, t1Conflicts: 0, t1BodyTimeouts: 0 };
+    const liveState: NonNullable<DriverRunContext["liveState"]> = { fallbackSpend: 0, routesDelivered: {}, cloneDir: null, t1Conflicts: 0, t1BodyTimeouts: 0 };
     // §4.5 R2's ledger must also see the success the frozen table accepts and production's
     // classifier does not: a partial-data 200 (some aliases resolved, some attributed-errored)
     // is classification "fatal" on every http record (production drops partial data BY DESIGN),
@@ -905,6 +1283,7 @@ export class BenchEngine {
     let outcome: DriverRunOutcome | null = null;
     let verification: VerificationReport | null = null;
     let runOutcome: RunRecord["outcome"] = "complete";
+    let controlPlaneFailed = false;
     let failureCause: string | null = null;
     let failureEvidence: RunRecord["failureEvidence"] = null;
     let r5: BenchProtocolError | null = null;
@@ -927,7 +1306,7 @@ export class BenchEngine {
             this.unitForms.set(row.unit, "scaffolding");
             const driftReclaimFailed = reclaimOnce();
             const driftRecord: RunRecord = {
-              type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+              type: "run", schemaVersion: 1, pos: row.pos, attemptId, unit: row.unit, driver: row.driver, rep: row.rep,
               probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: "production", startedAtIso: new Date(this.now()).toISOString(),
               wallMs: 0, segments: 1, outcome: "drift-restart", failureCause: `live head ${live.slice(0, 12)} moved off the pinned SHA at the pre-rep probe`,
               failureEvidence: null, requests: {}, okRequestClasses: [], attempts: { fivexx: 0, retries: 0, secondaryByKind: {} },
@@ -944,8 +1323,9 @@ export class BenchEngine {
               diskReclaimFailed: driftReclaimFailed,
               probeDivergences: 0, httpBodyBytes: 0, cloneObjectStoreBytes: null,
               diskSampledPeakBytes: 0, diskSamples: 0, diskSampleError: null, fallbackSpend: 0, routesDelivered: {},
-              g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
-              spawns: summarizeSpawns(spawnRecords), t1Conflicts: 0, t1BodyTimeouts: 0, washoutAppliedMs: 0,
+              g1Failures: 0, g2Failures: 0, g2PositiveFailures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
+              straddledReset: false, controlPlaneFailed: false,
+              spawns: summarizeSpawns(spawnRecords), t1Conflicts: 0, t1BodyTimeouts: 0, washoutAppliedMs: 0, washoutUntilEpochMs: 0,
               envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
               frozenSurfaceDigest: this.o.frozenSurfaceDigest,
             };
@@ -958,8 +1338,9 @@ export class BenchEngine {
               this.replayOfPos = null;
               this.replayKind = null;
               // no washout is owed (the probe consumed no API traffic), but the marker-per-row
-              // invariant the resume scan enforces must hold for THIS row too
-              this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
+              // invariant the resume scan enforces must hold for THIS row too — attempt-keyed,
+              // like every marker (pos alone is ambiguous across in-slot replays, residual 1)
+              this.o.runsLog.appendMarker({ type: "washout-done", forAttemptId: attemptId, pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
             } finally {
               // in a finally, mirroring the R5 path: an ENOSPC/EACCES on either append must not
               // skip the release — this early return bypasses finishMeasuredRun, and an armed
@@ -1000,11 +1381,19 @@ export class BenchEngine {
                 sizes: segmentSizes,
                 gate: async (nextSegmentIndex: number): Promise<void> => {
                   wall.pause(); // the clock pauses between segments (§4.8)
-                  const segAfter = await readRateLimit(ghMeta);
-                  bucketSnapshots.push({ before: segBefore!, after: segAfter });
-                  segmentDeltas.push({ core: bucketDelta(segBefore!.core, segAfter.core), graphql: bucketDelta(segBefore!.graphql, segAfter.graphql) });
-                  await this.reserve(ghMeta, segmentWc(segmentSizes, nextSegmentIndex));
-                  segBefore = await readRateLimit(ghMeta);
+                  // the gate is CONTROL PLANE executing inside the driver's call stack: its
+                  // snapshot/reservation failures must not surface as driver unit-failures
+                  // and consume the R1/R2 allowance (Step-C residual 3)
+                  try {
+                    const segAfter = await readRateLimit(ghMeta);
+                    bucketSnapshots.push({ before: segBefore!, after: segAfter });
+                    segmentDeltas.push({ core: bucketDelta(segBefore!.core, segAfter.core), graphql: bucketDelta(segBefore!.graphql, segAfter.graphql) });
+                    await this.reserve(ghMeta, segmentWc(segmentSizes, nextSegmentIndex));
+                    segBefore = await readRateLimit(ghMeta);
+                  } catch (e) {
+                    if (e instanceof BenchHttpError) throw new ControlPlaneFailure(`segment gate ${nextSegmentIndex}: ${e.code}: ${e.message}`);
+                    throw e;
+                  }
                   wall.start();
                 },
               },
@@ -1025,6 +1414,12 @@ export class BenchEngine {
         runOutcome = "halt-r5-breach"; // recorded IN runs.jsonl, then the halt propagates
         failureCause = e.message;
         r5 = e;
+      } else if (e instanceof ControlPlaneFailure) {
+        // a segment-gate snapshot/reservation failure: run invalid, replay in slot, never a
+        // driver failure and never charged to the driver allowance (Step-C residual 3)
+        runOutcome = "invalidated-control-plane";
+        failureCause = e.message;
+        controlPlaneFailed = true;
       } else if (e instanceof UnitFailure) {
         runOutcome = "unit-failure";
         failureCause = e.cause2;
@@ -1052,14 +1447,15 @@ export class BenchEngine {
       const disk = sampler.peek();
       const r5traffic = summarizeTraffic(httpRecords, t1TableAccepted());
       const r5record: RunRecord = {
-        type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+        type: "run", schemaVersion: 1, pos: row.pos, attemptId, unit: row.unit, driver: row.driver, rep: row.rep,
         probe: row.probe, phase, epilogue: this.epilogueMode, acquisitionForm: needsClonePath ? form : null,
         startedAtIso, wallMs, segments: segmentSizes.length, outcome: "halt-r5-breach",
         failureCause, failureEvidence: null,
         // an R5 halt is the evidence a freeze repair is diagnosed from, so it carries the partial
         // traffic it actually observed rather than zeroes — through the SAME control-plane rule
         // the normal record uses, which this literal previously contradicted
-        requests: r5traffic.requests, okRequestClasses: r5traffic.okRequestClasses, attempts: r5traffic.attempts,
+        requests: r5traffic.requests, okRequestClasses: r5traffic.okRequestClasses, attempts: r5traffic.attempts, straddledReset: false, controlPlaneFailed: false,
+        g2PositiveFailures: 0,
         secondarySignals: r5traffic.secondarySignals, points: r5traffic.points,
         bucketDeltas: { core: { valid: false, used: null }, graphql: { valid: false, used: null } },
         bucketSnapshots,
@@ -1073,7 +1469,7 @@ export class BenchEngine {
         diskSampleError: "not sampled: R5 halt records before any fallible post-run work",
         fallbackSpend: liveState.fallbackSpend, routesDelivered: liveState.routesDelivered,
         g1Failures: 0, g2Failures: 0, g1Details: [], g2Details: [], probeDivergenceDetails: [],
-        spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts, t1BodyTimeouts: liveState.t1BodyTimeouts, washoutAppliedMs: 0,
+        spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts ?? 0, t1BodyTimeouts: liveState.t1BodyTimeouts ?? 0, washoutAppliedMs: 0, washoutUntilEpochMs: 0,
         envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
         frozenSurfaceDigest: this.o.frozenSurfaceDigest,
       };
@@ -1087,6 +1483,7 @@ export class BenchEngine {
         sampler.abandon();
       }
       this.replayOfPos = null;
+      this.replayKind = null;
       throw r5;
     }
     // §4.6 item 1 keeps RECLAMATION inside the wall (production holds the unit slot through
@@ -1116,7 +1513,19 @@ export class BenchEngine {
     // globally irreversible evidence, and appending the invalidated-finalisation row with
     // zeroed failure counts let a wrong-bytes run whose rate-limit read then failed be
     // re-executed and ERASED by a clean replay
-    if (outcome !== null) verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
+    if (outcome !== null) {
+      verification = verifyDeliveries(workload, outcome.deliveries, row.driver, { probeRep: row.probe, acquiredPaths: outcome.acquiredPaths });
+    } else if ((liveState.deliveries ?? []).length > 0) {
+      // a thrown driver's PARTIAL deliveries still carry POSITIVE evidence — wrong bytes,
+      // duplicates, forbidden routes delivered before the failure must reach the gates (codex
+      // C0-R2 re f.10; C0-R3 finding 4). Only ABSENCE-shaped g2 noise is discarded: an
+      // interrupted set is by definition full of it and the terminal/rerun discipline owns it.
+      const partial = verifyDeliveries(workload, liveState.deliveries ?? [], row.driver, {
+        probeRep: row.probe,
+        ...(liveState.acquiredPaths === undefined ? {} : { acquiredPaths: liveState.acquiredPaths }),
+      });
+      verification = { ...partial, g2Failures: partial.g2Failures.filter((f) => f.kind === "positive") };
+    }
     let after: RateLimitSnapshot | null = null;
     try {
       after = await readRateLimit(ghMeta);
@@ -1128,10 +1537,12 @@ export class BenchEngine {
       // semantics read the outcome (a re-pin row REFUSES resume; an invalidated-finalisation
       // row in its place would silently re-run against a dead SHA). Those runs keep their
       // classified record, with the deltas degraded and the accounting failure noted.
+      controlPlaneFailed = true;
       if (runOutcome === "complete") {
         const partial = summarizeTraffic(httpRecords, t1TableAccepted());
+        const finalisationWashoutMs = washoutMs(cfg, outstandingHorizonMs(gh), this.now());
         this.o.runsLog.append({
-          type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+          type: "run", schemaVersion: 1, pos: row.pos, attemptId, unit: row.unit, driver: row.driver, rep: row.rep,
           probe: row.probe, phase, epilogue: this.epilogueMode,
           acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
           startedAtIso, wallMs, segments: segmentSizes.length,
@@ -1154,13 +1565,18 @@ export class BenchEngine {
           fallbackSpend: outcome?.fallbackSpend ?? liveState.fallbackSpend,
           routesDelivered: liveState.routesDelivered,
           g1Failures: verification?.g1Failures.length ?? 0, g2Failures: verification?.g2Failures.length ?? 0,
+          g2PositiveFailures: verification?.g2Failures.filter((f) => f.kind === "positive").length ?? 0,
           g1Details: verification?.g1Failures.slice(0, DETAIL_CAP) ?? [], g2Details: verification?.g2Failures.slice(0, DETAIL_CAP) ?? [],
           probeDivergenceDetails: verification?.probeDivergences.slice(0, DETAIL_CAP) ?? [],
-          spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts, t1BodyTimeouts: liveState.t1BodyTimeouts,
+          // the after-snapshot never arrived, so no reset move was OBSERVED; the accounting
+          // failure itself is the control-plane FACT this row records
+          straddledReset: false, controlPlaneFailed: true,
+          spawns: summarizeSpawns(spawnRecords), t1Conflicts: liveState.t1Conflicts ?? 0, t1BodyTimeouts: liveState.t1BodyTimeouts ?? 0,
           // this row throws before any washout sleep, so resume completes the OWED washout
-          // from this field — a hardcoded 0 collapsed a live Retry-After horizon (e.g. the
+          // from these fields — a hardcoded 0 collapsed a live Retry-After horizon (e.g. the
           // throttle that broke the accounting read) to the 60 s floor
-          washoutAppliedMs: washoutMs(cfg, outstandingHorizonMs(gh), this.now()),
+          washoutAppliedMs: finalisationWashoutMs,
+          washoutUntilEpochMs: this.now() + finalisationWashoutMs,
           envManifestHash: this.manifestHash, harnessCommit: this.o.runsLog.manifest.harnessCommit,
           frozenSurfaceDigest: this.o.frozenSurfaceDigest,
         });
@@ -1189,6 +1605,11 @@ export class BenchEngine {
     const deltas = after !== null
       ? { core: sumDelta((d) => d.core), graphql: sumDelta((d) => d.graphql) }
       : { core: { valid: false, used: null } as BucketDelta, graphql: { valid: false, used: null } as BucketDelta };
+    // the R4 straddle FACT is recorded independently of which outcome wins precedence (codex
+    // C0-R1 finding 4): an observed reset-epoch move under a consumed bucket must reach the
+    // two-strikes recurrence count even when a coincident failure claims the outcome. Only an
+    // OBSERVED move counts — a missing post-run snapshot invalidates deltas without observing one.
+    const straddledReset = after !== null && (!deltas.core.valid || !deltas.graphql.valid);
     // R4/R3 apply to unit-failure runs too, not only completed ones: §4.5 declares an invalid
     // run "replayed in its own slot" with no completion condition, and a failure observed under
     // verified external interference (or across a reset) is contaminated evidence — recording
@@ -1229,12 +1650,12 @@ export class BenchEngine {
     const washoutAppliedMs = washoutMs(cfg, horizon, this.now());
 
     const record: RunRecord = {
-      type: "run", schemaVersion: 1, pos: row.pos, unit: row.unit, driver: row.driver, rep: row.rep,
+      type: "run", schemaVersion: 1, pos: row.pos, attemptId, unit: row.unit, driver: row.driver, rep: row.rep,
       probe: row.probe, phase, epilogue: this.epilogueMode,
       acquisitionForm: outcome !== null ? outcome.acquisitionForm : (needsClonePath ? form : null),
       startedAtIso, wallMs, segments: segmentSizes.length, outcome: runOutcome, failureCause,
       failureEvidence,
-      requests, okRequestClasses: traffic.okRequestClasses, attempts, secondarySignals,
+      requests, okRequestClasses: traffic.okRequestClasses, attempts, straddledReset, controlPlaneFailed, secondarySignals,
       points: { measuredCostSum, imputed },
       bucketDeltas: deltas,
       bucketSnapshots,
@@ -1243,6 +1664,7 @@ export class BenchEngine {
       replayKind: this.replayKind,
       diskReclaimFailed,
       probeDivergences: verification?.probeDivergences.length ?? 0,
+      g2PositiveFailures: verification?.g2Failures.filter((f) => f.kind === "positive").length ?? 0,
       // body bytes derive from the RECORDS so a thrown driver still reports its real transfer
       httpBodyBytes: traffic.httpBodyBytes,
       cloneObjectStoreBytes,
@@ -1255,9 +1677,10 @@ export class BenchEngine {
       g2Details: verification?.g2Failures.slice(0, DETAIL_CAP) ?? [],
       probeDivergenceDetails: verification?.probeDivergences.slice(0, DETAIL_CAP) ?? [],
       spawns: summarizeSpawns(spawnRecords),
-      t1Conflicts: liveState.t1Conflicts,
-      t1BodyTimeouts: liveState.t1BodyTimeouts,
+      t1Conflicts: liveState.t1Conflicts ?? 0,
+      t1BodyTimeouts: liveState.t1BodyTimeouts ?? 0,
       washoutAppliedMs,
+      washoutUntilEpochMs: this.now() + washoutAppliedMs,
       envManifestHash: this.manifestHash,
       harnessCommit: this.o.runsLog.manifest.harnessCommit,
       frozenSurfaceDigest: this.o.frozenSurfaceDigest,
@@ -1281,7 +1704,8 @@ export class BenchEngine {
     // still-pending its washout/replay transition (codex R3 f.3).
     this.o.log(`washout ${Math.ceil(washoutAppliedMs / 1000)}s (horizon ${horizon === 0 ? "none" : new Date(horizon).toISOString()})`);
     await this.sleep(washoutAppliedMs);
-    this.o.runsLog.appendMarker({ type: "washout-done", pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
+    // the marker binds to the attempt, never to pos alone (Step-C residual 1)
+    this.o.runsLog.appendMarker({ type: "washout-done", forAttemptId: attemptId, pos: row.pos, rep: row.rep, probe: row.probe, phase, unit: row.unit, driver: row.driver });
     return { outcome, verification, record };
     } finally {
       // a no-op on every path that already reclaimed; the backstop for the ones that throw
@@ -1330,8 +1754,9 @@ export class BenchEngine {
         // second R4 per UNIT and never caps R3. The pilot is a declared non-decision
         // diagnostic; its stricter stop exists to surface a noisy account early (measured
         // live: a single foreign GraphQL point from a background consumer invalidated a rep
-        // on 2026-07-29), not to implement the frozen matrix discipline.
-        if (handle.record.outcome === "invalidated-straddle" || handle.record.outcome === "invalidated-foreign") {
+        // on 2026-07-29), not to implement the frozen matrix discipline. A segment-gate
+        // control-plane invalidation replays the same way — the driver was never charged.
+        if (handle.record.outcome === "invalidated-straddle" || handle.record.outcome === "invalidated-foreign" || handle.record.outcome === "invalidated-control-plane") {
           replays++;
           if (replays > 2) throw new BenchProtocolError(`pilot rep ${rep} invalidated ${replays} times (${handle.record.outcome}) — quiesce the account's other consumers and re-run`);
           this.o.log(`pilot rep ${rep} ${handle.record.outcome} — replaying in its own slot`);

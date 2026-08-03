@@ -27,7 +27,7 @@
 // them (the production sweep deliberately targets pkg-audit-* only); stale ones are safe to
 // delete by hand.
 
-import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -38,7 +38,7 @@ import { walkClone, cloneReader } from "./orchestrate.ts";
 import type { TreeEntry } from "./unitPipeline.ts";
 import { locateManifests, dirOf } from "./manifest.ts";
 import { makeExcluder } from "./unitPipeline.ts";
-import { loadBenchConfig, type BenchConfig } from "./benchConfig.ts";
+import { loadBenchConfig, parseBenchConfig, type BenchConfig } from "./benchConfig.ts";
 import {
   loadCorpus, scheduleUnitsFrom, verifyC1, verifyC2, verifyC3, verifyC4, verifyC5,
   verifyC6NonUtf8, verifyC6Symlink,
@@ -55,10 +55,17 @@ import { BatchChild, BenchSpawnError, runBenchGit, type BatchChildDisposal, type
 import { BenchHttpError, benchGraphqlDispatch, benchRestGet, gitBlobOid, makeBuckets, readRateLimit, type BenchGhContext } from "./benchGh.ts";
 import { analyzeBatchResponse, buildBatchQuery, packBatches } from "./benchT1.ts";
 import {
-  BenchEngine, RunsLog, buildEnvManifest, computeWorstCase, planSegments,
+  BenchEngine, RunsLog, applyPendingTransition, buildEnvManifest, computeWorstCase,
+  evidenceIsRerunnable, planSegments, reconstructMatrixState,
 } from "./benchProtocol.ts";
 import { RePinRequired, UnitFailure, acquireStore, describeDisposal, disposalIsClean, probeLiveHead, type DriverRunContext } from "./benchDrivers.ts";
 import { noiseBandFrom } from "./benchConfig.ts";
+import { scoreMatrix, type ScoreBundle, type ScoreOutput } from "./benchScore.ts";
+import { buildReport } from "./benchReport.ts";
+import { planBoundaryCells, runBoundaryProbe } from "./benchBoundary.ts";
+import { runConcurrencyProbe } from "./benchConcurrencyProbe.ts";
+import { CLONE_COMPOSITION_STATEMENT, analyzeOidDuplication, runOption3WarmScenario } from "./benchOption3.ts";
+import type { DriverId } from "./benchSchedule.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const ARTIFACTS = join(REPO_ROOT, "docs", "adrs", "0001-benchmark");
@@ -144,7 +151,9 @@ function frozenSurfaceDigest(): string {
   // calibrated band), so leaving it out let its walls, spread, reps, driver, or slot be edited
   // freely as long as noiseBand still matched. ratification.json is still deliberately excluded —
   // it must be COMMITTED, and binding a file to a digest recorded inside it is unsatisfiable.
-  files.push(CONFIG_PATH, CORPUS_PATH, join(ARTIFACTS, "pilot.json"));
+  // Step-C amendment: acquisition-diagnostics.json joins for the same reason — it bounds the
+  // scaffolding-form interpretation, so it must be tamper-evident under the freeze too.
+  files.push(CONFIG_PATH, CORPUS_PATH, join(ARTIFACTS, "pilot.json"), join(ARTIFACTS, "acquisition-diagnostics.json"));
   for (const tool of ["package.json", "tsconfig.json", "bun.lock", "bun.lockb"]) {
     const tp = join(REPO_ROOT, tool);
     if (existsSync(tp)) files.push(tp);
@@ -207,53 +216,126 @@ async function assertRatifiedAndFrozen(): Promise<{ rat: Record<string, unknown>
     lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
     benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
   });
-  assertFreezeGitState(statusOut, lsFiles, APPEND_ONLY);
-  // Verify the append-only CLAIM for each tracked evidence log: committed bytes must be a
-  // byte-exact prefix of the working copy. Presence-in-HEAD is probed with `ls-tree HEAD --`,
-  // whose contract is exit 0 with empty output for an absent path — so a NON-ZERO exit from
-  // either probe or show is a git failure and REFUSES (an earlier draft skipped on any show
-  // failure, which failed OPEN for exactly the rewritten-log case this check exists to catch).
-  // KNOWN LIMIT, stated plainly: this proves no COMMITTED evidence was edited or truncated;
-  // rows appended since the last commit have no committed baseline and are protected only by
-  // committing them — commit the evidence logs early and often during Step C.
-  for (const rel of APPEND_ONLY) {
-    if (rel.endsWith("/")) continue; // directory exemptions are untracked scratch space
-    const gitLimits = { maxStdoutBytes: 512 * 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 };
-    const probe = await runBenchGit({
-      argv: ["ls-tree", "HEAD", "--", rel], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
-      benchRoot: repoRoot, cwd: repoRoot, limits: gitLimits,
-    });
-    if (probe.exitCode !== 0)
-      throw new Error(`REFUSING: ${gitFailure(`git ls-tree HEAD -- ${rel}`, probe)} — the append-only verification cannot run, so it fails closed (§8)`);
-    if (text(probe.stdout).trim() === "") continue; // not in HEAD yet (first run of a log) — nothing to prefix-check
-    const abs = join(REPO_ROOT, rel);
-    if (!existsSync(abs))
-      throw new Error(`REFUSING: ${rel} is committed in HEAD but ABSENT from the working tree — deleting an evidence log is not appending (§8)`);
-    const show = await runBenchGit({
-      argv: ["show", `HEAD:${rel}`], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
-      benchRoot: repoRoot, cwd: repoRoot, limits: gitLimits,
-    });
-    if (show.exitCode !== 0)
-      throw new Error(`REFUSING: ${gitFailure(`git show HEAD:${rel}`, show)} — the committed evidence baseline is unreadable, so the append-only claim cannot be verified (§8)`);
-    const working = readFileSync(abs);
-    assertAppendOnlyPrefix(rel, show.stdout, working);
-    // the INDEX is a third copy a later plain `git commit` would persist: a staged REWRITE
-    // beside an appended working file passed the HEAD↔working check alone. The staged copy
-    // must itself extend HEAD and be a prefix of the working bytes (the chain HEAD ⊑ index ⊑
-    // working is exactly "only appends, everywhere").
-    const staged = await runBenchGit({
-      argv: ["show", `:${rel}`], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
-      benchRoot: repoRoot, cwd: repoRoot, limits: gitLimits,
-    });
-    if (staged.exitCode !== 0)
-      throw new Error(`REFUSING: ${gitFailure(`git show :${rel}`, staged)} — the staged copy of an evidence log is unreadable, so the append-only claim cannot be verified (§8)`);
-    assertAppendOnlyPrefix(`${rel} (staged)`, show.stdout, staged.stdout);
-    assertAppendOnlyPrefix(`${rel} (staged vs working)`, staged.stdout, working);
-  }
+  assertFreezeGitState(statusOut, lsFiles, [...APPEND_ONLY, ...REGENERATED_OUTPUTS]);
+  // The append-only CLAIM for each tracked evidence log is verified (and a crash-torn tail
+  // repaired) by the ONE shared helper — writers repair, readers never mutate (C0-R3 f.7).
+  await assertAppendOnlyLogs({ repairTornTail: true });
   return { rat, digest };
+}
+// The ONE append-only verifier for the two evidence logs (matrix gate AND the pure readers):
+// committed existence is decided from HEAD, never the index — a staged deletion would make
+// ls-files call a HEAD-protected log "untracked" and bypass the prefix check entirely
+// (codex C0-R3 finding 1); any OTHER git failure is fail-closed (C0-R2 finding 10). The staged
+// copy must itself extend HEAD and be a prefix of the working bytes (the chain
+// HEAD ⊑ index ⊑ working is exactly "only appends, everywhere"). KNOWN LIMIT, stated plainly:
+// this proves no COMMITTED evidence was edited or truncated; rows appended since the last
+// commit have no committed baseline and are protected only by committing them — commit the
+// evidence logs early and often during Step C.
+async function assertAppendOnlyLogs(opts: { repairTornTail: boolean }): Promise<void> {
+  const repoRoot = realpathSync(REPO_ROOT);
+  const env = buildGitEnv(process.env, "/dev/null");
+  const gitRO = (argv: string[], maxStdoutBytes: number): ReturnType<typeof runBenchGit> => runBenchGit({
+    argv, lane: { lane: "pinning" }, env, benchRoot: repoRoot, cwd: repoRoot,
+    limits: { maxStdoutBytes, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  for (const logRel of ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl"]) {
+    let prefix = Buffer.alloc(0);
+    let inHead = false;
+    const exists = await gitRO(["cat-file", "-e", `HEAD:${logRel}`], 4096);
+    if (exists.exitCode === 0) {
+      inHead = true;
+      const committed = await gitRO(["show", `HEAD:${logRel}`], 256 * 1024 * 1024);
+      if (committed.exitCode !== 0)
+        throw new Error(`REFUSING: cannot read HEAD:${logRel} to verify the append-only prefix (${text(committed.stderr).trim().slice(0, 160)}) — failing closed`);
+      prefix = Buffer.from(committed.stdout);
+    } else {
+      const err = text(exists.stderr);
+      if (!/does not exist|Not a valid object name|invalid object name|bad revision|path .* does not exist/i.test(err))
+        throw new Error(`REFUSING: cannot establish HEAD:${logRel}'s existence (${err.trim().slice(0, 160)}) — failing closed (codex C0-R3 finding 1)`);
+      // genuinely absent at HEAD — nothing committed to protect
+    }
+    const workingPath = join(REPO_ROOT, logRel);
+    if (inHead && !existsSync(workingPath))
+      throw new Error(`REFUSING: ${logRel} is committed in HEAD but ABSENT from the working tree — deleting an evidence log is not appending (§8)`);
+    const working = existsSync(workingPath) ? readFileSync(workingPath) : Buffer.alloc(0);
+    assertAppendOnlyPrefix(logRel, prefix, working);
+    // writers repair a torn tail — including on files not yet at HEAD (a first battery run's
+    // fidelity.jsonl, codex C0-R3 finding 7). A tail that parses as complete JSON lost only
+    // its newline to the crash: SEAL it (truncating would silently delete a recorded outcome);
+    // only genuinely malformed bytes are truncated, and only beyond the committed prefix.
+    if (opts.repairTornTail && working.byteLength > 0 && working[working.byteLength - 1] !== 0x0a) {
+      const tailStart = working.lastIndexOf(0x0a) + 1;
+      if (tailStart < prefix.byteLength)
+        throw new Error(`REFUSING: ${logRel}'s torn tail overlaps the committed prefix — corruption, not a crash artifact`);
+      const tail = working.subarray(tailStart);
+      let sealable = false;
+      try {
+        JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(tail));
+        sealable = true;
+      } catch {
+        sealable = false;
+      }
+      if (sealable) {
+        appendFileSync(workingPath, "\n");
+        log(`repaired ${logRel}: sealed a complete final record that lost only its newline`);
+      } else {
+        truncateSync(workingPath, tailStart);
+        log(`repaired ${logRel}: truncated a ${tail.byteLength}-byte torn uncommitted tail (crash mid-append)`);
+      }
+    }
+    if (inHead) {
+      // the INDEX is a third copy a later plain `git commit` would persist: a staged REWRITE
+      // beside an appended working file passed the HEAD↔working check alone.
+      const staged = await gitRO(["show", `:${logRel}`], 256 * 1024 * 1024);
+      if (staged.exitCode !== 0)
+        throw new Error(`REFUSING: ${gitFailure(`git show :${logRel}`, staged)} — the staged copy of an evidence log is unreadable, so the append-only claim cannot be verified (§8)`);
+      const workingNow = readFileSync(workingPath);
+      assertAppendOnlyPrefix(`${logRel} (staged)`, prefix, staged.stdout);
+      assertAppendOnlyPrefix(`${logRel} (staged vs working)`, staged.stdout, workingNow);
+    }
+  }
+}
+
+// reader-side integrity for score/report (codex C0-R2 finding 2): the evidence INPUTS must be
+// committed and unedited. The full §8 gate's digest equality is deliberately NOT demanded —
+// the pure-reader carve-out lets scoring/report code change after collection — but the frozen
+// preregistered artifacts, the logs' committed prefixes, and (via per-row digest stamps,
+// checked in benchScore) the rows' own freeze binding all still hold.
+async function assertEvidenceReadable(): Promise<void> {
+  const repoRoot = realpathSync(REPO_ROOT);
+  const env = buildGitEnv(process.env, "/dev/null");
+  const lsFiles = await runBenchGit({
+    argv: ["ls-files", "--error-unmatch", "docs/adrs/0001-benchmark/ratification.json"],
+    lane: { lane: "pinning" }, env, benchRoot: repoRoot, cwd: repoRoot,
+    limits: { maxStdoutBytes: 4096, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  if (lsFiles.exitCode !== 0)
+    throw new Error("REFUSING: ratification.json is not TRACKED — scoring reads only committed, signed answers (§8)");
+  const statusOut = await runBenchGit({
+    argv: ["status", "--porcelain"], lane: { lane: "pinning" }, env,
+    benchRoot: repoRoot, cwd: repoRoot, limits: { maxStdoutBytes: 1024 * 1024, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  const FROZEN_INPUTS = [
+    "docs/adrs/0001-benchmark/bench-config.json", "docs/adrs/0001-benchmark/corpus.json",
+    "docs/adrs/0001-benchmark/selected/", "docs/adrs/0001-benchmark/pilot.json",
+    "docs/adrs/0001-benchmark/acquisition-diagnostics.json", "docs/adrs/0001-benchmark/ratification.json",
+    "docs/plans/adr-0001-disagreements-resolution.md", "docs/adrs/0001-file-content-acquisition-strategy.md",
+  ];
+  const dirty = text(statusOut.stdout).split("\n").map((l) => l.slice(3).trim()).filter((f) => f !== "" && FROZEN_INPUTS.some((a) => (a.endsWith("/") ? f.startsWith(a) : f === a)));
+  if (dirty.length > 0)
+    throw new Error(`REFUSING: frozen evidence inputs are edited on disk: ${dirty.slice(0, 5).join(", ")} — scoring reads only committed preregistration (codex C0-R2 finding 2)`);
+  await assertAppendOnlyLogs({ repairTornTail: false });
 }
 
 const APPEND_ONLY = ["docs/adrs/0001-benchmark/runs.jsonl", "docs/adrs/0001-benchmark/fidelity.jsonl", "data/"];
+// Step-C executor outputs: whole-file artifacts an executor REWRITES and then commits as
+// evidence — exempt from the clean-tree refusal (results, not measurement surface), but never
+// prefix-checked: a regenerated report is not an append, and holding it to the append-only
+// claim would refuse exactly the legitimate rewrite the executors exist to produce.
+const REGENERATED_OUTPUTS = [
+  "docs/adrs/0001-benchmark/boundary-probe.json", "docs/adrs/0001-benchmark/concurrency-probe.json",
+  "docs/adrs/0001-benchmark/option3.json", "docs/adrs/0001-benchmark/report.md",
+];
 
 // The traversal is SERIAL by §4.5 and the evidence logs are append-only files with no internal
 // framing protection — two concurrent matrix/fidelity invocations would interleave rows and
@@ -356,6 +438,16 @@ export function classifyFidelityEnumeration(
   return parseLsTreeZ(res.stdout, format, limits);
 }
 
+// §8: pinning-family commands REWRITE preregistered artifacts (corpus.json, selected/*,
+// pilot.json, acquisition-diagnostics.json, the schedule) — after ratification that is
+// amendment territory, and the mutation must not happen even though the next gate would
+// detect it (codex C0-R1 finding 17). Removing/re-recording ratification.json is the explicit
+// amendment act that reopens them.
+function assertNotRatified(command: string): void {
+  if (existsSync(RATIFICATION_PATH))
+    throw new Error(`REFUSING: ratification.json exists — \`${command}\` would mutate frozen preregistered artifacts; a §8 amendment (deliberately re-recording ratification.json, with its review round) must precede it`);
+}
+
 // §4.2 candidates, in preference order — a failing candidate is SWAPPED, never forced.
 // C1 was swapped off the plan's fastify/fastify at pinning: its major lines share ≤14.2% of
 // blob oids (measured), nowhere near the ≥80% the slot requires — repos that keep parallel
@@ -422,12 +514,26 @@ interface PinRuntime {
   spawnObs: (r: BenchSpawnRecord) => void;
 }
 
-function makePinRuntime(cfg: BenchConfig): PinRuntime {
+async function makePinRuntime(cfg: BenchConfig): Promise<PinRuntime> {
   const benchRoot = mkdtempSync(join(realpathSync(tmpdir()), cfg.protocol.tempPrefix));
   try {
   mkdirSync(join(REPO_ROOT, "data"), { recursive: true });
   const db = AuditDb.open({ sqlitePath: join(REPO_ROOT, "data", "bench-pin-cache.sqlite"), fresh: false, purgeCache: false });
   const client = new GithubClient({ githubHost: cfg.githubHost, db, tempRoot: benchRoot });
+  // EVERY evidence-producing runtime enforces the ratified bench identity, not only the
+  // engine (codex amendment-review round 3): the fidelity battery and the three post-matrix
+  // executors route their traffic through this runtime, and their evidence must ride the
+  // same dedicated credential as the matrix rows once ratification binds one.
+  if (existsSync(RATIFICATION_PATH)) {
+    const ratLogin = (JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>)["benchLogin"];
+    if (typeof ratLogin === "string" && ratLogin !== "") {
+      const login = ((await client.restGetJson("user")) as { login?: string }).login ?? "unknown";
+      if (login !== ratLogin) {
+        rmSync(benchRoot, { recursive: true, force: true });
+        throw new Error(`REFUSING: authenticated as ${JSON.stringify(login)} but the bench identity is ${ratLogin} — set GH_TOKEN to the dedicated bench identity's token (§8; ratification.json benchLogin)`);
+      }
+    }
+  }
   const buckets = makeBuckets();
   const gh: BenchGhContext = {
     client, db, cfg, core: buckets.core, graphql: buckets.graphql,
@@ -961,6 +1067,19 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
   try {
   const metaClient = new GithubClient({ githubHost: cfg.githubHost, db: null, tempRoot: benchRoot });
   const login = loginFromUserPayload(await metaClient.restGetJson("user"));
+  // the bench identity is FAIL-CLOSED and bound in the TRACKED signed record (§8 environment
+  // amendment; codex amendment-review rounds 1–2): once ratification.json declares benchLogin,
+  // EVERY engine construction refuses any other authenticated identity — an omitted or
+  // mistyped GH_TOKEN can never silently fall back to the operator's stored auth, no matter
+  // which entrypoint or launcher started the process. BENCH_EXPECTED_LOGIN remains as an
+  // additional pre-ratification guard.
+  let expectedLogin = process.env["BENCH_EXPECTED_LOGIN"] ?? "";
+  if (existsSync(RATIFICATION_PATH)) {
+    const ratLogin = (JSON.parse(readFileSync(RATIFICATION_PATH, "utf8")) as Record<string, unknown>)["benchLogin"];
+    if (typeof ratLogin === "string" && ratLogin !== "") expectedLogin = ratLogin;
+  }
+  if (expectedLogin !== "" && login !== expectedLogin)
+    throw new Error(`REFUSING: authenticated as ${JSON.stringify(login)} but the bench identity is ${expectedLogin} — set GH_TOKEN to the dedicated bench identity's token (§8; ratification.json benchLogin)`);
   const harnessCommit = harnessCommitFromGitResult(await runBenchGit({
     argv: ["rev-parse", "HEAD"], lane: { lane: "pinning" }, env: buildGitEnv(process.env, "/dev/null"),
     benchRoot: realpathSync(REPO_ROOT), cwd: REPO_ROOT,
@@ -971,13 +1090,16 @@ async function makeEngine(cfg: BenchConfig, corpus: Corpus, workloads: Map<strin
     networkDescription: process.env["BENCH_NETWORK_DESC"] ?? "operator workstation (BENCH_NETWORK_DESC unset)",
     credentialType: "PAT (gh auth)",
   });
+  // NOTE: the manifest line is NOT appended here — callers append it via engine.writeManifest()
+  // only after any identity reconstruction has ACCEPTED the existing log, so a rejected resume
+  // cannot first contaminate runs.jsonl with a foreign manifest (codex C0-R1 finding 18)
   const runsLog = new RunsLog(join(ARTIFACTS, "runs.jsonl"), manifest);
-  runsLog.writeManifestOnce();
   const engine = new BenchEngine({
     cfg, corpus, workloads, benchRoot, artifactsDir: ARTIFACTS,
+    // every ratified-phase row binds to its freeze (codex C0-R2 f.2); null before ratification (the pilot)
+    frozenSurfaceDigest,
     runCacheDir: join(REPO_ROOT, "data", "bench-run-caches"),
     runsLog,
-    frozenSurfaceDigest,
     client: metaClient,
     makeClient: (db) => new GithubClient({ githubHost: cfg.githubHost, db, tempRoot: benchRoot }),
     log,
@@ -1011,8 +1133,12 @@ const workloadFileName = (unitId: string): string => `${unitId.replace(/[^A-Za-z
 async function cmdPinCorpus(): Promise<void> {
   const releaseLock = acquireSingleWriterLock("pin-corpus");
   try {
+  assertNotRatified("pin-corpus");
   const cfg = loadBenchConfig(CONFIG_PATH);
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
+  log(`bench root: ${rt.benchRoot}`);
+  const snap = await readRateLimit(rt.gh);
+  log(`rate_limit headroom: core ${snap.core.remaining}, graphql ${snap.graphql.remaining}`);
   try {
     log(`bench root: ${rt.benchRoot}`);
     const snap = await readRateLimit(rt.gh);
@@ -1098,10 +1224,12 @@ function findUnitIn(corpus: Corpus, unitId: string): { slot: PerformanceSlot } {
 async function cmdPilot(): Promise<void> {
   const releaseLock = acquireSingleWriterLock("pilot");
   try {
+  assertNotRatified("pilot");
   const { cfg, corpus, workloads } = loadPinned();
   // the pilot runs BEFORE ratification exists, so its rows carry no frozen-surface digest
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads, null);
   try {
+    engine.writeManifest();
     const { walls, spread } = await engine.runPilot(0);
     const band = noiseBandFrom(cfg, spread);
     const pilot = {
@@ -1125,8 +1253,9 @@ async function cmdPilot(): Promise<void> {
 async function cmdDiagnostics(): Promise<void> {
   const releaseLock = acquireSingleWriterLock("diagnostics");
   try {
+  assertNotRatified("diagnostics");
   const { cfg, corpus, workloads } = loadPinned();
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
   try {
     const diagnostics = await acquisitionDiagnostics(rt, corpus, workloads);
     writeFileSync(join(ARTIFACTS, "acquisition-diagnostics.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), results: diagnostics }, null, 2)}\n`);
@@ -1281,7 +1410,7 @@ async function cmdFidelity(): Promise<void> {
   const { cfg, corpus, workloads } = loadPinned();
   // gate-relevant evidence rides the SAME §8 freeze gate as the matrix (codex R2 f.8)
   const { digest } = await assertRatifiedAndFrozen();
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
   let inFlight: { fixture: string; driver: string } | null = null;
   const fidelityLogPath = join(ARTIFACTS, "fidelity.jsonl");
   const results: Array<Record<string, unknown>> = [];
@@ -1609,34 +1738,8 @@ async function cmdFidelity(): Promise<void> {
   }
 }
 
-// ---- matrix resumability (codex R1 f.17), extracted PURE so CI can drive it ------------------
-// The frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7): R1 = a network-layer
-// failure outside any HTTP response, rerunnable unconditionally (≤1); R2 = a transient-5xx
-// exhaustion within caps whose request class SUCCEEDED in at least one other completed
-// repetition of this unit × driver. Secondary-shaped failures are NEVER rerunnable.
-export function evidenceIsRerunnable(ev: unknown, unitDriverKey: string, ledger: ReadonlySet<string>): boolean {
-  if (typeof ev !== "object" || ev === null) return false;
-  const e = ev as Record<string, unknown>;
-  // §4.5 amended 2026-08-02: a SETTLED network-shaped git-transport failure on one of the three
-  // network-facing operations is R1 — same ≤1 allowance pool as the HTTP shapes. Validated
-  // fail-closed against the frozen vocabularies INCLUDING the exact exitCode pairing the
-  // classifier can mint (timeout ⇔ the synthetic 124; the stderr-classified shapes ⇔ 128) —
-  // this predicate also re-decides from persisted rows on resume, so a hand-edited or foreign
-  // value must never widen the allowance.
-  if (e["kind"] === "git-transport") {
-    const opOk = e["op"] === "clone" || e["op"] === "scaffold-fetch" || e["op"] === "ls-remote-probe";
-    if (!opOk) return false;
-    if (e["networkClass"] === "timeout") return e["exitCode"] === 124; // R1
-    const classOk = e["networkClass"] === "dns" || e["networkClass"] === "tls"
-      || e["networkClass"] === "connect" || e["networkClass"] === "reset";
-    return classOk && e["exitCode"] === 128; // R1
-  }
-  if (e["kind"] !== "http") return false;
-  if (e["code"] === "no-response") return true; // R1
-  if ((e["code"] === "attempts-exhausted" || e["code"] === "http-failure") && e["lastClassification"] === "transient")
-    return ledger.has(`${unitDriverKey}|${typeof e["requestClass"] === "string" ? e["requestClass"] : ""}`); // R2
-  return false;
-}
+// ---- matrix resumability: the shared rule lives in benchProtocol (reconstructMatrixState +
+// evidenceIsRerunnable) so resume, scoring, and the live loop can never drift ---------------
 
 // The R6 epilogue's execution order (§4.5, amended 2026-08-02). The raw drifted-row filter
 // preserves frozen positions but DESTROYS the interleaving guarantee: remove the units that
@@ -1702,210 +1805,6 @@ export function orderEpilogueRows(
   return [...main, ...probe];
 }
 
-export interface ResumeState {
-  terminalPos: Set<number>;
-  rerunUsed: Set<string>; // unit|driver keys whose ≤1 R1/R2 allowance is spent
-  straddled: Set<string>; // units with a recorded R4 straddle (a second one halts)
-  // unit|driver|requestClass a completed rep SUCCEEDED on — wider than "a record classified ok":
-  // it is that rep's okRequestClasses, i.e. records classified ok/not-modified PLUS the frozen T1
-  // table's accepted class, which a partial-data 200 mints with every record classified fatal
-  // (see summarizeTraffic's tableAcceptedClasses), plus the implied rest-meta entry the
-  // reconstruction inserts for every completed rep's accounting read
-  successLedger: Set<string>;
-  driftedUnits: Set<string>;
-  resumeForms: Map<string, "production" | "scaffolding">;
-  // pos → unit|driver: a rerunnable unit-failure whose MANDATED in-slot R1/R2 replay (§4.5)
-  // never landed a row — the traversal owes it, it is not terminal
-  owedReplays: Map<number, string>;
-  // pos set whose LAST row is an R3/R4 invalidation: the in-slot replay §4.5 mandates is still
-  // owed, and the caller must dispatch it AS an r3r4 replay so its record carries the
-  // physical-predecessor bookkeeping ("a replay's physical predecessor is the failed attempt
-  // itself — recorded as such") — a resumed re-execution previously ran unmarked
-  owedInSlotReplays: Set<number>;
-  // non-null when the log's FINAL event is a run row whose washout marker never landed: the
-  // washout was interrupted, and the caller COMPLETES it (sleep, then append the marker)
-  // before executing anything — §4.5's separation is satisfied without re-running a transport
-  // attempt that already measured (an earlier design re-ran the row, which duplicated
-  // measurements and consumed budget for an owed IDLE period)
-  owedWashout: { pos: number; ms: number } | null;
-}
-
-// the identity a resume row must match — the frozen schedule's own row at that position
-export interface ScheduleRowIdentity {
-  unit: string;
-  driver: string;
-  rep: number;
-  probe: boolean;
-}
-
-const RESUME_OUTCOMES = new Set([
-  "complete", "unit-failure", "invalidated-straddle", "invalidated-foreign",
-  "invalidated-finalisation", "halt-r5-breach", "drift-restart", "re-pin-required",
-]);
-
-// Reconstruct the traversal state from runs.jsonl. The properties that matter beyond
-// bookkeeping:
-//   • every run row is validated against the FROZEN schedule's identity at its position —
-//     a parseable-but-wrong row (garbage unit/driver, an unknown outcome) must refuse, never
-//     silently terminalize a position it does not describe;
-//   • washout markers pair with run rows by LOG ORDER (a marker certifies the row it follows;
-//     the live engine appends row-then-marker before anything else runs, so at most the FINAL
-//     event may be an unmarked row). An interrupted washout is returned as owedWashout for the
-//     caller to COMPLETE (sleep + append the marker) — never a reason to re-run a transport
-//     attempt that already measured, which duplicated measurements and consumed budget for an
-//     owed idle period;
-//   • a unit-failure whose live traversal had decided an R1/R2 replay — and was then
-//     interrupted anywhere in the replay run — must NOT terminalize: the frozen §4.5 discipline
-//     mandated that replay. It is re-decided here with the SAME predicate over the ledger AS OF
-//     the failure's position (a completion recorded after it must not retroactively authorize —
-//     §4.5's "evaluated at failure time" is order-stable), so a live "no rerun" decision
-//     reconstructs identically and is never granted a replay resume-side;
-//   • two recorded R4 straddles on one unit mean the live traversal already halted for freeze
-//     repair — resume REFUSES rather than quietly executing a third attempt past that halt.
-export function reconstructResumeState(
-  lines: readonly string[],
-  currentDigest: string,
-  currentEnvHash: string,
-  schedule: ReadonlyMap<number, ScheduleRowIdentity>,
-): ResumeState {
-  const rowsAtPos = new Map<number, Array<Record<string, unknown>>>();
-  const straddleRows = new Map<string, number>();
-  const driftedUnits = new Set<string>();
-  const rerunUsed = new Set<string>();
-  const resumeForms = new Map<string, "production" | "scaffolding">();
-  const ledgerEntries: Array<{ pos: number; key: string; unit: string; epilogue: boolean }> = [];
-  let pendingUnmarked: { pos: number; rec: Record<string, unknown>; line: number } | null = null;
-  for (const [i, line] of lines.entries()) {
-    if (line.trim() === "") continue;
-    let rec: Record<string, unknown>;
-    try {
-      rec = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      // an unreadable line in the evidence log is freeze-repair territory: skipping it could
-      // silently drop a terminal halt-r5/re-pin row and resume straight past a frozen-
-      // assumption breach
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} is not valid JSON — the append-only evidence log is corrupted; that is §8 freeze-repair territory, never a silent skip`);
-    }
-    if (rec["type"] === "washout-done" && rec["phase"] === "matrix") {
-      // a marker certifies the row it follows — one with no unmarked row, or the wrong pos,
-      // describes a log the live engine cannot have written
-      if (pendingUnmarked === null || rec["pos"] !== pendingUnmarked.pos)
-        throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} carries a washout marker with no matching preceding run row — the evidence log violates the row/marker invariant`);
-      pendingUnmarked = null;
-      continue;
-    }
-    if (rec["type"] !== "run" || rec["phase"] !== "matrix") continue;
-    // resume only trusts records from THIS frozen measurement surface — rows from another
-    // surface/machine must not silently mix into one traversal (codex R2 f.21). The binding is
-    // the §8 CONTENT digest, not the commit: an evidence-only or test-only commit moves HEAD
-    // without changing the frozen surface, and must not orphan every prior row (the commit
-    // stays stamped per row as provenance).
-    if (rec["frozenSurfaceDigest"] !== currentDigest)
-      throw new Error(`REFUSING to resume: runs.jsonl carries matrix rows from frozen surface ${String(rec["frozenSurfaceDigest"]).slice(0, 12)} != current ${currentDigest.slice(0, 12)} — a changed measurement surface restarts the matrix (§8)`);
-    // one machine, one network, one credential for ALL timed data (§8) — a foreign
-    // environment's rows must never mix into this traversal (codex R3 f.2)
-    if (rec["envManifestHash"] !== currentEnvHash)
-      throw new Error(`REFUSING to resume: runs.jsonl carries rows from environment ${String(rec["envManifestHash"])} != current ${currentEnvHash}`);
-    const outcome = rec["outcome"];
-    if (outcome === "halt-r5-breach" || outcome === "re-pin-required")
-      throw new Error(`REFUSING to resume: runs.jsonl carries a terminal ${outcome} row — that is freeze-repair/amendment territory (§4.5 R5/R6), never a silent retry`);
-    if (typeof outcome !== "string" || !RESUME_OUTCOMES.has(outcome))
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} carries unknown outcome ${JSON.stringify(outcome)} — a row this scan cannot classify must not be skimmed past`);
-    const pos = rec["pos"];
-    if (typeof pos !== "number")
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} is a matrix run row with no numeric pos`);
-    // the row must describe the FROZEN schedule's own identity at its position — a garbage
-    // unit/driver would otherwise terminalize a position it does not describe
-    const expected = schedule.get(pos);
-    if (expected === undefined)
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} names pos ${pos}, which the frozen schedule does not contain`);
-    if (rec["unit"] !== expected.unit || rec["driver"] !== expected.driver || rec["rep"] !== expected.rep || rec["probe"] !== expected.probe)
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} at pos ${pos} does not match the frozen schedule row (${expected.unit} ${expected.driver} rep${expected.rep}${expected.probe ? " probe" : ""})`);
-    if (pendingUnmarked !== null)
-      throw new Error(`REFUSING to resume: runs.jsonl line ${i + 1} appends a run row while line ${pendingUnmarked.line} is still awaiting its washout marker — the evidence log violates the row/marker invariant`);
-    pendingUnmarked = { pos, rec, line: i + 1 };
-    const list = rowsAtPos.get(pos) ?? [];
-    list.push(rec);
-    rowsAtPos.set(pos, list);
-    const unit = expected.unit;
-    if (outcome === "invalidated-straddle") straddleRows.set(unit, (straddleRows.get(unit) ?? 0) + 1);
-    if (outcome === "drift-restart") driftedUnits.add(unit); // pending R6 epilogue survives interruption (f.20)
-    const form = rec["acquisitionForm"];
-    if (form === "scaffolding") resumeForms.set(unit, "scaffolding");
-    else if (form === "production" && !resumeForms.has(unit)) resumeForms.set(unit, "production");
-    // only R1/R2 replays charge the driver allowance; R3/R4 in-slot replays do not (f.23)
-    if (rec["replayKind"] === "r1r2") rerunUsed.add(`${unit}|${expected.driver}`);
-    if (outcome === "complete") {
-      // §4.5 R2 needs classes that SUCCEEDED — `requests` counts recorded non-cache, non-rest-meta attempts including
-      // failures (a completed run can carry a class that only ever failed, e.g. every batch
-      // drained to fallback), so the ledger reads the ok-classes field
-      const okClasses = rec["okRequestClasses"];
-      for (const cls of Array.isArray(okClasses) ? okClasses.filter((c): c is string => typeof c === "string") : [])
-        ledgerEntries.push({ pos, key: `${unit}|${expected.driver}|${cls}`, unit, epilogue: rec["epilogue"] === true });
-      // every completed run READ rate_limit successfully before and after (its accounting
-      // depends on it), but rest-meta is control-plane and excluded from `requests` — without
-      // this implied entry a pre-run rate_limit exhaustion could never satisfy R2's
-      // prior-success predicate and became a permanent G3 failure
-      ledgerEntries.push({ pos, key: `${unit}|${expected.driver}|rest-meta`, unit, epilogue: rec["epilogue"] === true });
-    }
-  }
-  // §4.5 R4: the SECOND straddle on a unit halts the matrix for freeze repair — a log carrying
-  // two straddle rows records a traversal that already halted; resume must not run a third
-  for (const [unit, n] of straddleRows) {
-    if (n >= 2)
-      throw new Error(`REFUSING to resume: runs.jsonl records ${n} R4 straddles on ${unit} — the second one halted the matrix for freeze repair (§4.5); never a silent third attempt`);
-  }
-  const straddled = new Set(straddleRows.keys());
-  // a drifted unit's form is scaffolding regardless of what its pre-drift rows recorded
-  for (const unit of driftedUnits) resumeForms.set(unit, "scaffolding");
-  // drift may have landed AFTER a completion entered the ledger above — a drifted unit's
-  // non-epilogue reps are discarded and their evidence with them
-  const filteredLedger = ledgerEntries.filter((e) => !driftedUnits.has(e.unit) || e.epilogue);
-  const successLedger = new Set(filteredLedger.map((e) => e.key));
-  const ledgerBefore = (pos: number): Set<string> => new Set(filteredLedger.filter((e) => e.pos < pos).map((e) => e.key));
-
-  // the final event may legitimately be an unmarked row: its washout was interrupted and is
-  // OWED — the caller completes it before executing anything
-  const washoutMsOf = (rec: Record<string, unknown>): number => {
-    const v = rec["washoutAppliedMs"];
-    return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
-  };
-  const owedWashout = pendingUnmarked === null ? null : { pos: pendingUnmarked.pos, ms: washoutMsOf(pendingUnmarked.rec) };
-
-  const terminalPos = new Set<number>();
-  const owedReplays = new Map<number, string>();
-  const owedInSlotReplays = new Set<number>();
-  for (const [pos, rows] of rowsAtPos) {
-    // a SECOND invalidated-finalisation at one position means the post-run accounting read is
-    // failing persistently — an unbounded silent retry class; the operator investigates
-    const finalisationFailures = rows.filter((r) => r["outcome"] === "invalidated-finalisation").length;
-    if (finalisationFailures >= 2)
-      throw new Error(`REFUSING to resume: pos ${pos} carries ${finalisationFailures} invalidated-finalisation rows — the post-run accounting is failing persistently; investigate before re-running`);
-    const last = rows[rows.length - 1]!;
-    const outcome = last["outcome"] as string;
-    if (outcome === "invalidated-straddle" || outcome === "invalidated-foreign") {
-      // the §4.5 in-slot replay is owed AND must carry its replay bookkeeping when dispatched
-      owedInSlotReplays.add(pos);
-      continue;
-    }
-    if (outcome !== "complete" && outcome !== "unit-failure") continue; // finalisation/drift rows never terminalize
-    const unit = last["unit"] as string;
-    if (driftedUnits.has(unit) && last["epilogue"] !== true) continue; // discarded main reps; the epilogue re-runs them (f.4)
-    // the owed-replay reconstruction applies to EPILOGUE failures of drifted units too — an
-    // interrupt during an epilogue R1/R2 replay must not forfeit it (the ledger already keeps
-    // only the drifted unit's epilogue evidence)
-    if (outcome === "unit-failure" && (!driftedUnits.has(unit) || last["epilogue"] === true)) {
-      const key = `${unit}|${last["driver"] as string}`;
-      if (!rerunUsed.has(key) && evidenceIsRerunnable(last["failureEvidence"], key, ledgerBefore(pos))) {
-        owedReplays.set(pos, key);
-        continue;
-      }
-    }
-    terminalPos.add(pos);
-  }
-  return { terminalPos, rerunUsed, straddled, successLedger, driftedUnits, resumeForms, owedReplays, owedInSlotReplays, owedWashout };
-}
-
 async function cmdMatrix(): Promise<void> {
   // the lock comes FIRST — the pre-lock window previously ran workload parsing and the freeze
   // gate's git scans concurrently with whatever held the lock
@@ -1916,71 +1815,79 @@ async function cmdMatrix(): Promise<void> {
   const { digest } = await assertRatifiedAndFrozen();
   const { engine, benchRoot } = await makeEngine(cfg, corpus, workloads, digest);
   try {
+    // ---- resumability: reconstruct terminal state from runs.jsonl via the SHARED rule ------
+    // (benchProtocol.reconstructMatrixState — the same function the scoring reader uses, so
+    // resume and scoring can never disagree; codex R1 f.17 / R2 f.21 / R3 f.2-f.4 semantics
+    // live inside it, plus the Step-C residual repairs: attempt-keyed markers, the persisted
+    // washout horizon, straddle COUNTS, and interrupted-rerun recovery)
     const runsPath = join(ARTIFACTS, "runs.jsonl");
-    let terminalPos = new Set<number>();
-    let rerunUsed = new Set<string>();
-    let straddled = new Set<string>();
-    let successLedger = new Set<string>();
-    let driftedUnits = new Set<string>();
-    let owedReplays = new Map<number, string>();
-    let owedInSlotReplays = new Set<number>();
-    if (existsSync(runsPath)) {
-      const scheduleByPos = new Map(cfg.schedule.rows.map((r) => [r.pos, { unit: r.unit, driver: r.driver, rep: r.rep, probe: r.probe }]));
-      const state = reconstructResumeState(
-        readFileSync(runsPath, "utf8").split("\n"),
-        digest,
-        engine.envManifestHashValue(),
-        scheduleByPos,
-      );
-      ({ terminalPos, rerunUsed, straddled, successLedger, driftedUnits, owedReplays, owedInSlotReplays } = state);
-      if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
-      if (owedReplays.size > 0) log(`resuming: ${owedReplays.size} owed R1/R2 replay(s) reconstructed from the log`);
-      engine.restoreUnitForms(state.resumeForms);
-      if (state.owedWashout !== null) {
-        // the last recorded run's washout was interrupted: complete the owed IDLE period and
-        // append its marker — never re-run a transport attempt that already measured (§4.5's
-        // separation is about idle time, not repetition)
-        const sched = scheduleByPos.get(state.owedWashout.pos)!;
-        const ms = Math.max(cfg.protocol.washoutFloorMs, state.owedWashout.ms);
-        log(`completing the interrupted washout for pos ${state.owedWashout.pos} (${Math.ceil(ms / 1000)}s) before resuming (§4.5)`);
-        await new Promise((r) => setTimeout(r, ms));
-        engine.appendLogMarker({ type: "washout-done", pos: state.owedWashout.pos, rep: sched.rep, probe: sched.probe, phase: "matrix", unit: sched.unit, driver: sched.driver });
-      }
+    const state = reconstructMatrixState(
+      existsSync(runsPath) ? readFileSync(runsPath, "utf8").split("\n") : [],
+      { envManifestHash: engine.envManifestHashValue(), frozenSurfaceDigest: digest },
+      new Map(cfg.schedule.rows.map((r) => [r.pos, { unit: r.unit, driver: r.driver, rep: r.rep, probe: r.probe }])),
+    );
+    const { terminalPos, rerunUsed, straddleCounts, driftedUnits, successLedger, pendingReplays } = state;
+    if (terminalPos.size > 0) log(`resuming: ${terminalPos.size} scheduled positions already terminal in runs.jsonl`);
+    engine.writeManifest(); // only after reconstruction ACCEPTED the log's identity (codex C0-R1 f.18)
+    engine.restoreUnitForms(state.resumeForms);
+    // an interrupted washout owes its REMAINING horizon before anything re-runs (residual 2)
+    const owedMs = state.pendingWashoutUntilMs - Date.now();
+    if (owedMs > 0) {
+      log(`restoring an interrupted washout: sleeping ${Math.ceil(owedMs / 1000)}s to the recorded horizon`);
+      await new Promise((r) => setTimeout(r, owedMs));
     }
+    // a recorded attempt whose marker never landed is EVIDENCE owed its transition, not a
+    // do-over: append the missing marker, then terminalize or replay it under the frozen
+    // rules — a crash mid-washout must not launder a non-rerunnable failure into a retry
+    // (codex C0-R1 finding 1)
+    for (const transition of state.pendingTransitions) {
+      engine.appendPendingWashoutMarker(transition.row);
+      applyPendingTransition(state, transition);
+      log(`restored the interrupted washout transition at pos ${transition.pos} (${String(transition.row["outcome"])}${state.pendingReplays.get(transition.pos) === "r1r2" ? " → R1/R2 replay owed" : state.pendingReplays.get(transition.pos) === "r3r4" ? " → in-slot replay owed" : " → terminal"})`);
+    }
+    // the frozen R1/R2 predicate over TYPED evidence (§4.5; codex R1 f.7), shared with the
+    // reconstruction: R1 = a network-layer failure outside any HTTP response, rerunnable
+    // unconditionally (≤1); R2 = a transient-5xx exhaustion within caps whose request class
+    // SUCCEEDED in at least one other completed repetition of this unit × driver.
+    // Secondary-shaped failures are NEVER rerunnable.
     const isRerunnable = (record: import("./benchProtocol.ts").RunRecord): boolean =>
       evidenceIsRerunnable(record.failureEvidence, `${record.unit}|${record.driver}`, successLedger);
     const executeRows = async (rows: NonNullable<typeof cfg.schedule>["rows"], phaseNote: string): Promise<void> => {
       for (const row of rows) {
         if (terminalPos.has(row.pos) && phaseNote === "main") continue;
         if (driftedUnits.has(row.unit) && phaseNote === "main") continue; // discarded reps; the epilogue re-runs the whole unit
-        if (owedInSlotReplays.has(row.pos)) {
-          // the pre-interrupt traversal's R3/R4 in-slot replay: dispatch it WITH its replay
-          // bookkeeping so the record names its physical predecessor (§4.5)
-          owedInSlotReplays.delete(row.pos);
-          engine.setReplayOf(row.pos, "r3r4");
-          log(`resuming the owed in-slot (R3/R4) replay at pos ${row.pos}`);
+        // a crash-interrupted replay decision resumes AS the replay it owed, with its physical
+        // predecessor linkage restored (§4.5's recorded-predecessor rule survives the crash)
+        const owed = pendingReplays.get(row.pos);
+        if (owed !== undefined) {
+          engine.setReplayOf(row.pos, owed);
+          pendingReplays.delete(row.pos);
         }
-        const owedKey = owedReplays.get(row.pos);
-        if (owedKey !== undefined) {
-          // the pre-interrupt traversal decided this R1/R2 replay (§4.5's evaluated-at-failure-
-          // time predicate, reconstructed identically by reconstructResumeState) — execute it
-          // with the same bookkeeping the live decision would have used
-          owedReplays.delete(row.pos);
-          rerunUsed.add(owedKey);
-          engine.setReplayOf(row.pos, "r1r2");
-          log(`resuming the owed R1/R2 replay for ${owedKey} at pos ${row.pos}`);
-        }
+        // the control-plane replay cap is DURABLE and SINGLE-SOURCED: the reconstructed map
+        // is the only counter, live facts advance IT, and the guard runs BEFORE another
+        // physical attempt — neither a process restart nor a same-invocation R6 epilogue
+        // re-entry can reset it (codex C0-R1 finding 3; C0-R4 finding 2)
         for (;;) {
+          const controlPlaneCount = state.controlPlaneCounts.get(row.pos) ?? 0;
+          if (controlPlaneCount > 2)
+            throw new Error(`control-plane failure recorded ${controlPlaneCount}× at pos ${row.pos} — fix connectivity, then resume (the recorded rows stay; §4.5's in-slot replay discipline)`);
           const handle = await engine.runOne(row, "matrix");
           const key = `${row.unit}|${row.driver}`;
+          // live counters advance from the recorded FACTS, unconditionally, before any
+          // outcome branch — a straddle or control-plane failure that lost the outcome
+          // precedence still counts toward its cap (codex C0-R3 finding 5)
+          if (handle.record.straddledReset) {
+            const count = (straddleCounts.get(row.unit) ?? 0) + 1;
+            straddleCounts.set(row.unit, count);
+            if (count >= 2) throw new Error(`R4 recurred on ${row.unit} (${count} straddles) — halt for freeze repair (plan §4.5)`);
+          }
+          if (handle.record.controlPlaneFailed) state.controlPlaneCounts.set(row.pos, (state.controlPlaneCounts.get(row.pos) ?? 0) + 1);
           if (handle.record.outcome === "complete") {
             for (const cls of handle.record.okRequestClasses) successLedger.add(`${key}|${cls}`); // §4.5 R2: SUCCESSFUL classes only
             successLedger.add(`${key}|rest-meta`); // implied: a completed run's accounting read rate_limit successfully
             break;
           }
           if (handle.record.outcome === "invalidated-straddle") {
-            if (straddled.has(row.unit)) throw new Error(`R4 recurred on ${row.unit} — halt for freeze repair (plan §4.5)`);
-            straddled.add(row.unit);
             log(`R4 straddle on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
             engine.setReplayOf(row.pos, "r3r4");
             continue;
@@ -1988,6 +1895,14 @@ async function cmdMatrix(): Promise<void> {
           if (handle.record.outcome === "invalidated-foreign") {
             // R3: verified external interference — replay in slot, never charged to the driver
             log(`R3 foreign consumption on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
+            engine.setReplayOf(row.pos, "r3r4");
+            continue;
+          }
+          if (handle.record.outcome === "invalidated-control-plane") {
+            // a rate_limit snapshot failed (residual 3): run invalid, replay in slot, never
+            // charged to the driver — the loop-top durable guard bounds the retries (the
+            // counter advanced from the fact above)
+            log(`control-plane invalidation on ${row.unit} ${row.driver} rep${row.rep} — replaying in its own slot`);
             engine.setReplayOf(row.pos, "r3r4");
             continue;
           }
@@ -2058,8 +1973,9 @@ async function cmdMatrix(): Promise<void> {
 async function cmdRefreshEvidence(): Promise<void> {
   const releaseLock = acquireSingleWriterLock("refresh-evidence");
   try {
+  assertNotRatified("refresh-evidence");
   const { cfg, corpus } = loadPinned();
-  const rt = makePinRuntime(cfg);
+  const rt = await makePinRuntime(cfg);
   try {
     const c3 = corpus.performance.find((s) => s.slot === "C3")!;
     const c3unit = c3.units[0]!;
@@ -2151,6 +2067,280 @@ async function cmdRefreshEvidence(): Promise<void> {
   }
 }
 
+// ---- Step-C executors (scoring reader, report, and the informational evidence probes) --------
+// git-object readers for the evidence loaders: existence decided via cat-file -e (never the
+// index), content via show, everything else fail-closed (codex C0-R3 findings 1/2).
+async function gitObjectText(rev: string, rel: string): Promise<string | null> {
+  const repoRoot = realpathSync(REPO_ROOT);
+  const env = buildGitEnv(process.env, "/dev/null");
+  const gitRO = (argv: string[], maxStdoutBytes: number): ReturnType<typeof runBenchGit> => runBenchGit({
+    argv, lane: { lane: "pinning" }, env, benchRoot: repoRoot, cwd: repoRoot,
+    limits: { maxStdoutBytes, maxStderrBytes: 4096, deadlineMs: 60_000 },
+  });
+  const exists = await gitRO(["cat-file", "-e", `${rev}:${rel}`], 4096);
+  if (exists.exitCode !== 0) {
+    const err = text(exists.stderr);
+    if (/does not exist|Not a valid object name|invalid object name|bad revision|path .* does not exist/i.test(err)) return null;
+    throw new Error(`cannot establish ${rev}:${rel}'s existence (${err.trim().slice(0, 160)}) — failing closed`);
+  }
+  const shown = await gitRO(["show", `${rev}:${rel}`], 512 * 1024 * 1024);
+  if (shown.exitCode !== 0) throw new Error(`cannot read ${rev}:${rel} (${text(shown.stderr).trim().slice(0, 160)}) — failing closed`);
+  return text(shown.stdout);
+}
+
+// The score bundle is loaded from COMMITTED evidence only (codex C0-R3 finding 2): the logs
+// are read as HEAD blobs — an uncommitted appended row is not evidence yet, and a fabricated
+// suffix can never reach the gates — and every frozen input (config, corpus, selected sets,
+// pilot, ratification) is read from the ROWS' OWN harness commit, so a post-hoc committed
+// edit to any of them cannot change what the recorded rows are scored against.
+async function loadScoreBundle(): Promise<{ bundle: ScoreBundle; rat: Record<string, unknown> }> {
+  const runsBlob = (await gitObjectText("HEAD", "docs/adrs/0001-benchmark/runs.jsonl")) ?? "";
+  const fidelityBlob = (await gitObjectText("HEAD", "docs/adrs/0001-benchmark/fidelity.jsonl")) ?? "";
+  const runsLines = runsBlob.split("\n");
+  // the CONTENT binding is the rows' frozen-surface digest; the harnessCommit is provenance —
+  // any row's commit supplies digest-identical frozen inputs (they are all digest inputs), so
+  // the FIRST row's commit is content-safe once the digest set is proven singular below and
+  // the loaded ratification's own recorded binding is cross-checked against it.
+  let harnessCommit: string | null = null;
+  const rowDigests = new Set<string>();
+  for (const line of runsLines) {
+    if (line.trim() === "") continue;
+    try {
+      const rec = JSON.parse(line) as Record<string, unknown>;
+      if (rec["type"] === "run" && rec["phase"] === "matrix") {
+        if (harnessCommit === null && typeof rec["harnessCommit"] === "string") harnessCommit = rec["harnessCommit"] as string;
+        rowDigests.add(String(rec["frozenSurfaceDigest"]));
+      }
+    } catch {
+      continue;
+    }
+  }
+  if (harnessCommit === null)
+    throw new Error("no COMMITTED matrix rows in HEAD:runs.jsonl — commit the evidence log first (scoring reads committed blobs only; codex C0-R3 finding 2)");
+  if (rowDigests.size !== 1)
+    throw new Error(`committed matrix rows span ${rowDigests.size} frozen-surface digests — §8 requires one frozen surface for all timed data; a re-frozen matrix starts a fresh log`);
+  const rowsDigest = [...rowDigests][0]!;
+  const showAt = async (rel: string): Promise<string> => {
+    const content = await gitObjectText(harnessCommit, rel);
+    if (content === null)
+      throw new Error(`${rel} is absent at the rows' harness commit ${harnessCommit.slice(0, 12)} — the frozen inputs must ride the same revision as the rows. If that commit was rewritten away by a restack, restore resolvability via the evidence archive tag (e.g. archive/step-c-pre-restack) instead of re-scoring against a different revision`);
+    return content;
+  };
+  const cfg = parseBenchConfig(await showAt("docs/adrs/0001-benchmark/bench-config.json"));
+  const corpus = loadCorpus(await showAt("docs/adrs/0001-benchmark/corpus.json"));
+  const workloads = new Map<string, UnitWorkload>();
+  for (const slot of corpus.performance) {
+    for (const unit of slot.units) {
+      workloads.set(unit.unitId, parseUnitWorkload(await showAt(`docs/adrs/0001-benchmark/selected/${workloadFileName(unit.unitId)}`)));
+    }
+  }
+  const rat = JSON.parse(await showAt("docs/adrs/0001-benchmark/ratification.json")) as Record<string, unknown>;
+  const noiseBand = rat["noiseBand"];
+  if (typeof noiseBand !== "number") throw new Error("ratification.json carries no numeric noiseBand");
+  // the band is not taken on faith (codex C0-R1 finding 12): it must equal pilot.json's
+  // calibrated value AND re-derive, from the RECOMPUTED spread over the recorded walls,
+  // under the frozen §4.7 formula (codex C0-R2 re f.12)
+  const pilot = JSON.parse(await showAt("docs/adrs/0001-benchmark/pilot.json")) as { noiseBand?: number; pilotSpread?: number; wallsMs?: number[] };
+  if (noiseBand !== pilot.noiseBand)
+    throw new Error(`ratification.json noiseBand (${noiseBand}) != pilot.json's calibrated band (${String(pilot.noiseBand)})`);
+  const walls = pilot.wallsMs;
+  if (!Array.isArray(walls) || walls.length === 0 || walls.some((w) => typeof w !== "number" || w <= 0))
+    throw new Error("pilot.json carries no usable wallsMs — the band cannot be re-derived");
+  const recomputedSpread = Number((Math.max(...walls) / Math.min(...walls)).toFixed(4));
+  if (recomputedSpread !== pilot.pilotSpread)
+    throw new Error(`pilot.json's declared spread ${String(pilot.pilotSpread)} != ${recomputedSpread} recomputed from its own walls`);
+  if (noiseBandFrom(cfg, recomputedSpread) !== noiseBand)
+    throw new Error(`the ratified band ${noiseBand} does not re-derive from the recomputed pilot spread ${recomputedSpread} under the frozen formula`);
+  const ratifiedDigest = rat["frozenSurfaceDigest"];
+  if (typeof ratifiedDigest !== "string" || ratifiedDigest.length === 0)
+    throw new Error("ratification.json carries no frozenSurfaceDigest — scoring cannot scope the fidelity ledger");
+  // fail-closed content check: the commit that supplies the frozen inputs must RECORD the very
+  // digest the rows are stamped with — a commit whose recorded binding differs cannot be the
+  // surface those rows ran under, whatever its id says (the commit is provenance, never the
+  // binding)
+  if (ratifiedDigest !== rowsDigest)
+    throw new Error(`the rows are stamped with frozen-surface digest ${rowsDigest.slice(0, 12)}… but the ratification at their harness commit records ${ratifiedDigest.slice(0, 12)}… — the frozen inputs at that commit are not the surface the rows ran under; refuse rather than mis-score`);
+  return {
+    bundle: { cfg, corpus, workloads, runsLines, fidelityLines: fidelityBlob.split("\n"), noiseBand, ratifiedDigest },
+    rat,
+  };
+}
+
+// per-stream/leg cold cache DBs for the probes — same containment rules as the engine's run
+// caches (a §0-permitted ./data root; never the production sqlite path; removed on dispose)
+function makeProbeDbFactory(): { makeDb: (name: string) => AuditDb; disposeDb: (db: AuditDb, name: string) => void } {
+  const cacheDir = join(REPO_ROOT, "data", "bench-run-caches");
+  mkdirSync(cacheDir, { recursive: true });
+  const paths = new Map<string, string>();
+  return {
+    makeDb: (name) => {
+      const p = join(cacheDir, `probe-${name}-${process.pid}-${Date.now()}.sqlite`);
+      paths.set(name, p);
+      return AuditDb.open({ sqlitePath: p, fresh: true, purgeCache: true });
+    },
+    disposeDb: (db, name) => {
+      try {
+        db.close();
+      } catch {
+        // a close failure must not mask the probe outcome; the removal below still runs
+      }
+      const p = paths.get(name);
+      if (p !== undefined) for (const sfx of ["", "-wal", "-shm"]) rmSync(`${p}${sfx}`, { force: true });
+    },
+  };
+}
+
+function renderScoreToLog(out: ScoreOutput): void {
+  log(`identity: harness ${out.identity.harnessCommit.slice(0, 12)}, env ${out.identity.envManifestHash}, band ${out.noiseBand}`);
+  for (const g of out.gates) {
+    log(`${g.driver}: G1 ${g.g1}, G2 ${g.g2}, G3 ${g.g3}, G4 ${g.g4} (${g.g4AttributableSignals} attributable signals) → ${g.eligible ? "ELIGIBLE" : "ineligible"}`);
+    for (const r of g.reasons.slice(0, 6)) log(`    ${r}`);
+  }
+  for (const cell of out.cells) {
+    if (cell.medianT === null) continue;
+    log(`  ${cell.unit} ${cell.driver}: median T ${cell.medianT.toFixed(1)} files/h (worst ${(cell.worstT ?? 0).toFixed(1)}); @15k median ${(cell.medianT15k ?? 0).toFixed(1)} (worst ${(cell.worstT15k ?? 0).toFixed(1)})`);
+  }
+  log(`§4.7 case: ${out.caseMapping.kind}${out.caseMapping.recommendation !== null ? ` → recommend ${out.caseMapping.recommendation}` : ""}`);
+}
+
+async function cmdScore(): Promise<void> {
+  await assertEvidenceReadable();
+  const { bundle } = await loadScoreBundle();
+  renderScoreToLog(scoreMatrix(bundle));
+}
+
+async function cmdReport(): Promise<void> {
+  await assertEvidenceReadable();
+  const { bundle, rat } = await loadScoreBundle();
+  const score = scoreMatrix(bundle);
+  const envManifests: Array<Record<string, unknown>> = [];
+  for (const line of bundle.runsLines) {
+    if (line.trim() === "") continue;
+    try {
+      const rec = JSON.parse(line) as Record<string, unknown>;
+      if (rec["type"] === "env-manifest") envManifests.push(rec);
+    } catch {
+      continue;
+    }
+  }
+  const ratified = String(rat["frozenSurfaceDigest"] ?? "");
+  const readJson = async (name: string): Promise<Record<string, unknown> | null> => {
+    // informational artifacts are read as COMMITTED HEAD blobs, exactly like the evidence
+    // logs — the report says "committed as <artifact>", so a worktree-only or edited copy
+    // must never be presented as committed evidence (codex C0-R4 finding 1)
+    const content = await gitObjectText("HEAD", `docs/adrs/0001-benchmark/${name}`);
+    if (content === null) return null;
+    const artifact = JSON.parse(content) as Record<string, unknown>;
+    // every informational artifact must carry the SAME ratified stamp as the matrix evidence —
+    // a report must never present artifacts from different freezes under one digest (codex
+    // C0-R1 finding 16)
+    if (artifact["frozenSurfaceDigest"] !== ratified)
+      throw new Error(`${name} is stamped ${String(artifact["frozenSurfaceDigest"]).slice(0, 12)}… but the ratified digest is ${ratified.slice(0, 12)}… — regenerate it under the current freeze or leave it out`);
+    return artifact;
+  };
+  const live = frozenSurfaceDigest();
+  // the report is a pure reader (§8's carve-out) so a changed tree only WARNS — but the stamp
+  // is always the ratified digest the evidence actually bound to, never the live tree's
+  if (live !== ratified) log(`WARNING: live tree digest ${live.slice(0, 12)}… != ratified ${ratified.slice(0, 12)}… — report stamps the ratified digest`);
+  const md = buildReport({
+    score, cfg: bundle.cfg, corpus: bundle.corpus, ratification: rat, envManifests,
+    frozenSurfaceDigest: ratified,
+    boundary: await readJson("boundary-probe.json"),
+    concurrency: await readJson("concurrency-probe.json"),
+    option3: await readJson("option3.json"),
+    generatedAtIso: new Date().toISOString(),
+  });
+  writeFileSync(join(ARTIFACTS, "report.md"), md);
+  log(`report.md written — §4.7 output: ${score.caseMapping.kind}${score.caseMapping.recommendation !== null ? ` → ${score.caseMapping.recommendation}` : ""}`);
+}
+
+async function cmdBoundaryProbe(): Promise<void> {
+  const { cfg, corpus } = loadPinned();
+  const { digest } = await assertRatifiedAndFrozen();
+  const rt = await makePinRuntime(cfg);
+  try {
+    const c2 = corpus.performance.find((s) => s.slot === "C2") ?? ((): never => {
+      throw new Error("no pinned C2 slot");
+    })();
+    const unit = c2.units[0]!;
+    log(`boundary probe on ${c2.owner}/${c2.repo}@${unit.sha.slice(0, 12)} (the pinned mid-size C2 unit, §4.4)`);
+    const json = await rt.client.restGetJson(`repos/${encodeURIComponent(c2.owner)}/${encodeURIComponent(c2.repo)}/git/trees/${unit.treeOid}?recursive=1`, { immutable: true });
+    const tree = parseTreeResponse(json, "boundary-tree", unit.treeOid);
+    if (tree.truncated) throw new Error("C2's REST tree is truncated — the boundary probe's planning source is gone");
+    const blobs = tree.paths.filter((e) => e.type === "blob" && typeof e.size === "number").map((e) => ({ path: e.path, oid: e.sha, size: e.size as number }));
+    const cells = planBoundaryCells(blobs);
+    const probeRun = await runBoundaryProbe(
+      { gh: rt.gh, cfg, owner: c2.owner, repo: c2.repo, sha: unit.sha, objectFormat: c2.objectFormat, log, now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) },
+      cells,
+    );
+    writeFileSync(join(ARTIFACTS, "boundary-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, repo: `${c2.owner}/${c2.repo}`, sha: unit.sha, bucketBefore: probeRun.before, bucketAfter: probeRun.after, finalWashoutMs: probeRun.finalWashoutMs, cells: probeRun.cells }, null, 2)}\n`);
+    log("boundary-probe.json written — informational, not scored (§4.4)");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+}
+
+async function cmdConcurrencyProbe(): Promise<void> {
+  const { cfg, corpus, workloads } = loadPinned();
+  const { digest } = await assertRatifiedAndFrozen();
+  const rt = await makePinRuntime(cfg);
+  const { makeDb, disposeDb } = makeProbeDbFactory();
+  try {
+    const blocks = await runConcurrencyProbe({
+      cfg, corpus, workloads, client: rt.client, makeDb, disposeDb,
+      benchRoot: rt.benchRoot, gitEnv: rt.gitEnv, log, now: Date.now,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
+    writeFileSync(join(ARTIFACTS, "concurrency-probe.json"), `${JSON.stringify({ generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, streams: 4, drivers: blocks }, null, 2)}\n`);
+    log("concurrency-probe.json written — reported, not scored (§4.5)");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+}
+
+async function cmdOption3(): Promise<void> {
+  const { cfg, corpus, workloads } = loadPinned();
+  const { digest } = await assertRatifiedAndFrozen();
+  const duplication = analyzeOidDuplication(corpus, workloads);
+  // the warm scenario runs on the §4.7 rule's recommended driver when one exists, else on both
+  // finalists (plan §4.4) — scoring is a pure reader over runs.jsonl, so consult it
+  let drivers: DriverId[] = ["T1", "T2c"];
+  let driversRationale = "no §4.7 recommendation — both finalists (plan §4.4)";
+  try {
+    const { bundle } = await loadScoreBundle();
+    const score = scoreMatrix(bundle);
+    if (score.caseMapping.recommendation !== null) {
+      drivers = [score.caseMapping.recommendation];
+      driversRationale = `§4.7 rule output ${score.caseMapping.kind} → ${score.caseMapping.recommendation}`;
+    }
+  } catch (e) {
+    log(`scoring unavailable (${e instanceof Error ? e.message.slice(0, 120) : String(e)}) — running both finalists`);
+  }
+  log(`option3 warm-scenario drivers: ${drivers.join(", ")} (${driversRationale})`);
+  const c1 = corpus.performance.find((s) => s.slot === "C1") ?? ((): never => {
+    throw new Error("no pinned C1 slot");
+  })();
+  const advanced = workloads.get(c1.units[0]!.unitId) ?? ((): never => {
+    throw new Error("no pinned C1-main workload");
+  })();
+  const rt = await makePinRuntime(cfg);
+  const { makeDb, disposeDb } = makeProbeDbFactory();
+  try {
+    const warm = await runOption3WarmScenario({
+      cfg, corpus, advancedWorkload: advanced, client: rt.client, makeDb, disposeDb,
+      benchRoot: rt.benchRoot, gitEnv: rt.gitEnv, drivers, log, now: Date.now,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
+    writeFileSync(join(ARTIFACTS, "option3.json"), `${JSON.stringify({
+      generatedAtIso: new Date().toISOString(), frozenSurfaceDigest: digest, driversRationale,
+      duplication, warmScenario: warm, cloneCompositionStatement: CLONE_COMPOSITION_STATEMENT,
+    }, null, 2)}\n`);
+    log("option3.json written — the compositional analysis, reported alongside the matrix (§4.4)");
+  } finally {
+    rmSync(rt.benchRoot, { recursive: true, force: true });
+  }
+}
+
 async function cmdVerifyCorpus(): Promise<void> {
   const { corpus, workloads } = loadPinned();
   log(`corpus pinned ${corpus.pinnedAtIso} by ${corpus.pinnedByLogin}`);
@@ -2175,13 +2365,18 @@ async function main(): Promise<void> {
     case "fidelity": return cmdFidelity();
     case "refresh-evidence": return cmdRefreshEvidence();
     case "matrix": return cmdMatrix();
+    case "score": return cmdScore();
+    case "report": return cmdReport();
+    case "boundary-probe": return cmdBoundaryProbe();
+    case "concurrency-probe": return cmdConcurrencyProbe();
+    case "option3": return cmdOption3();
     case "verify-corpus": return cmdVerifyCorpus();
     case "digest": {
       log(frozenSurfaceDigest()); // the §8 freeze binding ratification.json records
       return;
     }
     default:
-      log("usage: bun run bench:content <pin-corpus | refresh-evidence | diagnostics | verify-corpus | digest | budget | pilot | fidelity | matrix>");
+      log("usage: bun run bench:content <pin-corpus | refresh-evidence | diagnostics | verify-corpus | digest | budget | pilot | matrix | fidelity | boundary-probe | concurrency-probe | option3 | score | report>");
       process.exitCode = 2;
   }
 }
