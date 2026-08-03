@@ -1027,6 +1027,36 @@ describe("parseGraphqlEnvelope / parseTreeResponse (pure)", () => {
     if (res.truncated) throw new Error("expected a non-truncated tree");
     expect(res.paths.map((p) => p.size)).toEqual([0, null]);
   });
+  // The malformed-envelope edges below were previously exercised through the retired
+  // fetchTreeRecursive describe; the PARSER is bench-retained (T0/T1 evaluate the REST-tree
+  // route by design), so its regression coverage is restored here as DIRECT parser cases.
+  test("non-object root / missing tree member / non-boolean truncated all fail closed", () => {
+    expect(() => parseTreeResponse("junk", "ep", null)).toThrow(/non-object response root/);
+    expect(() => parseTreeResponse({ truncated: false }, "ep", null)).toThrow(/tree member missing/);
+    expect(() => parseTreeResponse({ tree: [] }, "ep", null)).toThrow(/truncated flag missing/);
+    expect(() => parseTreeResponse({ truncated: "no", tree: [] }, "ep", null)).toThrow(/truncated flag missing or non-boolean/);
+  });
+  test("a mismatched root sha against the requested oid fails closed", () => {
+    const sha = "a".repeat(40);
+    expect(() => parseTreeResponse({ sha: "b".repeat(40), truncated: false, tree: [] }, "ep", sha)).toThrow(/does not match the requested tree oid/);
+  });
+  test("malformed entries fail closed: non-object, bad path, unknown type, non-hex sha, duplicate path", () => {
+    const entry = { path: "a.txt", type: "blob", sha: "a".repeat(40), size: 1 };
+    const body = (tree: unknown[]): Record<string, unknown> => ({ truncated: false, tree });
+    expect(() => parseTreeResponse(body(["junk"]), "ep", null)).toThrow(/not an object/);
+    expect(() => parseTreeResponse(body([{ ...entry, path: "../escape" }]), "ep", null)).toThrow(/non-canonical/);
+    expect(() => parseTreeResponse(body([{ ...entry, type: "wormhole" }]), "ep", null)).toThrow(/unknown entry type/);
+    expect(() => parseTreeResponse(body([{ ...entry, sha: "nope" }]), "ep", null)).toThrow(/sha missing or non-hex/);
+    expect(() => parseTreeResponse(body([entry, { ...entry }]), "ep", null)).toThrow(/duplicate path/);
+  });
+  test("a truncated:true listing returns the flag ALONE — junk entries beside it are never validated or consumed", () => {
+    expect(parseTreeResponse({ truncated: true, tree: ["junk"] }, "ep", null)).toEqual({ truncated: true });
+  });
+  test("a fractional or unsafe-integer size fails closed (would corrupt the downstream size gates)", () => {
+    const entry = { path: "a.txt", type: "blob", sha: "a".repeat(40) };
+    expect(() => parseTreeResponse({ truncated: false, tree: [{ ...entry, size: 1.5 }] }, "ep", null)).toThrow(/non-negative safe integer/);
+    expect(() => parseTreeResponse({ truncated: false, tree: [{ ...entry, size: -1 }] }, "ep", null)).toThrow(/non-negative safe integer/);
+  });
   test("a blob entry MISSING size fails closed — a null size would bypass the 2 MiB scan cap", () => {
     // unitPipeline skips only entries whose size EXCEEDS the cap; a null size sails through and the
     // (possibly huge) blob is fetched + scanned. Real GitHub always emits size for blobs, so require it.
@@ -3202,6 +3232,7 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     const gate = new Promise<void>((r) => (releaseHold = r));
     const sleeps: number[] = [];
     let fakeNow = 1_000_000_000_000;
+    const cloneStartTimes: number[] = [];
     const spawn: SpawnFn = async (_bin, args) => {
       if (args[0] === "api") {
         await gate; // the saturating one-shot spawn — holds the ONLY slot until released
@@ -3209,7 +3240,11 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
       }
       // argv-routed (never positional): at concurrency 1 the second clone legitimately
       // interleaves BETWEEN the first clone and its rev-parse
-      return args[0] === "clone" ? ok("") : ok(PIN + "\n");
+      if (args[0] === "clone") {
+        cloneStartTimes.push(fakeNow); // the REAL spawn instant on the fake clock
+        return ok("");
+      }
+      return ok(PIN + "\n");
     };
     const client = new GithubClient({
       githubHost: "github.com", spawnImpl: spawn, binPaths: BINS, tempRoot: TEST_TMP, concurrency: 1,
@@ -3228,6 +3263,9 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     await held;
     await Promise.all([c1, c2]);
     expect(sleeps).toEqual([200]); // the SECOND real start slept the spacing INSIDE its lease
+    // the REAL spawn instants — not merely the sleeps — are what the check claims about
+    expect(cloneStartTimes.length).toBe(2);
+    expect(cloneStartTimes[1]! - cloneStartTimes[0]!).toBeGreaterThanOrEqual(200);
   });
   test("check 9: clone RETRIES flow through the same gate — their starts are spaced too", async () => {
     const PIN = "a".repeat(40);
@@ -3240,6 +3278,21 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     // past on the advanced fake clock, so no second spacing sleep — the RETRY still consulted
     // the gate (ordering pinned by the sleeps: backoff only)
     expect(sleeps).toEqual([2000]);
+  });
+  test("rvo Q2: a MARKER-LESS STAGING dir is retained (a sibling mid-creation), a dead-owner staged orphan sweeps", () => {
+    const root = mkdtempSync(join(tmpdir(), "owned-stage-"));
+    const { client } = makeClient([], { tempRoot: root });
+    // mid-creation: the marker has not landed yet — deleting this would fail the sibling's publication
+    const midCreation = join(root, ".pkg-audit-stage-abc123");
+    mkdirSync(midCreation);
+    // crash orphan: staged, marked, owner long dead — reclaimed by the ownership rule
+    const orphan = join(root, ".pkg-audit-stage-dead99");
+    mkdirSync(orphan);
+    writeFileSync(join(orphan, ".pkg-audit-owner.json"), JSON.stringify({ pid: 999_999_999, startedAtIso: "2026-01-01T00:00:00Z" }));
+    const removed = client.sweepStaleTempDirs();
+    expect(removed).toEqual([".pkg-audit-stage-dead99"]);
+    expect(existsSync(midCreation)).toBe(true);
+    rmSync(root, { recursive: true, force: true });
   });
   test("rvo Q2: the sweep RETAINS a live-owner dir, removes dead-owner and marker-less dirs", () => {
     const root = mkdtempSync(join(tmpdir(), "owned-sweep-"));

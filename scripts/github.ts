@@ -2359,8 +2359,14 @@ export class GithubClient {
       while (attempts < CLONE_MAX_ATTEMPTS) {
         if (attempts > 0) {
           // transient-style backoff between attempts; a failed attempt may leave a partial
-          // dest, so the retry starts from a cleared destination
-          await this.sleep(this.backoffWait("transient", attempts - 1, null));
+          // dest, so the retry starts from a cleared destination. BOTH steps are guarded:
+          // a rejecting sleep or an uncleanable dest must stop the retrying WITHOUT replacing
+          // git's own diagnostic (lastFailure) as the surfaced error.
+          try {
+            await this.sleep(this.backoffWait("transient", attempts - 1, null));
+          } catch {
+            break;
+          }
           try {
             rmSync(dest, { recursive: true, force: true });
           } catch {
@@ -2445,7 +2451,8 @@ export class GithubClient {
     for (const name of entries) {
       // the swept namespace, PLUS crash-orphaned staging dirs (a staged dir always carries its
       // marker before anything else can happen to it, so the ownership rule below applies)
-      if (!name.startsWith("pkg-audit-") && !name.startsWith(STAGING_PREFIX)) continue;
+      const isStaging = name.startsWith(STAGING_PREFIX);
+      if (!name.startsWith("pkg-audit-") && !isStaging) continue;
       const full = join(this.tempRoot, name);
       let st;
       try {
@@ -2465,6 +2472,11 @@ export class GithubClient {
           // teardown owns them.
           const ownerPid = readOwnerPid(full);
           if (ownerPid !== null && ownerIsAlive(ownerPid)) continue;
+          // A MARKER-LESS staging dir is a sibling MID-CREATION (the marker lands one syscall
+          // after mkdtemp) — deleting it would fail the sibling's publication. Retain it; only
+          // a staged dir whose recorded owner is DEAD sweeps. The residue this accepts is an
+          // EMPTY staged dir per crash inside the two-syscall window — bytes, not clones.
+          if (isStaging && ownerPid === null) continue;
           rmSync(full, { recursive: true, force: true });
         } else {
           unlinkSync(full);
