@@ -6,7 +6,7 @@
 // `gh api -i` header parsing, the §4 rate-limit classes, api_cache integration (§3), the
 // hardened clone fallback (§0/§5.C), and the startup pkg-audit-* temp sweep.
 
-import { mkdtempSync, readdirSync, readFileSync, lstatSync, rmSync, unlinkSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, lstatSync, renameSync, rmSync, unlinkSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir, devNull } from "node:os";
 import { join } from "node:path";
 import {
@@ -1107,9 +1107,25 @@ export const CLONE_GATE_SPACING_MS = 200;
 // ---- owned temp-dir markers (ADR-0001 rvo Q2) ----------------------------------------------
 // Every pkg-audit-* dir this process creates is stamped with its owner; the startup sweep then
 // removes only UNOWNED (marker-less, legacy) or DEAD-OWNER dirs, never a live sibling audit's.
+// PUBLICATION IS ATOMIC: the dir is created under a dot-prefixed STAGING name the pkg-audit-*
+// sweep matcher never selects, the marker is written inside it, and only then is it renamed to
+// its final swept-namespace name — so no sweep can ever observe a marker-less dir that a live
+// sibling just created. A crash between mkdtemp and rename leaves a staged orphan, which the
+// sweep reclaims under the SAME ownership rule (see STAGING_PREFIX handling there).
 export const OWNER_MARKER_NAME = ".pkg-audit-owner.json";
+export const STAGING_PREFIX = ".pkg-audit-stage-";
 function writeOwnerMarker(dir: string): void {
   writeFileSync(join(dir, OWNER_MARKER_NAME), JSON.stringify({ pid: process.pid, startedAtIso: new Date().toISOString() }), { mode: 0o600 });
+}
+// Create an owned dir with the given final prefix (e.g. "pkg-audit-"): staged mkdtemp → marker
+// → atomic same-dir rename. Returns the FINAL path.
+function makeOwnedDir(root: string, finalPrefix: string): string {
+  const staged = mkdtempSync(join(root, STAGING_PREFIX));
+  writeOwnerMarker(staged);
+  const suffix = staged.slice(join(root, STAGING_PREFIX).length);
+  const final = join(root, `${finalPrefix}${suffix}`);
+  renameSync(staged, final);
+  return final;
 }
 // null = no readable/parseable marker (an unowned dir, swept); a number = the recorded owner pid.
 function readOwnerPid(dir: string): number | null {
@@ -1401,9 +1417,10 @@ export class GithubClient {
     assertReadOnlyGit(args);
     // §0: git itself is the only process allowed to run with cwd inside a clone.
     if (cwd !== undefined) assertContained(cwd, [this.tempRoot]);
-    // Clone DESTINATION containment lives HERE, not only in cloneShallow — the wrapper is the
-    // chokepoint, so no caller can aim a hardened-looking clone outside the temp root. The
-    // guard's grammar guarantees exactly two positionals: <url> <dest>.
+    // Clone DESTINATION containment lives HERE — the wrapper is the chokepoint, so no caller
+    // can aim a hardened-looking clone outside the temp root. The guard's grammar guarantees
+    // exactly two positionals: <url> <dest>. The URL is kept for the check-9 transport gate.
+    let cloneUrl: string | null = null;
     if (args[0] === "clone") {
       const positionals: string[] = [];
       for (let i = 1; i < args.length; i++) {
@@ -1416,6 +1433,7 @@ export class GithubClient {
       }
       const dest = positionals[1] ?? "";
       assertContained(dest, [this.tempRoot]);
+      cloneUrl = positionals[0] ?? "";
     }
     // The `--version` probe (§2 preflight — also --plan's ONLY git invocation) needs no
     // credential helper: point its global config at devNull instead of materializing the temp
@@ -1429,6 +1447,12 @@ export class GithubClient {
     // REST/GraphQL quota, so it sits OUTSIDE the rate-limit buckets — only the subprocess cap bounds it.
     const release = await this.sem.acquire();
     try {
+      // check 9: the per-repo transport gate runs INSIDE the semaphore lease, immediately
+      // before the spawn — gating before the acquire would let queued same-repo clones bunch
+      // the moment the semaphore frees (the stamp must BE the start). Sleeping the spacing
+      // while holding a slot is deadlock-free: the gate chain is FIFO and its head never
+      // waits on another slot holder.
+      if (cloneUrl !== null) await this.awaitCloneGate(cloneUrl);
       return await this.spawnBounded("git", this.bins.git, args, { env, cwd });
     } finally {
       release();
@@ -1483,8 +1507,21 @@ export class GithubClient {
         errReader = child.stderr.getReader();
       } catch (e) {
         // TRANSACTIONAL: a reader-acquisition failure after a successful launch must not
-        // orphan the child — kill-escalate it (no readers exist to cancel) and surface
+        // orphan the child — kill-escalate it (no readers exist to cancel), then hold the
+        // return BOUNDEDLY until it settles: the caller's failure path may delete the clone
+        // directory, and the killed child should be dead — not merely dying — first.
         killWithEscalation(child, []);
+        let settleTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          child.exited.then(
+            () => undefined,
+            () => undefined,
+          ),
+          new Promise<void>((resolve) => {
+            settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
+          }),
+        ]);
+        clearTimeout(settleTimer);
         throw e;
       }
       const kill = (): void => killWithEscalation(child, [outReader, errReader]);
@@ -2250,10 +2287,9 @@ export class GithubClient {
   // the SAME gh binary/auth the rest of the tool uses. Written once per client, contained.
   private ensureGitConfig(): string {
     if (this.gitConfigPath !== null) return this.gitConfigPath;
-    const dir = mkdtempSync(join(this.tempRoot, "pkg-audit-gitcfg-"));
+    const dir = makeOwnedDir(this.tempRoot, "pkg-audit-gitcfg-");
     const path = join(dir, "gitconfig");
     assertContained(path, [this.tempRoot]);
-    writeOwnerMarker(dir);
     // The `!` helper is a SHELL command — single-quote the gh path unconditionally (with
     // '\'' escaping) so spaces/metacharacters in the path can never be shell-interpreted.
     const ghBin = `'${this.bins.gh.replace(/'/g, `'\\''`)}'`;
@@ -2267,18 +2303,19 @@ export class GithubClient {
   }
 
   makeRunTempDir(): string {
-    const dir = mkdtempSync(join(this.tempRoot, "pkg-audit-"));
+    const dir = makeOwnedDir(this.tempRoot, "pkg-audit-");
     assertContained(dir, [this.tempRoot]);
-    writeOwnerMarker(dir);
     return dir;
   }
 
-  // ADR-0001 check 9 (§3.9): serialize clone starts per (host, org, repo) and space them at
-  // least CLONE_GATE_SPACING_MS apart. FIFO by chaining: each caller parks behind the previous
+  // ADR-0001 check 9 (§3.9): serialize clone starts per repository and space them at least
+  // CLONE_GATE_SPACING_MS apart. FIFO by chaining: each caller parks behind the previous
   // caller's promise, sleeps out any remaining spacing, stamps its own start, then releases
   // the next — so starts can never bunch, whatever fan-out or retry pressure produced them.
-  private async awaitCloneGate(org: string, repo: string): Promise<void> {
-    const key = `${this.githubHost}/${org.toLowerCase()}/${repo.toLowerCase()}`;
+  // Keyed by the clone URL (lowercased) — the one repository identity every clone argv
+  // carries at the chokepoint; retries reuse the same URL, so they share the same gate.
+  private async awaitCloneGate(cloneUrl: string): Promise<void> {
+    const key = cloneUrl.toLowerCase();
     let gate = this.cloneGates.get(key);
     if (gate === undefined) {
       gate = { lastStartMs: Number.NEGATIVE_INFINITY, chain: Promise.resolve() };
@@ -2333,10 +2370,9 @@ export class GithubClient {
             break;
           }
         }
-        // check 9: EVERY start — retries included — flows through the per-repo transport
-        // gate, IMMEDIATELY before the spawn (so the gate's stamp IS the start), keeping
-        // ≤15 ops/s/repo by construction whatever the fan-out or failure rate.
-        await this.awaitCloneGate(org, repo);
+        // (check 9's per-repo transport gate runs inside git()'s clone branch — INSIDE the
+        // semaphore lease, immediately before the spawn — so every start here, retries
+        // included, is gated where the start actually happens.)
         attempts++;
         const res = await this.git(args);
         if (res.exitCode === 0) {
@@ -2367,7 +2403,7 @@ export class GithubClient {
       return { dir: dest, cloneAttempts: attempts };
     } catch (e) {
       // reclaim the (possibly multi-GB, possibly partial) tree NOW rather than at the next
-      // startup sweep — best-effort, never masking the actionable error (cloneShallow's shape)
+      // startup sweep — best-effort, never masking the actionable error
       try {
         rmSync(runDir, { recursive: true, force: true });
       } catch (cleanupErr) {
@@ -2407,7 +2443,9 @@ export class GithubClient {
       return removed;
     }
     for (const name of entries) {
-      if (!name.startsWith("pkg-audit-")) continue;
+      // the swept namespace, PLUS crash-orphaned staging dirs (a staged dir always carries its
+      // marker before anything else can happen to it, so the ownership rule below applies)
+      if (!name.startsWith("pkg-audit-") && !name.startsWith(STAGING_PREFIX)) continue;
       const full = join(this.tempRoot, name);
       let st;
       try {

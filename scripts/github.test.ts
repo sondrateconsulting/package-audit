@@ -3193,6 +3193,42 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     // so the r2 start and the first r1 start see no live spacing window of their own)
     expect(sleeps).toEqual([200]);
   });
+  test("check 9: the gate spaces REAL starts even when the global semaphore was the bottleneck", async () => {
+    // Two same-repo clones queue behind a saturated semaphore. If the gate stamped BEFORE the
+    // acquire, both stamps would land while queued and the real spawns would bunch the moment
+    // the slot freed; gating INSIDE the lease forces the second REAL start to sleep the spacing.
+    const PIN = "a".repeat(40);
+    let releaseHold!: () => void;
+    const gate = new Promise<void>((r) => (releaseHold = r));
+    const sleeps: number[] = [];
+    let fakeNow = 1_000_000_000_000;
+    const spawn: SpawnFn = async (_bin, args) => {
+      if (args[0] === "api") {
+        await gate; // the saturating one-shot spawn — holds the ONLY slot until released
+        return ok(http(200, {}, "{}"));
+      }
+      // argv-routed (never positional): at concurrency 1 the second clone legitimately
+      // interleaves BETWEEN the first clone and its rev-parse
+      return args[0] === "clone" ? ok("") : ok(PIN + "\n");
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl: spawn, binPaths: BINS, tempRoot: TEST_TMP, concurrency: 1,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+        fakeNow += ms;
+      },
+      nowImpl: () => fakeNow,
+      env: { HOME: "/home/u", PATH: "/bin" },
+    });
+    const held = client.gh(["api", "rate_limit"]);
+    const c1 = client.cloneNoCheckout("o", "r", "main", PIN);
+    const c2 = client.cloneNoCheckout("o", "r", "main", PIN);
+    await new Promise((r) => setTimeout(r, 10)); // both clones are now queued on the semaphore
+    releaseHold();
+    await held;
+    await Promise.all([c1, c2]);
+    expect(sleeps).toEqual([200]); // the SECOND real start slept the spacing INSIDE its lease
+  });
   test("check 9: clone RETRIES flow through the same gate — their starts are spaced too", async () => {
     const PIN = "a".repeat(40);
     const { client, sleeps } = makeClient([

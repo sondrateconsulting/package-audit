@@ -15,9 +15,9 @@ import type { OrchestrateArgs } from "./args.ts";
 
 const head = (name: string, committedDate: string): BranchHead => ({ name, oid: `oid-${name}`, committedDate, treeOid: `tree-${name}` });
 
-// listBranchHeads requires HEX object ids and fetchTreeRecursive requires a sha-echoing tree
-// envelope (§5.B/§5.C fail-closed): derive a stable 40-hex oid from a readable seed, and answer
-// a git-trees request with the oid it actually asked for.
+// listBranchHeads requires HEX object ids (§5.B fail-closed): derive a stable 40-hex oid from
+// a readable seed. treeBody survives for the few fixtures that still script a REST git-trees
+// envelope shape (the parser is bench-retained); the T2c scan path itself never requests one.
 const hexOid = (seed: string): string => Buffer.from(seed).toString("hex").padEnd(40, "0").slice(0, 40);
 const treeBody = (args: string[], truncated = false): string => {
   const ep = args.find((a) => a.includes("/git/trees/")) ?? "";
@@ -164,6 +164,9 @@ function makeClient(
     symlinks?: string[];
     headOidFor?: (branch: string) => string;
     afterClone?: (dest: string) => void;
+    // async choreography hook: parks the unit MID-CLONE (owner/repo/branch from the argv), so
+    // concurrency tests can hold a unit in flight on a live T2c seam
+    beforeClone?: (owner: string, repo: string, branch: string) => Promise<void> | void;
     launchImpl?: LaunchFn;
   } = {},
 ): GithubClient {
@@ -174,7 +177,11 @@ function makeClient(
     if (args[0] === "clone") {
       const dest = args[args.length - 1]!;
       const branchAt = args.indexOf("--branch");
-      branchByDest.set(dest, branchAt === -1 ? "" : (args[branchAt + 1] ?? ""));
+      const branch = branchAt === -1 ? "" : (args[branchAt + 1] ?? "");
+      branchByDest.set(dest, branch);
+      const url = args[args.length - 2] ?? "";
+      const segs = url.replace(/\.git$/, "").split("/");
+      await opts.beforeClone?.(segs[segs.length - 2] ?? "", segs[segs.length - 1] ?? "", branch);
       mkdirSync(dest, { recursive: true });
       opts.afterClone?.(dest);
       return { exitCode: 0, stdout: "", stderr: "" };
@@ -2130,8 +2137,12 @@ describe("processRepo branch fan-out (P4: concurrency.branches > 1)", () => {
     const gateSlow = new Promise<void>((r) => { releaseSlow = r; });
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads(nodes) };
-      if (args.join(" ").includes(hexOid("t-slow"))) await gateSlow; // the 'slow' branch scan blocks until released
       return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+    }, {
+      headOidFor: (b) => nodes.find((n) => n.name === b)!.oid,
+      beforeClone: async (_o, _r, branch) => {
+        if (branch === "slow") await gateSlow; // the 'slow' unit parks MID-CLONE until released
+      },
     });
     const cfg = { ...testConfig(root, 25), concurrency: { organizations: 1, repositories: 1, branches: 2 } };
     const runAborter = new Aborter();
@@ -2311,9 +2322,12 @@ describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations
         if (j.includes("name=r1")) return { exitCode: 0, stderr: "", stdout: branchHeads([{ name: "main", tree: "t-b-r1" }]) };
         return { exitCode: 0, stderr: "", stdout: branchHeads([{ name: "main", tree: "t-b-r2" }]) }; // name=r2
       }
-      if (j.includes(hexOid("t-a-slow"))) await gateSlow; // org-a's 'slow' branch holds org-a's pool open
-      if (j.includes(hexOid("t-b-r1"))) await gateR1;     // org-b's r1 scan blocks until released
       return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+    }, {
+      beforeClone: async (owner, repoName, branch) => {
+        if (owner === "org-a" && branch === "slow") await gateSlow; // org-a's 'slow' unit holds org-a's pool open MID-CLONE
+        if (owner === "org-b" && repoName === "r1") await gateR1; // org-b's r1 unit parks until released
+      },
     });
     const cfg = { ...testConfig(root, 25), organizations: ["org-a", "org-b"], concurrency: { organizations: 2, repositories: 2, branches: 2 } };
     let thrown: unknown = "unset";

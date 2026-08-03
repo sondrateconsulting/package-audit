@@ -445,6 +445,11 @@ export class UnitContentStore {
   // (the child lane already gets prompt rejection through the poison path) — without it a
   // hung REST fallback would hold the read pending for the transport's full bounded budget
   private readonly teardownWaiters = new Set<() => void>();
+  // gate-detached fallback transports still in flight: the unit's own settle must DRAIN them
+  // (§7's drain-safety — db.close() must never race a live writer), so dispose() awaits this
+  // set. The wait is the transport's own §4-bounded wall — exactly what the unit's await held
+  // before the gate existed; the gate only moved WHERE the wait happens, never removed it.
+  private readonly floatingFallbacks = new Set<Promise<void>>();
 
   constructor(caps: ContentStoreCaps, opts: ContentStoreOptions, limits: ContentStoreLimits, budget: number, index: Map<string, LsTreeEntry>) {
     this.caps = caps;
@@ -578,9 +583,15 @@ export class UnitContentStore {
   }
 
   // Race a lane promise against the teardown gate. The loser's eventual settlement is always
-  // observed (no unhandled rejection), and the gate subscription never outlives the race.
+  // observed (no unhandled rejection) AND tracked in floatingFallbacks so dispose() drains it;
+  // the gate subscription never outlives the race.
   private raceTeardown<T>(p: Promise<T>, path: string): Promise<T> {
-    p.catch(() => undefined);
+    const observed = p.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.floatingFallbacks.add(observed);
+    void observed.then(() => this.floatingFallbacks.delete(observed));
     let unsubscribe = (): void => undefined;
     const gate = new Promise<never>((_resolve, reject) => {
       const fire = (): void => reject(this.teardownError(path) ?? new ContentStoreError("aborted", `read of ${path} aborted`));
@@ -712,6 +723,11 @@ export class UnitContentStore {
         // verdict's subject, and its death must not read as "no child was ever needed"
         uncleanFrom(this.firstDisposal);
       }
+      // DRAIN any gate-detached fallback transport before the unit settles (§7 drain-safety:
+      // a floating REST spawn, its retries, its one-shot permit, and its cache write must not
+      // outlive the unit toward db.close()). Bounded by the transport's own §4 budgets — the
+      // same wall the unit's await held before the teardown gate existed.
+      await Promise.allSettled([...this.floatingFallbacks]);
       try {
         // check 6's ordering: clone deletion sits BETWEEN the child teardown and the permit
         // release — the pool slot never frees while the disk it paid for is still occupied
