@@ -1,6 +1,6 @@
 // unitPipeline.ts — the §5.C-H per-branch-unit engine. Given a resolved tree file list and an
-// injected `readFile` (the orchestrator handles tree fetch, the raw/blob size split, and the
-// truncated-tree clone fallback behind it), produce the structured findings for ONE unit:
+// injected `readFile` (the orchestrator handles acquisition behind it: the per-unit clone, the
+// local enumeration, and the symlink fallback), produce the structured findings for ONE unit:
 // dependency facts (§5.D) with lockfile resolution, in-repo API usage (§5.F), and SPECIFIER-term
 // CLI usage (§5.G part 1). BIN-term CLI usage (§5.G part 2) is a separate pass the orchestrator
 // runs after introspection yields bin names. No db, no direct network — all I/O is injected, so

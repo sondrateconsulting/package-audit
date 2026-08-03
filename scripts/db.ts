@@ -257,8 +257,8 @@ export interface RunUnitHeadInput {
   policyStatus: PolicyStatus | null; // null = no exclusion (the branch is policy-eligible)
   policyMatchedPattern: string | null; // non-empty ONLY when policyStatus === 'excluded-by-deny'
   // The commit date (GitHub committedDate / git-%cI family — an ISO instant, offset preserved,
-  // stored RAW, NOT the nowIso millisecond form). scanned → the ACTUALLY-scanned commit's date (the clone HEAD's
-  // own date under the clone fallback); non-scanned → the discovered head date. REQUIRED non-null:
+  // stored RAW, NOT the nowIso millisecond form). scanned → the ACTUALLY-scanned commit's date (which the
+  // acquisition coherence gate makes equal to the discovered head's); non-scanned → the discovered head date. REQUIRED non-null:
   // every fresh upsert has a real date (the DB column stays nullable only for pre-v4 migrated rows,
   // which the migration writes directly, never through this input). A runtime guard rejects ''/null.
   scannedCommitDate: string;
@@ -1614,7 +1614,7 @@ export interface AuditDbReader {
 // necessary but NOT sufficient (e.g. the deny CHECK admits policy_matched_pattern=''); these guards
 // run at the single write chokepoint (upsertRunUnitHead), so no row that violates the §3 mapping is
 // ever persisted regardless of caller. All fail-fast. scanned_commit_date is REQUIRED non-null on
-// every fresh upsert (the clone fallback captures the clone HEAD's own date) — only pre-v4 migrated
+// every fresh upsert (the scanned commit's date is always known) — only pre-v4 migrated
 // rows carry NULL, and those are written directly by the migration, never through this input.
 function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   const where = `${h.organization}/${h.repository}@${h.branch}`;

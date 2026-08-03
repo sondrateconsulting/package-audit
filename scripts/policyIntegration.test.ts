@@ -42,8 +42,9 @@ const mkConfig = (root: string, over: Partial<Config> = {}): Config => ({
 const rt = (config: Config, configHash: string): AuditRuntime =>
   ({ config, configHash, branchPolicy: compileBranchPolicy(config.branches, config.excludeBranches), repositoryPolicy: compileRepositoryPolicy(config.excludeRepositories) });
 
-// One org repo `svc` (default main) + GraphQL heads + EMPTY trees; any git spawn is a failure (pins the
-// no-clone assumption — a non-truncated tree never triggers cloneShallow).
+// One org repo `svc` (default main) + GraphQL heads, with the T2c seams stubbed: the clone
+// materialises an empty dest and the enumeration serves an empty listing, so these tests exercise
+// POLICY routing without any content read.
 interface Head { name: string; oid: string; date: string }
 // The default branch is stated EXPLICITLY (never inferred from the head list): §5.B discovery resolves
 // it from THIS response, so a fixture that derived it from its own heads could never disagree with the

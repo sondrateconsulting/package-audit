@@ -4,7 +4,7 @@
 // with a sanitized allowlist env, and every write target (clone dest, tar -C dir, gitconfig)
 // is assertContained before the process starts (§0). Handles TS pagination via per-page
 // `gh api -i` header parsing, the §4 rate-limit classes, api_cache integration (§3), the
-// hardened clone fallback (§0/§5.C), and the startup pkg-audit-* temp sweep.
+// hardened per-unit clone (§0/§5.C), and the startup pkg-audit-* temp sweep.
 
 import { mkdtempSync, readdirSync, readFileSync, lstatSync, renameSync, rmSync, unlinkSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir, devNull } from "node:os";
@@ -897,8 +897,9 @@ export function parseGraphqlEnvelope(bodyText: string): GraphqlEnvelope {
 // GitHub git/trees (§5.C): the listing we act on must be PROVABLY complete and well-addressed,
 // so every violation throws (→ a scan-scope errors row at the unit boundary). Before this guard,
 // a missing `tree` member read as an EMPTY repo (zero findings, silently) and a missing
-// `truncated` flag read as `false` — silently disabling the caller's clone fallback, its only
-// escape hatch for over-limit repos.
+// `truncated` flag read as `false`. (Production no longer reads REST trees — the T2c cutover
+// enumerates locally — but the parser is retained for the benchmark's REST-tree drivers, and
+// its fail-closed guarantees are pinned by direct parser tests.)
 // The git object types git/trees returns — the SINGLE source of truth for both the runtime check
 // and the static TreeEntryType, so the two cannot drift. A future/unknown type must fail LOUD, not
 // vanish through the downstream blob filter.
@@ -1356,7 +1357,7 @@ export class GithubClient {
   // signal, so the impl kills the child, and yields an EMPTY-stdout nonzero result that the
   // callers' existing no-HTTP-response transient path retries under MAX_ATTEMPTS. After the
   // deadline fires, the return additionally WAITS for the spawned promise to settle — callers
-  // (cloneShallow, introspectVersion) delete the child's working directory the moment this
+  // (cloneNoCheckout, introspectVersion) delete the child's working directory the moment this
   // returns, and a SIGTERMed-but-not-yet-dead child could still be writing into that tree.
   // The wait is BOUNDED by the kill-escalation grace + margin so an impl that never settles
   // (or a wedged kill) cannot convert the deadline into a hang — on a timeout the caller's
@@ -2450,7 +2451,7 @@ export class GithubClient {
     return this.restGetJson("rate_limit"); // never cached as immutable; ETag varies per call
   }
 
-  // ---- hardened clone fallback (§0 / §5.C) ----
+  // ---- hardened clone (§0 / §5.C) ----
   // All git config is pinned to this generated file: only a credential helper delegating to
   // the SAME gh binary/auth the rest of the tool uses. Written once per client, contained.
   private ensureGitConfig(): string {

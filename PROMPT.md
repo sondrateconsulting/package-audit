@@ -25,13 +25,15 @@ every run as "continue the job," not "start over," unless the user passes `--fre
 - Any `git clone` must be shallow, into an ephemeral temp dir, and reclaimed on exit
   (best-effort — a reclaim that fails emits a `clone-cleanup-failed` warning; containment
   holds regardless, so a stranded dir is disk to reclaim on a later run, never an escape).
-  Full hardened invocation (the §5.C clone fallback uses exactly this):
+  Full hardened invocation (the §5.C content path uses exactly this, plus `--no-checkout`):
   `GIT_TERMINAL_PROMPT=0 git clone --depth 1
   --single-branch --branch <branch> --no-tags --no-recurse-submodules --template=
   <url> <mktemp-dir>` — `--branch` fetches the selected branch (§5.B),
   `--template=` blocks init.templateDir hooks, `GIT_TERMINAL_PROMPT=0` prevents
-  credential-prompt hangs. Record `git rev-parse HEAD` so permalinks pin the fetched
-  SHA. Never write inside a repo working tree.
+  credential-prompt hangs. `--no-checkout` means no working tree is ever materialised, so
+  committed `.gitattributes` filters never run and reads are the committed objects
+  themselves. Check `git rev-parse HEAD` against the discovery-pinned SHA and fail the unit
+  closed on a mismatch. Never write inside a repo working tree.
 - All `gh`/`git`/`tar` shell-outs in the audit product go through the single wrapper module (§6) that
   invokes `readOnlyGuard` on the argv ARRAY — never a joined string (naive substring
   matching false-positives on a repo named `create-x` and, worse, lets `gh api -X
@@ -478,9 +480,10 @@ CREATE TABLE IF NOT EXISTS run_unit_head (
                                        -- 'excluded-by-deny'; NULL for every other disposition
                                        -- (an allow-list MISS names no single pattern)
   scanned_commit_date TEXT,            -- v4. On a SCANNED row: the committed date of the commit
-                                       -- ACTUALLY scanned (the clone's real HEAD on the clone
-                                       -- fallback, §5.C — which may differ from the discovered
-                                       -- head). On every NON-scanned row (commit_sha=''): the
+                                       -- ACTUALLY scanned. Under §5.C's coherence gate that is
+                                       -- always the DISCOVERED head (a clone whose HEAD differs
+                                       -- fails the unit closed), so the two agree by
+                                       -- construction. On every NON-scanned row (commit_sha=''): the
                                        -- DISCOVERED head's date, so a skipped/excluded/past-cap
                                        -- branch still records how recent it was. NULL only on rows
                                        -- backfilled by the v3→v4 migration — which is what makes a
@@ -593,8 +596,7 @@ Resumability rules:
   is "the head it reported", never "the live head" — the report-head invariant below; a
   non-scanned row's commit_sha='' and discovered-head date describe the older evaluation), and
   the unit is left `error`/`pending` so the next run refreshes it. A head-SHA-aware prune is deliberately NOT used: it would delete
-  the clone-fallback path's legitimate rows (commit_sha = the clone's real HEAD, which may
-  differ from the discovered head by design, §5.C) and the commit_sha='' sentinels.
+  the commit_sha='' sentinels the non-scanned dispositions rely on.
 - Report-head invariant (co-designed with the skip predicate): as each unit is
   processed (scanned OR skipped-as-current), the run upserts `run_unit_head(run_id, org,
   repo, branch, commit_sha=the head it reported)`. Findings accumulate across commits

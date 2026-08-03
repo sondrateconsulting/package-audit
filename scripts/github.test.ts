@@ -701,7 +701,7 @@ describe("restGet caching + conditional requests", () => {
 
   test("an immutable cache HIT synthesizes an exact status 200 (the whole envelope is pinned, not just the body)", async () => {
     // restGet's zero-network immutable hit returns { status: 200, ... } literally; without this the
-    // synthesized status is only proven INDIRECTLY (fetchTreeRecursive's own !=200 reject). Pin it
+    // synthesized status is only proven INDIRECTLY (a consumer's own !=200 reject). Pin it
     // here so a mutation of the synthesized status (e.g. → 206) fails a direct assertion.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const ep = `repos/o/r/contents/package.json?ref=${SHA}`; // SHA-pinned → immutable eligible
@@ -903,7 +903,7 @@ describe("restGet caching + conditional requests", () => {
     // restGet persists the exact-200 body BEFORE restGetJson's JSON.parse validates it. Without the
     // tombstone, fetchFileMeta's SHA-pinned immutable row would re-serve the unparseable body forever
     // with ZERO network (JSON.parse failing on every later call). This pins restGetJson's invalid-JSON
-    // tombstone (the twin of fetchTreeRecursive's) via a structured-JSON consumer — previously uncovered.
+    // tombstone (the twin of the retired tree reader's) via a structured-JSON consumer — previously uncovered.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const { client, calls } = makeClient(
       [ok(http(200, {}, `{bad json`)), ok(http(200, {}, `{"type":"file","sha":"${SHA}","size":12}`))],
@@ -1683,7 +1683,7 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
   });
 
   test("a timed-out spawn returns only after the killed child settles (no cleanup race)", async () => {
-    // cloneShallow/introspectVersion delete the child's working directory the moment the
+    // cloneNoCheckout/introspectVersion delete the child's working directory the moment the
     // spawn call returns — so a timed-out spawn must not return while the (SIGTERMed but
     // not yet dead) child can still be writing into that tree.
     let settled = false;
@@ -2693,7 +2693,7 @@ describe("listBranchHeads (§5.B)", () => {
 describe("hardened clone (§0/§5.C)", () => {
   // (the cloneShallow argv/failure tests retired with the method at the T2c cutover —
   // cloneNoCheckout's describe above carries the acquisition coverage now.)
-  test("the PUBLIC git() wrapper itself contains a clone destination (chokepoint, not just cloneShallow)", async () => {
+  test("the PUBLIC git() wrapper itself contains a clone destination (the chokepoint is the wrapper, not any one caller)", async () => {
     const { client, calls } = makeClient([]);
     await expect(
       client.git([

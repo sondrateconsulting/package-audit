@@ -245,8 +245,8 @@ canonical decode — a disclosed findings change in the fidelity standard's own 
 consumers stay future work. Symlinks are mode-routed to REST's dereferenced
 bytes (the ratified policy), so symlink reads still spend API budget. There is no truncation
 cliff — `ls-tree` enumerates any tree — so the truncated-tree checkout-clone fallback and its
-checkout-byte caveat retire on this path once the implementation lands; until then production
-keeps today's routing.
+checkout-byte caveat retire on this path with the implementation: removing them is part of the
+implementation PR's own change set (see Follow-on work), not a separate later step.
 
 ### Consequences
 

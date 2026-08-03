@@ -303,10 +303,15 @@ as code comments at their decision sites.
 ## 8. Doc sweep (I4, after the final santa loop)
 
 README §security (spawn-site prose stays true — verify counts/wording), README log-vocabulary
-table, PROMPT.md content-path description, EXPORTS.md entries for `gitFrame.ts`/
-`contentStore.ts` + retired exports (exportsDoc.test.ts re-pinned), the ADR's
-"until then production keeps today's routing" clause updated to record the landing (PR-linked,
-past tense — a form true after the merge), bench module headers if §4(a).
+table, PROMPT.md content-path description, the ADR's "until then production keeps today's
+routing" clause rewritten in a form true both before and after the merge gate, bench module
+headers if §4(a).
+
+**Corrected while sweeping:** this queue originally listed EXPORTS.md entries for
+`gitFrame.ts`/`contentStore.ts`. That misread what EXPORTS.md is — it documents the `export`
+CLI's CSV/JSONL data contract, and `exportsDoc.test.ts` syncs it against `export.ts`'s column
+registry, not the module surface. This PR changes no export column and no row-order rule, so
+EXPORTS.md correctly needs no edit.
 
 ## 9. Review-process ledger (filled as the loops run)
 
