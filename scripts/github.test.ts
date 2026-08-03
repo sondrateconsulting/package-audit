@@ -7,8 +7,9 @@ import {
   GithubClient, GithubApiError, ThrottleExhausted, MAX_PAGES, MAX_PAUSE_MS, SPAWN_TIMEOUT_MS, MAX_TOTAL_PAUSE_MS, SPAWN_KILL_GRACE_MS,
   parseGhApiOutput, parseLinkNext, nextEndpointFromLink, parseRetryAfterMs,
   classifyRest, classifyGraphql, parseGraphqlEnvelope, parseTreeResponse, encodeContentsPath, mapRestRepo, filterSortCapRepos,
-  buildGhEnv, buildGitEnv, buildTarEnv, readCapped, makeRealSpawn, joinSpawnOutcome,
+  buildGhEnv, buildGitEnv, buildTarEnv, readCapped, readBytesCapped, makeRealSpawn, joinSpawnOutcome,
   type SpawnFn, type SpawnResult, type RepoInfo, type SpawnAbortSignal, type StreamReader,
+  type LaunchedChild, type LaunchRequest,
 } from "./github.ts";
 import { ReadOnlyViolation } from "./readOnlyGuard.ts";
 import { AuditDb } from "./db.ts";
@@ -503,6 +504,9 @@ describe("sanitized env construction", () => {
     expect(env["GIT_CONFIG_NOSYSTEM"]).toBe("1");
     expect(env["GIT_ALLOW_PROTOCOL"]).toBe("https");
     expect(env["GIT_TERMINAL_PROMPT"]).toBe("0");
+    // ADR-0001 check 4: EVERY git spawn runs replace-ref-blind — set here (the one env builder),
+    // not per-call-site, so rev-parse/ls-tree can never disagree with the cat-file child's reads.
+    expect(env["GIT_NO_REPLACE_OBJECTS"]).toBe("1");
     expect(env["GIT_ASKPASS"]).toBeUndefined();
     expect(env["GIT_SSH_COMMAND"]).toBeUndefined();
     // the pinned credential helper runs `gh auth git-credential` under THIS env — token and
@@ -525,6 +529,89 @@ describe("guard wiring", () => {
     await expect(client.gh(["api", "-X", "DELETE", "repos/o/r"])).rejects.toThrow(ReadOnlyViolation);
     await expect(client.git(["push"])).rejects.toThrow(ReadOnlyViolation);
     await expect(client.tar(["-cf", "x.tar", "dir"])).rejects.toThrow(ReadOnlyViolation);
+    expect(calls.length).toBe(0);
+  });
+  // The argv the guards validated must be the argv that LAUNCHES. Two ways a caller-owned
+  // object could otherwise diverge, both closed by copying at the wrapper entry (copiedArgv):
+  // an overridden iterator (the command vector is built from the argv) and a mutation landing
+  // in the validate→spawn window. Every string lane is covered because each one validated the
+  // caller's array before this fix (santa final loop, round 1).
+  test("an argv whose ITERATOR disagrees with its slots launches the validated slots, never the iterator's tokens", async () => {
+    const spawned: string[][] = [];
+    const spawn: SpawnFn = async (_bin, args) => {
+      spawned.push([...args]);
+      return ok(http(200, {}, "{}"));
+    };
+    const { client } = makeClient([], { spawnImpl: spawn });
+    const hostile = (slots: string[], yields: string[]): string[] => {
+      const a = [...slots];
+      Object.defineProperty(a, Symbol.iterator, {
+        value: function* (): Generator<string> {
+          for (const t of yields) yield t;
+        },
+      });
+      return a;
+    };
+    await client.git(hostile(["--version"], ["clean", "-fdx"]));
+    await client.gh(hostile(["api", "rate_limit"], ["api", "-X", "DELETE", "repos/o/r"]));
+    expect(spawned).toEqual([["--version"], ["api", "rate_limit"]]);
+  });
+  test("mutating the argv AFTER validation cannot change what spawns (the semaphore-acquire window)", async () => {
+    const spawned: string[][] = [];
+    let releaseHold!: () => void;
+    const hold = new Promise<void>((r) => (releaseHold = r));
+    const spawn: SpawnFn = async (_bin, args) => {
+      spawned.push([...args]);
+      if (args.includes("first")) await hold; // saturate the single slot
+      return ok(http(200, {}, "{}"));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl: spawn, binPaths: BINS, tempRoot: TEST_TMP, concurrency: 1,
+    });
+    const saturate = client.gh(["api", "rate_limit", "first"]);
+    const argv = ["api", "rate_limit"];
+    const queued = client.gh(argv); // validated now, spawns only after the slot frees
+    await new Promise((r) => setTimeout(r, 5));
+    argv[0] = "api"; argv[1] = "-X"; argv.push("DELETE"); // the window a caller would exploit
+    releaseHold();
+    await Promise.all([saturate, queued]);
+    expect(spawned[1]).toEqual(["api", "rate_limit"]);
+  });
+  test("a slot that is not an OWN STRING DATA property is refused at the wrapper, before any spawn", async () => {
+    const { client, calls } = makeClient([]);
+    await expect(client.git(["--version", 7 as unknown as string])).rejects.toThrow(/argv slot 1 is not an own string/);
+    await expect(client.tar(["--version", null as unknown as string])).rejects.toThrow(/argv slot 1 is not an own string/);
+    // An ACCESSOR slot is refused rather than read: invoking it would run caller code mid-copy,
+    // which is a timing channel for mutating state the guard consults afterwards.
+    const withGetter: string[] = ["--version"];
+    Object.defineProperty(withGetter, 1, { get: () => "--help", enumerable: true, configurable: true });
+    await expect(client.git(withGetter)).rejects.toThrow(/argv slot 1 is not an own string/);
+    // A PROTOTYPE-BACKED hole is refused rather than silently densified into an accepted shape.
+    Object.defineProperty(Array.prototype, 1, { value: "--help", configurable: true, writable: true });
+    try {
+      const holed: string[] = ["--version"];
+      holed.length = 2; // slot 1 is a hole served by the prototype
+      await expect(client.git(holed)).rejects.toThrow(/argv slot 1 is not an own string/);
+    } finally {
+      delete (Array.prototype as unknown as Record<number, unknown>)[1];
+    }
+    expect(calls.length).toBe(0);
+  });
+  test("a PROXY argv is refused before any property is touched — its traps must never run during validation", async () => {
+    // Array.isArray is TRUE for an Array-backed Proxy and every inspection (even a descriptor
+    // read) fires a trap, so the caller could run code mid-validation and mutate the prototypes
+    // the grammar consults a moment later — validation and launch would diverge with the argv
+    // object itself unchanged (santa final loop, round 3).
+    const { client, calls } = makeClient([]);
+    let trapRuns = 0;
+    const hostile = new Proxy(["--version"], {
+      getOwnPropertyDescriptor(t, k) { trapRuns++; return Reflect.getOwnPropertyDescriptor(t, k); },
+      get(t, k, r) { trapRuns++; return Reflect.get(t, k, r); },
+    });
+    await expect(client.git(hostile)).rejects.toThrow(/argv is a proxy/);
+    await expect(client.gh(hostile)).rejects.toThrow(/argv is a proxy/);
+    await expect(client.tar(hostile)).rejects.toThrow(/argv is a proxy/);
+    expect(trapRuns).toBe(0); // refused without reading a single property
     expect(calls.length).toBe(0);
   });
   test("a denylisted package-manager binary is refused at the chokepoint", async () => {
@@ -614,7 +701,7 @@ describe("restGet caching + conditional requests", () => {
 
   test("an immutable cache HIT synthesizes an exact status 200 (the whole envelope is pinned, not just the body)", async () => {
     // restGet's zero-network immutable hit returns { status: 200, ... } literally; without this the
-    // synthesized status is only proven INDIRECTLY (fetchTreeRecursive's own !=200 reject). Pin it
+    // synthesized status is only proven INDIRECTLY (a consumer's own !=200 reject). Pin it
     // here so a mutation of the synthesized status (e.g. → 206) fails a direct assertion.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const ep = `repos/o/r/contents/package.json?ref=${SHA}`; // SHA-pinned → immutable eligible
@@ -816,7 +903,7 @@ describe("restGet caching + conditional requests", () => {
     // restGet persists the exact-200 body BEFORE restGetJson's JSON.parse validates it. Without the
     // tombstone, fetchFileMeta's SHA-pinned immutable row would re-serve the unparseable body forever
     // with ZERO network (JSON.parse failing on every later call). This pins restGetJson's invalid-JSON
-    // tombstone (the twin of fetchTreeRecursive's) via a structured-JSON consumer — previously uncovered.
+    // tombstone (the twin of the retired tree reader's) via a structured-JSON consumer — previously uncovered.
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     const { client, calls } = makeClient(
       [ok(http(200, {}, `{bad json`)), ok(http(200, {}, `{"type":"file","sha":"${SHA}","size":12}`))],
@@ -1023,6 +1110,39 @@ describe("parseGraphqlEnvelope / parseTreeResponse (pure)", () => {
     if (res.truncated) throw new Error("expected a non-truncated tree");
     expect(res.paths.map((p) => p.size)).toEqual([0, null]);
   });
+  // The malformed-envelope edges below were previously exercised through the retired
+  // fetchTreeRecursive describe; the PARSER is bench-retained (T0/T1 evaluate the REST-tree
+  // route by design), so its regression coverage is restored here as DIRECT parser cases.
+  test("non-object root / missing tree member / non-boolean truncated all fail closed", () => {
+    expect(() => parseTreeResponse("junk", "ep", null)).toThrow(/non-object response root/);
+    expect(() => parseTreeResponse({ truncated: false }, "ep", null)).toThrow(/tree member missing/);
+    expect(() => parseTreeResponse({ tree: [] }, "ep", null)).toThrow(/truncated flag missing/);
+    expect(() => parseTreeResponse({ truncated: "no", tree: [] }, "ep", null)).toThrow(/truncated flag missing or non-boolean/);
+  });
+  test("a mismatched root sha against the requested oid fails closed", () => {
+    const sha = "a".repeat(40);
+    expect(() => parseTreeResponse({ sha: "b".repeat(40), truncated: false, tree: [] }, "ep", sha)).toThrow(/does not match the requested tree oid/);
+  });
+  test("malformed entries fail closed: non-object, bad path, unknown type, non-hex sha, duplicate path", () => {
+    const entry = { path: "a.txt", type: "blob", sha: "a".repeat(40), size: 1 };
+    const body = (tree: unknown[]): Record<string, unknown> => ({ truncated: false, tree });
+    expect(() => parseTreeResponse(body(["junk"]), "ep", null)).toThrow(/not an object/);
+    expect(() => parseTreeResponse(body([{ ...entry, path: "../escape" }]), "ep", null)).toThrow(/non-canonical/);
+    expect(() => parseTreeResponse(body([{ ...entry, type: "wormhole" }]), "ep", null)).toThrow(/unknown entry type/);
+    expect(() => parseTreeResponse(body([{ ...entry, sha: "nope" }]), "ep", null)).toThrow(/sha missing or non-hex/);
+    expect(() => parseTreeResponse(body([entry, { ...entry }]), "ep", null)).toThrow(/duplicate path/);
+  });
+  test("a truncated:true listing returns the flag ALONE — junk entries beside it are never validated or consumed", () => {
+    expect(parseTreeResponse({ truncated: true, tree: ["junk"] }, "ep", null)).toEqual({ truncated: true });
+  });
+  test("a fractional or unsafe-integer size fails closed (would corrupt the downstream size gates)", () => {
+    const entry = { path: "a.txt", type: "blob", sha: "a".repeat(40) };
+    expect(() => parseTreeResponse({ truncated: false, tree: [{ ...entry, size: 1.5 }] }, "ep", null)).toThrow(/non-negative safe integer/);
+    expect(() => parseTreeResponse({ truncated: false, tree: [{ ...entry, size: -1 }] }, "ep", null)).toThrow(/non-negative safe integer/);
+    // JSON "1e400" parses to Infinity — typeof number, but never a safe integer
+    expect(() => parseTreeResponse({ truncated: false, tree: [{ ...entry, size: Number.POSITIVE_INFINITY }] }, "ep", null)).toThrow(/non-negative safe integer/);
+    expect(() => parseTreeResponse({ truncated: false, tree: [{ ...entry, size: 2 ** 53 }] }, "ep", null)).toThrow(/non-negative safe integer/);
+  });
   test("a blob entry MISSING size fails closed — a null size would bypass the 2 MiB scan cap", () => {
     // unitPipeline skips only entries whose size EXCEEDS the cap; a null size sails through and the
     // (possibly huge) blob is fetched + scanned. Real GitHub always emits size for blobs, so require it.
@@ -1033,155 +1153,9 @@ describe("parseGraphqlEnvelope / parseTreeResponse (pure)", () => {
 });
 
 // ---- fetchTreeRecursive envelope validation (§5.C fail-closed) --------------------------------
-// A malformed 200 git/trees response must FAIL LOUD (→ a scan-scope errors row via processUnit's
-// catch), never read as "no files in this branch": `json.tree ?? []` silently produced an empty
-// tree, and a missing/malformed `truncated` flag silently suppressed the clone fallback that is
-// the caller's ONLY complete-tree escape hatch (orchestrate §5.C).
-describe("fetchTreeRecursive envelope validation (§5.C fail-closed)", () => {
-  const TREE_SHA = "f".repeat(40);
-  const tree = (body: string) => ok(http(200, {}, body));
-  const blob = (over: Record<string, unknown> = {}): Record<string, unknown> =>
-    ({ path: "package.json", type: "blob", sha: "a".repeat(40), size: 12, ...over });
-  const body = (over: Record<string, unknown> = {}) =>
-    JSON.stringify({ sha: TREE_SHA, truncated: false, tree: [blob()], ...over });
-
-  test("a 200 response MISSING the tree member fails closed — never an empty tree", async () => {
-    const { client } = makeClient([tree(JSON.stringify({ sha: TREE_SHA, truncated: false }))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/tree member/);
-  });
-  test("a non-array tree member is a clean GithubApiError, not a raw TypeError", async () => {
-    const { client } = makeClient([tree(body({ tree: "nope" }))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-  });
-  test("a MISSING or non-boolean truncated flag fails closed — false would silently disable the clone fallback", async () => {
-    for (const b of [JSON.stringify({ sha: TREE_SHA, tree: [blob()] }), body({ truncated: "yes" })]) {
-      const { client } = makeClient([tree(b)]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/truncated/);
-    }
-  });
-  test("a non-object JSON root (null/array/primitive) is a clean GithubApiError", async () => {
-    for (const b of ["null", "[]", "42", `"tree"`]) {
-      const { client } = makeClient([tree(b)]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-    }
-  });
-  test("a non-object tree entry fails closed", async () => {
-    for (const entry of [null, "x", 7, [1]]) {
-      const { client } = makeClient([tree(body({ tree: [entry] }))]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-    }
-  });
-  test("an entry with a missing/empty/non-canonical path fails closed — it would misaddress every downstream read", async () => {
-    // leading/trailing/double slash and dot segments would silently become the swallowed contents
-    // 404 (orchestrate apiReader); a NUL would corrupt the permalink and the contents URL.
-    const bads: Array<Record<string, unknown>> = [
-      { path: undefined }, { path: "" }, { path: 5 },
-      { path: "/lead" }, { path: "trail/" }, { path: "a//b" }, { path: "a/./b" }, { path: "a/../b" }, { path: "a\u0000b" },
-    ];
-    for (const over of bads) {
-      const { client } = makeClient([tree(body({ tree: [blob(over)] }))]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-    }
-  });
-  test("a DUPLICATE path fails closed — last-wins mapping downstream would let a later entry mask a manifest", async () => {
-    const { client } = makeClient([tree(body({ tree: [blob(), blob({ type: "tree", size: undefined })] }))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/duplicate/);
-  });
-  test("an unknown entry type fails closed — the blob filter downstream would silently discard it", async () => {
-    const { client } = makeClient([tree(body({ tree: [blob({ type: "symlink" })] }))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/type/);
-  });
-  test("a non-hex entry sha fails closed — it addresses the blob fetch", async () => {
-    for (const sha of [undefined, "", "main", "zz".repeat(20)]) {
-      const { client } = makeClient([tree(body({ tree: [blob({ sha })] }))]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-    }
-  });
-  test("a PRESENT size must be a non-negative safe integer — Infinity (1e400), negatives and fractions fail closed", async () => {
-    // typeof-number alone admits JSON.parse("1e400") === Infinity, which would trip the silent
-    // large-file skip downstream instead of failing loud.
-    for (const raw of [`1e400`, `-1`, `1.5`, `"5"`, `null`]) {
-      const { client } = makeClient([tree(`{"sha":"${TREE_SHA}","truncated":false,"tree":[{"path":"p","type":"blob","sha":"${"a".repeat(40)}","size":${raw}}]}`)]);
-      await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(GithubApiError);
-    }
-  });
-  test("a response whose root sha does not match the requested tree oid fails closed", async () => {
-    const { client } = makeClient([tree(body({ sha: "e".repeat(40) }))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/does not match/);
-  });
-  test("HTTP 2xx-but-not-200 (e.g. 206 Partial Content) is NOT success — a partial tree must not read as complete", async () => {
-    // now trips at classifyRest (restGet fails every non-200 2xx closed); the tree fetcher's own
-    // inner gate is exercised independently by the stubbed-restGet test below.
-    const { client } = makeClient([ok(http(206, {}, body()))]);
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/only exactly 200/);
-  });
-  test("the tree fetcher's OWN exact-200 gate holds even if restGet were to leak a non-200 2xx (defense in depth)", async () => {
-    // classifyRest already fails non-200 2xx closed, so this state is unreachable through the
-    // spawn seam — stub restGet to prove tree completeness never silently depends on a distant
-    // classifier's range staying narrow.
-    const { client } = makeClient([]);
-    client.restGet = async () => ({ status: 206, headers: {}, body: body() });
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/only exactly 200/);
-  });
-  test("a valid response maps entries verbatim; absent size maps to null", async () => {
-    const b = JSON.stringify({ sha: TREE_SHA, truncated: false, tree: [blob(), { path: "src", type: "tree", sha: "b".repeat(40) }] });
-    const { client } = makeClient([tree(b)]);
-    const res = await client.fetchTreeRecursive("o", "r", TREE_SHA);
-    expect(res).toEqual({
-      truncated: false,
-      paths: [
-        { path: "package.json", type: "blob", sha: "a".repeat(40), size: 12 },
-        { path: "src", type: "tree", sha: "b".repeat(40), size: null },
-      ],
-    });
-  });
-  test("truncated:true returns NO paths — the partial list is unusable, and `paths` is a COMPILE error on it", async () => {
-    // per-entry validation is deliberately skipped here: junk inside a partial list must not block
-    // the clone fallback, and nothing downstream may read these entries anyway.
-    const b = JSON.stringify({ sha: TREE_SHA, truncated: true, tree: [{ path: 42 }] });
-    const { client } = makeClient([tree(b)]);
-    const res = await client.fetchTreeRecursive("o", "r", TREE_SHA);
-    expect(res).toEqual({ truncated: true });
-    expect(Object.hasOwn(res, "paths")).toBe(false); // no `paths` key at runtime, not just at the type level
-    if (res.truncated) {
-      // @ts-expect-error — the discriminated union makes `paths` inaccessible on the truncated variant;
-      // this line stops compiling (unused @ts-expect-error) if `paths` is ever added back, guarding the union.
-      void res.paths;
-    }
-  });
-  test("a malformed 200 body does NOT permanently poison the immutable cache — the next call refetches", async () => {
-    // restGet caches the 200 body BEFORE validation sees it; without the tombstone the SHA-pinned
-    // immutable path would serve the malformed body forever (until --purge-cache).
-    const db = AuditDb.open({ sqlitePath: ":memory:" });
-    const { client, calls } = makeClient(
-      [tree(JSON.stringify({ sha: TREE_SHA, truncated: false })), tree(body())],
-      { db },
-    );
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/tree member/);
-    const second = await client.fetchTreeRecursive("o", "r", TREE_SHA);
-    if (second.truncated) throw new Error("expected a non-truncated tree");
-    expect(second.paths.map((p) => p.path)).toEqual(["package.json"]);
-    expect(calls.length).toBe(2); // call 2 went back to the network, not the poisoned cache row
-    const third = await client.fetchTreeRecursive("o", "r", TREE_SHA);
-    expect(third).toEqual(second);
-    expect(calls.length).toBe(2); // …and the VALID body still earns the immutable zero-network hit
-    db.close();
-  });
-  test("a direct 2xx-non-200 tree response is fatal, leaves NO cache row, and the next call refetches cleanly", async () => {
-    // Laundering is doubly closed: restGet persists only exact-200 bodies AND classifyRest now
-    // fails a direct non-200 2xx before any consumer sees it. Pin the recovery shape: the failed
-    // call leaves no poisoned row behind, so the retry serves fresh valid bytes from the network.
-    const db = AuditDb.open({ sqlitePath: ":memory:" });
-    const { client, calls } = makeClient([ok(http(206, {}, body())), tree(body())], { db });
-    await expect(client.fetchTreeRecursive("o", "r", TREE_SHA)).rejects.toThrow(/only exactly 200/);
-    const afterFailure = db.read("SELECT COUNT(*) AS n FROM api_cache").get() as { n: number };
-    expect(afterFailure.n).toBe(0); // restGet threw before the fetcher ran — not even a tombstone
-    const second = await client.fetchTreeRecursive("o", "r", TREE_SHA);
-    expect(second.truncated).toBe(false);
-    expect(calls.length).toBe(2);
-    db.close();
-  });
-});
+// (the fetchTreeRecursive envelope-validation describe retired with the method at the T2c
+// cutover; parseTreeResponse — the pure validator the bench still consumes — keeps its own
+// describe above.)
 
 describe("throttle wait clamping (§4 hardening)", () => {
   // 10 years past the fake clock — a poisoned response must not command such a pause.
@@ -1709,7 +1683,7 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
   });
 
   test("a timed-out spawn returns only after the killed child settles (no cleanup race)", async () => {
-    // cloneShallow/introspectVersion delete the child's working directory the moment the
+    // cloneNoCheckout/introspectVersion delete the child's working directory the moment the
     // spawn call returns — so a timed-out spawn must not return while the (SIGTERMed but
     // not yet dead) child can still be writing into that tree.
     let settled = false;
@@ -1775,77 +1749,155 @@ describe("spawn wall-clock deadline (§4 hardening)", () => {
   });
 });
 
-describe("cloneShallow temp-dir cleanup on failure", () => {
-  // the shared git-config dir (pkg-audit-gitcfg-*) is a per-client cached resource, NOT a
-  // per-clone leak — the run temp dir holding the partial clone is what must be reclaimed.
+// ---- ADR-0001 T2c acquisition: cloneNoCheckout (§3.1(1-2), rvo Q1 bounded retry) ------------
+describe("cloneNoCheckout (T2c acquisition: no-checkout argv, head coherence, bounded retry)", () => {
+  const PIN = "a".repeat(40);
   const cloneRunDirs = (root: string): string[] =>
     readdirSync(root).filter((n) => n.startsWith("pkg-audit-") && !n.startsWith("pkg-audit-gitcfg-"));
 
-  test("a failed clone leaves no clone run dir behind", async () => {
-    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
-    const { client } = makeClient([err("", "fatal: repository not found", 128)], { tempRoot: root });
-    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/clone failed/);
+  test("emits exactly the hardened no-checkout argv, enforces head coherence, and reads NO commit date", async () => {
+    const { client, calls } = makeClient([
+      ok(""), // clone
+      ok(PIN + "\n"), // rev-parse HEAD — equals the pin
+    ]);
+    const { dir, cloneAttempts } = await client.cloneNoCheckout("org-a", "repo-b", "release/1.x", PIN);
+    expect(cloneAttempts).toBe(1);
+    expect(dir.startsWith(TEST_TMP)).toBe(true);
+    expect(existsSync(dirname(dir))).toBe(true); // a SUCCESSFUL clone keeps its run dir for the store
+    expect(calls.length).toBe(2); // clone + rev-parse — the commit date comes from DISCOVERY (HEAD == pin)
+    const clone = calls[0]!;
+    expect(clone.bin).toBe(BINS.git);
+    expect(clone.args).toEqual([
+      "clone", "--depth", "1", "--single-branch", "--branch", "release/1.x",
+      "--no-tags", "--no-recurse-submodules", "--template=", "--no-checkout",
+      "https://github.com/org-a/repo-b.git", dir,
+    ]);
+    expect(clone.opts.env["GIT_NO_REPLACE_OBJECTS"]).toBe("1"); // check 4: the acquisition too
+    expect(clone.opts.env["GIT_ASKPASS"]).toBeUndefined();
+    const rev = calls[1]!;
+    expect(rev.args).toEqual(["rev-parse", "HEAD"]);
+    expect(rev.opts.cwd).toBe(dir);
+  });
+  test("a MOVED branch (HEAD != discovery pin) fails CLOSED — never accepted — and reclaims the run dir", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-moved-"));
+    const { client, calls } = makeClient([ok(""), ok("b".repeat(40) + "\n")], { tempRoot: root });
+    await expect(client.cloneNoCheckout("o", "r", "main", PIN)).rejects.toThrow(/does not match the discovery-pinned/);
+    expect(calls.length).toBe(2); // a coherence mismatch is NOT transient — no clone retry
     expect(cloneRunDirs(root)).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
-  test("a clone whose rev-parse fails also cleans up", async () => {
-    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
+  test("transient clone failures retry with backoff up to 3 attempts, and the success reports the attempt count", async () => {
+    const { client, calls, sleeps } = makeClient([
+      err("", "fatal: early EOF", 128),
+      err("", "fatal: early EOF", 128),
+      ok(""), // third attempt lands
+      ok(PIN + "\n"),
+    ]);
+    const { cloneAttempts } = await client.cloneNoCheckout("o", "r", "main", PIN);
+    expect(cloneAttempts).toBe(3);
+    expect(calls.filter((c) => c.args[0] === "clone").length).toBe(3);
+    expect(sleeps).toEqual([2000, 4000]); // transient-style backoff between attempts (rvo Q1)
+  });
+  test("a clone failing ALL attempts surfaces the LAST stderr with the attempt count, and reclaims", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-exhaust-"));
+    const { client } = makeClient(
+      [err("", "fatal: first", 128), err("", "fatal: second", 128), err("", "fatal: final failure", 128)],
+      { tempRoot: root },
+    );
+    await expect(client.cloneNoCheckout("o", "r", "main", PIN)).rejects.toThrow(/after 3 attempts: fatal: final failure/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("check 8: concurrent units never cross-attribute each other's clone starts", async () => {
+    // Found by the T2c LIVE run: with two branch lanes, 4 of 6 units reported cloneAttempts=2 /
+    // cloneRetries=1 though no clone ever failed. Each unit's count was a GLOBAL-counter delta
+    // across its own clone window, so a concurrent sibling's start landing inside that window
+    // was reported as a retry that never happened. The count must be the unit's OWN starts.
+    const root = mkdtempSync(join(tmpdir(), "clone-conc-"));
+    let cloneSpawns = 0;
+    let releaseA!: () => void;
+    const aParked = new Promise<void>((r) => (releaseA = r));
+    const spawnImpl: SpawnFn = async (_bin, args) => {
+      if (args[0] === "clone") {
+        cloneSpawns++;
+        const url = args[args.length - 2]!;
+        if (url.endsWith("/r-a.git")) {
+          await aParked; // unit A's clone stays in flight until unit B's clone has STARTED
+          return ok("");
+        }
+        releaseA(); // unit B's start lands strictly inside unit A's clone window
+        return ok("");
+      }
+      if (args[0] === "rev-parse") return ok(PIN + "\n");
+      throw new Error(`unexpected spawn: ${args.join(" ")}`);
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl, sleepImpl: async () => {},
+      env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: root,
+      concurrency: 4, spawnTimeoutMs: 30_000,
+    });
+    try {
+      const [a, b] = await Promise.all([
+        client.cloneNoCheckout("o", "r-a", "main", PIN),
+        client.cloneNoCheckout("o", "r-b", "main", PIN),
+      ]);
+      expect(cloneSpawns).toBe(2); // one real start each — anything above 1 per unit is fiction
+      expect(a.cloneAttempts).toBe(1);
+      expect(b.cloneAttempts).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  test("a rev-parse failure or a non-hex HEAD fails closed and reclaims", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-rev-"));
     const { client } = makeClient([ok(""), err("", "fatal: bad revision", 128)], { tempRoot: root });
-    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/rev-parse/);
+    await expect(client.cloneNoCheckout("o", "r", "main", PIN)).rejects.toThrow(/rev-parse/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    const { client: c2 } = makeClient([ok(""), ok("not-hex\n")], { tempRoot: root });
+    await expect(c2.cloneNoCheckout("o", "r", "main", PIN)).rejects.toThrow(/non-hex object id/);
     expect(cloneRunDirs(root)).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
-  test("a clone whose date-capture (show) fails also cleans up", async () => {
-    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
-    const { client } = makeClient([ok(""), ok("a".repeat(40) + "\n"), err("", "fatal: bad object", 128)], { tempRoot: root });
-    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/committer date failed/);
-    expect(cloneRunDirs(root)).toEqual([]);
-    rmSync(root, { recursive: true, force: true });
-  });
-  test("a non-ISO committer date is rejected and cleans up (a garbled read must not poison provenance)", async () => {
-    const root = mkdtempSync(join(tmpdir(), "clone-fail-"));
-    const { client } = makeClient([ok(""), ok("a".repeat(40) + "\n"), ok("not-a-date\n")], { tempRoot: root });
-    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/non-ISO committer date/);
-    expect(cloneRunDirs(root)).toEqual([]);
-    rmSync(root, { recursive: true, force: true });
-  });
-
   test("a cleanup failure never masks the original clone error, but IS surfaced as a warning", async () => {
     // rmSync's force only suppresses ENOENT — an EACCES/EBUSY from the cleanup walk must not
     // replace the actionable git error (which carries git's stderr): the ORIGINAL error is the
     // operator's diagnostic. But the failed reclaim is not swallowed silently — it emits a
-    // clone-cleanup-failed warning, consistent with processUnit's success-path reclaim.
+    // clone-cleanup-failed warning, consistent with processUnit's teardown-path reclaim.
     const root = mkdtempSync(join(tmpdir(), "clone-mask-"));
     let cloneDest = "";
+    let cloneCalls = 0;
     const spawnImpl: SpawnFn = async (_bin, args) => {
-      cloneDest = args[args.length - 1]!; // clone dest is the final argv token
-      mkdirSync(cloneDest, { recursive: true });
-      writeFileSync(join(cloneDest, "partial"), "x");
-      chmodSync(cloneDest, 0o555); // cleanup cannot unlink `partial` → rmSync throws EACCES
+      if (args[0] === "clone") {
+        cloneCalls++;
+        cloneDest = args[args.length - 1]!; // clone dest is the final argv token
+        if (cloneCalls === 1) {
+          mkdirSync(cloneDest, { recursive: true });
+          writeFileSync(join(cloneDest, "partial"), "x");
+          chmodSync(cloneDest, 0o555); // the retry's dest-clear AND the final reclaim hit EACCES
+        }
+      }
       return { exitCode: 128, stdout: "", stderr: "ORIGINAL_GIT_FAILURE" };
     };
     const client = new GithubClient({
-      githubHost: "github.com", spawnImpl,
+      githubHost: "github.com", spawnImpl, sleepImpl: async () => {},
       env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: root,
     });
-    const isRoot = typeof process.getuid === "function" && process.getuid() === 0; // root ignores chmod
+    const isRoot = typeof process.getuid === "function" && process.getuid() === 0; // root ignores modes
     const lines: string[] = [];
     const realWrite = process.stdout.write.bind(process.stdout);
     (process.stdout as unknown as { write: (s: string) => boolean }).write = (s: string) => { lines.push(s); return true; };
     let thrown: unknown;
     try {
-      await client.cloneShallow("o", "r", "main");
+      await client.cloneNoCheckout("o", "r", "main", "a".repeat(40));
     } catch (e) { thrown = e; } finally {
       (process.stdout as unknown as { write: typeof realWrite }).write = realWrite;
-      // As root the chmod 0o555 is ignored, so rmSync(runDir) already deleted cloneDest — guard the
-      // restore so it doesn't throw ENOENT on an already-removed path.
       if (cloneDest !== "" && existsSync(cloneDest)) chmodSync(cloneDest, 0o755);
       rmSync(root, { recursive: true, force: true });
     }
     expect(String((thrown as Error | undefined)?.message)).toMatch(/ORIGINAL_GIT_FAILURE/); // never masked
     if (!isRoot) {
       const events = lines.join("").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
-      expect(events.filter((e) => e.event === "warning" && e.reason === "clone-cleanup-failed").length).toBe(1); // reclaim failure surfaced
+      expect(events.filter((e) => e.event === "warning" && e.reason === "clone-cleanup-failed").length).toBeGreaterThanOrEqual(1);
     }
   });
 });
@@ -2531,8 +2583,10 @@ describe("listBranchHeads (§5.B)", () => {
     await expect(client.listBranchHeads("o", "r")).rejects.toThrow(/malformed branch-head node/);
   });
   test("a non-hex oid / tree.oid is malformed — a ref-looking value would freeze MUTABLE reads into the immutable cache", async () => {
-    // h.oid / h.treeOid flow into SHA-pinned fetches where isSha() earns the zero-network cache
-    // path, and into skip-current persistence; "main" in an oid field must fail loud here.
+    // h.oid pins the clone's coherence gate, the symlink fallback's SHA-pinned fetches (where
+    // isSha() earns the zero-network cache path), and skip-current persistence; h.treeOid is
+    // validated because BranchHead still carries it for the benchmark's REST-tree drivers.
+    // "main" in either oid field must fail loud here.
     for (const target of [
       { oid: "main", committedDate: "2024-01-01T00:00:00Z", tree: { oid: "d".repeat(40) } },
       { oid: "a".repeat(40), committedDate: "2024-01-01T00:00:00Z", tree: { oid: "refs/heads/x" } },
@@ -2679,50 +2733,9 @@ describe("listBranchHeads (§5.B)", () => {
 });
 
 describe("hardened clone (§0/§5.C)", () => {
-  test("emits exactly the hardened argv, pins git config, and records the fetched SHA + committer date", async () => {
-    const { client, calls } = makeClient([
-      ok(""), // clone
-      ok("a".repeat(40) + "\n"), // rev-parse HEAD
-      ok("2025-06-01T12:34:56+00:00\n"), // show --format=%cI HEAD (the scanned commit's date)
-    ]);
-    const { dir, headSha, headCommittedDate } = await client.cloneShallow("org-a", "repo-b", "release/1.x");
-    expect(headSha).toBe("a".repeat(40));
-    expect(headCommittedDate).toBe("2025-06-01T12:34:56+00:00"); // strict-ISO, offset preserved verbatim
-    expect(dir.startsWith(TEST_TMP)).toBe(true);
-    // a SUCCESSFUL clone must keep its run dir (the failure-only cleanup must not be a finally):
-    // downstream walkClone/cloneReader read this dir, so deleting it would silently zero findings.
-    expect(existsSync(dirname(dir))).toBe(true);
-
-    const clone = calls[0]!;
-    expect(clone.bin).toBe(BINS.git);
-    expect(clone.args).toEqual([
-      "clone", "--depth", "1", "--single-branch", "--branch", "release/1.x",
-      "--no-tags", "--no-recurse-submodules", "--template=",
-      "https://github.com/org-a/repo-b.git", dir,
-    ]);
-    expect(clone.opts.env["GIT_TERMINAL_PROMPT"]).toBe("0");
-    expect(clone.opts.env["GIT_CONFIG_NOSYSTEM"]).toBe("1");
-    expect(clone.opts.env["GIT_ASKPASS"]).toBeUndefined();
-    const cfgPath = clone.opts.env["GIT_CONFIG_GLOBAL"]!;
-    expect(cfgPath.startsWith(TEST_TMP)).toBe(true);
-    const cfg = readFileSync(cfgPath, "utf8");
-    expect(cfg).toContain("auth git-credential"); // pinned helper, no ambient config
-    expect(cfg).toContain("allow = never");
-
-    const rev = calls[1]!;
-    expect(rev.args).toEqual(["rev-parse", "HEAD"]);
-    expect(rev.opts.cwd).toBe(dir); // §0: git itself may run with cwd inside the clone
-
-    const showDate = calls[2]!;
-    // the EXACT commit-date tuple readOnlyGuard permits — cwd inside the clone, no argv -C
-    expect(showDate.args).toEqual(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"]);
-    expect(showDate.opts.cwd).toBe(dir);
-  });
-  test("clone failure surfaces stderr as a GithubApiError", async () => {
-    const { client } = makeClient([err("", "fatal: repository not found")]);
-    await expect(client.cloneShallow("o", "r", "main")).rejects.toThrow(/repository not found/);
-  });
-  test("the PUBLIC git() wrapper itself contains a clone destination (chokepoint, not just cloneShallow)", async () => {
+  // (the cloneShallow argv/failure tests retired with the method at the T2c cutover —
+  // cloneNoCheckout's describe above carries the acquisition coverage now.)
+  test("the PUBLIC git() wrapper itself contains a clone destination (the chokepoint is the wrapper, not any one caller)", async () => {
     const { client, calls } = makeClient([]);
     await expect(
       client.git([
@@ -2940,12 +2953,156 @@ describe("spawn-site allowlist (grep-enforced, with two exact-path scanner-test 
   });
   test("every spawn in github.ts flows through a guard-calling wrapper", () => {
     const src = readFileSync("./scripts/github.ts", "utf8");
-    // each guarded spawn path must call assertSpawnAllowed + its read-only guard. FOUR paths now:
+    // each guarded spawn path must call assertSpawnAllowed + its read-only guard. SIX paths now:
     // gh() (bare, e.g. preflight), ghBucketedAttempt() (the pause-aware gh path restGet/graphql use —
-    // a DISTINCT gh spawn that re-runs the guards), git(), and tar().
-    expect(src.match(/assertSpawnAllowed\(/g)?.length).toBe(4);
+    // a DISTINCT gh spawn that re-runs the guards), git(), tar(), and the two ADR-0001 T2c paths:
+    // gitBytes() (the one-shot byte-capture spawn ls-tree rides) and launchBatchChild() (the
+    // unit-lived interactive cat-file child).
+    expect(src.match(/assertSpawnAllowed\(/g)?.length).toBe(6);
     for (const guard of ["assertReadOnlyGh", "assertReadOnlyGit", "assertReadOnlyTar"])
       expect(src.includes(`${guard}(args)`)).toBe(true);
+  });
+  test("the launch site assembles its command vector with defineProperty and freezes it", () => {
+    // The wrapper reads the caller's env object (whose properties may be accessors) between
+    // validation and launch, so caller code can run in that window and replace shared state. A
+    // vector built with `push` or a spread routes through a mutable Array.prototype method; a
+    // plain index write is ALSO unsafe, because assigning into a hole walks the prototype chain
+    // and an inherited numeric setter captures it. defineProperty consults no prototype and the
+    // freeze stops any later rewrite, which is what makes "the argv the guards validated is the
+    // argv that launches" hold at the site itself. Structural, because the property lives in
+    // HOW the vector is built (santa final loop, rounds 4-5).
+    const src = readFileSync("./scripts/github.ts", "utf8");
+    const site = src.slice(src.indexOf("const realLaunch"), src.indexOf("// Copy an argv into a fresh"));
+    expect(site).toMatch(/defineProp\(cmd, 0, \{ value: bin/);
+    expect(site).toMatch(/defineProp\(cmd, i \+ 1, \{ value: token/);
+    expect(site).toMatch(/freezeIntrinsic\(cmd\)/);
+    expect(site).not.toMatch(/cmd\.push\(/);
+    expect(site).not.toMatch(/cmd\[\w+(\s*\+\s*1)?\]\s*=/); // no plain index assignment
+    expect(site).not.toMatch(/cmd:\s*\[bin,\s*\.\.\./);
+  });
+  test("RUNTIME: an inherited Array.prototype numeric setter never touches the launched vector, which arrives frozen", async () => {
+    // The source-shape test above pins HOW the launch site builds its vector; this pins the
+    // PROPERTY itself, at runtime, through the real default spawn path (no spawnImpl /
+    // launchImpl — the fake sits at the Bun.spawn boundary, the exact call the production
+    // launch makes). Rounds 2, 3 and 5 of the final review loop each found a
+    // defineProperty-SHAPED build still escapable at runtime; a source regex alone would have
+    // passed every one of those, which is why this test exists.
+    const root = mkdtempSync(join(tmpdir(), "launch-freeze-"));
+    // Everything the fake needs is prebuilt BEFORE the pollution window so no test-infra
+    // allocation walks the poisoned prototype: closed streams + exit 0 = a well-behaved,
+    // instantly-exiting child.
+    const doneReader = { read: async () => ({ done: true as const }), cancel: async () => undefined };
+    const captured: { cmd?: readonly string[] } = {};
+    const fakeProc = {
+      pid: 4_242_424,
+      stdout: { getReader: () => doneReader },
+      stderr: { getReader: () => doneReader },
+      stdin: undefined,
+      exited: Promise.resolve(0),
+      kill: () => undefined,
+      unref: () => undefined,
+    };
+    const fakeSpawn = (opts: { cmd: readonly string[] }): typeof fakeProc => {
+      captured.cmd = opts.cmd;
+      return fakeProc;
+    };
+    const client = new GithubClient({
+      githubHost: "github.com",
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: root,
+    });
+    const bunObj = Bun as unknown as { spawn: unknown };
+    const realBunSpawn = bunObj.spawn;
+    // every receiver the setter catches — the launched vector must never be among them. The
+    // setter stays TRANSPARENT (it completes the write as an own property) because harness
+    // internals may legitimately push through the polluted slot during the window; breaking
+    // them would test the harness, not the launch site.
+    const setterReceivers: unknown[] = [];
+    bunObj.spawn = fakeSpawn;
+    try {
+      // first call OUTSIDE the window: materializes the lazy gitcfg dir so the polluted
+      // window below covers the wrapper + launch alone
+      await client.git(["rev-parse", "HEAD"], undefined);
+      expect(captured.cmd !== undefined && Array.from(captured.cmd).join(" ")).toBe(`${BINS.git} rev-parse HEAD`);
+      // slot 1 is where the first argv token lands in the launch vector and where copiedArgv's
+      // copy writes its second slot — the exact channel the round-5 fix (holes + inherited
+      // numeric setters) closed
+      Object.defineProperty(Array.prototype, 1, {
+        configurable: true,
+        get() {
+          return undefined;
+        },
+        set(v: unknown) {
+          setterReceivers.push(this);
+          Object.defineProperty(this, 1, { value: v, writable: true, enumerable: true, configurable: true });
+        },
+      });
+      let res;
+      try {
+        res = await client.git(["rev-parse", "HEAD"], undefined);
+      } finally {
+        delete (Array.prototype as unknown as Record<number, unknown>)[1];
+      }
+      // window closed — assert on what actually launched
+      expect(res.exitCode).toBe(0);
+      const cmd = captured.cmd!;
+      expect(setterReceivers.includes(cmd)).toBe(false); // no vector write ever consulted the prototype
+      expect(Object.isFrozen(cmd)).toBe(true); // and the vector arrives frozen
+      expect(Array.from(cmd)).toEqual([BINS.git, "rev-parse", "HEAD"]); // carrying exactly the validated tokens
+      const slot = Object.getOwnPropertyDescriptor(cmd, 1);
+      expect(slot !== undefined && "value" in slot && slot.value === "rev-parse").toBe(true); // an own DATA slot, never an accessor
+    } finally {
+      bunObj.spawn = realBunSpawn;
+      delete (Array.prototype as unknown as Record<number, unknown>)[1]; // idempotent belt-and-braces
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  test("the launched git binary is the one captured BEFORE validation, even if an env accessor swaps this.bins mid-call", async () => {
+    // The round-5 fix captures `const bin = this.bins.git` once, before buildGitEnv runs — and
+    // buildGitEnv reads the caller's env object, whose properties may be accessors that fire
+    // AFTER the capture but BEFORE the spawn. Without the capture, re-reading this.bins.git at
+    // the launch would let that accessor swap the executable between check and spawn. Assert the
+    // SpawnFn receives the ORIGINAL binary though the accessor mutated this.bins.git mid-call.
+    const root = mkdtempSync(join(tmpdir(), "bin-toctou-"));
+    let launchedBin: string | undefined;
+    const spy: SpawnFn = async (bin) => {
+      launchedBin = bin;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    let armed = false;
+    // env is stored by reference as baseEnv; buildGitEnv reads PATH (a GIT_PASSTHROUGH key), so
+    // this getter fires DURING the git() call, after the bin capture. Once armed, it swaps the
+    // client's private bins.git — the exact between-check-and-spawn window the fix closes.
+    const clientRef: { c?: GithubClient } = {};
+    const env: Record<string, string> = { HOME: "/home/u", GH_TOKEN: "tok" };
+    Object.defineProperty(env, "PATH", {
+      enumerable: true,
+      get() {
+        if (armed && clientRef.c !== undefined) {
+          (clientRef.c as unknown as { bins: { git: string } }).bins.git = "/opt/bin/EVIL";
+        }
+        return "/bin";
+      },
+    });
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spy,
+      env,
+      binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" },
+      tempRoot: root,
+    });
+    clientRef.c = client;
+    try {
+      armed = true;
+      await client.git(["rev-parse", "HEAD"], undefined);
+      expect(launchedBin).toBe("/opt/bin/git"); // the captured value, NOT the accessor's swap
+      // and the swap really did land on this.bins — proving the accessor fired and the capture,
+      // not luck, is what protected the launch
+      expect((client as unknown as { bins: { git: string } }).bins.git).toBe("/opt/bin/EVIL");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -3004,5 +3161,559 @@ describe("sweepStaleTempDirs observability (§0)", () => {
     expect(removed).toEqual([]); // nothing was successfully removed
     const removeWarnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed" && e.operation === "remove" && String(e.target).endsWith("pkg-audit-stuck"));
     expect(removeWarnings.length).toBe(1); // the non-ENOENT removal failure is surfaced (not the suppressed root path)
+  });
+  test("rvo Q2: an UNREADABLE owner marker (transient read failure) RETAINS the dir and warns — never fail-open", () => {
+    const root = mkdtempSync(join(tmpdir(), "sweep-marker-"));
+    // An unreadable marker whose FAILURE is uid-independent: the marker path is a symlink to
+    // itself, so readFileSync fails with ELOOP for every user, root included (a chmod-based
+    // EACCES fixture silently skips under uid 0). If the sweep could read a marker here it
+    // would see nothing live and sweep — retention therefore proves the unreadable-marker
+    // classification, which is what protects a LIVE sibling's clone from the same read blip
+    // (EMFILE/EACCES/EIO) mid-run.
+    const dir = join(root, "pkg-audit-blip1");
+    mkdirSync(dir);
+    const marker = join(dir, ".pkg-audit-owner.json");
+    symlinkSync(marker, marker); // self-loop: readFileSync(marker) → ELOOP, regardless of uid
+    const { client } = makeClient([], { tempRoot: root });
+    let removed: string[] = ["sentinel"];
+    let events: Record<string, unknown>[] = [];
+    events = captureStdout(() => { removed = client.sweepStaleTempDirs(); });
+    expect(removed).toEqual([]); // retained: the sweep cannot prove unowned-or-dead
+    expect(existsSync(dir)).toBe(true);
+    const markerWarnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed" && e.operation === "owner-marker");
+    expect(markerWarnings.length).toBe(1); // ...and the ambiguity is surfaced, never silent
+    expect(markerWarnings[0]!.target).toBe(dir);
+    expect(typeof markerWarnings[0]!.message).toBe("string"); // the errno rides along
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+// ---- ADR-0001 T2c spawn seam (gitBytes / launchBatchChild / the child permit pool) ------------
+describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", () => {
+  // Minimal scripted structural child for the interactive-launch seam. The pid sits far above
+  // the platform pid ceiling so the escalation's best-effort group signal can only ESRCH.
+  const byteStream = (chunks: Array<Uint8Array | string>, open = false) => {
+    const queue = chunks.map((c) => (typeof c === "string" ? new TextEncoder().encode(c) : c));
+    let closed = !open;
+    const pending: Array<(r: { done?: boolean; value?: Uint8Array }) => void> = [];
+    return {
+      close(): void {
+        closed = true;
+        for (const w of pending.splice(0)) w({ done: true });
+      },
+      getReader: (): StreamReader => ({
+        read: () =>
+          new Promise((resolve) => {
+            const item = queue.shift();
+            if (item !== undefined) return resolve({ value: item });
+            if (closed) return resolve({ done: true });
+            pending.push(resolve);
+          }),
+        cancel: async () => undefined,
+      }),
+    };
+  };
+  interface FakeLaunch {
+    child: LaunchedChild;
+    kills: Array<number | undefined>;
+    exit: (code: number) => void;
+  }
+  const fakeOneShot = (opts: { stdout?: Array<Uint8Array | string>; stderr?: Array<Uint8Array | string>; exitCode?: number; stayOpen?: boolean }): FakeLaunch => {
+    const stayOpen = opts.stayOpen === true;
+    const out = byteStream(opts.stdout ?? [], stayOpen);
+    const errS = byteStream(opts.stderr ?? [], stayOpen);
+    const kills: Array<number | undefined> = [];
+    let exitResolve!: (code: number) => void;
+    const exited = new Promise<number>((r) => (exitResolve = r));
+    let settled = false;
+    const exit = (code: number): void => {
+      if (settled) return;
+      settled = true;
+      out.close();
+      errS.close();
+      exitResolve(code);
+    };
+    if (!stayOpen) exit(opts.exitCode ?? 0);
+    const child: LaunchedChild = {
+      pid: 4_242_424,
+      stdout: { getReader: () => out.getReader() },
+      stderr: { getReader: () => errS.getReader() },
+      stdin: null,
+      exited,
+      kill: (signal?: number) => {
+        kills.push(signal);
+        exit(137); // a killed fake dies promptly, keeping the settle waits off the escalation timers
+      },
+      unref: () => undefined,
+    };
+    return { child, kills, exit };
+  };
+  const LS_TUPLE = ["ls-tree", "-r", "-z", "-l", "--full-tree", "HEAD"];
+
+  test("gitBytes: a non-allowlisted argv is refused before any launch", async () => {
+    const launches: LaunchRequest[] = [];
+    const { client } = makeClient([], {
+      launchImpl: (_bin, _args, req) => {
+        launches.push(req);
+        return fakeOneShot({}).child;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-guard-"));
+    await expect(client.gitBytes(["log", "-p"], dir)).rejects.toThrow(ReadOnlyViolation);
+    expect(launches.length).toBe(0);
+  });
+  test("gitBytes: the cwd is containment-checked against the temp root before any launch", async () => {
+    const launches: LaunchRequest[] = [];
+    const { client } = makeClient([], {
+      launchImpl: (_bin, _args, req) => {
+        launches.push(req);
+        return fakeOneShot({}).child;
+      },
+    });
+    await expect(client.gitBytes(LS_TUPLE, "/etc")).rejects.toThrow(ReadOnlyViolation);
+    expect(launches.length).toBe(0);
+  });
+  test("gitBytes: stdout/stderr are captured as RAW BYTES (a non-UTF-8 byte survives verbatim), env is the sanitized git env", async () => {
+    const raw = new Uint8Array([0x61, 0xff, 0x00, 0x62]); // would be destroyed by a string decode
+    let seen: { bin: string; args: readonly string[]; req: LaunchRequest } | null = null;
+    const { client } = makeClient([], {
+      launchImpl: (bin, args, req) => {
+        seen = { bin, args, req };
+        return fakeOneShot({ stdout: [raw], stderr: ["warned\n"] }).child;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-bytes-"));
+    const res = await client.gitBytes(LS_TUPLE, dir);
+    expect(res.exitCode).toBe(0);
+    expect(res.timedOut).toBe(false);
+    expect([...res.stdout]).toEqual([...raw]);
+    expect(new TextDecoder().decode(res.stderr)).toBe("warned\n");
+    expect(seen).not.toBeNull();
+    const call = seen!;
+    expect(call.bin).toBe(BINS.git);
+    expect([...call.args]).toEqual(LS_TUPLE);
+    expect(call.req.stdin).toBe("ignore");
+    expect(call.req.cwd).toBe(dir);
+    expect(call.req.env["GIT_NO_REPLACE_OBJECTS"]).toBe("1"); // check 4: every git spawn
+    expect(call.req.env["GIT_TERMINAL_PROMPT"]).toBe("0");
+    expect(call.req.env["GIT_ASKPASS"]).toBeUndefined(); // sanitized, not a raw passthrough
+  });
+  test("gitBytes: counts against the GLOBAL subprocess semaphore (queued behind a held gh slot)", async () => {
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((r) => (releaseFirst = r));
+    const launches: LaunchRequest[] = [];
+    const spawn: SpawnFn = async () => {
+      await gate;
+      return ok(http(200, {}, "{}"));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spawn,
+      launchImpl: (_bin, _args, req) => {
+        launches.push(req);
+        return fakeOneShot({ stdout: ["x"] }).child;
+      },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      concurrency: 1,
+      env: { HOME: "/home/u", PATH: "/bin" },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-sem-"));
+    const p1 = client.gh(["api", "rate_limit"]);
+    const p2 = client.gitBytes(LS_TUPLE, dir);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(launches.length).toBe(0); // queued behind the held slot — the cap covers byte spawns too
+    releaseFirst();
+    await p1;
+    const res = await p2;
+    expect(launches.length).toBe(1);
+    expect(res.exitCode).toBe(0);
+  });
+  test("gitBytes: launches the VALIDATED COPY — mutating the caller argv in the acquire gap cannot change what runs", async () => {
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((r) => (releaseFirst = r));
+    const launched: Array<readonly string[]> = [];
+    const spawn: SpawnFn = async () => {
+      await gate;
+      return ok(http(200, {}, "{}"));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spawn,
+      launchImpl: (_bin, args) => {
+        launched.push(args);
+        return fakeOneShot({ stdout: ["x"] }).child;
+      },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      concurrency: 1,
+      env: { HOME: "/home/u", PATH: "/bin" },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-toctou-"));
+    const held = client.gh(["api", "rate_limit"]); // occupy the only slot: gitBytes queues AFTER its guards ran
+    const args = [...LS_TUPLE];
+    const p = client.gitBytes(args, dir);
+    await new Promise((r) => setTimeout(r, 10));
+    args[0] = "push"; // hostile mutation inside the semaphore-acquire gap
+    args.length = 1;
+    releaseFirst();
+    await held;
+    const res = await p;
+    expect(res.exitCode).toBe(0);
+    expect(launched.length).toBe(1);
+    expect([...launched[0]!]).toEqual(LS_TUPLE); // the validated tuple ran, not the mutated array
+  });
+  test("gitBytes: the wall-clock deadline kills the child and yields the synthetic 124 with timedOut", async () => {
+    let fake: FakeLaunch | null = null;
+    const { client } = makeClient([], {
+      spawnTimeoutMs: 40,
+      launchImpl: () => {
+        // the child EMITS partial listing bytes, then wedges: the synthetic 124 must discard
+        // them — a timed-out capture surfacing partial bytes would read as a complete listing
+        fake = fakeOneShot({ stdout: ["100644 blob aaaa 5\tsrc/x"], stayOpen: true });
+        return fake.child;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-timeout-"));
+    const res = await client.gitBytes(LS_TUPLE, dir);
+    expect(res.timedOut).toBe(true);
+    expect(res.exitCode).toBe(124);
+    expect(res.stdout.byteLength).toBe(0); // the partial bytes were discarded, never surfaced
+    expect(fake!.kills.length).toBeGreaterThan(0);
+  });
+  test("gitBytes: refuses clone even in its grammar-legal shape — write-destination verbs stay on the string lane", async () => {
+    const launches: LaunchRequest[] = [];
+    const { client } = makeClient([], {
+      launchImpl: (_bin, _args, req) => {
+        launches.push(req);
+        return fakeOneShot({}).child;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-clone-"));
+    const cloneArgv = [
+      "clone", "--depth", "1", "--single-branch", "--branch", "main",
+      "--no-tags", "--no-recurse-submodules", "--template=", "https://github.com/o/r.git", join(dir, "dest"),
+    ];
+    await expect(client.gitBytes(cloneArgv, dir)).rejects.toThrow(/refuses clone/);
+    expect(launches.length).toBe(0);
+  });
+  test("gitBytes: a reader-acquisition failure after the launch kills the child instead of orphaning it", async () => {
+    const kills: Array<number | undefined> = [];
+    const { client } = makeClient([], {
+      launchImpl: () => {
+        const real = fakeOneShot({ stayOpen: true });
+        return {
+          ...real.child,
+          kill: (signal?: number) => {
+            kills.push(signal);
+            real.child.kill(signal);
+          },
+          stdout: {
+            getReader: (): never => {
+              throw new Error("reader acquisition failed");
+            },
+          },
+        };
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-reader-throw-"));
+    await expect(client.gitBytes(LS_TUPLE, dir)).rejects.toThrow(/reader acquisition failed/);
+    expect(kills.length).toBeGreaterThan(0); // the launched child was escalated, not abandoned
+  });
+  test("gitBytes: a REJECTED exit promise holds the return until the pumps settle, so the caller cannot delete the clone under a live child", async () => {
+    // `Promise.all` is fail-fast, so a rejected exit promise short-circuited the join and
+    // returned straight through the finally with the pumps unjoined — while the caller's
+    // failure path deletes the clone directory. A rejected exit means the process WAIT failed,
+    // not that the process died (santa final loop, round 2).
+    const order: string[] = [];
+    let releaseReaders!: () => void;
+    const readersGate = new Promise<void>((r) => { releaseReaders = r; });
+    const { client } = makeClient([], {
+      launchImpl: () => {
+        const drain = async (label: string): Promise<{ done: true; value: undefined }> => {
+          await readersGate;
+          order.push(`${label}-settled`);
+          return { done: true, value: undefined };
+        };
+        return {
+          pid: 4_242_424,
+          stdout: { getReader: () => ({ read: () => drain("stdout"), cancel: async () => undefined, releaseLock: () => undefined }) },
+          stderr: { getReader: () => ({ read: () => drain("stderr"), cancel: async () => undefined, releaseLock: () => undefined }) },
+          stdin: null,
+          exited: Promise.reject(new Error("process wait failed")),
+          kill: () => { order.push("killed"); },
+          unref: () => undefined,
+        } as unknown as LaunchedChild;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-exit-reject-"));
+    const call = client.gitBytes(LS_TUPLE, dir).then(
+      () => order.push("returned"),
+      () => order.push("returned"),
+    );
+    await new Promise((r) => setTimeout(r, 20)); // the exit rejection has landed by now
+    expect(order).not.toContain("returned"); // …and the call is STILL held, pumps unsettled
+    releaseReaders();
+    await call;
+    expect(order.indexOf("stdout-settled")).toBeLessThan(order.indexOf("returned"));
+    expect(order.indexOf("stderr-settled")).toBeLessThan(order.indexOf("returned"));
+    expect(order).toContain("killed"); // the escalation still ran
+  });
+  test("gitBytes: a stderr reader-acquisition failure cancels the stdout reader it already took", async () => {
+    // Escalating with an empty reader list left the FIRST acquired reader locked to a stream
+    // nobody would ever drain or cancel — and nothing else can reach it, so a descendant
+    // holding that pipe could outlive the clone deletion (santa final loop, round 4).
+    let outCancelled = 0;
+    const { client } = makeClient([], {
+      launchImpl: () => {
+        const real = fakeOneShot({ stayOpen: true });
+        return {
+          ...real.child,
+          stdout: { getReader: () => ({ read: async () => ({ done: true, value: undefined }), cancel: async () => { outCancelled++; }, releaseLock: () => undefined }) },
+          stderr: { getReader: (): never => { throw new Error("stderr reader acquisition failed"); } },
+        } as unknown as LaunchedChild;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-partial-reader-"));
+    await expect(client.gitBytes(LS_TUPLE, dir)).rejects.toThrow(/stderr reader acquisition failed/);
+    expect(outCancelled).toBe(1);
+  });
+  test("gitBytes: a non-string argv slot is refused before the guards run", async () => {
+    const launches: LaunchRequest[] = [];
+    const { client } = makeClient([], {
+      launchImpl: (_bin, _args, req) => {
+        launches.push(req);
+        return fakeOneShot({}).child;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-nonstring-"));
+    const hostile = ["ls-tree", 42, "-z"] as unknown as string[];
+    await expect(client.gitBytes(hostile, dir)).rejects.toThrow(/not an own string/);
+    expect(launches.length).toBe(0);
+  });
+  test("binPaths is defensively copied — mutating the caller's object after construction cannot swap the binary", async () => {
+    const callerBins = { ...BINS };
+    const seenBins: string[] = [];
+    const spawn: SpawnFn = async (bin) => {
+      seenBins.push(bin);
+      return ok(http(200, {}, "{}"));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spawn,
+      binPaths: callerBins,
+      tempRoot: TEST_TMP,
+      env: { HOME: "/home/u", PATH: "/bin" },
+    });
+    callerBins.gh = "/evil/replacement"; // post-construction mutation of the caller's object
+    await client.gh(["api", "rate_limit"]);
+    expect(seenBins).toEqual([BINS.gh]); // the client spawned its own copy, not the mutation
+  });
+  test("launchBatchChild: guarded + containment-checked, launched with a stdin PIPE, and NEVER holding a global permit", async () => {
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((r) => (releaseFirst = r));
+    const calls: Array<{ args: readonly string[]; req: LaunchRequest }> = [];
+    const spawn: SpawnFn = async () => {
+      await gate;
+      return ok(http(200, {}, "{}"));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spawn,
+      launchImpl: (_bin, args, req) => {
+        calls.push({ args, req });
+        return fakeOneShot({ stayOpen: true }).child;
+      },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+      concurrency: 1,
+      env: { HOME: "/home/u", PATH: "/bin", GIT_ASKPASS: "/evil" },
+    });
+    expect(() => client.launchBatchChild("/etc")).toThrow(ReadOnlyViolation); // containment
+    expect(calls.length).toBe(0);
+    const dir = mkdtempSync(join(TEST_TMP, "batch-child-"));
+    const held = client.gh(["api", "rate_limit"]); // occupy the ONLY one-shot slot…
+    const child = client.launchBatchChild(dir); // …and the child still launches: no global permit
+    expect(calls.length).toBe(1);
+    expect([...calls[0]!.args]).toEqual(["cat-file", "--batch"]);
+    expect(calls[0]!.req.stdin).toBe("pipe");
+    expect(calls[0]!.req.cwd).toBe(dir);
+    expect(calls[0]!.req.env["GIT_NO_REPLACE_OBJECTS"]).toBe("1"); // check 4, at the child's own launch
+    expect(calls[0]!.req.env["GIT_ASKPASS"]).toBeUndefined(); // the sanitized env, not process.env
+    expect(typeof child.pid).toBe("number");
+    releaseFirst();
+    await held;
+  });
+  test("the child permit pool is fixed at the subprocess semaphore's size and is INDEPENDENT of it", async () => {
+    const { client } = makeClient([ok(http(200, {}, "{}"))], { concurrency: 1 });
+    const release1 = await client.acquireChildPermit();
+    let secondAcquired = false;
+    const p2 = client.acquireChildPermit().then((r) => {
+      secondAcquired = true;
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(secondAcquired).toBe(false); // pool size 1: the second permit queues
+    // independence: a held CHILD permit must not block the one-shot lane (no shared semaphore)
+    const res = await client.gh(["api", "rate_limit"]);
+    expect(res.exitCode).toBe(0);
+    release1();
+    (await p2)();
+  });
+  test("check 9: same-repo clone starts are serialized and spaced ≥ 200ms apart; different repos are unaffected", async () => {
+    const PIN = "a".repeat(40);
+    const { client, calls, sleeps } = makeClient([
+      ok(""), ok(PIN + "\n"), // repo r1, clone A
+      ok(""), ok(PIN + "\n"), // repo r1, clone B — must be gated ≥200ms after A's start
+      ok(""), ok(PIN + "\n"), // repo r2 — a DIFFERENT repo, no spacing sleep
+    ]);
+    await client.cloneNoCheckout("o", "r1", "main", PIN);
+    await client.cloneNoCheckout("o", "r1", "main", PIN);
+    await client.cloneNoCheckout("o", "r2", "main", PIN);
+    expect(calls.filter((c) => c.args[0] === "clone").length).toBe(3);
+    // exactly ONE spacing sleep: the second r1 start (the fake clock advances only via sleeps,
+    // so the r2 start and the first r1 start see no live spacing window of their own)
+    expect(sleeps).toEqual([200]);
+  });
+  test("check 9: the gate spaces REAL starts even when the global semaphore was the bottleneck", async () => {
+    // Two same-repo clones queue behind a saturated semaphore. If the gate stamped BEFORE the
+    // acquire, both stamps would land while queued and the real spawns would bunch the moment
+    // the slot freed; gating INSIDE the lease forces the second REAL start to sleep the spacing.
+    const PIN = "a".repeat(40);
+    let releaseHold!: () => void;
+    const gate = new Promise<void>((r) => (releaseHold = r));
+    const sleeps: number[] = [];
+    let fakeNow = 1_000_000_000_000;
+    const cloneStartTimes: number[] = [];
+    const spawn: SpawnFn = async (_bin, args) => {
+      if (args[0] === "api") {
+        await gate; // the saturating one-shot spawn — holds the ONLY slot until released
+        return ok(http(200, {}, "{}"));
+      }
+      // argv-routed (never positional): at concurrency 1 the second clone legitimately
+      // interleaves BETWEEN the first clone and its rev-parse
+      if (args[0] === "clone") {
+        cloneStartTimes.push(fakeNow); // the REAL spawn instant on the fake clock
+        return ok("");
+      }
+      return ok(PIN + "\n");
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl: spawn, binPaths: BINS, tempRoot: TEST_TMP, concurrency: 1,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+        fakeNow += ms;
+      },
+      nowImpl: () => fakeNow,
+      env: { HOME: "/home/u", PATH: "/bin" },
+    });
+    const held = client.gh(["api", "rate_limit"]);
+    const c1 = client.cloneNoCheckout("o", "r", "main", PIN);
+    const c2 = client.cloneNoCheckout("o", "r", "main", PIN);
+    await new Promise((r) => setTimeout(r, 10)); // both clones are now queued on the semaphore
+    releaseHold();
+    await held;
+    await Promise.all([c1, c2]);
+    expect(sleeps).toEqual([200]); // the SECOND real start slept the spacing INSIDE its lease
+    // the REAL spawn instants — not merely the sleeps — are what the check claims about
+    expect(cloneStartTimes.length).toBe(2);
+    expect(cloneStartTimes[1]! - cloneStartTimes[0]!).toBeGreaterThanOrEqual(200);
+  });
+  test("check 9: clone RETRIES flow through the same gate — the retry's start sleeps the remaining spacing", async () => {
+    const PIN = "a".repeat(40);
+    // The fake clock advances by a FIXED small step per sleep rather than by the sleep's own
+    // duration. That decoupling is what makes the assertion discriminating: with a truthful
+    // clock the 2,000 ms transient backoff would already satisfy the 200 ms spacing, so the
+    // gate would compute no wait and an UNGATED retry would produce exactly the same `[2000]`
+    // — the test could not tell the two apart (santa final loop, round 1). Under-advancing the
+    // clock leaves spacing genuinely due at the retry, so the gate's own sleep is observable.
+    // awaitCloneGate sleeps once on a computed remainder (it does not loop), so a short step
+    // cannot spin.
+    const sleeps: number[] = [];
+    let fakeNow = 1_000_000_000_000;
+    const CLOCK_STEP_MS = 25;
+    const { spawn } = scripted([err("", "fatal: early EOF", 128), ok(""), ok(PIN + "\n")]);
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spawn,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+        fakeNow += CLOCK_STEP_MS;
+      },
+      nowImpl: () => fakeNow,
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+    });
+    await client.cloneNoCheckout("o", "r", "main", PIN);
+    // attempt 1: gate has no prior stamp for this url → no wait, stamps t0 → spawn fails 128.
+    // backoff 2000 (clock → t0+25). attempt 2: the gate's own consultation finds t0+200 still
+    // in the future and sleeps the remaining 175 — present ONLY because the retry consults it.
+    expect(sleeps).toEqual([2000, 175]);
+  });
+  test("rvo Q2: a MARKER-LESS STAGING dir is retained (a sibling mid-creation), a dead-owner staged orphan sweeps", () => {
+    const root = mkdtempSync(join(tmpdir(), "owned-stage-"));
+    const { client } = makeClient([], { tempRoot: root });
+    // mid-creation: the marker has not landed yet — deleting this would fail the sibling's publication
+    const midCreation = join(root, ".pkg-audit-stage-abc123");
+    mkdirSync(midCreation);
+    // crash orphan: staged, marked, owner long dead — reclaimed by the ownership rule
+    const orphan = join(root, ".pkg-audit-stage-dead99");
+    mkdirSync(orphan);
+    writeFileSync(join(orphan, ".pkg-audit-owner.json"), JSON.stringify({ pid: 999_999_999, startedAtIso: "2026-01-01T00:00:00Z" }));
+    const removed = client.sweepStaleTempDirs();
+    expect(removed).toEqual([".pkg-audit-stage-dead99"]);
+    expect(existsSync(midCreation)).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("rvo Q2: the sweep RETAINS a live-owner dir, removes dead-owner and marker-less dirs", () => {
+    const root = mkdtempSync(join(tmpdir(), "owned-sweep-"));
+    const { client } = makeClient([], { tempRoot: root });
+    // live owner: THIS process — makeRunTempDir stamps the marker itself
+    const live = client.makeRunTempDir();
+    // dead owner: a pid far above the platform ceiling can never be alive
+    const dead = join(root, "pkg-audit-dead1");
+    mkdirSync(dead);
+    writeFileSync(join(dead, ".pkg-audit-owner.json"), JSON.stringify({ pid: 999_999_999, startedAtIso: "2026-01-01T00:00:00Z" }));
+    // marker-less: a legacy leftover from a pre-ownership version
+    const legacy = join(root, "pkg-audit-legacy1");
+    mkdirSync(legacy);
+    // malformed marker CONTENT (the read itself succeeded): UNOWNED, not retained — atomic
+    // marker publication means a torn write cannot exist, so garbage is a dead writer's
+    // residue. (A marker whose READ fails is the opposite case: retained — see the
+    // unreadable-marker test in the observability block.)
+    const garbled = join(root, "pkg-audit-garbled1");
+    mkdirSync(garbled);
+    writeFileSync(join(garbled, ".pkg-audit-owner.json"), "not json");
+    const removed = client.sweepStaleTempDirs().sort();
+    expect(removed).toEqual(["pkg-audit-dead1", "pkg-audit-garbled1", "pkg-audit-legacy1"]);
+    expect(existsSync(live)).toBe(true); // the live sibling's clone survives the sweep
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("rvo Q2: makeRunTempDir and the gitcfg dir both stamp the owner marker", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owned-stamp-"));
+    const { client } = makeClient([ok("abc\n")], { tempRoot: root });
+    const dir = client.makeRunTempDir();
+    expect(existsSync(join(dir, ".pkg-audit-owner.json"))).toBe(true);
+    const marker = JSON.parse(readFileSync(join(dir, ".pkg-audit-owner.json"), "utf8")) as { pid: number };
+    expect(marker.pid).toBe(process.pid);
+    await client.git(["rev-parse", "HEAD"], undefined).catch(() => undefined); // materializes the gitcfg dir
+    const cfgDirs = readdirSync(root).filter((n) => n.startsWith("pkg-audit-gitcfg-"));
+    expect(cfgDirs.length).toBe(1);
+    expect(existsSync(join(root, cfgDirs[0]!, ".pkg-audit-owner.json"))).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("readBytesCapped: the byte cap kills mid-stream and rejects (never buffers past the cap)", async () => {
+    let cancelled = false;
+    let exceeded = 0;
+    const reader: StreamReader = {
+      read: async () => ({ value: new Uint8Array(64) }), // an endless 64-byte firehose
+      cancel: async () => {
+        cancelled = true;
+      },
+    };
+    await expect(readBytesCapped(reader, 100, () => exceeded++)).rejects.toThrow(/exceeds 100 bytes/);
+    expect(exceeded).toBe(1);
+    expect(cancelled).toBe(false); // the CALLER's kill path owns cancellation, mirroring readCapped
   });
 });

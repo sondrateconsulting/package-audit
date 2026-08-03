@@ -4,11 +4,12 @@
 // with a sanitized allowlist env, and every write target (clone dest, tar -C dir, gitconfig)
 // is assertContained before the process starts (§0). Handles TS pagination via per-page
 // `gh api -i` header parsing, the §4 rate-limit classes, api_cache integration (§3), the
-// hardened clone fallback (§0/§5.C), and the startup pkg-audit-* temp sweep.
+// hardened per-unit clone (§0/§5.C), and the startup pkg-audit-* temp sweep.
 
-import { mkdtempSync, readdirSync, lstatSync, rmSync, unlinkSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, lstatSync, renameSync, rmSync, unlinkSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir, devNull } from "node:os";
 import { join } from "node:path";
+import { types as runtimeTypes } from "node:util";
 import {
   assertReadOnlyGh, assertReadOnlyGit, assertReadOnlyTar, assertSpawnAllowed, assertContained,
 } from "./readOnlyGuard.ts";
@@ -64,6 +65,15 @@ export interface SpawnResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+}
+// The byte-typed one-shot capture (gitBytes) — the T2c enumeration path consumes bytes, never
+// a pre-decoded string. `timedOut: true` always pairs with the synthetic exit 124 and EMPTY
+// stdout (a timed-out capture must never surface partial bytes as a complete listing).
+export interface GitBytesResult {
+  exitCode: number;
+  stdout: Uint8Array;
+  stderr: Uint8Array;
+  timedOut: boolean;
 }
 // Minimal, purpose-built abort plumbing: a bespoke { aborted, onAbort } read side fit for the
 // spawn-deadline use — the client flips it on deadline expiry and the spawn impl registers the
@@ -132,7 +142,10 @@ export function spawnLabel(tool: SpawnTool, args: readonly string[]): string {
   }
 }
 
-const MAX_SPAWN_OUTPUT_BYTES = 110 * 1024 * 1024; // raw contents cap is 100 MB (§5.C) + slack
+// EXPORTED since the ADR-0001 T2c adoption: the content store's absolute per-frame ceiling is
+// PINNED to this cap by the bill (an ungated manifest can never allocate more than today's REST
+// path could return before the cap kill), and the store's tests assert that binding.
+export const MAX_SPAWN_OUTPUT_BYTES = 110 * 1024 * 1024; // raw contents cap is 100 MB (§5.C) + slack
 // §4 hardening: SIGTERM is refusable — a signal-trapping/wedged child, or a descendant that
 // inherited the pipes, must not orphan the read loop or pin the event loop. This grace period
 // after the deadline's SIGTERM ends in SIGKILL, a best-effort process-group kill (the spawn
@@ -169,47 +182,210 @@ export async function readCapped(reader: StreamReader, cap: number, onExceed: ()
   return Buffer.concat(chunks).toString("utf8");
 }
 
+// Like readCapped but yielding RAW BYTES — the T2c seam consumes `ls-tree -z` output (and the
+// framed child's streams) as bytes, because the string path's irreversible UTF-8 decode would
+// destroy exactly the evidence the byte-level parsers must fail closed on. Same cap semantics:
+// the process is killed the moment the cap is crossed, never after buffering the excess.
+export async function readBytesCapped(reader: StreamReader, cap: number, onExceed: () => void): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (value !== undefined) {
+      total += value.byteLength;
+      if (total > cap) {
+        onExceed();
+        throw new GithubApiError(`spawn output exceeds ${cap} bytes`, {});
+      }
+      chunks.push(value);
+    }
+    if (done) break;
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.byteLength;
+  }
+  return out;
+}
+
+// ---- the single launch primitive (ADR-0001 T2c: parameterized, never duplicated) -------------
+// Structural shapes for the launched child (house precedent: StreamReader) — enough for byte
+// pumps, stdin writes, and the kill path, without runtime-specific generics. The interactive
+// consumers (contentStore.ts's child manager) hold these shapes only, never a runtime handle
+// type, so scripted fakes drive every lifecycle test.
+export interface StdinSink {
+  write(data: Uint8Array): number | Promise<number>;
+  flush(): unknown;
+  end(): unknown;
+}
+export interface LaunchedChild {
+  readonly pid: number;
+  readonly stdout: { getReader(): StreamReader };
+  readonly stderr: { getReader(): StreamReader };
+  // ONE "no pipe" representation: null. The real runtime handle surfaces undefined for a
+  // non-pipe stdin; realLaunch normalizes that to null at the launch boundary so consumers
+  // and structural fakes never need a two-bottom-values dance.
+  readonly stdin: StdinSink | null;
+  readonly exited: Promise<number>;
+  kill(signal?: number): void;
+  unref(): void;
+}
+export interface LaunchRequest {
+  env: Record<string, string>;
+  cwd?: string;
+  stdin: "ignore" | "pipe";
+}
+// The injectable interactive/byte launch seam (GithubClientOptions.launchImpl). The one-shot
+// string SpawnFn seam stays as-is for its existing consumers; interactive children get their
+// own launch type rather than stretching the one-shot seam (plan §6 P3).
+export type LaunchFn = (bin: string, args: readonly string[], req: LaunchRequest) => LaunchedChild;
+
+// THE process-launch site — the only one in the audit product (§6; grep-enforced). Both stdin
+// modes flow through this single call: the one-shot paths pass "ignore", the unit-lived
+// cat-file child passes "pipe".
+//
+// The command vector is assembled BY INDEX rather than by spreading `args`: a spread reads the
+// argument object's own iterator, so an argv whose indexed slots are innocuous but whose
+// iterator yields other tokens would launch a command no guard ever saw. Every wrapper already
+// hands us an owned copy (copiedArgv), which is what makes the argv the guards validated and
+// the argv that launches the same array; building the vector positionally keeps that property
+// structural here rather than resting on caller discipline alone.
+const realLaunch: LaunchFn = (bin, args, req) => {
+  // Assembled with defineProperty, then frozen — not `push`, not a spread, and NOT plain index
+  // assignment. By this point the wrapper has already read the caller's env object (whose
+  // properties may be accessors), so caller code can have run AFTER argv validation and
+  // replaced shared state. `push` and spread route through mutable Array.prototype methods; a
+  // plain index write is worse than it looks, because assigning into a HOLE walks the
+  // prototype chain and an inherited numeric SETTER captures the write, leaving the slot
+  // reading back as whatever that accessor returns. defineProperty consults no prototype at
+  // all, and the freeze means nothing downstream can rewrite the vector either.
+  const cmd: string[] = [];
+  defineProp(cmd, 0, { value: bin, writable: false, enumerable: true, configurable: false });
+  for (let i = 0; i < args.length; i++) {
+    const token: unknown = args[i];
+    if (typeof token !== "string") throw new GithubApiError(`launch argv slot ${i} is not a string`, {});
+    defineProp(cmd, i + 1, { value: token, writable: false, enumerable: true, configurable: false });
+  }
+  freezeIntrinsic(cmd);
+  const proc = Bun.spawn({
+    cmd,
+    env: req.env,
+    cwd: req.cwd,
+    stdin: req.stdin,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  // A structural pick instead of a double cast: every field the tool consumes is read off the
+  // real subprocess HERE, so a Bun API drift becomes a compile error at the one launch site
+  // rather than a runtime surprise in a consumer. stdin normalizes to null at this boundary
+  // (the real handle surfaces undefined for a non-pipe stdin; structural fakes already use
+  // null), and kill/unref are forwarding closures — an unbound method pick would detach the
+  // subprocess receiver.
+  return {
+    pid: proc.pid,
+    stdout: proc.stdout,
+    stderr: proc.stderr,
+    stdin: proc.stdin ?? null,
+    exited: proc.exited,
+    kill: (signal?: number) => proc.kill(signal),
+    unref: () => proc.unref(),
+  };
+};
+
+// Copy an argv into a fresh, dense array of primitive strings BEFORE the guards run, so that the
+// guards, the containment walks, and the launch all operate on ONE array this module owns. The
+// caller's own object can otherwise diverge from what was validated in two ways:
+//   • the launch builds its command vector from the argv, so an overridden `Symbol.iterator`
+//     (or any other overridden array method a consumer uses) can present tokens the guards never
+//     inspected — hardening readOnlyGuard's internal copy does not help, because the object that
+//     reaches the launch is still the caller's;
+//   • every wrapper awaits a semaphore permit between validation and launch, so a caller holding
+//     a reference can swap a validated slot inside that window.
+// Both close the same way: validate and launch one array we own.
+//
+// The overriding rule is that NO CALLER CODE RUNS while an argv is being validated. Anything
+// the caller can make executable during inspection is a channel for changing the decision after
+// it is made — a getter or a Proxy trap can mutate the very prototypes the grammar consults a
+// moment later, so the guard would judge one command and the wrapper would launch another
+// without the argv object itself ever changing. So:
+//   • a Proxy is refused before ANY property is touched (`isProxy` reads no properties, and
+//     `Array.isArray` is true for an Array-backed Proxy, so it cannot stand in for this check);
+//   • every slot must be an OWN DATA property holding a primitive string — accessors are
+//     refused rather than invoked, and a prototype-backed hole is refused rather than silently
+//     materialised into a shape readOnlyGuard deliberately rejects.
+// Every intrinsic used here — `isProxy`, `Array.isArray`, `Object.getOwnPropertyDescriptor` —
+// is captured at module load, so a later mutation of any of them cannot weaken the copy, and
+// the arrays this module builds are filled by index rather than through prototype methods.
+//
+// Residual, deliberately out of scope: an actor who can mutate shared intrinsics BEFORE the call
+// already executes arbitrary code in this process and could launch a child directly — no argv
+// guard can bound that. What this boundary does guarantee is that a hostile argv OBJECT cannot
+// make the validated command differ from the launched one.
+const isArrayIntrinsic = Array.isArray;
+const isProxyIntrinsic = runtimeTypes.isProxy;
+const ownDescriptor = Object.getOwnPropertyDescriptor;
+const defineProp = Object.defineProperty;
+const freezeIntrinsic = Object.freeze;
+function copiedArgv(args: readonly string[], lane: string): string[] {
+  if (isProxyIntrinsic(args)) throw new GithubApiError(`${lane} argv is a proxy (its traps would run during validation)`, {});
+  if (!isArrayIntrinsic(args)) throw new GithubApiError(`${lane} argv is not an array`, {});
+  const len = args.length;
+  if (!Number.isSafeInteger(len) || len < 0) throw new GithubApiError(`${lane} argv length is not a safe nonnegative integer`, {});
+  // defineProperty per slot, then FROZEN: the array the guards judge and the launch consumes is
+  // built without touching a replaceable prototype method or an inherited numeric setter, and
+  // is thereafter immutable — so nothing that runs between validation and launch (a progress
+  // label builder, a future reader, anything) can alter what actually spawns.
+  const out: string[] = [];
+  for (let i = 0; i < len; i++) {
+    const slot = ownDescriptor(args, i);
+    if (slot === undefined || !("value" in slot) || typeof slot.value !== "string")
+      throw new GithubApiError(`${lane} argv slot ${i} is not an own string data property (sparse, prototype-backed, or accessor argv)`, {});
+    defineProp(out, i, { value: slot.value, writable: false, enumerable: true, configurable: false });
+  }
+  freezeIntrinsic(out);
+  return out;
+}
+
+// Kill with the §4 escalation shape, shared by every consumer of the launch primitive:
+// terminate now; after the grace, SIGKILL + best-effort group kill + reader cancellation +
+// unref — every step a no-op on a clean exit. Escalation fires UNCONDITIONALLY after the grace:
+// SIGKILL cannot be trapped, and cancelling the readers unblocks the capped reads even when a
+// surviving grandchild still holds the inherited pipes open. EXPORTED for contentStore.ts's
+// child manager (which owns per-read deadlines over the same escalation).
+export function killWithEscalation(child: LaunchedChild, readers: StreamReader[]): void {
+  try {
+    child.kill();
+  } catch {
+    // already exited
+  }
+  const escalate = setTimeout(() => {
+    try {
+      child.kill(9); // SIGKILL
+    } catch {
+      // already exited
+    }
+    try {
+      process.kill(-child.pid, 9); // group kill, when the child leads a group
+    } catch {
+      // not a group leader / already gone
+    }
+    for (const r of readers) r.cancel().catch(() => {});
+    child.unref();
+  }, SPAWN_KILL_GRACE_MS);
+  escalate.unref?.();
+}
+
 // Factory so the byte cap is injectable for tests (shipping 110MB through a real child to
 // exercise the cap would be pure test tax); realSpawn — the production SpawnFn — is
 // makeRealSpawn(MAX_SPAWN_OUTPUT_BYTES).
 export function makeRealSpawn(cap: number): SpawnFn {
   return async (bin, args, opts) => {
-    const proc = Bun.spawn({
-      cmd: [bin, ...args],
-      env: opts.env,
-      cwd: opts.cwd,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const proc = realLaunch(bin, args, { env: opts.env, cwd: opts.cwd, stdin: "ignore" });
     const outReader = proc.stdout.getReader();
     const errReader = proc.stderr.getReader();
-    const kill = (): void => {
-      try {
-        proc.kill();
-      } catch {
-        // already exited
-      }
-      // Escalation fires UNCONDITIONALLY after the grace (all steps are no-ops on a clean
-      // exit): SIGKILL cannot be trapped, and cancelling the readers unblocks readCapped even
-      // when a surviving grandchild still holds the inherited pipes open.
-      const escalate = setTimeout(() => {
-        try {
-          proc.kill(9); // SIGKILL
-        } catch {
-          // already exited
-        }
-        try {
-          process.kill(-proc.pid, 9); // group kill, when the child leads a group
-        } catch {
-          // not a group leader / already gone
-        }
-        outReader.cancel().catch(() => {});
-        errReader.cancel().catch(() => {});
-        proc.unref();
-      }, SPAWN_KILL_GRACE_MS);
-      escalate.unref?.();
-    };
+    const kill = (): void => killWithEscalation(proc, [outReader, errReader]);
     opts.signal?.onAbort(kill);
     // ANY reader failure — not only the byte cap's own onExceed — must start the kill
     // escalation: a raw stream error otherwise leaves the child running and pins the
@@ -219,11 +395,30 @@ export function makeRealSpawn(cap: number): SpawnFn {
       p.catch(() => kill());
       return p;
     };
-    return joinSpawnOutcome(
-      killOnFailure(readCapped(outReader, cap, kill)),
-      killOnFailure(readCapped(errReader, cap, kill)),
-      proc.exited,
+    const outP = killOnFailure(readCapped(outReader, cap, kill));
+    const errP = killOnFailure(readCapped(errReader, cap, kill));
+    // A REJECTED exit promise is a local process-wait failure — the child may well still be
+    // running. Callers treat this promise's settlement as "the child is gone" and delete its
+    // working directory immediately, so surface it only after the best-effort escalation and a
+    // BOUNDED wait for the pumps (the escalation cancels the readers, so this cannot hang).
+    // Without it the one-shot string lane released its permit and let the clone deletion race a
+    // live child — the byte lane's discipline, which this lane lacked.
+    const exitedSettled = proc.exited.then(
+      (code) => code,
+      async (): Promise<number> => {
+        kill();
+        let settleTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          Promise.all([outP.then(() => undefined, () => undefined), errP.then(() => undefined, () => undefined)]),
+          new Promise<void>((resolve) => {
+            settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
+          }),
+        ]);
+        clearTimeout(settleTimer);
+        throw new GithubApiError("spawn exit promise rejected — the child was kill-escalated", {});
+      },
     );
+    return joinSpawnOutcome(outP, errP, exitedSettled);
   };
 }
 
@@ -306,6 +501,12 @@ export function buildGitEnv(base: Env, gitConfigPath: string): Record<string, st
     GIT_CONFIG_SYSTEM: devNull,
     GIT_CONFIG_GLOBAL: gitConfigPath,
     GIT_ALLOW_PROTOCOL: "https", // insteadOf can't smuggle ssh/file even if config slipped
+    // ADR-0001 check 4: EVERY git spawn runs replace-ref-blind, set HERE (the one env builder)
+    // rather than only on the cat-file child — rev-parse/ls-tree running WITH replace refs
+    // while cat-file runs without them would let the coherence check and the enumeration
+    // disagree with the reads. An env var deliberately: the guard treats a pre-verb global
+    // like a no-replace option as the verb and denies it (readOnlyGuard's pre-verb rule).
+    GIT_NO_REPLACE_OBJECTS: "1",
     GIT_PAGER: "cat",
     NO_COLOR: "1",
     TERM: "dumb",
@@ -712,8 +913,9 @@ export function parseGraphqlEnvelope(bodyText: string): GraphqlEnvelope {
 // GitHub git/trees (§5.C): the listing we act on must be PROVABLY complete and well-addressed,
 // so every violation throws (→ a scan-scope errors row at the unit boundary). Before this guard,
 // a missing `tree` member read as an EMPTY repo (zero findings, silently) and a missing
-// `truncated` flag read as `false` — silently disabling the caller's clone fallback, its only
-// escape hatch for over-limit repos.
+// `truncated` flag read as `false`. (Production no longer reads REST trees — the T2c cutover
+// enumerates locally — but the parser is retained for the benchmark's REST-tree drivers, and
+// its fail-closed guarantees are pinned by direct parser tests.)
 // The git object types git/trees returns — the SINGLE source of truth for both the runtime check
 // and the static TreeEntryType, so the two cannot drift. A future/unknown type must fail LOUD, not
 // vanish through the downstream blob filter.
@@ -1008,12 +1210,98 @@ const TRANSIENT_BASE_WAIT_MS = 2_000;
 // wall-clock kill deadline, generous enough for a large shallow clone or tarball extract. On
 // expiry the child is killed and the empty result flows into the transient retry path.
 export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
+// ADR-0001 T2c (rvo Q1): bounded clone retry — on the common path a single-attempt clone would
+// convert every network blip into a unit error.
+const CLONE_MAX_ATTEMPTS = 3;
+// ADR-0001 check 9 (§3.9): clone STARTS for the same (host, org, repo) are serialized and
+// spaced at least this far apart — a hard construction that keeps git transport under GitHub's
+// recommended 15 read ops/s/repo whatever the fan-out or failure rate (at a conservative 2
+// transport operations per clone start, ≥200 ms spacing bounds it at ≤10 ops/s/repo).
+const CLONE_GATE_SPACING_MS = 200;
+
+// ---- owned temp-dir markers (ADR-0001 rvo Q2) ----------------------------------------------
+// Every pkg-audit-* dir this process creates is stamped with its owner; the startup sweep then
+// removes only UNOWNED (marker-less, legacy) or DEAD-OWNER dirs, never a live sibling audit's.
+// PUBLICATION IS ATOMIC: the dir is created under a dot-prefixed STAGING name the pkg-audit-*
+// sweep matcher never selects, the marker is written inside it, and only then is it renamed to
+// its final swept-namespace name — so no sweep can ever observe a marker-less dir that a live
+// sibling just created. A crash between mkdtemp and rename leaves a staged orphan, which the
+// sweep reclaims under the SAME ownership rule (see STAGING_PREFIX handling there).
+const OWNER_MARKER_NAME = ".pkg-audit-owner.json";
+const STAGING_PREFIX = ".pkg-audit-stage-";
+// The one marker shape, shared by the writer and the reader: the writer serializes exactly this
+// interface, and the reader's parse is keyed through `keyof OwnerMarker`, so renaming a field
+// compiles only if BOTH sides move together. The reader still validates at runtime — an on-disk
+// marker is external data — and accepts a valid `pid` alone: `startedAtIso` is diagnostic, so
+// older or hand-edited markers that carry only a valid pid stay owned.
+export interface OwnerMarker {
+  pid: number;
+  startedAtIso: string;
+}
+function writeOwnerMarker(dir: string): void {
+  const marker: OwnerMarker = { pid: process.pid, startedAtIso: new Date().toISOString() };
+  writeFileSync(join(dir, OWNER_MARKER_NAME), JSON.stringify(marker), { mode: 0o600 });
+}
+// Create an owned dir with the given final prefix (e.g. "pkg-audit-"): staged mkdtemp → marker
+// → atomic same-dir rename. Returns the FINAL path.
+function makeOwnedDir(root: string, finalPrefix: string): string {
+  const staged = mkdtempSync(join(root, STAGING_PREFIX));
+  writeOwnerMarker(staged);
+  const suffix = staged.slice(join(root, STAGING_PREFIX).length);
+  const final = join(root, `${finalPrefix}${suffix}`);
+  renameSync(staged, final);
+  return final;
+}
+// The marker read is THREE-way, because "no valid marker" conflates two states with opposite
+// safe answers. `unowned` is a PROVEN absence of a live claim: the file does not exist (ENOENT —
+// a legacy dir), or it was read and its content carries no valid pid (publication is atomic via
+// the staged rename above, so a torn write cannot exist — garbage content is a dead writer's
+// residue, never a live sibling's marker mid-write). `unreadable` is everything else: the file
+// may exist but the READ itself failed (EMFILE under fan-out, a transient EACCES/EIO), which
+// proves nothing about ownership — the sweep must retain and warn, the same fail-safe posture
+// `ownerIsAlive` documents below. Collapsing these to one value was fail-OPEN: a read blip on a
+// live sibling's valid marker deleted its clone mid-run, silently.
+type OwnerRead = { kind: "owned"; pid: number } | { kind: "unowned" } | { kind: "unreadable"; error: unknown };
+function readOwnerPid(dir: string): OwnerRead {
+  let raw: string;
+  try {
+    raw = readFileSync(join(dir, OWNER_MARKER_NAME), "utf8");
+  } catch (e) {
+    if (typeof e === "object" && e !== null && (e as { code?: unknown }).code === "ENOENT") return { kind: "unowned" };
+    return { kind: "unreadable", error: e };
+  }
+  try {
+    // keyed through OwnerMarker (values stay unknown — runtime validation below is the gate):
+    // a writer-side field rename is a compile error HERE, not a silent never-matching read
+    const parsed = JSON.parse(raw) as Partial<Record<keyof OwnerMarker, unknown>>;
+    return typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0
+      ? { kind: "owned", pid: parsed.pid }
+      : { kind: "unowned" };
+  } catch {
+    return { kind: "unowned" }; // the read succeeded; invalid content is a dead writer's residue
+  }
+}
+// Is the recorded owner still alive? kill(pid, 0) probes without signalling: ESRCH = dead;
+// EPERM = alive but not ours (fail SAFE: retain). Any other failure retains too — the sweep
+// must never delete a dir it cannot prove unowned-or-dead.
+function ownerIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return !(typeof e === "object" && e !== null && (e as { code?: unknown }).code === "ESRCH");
+  }
+}
 
 export interface GithubClientOptions {
   githubHost: string;
   db?: AuditDb | null; // api_cache home; null disables caching
-  concurrency?: number; // GLOBAL in-flight cap on gh/git/tar subprocesses (§4/§5.6)
+  concurrency?: number; // in-flight cap for ONE-SHOT gh/git/tar spawns; also sizes the separate cat-file child pool (§4/§5.6)
   spawnImpl?: SpawnFn;
+  // The T2c byte/interactive launch seam (gitBytes + launchBatchChild). A SEPARATE injectable
+  // from spawnImpl on purpose: the one-shot string seam cannot express a live child, and
+  // stretching it would force every existing scripted test to grow a child shape it never uses.
+  launchImpl?: LaunchFn;
   sleepImpl?: (ms: number) => Promise<void>;
   nowImpl?: () => number;
   spawnTimeoutMs?: number; // wall-clock kill deadline per spawn (default SPAWN_TIMEOUT_MS)
@@ -1043,6 +1331,7 @@ export class GithubClient {
   readonly tempRoot: string;
   private readonly db: AuditDb | null;
   private readonly spawn: SpawnFn;
+  private readonly launch: LaunchFn;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
   private readonly spawnTimeoutMs: number;
@@ -1050,8 +1339,18 @@ export class GithubClient {
   private readonly ghEnv: Record<string, string>;
   private readonly baseEnv: Env;
   private readonly sem: Semaphore;
+  // ADR-0001 T2c check 7: the SECOND permit pool — unit-lived cat-file children draw from
+  // here, never from the one-shot subprocess semaphore (a child HOLDING a one-shot permit
+  // while its unit's symlink read awaits one is a deadlock, certain at capacity 1). Sized to
+  // the subprocess semaphore's own size (rvo Q4: the ratified default), a fixed small constant
+  // independent of unit fan-out.
+  private readonly childPool: Semaphore;
   private readonly core: Bucket = { label: "core", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
   private readonly graphqlBucket: Bucket = { label: "graphql", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
+  // ADR-0001 check 9 (§3.9): the per-repo clone-transport gate — one entry per (host/org/repo)
+  // ever cloned this client lifetime (a string key + two numbers; bounded by the estate's repo
+  // count). `chain` serializes starts; `lastStartMs` enforces the spacing.
+  private readonly cloneGates = new Map<string, { lastStartMs: number; chain: Promise<void> }>();
   private gitConfigPath: string | null = null;
 
   // Observable cache-role: --plan's zero-write contract requires a cache-less client (db: null),
@@ -1064,6 +1363,7 @@ export class GithubClient {
     this.githubHost = opts.githubHost;
     this.db = opts.db ?? null;
     this.spawn = opts.spawnImpl ?? realSpawn;
+    this.launch = opts.launchImpl ?? realLaunch;
     this.sleep = opts.sleepImpl ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.now = opts.nowImpl ?? Date.now;
     this.spawnTimeoutMs = opts.spawnTimeoutMs ?? SPAWN_TIMEOUT_MS;
@@ -1076,11 +1376,14 @@ export class GithubClient {
     if (!Number.isFinite(concurrency) || concurrency < 1)
       throw new Error(`concurrency must be >= 1 (got ${concurrency}) — a zero-slot semaphore hangs the first acquire forever`);
     this.baseEnv = opts.env ?? process.env;
-    this.bins = opts.binPaths ?? {
-      gh: whichIn(this.baseEnv, "gh"),
-      git: whichIn(this.baseEnv, "git"),
-      tar: whichIn(this.baseEnv, "tar"),
-    };
+    // Defensive COPY, never the caller's object: retaining a caller-owned reference would let a
+    // post-construction mutation swap the validated binary for another executable. Each wrapper
+    // additionally captures its bin value ONCE, before validation, and launches that same value,
+    // so nothing running between the guards and the spawn can change which executable starts.
+    const bp = opts.binPaths;
+    this.bins = bp === undefined
+      ? { gh: whichIn(this.baseEnv, "gh"), git: whichIn(this.baseEnv, "git"), tar: whichIn(this.baseEnv, "tar") }
+      : { gh: bp.gh, git: bp.git, tar: bp.tar };
     this.ghEnv = buildGhEnv(this.baseEnv, this.githubHost);
     // PROMPT-TUI §U3.2: the waiter gauge. Both clients (preflight + scan) report their OWN
     // semaphore's queue depth through the one hub — each emission overwrites the scalar, and it
@@ -1090,6 +1393,7 @@ export class GithubClient {
     this.sem = new Semaphore(concurrency, (waiting) => {
       if (hasProgressSink()) emitProgress({ type: "spawn-queue", waiting });
     });
+    this.childPool = new Semaphore(concurrency); // no waiter gauge: the TUI's queue depth is the one-shot lane's
     this.tempRoot = opts.tempRoot ?? realpathSync(tmpdir());
   }
 
@@ -1098,7 +1402,7 @@ export class GithubClient {
   // signal, so the impl kills the child, and yields an EMPTY-stdout nonzero result that the
   // callers' existing no-HTTP-response transient path retries under MAX_ATTEMPTS. After the
   // deadline fires, the return additionally WAITS for the spawned promise to settle — callers
-  // (cloneShallow, introspectVersion) delete the child's working directory the moment this
+  // (cloneNoCheckout, introspectVersion) delete the child's working directory the moment this
   // returns, and a SIGTERMed-but-not-yet-dead child could still be writing into that tree.
   // The wait is BOUNDED by the kill-escalation grace + margin so an impl that never settles
   // (or a wedged kill) cannot convert the deadline into a hang — on a timeout the caller's
@@ -1133,8 +1437,9 @@ export class GithubClient {
         resolve();
       }, this.spawnTimeoutMs);
     });
-    // PROMPT-TUI §U3.1: ONE span per attempt through the one funnel every gh/git/tar spawn flows
-    // through (preflight and plan included). Synchronous, O(1), no-throw; label construction is
+    // PROMPT-TUI §U3.1: ONE span per attempt through the funnel every ONE-SHOT gh/git/tar spawn
+    // flows through (preflight and plan included; the T2c byte and interactive lanes use the launch
+    // seam directly and emit their own spans). Synchronous, O(1), no-throw; label construction is
     // gated behind the sink check (§U0 — a bare run pays only this boolean).
     let spanId = 0;
     if (hasProgressSink()) {
@@ -1178,18 +1483,22 @@ export class GithubClient {
   }
 
   // ---- guarded low-level spawns (the §6 chokepoint) ----
-  // EVERY guarded subprocess — gh (incl. direct preflight `gh auth status`/`gh --version`), git
-  // (clone), and tar (extract) — acquires the GLOBAL semaphore so §4's "cap TOTAL in-flight
+  // EVERY guarded ONE-SHOT subprocess — gh (incl. direct preflight `gh auth status`/`gh --version`),
+  // git (clone), and tar (extract) — acquires the GLOBAL semaphore so §4's "cap in-flight
   // subprocesses" holds for every path. `gh()` is the BARE form (no rate-limit bucket): it counts
   // against the cap but is not pause-aware. The pause-aware, bucketed path is ghBucketedAttempt
   // below (restGet/graphql), which arms any throttle pause INSIDE the lease so the slot is never
   // released into an about-to-open pause window.
-  async gh(args: string[]): Promise<SpawnResult> {
-    assertSpawnAllowed(this.bins.gh, args);
+  async gh(callerArgs: string[]): Promise<SpawnResult> {
+    const args = copiedArgv(callerArgs, "gh"); // validate and launch OUR array, never the caller's
+    // The binary is read ONCE and the same captured value is both validated and launched: a
+    // re-read could pick up a different path if anything mutated `bins` after validation.
+    const bin = this.bins.gh;
+    assertSpawnAllowed(bin, args);
     assertReadOnlyGh(args);
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded("gh", this.bins.gh, args, { env: this.ghEnv });
+      return await this.spawnBounded("gh", bin, args, { env: this.ghEnv });
     } finally {
       release();
     }
@@ -1220,10 +1529,14 @@ export class GithubClient {
   // allocation; omitted on the no-response path). ghBucketedAttempt — already impure — derives
   // and emits the rate-limit snapshot, gated on hasProgressSink(), inside the lease.
   private async ghBucketedAttempt<T>(
-    args: string[], bucket: Bucket,
+    callerArgs: string[], bucket: Bucket,
     analyze: (res: SpawnResult, now: number) => { outcome: T; pauseUntilMs: number | null; rateLimitHeaders?: Record<string, string> },
   ): Promise<T> {
-    assertSpawnAllowed(this.bins.gh, args);
+    // OUR array for the guards and every attempt below: this loop re-spawns across pauses and
+    // permit waits, so the caller's object would otherwise have many windows to diverge.
+    const args = copiedArgv(callerArgs, "gh");
+    const bin = this.bins.gh; // validated and launched value captured once (see gh())
+    assertSpawnAllowed(bin, args);
     assertReadOnlyGh(args);
     for (;;) {
       const release = await this.acquireRespectingPause(bucket);
@@ -1232,7 +1545,7 @@ export class GithubClient {
         continue;  // re-loop: acquireRespectingPause sleeps the window, re-acquires, re-checks
       }
       try {
-        const res = await this.spawnBounded("gh", this.bins.gh, args, { env: this.ghEnv });
+        const res = await this.spawnBounded("gh", bin, args, { env: this.ghEnv });
         const now = this.now();
         const { outcome, pauseUntilMs, rateLimitHeaders } = analyze(res, now);
         // `!== null`/`!== undefined` on purpose, never truthiness: a zero-valued injected horizon
@@ -1254,14 +1567,23 @@ export class GithubClient {
     }
   }
 
-  async git(args: string[], cwd?: string): Promise<SpawnResult> {
-    assertSpawnAllowed(this.bins.git, args);
+  async git(callerArgs: string[], cwd?: string, onCloneTransportStart?: () => void): Promise<SpawnResult> {
+    // OUR array from here down — the guards, the clone-destination walk, and the launch all
+    // read the same owned copy (the byte lane's copy-then-check discipline, applied to the
+    // string lane too: the launch would otherwise build its vector from the caller's object).
+    const args = copiedArgv(callerArgs, "git");
+    // Captured ONCE, before validation, and reused at the launch. Reading `bins.git` again
+    // after the caller's env accessors have run (they fire in buildGitEnv below) would let a
+    // mutation there swap the executable between the check and the spawn.
+    const bin = this.bins.git;
+    assertSpawnAllowed(bin, args);
     assertReadOnlyGit(args);
     // §0: git itself is the only process allowed to run with cwd inside a clone.
     if (cwd !== undefined) assertContained(cwd, [this.tempRoot]);
-    // Clone DESTINATION containment lives HERE, not only in cloneShallow — the wrapper is the
-    // chokepoint, so no caller can aim a hardened-looking clone outside the temp root. The
-    // guard's grammar guarantees exactly two positionals: <url> <dest>.
+    // Clone DESTINATION containment lives HERE — the wrapper is the chokepoint, so no caller
+    // can aim a hardened-looking clone outside the temp root. The guard's grammar guarantees
+    // exactly two positionals: <url> <dest>. The URL is kept for the check-9 transport gate.
+    let cloneUrl: string | null = null;
     if (args[0] === "clone") {
       const positionals: string[] = [];
       for (let i = 1; i < args.length; i++) {
@@ -1274,27 +1596,236 @@ export class GithubClient {
       }
       const dest = positionals[1] ?? "";
       assertContained(dest, [this.tempRoot]);
+      cloneUrl = positionals[0] ?? "";
     }
     // The `--version` probe (§2 preflight — also --plan's ONLY git invocation) needs no
     // credential helper: point its global config at devNull instead of materializing the temp
     // gitconfig, so plan mode truly writes nothing and leaks no pkg-audit-gitcfg-* dir.
     const isVersionProbe = args.length === 1 && args[0] === "--version";
     const env = buildGitEnv(this.baseEnv, isVersionProbe ? devNull : this.ensureGitConfig());
-    // Count the clone against the GLOBAL in-flight cap (§4/§5.6): under fan-out a clone per branch-unit
+    // Count the clone against the global ONE-SHOT in-flight cap (§4/§5.6): under fan-out a clone per branch-unit
     // would otherwise reach the composed organizations×branches degree and blow temp-dir/fd/memory.
     // Acquire HERE (not inside spawnBounded, which gh already wraps — a second acquire there would
     // deadlock gh at concurrency 1). Bare slot (no bucket): a clone is network work but consumes no
     // REST/GraphQL quota, so it sits OUTSIDE the rate-limit buckets — only the subprocess cap bounds it.
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded("git", this.bins.git, args, { env, cwd });
+      // check 9: the per-repo transport gate runs INSIDE the semaphore lease, immediately
+      // before the spawn — gating before the acquire would let queued same-repo clones bunch
+      // the moment the semaphore frees (the stamp must BE the start). Sleeping the spacing
+      // while holding a slot is deadlock-free: the gate chain is FIFO and its head never
+      // waits on another slot holder.
+      if (cloneUrl !== null) {
+        await this.awaitCloneGate(cloneUrl);
+        // Observed HERE — the gate has stamped and the spawn is the next statement, so this is
+        // the one place that means "a clone transport start actually happened". Counting in the
+        // caller instead was wrong in both directions: before the wrapper it counted setup
+        // faults that never spawned, and after the wrapper returned it missed starts whose
+        // capture rejected post-launch (santa final loop, rounds 4-5). The observer is
+        // PER-CALL (cloneNoCheckout's unit-local sink) rather than a client-global counter:
+        // a global count read back as a delta attributed concurrent sibling units' starts to
+        // each other as phantom retries (T2c live-test finding).
+        onCloneTransportStart?.();
+      }
+      return await this.spawnBounded("git", bin, args, { env, cwd });
     } finally {
       release();
     }
   }
 
-  async tar(args: string[]): Promise<SpawnResult> {
-    assertSpawnAllowed(this.bins.tar, args);
+  // ---- ADR-0001 T2c: the byte-capture one-shot and the unit-lived interactive child ----
+  // One-shot guarded BYTE-capture git spawn (the enumeration path). The store open consumes
+  // `ls-tree -z` output as raw bytes because the string path's irreversible UTF-8 decode would
+  // destroy exactly the evidence parseLsTreeZ must fail closed on. Same §6 discipline as git():
+  // both guards + cwd containment BEFORE anything starts, a GLOBAL semaphore slot (a one-shot
+  // subprocess like any other), the wall-clock deadline with the kill escalation, and a span
+  // through the §U3.1 funnel. On a deadline expiry the result is ALWAYS the synthetic 124 with
+  // EMPTY stdout — a timed-out capture must never surface partial bytes as a complete listing.
+  async gitBytes(args: string[], cwd: string): Promise<GitBytesResult> {
+    // Copy FIRST, then guard and launch THE COPY (copiedArgv — the discipline every lane now
+    // shares): validating the caller's array and launching it later would let a mutation
+    // inside the semaphore-acquire gap, or an overridden iterator at the launch, swap the
+    // validated tuple for something else.
+    const argv = copiedArgv(args, "gitBytes");
+    const bin = this.bins.git; // captured once: validated and launched value are the same
+    assertSpawnAllowed(bin, argv);
+    assertReadOnlyGit(argv);
+    // The byte-capture lane serves LOCAL read verbs only. `clone` — allowlisted in the shared
+    // git grammar — is refused HERE: its destination positional is a write target whose
+    // containment lives in the string lane's wrapper (git()), and a byte-lane clone would
+    // bypass exactly that check. Structural refusal beats duplicating the containment walk.
+    if (argv[0] === "clone")
+      throw new GithubApiError("gitBytes refuses clone — write-destination verbs travel the string lane with its containment", {});
+    assertContained(cwd, [this.tempRoot]); // §0: git is the only process allowed cwd inside a clone
+    const env = buildGitEnv(this.baseEnv, this.ensureGitConfig());
+    const release = await this.sem.acquire();
+    let spanId = 0;
+    if (hasProgressSink()) {
+      spanId = nextProgressId();
+      emitProgress({ type: "spawn-start", id: spanId, tool: "git", label: spawnLabel("git", argv) });
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let gaveUpTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const child = this.launch(bin, argv, { env, cwd, stdin: "ignore" });
+      let outReader: StreamReader;
+      let errReader: StreamReader;
+      const acquired: StreamReader[] = [];
+      try {
+        outReader = child.stdout.getReader();
+        acquired[0] = outReader; // recorded BEFORE the second acquisition can throw
+        errReader = child.stderr.getReader();
+        acquired[1] = errReader;
+      } catch (e) {
+        // TRANSACTIONAL: a reader-acquisition failure after a successful launch must not
+        // orphan the child. Cancel whatever was already acquired NOW rather than leaving it to
+        // the escalation's grace — this lane is abandoning those readers deliberately, and a
+        // lock held on the first stream is unreachable to every other caller — then
+        // kill-escalate and hold the return BOUNDEDLY until the child settles: the caller's
+        // failure path may delete the clone directory, and the killed child should be dead —
+        // not merely dying — first.
+        for (const r of acquired) r.cancel().catch(() => undefined);
+        killWithEscalation(child, acquired);
+        let settleTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          child.exited.then(
+            () => undefined,
+            () => undefined,
+          ),
+          new Promise<void>((resolve) => {
+            settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
+          }),
+        ]);
+        clearTimeout(settleTimer);
+        throw e;
+      }
+      const kill = (): void => killWithEscalation(child, [outReader, errReader]);
+      let timedOut = false;
+      timer = setTimeout(() => {
+        timedOut = true;
+        kill();
+      }, this.spawnTimeoutMs);
+      // ANY reader failure starts the escalation (the string path's posture), and the
+      // temporally-FIRST reader error is retained across the exit join.
+      const guard = (p: Promise<Uint8Array>): Promise<Uint8Array> => {
+        p.catch(() => kill());
+        return p;
+      };
+      const outP = guard(readBytesCapped(outReader, MAX_SPAWN_OUTPUT_BYTES, kill));
+      const errP = guard(readBytesCapped(errReader, MAX_SPAWN_OUTPUT_BYTES, kill));
+      let firstErr: unknown;
+      let failed = false;
+      const capture = (p: Promise<Uint8Array>): Promise<Uint8Array> =>
+        p.catch((e: unknown) => {
+          if (!failed) {
+            failed = true;
+            firstErr = e;
+          }
+          return new Uint8Array(0);
+        });
+      // a REJECTED exit promise is a local process-wait failure: start the escalation and
+      // surface it, never leave the child running behind an unexplained join rejection
+      const exited = child.exited.then(
+        (c) => c,
+        (): number => {
+          kill();
+          throw new GithubApiError("git exit promise rejected — the child was kill-escalated", {});
+        },
+      );
+      // The exit join is BOUNDED once the deadline could have fired: a wedged exit promise
+      // must not hang the caller past deadline + escalation grace + margin.
+      const joined = Promise.all([capture(outP), capture(errP), exited]);
+      let bounded: [Uint8Array, Uint8Array, number] | null;
+      try {
+        bounded = await Promise.race([
+          joined,
+          new Promise<null>((resolve) => {
+            gaveUpTimer = setTimeout(() => resolve(null), this.spawnTimeoutMs + SPAWN_KILL_GRACE_MS + 2_000);
+          }),
+        ]);
+      } catch (e) {
+        // `Promise.all` is fail-fast, so a REJECTED exit promise short-circuits the join. That
+        // rejection means the process WAIT failed — not that the process died — so returning
+        // straight through the finally would hand the caller a failure while the child may
+        // still be alive with its pumps unjoined, and the caller's failure path deletes the
+        // clone directory. The escalation has already started (the rejection handler above);
+        // hold the return until the pumps settle, bounded by the same grace + margin, since
+        // the escalation cancels the readers and this therefore cannot hang. Same transactional
+        // discipline as the reader-acquisition failure path.
+        await this.settlePumpsBounded(outP, errP);
+        throw e;
+      }
+      if (bounded === null)
+        throw new GithubApiError(`git ${argv[0] ?? ""} never settled within the deadline + escalation grace`, {});
+      const [stdout, stderr, exitCode] = bounded;
+      // deadline FIRST: an escalation-induced reader cancellation must surface as the promised
+      // terminal 124, never as a reader error (the bench seam's reviewed ordering)
+      if (timedOut) return { exitCode: 124, stdout: new Uint8Array(0), stderr, timedOut: true };
+      if (failed) throw firstErr;
+      return { exitCode, stdout, stderr, timedOut: false };
+    } finally {
+      clearTimeout(timer);
+      clearTimeout(gaveUpTimer);
+      if (spanId !== 0 && hasProgressSink()) emitProgress({ type: "spawn-end", id: spanId });
+      release();
+    }
+  }
+
+  // Hold until both output pumps settle, bounded by the escalation grace plus a margin. Used on
+  // the byte lane's failure paths, where the caller may delete the clone directory as soon as we
+  // return: a child that is dying must not still be reading from a tree being removed. Reader
+  // rejections are absorbed — this waits for settlement, it does not diagnose.
+  private async settlePumpsBounded(outP: Promise<Uint8Array>, errP: Promise<Uint8Array>): Promise<void> {
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    const quiet = (p: Promise<Uint8Array>): Promise<void> =>
+      p.then(
+        () => undefined,
+        () => undefined,
+      );
+    try {
+      await Promise.race([
+        Promise.all([quiet(outP), quiet(errP)]),
+        new Promise<void>((resolve) => {
+          settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(settleTimer);
+    }
+  }
+
+  // Launch the unit-lived `cat-file --batch` child (ADR-0001 §3.1(4)): guarded exactly like
+  // every other spawn (argv guards + cwd containment + the sanitized git env, which carries
+  // GIT_NO_REPLACE_OBJECTS — check 4), launched with a stdin PIPE, and — deliberately — holding
+  // NO permit of the one-shot subprocess semaphore: children draw from the child pool via
+  // acquireChildPermit() (check 7; a child holding a one-shot permit while its unit's symlink
+  // fallback awaits one would deadlock at capacity 1). Lifecycle ownership (pumps, per-read
+  // deadlines, ordered teardown) lives in contentStore.ts; this method is only the guarded
+  // launch capability it injects.
+  launchBatchChild(cwd: string): LaunchedChild {
+    const args = ["cat-file", "--batch"];
+    const bin = this.bins.git; // captured once: validated and launched value are the same
+    assertSpawnAllowed(bin, args);
+    assertReadOnlyGit(args);
+    assertContained(cwd, [this.tempRoot]);
+    const env = buildGitEnv(this.baseEnv, this.ensureGitConfig());
+    return this.launch(bin, args, { env, cwd, stdin: "pipe" });
+  }
+
+  // The child pool's acquire — a fixed small pool (the subprocess semaphore's size, rvo Q4)
+  // independent of unit fan-out. A unit waiting here holds no permit of EITHER pool, and child
+  // holders never occupy one-shot permits — no cycle exists (§3.1's deadlock argument).
+  acquireChildPermit(): Promise<() => void> {
+    return this.childPool.acquire();
+  }
+
+  async tar(callerArgs: string[]): Promise<SpawnResult> {
+    // OUR array: the containment walk below reads the argv through array METHODS (`some`,
+    // `includes`) as well as by index, so a caller-owned object could report one shape to the
+    // walk and hand another to the launch.
+    const args = copiedArgv(callerArgs, "tar");
+    const bin = this.bins.tar; // captured once: validated and launched value are the same
+    assertSpawnAllowed(bin, args);
     assertReadOnlyTar(args);
     // The argv guard proves read-only INTENT; the wrapper still containment-checks every
     // write/read target: each -C/--directory extraction dir and the -f/--file archive.
@@ -1347,11 +1878,11 @@ export class GithubClient {
       if (!args.includes("--no-same-owner") || !args.includes("--no-same-permissions"))
         throw new GithubApiError("tar extract requires --no-same-owner and --no-same-permissions", {});
     }
-    // Count the extraction against the GLOBAL in-flight cap (§4/§5.6), same as git — acquire once at
+    // Count the extraction against the global ONE-SHOT in-flight cap (§4/§5.6), same as git — acquire once at
     // this level, never inside spawnBounded (gh already wraps it → double-acquire deadlock at 1).
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded("tar", this.bins.tar, args, { env: buildTarEnv(this.baseEnv) });
+      return await this.spawnBounded("tar", bin, args, { env: buildTarEnv(this.baseEnv) });
     } finally {
       release();
     }
@@ -1943,34 +2474,10 @@ export class GithubClient {
     return HEX_OBJECT_ID_RE.test(ref); // sha1 (40) or sha256 (64) object ids
   }
 
-  async fetchTreeRecursive(org: string, repo: string, treeOid: string): Promise<TreeResponse> {
-    const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(treeOid)}?recursive=1`;
-    const immutable = GithubClient.isSha(treeOid);
-    const res = await this.restGet(endpoint, { immutable });
-    try {
-      // Unreachable through restGet (its contract is exact-200), so this is DELIBERATE
-      // defense-in-depth: a partial 206 body parsed here would read as a complete tree, and
-      // tree completeness must not silently depend on a distant classifier's range staying
-      // narrow. Exercised by a stubbed-restGet test; expected to survive mutation testing.
-      if (res.status !== 200)
-        throw new GithubApiError(`malformed git-tree response from ${endpoint}: HTTP ${res.status} — only exactly 200 is success`, { status: res.status, endpoint });
-      let json: unknown;
-      try {
-        json = JSON.parse(res.body);
-      } catch {
-        throw new GithubApiError(`invalid JSON from ${endpoint}`, { status: res.status, endpoint });
-      }
-      return parseTreeResponse(json, endpoint, immutable ? treeOid : null);
-    } catch (e) {
-      // restGet cached this body BEFORE validation could see it; for a SHA-pinned tree the
-      // immutable path would re-serve the poisoned bytes forever (--purge-cache was the only
-      // remedy). Tombstone the row so the next call goes back to the network — compare-and-delete on
-      // the exact bytes read (res.body) so a sibling's concurrent VALID write of the same SHA is not
-      // clobbered.
-      this.tombstoneApiCache(endpoint, "", res.body);
-      throw e;
-    }
-  }
+  // (fetchTreeRecursive — the per-unit REST tree request — retired at the ADR-0001 T2c
+  // cutover: enumeration is now the local guarded `ls-tree` over the no-checkout store, with
+  // no truncation cliff. parseTreeResponse stays exported above: the bench's T0/T1 drivers
+  // still evaluate the REST-tree route by design.)
 
   async fetchFileRaw(org: string, repo: string, path: string, refSha: string): Promise<string> {
     const endpoint = `repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/contents/${encodeContentsPath(path)}?ref=${encodeURIComponent(refSha)}`;
@@ -1993,12 +2500,12 @@ export class GithubClient {
     return this.restGetJson("rate_limit"); // never cached as immutable; ETag varies per call
   }
 
-  // ---- hardened clone fallback (§0 / §5.C) ----
+  // ---- hardened clone (§0 / §5.C) ----
   // All git config is pinned to this generated file: only a credential helper delegating to
   // the SAME gh binary/auth the rest of the tool uses. Written once per client, contained.
   private ensureGitConfig(): string {
     if (this.gitConfigPath !== null) return this.gitConfigPath;
-    const dir = mkdtempSync(join(this.tempRoot, "pkg-audit-gitcfg-"));
+    const dir = makeOwnedDir(this.tempRoot, "pkg-audit-gitcfg-");
     const path = join(dir, "gitconfig");
     assertContained(path, [this.tempRoot]);
     // The `!` helper is a SHELL command — single-quote the gh path unconditionally (with
@@ -2014,70 +2521,155 @@ export class GithubClient {
   }
 
   makeRunTempDir(): string {
-    const dir = mkdtempSync(join(this.tempRoot, "pkg-audit-"));
+    const dir = makeOwnedDir(this.tempRoot, "pkg-audit-");
     assertContained(dir, [this.tempRoot]);
     return dir;
   }
 
-  async cloneShallow(org: string, repo: string, branch: string): Promise<{ dir: string; headSha: string; headCommittedDate: string }> {
+  // ADR-0001 check 9 (§3.9): serialize clone starts per repository and space them at least
+  // CLONE_GATE_SPACING_MS apart. FIFO by chaining: each caller parks behind the previous
+  // caller's promise, sleeps out any remaining spacing, stamps its own start, then releases
+  // the next — so starts can never bunch, whatever fan-out or retry pressure produced them.
+  // Keyed by the clone URL (lowercased) — the one repository identity every clone argv
+  // carries at the chokepoint; retries reuse the same URL, so they share the same gate.
+  private async awaitCloneGate(cloneUrl: string): Promise<void> {
+    const key = cloneUrl.toLowerCase();
+    let gate = this.cloneGates.get(key);
+    if (gate === undefined) {
+      gate = { lastStartMs: Number.NEGATIVE_INFINITY, chain: Promise.resolve() };
+      this.cloneGates.set(key, gate);
+    }
+    const prev = gate.chain;
+    let release!: () => void;
+    gate.chain = new Promise<void>((r) => (release = r));
+    try {
+      await prev;
+      const wait = gate.lastStartMs + CLONE_GATE_SPACING_MS - this.now();
+      if (wait > 0) await this.sleep(wait);
+      gate.lastStartMs = this.now();
+    } finally {
+      release(); // even a rejected sleep must not wedge every later same-repo clone
+    }
+  }
+
+  // ---- ADR-0001 T2c acquisition (§3.1(1-2)) ----
+  // The hardened production clone argv + `--no-checkout` (no working tree is ever materialised,
+  // so committed .gitattributes never runs), with rvo Q1's BOUNDED retry for transient clone
+  // failures, and the head-coherence gate: `rev-parse HEAD` must equal the discovery-pinned
+  // OID or the unit fails CLOSED. The retired checkout fallback ACCEPTED a moved branch
+  // (recording the clone's real HEAD); the ratified shape refuses it — transient, self-healing
+  // via the next run's re-discovery (plan §7.2). Because HEAD == the pin on every success, the
+  // scanned commit's date is the DISCOVERED committedDate — no clone-side date read exists on
+  // this path. `cloneAttempts` feeds the per-unit transport counters (check 8).
+  // `startsOut`, when supplied, is written LIVE — each start increments it inside git(), at
+  // the one spot that means "a clone transport start actually happened" — so the caller's
+  // failure path reads THIS unit's true count even when this method throws before returning
+  // one (check 8/9's accounting must cover failed units too). A unit-local sink is the only
+  // shape that stays exact under concurrent lanes: a client-global counter read back as a
+  // delta attributed sibling units' starts to each other as phantom retries (T2c live-test
+  // finding).
+  async cloneNoCheckout(
+    org: string, repo: string, branch: string, pinnedOid: string, startsOut?: { count: number },
+  ): Promise<{ dir: string; cloneAttempts: number }> {
+    const starts = startsOut ?? { count: 0 };
+    const onCloneTransportStart = (): void => {
+      starts.count++;
+    };
     const runDir = this.makeRunTempDir();
     const dest = join(runDir, "clone");
     assertContained(dest, [this.tempRoot]); // §0: clone dest containment BEFORE spawning
     const url = `https://${this.githubHost}/${encodeURIComponent(org)}/${encodeURIComponent(repo)}.git`;
     const args = [
       "clone", "--depth", "1", "--single-branch", "--branch", branch,
-      "--no-tags", "--no-recurse-submodules", "--template=", url, dest,
+      "--no-tags", "--no-recurse-submodules", "--template=", "--no-checkout", url, dest,
     ];
     try {
-      const res = await this.git(args);
-      if (res.exitCode !== 0)
-        throw new GithubApiError(`git clone failed for ${org}/${repo}@${branch}: ${res.stderr.trim().slice(0, 300)}`, { endpoint: url });
-      // §0: record the fetched SHA. cwd inside the clone is permitted for git itself only.
+      let attempts = 0;
+      let lastFailure = "";
+      let cloned = false;
+      while (attempts < CLONE_MAX_ATTEMPTS) {
+        if (attempts > 0) {
+          // transient-style backoff between attempts; a failed attempt may leave a partial
+          // dest, so the retry starts from a cleared destination. BOTH steps are guarded:
+          // a rejecting sleep or an uncleanable dest must stop the retrying WITHOUT replacing
+          // git's own diagnostic (lastFailure) as the surfaced error.
+          try {
+            await this.sleep(this.backoffWait("transient", attempts - 1, null));
+          } catch {
+            break;
+          }
+          try {
+            rmSync(dest, { recursive: true, force: true });
+          } catch {
+            // the destination cannot be cleared — a retry would only refuse the dirty dest
+            // and REPLACE git's actionable diagnostic with a refusal; stop retrying and
+            // surface the last REAL failure instead
+            break;
+          }
+        }
+        // (check 9's per-repo transport gate runs inside git()'s clone branch — INSIDE the
+        // semaphore lease, immediately before the spawn — so every start here, retries
+        // included, is gated where the start actually happens.)
+        attempts++;
+        let res: SpawnResult;
+        try {
+          res = await this.git(args, undefined, onCloneTransportStart);
+        } catch (e) {
+          // a THROW from the wrapper (e.g. the transport gate's injectable sleep rejecting)
+          // must not replace a PRIOR attempt's git diagnostic; with no prior failure it is
+          // the real, first diagnostic and propagates
+          if (lastFailure !== "") break;
+          throw e;
+        }
+        if (res.exitCode === 0) {
+          cloned = true;
+          break;
+        }
+        lastFailure = res.stderr.trim().slice(0, 300);
+      }
+      if (!cloned)
+        throw new GithubApiError(
+          `git clone failed for ${org}/${repo}@${branch} after ${attempts} attempt${attempts === 1 ? "" : "s"}: ${lastFailure}`,
+          { endpoint: url },
+        );
+      // §0: cwd inside the clone is permitted for git itself only.
       const rev = await this.git(["rev-parse", "HEAD"], dest);
       if (rev.exitCode !== 0)
         throw new GithubApiError(`git rev-parse HEAD failed in ${dest}: ${rev.stderr.trim().slice(0, 300)}`, { endpoint: url });
       const headSha = rev.stdout.trim();
-      // §5.C fail-closed: this clone HEAD is persisted as the scanned commit and built into every
-      // permalink, so it must be a real object id — validate it exactly like the API path's oids (and
-      // like the committer date below), never trust rev-parse's stdout verbatim.
       if (!HEX_OBJECT_ID_RE.test(headSha))
         throw new GithubApiError(`git rev-parse HEAD returned a non-hex object id in ${dest}: ${JSON.stringify(headSha.slice(0, 80))}`, { endpoint: url });
-      // §4 (branch allow/deny): the ACTUAL scanned commit's date. The clone HEAD may be AHEAD of the
-      // GraphQL-discovered head (the branch moved between discovery and clone), so its date must be
-      // read from the clone — not reused from discovery. This exact argv is the ONLY `show` form
-      // readOnlyGuard permits (--no-patch/--no-notes/--no-show-signature suppress diff/notes/GPG; %cI
-      // is the strict-ISO committer date). A capture failure reclaims the tree via the catch below.
-      const dateRes = await this.git(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"], dest);
-      if (dateRes.exitCode !== 0)
-        throw new GithubApiError(`git show HEAD committer date failed in ${dest}: ${dateRes.stderr.trim().slice(0, 300)}`, { endpoint: url });
-      const headCommittedDate = dateRes.stdout.trim();
-      // Exactly one strict-ISO line, offset preserved verbatim (NOT normalized to Z/ms — this joins
-      // the committedDate family feeding scanned_commit_date). A garbled read would poison that
-      // durable provenance. isIsoInstant, not a bare shape regex: the shape alone admits impossible
-      // CALENDAR values (2025-02-30, which Date.parse silently rolls over rather than rejecting).
-      // Planning already happened — the cutoff was judged on the DISCOVERED head date, never on this
-      // value — so the poison risk here is the run's durable scan-scope ledger, not selection.
-      if (!isIsoInstant(headCommittedDate))
-        throw new GithubApiError(`git show HEAD returned a non-ISO committer date in ${dest}: ${JSON.stringify(headCommittedDate.slice(0, 80))}`, { endpoint: url });
-      return { dir: dest, headSha, headCommittedDate };
+      // Check 4's coherence gate. Case-insensitive like every other oid comparison here; a
+      // mismatch is NOT transient (the branch genuinely moved), so it is never retried.
+      if (headSha.toLowerCase() !== pinnedOid.toLowerCase())
+        throw new GithubApiError(
+          `clone HEAD ${headSha} does not match the discovery-pinned ${pinnedOid} for ${org}/${repo}@${branch} — the branch moved between discovery and clone; failing closed (self-heals via the next run's re-discovery)`,
+          { endpoint: url },
+        );
+      return { dir: dest, cloneAttempts: starts.count };
     } catch (e) {
-      // a failed/timed-out clone can leave a multi-GB partial tree — reclaim it NOW rather
-      // than at the next run's startup sweep (the caller only cleans up on success). The
-      // cleanup is BEST-EFFORT: force only suppresses ENOENT, and an EACCES/EBUSY here must
-      // not replace the actionable git error (a stuck tree is the next sweep's problem).
+      // reclaim the (possibly multi-GB, possibly partial) tree NOW rather than at the next
+      // startup sweep — best-effort, never masking the actionable error
       try {
         rmSync(runDir, { recursive: true, force: true });
       } catch (cleanupErr) {
-        // best-effort — the ORIGINAL clone/rev-parse/show error (thrown below) is the operator's
-        // diagnostic and must NOT be masked, but the failed reclaim is still surfaced (a stuck tree the
-        // next startup sweep must handle), consistent with processUnit's clone-cleanup-failed warning.
         logLine({ event: "warning", reason: "clone-cleanup-failed", target: runDir, message: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) });
       }
       throw e;
     }
   }
 
+  // (cloneShallow — the truncated-tree CHECKOUT clone fallback — retired at the ADR-0001 T2c
+  // cutover together with its `git show %cI` date read: cloneNoCheckout above refuses a moved
+  // branch, so the discovered committedDate IS the scanned commit's date and no clone-side
+  // date read exists. The bench evaluates checkout semantics through its own lanes.)
+
   // ---- startup sweep (§0): stale pkg-audit-* DIRECT children of the temp root only ----
+  // OWNED since the T2c cutover (rvo Q2, a named residual risk closed): every pkg-audit-* dir
+  // this process creates carries an owner marker ({pid, startedAtIso}), and the sweep removes
+  // only marker-less dirs (legacy/compat leftovers) and DEAD-pid dirs — a live sibling audit's
+  // clones are RETAINED, closing "a second concurrent audit deletes the first's live clones",
+  // which the common path's per-unit clones turned from a fallback edge into an everyday hazard.
   sweepStaleTempDirs(): string[] {
     const removed: string[] = [];
     // ENOENT here is benign (a dir vanished mid-sweep under concurrent cleanup); anything else
@@ -2097,7 +2689,10 @@ export class GithubClient {
       return removed;
     }
     for (const name of entries) {
-      if (!name.startsWith("pkg-audit-")) continue;
+      // the swept namespace, PLUS crash-orphaned staging dirs (a staged dir always carries its
+      // marker before anything else can happen to it, so the ownership rule below applies)
+      const isStaging = name.startsWith(STAGING_PREFIX);
+      if (!name.startsWith("pkg-audit-") && !isStaging) continue;
       const full = join(this.tempRoot, name);
       let st;
       try {
@@ -2110,6 +2705,27 @@ export class GithubClient {
         if (st.isSymbolicLink()) {
           unlinkSync(full); // remove the link itself, never its target
         } else if (st.isDirectory()) {
+          // ownership gate (rvo Q2): retain a dir whose recorded owner is still ALIVE — it is
+          // a concurrent audit's live clone, not a stale leftover. Marker-less (legacy) and
+          // dead-owner dirs sweep as before. This process's OWN dirs are also retained by the
+          // same rule (their marker carries this live pid), which is correct: its per-unit
+          // teardown owns them.
+          const owner = readOwnerPid(full);
+          if (owner.kind === "unreadable") {
+            // fail SAFE, the same posture as ownerIsAlive: a marker whose READ failed proves
+            // nothing, and deleting on it would let a transient blip take out a live sibling's
+            // clone. Retain and surface; a genuinely stale dir sweeps on a later startup.
+            // (suppressENOENT false is vacuous here — readOwnerPid maps ENOENT to unowned, so
+            // it can never reach this branch — but an always-warn is the honest default.)
+            warnFailure("owner-marker", full, owner.error, false);
+            continue;
+          }
+          if (owner.kind === "owned" && ownerIsAlive(owner.pid)) continue;
+          // A MARKER-LESS staging dir is a sibling MID-CREATION (the marker lands one syscall
+          // after mkdtemp) — deleting it would fail the sibling's publication. Retain it; only
+          // a staged dir whose recorded owner is DEAD sweeps. The residue this accepts is an
+          // EMPTY staged dir per crash inside the two-syscall window — bytes, not clones.
+          if (isStaging && owner.kind === "unowned") continue;
           rmSync(full, { recursive: true, force: true });
         } else {
           unlinkSync(full);

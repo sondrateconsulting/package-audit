@@ -1,6 +1,6 @@
 // unitPipeline.ts — the §5.C-H per-branch-unit engine. Given a resolved tree file list and an
-// injected `readFile` (the orchestrator handles tree fetch, the raw/blob size split, and the
-// truncated-tree clone fallback behind it), produce the structured findings for ONE unit:
+// injected `readFile` (the orchestrator handles acquisition behind it: the per-unit clone, the
+// local enumeration, and the symlink fallback), produce the structured findings for ONE unit:
 // dependency facts (§5.D) with lockfile resolution, in-repo API usage (§5.F), and SPECIFIER-term
 // CLI usage (§5.G part 1). BIN-term CLI usage (§5.G part 2) is a separate pass the orchestrator
 // runs after introspection yields bin names. No db, no direct network — all I/O is injected, so
@@ -9,7 +9,7 @@
 import { buildPermalink } from "./permalink.ts";
 import {
   extractDependencyFacts, installNameSet, locateManifests, nearestLockfile, resolveOwningManifest,
-  dirOf, type DependencyFact, type LockfileRef,
+  dirOf, ALWAYS_SKIP_DIRS, type DependencyFact, type LockfileRef,
 } from "./manifest.ts";
 import { resolveFromLockfile, type LockResolution } from "./lockfile.ts";
 import { scanUsage, type TrackedPackage, type UsageRow } from "./usageScanner.ts";
@@ -17,7 +17,8 @@ import { scanCli, classifyFile, type CliTermSet, type CliRow } from "./cliScanne
 import type { DependencyType } from "./manifest.ts";
 import type { TreeEntryType } from "./github.ts"; // type-only: the git object types, one source of truth
 
-// A tree entry (from the git/trees API or a walked clone). `type` is the git object type — the
+// A tree entry (production: the unit's local `ls-tree` index; the benchmark and legacy fixtures
+// feed REST-tree and walked-clone shapes through the same type). `type` is the git object type — the
 // same closed set github.ts validates git/trees against, so `e.type === "blob"` typos and any
 // TreeEntry-typed fixture drift are compile errors (a stub cast with `as` still bypasses the type).
 export interface TreeEntry {
@@ -96,6 +97,32 @@ export const MAX_SCAN_BYTES = 2 * 1024 * 1024; // skip a huge (minified/generate
 export function makeExcluder(globs: string[]): (path: string) => boolean {
   const matchers = globs.map((g) => new Bun.Glob(g));
   return (path: string) => matchers.some((m) => m.match(path));
+}
+
+// ---- ADR-0001 check 8 (rvo Q6): the REST fallback budget's denominator --------------------
+// A DISCLOSED deviation from the bill's literal `selected`: production selection is
+// content-dependent (lockfiles are read per extracted fact; source reads require a resolving
+// tracked package), so the bench's recorded `selected` exists only after the unit finishes.
+// The ratified denominator is the ENUMERABLE UPPER BOUND from the pure path predicates alone —
+// manifests ∪ ALL lockfile candidates (binary included: they are the bench denominator's
+// no-read election) ∪ scannable source ∪ CLI-scan kinds, after excludeDirGlobs/node_modules,
+// with NO size filter (size-gate skips count in the bench denominator too). Every
+// bench-denominator class is contained in one of these terms, so eligible ⊇ reads ∪ no-reads
+// and the derived budget is ≥ the bill's — deterministically and order-independently.
+export function countBudgetEligible(blobPaths: readonly string[], isExcluded: (path: string) => boolean): number {
+  const { manifests, lockfiles } = locateManifests([...blobPaths], isExcluded);
+  const eligible = new Set<string>(manifests);
+  for (const lf of lockfiles) eligible.add(lf.path);
+  for (const path of blobPaths) {
+    if (ALWAYS_SKIP_DIRS.test(path) || isExcluded(path)) continue;
+    if (SCANNABLE_EXT.test(path) || classifyFile(path) !== "other") eligible.add(path);
+  }
+  return eligible.size;
+}
+
+// The bill's formula over that denominator: max(20, ceil(10% of eligible)).
+export function restFallbackBudgetFromEligible(eligible: number): number {
+  return Math.max(20, Math.ceil(0.1 * eligible));
 }
 
 // `cliTermSets` carries the specifier term plus any introspection-supplied bin names per tracked
@@ -185,7 +212,7 @@ export async function scanUnit(loc: UnitLocation, cfg: UnitConfig, entries: Tree
   const cliFindings: CliRow[] = [];
 
   for (const entry of blobs) {
-    if (isExcluded(entry.path) || /(^|\/)node_modules\//.test(entry.path)) continue;
+    if (isExcluded(entry.path) || ALWAYS_SKIP_DIRS.test(entry.path)) continue;
     if (entry.size !== null && entry.size > MAX_SCAN_BYTES) continue;
 
     // import/usage scan (source files only)

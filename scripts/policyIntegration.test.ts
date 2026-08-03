@@ -12,7 +12,7 @@
 //      makes the status='scanned' predicate load-bearing: drop it and the poison leaks. Direct-seeded
 //      by design (the read-model join, not upsert*Finding, is what's under test here).
 import { expect, test, describe, spyOn } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuditDb, nowIso, type RunRecord } from "./db.ts";
@@ -42,8 +42,9 @@ const mkConfig = (root: string, over: Partial<Config> = {}): Config => ({
 const rt = (config: Config, configHash: string): AuditRuntime =>
   ({ config, configHash, branchPolicy: compileBranchPolicy(config.branches, config.excludeBranches), repositoryPolicy: compileRepositoryPolicy(config.excludeRepositories) });
 
-// One org repo `svc` (default main) + GraphQL heads + EMPTY trees; any git spawn is a failure (pins the
-// no-clone assumption — a non-truncated tree never triggers cloneShallow).
+// One org repo `svc` (default main) + GraphQL heads, with the T2c seams stubbed: the clone
+// materialises an empty dest and the enumeration serves an empty listing, so these tests exercise
+// POLICY routing without any content read.
 interface Head { name: string; oid: string; date: string }
 // The default branch is stated EXPLICITLY (never inferred from the head list): §5.B discovery resolves
 // it from THIS response, so a fixture that derived it from its own heads could never disagree with the
@@ -60,20 +61,55 @@ const graphqlHeads = (nodes: Head[], defaultBranch: string | null): string =>
 // NOTE the REST listing still carries default_branch — the shape is real, the auditor just ignores it.
 const repoList = `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}`;
 
-function scanClient(root: string, heads: Head[], defaultBranch: string | null): GithubClient {
-  const spawn: SpawnFn = async (bin, args) => {
-    if (bin.endsWith("/git")) throw new Error(`unexpected git spawn (${args.join(" ")}) — non-truncated trees must never clone`);
-    if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads(heads, defaultBranch) };
-    if (args.some((a) => a.includes("git/trees"))) {
-      // §5.C envelope: echo the requested oid as the root sha (fetchTreeRecursive verifies it)
-      const ep = args.find((a) => a.includes("/git/trees/")) ?? "";
-      const sha = decodeURIComponent(ep.split("/git/trees/")[1]?.split("?")[0] ?? "");
-      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ sha, truncated: false, tree: [] })}` };
+
+// ---- T2c scan-path shims (the git spawns + the one-shot ls-tree byte seam) -------------------
+// Since the cutover every scanned unit clones (a git spawn) and enumerates through the one-shot
+// byte seam (the interactive child seam is reserved for `cat-file --batch` content reads). The shim materialises each clone dest, answers rev-parse with the
+// FIXTURE's oid for that clone's branch (head coherence), and serves an EMPTY listing — the
+// exact parity of the old empty REST tree envelope.
+const emptyLsTreeLaunch = (_bin: string, args: readonly string[]) => {
+  if (args[0] !== "ls-tree") throw new Error(`unexpected launch on the byte seam: ${args.join(" ")}`);
+  const pending: Array<(r: { done?: boolean }) => void> = [];
+  void pending;
+  return {
+    pid: 4_242_424,
+    stdout: { getReader: () => ({ read: async () => ({ done: true as const }), cancel: async () => undefined }) },
+    stderr: { getReader: () => ({ read: async () => ({ done: true as const }), cancel: async () => undefined }) },
+    stdin: null,
+    exited: Promise.resolve(0),
+    kill: () => undefined,
+    unref: () => undefined,
+  };
+};
+const gitShimFor = (oidByBranch: Map<string, string>, inner: SpawnFn): SpawnFn => {
+  const branchByDest = new Map<string, string>();
+  return async (bin, args, sOpts) => {
+    if (args[0] === "clone") {
+      const dest = args[args.length - 1]!;
+      const bi = args.indexOf("--branch");
+      branchByDest.set(dest, bi === -1 ? "" : (args[bi + 1] ?? ""));
+      mkdirSync(dest, { recursive: true });
+      return { exitCode: 0, stdout: "", stderr: "" };
     }
+    if (args[0] === "rev-parse") {
+      const b = branchByDest.get(sOpts.cwd ?? "") ?? "";
+      const oid = oidByBranch.get(b);
+      if (oid === undefined) throw new Error(`rev-parse for an unknown clone branch ${JSON.stringify(b)}`);
+      return { exitCode: 0, stdout: `${oid}\n`, stderr: "" };
+    }
+    return inner(bin, args, sOpts);
+  };
+};
+
+function scanClient(root: string, heads: Head[], defaultBranch: string | null): GithubClient {
+  const gh: SpawnFn = async (_bin, args) => {
+    if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads(heads, defaultBranch) };
     return { exitCode: 0, stderr: "", stdout: repoList };
   };
   return new GithubClient({
-    githubHost: "github.com", db: null, spawnImpl: spawn, sleepImpl: async () => {},
+    githubHost: "github.com", db: null,
+    spawnImpl: gitShimFor(new Map(heads.map((h) => [h.name, h.oid])), gh),
+    launchImpl: emptyLsTreeLaunch, sleepImpl: async () => {},
     env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
   });
 }
@@ -265,19 +301,17 @@ describe("repository denylist — end-to-end scan/plan seam", () => {
   // args, so a test can prove no denied repo was ever REQUESTED (denied repos are dropped before branch
   // discovery, so their names never appear in a heads/tree request — only in the discovery RESPONSE body).
   const multiRepoClient = (root: string, repos: RepoFixture[], calls: string[][]): GithubClient => {
-    const spawn: SpawnFn = async (bin, args) => {
-      calls.push(args);
-      if (bin.endsWith("/git")) throw new Error(`unexpected git spawn (${args.join(" ")})`);
+    const gh: SpawnFn = async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: "aaaa000000000000000000000000000000000001", date: "2025-06-01T00:00:00Z" }], "main") };
-      if (args.some((a) => a.includes("git/trees"))) {
-        const ep = args.find((a) => a.includes("/git/trees/")) ?? "";
-        const sha = decodeURIComponent(ep.split("/git/trees/")[1]?.split("?")[0] ?? "");
-        return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify({ sha, truncated: false, tree: [] })}` };
-      }
       return { exitCode: 0, stderr: "", stdout: listingBody(repos) };
     };
+    const shimmed = gitShimFor(new Map([["main", "aaaa000000000000000000000000000000000001"]]), gh);
+    const recording: SpawnFn = async (bin, args, sOpts) => {
+      calls.push([...args]); // EVERY spawn recorded — a denied repo must never be cloned either
+      return shimmed(bin, args, sOpts);
+    };
     return new GithubClient({
-      githubHost: "github.com", db: null, spawnImpl: spawn, sleepImpl: async () => {},
+      githubHost: "github.com", db: null, spawnImpl: recording, launchImpl: emptyLsTreeLaunch, sleepImpl: async () => {},
       env: { PATH: "/bin" }, binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" }, tempRoot: root,
     });
   };

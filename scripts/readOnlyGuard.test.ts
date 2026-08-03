@@ -124,6 +124,10 @@ describe("assertReadOnlyGit", () => {
   );
   test("hardened clone passes", () => ok(() => assertReadOnlyGit(HARDENED)));
   test("rev-parse HEAD passes", () => ok(() => assertReadOnlyGit(["rev-parse", "HEAD"])));
+  // exact tuple, like show/ls-tree/cat-file — the tool emits no other rev-parse form
+  test("bare rev-parse throws", () => throws(() => assertReadOnlyGit(["rev-parse"])));
+  test("rev-parse of a branch name throws", () => throws(() => assertReadOnlyGit(["rev-parse", "main"])));
+  test("rev-parse with an extra rev throws", () => throws(() => assertReadOnlyGit(["rev-parse", "HEAD", "OTHER"])));
   test("--version passes", () => ok(() => assertReadOnlyGit(["--version"])));
   test("push throws", () => throws(() => assertReadOnlyGit(["push"])));
   test("clone -c injection throws", () =>
@@ -133,16 +137,13 @@ describe("assertReadOnlyGit", () => {
   test("clone -ufoo throws", () =>
     throws(() => assertReadOnlyGit(sh("clone -ufoo --depth 1 --single-branch --branch m --no-tags --no-recurse-submodules --template= u d"))));
   test("clone missing hardening throws", () => throws(() => assertReadOnlyGit(["clone", "url", "dir"])));
-  // `show` is allowed ONLY as the exact commit-date tuple (the clone-fallback commit date).
+  // `show` is EXCLUDED again since the T2c cutover (its only caller — the checkout fallback's
+  // commit-date read — retired with the fallback): even its once-permitted exact tuple denies.
   const SHOW_DATE = ["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"];
-  test("the exact commit-date show tuple passes", () => ok(() => assertReadOnlyGit(SHOW_DATE)));
-  test("bare `show HEAD` rejected (not the exact tuple)", () => throws(() => assertReadOnlyGit(["show", "HEAD"])));
-  test("show with an extra --output arg rejected", () => throws(() => assertReadOnlyGit(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "--output=/tmp/x", "HEAD"])));
-  test("show with a different format rejected", () => throws(() => assertReadOnlyGit(["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%H", "HEAD"])));
-  test("show with a trailing extra revision rejected", () => throws(() => assertReadOnlyGit([...SHOW_DATE, "OTHER"])));
-  test("show reordered rejected", () => throws(() => assertReadOnlyGit(["show", "--format=%cI", "--no-patch", "--no-notes", "--no-show-signature", "HEAD"])));
-  test("git -C before the date tuple rejected (no argv -C)", () => throws(() => assertReadOnlyGit(["-C", "/other", ...SHOW_DATE])));
-  test("cat-file verb rejected", () => throws(() => assertReadOnlyGit(["cat-file", "-p", "HEAD"])));
+  test("show is excluded entirely — even the once-permitted commit-date tuple denies", () => throws(() => assertReadOnlyGit(SHOW_DATE)));
+  test("bare `show HEAD` rejected", () => throws(() => assertReadOnlyGit(["show", "HEAD"])));
+  test("git -C before a show tuple rejected (pre-verb global)", () => throws(() => assertReadOnlyGit(["-C", "/other", ...SHOW_DATE])));
+  test("cat-file outside the exact batch tuple rejected (-p form)", () => throws(() => assertReadOnlyGit(["cat-file", "-p", "HEAD"])));
   test("clone non-empty --template override throws", () =>
     throws(() => assertReadOnlyGit(sh("clone --depth 1 --single-branch --branch m --no-tags --no-recurse-submodules --template=/tmp/evil u d"))));
   test("clone --separate-git-dir throws", () =>
@@ -187,6 +188,178 @@ describe("assertReadOnlyGit", () => {
   test("clone --depth=1 attached form passes", () =>
     ok(() => assertReadOnlyGit(sh("clone --depth=1 --single-branch --branch=m --no-tags --no-recurse-submodules --template= u d"))));
   test("empty args", () => throws(() => assertReadOnlyGit([])));
+});
+
+// ---- ADR-0001 T2c grammars (accept/reject tables — Confirmation check 1) --------------------
+// Exactness-discipline note (santa round-1 adjudication): ls-tree/cat-file (like `show`) are
+// compared as RAW TUPLES, while BOTH clone shapes are PARSED grammars — order-free, attached
+// value forms allowed, every option mandatory-exactly-once. That split is the governing
+// bill's own definition: the ADR specifies the "second exact clone shape" BY the
+// mandatory-exactly-once discipline of this guard's existing clone parser (ADR-0001 Option
+// 2c cons; resolution plan §3.2(i)), and the pre-T2c clone grammar always accepted
+// attached/reordered forms.
+describe("assertReadOnlyGit — the no-checkout clone tuple (second exact shape)", () => {
+  // The canonical shape-2 argv with each flag's token span, for table-driven mutations.
+  const NC_ARGV = ["clone", "--depth", "1", "--single-branch", "--branch", "main", "--no-tags", "--no-recurse-submodules", "--template=", "--no-checkout", "https://github.com/o/r", "/tmp/pkg-audit-x"];
+  const NC_SPAN: Record<string, readonly [number, number]> = {
+    "--depth": [1, 2], "--single-branch": [3, 1], "--branch": [4, 2], "--no-tags": [6, 1],
+    "--no-recurse-submodules": [7, 1], "--template": [8, 1], "--no-checkout": [9, 1],
+  };
+  for (const [flag, [at, len]] of Object.entries(NC_SPAN)) {
+    // omitting --no-checkout itself yields the (accepted) first shape — covered by the
+    // shape-1 accept vector below, so the omission table spans the six SHARED flags only.
+    if (flag !== "--no-checkout")
+      test(`shape-2 omission of ${flag} throws`, () =>
+        throws(() => assertReadOnlyGit([...NC_ARGV.slice(0, at), ...NC_ARGV.slice(at + len)])));
+    test(`shape-2 duplication of ${flag} throws`, () =>
+      throws(() => assertReadOnlyGit([...NC_ARGV.slice(0, at), ...NC_ARGV.slice(at, at + len), ...NC_ARGV.slice(at)])));
+  }
+  for (const boolFlag of ["--single-branch", "--no-tags", "--no-recurse-submodules", "--no-checkout"])
+    test(`shape-2 ${boolFlag} given a value throws (bool flags stay bare)`, () =>
+      throws(() => assertReadOnlyGit(NC_ARGV.map((a) => (a === boolFlag ? `${boolFlag}=x` : a)))));
+  // arity: a DETACHED value flag in the terminal slot has no value token. `--template` is the
+  // exploitable one — its required value IS the empty string, so folding "missing" to "" let a
+  // bare terminal --template satisfy the hardening (santa round-2). Both shapes are pinned.
+  for (const valueFlag of ["--template", "--depth", "--branch"]) {
+    test(`shape-2 terminal bare ${valueFlag} throws (missing value is not an empty value)`, () =>
+      throws(() => assertReadOnlyGit([...NC_ARGV.filter((a) => !a.startsWith(valueFlag)), valueFlag])));
+    test(`shape-1 terminal bare ${valueFlag} throws`, () =>
+      throws(() => assertReadOnlyGit([...NC_ARGV.filter((a) => a !== "--no-checkout" && !a.startsWith(valueFlag)), valueFlag])));
+  }
+  test("shape-2 with a third positional throws", () =>
+    throws(() => assertReadOnlyGit([...NC_ARGV, "extra"])));
+  test("shape-2 with one positional throws", () =>
+    throws(() => assertReadOnlyGit(NC_ARGV.slice(0, -1))));
+  const NC = sh(
+    "clone --depth 1 --single-branch --branch main --no-tags --no-recurse-submodules --template= --no-checkout https://github.com/o/r /tmp/pkg-audit-x",
+  );
+  test("the exact no-checkout tuple passes", () => ok(() => assertReadOnlyGit(NC)));
+  test("flag order is free within the tuple (--no-checkout first)", () =>
+    ok(() => assertReadOnlyGit(sh("clone --no-checkout --depth 1 --single-branch --branch main --no-tags --no-recurse-submodules --template= u d"))));
+  test("attached value forms still pass with --no-checkout", () =>
+    ok(() => assertReadOnlyGit(sh("clone --depth=1 --single-branch --branch=m --no-tags --no-recurse-submodules --template= --no-checkout u d"))));
+  test("duplicate --no-checkout throws (mandatory-exactly-once)", () =>
+    throws(() => assertReadOnlyGit(sh("clone --depth 1 --single-branch --branch m --no-tags --no-recurse-submodules --template= --no-checkout --no-checkout u d"))));
+  test("--no-checkout given a value throws (bool flag)", () =>
+    throws(() => assertReadOnlyGit(sh("clone --depth 1 --single-branch --branch m --no-tags --no-recurse-submodules --template= --no-checkout=x u d"))));
+  test("--no-checkout without the rest of the hardening throws", () =>
+    throws(() => assertReadOnlyGit(sh("clone --no-checkout u d"))));
+  test("--no-checkout with one hardening flag missing throws (no shape mixing)", () =>
+    throws(() => assertReadOnlyGit(sh("clone --depth 1 --single-branch --branch m --no-recurse-submodules --template= --no-checkout u d"))));
+  test("abbreviated --no-checkou throws", () =>
+    throws(() => assertReadOnlyGit(sh("clone --depth 1 --single-branch --branch m --no-tags --no-recurse-submodules --template= --no-checkou u d"))));
+  test("-c injection alongside --no-checkout still throws", () =>
+    throws(() => assertReadOnlyGit(sh("clone -c core.fsmonitor=x --depth 1 --single-branch --branch m --no-tags --no-recurse-submodules --template= --no-checkout u d"))));
+  test("the checkout tuple (shape 1) still passes beside shape 2", () =>
+    ok(() => assertReadOnlyGit(sh("clone --depth 1 --single-branch --branch m --no-tags --no-recurse-submodules --template= u d"))));
+});
+
+describe("assertReadOnlyGit — the ls-tree tuple", () => {
+  const LS = ["ls-tree", "-r", "-z", "-l", "--full-tree", "HEAD"];
+  test("the exact tuple passes", () => ok(() => assertReadOnlyGit(LS)));
+  // per-slot mutation tables over the inner tokens (the verb and rev have their own vectors)
+  for (let i = 1; i < LS.length - 1; i++) {
+    test(`omitting ${LS[i]} throws`, () => throws(() => assertReadOnlyGit(LS.filter((_, j) => j !== i))));
+    test(`duplicating ${LS[i]} throws`, () =>
+      throws(() => assertReadOnlyGit([...LS.slice(0, i), LS[i]!, ...LS.slice(i)])));
+  }
+  test("abbreviated --full-tre throws", () => throws(() => assertReadOnlyGit(["ls-tree", "-r", "-z", "-l", "--full-tre", "HEAD"])));
+  test("omitting the HEAD rev throws", () => throws(() => assertReadOnlyGit(LS.slice(0, 5))));
+  test("duplicating the HEAD rev throws", () => throws(() => assertReadOnlyGit([...LS, "HEAD"])));
+  test("a SPARSE argv with holes in mandatory slots throws (santa round-1: hole-skipping iteration bypass)", () => {
+    const sparse = new Array(6) as string[];
+    sparse[0] = "ls-tree";
+    sparse[5] = "HEAD";
+    throws(() => assertReadOnlyGit(sparse));
+  });
+  test("a DENSE argv with an overridden `every` throws (santa round-3: method-override bypass)", () => {
+    // Own string slots spelling a WRITE-capable `show --output=...`, with the tuple sweep
+    // rigged to report agreement. The guard must compare its own copy, never the caller's.
+    const danger = ["show", "--no-patch", "--no-notes", "--no-show-signature", "--output=/tmp/pwned", "HEAD"];
+    const rigged = Object.create(Array.prototype) as Record<string, unknown>;
+    rigged["every"] = () => true;
+    Object.setPrototypeOf(danger, rigged);
+    throws(() => assertReadOnlyGit(danger));
+  });
+  test("a DENSE argv with an overridden `flatMap` throws (canonicalization must run on our copy)", () => {
+    const danger = ["clone", "--upload-pack", "/tmp/pwned", "u", "d"];
+    const rigged = Object.create(Array.prototype) as Record<string, unknown>;
+    rigged["flatMap"] = () => ["--version"]; // pretend to canon into a harmless argv
+    Object.setPrototypeOf(danger, rigged);
+    throws(() => assertReadOnlyGit(danger));
+  });
+  test("an ARRAY-LIKE argv with a lying `length` getter throws (validated argv must equal the spawned one)", () => {
+    // A real Array's length is non-configurable, so this attack needs an array-like: it would
+    // report 2 slots to the guard while carrying a third (`--textconv`) into the spawn. The
+    // guard therefore requires a genuine Array.
+    const danger = { 0: "cat-file", 1: "--batch", 2: "--textconv", get length() { return 2; } };
+    throws(() => assertReadOnlyGit(danger as unknown as string[]));
+  });
+  test("a non-array argv throws", () => throws(() => assertReadOnlyGit("clone" as unknown as string[])));
+  test("a PROTOTYPE-BACKED sparse argv throws (santa round-2: holes read through the prototype)", () => {
+    // holes serve conforming tokens via a prototype trap while iteration helpers still skip
+    // them — value checks and iteration disagree unless own-ness is required.
+    const proto = new Proxy(Array.prototype, {
+      get(target, key, receiver) {
+        const n = Number(key);
+        if (Number.isInteger(n)) return LS[n];
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const argv = ["ls-tree", "", "", "", "", "HEAD"] as string[];
+    for (const i of [1, 2, 3, 4]) delete argv[i];
+    Object.setPrototypeOf(argv, proto);
+    throws(() => assertReadOnlyGit(argv));
+  });
+  test("a PROXY argv throws AT THE GUARD, with no trap invoked (not merely at the wrapper's copy)", () => {
+    // github.ts's wrapper refuses proxies first, so a wrapper-level test cannot pin THIS
+    // refusal: reverting it there would stay green while direct guard callers could again run
+    // traps during validation (santa final loop, round 4).
+    let traps = 0;
+    const hostile = new Proxy([...LS], {
+      getOwnPropertyDescriptor(t, k) { traps++; return Reflect.getOwnPropertyDescriptor(t, k); },
+      get(t, k, r) { traps++; return Reflect.get(t, k, r); },
+    });
+    throws(() => assertReadOnlyGit(hostile));
+    throws(() => assertReadOnlyGh(new Proxy(["api", "rate_limit"], { get(t, k, r) { traps++; return Reflect.get(t, k, r); } })));
+    throws(() => assertReadOnlyTar(new Proxy(["--version"], { get(t, k, r) { traps++; return Reflect.get(t, k, r); } })));
+    expect(traps).toBe(0); // refused before a single property was read
+  });
+  test("an ACCESSOR-backed argv slot throws at the guard rather than invoking the getter", () => {
+    let getterRuns = 0;
+    const argv = [...LS];
+    Object.defineProperty(argv, 5, { get: () => { getterRuns++; return "HEAD"; }, enumerable: true, configurable: true });
+    throws(() => assertReadOnlyGit(argv));
+    expect(getterRuns).toBe(0);
+  });
+  test("reordered flags throw", () => throws(() => assertReadOnlyGit(["ls-tree", "-z", "-r", "-l", "--full-tree", "HEAD"])));
+  test("missing -l throws", () => throws(() => assertReadOnlyGit(["ls-tree", "-r", "-z", "--full-tree", "HEAD"])));
+  test("a branch-name rev throws (HEAD only)", () => throws(() => assertReadOnlyGit(["ls-tree", "-r", "-z", "-l", "--full-tree", "main"])));
+  test("a full-oid rev throws (production pins HEAD after the coherence gate)", () =>
+    throws(() => assertReadOnlyGit(["ls-tree", "-r", "-z", "-l", "--full-tree", "a".repeat(40)])));
+  test("a trailing pathspec throws (it would silently narrow enumeration)", () =>
+    throws(() => assertReadOnlyGit([...LS, "src/"])));
+  test("bare ls-tree HEAD throws", () => throws(() => assertReadOnlyGit(["ls-tree", "HEAD"])));
+  test("attached --full-tree=x throws", () => throws(() => assertReadOnlyGit(["ls-tree", "-r", "-z", "-l", "--full-tree=x", "HEAD"])));
+  test("-c injection on ls-tree throws", () => throws(() => assertReadOnlyGit(["ls-tree", "-c", "x=y", "-r", "-z", "-l", "--full-tree", "HEAD"])));
+  test("pre-verb global before ls-tree throws", () => throws(() => assertReadOnlyGit(["-c", "x=y", "ls-tree", "-r", "-z", "-l", "--full-tree", "HEAD"])));
+});
+
+describe("assertReadOnlyGit — the cat-file batch tuple (structural absence of every option)", () => {
+  test("the exact two-token tuple passes", () => ok(() => assertReadOnlyGit(["cat-file", "--batch"])));
+  test("--textconv appended throws", () => throws(() => assertReadOnlyGit(["cat-file", "--batch", "--textconv"])));
+  test("--textconv before --batch throws", () => throws(() => assertReadOnlyGit(["cat-file", "--textconv", "--batch"])));
+  test("--filters appended throws", () => throws(() => assertReadOnlyGit(["cat-file", "--batch", "--filters"])));
+  test("--batch-check throws (a different tuple)", () => throws(() => assertReadOnlyGit(["cat-file", "--batch-check"])));
+  test("-z appended throws", () => throws(() => assertReadOnlyGit(["cat-file", "--batch", "-z"])));
+  test("a rev argument throws (revs travel on stdin, contained by the writer)", () =>
+    throws(() => assertReadOnlyGit(["cat-file", "--batch", "HEAD"])));
+  test("attached --batch=x throws", () => throws(() => assertReadOnlyGit(["cat-file", "--batch=x"])));
+  test("bare cat-file throws", () => throws(() => assertReadOnlyGit(["cat-file"])));
+  test("-c injection on cat-file throws", () => throws(() => assertReadOnlyGit(["cat-file", "-c", "x=y", "--batch"])));
+  test("duplicate --batch throws", () => throws(() => assertReadOnlyGit(["cat-file", "--batch", "--batch"])));
+  test("abbreviated --batc throws", () => throws(() => assertReadOnlyGit(["cat-file", "--batc"])));
+  test("pre-verb global before cat-file throws", () => throws(() => assertReadOnlyGit(["-c", "x=y", "cat-file", "--batch"])));
 });
 
 describe("assertReadOnlyTar", () => {

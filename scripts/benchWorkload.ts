@@ -9,6 +9,7 @@
 // set is a G2 failure — no post-hoc relabeling.
 
 import { createHash } from "node:crypto";
+import { seamDecode } from "./gitFrame.ts";
 import { scanUnit, type ReadFile, type TreeEntry, type UnitLocation } from "./unitPipeline.ts";
 import { extractDependencyFacts, locateManifests, nearestLockfile, resolveOwningManifest, dirOf, type DependencyFact, type LockfileRef } from "./manifest.ts";
 import { classifyFile } from "./cliScanner.ts";
@@ -28,12 +29,10 @@ const fail = (msg: string): never => {
 };
 
 // ---- seam semantics --------------------------------------------------------------------------
-// The seam delivers STRINGS: production decodes bytes with UTF-8 replacement semantics
-// (github.ts's aggregate decode; 2c applies the same decode deliberately for parity, §3.1).
-const SEAM_DECODER = new TextDecoder("utf-8", { fatal: false });
-export function seamDecode(bytes: Uint8Array): string {
-  return SEAM_DECODER.decode(bytes);
-}
+// The seam delivers STRINGS via UTF-8 replacement decode. Sourced from the production owner
+// (gitFrame.ts, imported above) rather than re-implemented — T2c moved this into production —
+// and re-exported so this module keeps its consumers' import path and its own internal uses.
+export { seamDecode };
 export function sha256Hex(bytes: Uint8Array | string): string {
   return createHash("sha256").update(bytes).digest("hex");
 }

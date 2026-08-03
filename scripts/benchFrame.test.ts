@@ -189,6 +189,14 @@ describe("parseLsTreeZ — fail-closed set", () => {
     expect(code(one(`100644 blob ${OID}     1 2`))).toBe("size-shape"); // interior space
     expect(code(one(`100644 blob ${OID}`))).toBe("meta-shape");
   });
+  test("a size beyond the safe-integer range fails closed — the digit regex alone would admit it rounded", () => {
+    // `9007199254740993` is canonical decimal (the shape check passes) but unrepresentable:
+    // Number() rounds it to 2**53, so without the safe-integer rejection the parser would
+    // publish a size that is not the one git declared, and the frame's exact-size check would
+    // then compare against a rounded value. Same for a digit run long enough to reach Infinity.
+    expect(code(one(`100644 blob ${OID}       9007199254740993`))).toBe("size-shape");
+    expect(code(one(`100644 blob ${OID}       ${"9".repeat(400)}`))).toBe("size-shape");
+  });
   test("framing violations: no TAB, unterminated tail, record and entry bounds", () => {
     expect(code(() => parseLsTreeZ(bytes(`100644 blob ${OID}       1 f`, [0]), "sha1", LSL))).toBe("record-shape");
     expect(code(() => parseLsTreeZ(bytes(rec(`100644 blob ${OID}       1`, "f"), "dangling"), "sha1", LSL))).toBe("record-unterminated");

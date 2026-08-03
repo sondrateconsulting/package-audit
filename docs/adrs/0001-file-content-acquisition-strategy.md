@@ -10,6 +10,9 @@ informed: operators running `bun run audit` against large estates
 
 ## Context and Problem Statement
 
+*This section states the behavior as it stood when the decision was taken — the problem the
+decision addresses. What replaces it is the Decision Outcome below.*
+
 `package-audit` fetches file content one HTTP request per file — concurrently across branch units, but never batched within one. For each branch unit the
 orchestrator fetches the recursive tree once
 ([orchestrate.ts:807](../../scripts/orchestrate.ts#L807)), then hands `scanUnit` an `apiReader`
@@ -243,10 +246,12 @@ where the canonical decode (`c98204…`) is the ratified expectation (`fidelity.
 2c therefore changes delivered strings on non-UTF-8 content, from the API's transcode to the
 canonical decode — a disclosed findings change in the fidelity standard's own direction; raw-byte
 consumers stay future work. Symlinks are mode-routed to REST's dereferenced
-bytes (the ratified policy), so symlink reads still spend API budget. There is no truncation
-cliff — `ls-tree` enumerates any tree — so the truncated-tree checkout-clone fallback and its
-checkout-byte caveat retire on this path once the implementation lands; until then production
-keeps today's routing.
+bytes (the ratified policy), so symlink reads still spend API budget. There is no REST truncation
+cliff — local enumeration replaces the 100,000-entry / 7 MB cap, under explicit `ls-tree`
+entry/record bounds that fail a unit LOUDLY rather than silently switching transports — so the
+truncated-tree checkout-clone fallback and its checkout-byte caveat retire on this path with the
+implementation: removing them is part of the
+implementation PR's own change set (see Follow-on work), not a separate later step.
 
 ### Consequences
 
@@ -268,7 +273,8 @@ keeps today's routing.
   interactive-child lifecycle with its second permit pool, and the framed binary seam — the
   §3.2 ledger's honest price, now an implementation obligation rather than a hypothetical.
 * Bad, because symlink reads still spend the per-unit REST fallback budget (max(20, ceil(10% of
-  selected))), so symlink-heavy units keep an API dependency and its failure modes.
+  selected)) — see Confirmation check 8 for the implementation's disclosed denominator), so
+  symlink-heavy units keep an API dependency and its failure modes.
 * Neutral, because operational hardening is deferred to implementation **by name**, not
   silently: clone retry policy, pacing under fan-out, and the sweep-ownership fix (the
   residual-risk list above).
@@ -322,7 +328,10 @@ Post-implementation checks (the implementation PR must demonstrate these, not as
    live; maximum configured fan-out spawns no more children than the pool size.
 8. **Separated counters.** Local canonical reads, REST fallback reads by cause, fallback-budget
    spend, clone-transport operations, and retries as distinct metrics; the per-unit fallback
-   budget (max(20, ceil(10% of selected))) trips and terminates as defined.
+   budget (max(20, ceil(10% of selected))) trips and terminates as defined. (The
+   implementation denominates this on the enumerable eligible superset rather than the literal
+   `selected` set, which production cannot know until a unit finishes — a disclosed deviation
+   that can only make the budget larger; see the implementation plan §3.8.)
 9. **Operational hardening.** The clone retry policy and an owned temp sweep land with the
    implementation, or their explicit risk acceptance is recorded in the implementation PR; git
    transport stays under 15 ops/s/repo by construction, and the implementation shows its
@@ -671,7 +680,10 @@ the strongest form available — the ADR changed state only after the measuremen
 **The implementation.** This decision chooses a direction; it implements nothing. The
 implementation PR carries the §3.1/§3.2 bill under this repository's own gates (the Confirmation
 checks above), including the production `readOnlyGuard` changes the benchmark deliberately did
-not make — its proposed grammars and framed-reader prototype live beside the bench until adopted.
+not make: the benchmark's proposed grammars and framed-reader prototype were built beside the
+bench precisely so that adopting them is the implementation PR's own step — that PR moves the
+framed parsers into `gitFrame.ts` (leaving `benchFrame.ts` a re-export shim) and adds the
+grammars to `readOnlyGuard.ts`.
 
 **The tree-request term** is closed by the chosen option: local `ls-tree` enumeration replaces
 the per-unit recursive REST tree request, so the separate budgeting ADR that an Option-1

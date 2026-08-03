@@ -34,7 +34,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GithubClient, buildGitEnv, parseTreeResponse } from "./github.ts";
 import { AuditDb } from "./db.ts";
-import { walkClone, cloneReader } from "./orchestrate.ts";
+import { walkClone, cloneReader } from "./benchDrivers.ts";
 import type { TreeEntry } from "./unitPipeline.ts";
 import { locateManifests, dirOf } from "./manifest.ts";
 import { makeExcluder } from "./unitPipeline.ts";

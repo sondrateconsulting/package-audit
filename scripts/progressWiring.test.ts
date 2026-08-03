@@ -4,7 +4,7 @@
 // Scripted-fake style throughout (injected SpawnFn / fetchImpl / clocks); the progress sink is
 // restored in afterEach (§U8 hygiene).
 import { expect, test, describe, afterEach, afterAll, spyOn } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { realpathSync } from "node:fs";
@@ -448,14 +448,20 @@ describe("orchestrate unit lifecycle events (§U8.9)", () => {
   const startRun = (db: AuditDb): string =>
     db.startRun({ configHash: "hash", effectiveOwners: ["org-a"], ownersSource: "configured", trackedPackages: [], cutoffDate: "2024-01-01", githubHost: "github.com" }).runId;
 
-  function patchedClient(root: string, treeFor: (treeOid: string) => TreeResponse | Error): GithubClient {
+  function patchedClient(root: string, outcomeFor: (branch: string) => "ok" | Error): GithubClient {
     const client = makeClient([], { tempRoot: root });
     client.listBranchHeads = async () => snapshot(["main", "dev", "boom", "slow"]);
-    client.fetchTreeRecursive = async (_o, _r, treeOid) => {
-      const t = treeFor(treeOid);
+    // per-branch scan outcomes route through the T2c acquisition seam: an "ok" branch gets a
+    // real contained clone dir whose EMPTY enumeration scans to zero findings (no child ever
+    // spawns), an Error branch fails at acquisition exactly as the old tree-fetch stub failed
+    client.cloneNoCheckout = async (_o, _r, branch) => {
+      const t = outcomeFor(branch);
       if (t instanceof Error) throw t;
-      return t;
+      const dir = join(client.makeRunTempDir(), "clone");
+      mkdirSync(dir, { recursive: true });
+      return { dir, cloneAttempts: 1 };
     };
+    client.gitBytes = async () => ({ exitCode: 0, stdout: new Uint8Array(0), stderr: new Uint8Array(0), timedOut: false });
     return client;
   }
 
@@ -468,11 +474,10 @@ describe("orchestrate unit lifecycle events (§U8.9)", () => {
       const devKey = { configHash: "hash", scope: "branch" as const, organization: "org-a", repository: "svc", branch: "dev" };
       db.enqueueUnit(devKey, runId);
       db.setUnitStatus(devKey, { status: "done", runId, lastCommitSha: hexOid("dev"), lastCommitDate: "2025-06-01T10:00:00Z" });
-      const client = patchedClient(root, (treeOid) => {
-        if (treeOid === hexOid("t-main")) return { truncated: false, paths: [] };
-        if (treeOid === hexOid("t-boom")) return new GithubApiError("tree fetch failed", { status: 500 });
-        if (treeOid === hexOid("t-slow")) return new ThrottleExhausted("repos/org-a/svc/git/trees");
-        return { truncated: false, paths: [] };
+      const client = patchedClient(root, (branch) => {
+        if (branch === "boom") return new GithubApiError("clone acquisition failed", { status: 500 });
+        if (branch === "slow") return new ThrottleExhausted("org-a/svc clone");
+        return "ok";
       });
       const seen = captureProgress();
       await quietly(() => processRepo(db, client, rt(testConfig(root)), runId, "org-a", REPO, [], new Set()));

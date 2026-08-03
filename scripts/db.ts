@@ -3,8 +3,8 @@
 // SQLite is the source of truth. Tool-generated timestamps (found_at/date_fetched/occurred_at) are
 // persisted in ONE canonical fixed-width ISO-8601 UTC form (nowIso), so lexicographic ordering equals
 // chronological ordering (§3/§7). Commit-INSTANT columns (work_queue.last_commit_date,
-// run_unit_head.scanned_commit_date) instead hold what their producers supply — in production, GitHub
-// committedDate / git-%cI instants (second-precision, offset preserved) verbatim, NOT the nowIso
+// run_unit_head.scanned_commit_date) instead hold what their producers supply — in production,
+// GitHub committedDate instants (second-precision, offset preserved) verbatim, NOT the nowIso
 // form — and runs.cutoff_date holds the operator-CONFIGURED bare YYYY-MM-DD cutoff (validated at
 // config load; legacy-migrated rows carry ''). None of these participate in the nowIso MAX/ordering
 // invariant (see assertCanonicalTimestamp).
@@ -257,8 +257,8 @@ export interface RunUnitHeadInput {
   policyStatus: PolicyStatus | null; // null = no exclusion (the branch is policy-eligible)
   policyMatchedPattern: string | null; // non-empty ONLY when policyStatus === 'excluded-by-deny'
   // The commit date (GitHub committedDate / git-%cI family — an ISO instant, offset preserved,
-  // stored RAW, NOT the nowIso millisecond form). scanned → the ACTUALLY-scanned commit's date (the clone HEAD's
-  // own date under the clone fallback); non-scanned → the discovered head date. REQUIRED non-null:
+  // stored RAW, NOT the nowIso millisecond form). scanned → the ACTUALLY-scanned commit's date (which the
+  // acquisition coherence gate makes equal to the discovered head's); non-scanned → the discovered head date. REQUIRED non-null:
   // every fresh upsert has a real date (the DB column stays nullable only for pre-v4 migrated rows,
   // which the migration writes directly, never through this input). A runtime guard rejects ''/null.
   scannedCommitDate: string;
@@ -1614,7 +1614,7 @@ export interface AuditDbReader {
 // necessary but NOT sufficient (e.g. the deny CHECK admits policy_matched_pattern=''); these guards
 // run at the single write chokepoint (upsertRunUnitHead), so no row that violates the §3 mapping is
 // ever persisted regardless of caller. All fail-fast. scanned_commit_date is REQUIRED non-null on
-// every fresh upsert (the clone fallback captures the clone HEAD's own date) — only pre-v4 migrated
+// every fresh upsert (the scanned commit's date is always known) — only pre-v4 migrated
 // rows carry NULL, and those are written directly by the migration, never through this input.
 function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   const where = `${h.organization}/${h.repository}@${h.branch}`;
@@ -1661,7 +1661,8 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   // as 'complete' provenance by the read surfaces (report scanScope, compare policyChurn availability).
   // The STORED value is never re-read for cutoff or selection decisions — later runs judge freshly
   // DISCOVERED head dates, where the same shared validator is what protects the live slice(0, 10)
-  // cutoff comparison. The producers (github.ts discovery + the clone-date read) already validate
+  // cutoff comparison. The producers (GitHub discovery — which the clone's head-coherence gate
+  // proves names the scanned commit) already validate
   // with the same isIsoInstant, so this enforces the documented semantic at the chokepoint rather than
   // trusting every caller to have done it, exactly as the presence checks above do.
   if (!h.scannedCommitDate) fail(`run_unit_head ${where}: a non-empty scanned_commit_date is required`);

@@ -11,7 +11,6 @@
 // throws past the recorder, so it leaves no row. The recorder feeds runs.jsonl and the G4 signal
 // classifier.
 
-import { createHash } from "node:crypto";
 import {
   GithubClient, GithubApiError, classifyRest, classifyGraphql, parseGhApiOutput,
   type HttpResponse,
@@ -480,12 +479,10 @@ export async function benchGraphqlDispatch(
 }
 
 // ---- blob-hash validation (T1's per-alias check; T2c's frame check shares the helper) --------
-export function gitBlobOid(bytes: Uint8Array, algo: "sha1" | "sha256"): string {
-  const h = createHash(algo === "sha1" ? "sha1" : "sha256");
-  h.update(`blob ${bytes.byteLength}\0`);
-  h.update(bytes);
-  return h.digest("hex");
-}
+// Re-exported from the production owner (gitFrame.ts) rather than re-implemented: ADR-0001's T2c
+// adoption moved this helper into production, so this bench module keeps the historical import
+// path for its consumers while the single definition lives with the parsers it validates.
+export { gitBlobOid } from "./gitFrame.ts";
 
 // ---- rate_limit snapshots (bucket-delta accounting, §4.6) ------------------------------------
 export interface RateLimitSnapshot {

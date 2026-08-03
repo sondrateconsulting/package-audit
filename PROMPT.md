@@ -25,13 +25,15 @@ every run as "continue the job," not "start over," unless the user passes `--fre
 - Any `git clone` must be shallow, into an ephemeral temp dir, and reclaimed on exit
   (best-effort — a reclaim that fails emits a `clone-cleanup-failed` warning; containment
   holds regardless, so a stranded dir is disk to reclaim on a later run, never an escape).
-  Full hardened invocation (the §5.C clone fallback uses exactly this):
+  Full hardened invocation (the §5.C content path uses exactly this, plus `--no-checkout`):
   `GIT_TERMINAL_PROMPT=0 git clone --depth 1
   --single-branch --branch <branch> --no-tags --no-recurse-submodules --template=
   <url> <mktemp-dir>` — `--branch` fetches the selected branch (§5.B),
   `--template=` blocks init.templateDir hooks, `GIT_TERMINAL_PROMPT=0` prevents
-  credential-prompt hangs. Record `git rev-parse HEAD` so permalinks pin the fetched
-  SHA. Never write inside a repo working tree.
+  credential-prompt hangs. `--no-checkout` means no working tree is ever materialised, so
+  committed `.gitattributes` filters never run and reads are the committed objects
+  themselves. Check `git rev-parse HEAD` against the discovery-pinned SHA and fail the unit
+  closed on a mismatch. Never write inside a repo working tree.
 - All `gh`/`git`/`tar` shell-outs in the audit product go through the single wrapper module (§6) that
   invokes `readOnlyGuard` on the argv ARRAY — never a joined string (naive substring
   matching false-positives on a repo named `create-x` and, worse, lets `gh api -X
@@ -156,7 +158,10 @@ Effective owner resolution (normative — EVERY run, BOTH modes):
   `includePersonalNamespace`) participate in `config_hash`; the DISCOVERED result
   set does not. Discovery re-runs every invocation, so org-membership changes never
   orphan resumable work: newly visible orgs simply enqueue as new work units on the
-  next run, and orgs no longer accessible are marked `skipped`, never deleted.
+  next run, and orgs no longer accessible simply stop enqueuing — their prior rows are
+  never deleted and no accessibility marker is written for them (the startup
+  self-healing reset still applies to them like any current-config row:
+  `in_progress` under a failed run returns to `pending`).
 - Note: SAML/SSO-enforced orgs may enumerate but 403 on content access until the
   token is SSO-authorized — and under SSO enforcement `user/orgs` may OMIT
   non-authorized orgs entirely, so enumeration itself can under-report until the
@@ -478,9 +483,10 @@ CREATE TABLE IF NOT EXISTS run_unit_head (
                                        -- 'excluded-by-deny'; NULL for every other disposition
                                        -- (an allow-list MISS names no single pattern)
   scanned_commit_date TEXT,            -- v4. On a SCANNED row: the committed date of the commit
-                                       -- ACTUALLY scanned (the clone's real HEAD on the clone
-                                       -- fallback, §5.C — which may differ from the discovered
-                                       -- head). On every NON-scanned row (commit_sha=''): the
+                                       -- ACTUALLY scanned. Under §5.C's coherence gate that is
+                                       -- always the DISCOVERED head (a clone whose HEAD differs
+                                       -- fails the unit closed), so the two agree by
+                                       -- construction. On every NON-scanned row (commit_sha=''): the
                                        -- DISCOVERED head's date, so a skipped/excluded/past-cap
                                        -- branch still records how recent it was. NULL only on rows
                                        -- backfilled by the v3→v4 migration — which is what makes a
@@ -593,8 +599,7 @@ Resumability rules:
   is "the head it reported", never "the live head" — the report-head invariant below; a
   non-scanned row's commit_sha='' and discovered-head date describe the older evaluation), and
   the unit is left `error`/`pending` so the next run refreshes it. A head-SHA-aware prune is deliberately NOT used: it would delete
-  the clone-fallback path's legitimate rows (commit_sha = the clone's real HEAD, which may
-  differ from the discovered head by design, §5.C) and the commit_sha='' sentinels.
+  the commit_sha='' sentinels the non-scanned dispositions rely on.
 - Report-head invariant (co-designed with the skip predicate): as each unit is
   processed (scanned OR skipped-as-current), the run upserts `run_unit_head(run_id, org,
   repo, branch, commit_sha=the head it reported)`. Findings accumulate across commits
@@ -689,8 +694,9 @@ work bounded by `concurrency.*`:
 - one per repo (branch lists, cutoff filter, candidate files),
 - one per branch (fetch manifests/lockfiles, scan usage).
 AS BUILT (§5 fan-out): all three `concurrency.*` values are consumed. `repositories` is the
-GLOBAL in-flight cap on gh/git/tar subprocesses (github.ts's semaphore) — NOT a per-repo
-fan-out degree. `concurrency.organizations` sizes the owner fan-out pool and
+global in-flight cap on ONE-SHOT gh/git/tar subprocesses (github.ts's semaphore) — NOT a
+per-repo fan-out degree — and it also sizes the separate pool bounding the unit-lived
+`cat-file` content children, which deliberately hold no one-shot permit. `concurrency.organizations` sizes the owner fan-out pool and
 `concurrency.branches` the per-repo branch-unit pool; repos within an owner stay SEQUENTIAL
 (each repo's discover→plan→scan→reconcile is atomic per worker). All three are optional and
 default (3 / 8 / 4), capped at 64, and excluded from config_hash (tuning never orphans
@@ -715,8 +721,10 @@ but keep code structured (pure functions) so it could parallelize later.
 
 RATE-LIMIT & THROTTLING (all gh calls go through the github.ts wrapper, so this is
 enforced in one place): the shipped `concurrency.*` fan-out (up to organizations × branches
-units dispatched at once) could trip GitHub's rate limits, so the wrapper caps TOTAL in-flight
-gh/git/tar subprocesses with one GLOBAL semaphore (sized by `concurrency.repositories`).
+units dispatched at once) could trip GitHub's rate limits, so the wrapper caps in-flight
+ONE-SHOT gh/git/tar subprocesses with one global semaphore (sized by
+`concurrency.repositories`); the unit-lived `cat-file` content children are bounded by a
+separate pool of the same size, so the two lanes cannot deadlock against each other.
 Throttle classification and pause-arming happen INSIDE the semaphore lease (so a queued caller
 never spawns into an about-to-open pause), and the per-bucket pause budget is WALL-CLOCK and
 shared, so N concurrent callers waiting out one window charge it once rather than N times. The wrapper reads the relevant response headers
@@ -808,7 +816,8 @@ A. Resolve the effective owner list per the NORMATIVE algorithm in §1 (base set
 B. Discover & prioritize branches: via `gh api graphql` querying
    refs(refPrefix:"refs/heads/", first:100, after:$endCursor) with
    target{...on Commit{committedDate,oid,tree{oid}}} and `pageInfo{hasNextPage endCursor}`
-   (the `tree.oid` is the commit's ROOT TREE SHA, needed by §5.C's git/trees call), PLUS
+   (the `tree.oid` is the commit's ROOT TREE SHA, carried on BranchHead for compatibility and
+   the ADR-0001 benchmark's REST-tree drivers; §5.C's production path enumerates locally), PLUS
    `defaultBranchRef{name}` on the SAME `repository` node — so the default branch is resolved
    from the same snapshot as the heads, at no extra request. The two halves are validated
    TOGETHER and fail closed: `defaultBranchRef` ABSENT from a page is malformed (we asked for
@@ -862,7 +871,13 @@ B. Discover & prioritize branches: via `gh api graphql` querying
    Record `is_default_branch` (1/0, §3) on every `run_unit_head` upsert —
    discovery always knows it, so live runs never write NULL. The `oid` is the live head the §3 skip predicate compares against —
    obtaining it here costs zero extra requests.
-C. Locate manifests read-only. Build the API path in TypeScript (github.ts) —
+C. Locate manifests read-only. **Acquisition changed with ADR-0001 (Option 2c): production
+   clones each branch unit with `--no-checkout`, checks `rev-parse HEAD` against the
+   discovery-pinned OID (failing the unit closed on a mismatch), enumerates locally with
+   `ls-tree -r -z -l --full-tree HEAD`, and reads blobs through one unit-lived
+   `cat-file --batch` child.** The REST mechanics below still govern the one content lane that
+   remains on the API — the symlink dereference fallback, under a per-unit budget — and the
+   benchmark's REST drivers, so they are stated in full. Build the API path in TypeScript (github.ts) —
    `repos/<org>/<repo>/contents/<path>?ref=<sha>` with `encodeURIComponent` applied
    per PATH SEGMENT (preserving `/`) and on the `ref` value; do NOT rely on `gh api`'s
    brace placeholders (`gh` only substitutes `{owner}`/`{repo}`/`{branch}` and fills
@@ -875,23 +890,24 @@ C. Locate manifests read-only. Build the API path in TypeScript (github.ts) —
    `--jq .content` a raw response) or via `repos/<owner>/<repo>/git/blobs/<blob_sha>`
    with the raw media type (the blob SHA comes from the `sha` field of the file's
    default-JSON `contents` metadata — it is NOT the commit SHA). For files > 100 MB, or a `contents` entry whose `type` is
-   `symlink`/`submodule`/`dir` (not a plain file), fall back to the hardened shallow
-   clone from §0 (note a directory path returns a JSON ARRAY of entries rather than a
+   `symlink`/`submodule`/`dir` (not a plain file), there is no clone fallback under T2c —
+   production reaches this lane only for mode-`120000` symlinks, whose dereferenced bytes are
+   exactly what it wants, and every other entry kind is resolved from the local enumeration
+   (note a directory path returns a JSON ARRAY of entries rather than a
    file object, so branch on array-vs-object before attempting a raw/blob read). A raw fetch and a default-JSON fetch of the SAME url are cached under
    distinct `api_cache.variant_hash` values (the Accept media type; §3) so they never
    collide. (Only when you deliberately use the default JSON representation must
    you base64-decode `content`, which contains newlines.)
-   MANIFEST DISCOVERY — one `gh api "repos/<org>/<repo>/git/trees/<tree_oid>?recursive=1"`
-   call (use the commit's ROOT TREE oid from §5.B — the `git/trees` endpoint takes a TREE
-   SHA, not the commit SHA; the commit SHA is still what pins the permalinks)
-   returns the whole tree; filter paths ending in `package.json` and the lockfile
-   names (§5.D) against `excludeDirGlobs` (always skip `**/node_modules/**` and vendored/
-   generated dirs). This finds EVERY manifest — workspace-declared or not (pnpm
+   MANIFEST DISCOVERY — the unit's own local `ls-tree` enumeration returns every entry with
+   its mode, type, OID and canonical size; filter paths ending in `package.json` and the
+   lockfile names (§5.D) against `excludeDirGlobs` (always skip `**/node_modules/**` and
+   vendored/generated dirs). This finds EVERY manifest — workspace-declared or not (pnpm
    monorepos keep globs in `pnpm-workspace.yaml` not package.json; yarn uses the object
    form `workspaces:{packages,nohoist}`; split repos have undeclared nested
-   package.json) — in a single request. If the tree response is `truncated:true`, fall
-   back to the hardened shallow clone from §0 and walk the working tree. Delete any tmp
-   dir in `finally`. Never install, never execute.
+   package.json) — with no request and no 100,000-entry/7 MB truncation cliff (the bound is
+   now an explicit enumeration limit that fails the unit LOUD rather than switching
+   transports). Delete the clone's tmp dir through the store's ordered teardown. Never
+   install, never execute.
 D. Extract dependency facts: a tracked package "appears" in a manifest when the
    dependency KEY equals its registry name, OR the dependency VALUE is an npm-alias
    spec targeting it (`"<anyKey>": "npm:<name>@<range>"`). Persist the manifest key
@@ -1230,9 +1246,9 @@ db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_k
 // readOnlyGuard.ts — ARGV-ARRAY allowlist, not substring/prefix matching.
 // Canonicalize first so `--flag=value` cannot dodge a `--flag value` check.
 const BODY_FLAGS = new Set(["-f","-F","--field","--raw-field","--input"]);
-const GIT_READ = new Set(["clone","rev-parse","ls-tree","cat-file","show","--version"]);
+const GIT_READ = new Set(["clone","rev-parse","ls-tree","cat-file","--version"]);
 // package managers are NEVER spawned (§0). Their binaries are hard-denied here.
-export const PM_DENYLIST = new Set(["npm","npx","yarn","pnpm","bunx"]);
+export const PM_DENYLIST = new Set(["npm","npx","yarn","pnpm","bunx","corepack"]);
 const BUN_DENY_SUBS = new Set(["install","add","remove","x","pm"]);
 // gh api endpoint allowlist (matched on the path with any ?query-string stripped):
 const GH_API_PATHS = ["repos","orgs","user","rate_limit","graphql"];  // "user/orgs" ⊂ "user";

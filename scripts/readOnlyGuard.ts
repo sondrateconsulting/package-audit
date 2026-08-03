@@ -6,6 +6,14 @@
 
 import { lstatSync, readlinkSync } from "node:fs";
 import { isAbsolute, sep } from "node:path";
+import { types as runtimeTypes } from "node:util";
+
+// Captured at module load: the checks that decide whether an argv may be inspected at all must
+// not themselves be replaceable by whoever is being inspected.
+const isArrayIntrinsic = Array.isArray;
+const isProxyIntrinsic = runtimeTypes.isProxy;
+const ownDescriptor = Object.getOwnPropertyDescriptor;
+const defineProp = Object.defineProperty;
 
 export class ReadOnlyViolation extends Error {
   constructor(message: string) {
@@ -44,19 +52,80 @@ const GH_API_FIRST_SEGMENT = new Set(["repos", "orgs", "user", "rate_limit", "gr
 // resource stays denied. (\d in JS regex is exactly [0-9]; no unicode digits.)
 const GH_ORG_ID_REPOS = /^organizations\/\d+\/repos$/;
 
+// Copy an argv into a FRESH, dense, plain array of primitive strings before any grammar runs.
+// The attacks this closes, all found by adversarial review:
+//   • sparse / prototype-backed slots — a hole reads through the prototype chain, so indexed
+//     reads and iteration helpers can disagree about what the argv contains;
+//   • overridden array methods — the guards compare tuples with helpers an argv object may
+//     override to report whatever it likes while the INDEXED argv handed to the spawn stays
+//     dangerous;
+//   • accessor slots and Proxy traps — both run caller code during validation, which can
+//     mutate the shared state the grammar consults immediately afterwards.
+// Reading only `length` (validated) plus own indexed DATA slots, into an array we own, makes
+// every later check run on OUR array rather than on caller-supplied behaviour.
+function trustedArgv(raw: readonly string[], what: string): string[] {
+  // A genuine Array is required, not merely something array-LIKE: an array-like object can
+  // expose a `length` getter that under-reports its slots, so the guard would validate a
+  // SHORTER argv than the caller then spawns. A real Array's `length` is non-configurable and
+  // cannot lie, which is what makes the slot sweep below a complete check.
+  //
+  // Slots are read as DESCRIPTORS, and a Proxy is refused outright, for the reason github.ts's
+  // own copy does the same: reading through an accessor or a trap runs caller code in the
+  // middle of validation, and that code can mutate what the grammar below consults. Callers
+  // inside this repository already hand us a plain copied argv, so this is the guard holding
+  // its own entry point to the same standard rather than trusting its callers to have done it.
+  if (isProxyIntrinsic(raw)) deny(`${what} argv is a proxy (its traps would run during validation)`);
+  if (!isArrayIntrinsic(raw)) deny(`${what} argv is not an array`);
+  const len = raw.length;
+  if (!Number.isSafeInteger(len) || len < 0) deny(`${what} argv length is not a safe nonnegative integer`);
+  // Slots are DEFINED, never pushed or index-assigned: `push` is a replaceable prototype
+  // method, and assigning into a hole walks the prototype chain where an inherited numeric
+  // setter would capture the write. defineProperty consults no prototype at all.
+  const out: string[] = [];
+  for (let i = 0; i < len; i++) {
+    const slot = ownDescriptor(raw, i);
+    const value: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
+    if (typeof value !== "string")
+      deny(`${what} argv slot ${i} is not an own string data property (sparse, prototype-backed, or accessor argv)`);
+    defineProp(out, i, { value: value as string, writable: false, enumerable: true, configurable: true });
+  }
+  return out;
+}
+
 // Normalize BOTH `--flag=value` and attached short forms (`-XDELETE`, `-X=DELETE`,
 // `-fbody=x`) into separate tokens so no attached-value form dodges a `--flag value`
 // check. Bare short flags like `-i` are left intact (the regex requires a value).
+//
+// Written without `flatMap` or `push`: this canonicalization decides what every later check
+// sees, so it must not route through a mutable `Array.prototype` method — even an array we own
+// inherits its methods from the shared prototype. Slots are DEFINED rather than assigned,
+// because writing into a hole walks the prototype chain and an inherited numeric setter would
+// capture the write. (Under the recorded threat model no caller code can run between the
+// wrapper's copy and this function; the point is that the invariant holds by construction
+// rather than by that timing argument.)
 function canon(args: string[]): string[] {
-  return args.flatMap((a) => {
+  const out: string[] = [];
+  let n = 0;
+  const emit = (token: string): void => {
+    defineProp(out, n++, { value: token, writable: false, enumerable: true, configurable: true });
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
     if (a.startsWith("--") && a.includes("=")) {
       const eq = a.indexOf("=");
-      return [a.slice(0, eq), a.slice(eq + 1)];
+      emit(a.slice(0, eq));
+      emit(a.slice(eq + 1));
+      continue;
     }
     const m = /^(-[A-Za-z])=?(.+)$/.exec(a); // -Xvalue / -X=value (NOT bare -i)
-    if (m && SHORT_VALUE.has(m[1]!)) return [m[1]!, m[2]!];
-    return [a];
-  });
+    if (m && SHORT_VALUE.has(m[1]!)) {
+      emit(m[1]!);
+      emit(m[2]!);
+      continue;
+    }
+    emit(a);
+  }
+  return out;
 }
 
 // Reject a single-dash token that is neither a recognized value/bare short flag nor a
@@ -69,7 +138,8 @@ function rejectUnknownGhShort(token: string): void {
   deny(`gh unrecognized/cluster short flag ${token}`);
 }
 
-export function assertReadOnlyGh(rawArgs: string[]): void {
+export function assertReadOnlyGh(callerArgs: string[]): void {
+  const rawArgs = trustedArgv(callerArgs, "gh");
   const args = canon(rawArgs);
   if (args.length === 0) deny("gh with no subcommand");
   const sub = args[0]!;
@@ -198,27 +268,40 @@ export function assertGraphqlQueryIsReadOnly(rest: string[]): void {
 }
 
 // ---- git ----------------------------------------------------------------------------
-// The tool ONLY ever spawns `git clone` (§5.C fallback), `git rev-parse HEAD`, and ONE fixed
-// `git show` form (the clone-HEAD committer date, §4). The verb allowlist is exactly those (plus
-// --version). Because git accepts unambiguous long-option ABBREVIATIONS (`--templ` = `--template`,
-// `--dep` = `--depth`), a denylist is unsafe — so clone uses a strict EXACT-OPTION ALLOWLIST of only
-// the hardening flags the wrapper emits, rev-parse forbids every flag, and `show` is pinned to ONE
-// exact raw-argv tuple (below). Other read verbs (cat-file, log) stay excluded entirely — they
-// accept --output/--textconv/--filters, which would breach read-only.
-const GIT_READ = new Set(["clone", "rev-parse", "show", "--version"]);
-// The tool runs EXACTLY ONE `show` form: read a cloned HEAD's committer date (the
-// clone-fallback scan). There is NO general show/log parser — that would reopen --output/textconv/
-// --ext-diff/alternate-format/revision surface. Instead an EXACT raw-argv allowlist: --no-patch
-// suppresses diff machinery, --no-show-signature avoids invoking GPG, --no-notes avoids notes
-// lookups, %cI is the strict-ISO committer date. Anything else (reordered, extra args, -C, a
-// different format, a revision other than HEAD) is rejected.
-const GIT_SHOW_DATE_ARGV = ["show", "--no-patch", "--no-notes", "--no-show-signature", "--format=%cI", "HEAD"];
+// The tool ONLY ever spawns `git clone` (two exact shapes, below), `git rev-parse HEAD`, the
+// bare `git --version` preflight probe, and — since ADR-0001's T2c adoption — `git ls-tree` and
+// `git cat-file` as ONE exact tuple each.
+// Because git accepts unambiguous long-option ABBREVIATIONS (`--templ` = `--template`,
+// `--dep` = `--depth`), a denylist is unsafe — so clone uses a strict EXACT-OPTION ALLOWLIST
+// of only the hardening flags the wrapper emits, rev-parse forbids every flag, and
+// ls-tree/cat-file are pinned to exact tuples. cat-file is admitted ONLY as the two-token
+// `cat-file --batch` tuple, so `--textconv`/`--filters` (the options whose exclusion once kept
+// the verb out entirely) are STRUCTURALLY absent rather than denylisted; the revs it resolves
+// travel on stdin, which this argv guard cannot see — that containment lives in the caller's
+// OID-only writer (ADR-0001 Confirmation check 2). `log` stays excluded entirely, and `show` —
+// once admitted as the checkout fallback's exact commit-date tuple — is excluded again since
+// the T2c cutover retired its only caller (head coherence pins the scanned commit to the
+// discovered oid, whose date discovery already carries).
+const GIT_READ = new Set(["clone", "rev-parse", "ls-tree", "cat-file", "--version"]);
+// ADR-0001 T2c: the exact enumeration tuple. HEAD only — production enumerates after the head
+// coherence gate has already pinned HEAD to the discovery OID; a pathspec is rejected because
+// it would silently narrow the enumeration the scan's completeness rests on.
+const GIT_LS_TREE_ARGV = ["ls-tree", "-r", "-z", "-l", "--full-tree", "HEAD"];
 // clone options, split by arity: VALUE flags consume the following token as their value
 // (git does too, even if that token looks like a flag), BOOL flags stand alone.
 const GIT_CLONE_VALUE = new Set(["--depth", "--branch", "--template"]);
 const GIT_CLONE_BOOL = new Set(["--single-branch", "--no-tags", "--no-recurse-submodules"]);
+// ADR-0001 T2c: the SECOND exact clone shape — the same hardened tuple plus `--no-checkout`,
+// itself mandatory-exactly-once. It cannot join GIT_CLONE_BOOL: that set's flags are REQUIRED
+// in every clone, which would break the first shape's "exactly the production tuple". The
+// grammar is therefore the union of two exact tuples, selected by the flag's presence; the
+// first shape is retained deliberately even while caller-less (the ADR bill's letter).
+const GIT_CLONE_NO_CHECKOUT = "--no-checkout";
 
-export function assertReadOnlyGit(rawArgs: string[]): void {
+export function assertReadOnlyGit(callerArgs: string[]): void {
+  // Every check below runs on OUR copy (see trustedArgv): own primitive-string slots only, and
+  // no caller-overridable array method can report a shape the spawned argv does not have.
+  const rawArgs = trustedArgv(callerArgs, "git");
   const args = canon(rawArgs);
   if (args.length === 0) deny("git with no subcommand");
   const verb = args[0]!;
@@ -234,19 +317,34 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
   }
 
   if (verb === "rev-parse") {
-    // the tool only runs `git rev-parse HEAD`; NO option is needed, so reject every flag
-    // (incl. --git-dir/--work-tree and any abbreviation) — only bare positionals allowed.
-    for (const a of args.slice(1)) if (a.startsWith("-")) deny(`git rev-parse option ${a}`);
+    // The tool runs EXACTLY `git rev-parse HEAD` (the T2c head-coherence check and nothing
+    // else), so this is an exact two-token tuple like show/ls-tree/cat-file — not merely
+    // "any bare positional". A missing, different, or extra rev is refused: an under-specified
+    // grammar let `rev-parse`, `rev-parse main` and `rev-parse HEAD OTHER` through, none of
+    // which any call site emits (santa round-3).
+    if (rawArgs.length !== 2 || rawArgs[1] !== "HEAD")
+      deny("git rev-parse is restricted to the exact `rev-parse HEAD` tuple");
     return;
   }
 
-  if (verb === "show") {
-    // Compare the RAW argv (NOT canon'd — canon splits `--format=%cI` into two tokens): the ONLY
-    // permitted show is the exact commit-date tuple. No option parser, no abbreviations, no reorder.
-    const ok =
-      rawArgs.length === GIT_SHOW_DATE_ARGV.length &&
-      rawArgs.every((a, i) => a === GIT_SHOW_DATE_ARGV[i]);
-    if (!ok) deny("git show is restricted to the exact commit-date form");
+  if (verb === "cat-file") {
+    // ONE exact two-token tuple, raw-compared: anything beyond it — --textconv, --filters, a
+    // rev argument, -z, a batch-check variant — is structurally impossible, not merely named.
+    if (rawArgs.length !== 2 || rawArgs[1] !== "--batch")
+      deny("git cat-file is restricted to the exact batch tuple");
+    return;
+  }
+
+  if (verb === "ls-tree") {
+    // ONE exact tuple, compared SLOT-BY-SLOT with direct indexing (never a hole-skipping
+    // iteration helper — the density guard above already rejects holes; the indexed loop is
+    // belt-and-braces): no reorder, no abbreviations, no pathspecs, rev pinned to HEAD.
+    if (rawArgs.length !== GIT_LS_TREE_ARGV.length)
+      deny("git ls-tree is restricted to the exact recursive-NUL-long enumeration tuple");
+    for (let i = 0; i < GIT_LS_TREE_ARGV.length; i++) {
+      if (rawArgs[i] !== GIT_LS_TREE_ARGV[i])
+        deny("git ls-tree is restricted to the exact recursive-NUL-long enumeration tuple");
+    }
     return;
   }
 
@@ -259,6 +357,12 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
   // allowlist (an abbreviation --templ/--dep, an alias --recursive, or a dangerous flag
   // --separate-git-dir/--reference/--output/--mirror/--bare, or ANY short flag) is rejected.
   const raw = rawArgs.slice(1);
+  // Shape selection (ADR-0001 T2c): the presence of `--no-checkout` (bare or attached form —
+  // the attached form still selects shape 2 and is then rejected as a valued bool) commits the
+  // argv to the second exact tuple, where the flag is required-exactly-once alongside every
+  // shape-1 flag. Absent, the argv must be exactly the first tuple. No mixing.
+  const wantsNoCheckout = raw.some((a) => a === GIT_CLONE_NO_CHECKOUT || a.startsWith(`${GIT_CLONE_NO_CHECKOUT}=`));
+  const boolSet = wantsNoCheckout ? new Set([...GIT_CLONE_BOOL, GIT_CLONE_NO_CHECKOUT]) : GIT_CLONE_BOOL;
   const seen: Record<string, number> = {};
   const values: Record<string, string> = {};
   const positionals: string[] = [];
@@ -271,8 +375,16 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
       if (GIT_CLONE_VALUE.has(name)) {
         seen[name] = (seen[name] ?? 0) + 1;
         if (attached !== undefined) values[name] = attached;
-        else { values[name] = raw[i + 1] ?? ""; i++; }
-      } else if (GIT_CLONE_BOOL.has(name)) {
+        else {
+          // A detached value flag in the LAST slot has no value token. Folding that to ""
+          // made a terminal bare `--template` indistinguishable from `--template=` — whose
+          // empty value is exactly what the hardening requires — so the flag's arity could be
+          // dropped entirely (santa round-2). Missing ≠ explicitly empty: deny it.
+          if (i + 1 >= raw.length) deny(`git clone ${name} requires a value`);
+          values[name] = raw[i + 1]!;
+          i++;
+        }
+      } else if (boolSet.has(name)) {
         if (attached !== undefined) deny(`git clone ${name} takes no value`);
         seen[name] = (seen[name] ?? 0) + 1;
       } else {
@@ -285,8 +397,9 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
     }
   }
   // §0's hardened shape: --depth 1, --single-branch, --branch <b>, --no-tags,
-  // --no-recurse-submodules, --template= (empty). ALL required, each exactly once.
-  for (const f of [...GIT_CLONE_VALUE, ...GIT_CLONE_BOOL]) {
+  // --no-recurse-submodules, --template= (empty) — plus --no-checkout in shape 2. ALL
+  // required, each exactly once.
+  for (const f of [...GIT_CLONE_VALUE, ...boolSet]) {
     if ((seen[f] ?? 0) === 0) deny(`git clone missing hardening ${f}`);
     if ((seen[f] ?? 0) > 1) deny(`git clone duplicate ${f}`);
   }
@@ -311,7 +424,8 @@ const TAR_SAFE_LONG = new Set([
 // write letters (c,r,u,A), exec letters (I,F), path-escape (P), incremental (g).
 const TAR_SAFE_SHORT = new Set(["t", "x", "z", "j", "J", "f", "v"]);
 
-export function assertReadOnlyTar(rawArgs: string[]): void {
+export function assertReadOnlyTar(callerArgs: string[]): void {
+  const rawArgs = trustedArgv(callerArgs, "tar");
   if (rawArgs.length === 0) deny("tar with no arguments");
   // --version / --help are allowed ONLY as the sole argument (preflight flavor detection).
   if (rawArgs.includes("--version") || rawArgs.includes("--help")) {
@@ -345,7 +459,9 @@ function normBin(bin: string): string {
   return base.replace(/\.(cmd|exe|bat|ps1)$/i, "").toLowerCase();
 }
 
-export function assertSpawnAllowed(bin: string, argv: string[] = []): void {
+export function assertSpawnAllowed(bin: string, callerArgv: string[] = []): void {
+  if (typeof bin !== "string") deny("spawn binary is not a string");
+  const argv = trustedArgv(callerArgv, "spawn");
   const name = normBin(bin);
   if (PM_DENYLIST.has(name)) deny(`banned package manager ${name}`);
   if (name === "bun") {

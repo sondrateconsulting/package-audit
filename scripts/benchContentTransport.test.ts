@@ -11,7 +11,11 @@ import {
   BenchOperationalError, assertFreezeGitState, classifyFidelityAbort,
   classifyFidelityEnumeration, harnessCommitFromGitResult, loginFromUserPayload, parseProbeBatch,
 } from "./benchContentTransport.ts";
-import { RePinRequired, UnitFailure, describeDisposal } from "./benchDrivers.ts";
+import { RePinRequired, UnitFailure, cloneReader, describeDisposal, walkClone } from "./benchDrivers.ts";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { TreeEntry } from "./unitPipeline.ts";
 import { BenchHttpError, replayRank } from "./benchGh.ts";
 import { BenchSpawnError } from "./benchSpawn.ts";
 import type { WorkloadEntry } from "./benchWorkload.ts";
@@ -744,5 +748,67 @@ describe("reclaimBenchRoot — command teardowns must never substitute a cleanup
     expect(() => reclaimBenchRoot("/tmp/pa-bench-test-root", () => {
       throw null;
     })).not.toThrow();
+  });
+});
+
+// ---- the relocated checkout-walk readers (moved here from production at the T2c cutover) -----
+// Their consumers are the bench's checkout lanes: walkClone in the T0/T1 truncated-checkout
+// drivers and the pinning lane, cloneReader in the pinning lane alone (not T2a, which reads
+// through enumerateStore + readCheckoutDelivery). The fail-closed claims they carried in
+// production still hold and stay pinned here verbatim.
+describe("checkout-walk readers fail closed (relocated with the T2c cutover)", () => {
+  const dummyEntry: TreeEntry = { path: "x", type: "blob", sha: "", size: 0 };
+
+  test("cloneReader PROPAGATES a read failure (a dir at the blob path → EISDIR) instead of degrading to null", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "clonereader-"));
+    mkdirSync(join(dir, "notafile"));
+    try {
+      await expect(cloneReader(dir)("notafile", dummyEntry)).rejects.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("cloneReader returns a real file's contents", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "clonereader-"));
+    writeFileSync(join(dir, "f.txt"), "hello");
+    try {
+      expect(await cloneReader(dir)("f.txt", dummyEntry)).toBe("hello");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("cloneReader fails loud on a containment violation (never reads outside the clone dir)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "clonereader-"));
+    try {
+      await expect(cloneReader(dir)("../escape", dummyEntry)).rejects.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("walkClone PROPAGATES a readdir failure on an unreadable subdir instead of silently skipping it", () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root ignores modes
+    const root = mkdtempSync(join(tmpdir(), "walkclone-"));
+    mkdirSync(join(root, "sub"));
+    writeFileSync(join(root, "sub", "deep.txt"), "x");
+    chmodSync(join(root, "sub"), 0o111); // execute-only: readdir(sub) throws EACCES
+    try {
+      expect(() => walkClone(root)).toThrow();
+    } finally {
+      chmodSync(join(root, "sub"), 0o755); // restore so rmSync can recurse
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  test("walkClone enumerates a normal tree (blobs only; skips .git)", () => {
+    const root = mkdtempSync(join(tmpdir(), "walkclone-"));
+    mkdirSync(join(root, "src"));
+    writeFileSync(join(root, "a.txt"), "a");
+    writeFileSync(join(root, "src", "b.txt"), "bb");
+    mkdirSync(join(root, ".git"));
+    writeFileSync(join(root, ".git", "config"), "ignored");
+    try {
+      expect(walkClone(root).map((e) => e.path).sort()).toEqual(["a.txt", "src/b.txt"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -77,7 +77,8 @@ const DEFAULT_EXCLUDE_DIR_GLOBS = ["**/node_modules/**", "**/dist/**", "**/build
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // §5 concurrency: all three keys are OPTIONAL and default when absent. `repositories` is the global
-// in-flight cap on gh/git/tar subprocesses; `organizations` and `branches` size the owner and
+// in-flight cap on ONE-SHOT gh/git/tar subprocesses (it also sizes the separate pool bounding the
+// unit-lived cat-file content children); `organizations` and `branches` size the owner and
 // per-repo branch-unit fan-out pools. A documented ceiling caps a pathological value (e.g. a huge
 // `branches` would otherwise try to dispatch that many fibers). concurrency is EXCLUDED from
 // config_hash, so defaulting/tuning it never changes the hash or orphans resumable work.
@@ -100,7 +101,8 @@ const isPosInt = (v: unknown): v is number => typeof v === "number" && Number.is
 // someone they meant the other key when they simply mistyped this one — is worse than no hint.
 // `concurrency.repositories` has no root-level twin and never hints.
 // The hints name a DESTINATION, not behavior. All three concurrency keys ARE consumed now (§5 fan-out):
-// `repositories` is the global in-flight cap on gh/git/tar subprocesses (github.ts), `organizations`
+// `repositories` is the global in-flight cap on ONE-SHOT gh/git/tar subprocesses (github.ts;
+// it also sizes the separate content-child pool), `organizations`
 // sizes the owner fan-out pool, and `branches` the per-repo branch-unit pool. They are DISTINCT from
 // the root-level `organizations`/`branches` allow-lists (which define WHAT is scanned) — same word,
 // unrelated setting — which is exactly the collision these hints disambiguate.

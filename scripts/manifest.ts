@@ -182,8 +182,12 @@ export function baseOf(path: string): string {
   return i === -1 ? path : path.slice(i + 1);
 }
 
-// Default directory globs always skipped even if not configured (§5.C).
+// Default directory globs always skipped even if not configured (§5.C). EXPORTED (as
+// ALWAYS_SKIP_DIRS) since the T2c budget denominator: unitPipeline's source/CLI passes and the
+// check-8 eligibility count must apply the SAME node_modules rule this partition applies, and
+// a duplicated literal would drift silently.
 const ALWAYS_SKIP = /(^|\/)node_modules\//;
+export { ALWAYS_SKIP as ALWAYS_SKIP_DIRS };
 
 export interface LocatedManifests {
   manifests: string[]; // package.json paths
