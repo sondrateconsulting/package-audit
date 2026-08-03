@@ -1212,12 +1212,12 @@ const TRANSIENT_BASE_WAIT_MS = 2_000;
 export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
 // ADR-0001 T2c (rvo Q1): bounded clone retry — on the common path a single-attempt clone would
 // convert every network blip into a unit error.
-export const CLONE_MAX_ATTEMPTS = 3;
+const CLONE_MAX_ATTEMPTS = 3;
 // ADR-0001 check 9 (§3.9): clone STARTS for the same (host, org, repo) are serialized and
 // spaced at least this far apart — a hard construction that keeps git transport under GitHub's
 // recommended 15 read ops/s/repo whatever the fan-out or failure rate (at a conservative 2
 // transport operations per clone start, ≥200 ms spacing bounds it at ≤10 ops/s/repo).
-export const CLONE_GATE_SPACING_MS = 200;
+const CLONE_GATE_SPACING_MS = 200;
 
 // ---- owned temp-dir markers (ADR-0001 rvo Q2) ----------------------------------------------
 // Every pkg-audit-* dir this process creates is stamped with its owner; the startup sweep then
@@ -1227,8 +1227,8 @@ export const CLONE_GATE_SPACING_MS = 200;
 // its final swept-namespace name — so no sweep can ever observe a marker-less dir that a live
 // sibling just created. A crash between mkdtemp and rename leaves a staged orphan, which the
 // sweep reclaims under the SAME ownership rule (see STAGING_PREFIX handling there).
-export const OWNER_MARKER_NAME = ".pkg-audit-owner.json";
-export const STAGING_PREFIX = ".pkg-audit-stage-";
+const OWNER_MARKER_NAME = ".pkg-audit-owner.json";
+const STAGING_PREFIX = ".pkg-audit-stage-";
 // The one marker shape, shared by the writer and the reader so the two cannot silently drift
 // apart on a field name (the reader still validates at runtime — an on-disk marker is external
 // data — and keys on `pid` alone: `startedAtIso` is diagnostic, so older or hand-edited markers
