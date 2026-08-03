@@ -1299,8 +1299,6 @@ export class GithubClient {
   // the subprocess semaphore's own size (rvo Q4: the ratified default), a fixed small constant
   // independent of unit fan-out.
   private readonly childPool: Semaphore;
-  // clone spawns that actually started (incremented after the pacing gate, before the spawn)
-  private cloneTransportStartCount = 0;
   private readonly core: Bucket = { label: "core", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
   private readonly graphqlBucket: Bucket = { label: "graphql", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
   // ADR-0001 check 9 (§3.9): the per-repo clone-transport gate — one entry per (host/org/repo)
@@ -1523,7 +1521,7 @@ export class GithubClient {
     }
   }
 
-  async git(callerArgs: string[], cwd?: string): Promise<SpawnResult> {
+  async git(callerArgs: string[], cwd?: string, onCloneTransportStart?: () => void): Promise<SpawnResult> {
     // OUR array from here down — the guards, the clone-destination walk, and the launch all
     // read the same owned copy (the byte lane's copy-then-check discipline, applied to the
     // string lane too: the launch would otherwise build its vector from the caller's object).
@@ -1573,12 +1571,15 @@ export class GithubClient {
       // waits on another slot holder.
       if (cloneUrl !== null) {
         await this.awaitCloneGate(cloneUrl);
-        // Counted HERE — the gate has stamped and the spawn is the next statement, so this is
+        // Observed HERE — the gate has stamped and the spawn is the next statement, so this is
         // the one place that means "a clone transport start actually happened". Counting in the
         // caller instead was wrong in both directions: before the wrapper it counted setup
         // faults that never spawned, and after the wrapper returned it missed starts whose
-        // capture rejected post-launch (santa final loop, rounds 4-5).
-        this.cloneTransportStartCount++;
+        // capture rejected post-launch (santa final loop, rounds 4-5). The observer is
+        // PER-CALL (cloneNoCheckout's unit-local sink) rather than a client-global counter:
+        // a global count read back as a delta attributed concurrent sibling units' starts to
+        // each other as phantom retries (T2c live-test finding).
+        onCloneTransportStart?.();
       }
       return await this.spawnBounded("git", bin, args, { env, cwd });
     } finally {
@@ -2514,18 +2515,20 @@ export class GithubClient {
   // via the next run's re-discovery (plan §7.2). Because HEAD == the pin on every success, the
   // scanned commit's date is the DISCOVERED committedDate — no clone-side date read exists on
   // this path. `cloneAttempts` feeds the per-unit transport counters (check 8).
-  // Real clone-transport starts observed so far. The counter advances immediately before each
-  // clone spawn (inside git(), after the pacing gate), so a caller can account for the
-  // transport even when the clone throws and never returns its own count — check 9's
-  // accounting, which must cover failed units too.
-  get cloneTransportStarts(): number {
-    return this.cloneTransportStartCount;
-  }
-
+  // `startsOut`, when supplied, is written LIVE — each start increments it inside git(), at
+  // the one spot that means "a clone transport start actually happened" — so the caller's
+  // failure path reads THIS unit's true count even when this method throws before returning
+  // one (check 8/9's accounting must cover failed units too). A unit-local sink is the only
+  // shape that stays exact under concurrent lanes: a client-global counter read back as a
+  // delta attributed sibling units' starts to each other as phantom retries (T2c live-test
+  // finding).
   async cloneNoCheckout(
-    org: string, repo: string, branch: string, pinnedOid: string,
+    org: string, repo: string, branch: string, pinnedOid: string, startsOut?: { count: number },
   ): Promise<{ dir: string; cloneAttempts: number }> {
-    const startsBefore = this.cloneTransportStartCount;
+    const starts = startsOut ?? { count: 0 };
+    const onCloneTransportStart = (): void => {
+      starts.count++;
+    };
     const runDir = this.makeRunTempDir();
     const dest = join(runDir, "clone");
     assertContained(dest, [this.tempRoot]); // §0: clone dest containment BEFORE spawning
@@ -2564,7 +2567,7 @@ export class GithubClient {
         attempts++;
         let res: SpawnResult;
         try {
-          res = await this.git(args);
+          res = await this.git(args, undefined, onCloneTransportStart);
         } catch (e) {
           // a THROW from the wrapper (e.g. the transport gate's injectable sleep rejecting)
           // must not replace a PRIOR attempt's git diagnostic; with no prior failure it is
@@ -2597,7 +2600,7 @@ export class GithubClient {
           `clone HEAD ${headSha} does not match the discovery-pinned ${pinnedOid} for ${org}/${repo}@${branch} — the branch moved between discovery and clone; failing closed (self-heals via the next run's re-discovery)`,
           { endpoint: url },
         );
-      return { dir: dest, cloneAttempts: this.cloneTransportStartCount - startsBefore };
+      return { dir: dest, cloneAttempts: starts.count };
     } catch (e) {
       // reclaim the (possibly multi-GB, possibly partial) tree NOW rather than at the next
       // startup sweep — best-effort, never masking the actionable error

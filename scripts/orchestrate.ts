@@ -799,13 +799,16 @@ async function processUnit(
     });
   };
   let cloned: { dir: string; cloneAttempts: number };
-  const startsBefore = client.cloneTransportStarts;
+  // Written LIVE by cloneNoCheckout at each real start, so the failure path below reads THIS
+  // unit's true count — never a client-global delta, which under concurrent branch lanes
+  // attributed sibling units' clone starts here as phantom retries (T2c live-test finding).
+  const cloneStarts = { count: 0 };
   try {
-    cloned = await client.cloneNoCheckout(repo.organization, repo.name, h.name, h.oid);
+    cloned = await client.cloneNoCheckout(repo.organization, repo.name, h.name, h.oid, cloneStarts);
     cloneAttempts = cloned.cloneAttempts;
   } catch (e) {
-    // the starts the client actually made, even though the clone never returned its own count
-    cloneAttempts = client.cloneTransportStarts - startsBefore;
+    // the starts this unit actually made, even though the clone never returned its own count
+    cloneAttempts = cloneStarts.count;
     logTransport("failed", null, null);
     throw e;
   }

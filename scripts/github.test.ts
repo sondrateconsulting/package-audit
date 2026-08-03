@@ -1808,6 +1808,46 @@ describe("cloneNoCheckout (T2c acquisition: no-checkout argv, head coherence, bo
     expect(cloneRunDirs(root)).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
+  test("check 8: concurrent units never cross-attribute each other's clone starts", async () => {
+    // Found by the T2c LIVE run: with two branch lanes, 4 of 6 units reported cloneAttempts=2 /
+    // cloneRetries=1 though no clone ever failed. Each unit's count was a GLOBAL-counter delta
+    // across its own clone window, so a concurrent sibling's start landing inside that window
+    // was reported as a retry that never happened. The count must be the unit's OWN starts.
+    const root = mkdtempSync(join(tmpdir(), "clone-conc-"));
+    let cloneSpawns = 0;
+    let releaseA!: () => void;
+    const aParked = new Promise<void>((r) => (releaseA = r));
+    const spawnImpl: SpawnFn = async (_bin, args) => {
+      if (args[0] === "clone") {
+        cloneSpawns++;
+        const url = args[args.length - 2]!;
+        if (url.endsWith("/r-a.git")) {
+          await aParked; // unit A's clone stays in flight until unit B's clone has STARTED
+          return ok("");
+        }
+        releaseA(); // unit B's start lands strictly inside unit A's clone window
+        return ok("");
+      }
+      if (args[0] === "rev-parse") return ok(PIN + "\n");
+      throw new Error(`unexpected spawn: ${args.join(" ")}`);
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl, sleepImpl: async () => {},
+      env: { HOME: "/home/u", PATH: "/bin" }, binPaths: BINS, tempRoot: root,
+      concurrency: 4, spawnTimeoutMs: 30_000,
+    });
+    try {
+      const [a, b] = await Promise.all([
+        client.cloneNoCheckout("o", "r-a", "main", PIN),
+        client.cloneNoCheckout("o", "r-b", "main", PIN),
+      ]);
+      expect(cloneSpawns).toBe(2); // one real start each — anything above 1 per unit is fiction
+      expect(a.cloneAttempts).toBe(1);
+      expect(b.cloneAttempts).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   test("a rev-parse failure or a non-hex HEAD fails closed and reclaims", async () => {
     const root = mkdtempSync(join(tmpdir(), "clone-rev-"));
     const { client } = makeClient([ok(""), err("", "fatal: bad revision", 128)], { tempRoot: root });
