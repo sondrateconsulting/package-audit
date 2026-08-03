@@ -504,5 +504,30 @@ past tense — a form true after the merge), bench module headers if §4(a).
     subscription scope, the computed budget term and the unsubscribe fixture were all
     **mutation-verified** against the production code they claim to pin. A's remaining
     findings were P3 notes it self-refuted or doc-sweep items already queued.
-  - Round 3: (running)
+  - **Round 3 (A PASS, B FAIL, C FAIL — a third non-unanimous round), verified + fixed at
+    `deffc4a`.** B and C converged INDEPENDENTLY on the same **P0 in round 2's own fix**, the
+    third consecutive round to find this surface incomplete: `Array.isArray` is TRUE for an
+    Array-backed Proxy and `Object.getOwnPropertyDescriptor` FIRES its trap, so the "safe" copy
+    ran caller code. Both escalated it identically — the trap poisons an intrinsic the grammar
+    consults a moment later (`Array.prototype.slice` in the clone-tuple walk,
+    `Set.prototype.has` in the verb allowlist), so the guard validates a hardened clone while
+    the wrapper launches the original argv, reaching a write outside `tempRoot`. Reproduced
+    before the fix and re-run after it (refused, nothing spawned). The rule is now structural:
+    **no caller code runs during validation** — a proxy is refused before any property is
+    touched, slots are read as descriptors so accessors are refused rather than invoked, and the
+    copy's own intrinsics are captured at module load. `readOnlyGuard`'s `trustedArgv` is held
+    to the same standard (A's P2: it used `hasOwn` plus a plain read, so an accessor's getter
+    would run — unreachable in production because `copiedArgv` precedes it, but the guard should
+    not depend on its callers for that). **Recorded residual, deliberately:** an actor who can
+    mutate shared intrinsics BEFORE the call already executes arbitrary code in-process and
+    could launch a child directly; what this boundary guarantees is that a hostile argv OBJECT
+    cannot make the validated command differ from the launched one. Also fixed: the transport
+    event was emitted with `outcome: "scanned"` right after dispose, so a unit that read
+    everything and then threw in the WRITE block left a `scanned` line while the unit errored
+    (B, and my own independent pass) — it now emits once the unit has landed; and **a
+    regression I introduced in round 2** — recording the construction-failure disposal
+    unconditionally overwrote the dead first child's real disposal on the respawn path,
+    discarding git's own stderr, the very diagnosis `508e820` exists to retain (found by my own
+    pass, not by a reviewer).
+  - Round 4: (running)
 - Doc-sweep codex prose pass: (pending)
