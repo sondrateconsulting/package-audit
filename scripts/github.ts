@@ -252,18 +252,22 @@ export type LaunchFn = (bin: string, args: readonly string[], req: LaunchRequest
 // the argv that launches the same array; building the vector positionally keeps that property
 // structural here rather than resting on caller discipline alone.
 const realLaunch: LaunchFn = (bin, args, req) => {
-  // Assembled by INDEX ASSIGNMENT — not `push`, and not a spread. Both route through mutable
-  // Array.prototype methods, and by this point the wrapper has already read the caller's env
-  // object (whose properties may be accessors), so caller code can have run AFTER argv
-  // validation and swapped those methods. Index writes touch no prototype at all, which is
-  // what makes "the argv the guards validated is the argv that launches" hold here.
-  const cmd: string[] = new Array<string>(args.length + 1);
-  cmd[0] = bin;
+  // Assembled with defineProperty, then frozen — not `push`, not a spread, and NOT plain index
+  // assignment. By this point the wrapper has already read the caller's env object (whose
+  // properties may be accessors), so caller code can have run AFTER argv validation and
+  // replaced shared state. `push` and spread route through mutable Array.prototype methods; a
+  // plain index write is worse than it looks, because assigning into a HOLE walks the
+  // prototype chain and an inherited numeric SETTER captures the write, leaving the slot
+  // reading back as whatever that accessor returns. defineProperty consults no prototype at
+  // all, and the freeze means nothing downstream can rewrite the vector either.
+  const cmd: string[] = [];
+  defineProp(cmd, 0, { value: bin, writable: false, enumerable: true, configurable: false });
   for (let i = 0; i < args.length; i++) {
     const token: unknown = args[i];
     if (typeof token !== "string") throw new GithubApiError(`launch argv slot ${i} is not a string`, {});
-    cmd[i + 1] = token;
+    defineProp(cmd, i + 1, { value: token, writable: false, enumerable: true, configurable: false });
   }
+  freezeIntrinsic(cmd);
   return Bun.spawn({
     cmd,
     env: req.env,
@@ -306,20 +310,25 @@ const realLaunch: LaunchFn = (bin, args, req) => {
 const isArrayIntrinsic = Array.isArray;
 const isProxyIntrinsic = runtimeTypes.isProxy;
 const ownDescriptor = Object.getOwnPropertyDescriptor;
+const defineProp = Object.defineProperty;
+const freezeIntrinsic = Object.freeze;
 function copiedArgv(args: readonly string[], lane: string): string[] {
   if (isProxyIntrinsic(args)) throw new GithubApiError(`${lane} argv is a proxy (its traps would run during validation)`, {});
   if (!isArrayIntrinsic(args)) throw new GithubApiError(`${lane} argv is not an array`, {});
   const len = args.length;
   if (!Number.isSafeInteger(len) || len < 0) throw new GithubApiError(`${lane} argv length is not a safe nonnegative integer`, {});
-  // index assignment, never `push`: the copy the guards then judge must not be assembled by a
-  // replaceable prototype method (the same reason the launch builds its vector by index)
-  const out: string[] = new Array<string>(len);
+  // defineProperty per slot, then FROZEN: the array the guards judge and the launch consumes is
+  // built without touching a replaceable prototype method or an inherited numeric setter, and
+  // is thereafter immutable — so nothing that runs between validation and launch (a progress
+  // label builder, a future reader, anything) can alter what actually spawns.
+  const out: string[] = [];
   for (let i = 0; i < len; i++) {
     const slot = ownDescriptor(args, i);
     if (slot === undefined || !("value" in slot) || typeof slot.value !== "string")
       throw new GithubApiError(`${lane} argv slot ${i} is not an own string data property (sparse, prototype-backed, or accessor argv)`, {});
-    out[i] = slot.value;
+    defineProp(out, i, { value: slot.value, writable: false, enumerable: true, configurable: false });
   }
+  freezeIntrinsic(out);
   return out;
 }
 
@@ -370,11 +379,30 @@ export function makeRealSpawn(cap: number): SpawnFn {
       p.catch(() => kill());
       return p;
     };
-    return joinSpawnOutcome(
-      killOnFailure(readCapped(outReader, cap, kill)),
-      killOnFailure(readCapped(errReader, cap, kill)),
-      proc.exited,
+    const outP = killOnFailure(readCapped(outReader, cap, kill));
+    const errP = killOnFailure(readCapped(errReader, cap, kill));
+    // A REJECTED exit promise is a local process-wait failure — the child may well still be
+    // running. Callers treat this promise's settlement as "the child is gone" and delete its
+    // working directory immediately, so surface it only after the best-effort escalation and a
+    // BOUNDED wait for the pumps (the escalation cancels the readers, so this cannot hang).
+    // Without it the one-shot string lane released its permit and let the clone deletion race a
+    // live child — the byte lane's discipline, which this lane lacked.
+    const exitedSettled = proc.exited.then(
+      (code) => code,
+      async (): Promise<number> => {
+        kill();
+        let settleTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          Promise.all([outP.then(() => undefined, () => undefined), errP.then(() => undefined, () => undefined)]),
+          new Promise<void>((resolve) => {
+            settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
+          }),
+        ]);
+        clearTimeout(settleTimer);
+        throw new GithubApiError("spawn exit promise rejected — the child was kill-escalated", {});
+      },
     );
+    return joinSpawnOutcome(outP, errP, exitedSettled);
   };
 }
 
@@ -1270,6 +1298,8 @@ export class GithubClient {
   // the subprocess semaphore's own size (rvo Q4: the ratified default), a fixed small constant
   // independent of unit fan-out.
   private readonly childPool: Semaphore;
+  // clone spawns that actually started (incremented after the pacing gate, before the spawn)
+  private cloneTransportStartCount = 0;
   private readonly core: Bucket = { label: "core", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
   private readonly graphqlBucket: Bucket = { label: "graphql", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
   // ADR-0001 check 9 (§3.9): the per-repo clone-transport gate — one entry per (host/org/repo)
@@ -1414,11 +1444,14 @@ export class GithubClient {
   // released into an about-to-open pause window.
   async gh(callerArgs: string[]): Promise<SpawnResult> {
     const args = copiedArgv(callerArgs, "gh"); // validate and launch OUR array, never the caller's
-    assertSpawnAllowed(this.bins.gh, args);
+    // The binary is read ONCE and the same captured value is both validated and launched: a
+    // re-read could pick up a different path if anything mutated `bins` after validation.
+    const bin = this.bins.gh;
+    assertSpawnAllowed(bin, args);
     assertReadOnlyGh(args);
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded("gh", this.bins.gh, args, { env: this.ghEnv });
+      return await this.spawnBounded("gh", bin, args, { env: this.ghEnv });
     } finally {
       release();
     }
@@ -1455,7 +1488,8 @@ export class GithubClient {
     // OUR array for the guards and every attempt below: this loop re-spawns across pauses and
     // permit waits, so the caller's object would otherwise have many windows to diverge.
     const args = copiedArgv(callerArgs, "gh");
-    assertSpawnAllowed(this.bins.gh, args);
+    const bin = this.bins.gh; // validated and launched value captured once (see gh())
+    assertSpawnAllowed(bin, args);
     assertReadOnlyGh(args);
     for (;;) {
       const release = await this.acquireRespectingPause(bucket);
@@ -1464,7 +1498,7 @@ export class GithubClient {
         continue;  // re-loop: acquireRespectingPause sleeps the window, re-acquires, re-checks
       }
       try {
-        const res = await this.spawnBounded("gh", this.bins.gh, args, { env: this.ghEnv });
+        const res = await this.spawnBounded("gh", bin, args, { env: this.ghEnv });
         const now = this.now();
         const { outcome, pauseUntilMs, rateLimitHeaders } = analyze(res, now);
         // `!== null`/`!== undefined` on purpose, never truthiness: a zero-valued injected horizon
@@ -1491,7 +1525,11 @@ export class GithubClient {
     // read the same owned copy (the byte lane's copy-then-check discipline, applied to the
     // string lane too: the launch would otherwise build its vector from the caller's object).
     const args = copiedArgv(callerArgs, "git");
-    assertSpawnAllowed(this.bins.git, args);
+    // Captured ONCE, before validation, and reused at the launch. Reading `bins.git` again
+    // after the caller's env accessors have run (they fire in buildGitEnv below) would let a
+    // mutation there swap the executable between the check and the spawn.
+    const bin = this.bins.git;
+    assertSpawnAllowed(bin, args);
     assertReadOnlyGit(args);
     // §0: git itself is the only process allowed to run with cwd inside a clone.
     if (cwd !== undefined) assertContained(cwd, [this.tempRoot]);
@@ -1530,8 +1568,16 @@ export class GithubClient {
       // the moment the semaphore frees (the stamp must BE the start). Sleeping the spacing
       // while holding a slot is deadlock-free: the gate chain is FIFO and its head never
       // waits on another slot holder.
-      if (cloneUrl !== null) await this.awaitCloneGate(cloneUrl);
-      return await this.spawnBounded("git", this.bins.git, args, { env, cwd });
+      if (cloneUrl !== null) {
+        await this.awaitCloneGate(cloneUrl);
+        // Counted HERE — the gate has stamped and the spawn is the next statement, so this is
+        // the one place that means "a clone transport start actually happened". Counting in the
+        // caller instead was wrong in both directions: before the wrapper it counted setup
+        // faults that never spawned, and after the wrapper returned it missed starts whose
+        // capture rejected post-launch (santa final loop, rounds 4-5).
+        this.cloneTransportStartCount++;
+      }
+      return await this.spawnBounded("git", bin, args, { env, cwd });
     } finally {
       release();
     }
@@ -1551,7 +1597,8 @@ export class GithubClient {
     // inside the semaphore-acquire gap, or an overridden iterator at the launch, swap the
     // validated tuple for something else.
     const argv = copiedArgv(args, "gitBytes");
-    assertSpawnAllowed(this.bins.git, argv);
+    const bin = this.bins.git; // captured once: validated and launched value are the same
+    assertSpawnAllowed(bin, argv);
     assertReadOnlyGit(argv);
     // The byte-capture lane serves LOCAL read verbs only. `clone` — allowlisted in the shared
     // git grammar — is refused HERE: its destination positional is a write target whose
@@ -1570,7 +1617,7 @@ export class GithubClient {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let gaveUpTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const child = this.launch(this.bins.git, argv, { env, cwd, stdin: "ignore" });
+      const child = this.launch(bin, argv, { env, cwd, stdin: "ignore" });
       let outReader: StreamReader;
       let errReader: StreamReader;
       const acquired: StreamReader[] = [];
@@ -1707,11 +1754,12 @@ export class GithubClient {
   // launch capability it injects.
   launchBatchChild(cwd: string): LaunchedChild {
     const args = ["cat-file", "--batch"];
-    assertSpawnAllowed(this.bins.git, args);
+    const bin = this.bins.git; // captured once: validated and launched value are the same
+    assertSpawnAllowed(bin, args);
     assertReadOnlyGit(args);
     assertContained(cwd, [this.tempRoot]);
     const env = buildGitEnv(this.baseEnv, this.ensureGitConfig());
-    return this.launch(this.bins.git, args, { env, cwd, stdin: "pipe" });
+    return this.launch(bin, args, { env, cwd, stdin: "pipe" });
   }
 
   // The child pool's acquire — a fixed small pool (the subprocess semaphore's size, rvo Q4)
@@ -1726,7 +1774,8 @@ export class GithubClient {
     // `includes`) as well as by index, so a caller-owned object could report one shape to the
     // walk and hand another to the launch.
     const args = copiedArgv(callerArgs, "tar");
-    assertSpawnAllowed(this.bins.tar, args);
+    const bin = this.bins.tar; // captured once: validated and launched value are the same
+    assertSpawnAllowed(bin, args);
     assertReadOnlyTar(args);
     // The argv guard proves read-only INTENT; the wrapper still containment-checks every
     // write/read target: each -C/--directory extraction dir and the -f/--file archive.
@@ -1783,7 +1832,7 @@ export class GithubClient {
     // this level, never inside spawnBounded (gh already wraps it → double-acquire deadlock at 1).
     const release = await this.sem.acquire();
     try {
-      return await this.spawnBounded("tar", this.bins.tar, args, { env: buildTarEnv(this.baseEnv) });
+      return await this.spawnBounded("tar", bin, args, { env: buildTarEnv(this.baseEnv) });
     } finally {
       release();
     }
@@ -2462,13 +2511,18 @@ export class GithubClient {
   // via the next run's re-discovery (plan §7.2). Because HEAD == the pin on every success, the
   // scanned commit's date is the DISCOVERED committedDate — no clone-side date read exists on
   // this path. `cloneAttempts` feeds the per-unit transport counters (check 8).
-  // `onAttempt` reports each attempt's number as it STARTS, so the caller can account for the
-  // transport even when every attempt fails (the return value never arrives on that path, and a
-  // failed clone's starts are exactly the pacing-relevant ones — check 9's accounting).
+  // Real clone-transport starts observed so far. The counter advances immediately before each
+  // clone spawn (inside git(), after the pacing gate), so a caller can account for the
+  // transport even when the clone throws and never returns its own count — check 9's
+  // accounting, which must cover failed units too.
+  get cloneTransportStarts(): number {
+    return this.cloneTransportStartCount;
+  }
+
   async cloneNoCheckout(
     org: string, repo: string, branch: string, pinnedOid: string,
-    onAttempt?: (attempt: number) => void,
   ): Promise<{ dir: string; cloneAttempts: number }> {
+    const startsBefore = this.cloneTransportStartCount;
     const runDir = this.makeRunTempDir();
     const dest = join(runDir, "clone");
     assertContained(dest, [this.tempRoot]); // §0: clone dest containment BEFORE spawning
@@ -2515,12 +2569,6 @@ export class GithubClient {
           if (lastFailure !== "") break;
           throw e;
         }
-        // Counted only once the attempt actually REACHED the process: git() throws (above)
-        // only for wrapper setup faults — a denied argv, an uncontained destination, a config
-        // failure — which never spawn, and counting those would report network starts that
-        // did not happen. A spawned attempt always resolves, including a timeout (124) and a
-        // nonzero exit, so every real start is still counted.
-        onAttempt?.(attempts);
         if (res.exitCode === 0) {
           cloned = true;
           break;
@@ -2546,7 +2594,7 @@ export class GithubClient {
           `clone HEAD ${headSha} does not match the discovery-pinned ${pinnedOid} for ${org}/${repo}@${branch} — the branch moved between discovery and clone; failing closed (self-heals via the next run's re-discovery)`,
           { endpoint: url },
         );
-      return { dir: dest, cloneAttempts: attempts };
+      return { dir: dest, cloneAttempts: this.cloneTransportStartCount - startsBefore };
     } catch (e) {
       // reclaim the (possibly multi-GB, possibly partial) tree NOW rather than at the next
       // startup sweep — best-effort, never masking the actionable error

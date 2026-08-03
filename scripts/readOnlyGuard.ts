@@ -13,6 +13,7 @@ import { types as runtimeTypes } from "node:util";
 const isArrayIntrinsic = Array.isArray;
 const isProxyIntrinsic = runtimeTypes.isProxy;
 const ownDescriptor = Object.getOwnPropertyDescriptor;
+const defineProp = Object.defineProperty;
 
 export class ReadOnlyViolation extends Error {
   constructor(message: string) {
@@ -52,14 +53,16 @@ const GH_API_FIRST_SEGMENT = new Set(["repos", "orgs", "user", "rate_limit", "gr
 const GH_ORG_ID_REPOS = /^organizations\/\d+\/repos$/;
 
 // Copy an argv into a FRESH, dense, plain array of primitive strings before any grammar runs.
-// Two attacks this closes, both found by adversarial review:
+// The attacks this closes, all found by adversarial review:
 //   • sparse / prototype-backed slots — a hole reads through the prototype chain, so indexed
 //     reads and iteration helpers can disagree about what the argv contains;
-//   • overridden array methods — the guards compare tuples and canonicalize with `every`/
-//     `flatMap`, which an argv object may override to report whatever it likes while the
-//     INDEXED argv actually handed to the spawn stays dangerous.
-// Reading only `length` (validated) plus own indexed slots, into an array literal we own,
-// makes every later method call run on OUR array, not on caller-supplied behaviour.
+//   • overridden array methods — the guards compare tuples with helpers an argv object may
+//     override to report whatever it likes while the INDEXED argv handed to the spawn stays
+//     dangerous;
+//   • accessor slots and Proxy traps — both run caller code during validation, which can
+//     mutate the shared state the grammar consults immediately afterwards.
+// Reading only `length` (validated) plus own indexed DATA slots, into an array we own, makes
+// every later check run on OUR array rather than on caller-supplied behaviour.
 function trustedArgv(raw: readonly string[], what: string): string[] {
   // A genuine Array is required, not merely something array-LIKE: an array-like object can
   // expose a `length` getter that under-reports its slots, so the guard would validate a
@@ -75,15 +78,16 @@ function trustedArgv(raw: readonly string[], what: string): string[] {
   if (!isArrayIntrinsic(raw)) deny(`${what} argv is not an array`);
   const len = raw.length;
   if (!Number.isSafeInteger(len) || len < 0) deny(`${what} argv length is not a safe nonnegative integer`);
-  // filled by index, never `push`: the array the grammar below judges must not be assembled
-  // through a prototype method that something else could have replaced
-  const out: string[] = new Array<string>(len);
+  // Slots are DEFINED, never pushed or index-assigned: `push` is a replaceable prototype
+  // method, and assigning into a hole walks the prototype chain where an inherited numeric
+  // setter would capture the write. defineProperty consults no prototype at all.
+  const out: string[] = [];
   for (let i = 0; i < len; i++) {
     const slot = ownDescriptor(raw, i);
     const value: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
     if (typeof value !== "string")
       deny(`${what} argv slot ${i} is not an own string data property (sparse, prototype-backed, or accessor argv)`);
-    out[i] = value as string;
+    defineProp(out, i, { value: value as string, writable: false, enumerable: true, configurable: true });
   }
   return out;
 }
@@ -92,25 +96,34 @@ function trustedArgv(raw: readonly string[], what: string): string[] {
 // `-fbody=x`) into separate tokens so no attached-value form dodges a `--flag value`
 // check. Bare short flags like `-i` are left intact (the regex requires a value).
 //
-// Written as an index loop rather than `flatMap`: this canonicalization decides what every
-// later check sees, so it must not route through a mutable `Array.prototype` method. Even a
-// dense array we own inherits its methods from the shared prototype, so a polluted `flatMap`
-// could otherwise hand the grammar a token list the spawned argv does not have.
+// Written without `flatMap` or `push`: this canonicalization decides what every later check
+// sees, so it must not route through a mutable `Array.prototype` method — even an array we own
+// inherits its methods from the shared prototype. Slots are DEFINED rather than assigned,
+// because writing into a hole walks the prototype chain and an inherited numeric setter would
+// capture the write. (Under the recorded threat model no caller code can run between the
+// wrapper's copy and this function; the point is that the invariant holds by construction
+// rather than by that timing argument.)
 function canon(args: string[]): string[] {
   const out: string[] = [];
+  let n = 0;
+  const emit = (token: string): void => {
+    defineProp(out, n++, { value: token, writable: false, enumerable: true, configurable: true });
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     if (a.startsWith("--") && a.includes("=")) {
       const eq = a.indexOf("=");
-      out.push(a.slice(0, eq), a.slice(eq + 1));
+      emit(a.slice(0, eq));
+      emit(a.slice(eq + 1));
       continue;
     }
     const m = /^(-[A-Za-z])=?(.+)$/.exec(a); // -Xvalue / -X=value (NOT bare -i)
     if (m && SHORT_VALUE.has(m[1]!)) {
-      out.push(m[1]!, m[2]!);
+      emit(m[1]!);
+      emit(m[2]!);
       continue;
     }
-    out.push(a);
+    emit(a);
   }
   return out;
 }

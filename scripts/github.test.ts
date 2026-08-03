@@ -2920,17 +2920,22 @@ describe("spawn-site allowlist (grep-enforced, with two exact-path scanner-test 
     for (const guard of ["assertReadOnlyGh", "assertReadOnlyGit", "assertReadOnlyTar"])
       expect(src.includes(`${guard}(args)`)).toBe(true);
   });
-  test("the launch site assembles its command vector by INDEX, never through a prototype method", () => {
+  test("the launch site assembles its command vector with defineProperty and freezes it", () => {
     // The wrapper reads the caller's env object (whose properties may be accessors) between
-    // validation and launch, so caller code can run in that window and replace an Array
-    // prototype method. A vector built with `push` or a spread would then carry tokens no
-    // guard approved. Index writes touch no prototype, which is what makes "the argv the
-    // guards validated is the argv that launches" hold at the site itself. Structural, because
-    // the property lives in HOW the vector is built (santa final loop, round 4).
+    // validation and launch, so caller code can run in that window and replace shared state. A
+    // vector built with `push` or a spread routes through a mutable Array.prototype method; a
+    // plain index write is ALSO unsafe, because assigning into a hole walks the prototype chain
+    // and an inherited numeric setter captures it. defineProperty consults no prototype and the
+    // freeze stops any later rewrite, which is what makes "the argv the guards validated is the
+    // argv that launches" hold at the site itself. Structural, because the property lives in
+    // HOW the vector is built (santa final loop, rounds 4-5).
     const src = readFileSync("./scripts/github.ts", "utf8");
     const site = src.slice(src.indexOf("const realLaunch"), src.indexOf("// Copy an argv into a fresh"));
-    expect(site).toContain("cmd[0] = bin");
+    expect(site).toMatch(/defineProp\(cmd, 0, \{ value: bin/);
+    expect(site).toMatch(/defineProp\(cmd, i \+ 1, \{ value: token/);
+    expect(site).toMatch(/freezeIntrinsic\(cmd\)/);
     expect(site).not.toMatch(/cmd\.push\(/);
+    expect(site).not.toMatch(/cmd\[\w+(\s*\+\s*1)?\]\s*=/); // no plain index assignment
     expect(site).not.toMatch(/cmd:\s*\[bin,\s*\.\.\./);
   });
 });

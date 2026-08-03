@@ -798,12 +798,14 @@ async function processUnit(
     });
   };
   let cloned: { dir: string; cloneAttempts: number };
+  const startsBefore = client.cloneTransportStarts;
   try {
-    cloned = await client.cloneNoCheckout(repo.organization, repo.name, h.name, h.oid, (n) => {
-      cloneAttempts = n;
-    });
+    cloned = await client.cloneNoCheckout(repo.organization, repo.name, h.name, h.oid);
+    cloneAttempts = cloned.cloneAttempts;
   } catch (e) {
-    logTransport("failed", null, null); // the attempts happened; the clone never returned them
+    // the starts the client actually made, even though the clone never returned its own count
+    cloneAttempts = client.cloneTransportStarts - startsBefore;
+    logTransport("failed", null, null);
     throw e;
   }
   // Best-effort clone reclaim with the §0 containment re-check; a failure surfaces as the

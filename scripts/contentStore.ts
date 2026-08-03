@@ -454,6 +454,9 @@ export class UnitContentStore {
   // (the child lane already gets prompt rejection through the poison path) — without it a
   // hung REST fallback would hold the read pending for the transport's full bounded budget
   private readonly teardownWaiters = new Set<() => void>();
+  // a construction failure's bounded settle, while it is still running: dispose() joins it
+  // rather than declaring teardown complete while that child may still be alive
+  private pendingChildSettle: Promise<void> | null = null;
   // gate-detached fallback transports still in flight: the unit's own settle must DRAIN them
   // (§7's drain-safety — db.close() must never race a live writer), so dispose() awaits this
   // set. The wait is the transport's own §4-bounded wall — exactly what the unit's await held
@@ -656,9 +659,11 @@ export class UnitContentStore {
         };
       // bounded settle before control returns: the caller's failure path may delete the
       // store directory, and the failed launch should be dead — not merely dying — first
-      // (the same bound the disposer's escalated exit wait uses)
+      // (the same bound the disposer's escalated exit wait uses). PUBLISHED as
+      // pendingChildSettle so a concurrent dispose() waits for it instead of deleting the
+      // clone and releasing the permit while this child is still unsettled.
       let settleTimer: ReturnType<typeof setTimeout> | undefined;
-      const settledExit = await Promise.race([
+      const settleRace = Promise.race([
         launched.exited.then(
           (code) => code,
           () => null,
@@ -667,6 +672,9 @@ export class UnitContentStore {
           settleTimer = setTimeout(() => resolve(null), SPAWN_KILL_GRACE_MS + 1_000);
         }),
       ]);
+      this.pendingChildSettle = settleRace.then(() => undefined, () => undefined);
+      const settledExit = await settleRace;
+      this.pendingChildSettle = null;
       clearTimeout(settleTimer);
       // refine the record written before the wait with the exit it actually reached (if it did)
       if (recordedHere && this.firstDisposal !== null) this.firstDisposal = { ...this.firstDisposal, exitCode: settledExit };
@@ -752,6 +760,16 @@ export class UnitContentStore {
         // verdict's subject, and its death must not read as "no child was ever needed"
         uncleanFrom(this.firstDisposal);
       }
+      // A construction failure may still be inside its bounded settle: join it before calling
+      // the teardown complete, or the clone deletion and the permit release would race a child
+      // whose termination has not been established.
+      if (this.pendingChildSettle !== null) await this.pendingChildSettle;
+      // A first child that NEVER SETTLED (exitCode null) may still be alive, so it dirties the
+      // verdict even when a replacement served the unit cleanly. This is narrower than the
+      // sanctioned-respawn rule: that rule forgets a first child whose DEATH was established;
+      // "never settled" is precisely the case where it was not.
+      if (this.firstDisposal !== null && this.firstDisposal.exitCode === null && verdict.clean)
+        verdict = { clean: false, detail: `a prior child never settled: ${formatDisposal(this.firstDisposal)}` };
       // DRAIN any gate-detached fallback transport before the unit settles (§7 drain-safety:
       // a floating REST spawn, its retries, its one-shot permit, and its cache write must not
       // outlive the unit toward db.close()). Bounded by the transport's own §4 budgets — the
