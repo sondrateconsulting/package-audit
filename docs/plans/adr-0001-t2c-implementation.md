@@ -247,6 +247,15 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
    on. Recommendation: accept-risk with the honest formula at the default fan-out; the pool
    matters mainly for high-fan-out configs.
 
+### 5.1 Decisions recorded (2026-08-03, rvo, one AskUserQuestion batch)
+
+All seven questions were answered with the recommended option, verbatim labels:
+Q1 "Bounded retry (Recommended)"; Q2 "Owned sweep (Recommended)"; Q3 "Hard cutover
+(Recommended)"; Q4 "Ratified defaults (Recommended)"; Q5 "Move + shim (Recommended)";
+Q6 "Eligible upper bound (Recommended)"; Q7 "Accept + document (Recommended)". The Q6
+denominator deviation and the Q7 acceptance get recorded in the PR body; the rest surface
+as code comments at their decision sites.
+
 ## 6. Phases (TDD; commit before reviewers; santa loop per phase batch)
 
 - **P1 — grammars.** readOnlyGuard tables first (RED) → grammar code (GREEN). Pure.
