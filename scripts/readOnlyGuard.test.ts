@@ -216,6 +216,19 @@ describe("assertReadOnlyGit — the no-checkout clone tuple (second exact shape)
   for (const boolFlag of ["--single-branch", "--no-tags", "--no-recurse-submodules", "--no-checkout"])
     test(`shape-2 ${boolFlag} given a value throws (bool flags stay bare)`, () =>
       throws(() => assertReadOnlyGit(NC_ARGV.map((a) => (a === boolFlag ? `${boolFlag}=x` : a)))));
+  // arity: a DETACHED value flag in the terminal slot has no value token. `--template` is the
+  // exploitable one — its required value IS the empty string, so folding "missing" to "" let a
+  // bare terminal --template satisfy the hardening (santa round-2). Both shapes are pinned.
+  for (const valueFlag of ["--template", "--depth", "--branch"]) {
+    test(`shape-2 terminal bare ${valueFlag} throws (missing value is not an empty value)`, () =>
+      throws(() => assertReadOnlyGit([...NC_ARGV.filter((a) => !a.startsWith(valueFlag)), valueFlag])));
+    test(`shape-1 terminal bare ${valueFlag} throws`, () =>
+      throws(() => assertReadOnlyGit([...NC_ARGV.filter((a) => a !== "--no-checkout" && !a.startsWith(valueFlag)), valueFlag])));
+  }
+  test("shape-2 with a third positional throws", () =>
+    throws(() => assertReadOnlyGit([...NC_ARGV, "extra"])));
+  test("shape-2 with one positional throws", () =>
+    throws(() => assertReadOnlyGit(NC_ARGV.slice(0, -1))));
   const NC = sh(
     "clone --depth 1 --single-branch --branch main --no-tags --no-recurse-submodules --template= --no-checkout https://github.com/o/r /tmp/pkg-audit-x",
   );
@@ -250,11 +263,28 @@ describe("assertReadOnlyGit — the ls-tree tuple", () => {
       throws(() => assertReadOnlyGit([...LS.slice(0, i), LS[i]!, ...LS.slice(i)])));
   }
   test("abbreviated --full-tre throws", () => throws(() => assertReadOnlyGit(["ls-tree", "-r", "-z", "-l", "--full-tre", "HEAD"])));
+  test("omitting the HEAD rev throws", () => throws(() => assertReadOnlyGit(LS.slice(0, 5))));
+  test("duplicating the HEAD rev throws", () => throws(() => assertReadOnlyGit([...LS, "HEAD"])));
   test("a SPARSE argv with holes in mandatory slots throws (santa round-1: hole-skipping iteration bypass)", () => {
     const sparse = new Array(6) as string[];
     sparse[0] = "ls-tree";
     sparse[5] = "HEAD";
     throws(() => assertReadOnlyGit(sparse));
+  });
+  test("a PROTOTYPE-BACKED sparse argv throws (santa round-2: holes read through the prototype)", () => {
+    // holes serve conforming tokens via a prototype trap while iteration helpers still skip
+    // them — value checks and iteration disagree unless own-ness is required.
+    const proto = new Proxy(Array.prototype, {
+      get(target, key, receiver) {
+        const n = Number(key);
+        if (Number.isInteger(n)) return LS[n];
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const argv = ["ls-tree", "", "", "", "", "HEAD"] as string[];
+    for (const i of [1, 2, 3, 4]) delete argv[i];
+    Object.setPrototypeOf(argv, proto);
+    throws(() => assertReadOnlyGit(argv));
   });
   test("reordered flags throw", () => throws(() => assertReadOnlyGit(["ls-tree", "-z", "-r", "-l", "--full-tree", "HEAD"])));
   test("missing -l throws", () => throws(() => assertReadOnlyGit(["ls-tree", "-r", "-z", "--full-tree", "HEAD"])));

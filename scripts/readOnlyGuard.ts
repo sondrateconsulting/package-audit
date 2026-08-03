@@ -234,11 +234,14 @@ const GIT_CLONE_NO_CHECKOUT = "--no-checkout";
 
 export function assertReadOnlyGit(rawArgs: string[]): void {
   // argv DENSITY guard: array-iteration helpers skip sparse-array holes, so a hole in a
-  // mandatory slot could otherwise satisfy an equality sweep over an exact tuple (santa
-  // round-1 finding). Every slot must be a real string before any grammar logic runs;
-  // indexing (below) then sees only genuine tokens.
+  // mandatory slot could otherwise satisfy an equality sweep over an exact tuple. Checking
+  // the VALUE alone is not enough — a hole reads through the prototype chain, so a
+  // prototype-backed sparse array can serve a conforming token from a slot it does not own
+  // while iteration helpers still skip it (santa round-2). Require an OWN string slot, so
+  // value reads and iteration can never disagree about what the argv contains.
   for (let i = 0; i < rawArgs.length; i++) {
-    if (typeof rawArgs[i] !== "string") deny(`git argv slot ${i} is not a string`);
+    if (!Object.hasOwn(rawArgs, i) || typeof rawArgs[i] !== "string")
+      deny(`git argv slot ${i} is not an own string property (sparse or prototype-backed argv)`);
   }
   const args = canon(rawArgs);
   if (args.length === 0) deny("git with no subcommand");
@@ -319,7 +322,15 @@ export function assertReadOnlyGit(rawArgs: string[]): void {
       if (GIT_CLONE_VALUE.has(name)) {
         seen[name] = (seen[name] ?? 0) + 1;
         if (attached !== undefined) values[name] = attached;
-        else { values[name] = raw[i + 1] ?? ""; i++; }
+        else {
+          // A detached value flag in the LAST slot has no value token. Folding that to ""
+          // made a terminal bare `--template` indistinguishable from `--template=` — whose
+          // empty value is exactly what the hardening requires — so the flag's arity could be
+          // dropped entirely (santa round-2). Missing ≠ explicitly empty: deny it.
+          if (i + 1 >= raw.length) deny(`git clone ${name} requires a value`);
+          values[name] = raw[i + 1]!;
+          i++;
+        }
       } else if (boolSet.has(name)) {
         if (attached !== undefined) deny(`git clone ${name} takes no value`);
         seen[name] = (seen[name] ?? 0) + 1;
