@@ -150,7 +150,7 @@ function contentSeams(root: string, files: Record<string, string>, symlinks: str
 // Scripted client factory — every test client shares this boilerplate (offline binPaths, noop
 // sleep, tempRoot under the test dir) and differs ONLY in its spawn script and cache role.
 // Since the T2c cutover the scan path's git spawns (clone + rev-parse) and enumeration
-// (ls-tree via the interactive seam) are answered by DEFAULT shims here: a clone materialises
+// (ls-tree via the one-shot byte seam) are answered by DEFAULT shims here: a clone materialises
 // its dest and records its branch; rev-parse echoes the discovery convention's oid for that
 // clone's branch (override per test via headOidFor); ls-tree serves `repoFiles` (default: an
 // empty listing = an empty repo, the pre-cutover treeBody(args) parity); cat-file serves the

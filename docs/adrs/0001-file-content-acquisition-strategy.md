@@ -273,7 +273,8 @@ implementation PR's own change set (see Follow-on work), not a separate later st
   interactive-child lifecycle with its second permit pool, and the framed binary seam — the
   §3.2 ledger's honest price, now an implementation obligation rather than a hypothetical.
 * Bad, because symlink reads still spend the per-unit REST fallback budget (max(20, ceil(10% of
-  selected))), so symlink-heavy units keep an API dependency and its failure modes.
+  selected)) — see Confirmation check 8 for the implementation's disclosed denominator), so
+  symlink-heavy units keep an API dependency and its failure modes.
 * Neutral, because operational hardening is deferred to implementation **by name**, not
   silently: clone retry policy, pacing under fan-out, and the sweep-ownership fix (the
   residual-risk list above).
@@ -327,7 +328,10 @@ Post-implementation checks (the implementation PR must demonstrate these, not as
    live; maximum configured fan-out spawns no more children than the pool size.
 8. **Separated counters.** Local canonical reads, REST fallback reads by cause, fallback-budget
    spend, clone-transport operations, and retries as distinct metrics; the per-unit fallback
-   budget (max(20, ceil(10% of selected))) trips and terminates as defined.
+   budget (max(20, ceil(10% of selected))) trips and terminates as defined. (The
+   implementation denominates this on the enumerable eligible superset rather than the literal
+   `selected` set, which production cannot know until a unit finishes — a disclosed deviation
+   that can only make the budget larger; see the implementation plan §3.8.)
 9. **Operational hardening.** The clone retry policy and an owned temp sweep land with the
    implementation, or their explicit risk acceptance is recorded in the implementation PR; git
    transport stays under 15 ops/s/repo by construction, and the implementation shows its

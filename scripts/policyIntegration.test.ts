@@ -62,13 +62,13 @@ const graphqlHeads = (nodes: Head[], defaultBranch: string | null): string =>
 const repoList = `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: "org-a" }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}`;
 
 
-// ---- T2c scan-path shims (the git spawns + the enumeration seam) -----------------------------
-// Since the cutover every scanned unit clones (a git spawn) and enumerates through the
-// interactive seam. The shim materialises each clone dest, answers rev-parse with the
+// ---- T2c scan-path shims (the git spawns + the one-shot ls-tree byte seam) -------------------
+// Since the cutover every scanned unit clones (a git spawn) and enumerates through the one-shot
+// byte seam (the interactive child seam is reserved for `cat-file --batch` content reads). The shim materialises each clone dest, answers rev-parse with the
 // FIXTURE's oid for that clone's branch (head coherence), and serves an EMPTY listing — the
 // exact parity of the old empty REST tree envelope.
 const emptyLsTreeLaunch = (_bin: string, args: readonly string[]) => {
-  if (args[0] !== "ls-tree") throw new Error(`unexpected interactive launch: ${args.join(" ")}`);
+  if (args[0] !== "ls-tree") throw new Error(`unexpected launch on the byte seam: ${args.join(" ")}`);
   const pending: Array<(r: { done?: boolean }) => void> = [];
   void pending;
   return {

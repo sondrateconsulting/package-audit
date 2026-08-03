@@ -884,8 +884,10 @@ C. Locate manifests read-only. **Acquisition changed with ADR-0001 (Option 2c): 
    `--jq .content` a raw response) or via `repos/<owner>/<repo>/git/blobs/<blob_sha>`
    with the raw media type (the blob SHA comes from the `sha` field of the file's
    default-JSON `contents` metadata — it is NOT the commit SHA). For files > 100 MB, or a `contents` entry whose `type` is
-   `symlink`/`submodule`/`dir` (not a plain file), fall back to the hardened shallow
-   clone from §0 (note a directory path returns a JSON ARRAY of entries rather than a
+   `symlink`/`submodule`/`dir` (not a plain file), there is no clone fallback under T2c —
+   production reaches this lane only for mode-`120000` symlinks, whose dereferenced bytes are
+   exactly what it wants, and every other entry kind is resolved from the local enumeration
+   (note a directory path returns a JSON ARRAY of entries rather than a
    file object, so branch on array-vs-object before attempting a raw/blob read). A raw fetch and a default-JSON fetch of the SAME url are cached under
    distinct `api_cache.variant_hash` values (the Accept media type; §3) so they never
    collide. (Only when you deliberately use the default JSON representation must
