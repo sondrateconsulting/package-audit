@@ -288,7 +288,7 @@ Apache-2.0 — see [LICENSE](LICENSE). Copyright 2026 Sondrate Consulting.
 
 ## Data, upgrades & privacy
 
-Everything runs locally. Findings live in a local SQLite database (`data/audit.db`) and reports in `output/`; nothing is uploaded anywhere — the only network traffic is read-only GitHub access (through `gh`, plus one hardened no-checkout `git clone` per scanned branch unit) and registry fetches for the packages you track.
+Everything runs locally. Findings live in a local SQLite database (`data/audit.db`) and reports in `output/`; nothing is uploaded anywhere — the only network traffic is read-only GitHub access (through `gh`, plus a hardened no-checkout `git clone` for each scanned branch unit — retried up to three times on a transient failure) and registry fetches for the packages you track.
 
 - **`data/audit.db` is the durable source of truth.** Weekly re-runs are cheap: unchanged branches are skipped outright, and any REST response the run does make is served from cache with zero network when it is commit-pinned.
 - **Know what the database retains:** the API cache stores GitHub REST response bodies. File content reaches it only through the symlink dereference fallback (and, in databases predating this version, the retired per-file content path — those rows are not pruned). Treat `audit.db` with the same sensitivity as the source it scanned.

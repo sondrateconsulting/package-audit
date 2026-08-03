@@ -246,9 +246,11 @@ where the canonical decode (`c98204…`) is the ratified expectation (`fidelity.
 2c therefore changes delivered strings on non-UTF-8 content, from the API's transcode to the
 canonical decode — a disclosed findings change in the fidelity standard's own direction; raw-byte
 consumers stay future work. Symlinks are mode-routed to REST's dereferenced
-bytes (the ratified policy), so symlink reads still spend API budget. There is no truncation
-cliff — `ls-tree` enumerates any tree — so the truncated-tree checkout-clone fallback and its
-checkout-byte caveat retire on this path with the implementation: removing them is part of the
+bytes (the ratified policy), so symlink reads still spend API budget. There is no REST truncation
+cliff — local enumeration replaces the 100,000-entry / 7 MB cap, under explicit `ls-tree`
+entry/record bounds that fail a unit LOUDLY rather than silently switching transports — so the
+truncated-tree checkout-clone fallback and its checkout-byte caveat retire on this path with the
+implementation: removing them is part of the
 implementation PR's own change set (see Follow-on work), not a separate later step.
 
 ### Consequences

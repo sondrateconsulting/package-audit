@@ -886,7 +886,8 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
     // No pre-seeded work-queue rows → both branches go through processUnit's REAL scan.
-    // The scripted client serves branch discovery (GraphQL) and an EMPTY tree (REST), so the
+    // The scripted client serves branch discovery (GraphQL) and an empty local `ls-tree`
+    // enumeration, so the
     // scan pipeline runs end-to-end with zero findings and the unit lands 'done'/'scanned'.
     const client = makeClient(root, async (_bin, args) => {
       const isGraphql = args.some((a) => a === "graphql");
@@ -958,7 +959,7 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
         nodes: nodes.map((n) => ({ name: n.name, target: { oid: n.oid, committedDate: n.date, tree: { oid: hexOid(`t-${n.name}`) } } })),
       },
     } } })}`;
-  // heads via GraphQL, an EMPTY tree via REST so a scanned unit runs the pipeline to zero findings.
+  // heads via GraphQL, an empty local `ls-tree` enumeration so a scanned unit runs the pipeline to zero findings.
   const scanClient = (root: string, nodes: Array<{ name: string; oid: string; date: string }>, defaultBranch: string | null): GithubClient =>
     makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads(nodes, defaultBranch) };
