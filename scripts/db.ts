@@ -1661,7 +1661,8 @@ function assertRunUnitHeadInvariants(h: RunUnitHeadInput): void {
   // as 'complete' provenance by the read surfaces (report scanScope, compare policyChurn availability).
   // The STORED value is never re-read for cutoff or selection decisions — later runs judge freshly
   // DISCOVERED head dates, where the same shared validator is what protects the live slice(0, 10)
-  // cutoff comparison. The producers (github.ts discovery + the clone-date read) already validate
+  // cutoff comparison. The producers (GitHub discovery — which the clone's head-coherence gate
+  // proves names the scanned commit) already validate
   // with the same isIsoInstant, so this enforces the documented semantic at the chokepoint rather than
   // trusting every caller to have done it, exactly as the presence checks above do.
   if (!h.scannedCommitDate) fail(`run_unit_head ${where}: a non-empty scanned_commit_date is required`);

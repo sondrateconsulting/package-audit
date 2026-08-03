@@ -1332,9 +1332,10 @@ export class GithubClient {
     if (!Number.isFinite(concurrency) || concurrency < 1)
       throw new Error(`concurrency must be >= 1 (got ${concurrency}) — a zero-slot semaphore hangs the first acquire forever`);
     this.baseEnv = opts.env ?? process.env;
-    // Defensive COPY, never the caller's object: this.bins is re-read at every launch (after
-    // semaphore awaits), so retaining a caller-owned reference would let a post-construction
-    // mutation swap the validated binary for another executable in the acquire gap.
+    // Defensive COPY, never the caller's object: retaining a caller-owned reference would let a
+    // post-construction mutation swap the validated binary for another executable. Each wrapper
+    // additionally captures its bin value ONCE, before validation, and launches that same value,
+    // so nothing running between the guards and the spawn can change which executable starts.
     const bp = opts.binPaths;
     this.bins = bp === undefined
       ? { gh: whichIn(this.baseEnv, "gh"), git: whichIn(this.baseEnv, "git"), tar: whichIn(this.baseEnv, "tar") }
@@ -1392,8 +1393,9 @@ export class GithubClient {
         resolve();
       }, this.spawnTimeoutMs);
     });
-    // PROMPT-TUI §U3.1: ONE span per attempt through the one funnel every gh/git/tar spawn flows
-    // through (preflight and plan included). Synchronous, O(1), no-throw; label construction is
+    // PROMPT-TUI §U3.1: ONE span per attempt through the funnel every ONE-SHOT gh/git/tar spawn
+    // flows through (preflight and plan included; the T2c byte and interactive lanes use the launch
+    // seam directly and emit their own spans). Synchronous, O(1), no-throw; label construction is
     // gated behind the sink check (§U0 — a bare run pays only this boolean).
     let spanId = 0;
     if (hasProgressSink()) {

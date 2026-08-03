@@ -1245,7 +1245,7 @@ db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_k
 const BODY_FLAGS = new Set(["-f","-F","--field","--raw-field","--input"]);
 const GIT_READ = new Set(["clone","rev-parse","ls-tree","cat-file","--version"]);
 // package managers are NEVER spawned (§0). Their binaries are hard-denied here.
-export const PM_DENYLIST = new Set(["npm","npx","yarn","pnpm","bunx"]);
+export const PM_DENYLIST = new Set(["npm","npx","yarn","pnpm","bunx","corepack"]);
 const BUN_DENY_SUBS = new Set(["install","add","remove","x","pm"]);
 // gh api endpoint allowlist (matched on the path with any ?query-string stripped):
 const GH_API_PATHS = ["repos","orgs","user","rate_limit","graphql"];  // "user/orgs" ⊂ "user";

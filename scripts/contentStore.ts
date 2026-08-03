@@ -99,7 +99,9 @@ export interface ContentStoreCounters {
 // 0 on a clean stdin close and nothing else, so anything short of that means delivered bytes
 // cannot be vouched for and the caller must not record the unit as fully read. (When a
 // consumed respawn's replacement served the unit, the replacement IS the last child and the
-// verdict describes it — the sanctioned single respawn never dirties a successful unit.)
+// verdict describes it — a sanctioned respawn whose first child's DEATH was established does not
+// dirty the replacement. A prior child that never settled is the exception: it may still be
+// alive, so it makes the disposal unclean even behind a clean replacement.)
 export interface StoreDisposal {
   clean: boolean;
   detail: string | null;

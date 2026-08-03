@@ -680,7 +680,10 @@ the strongest form available — the ADR changed state only after the measuremen
 **The implementation.** This decision chooses a direction; it implements nothing. The
 implementation PR carries the §3.1/§3.2 bill under this repository's own gates (the Confirmation
 checks above), including the production `readOnlyGuard` changes the benchmark deliberately did
-not make — its proposed grammars and framed-reader prototype live beside the bench until adopted.
+not make: the benchmark's proposed grammars and framed-reader prototype were built beside the
+bench precisely so that adopting them is the implementation PR's own step — that PR moves the
+framed parsers into `gitFrame.ts` (leaving `benchFrame.ts` a re-export shim) and adds the
+grammars to `readOnlyGuard.ts`.
 
 **The tree-request term** is closed by the chosen option: local `ls-tree` enumeration replaces
 the per-unit recursive REST tree request, so the separate budgeting ADR that an Option-1
