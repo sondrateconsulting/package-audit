@@ -59,7 +59,7 @@ export function buildReport(ctx: ReportContext): string {
   push(`- **Plan:** [docs/plans/adr-0001-disagreements-resolution.md](../../plans/adr-0001-disagreements-resolution.md) §4.5–§4.8 (protocol, metrics, rule, budget); ratified per §8.`);
   push(`- **Frozen-surface digest:** \`${ctx.frozenSurfaceDigest}\``);
   push(`- **Harness commit (rows):** \`${score.identity.harnessCommit}\`; **environment manifest hash:** \`${score.identity.envManifestHash}\``);
-  push(`- **Noise band:** ${score.noiseBand} (ratified; pilot spread ${String(ctx.ratification["pilotSpread"] ?? "?")}, the formula's floor binds)`);
+  push(`- **Noise band:** ${score.noiseBand} (ratified; pilot spread ${String(ctx.ratification["pilotSpread"] ?? "?")} — the band is the frozen formula's output over this spread; provenance, including any re-ratification, is in ratification.json)`);
   const env = ctx.envManifests.find((m) => m["hash"] === score.identity.envManifestHash);
   if (env !== undefined) {
     push(`- **Environment:** ${String(env["os"])} ${String(env["osVersion"])} ${String(env["archName"])}, git ${String(env["gitVersion"])}, gh ${String(env["ghVersion"])}, Bun ${String(env["bunVersion"])}; network: ${String(env["networkDescription"])}; credential: ${String(env["credentialType"])} (login \`${String(env["login"])}\`)`);
@@ -232,7 +232,8 @@ export function buildReport(ctx: ReportContext): string {
   push(`replaced attempt's timing is excluded from throughput aggregation and the replay's enters`);
   push(`(§4.5). Git transport pacing stayed well under 15 ops/s/repo by construction: each run`);
   push(`issues at most a handful of git transport operations (acquire, coherence check, enumerate,`);
-  push(`one interactive read child) across a multi-second wall (§4.8, asserted here).`);
+  push(`one interactive read child) per run — even the fastest sub-second wall carries only that`);
+  push(`handful of operations, far under the ceiling (§4.8, asserted here).`);
   push();
 
   // ---- informational executors -----------------------------------------------------------
@@ -286,7 +287,7 @@ export function buildReport(ctx: ReportContext): string {
     push();
     push(`Committed as [option3.json](option3.json): the offline duplicate-OID analysis over`);
     push(`the corpus trees plus the frozen warm-run scenario`);
-    push(`(base = parent of C1-main's pin, advanced = the pin).`);
+    push(`(base/advanced = the pinned warm-pair SHAs recorded in corpus.json).`);
     const statement = ctx.option3["cloneCompositionStatement"];
     if (typeof statement === "string") {
       push();
@@ -300,9 +301,10 @@ export function buildReport(ctx: ReportContext): string {
 
   push(`## 6. Review record`);
   push();
-  push(`Step B's harness passed four adversarial review rounds (30/32/9/7 findings, all remediated`);
-  push(`or plan-amended; no formal CONVERGED verdict was recorded — stated plainly, per the loop's`);
-  push(`own precedent). Step C's runner repairs and executors passed the §8-amended review round`);
+  push(`Step B's harness passed its adversarial review rounds (the counts and outcomes are`);
+  push(`committed in ratification.json's adversarialReviewRecord and amendment entries; no formal`);
+  push(`CONVERGED verdict was recorded — stated plainly, per the loop's own precedent). Step C's`);
+  push(`runner repairs and executors passed the §8-amended review round`);
   push(`recorded in ratification.json before any evidence here was collected. The artifacts map:`);
   push(`\`runs.jsonl\` (§4.5/§4.6 matrix evidence), \`fidelity.jsonl\` (§4.2 battery),`);
   push(`\`boundary-probe.json\`/\`concurrency-probe.json\`/\`option3.json\` (§4.4/§4.5 informational),`);

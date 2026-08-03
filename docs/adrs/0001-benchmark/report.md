@@ -1,10 +1,10 @@
 # ADR-0001 content-transport benchmark — Step C report
 
-- **Generated:** 2026-08-02T23:51:52.753Z
+- **Generated:** 2026-08-03T00:05:22.564Z
 - **Plan:** [docs/plans/adr-0001-disagreements-resolution.md](../../plans/adr-0001-disagreements-resolution.md) §4.5–§4.8 (protocol, metrics, rule, budget); ratified per §8.
 - **Frozen-surface digest:** `8b67a31418531d4da69d044c19d644805c6c910b30cc4037d61edf0b35b80255`
 - **Harness commit (rows):** `1e8ea6622f97ddc3764213f0371260029e1f97cc`; **environment manifest hash:** `f3075994b4a17608`
-- **Noise band:** 1.75 (ratified; pilot spread 1.7126, the formula's floor binds)
+- **Noise band:** 1.75 (ratified; pilot spread 1.7126 — the band is the frozen formula's output over this spread; provenance, including any re-ratification, is in ratification.json)
 - **Environment:** darwin 25.5.0 arm64, git git version 2.50.1 (Apple Git-155), gh gh version 2.95.0 (2026-06-17), Bun 1.4.0; network: operator macOS workstation (same host as the Step-B pilot); credential: PAT (gh auth) (login `rvobot`)
 
 > **Scope, stated plainly (plan §4.6):** this is a per-scenario serial cost profile, not an
@@ -185,7 +185,8 @@ Failed and invalidated attempts stay in `runs.jsonl` and count in failure metric
 replaced attempt's timing is excluded from throughput aggregation and the replay's enters
 (§4.5). Git transport pacing stayed well under 15 ops/s/repo by construction: each run
 issues at most a handful of git transport operations (acquire, coherence check, enumerate,
-one interactive read child) across a multi-second wall (§4.8, asserted here).
+one interactive read child) per run — even the fastest sub-second wall carries only that
+handful of operations, far under the ceiling (§4.8, asserted here).
 
 ## 5. Informational executors (reported, not scored)
 
@@ -225,15 +226,16 @@ These results evidence the scheduler requirement; they rank nothing (§4.5).
 
 Committed as [option3.json](option3.json): the offline duplicate-OID analysis over
 the corpus trees plus the frozen warm-run scenario
-(base = parent of C1-main's pin, advanced = the pin).
+(base/advanced = the pinned warm-pair SHAs recorded in corpus.json).
 
 > OID-keyed content caching composes with the API read paths (T0/T1): a cache hit skips a REST request or shrinks a GraphQL batch, which is exactly what the warm legs measure. On the clone paths (T2a/T2c) the unit's cost is dominated by whole-branch pack transfer, which an OID-keyed CONTENT cache does not reduce — a warm T2c leg still clones the branch and saves only local cat-file reads (microseconds each). What git natively provides in this direction is incremental object transfer against a PERSISTED prior store (fetch negotiation); production's fresh-clone-per-unit design has no persisted store, so that reuse is a different architecture (a shared object store), not a cache layer over the measured drivers.
 
 ## 6. Review record
 
-Step B's harness passed four adversarial review rounds (30/32/9/7 findings, all remediated
-or plan-amended; no formal CONVERGED verdict was recorded — stated plainly, per the loop's
-own precedent). Step C's runner repairs and executors passed the §8-amended review round
+Step B's harness passed its adversarial review rounds (the counts and outcomes are
+committed in ratification.json's adversarialReviewRecord and amendment entries; no formal
+CONVERGED verdict was recorded — stated plainly, per the loop's own precedent). Step C's
+runner repairs and executors passed the §8-amended review round
 recorded in ratification.json before any evidence here was collected. The artifacts map:
 `runs.jsonl` (§4.5/§4.6 matrix evidence), `fidelity.jsonl` (§4.2 battery),
 `boundary-probe.json`/`concurrency-probe.json`/`option3.json` (§4.4/§4.5 informational),
