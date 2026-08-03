@@ -95,12 +95,22 @@ export interface ContentStoreOptions {
   limits?: ContentStoreLimits;
 }
 
+// Deeply readonly on the public surface: orchestrate holds this object by reference for the
+// check-9 content-transport event, so a mutable shape would let any holder silently corrupt
+// the very counters that event exists to report. The store increments through its private
+// mutable view of the same object (compile-time protection only — same object, two types).
 export interface ContentStoreCounters {
+  readonly localCanonicalReads: number;
+  readonly restFallbackReads: { readonly symlink: number };
+  readonly fallbackBudgetSpend: number;
+  readonly childRespawns: number;
+}
+type MutableContentStoreCounters = {
   localCanonicalReads: number;
   restFallbackReads: { symlink: number };
   fallbackBudgetSpend: number;
   childRespawns: number;
-}
+};
 
 // The store-level teardown verdict. `clean` means: no child was ever needed, or the LAST
 // child that existed closed with exit 0 and no protocol fault — `git cat-file --batch` exits
@@ -441,12 +451,16 @@ export async function openUnitContentStore(caps: ContentStoreCaps, opts: Content
 }
 
 export class UnitContentStore {
-  readonly counters: ContentStoreCounters = {
+  // the store's own mutable view; holders see the same object through the readonly getter below
+  private readonly countersMut: MutableContentStoreCounters = {
     localCanonicalReads: 0,
     restFallbackReads: { symlink: 0 },
     fallbackBudgetSpend: 0,
     childRespawns: 0,
   };
+  get counters(): ContentStoreCounters {
+    return this.countersMut;
+  }
   private readonly caps: ContentStoreCaps;
   private readonly cwd: string;
   private readonly format: GitObjectFormat;
@@ -547,7 +561,7 @@ export class UnitContentStore {
       // self-verification BEFORE the seam decode: the frame bytes must hash to the tree oid
       if (gitBlobOid(frame.body, this.format) !== ls.oid)
         throw new ContentStoreError("hash-mismatch", `frame bytes do not hash to the enumerated oid at ${path}`);
-      this.counters.localCanonicalReads++;
+      this.countersMut.localCanonicalReads++;
       return seamDecode(frame.body);
     } finally {
       this.readInFlight = false;
@@ -557,15 +571,15 @@ export class UnitContentStore {
   private async readSymlink(path: string, entry: TreeEntry): Promise<string | null> {
     // trip BEFORE spending: the (budget+1)th fallback read must terminate the unit with the
     // distinct budget failure, not perform a request past the bound (check 8)
-    if (this.counters.fallbackBudgetSpend >= this.budget)
+    if (this.countersMut.fallbackBudgetSpend >= this.budget)
       throw new ContentStoreError(
         "fallback-budget",
         `REST fallback budget (${this.budget}) exhausted at ${path} — the unit fails rather than exceeding its bounded API spend`,
       );
     this.readInFlight = true;
     try {
-      this.counters.fallbackBudgetSpend++;
-      this.counters.restFallbackReads.symlink++;
+      this.countersMut.fallbackBudgetSpend++;
+      this.countersMut.restFallbackReads.symlink++;
       let text: string | null;
       try {
         // raced against the teardown gate: an abort/dispose rejects THIS read promptly even
@@ -708,7 +722,7 @@ export class UnitContentStore {
     if (this.respawns >= 1)
       throw new ContentStoreError("child-died-twice", withFirst(`batch child died twice: ${describe(firstError)}`));
     this.respawns++;
-    this.counters.childRespawns++;
+    this.countersMut.childRespawns++;
     this.firstDisposal = this.child === null ? null : await this.child.dispose();
     this.child = null;
     // an abort/dispose that landed DURING the dead child's teardown stops the respawn — a
