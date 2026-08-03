@@ -1095,6 +1095,9 @@ const TRANSIENT_BASE_WAIT_MS = 2_000;
 // wall-clock kill deadline, generous enough for a large shallow clone or tarball extract. On
 // expiry the child is killed and the empty result flows into the transient retry path.
 export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
+// ADR-0001 T2c (rvo Q1): bounded clone retry — on the common path a single-attempt clone would
+// convert every network blip into a unit error.
+export const CLONE_MAX_ATTEMPTS = 3;
 
 export interface GithubClientOptions {
   githubHost: string;
@@ -2253,6 +2256,75 @@ export class GithubClient {
     const dir = mkdtempSync(join(this.tempRoot, "pkg-audit-"));
     assertContained(dir, [this.tempRoot]);
     return dir;
+  }
+
+  // ---- ADR-0001 T2c acquisition (§3.1(1-2)) ----
+  // The hardened production clone argv + `--no-checkout` (no working tree is ever materialised,
+  // so committed .gitattributes never runs), with rvo Q1's BOUNDED retry for transient clone
+  // failures, and the head-coherence gate: `rev-parse HEAD` must equal the discovery-pinned
+  // OID or the unit fails CLOSED. The retired checkout fallback ACCEPTED a moved branch
+  // (recording the clone's real HEAD); the ratified shape refuses it — transient, self-healing
+  // via the next run's re-discovery (plan §7.2). Because HEAD == the pin on every success, the
+  // scanned commit's date is the DISCOVERED committedDate — no clone-side date read exists on
+  // this path. `cloneAttempts` feeds the per-unit transport counters (check 8).
+  async cloneNoCheckout(org: string, repo: string, branch: string, pinnedOid: string): Promise<{ dir: string; cloneAttempts: number }> {
+    const runDir = this.makeRunTempDir();
+    const dest = join(runDir, "clone");
+    assertContained(dest, [this.tempRoot]); // §0: clone dest containment BEFORE spawning
+    const url = `https://${this.githubHost}/${encodeURIComponent(org)}/${encodeURIComponent(repo)}.git`;
+    const args = [
+      "clone", "--depth", "1", "--single-branch", "--branch", branch,
+      "--no-tags", "--no-recurse-submodules", "--template=", "--no-checkout", url, dest,
+    ];
+    try {
+      let attempts = 0;
+      let lastFailure = "";
+      let cloned = false;
+      while (attempts < CLONE_MAX_ATTEMPTS) {
+        if (attempts > 0) {
+          // transient-style backoff between attempts; a failed attempt may leave a partial
+          // dest, so the retry starts from a cleared destination
+          await this.sleep(this.backoffWait("transient", attempts - 1, null));
+          rmSync(dest, { recursive: true, force: true });
+        }
+        attempts++;
+        const res = await this.git(args);
+        if (res.exitCode === 0) {
+          cloned = true;
+          break;
+        }
+        lastFailure = res.stderr.trim().slice(0, 300);
+      }
+      if (!cloned)
+        throw new GithubApiError(
+          `git clone failed for ${org}/${repo}@${branch} after ${CLONE_MAX_ATTEMPTS} attempts: ${lastFailure}`,
+          { endpoint: url },
+        );
+      // §0: cwd inside the clone is permitted for git itself only.
+      const rev = await this.git(["rev-parse", "HEAD"], dest);
+      if (rev.exitCode !== 0)
+        throw new GithubApiError(`git rev-parse HEAD failed in ${dest}: ${rev.stderr.trim().slice(0, 300)}`, { endpoint: url });
+      const headSha = rev.stdout.trim();
+      if (!HEX_OBJECT_ID_RE.test(headSha))
+        throw new GithubApiError(`git rev-parse HEAD returned a non-hex object id in ${dest}: ${JSON.stringify(headSha.slice(0, 80))}`, { endpoint: url });
+      // Check 4's coherence gate. Case-insensitive like every other oid comparison here; a
+      // mismatch is NOT transient (the branch genuinely moved), so it is never retried.
+      if (headSha.toLowerCase() !== pinnedOid.toLowerCase())
+        throw new GithubApiError(
+          `clone HEAD ${headSha} does not match the discovery-pinned ${pinnedOid} for ${org}/${repo}@${branch} — the branch moved between discovery and clone; failing closed (self-heals via the next run's re-discovery)`,
+          { endpoint: url },
+        );
+      return { dir: dest, cloneAttempts: attempts };
+    } catch (e) {
+      // reclaim the (possibly multi-GB, possibly partial) tree NOW rather than at the next
+      // startup sweep — best-effort, never masking the actionable error (cloneShallow's shape)
+      try {
+        rmSync(runDir, { recursive: true, force: true });
+      } catch (cleanupErr) {
+        logLine({ event: "warning", reason: "clone-cleanup-failed", target: runDir, message: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) });
+      }
+      throw e;
+    }
   }
 
   async cloneShallow(org: string, repo: string, branch: string): Promise<{ dir: string; headSha: string; headCommittedDate: string }> {

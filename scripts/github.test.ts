@@ -1854,6 +1854,77 @@ describe("cloneShallow temp-dir cleanup on failure", () => {
   });
 });
 
+// ---- ADR-0001 T2c acquisition: cloneNoCheckout (§3.1(1-2), rvo Q1 bounded retry) ------------
+describe("cloneNoCheckout (T2c acquisition: no-checkout argv, head coherence, bounded retry)", () => {
+  const PIN = "a".repeat(40);
+  const cloneRunDirs = (root: string): string[] =>
+    readdirSync(root).filter((n) => n.startsWith("pkg-audit-") && !n.startsWith("pkg-audit-gitcfg-"));
+
+  test("emits exactly the hardened no-checkout argv, enforces head coherence, and reads NO commit date", async () => {
+    const { client, calls } = makeClient([
+      ok(""), // clone
+      ok(PIN + "\n"), // rev-parse HEAD — equals the pin
+    ]);
+    const { dir, cloneAttempts } = await client.cloneNoCheckout("org-a", "repo-b", "release/1.x", PIN);
+    expect(cloneAttempts).toBe(1);
+    expect(dir.startsWith(TEST_TMP)).toBe(true);
+    expect(existsSync(dirname(dir))).toBe(true); // a SUCCESSFUL clone keeps its run dir for the store
+    expect(calls.length).toBe(2); // clone + rev-parse — the commit date comes from DISCOVERY (HEAD == pin)
+    const clone = calls[0]!;
+    expect(clone.bin).toBe(BINS.git);
+    expect(clone.args).toEqual([
+      "clone", "--depth", "1", "--single-branch", "--branch", "release/1.x",
+      "--no-tags", "--no-recurse-submodules", "--template=", "--no-checkout",
+      "https://github.com/org-a/repo-b.git", dir,
+    ]);
+    expect(clone.opts.env["GIT_NO_REPLACE_OBJECTS"]).toBe("1"); // check 4: the acquisition too
+    expect(clone.opts.env["GIT_ASKPASS"]).toBeUndefined();
+    const rev = calls[1]!;
+    expect(rev.args).toEqual(["rev-parse", "HEAD"]);
+    expect(rev.opts.cwd).toBe(dir);
+  });
+  test("a MOVED branch (HEAD != discovery pin) fails CLOSED — never accepted — and reclaims the run dir", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-moved-"));
+    const { client, calls } = makeClient([ok(""), ok("b".repeat(40) + "\n")], { tempRoot: root });
+    await expect(client.cloneNoCheckout("o", "r", "main", PIN)).rejects.toThrow(/does not match the discovery-pinned/);
+    expect(calls.length).toBe(2); // a coherence mismatch is NOT transient — no clone retry
+    expect(cloneRunDirs(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("transient clone failures retry with backoff up to 3 attempts, and the success reports the attempt count", async () => {
+    const { client, calls, sleeps } = makeClient([
+      err("", "fatal: early EOF", 128),
+      err("", "fatal: early EOF", 128),
+      ok(""), // third attempt lands
+      ok(PIN + "\n"),
+    ]);
+    const { cloneAttempts } = await client.cloneNoCheckout("o", "r", "main", PIN);
+    expect(cloneAttempts).toBe(3);
+    expect(calls.filter((c) => c.args[0] === "clone").length).toBe(3);
+    expect(sleeps).toEqual([2000, 4000]); // transient-style backoff between attempts (rvo Q1)
+  });
+  test("a clone failing ALL attempts surfaces the LAST stderr with the attempt count, and reclaims", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-exhaust-"));
+    const { client } = makeClient(
+      [err("", "fatal: first", 128), err("", "fatal: second", 128), err("", "fatal: final failure", 128)],
+      { tempRoot: root },
+    );
+    await expect(client.cloneNoCheckout("o", "r", "main", PIN)).rejects.toThrow(/after 3 attempts: fatal: final failure/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("a rev-parse failure or a non-hex HEAD fails closed and reclaims", async () => {
+    const root = mkdtempSync(join(tmpdir(), "clone-rev-"));
+    const { client } = makeClient([ok(""), err("", "fatal: bad revision", 128)], { tempRoot: root });
+    await expect(client.cloneNoCheckout("o", "r", "main", PIN)).rejects.toThrow(/rev-parse/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    const { client: c2 } = makeClient([ok(""), ok("not-hex\n")], { tempRoot: root });
+    await expect(c2.cloneNoCheckout("o", "r", "main", PIN)).rejects.toThrow(/non-hex object id/);
+    expect(cloneRunDirs(root)).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
 describe("spawn kill escalation (§4 hardening)", () => {
   test("SPAWN_KILL_GRACE_MS is 2s (independent literal pins the magnitude)", () => {
     expect(SPAWN_KILL_GRACE_MS).toBe(2000);
