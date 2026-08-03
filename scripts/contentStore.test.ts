@@ -204,14 +204,18 @@ function makeHarness(opts: HarnessOpts = {}) {
   const fallbackCalls: string[] = [];
   const permits = { acquired: 0, released: 0 };
   const permitWaiters: Array<() => void> = [];
+  const counts = { lsTree: 0 };
   const caps: ContentStoreCaps = {
-    runLsTree: async () => ({
-      exitCode: 0,
-      stdout: lsBytes(opts.rows ?? DEFAULT_ROWS),
-      stderr: new Uint8Array(0),
-      timedOut: false,
-      ...opts.lsResult,
-    }),
+    runLsTree: async () => {
+      counts.lsTree++;
+      return {
+        exitCode: 0,
+        stdout: lsBytes(opts.rows ?? DEFAULT_ROWS),
+        stderr: new Uint8Array(0),
+        timedOut: false,
+        ...opts.lsResult,
+      };
+    },
     launchBatchChild: () => {
       const script = opts.childOpts?.[launches.length] ?? {
         onStdinLine: (line: string, fc: FakeChild) => {
@@ -253,7 +257,7 @@ function makeHarness(opts: HarnessOpts = {}) {
       limits: { ...TEST_LIMITS, ...opts.limits },
     });
   const grantNextPermit = (): void => permitWaiters.shift()?.();
-  return { caps, open, events, launches, fallbackCalls, permits, grantNextPermit };
+  return { caps, open, events, launches, fallbackCalls, permits, counts, grantNextPermit };
 }
 
 const entryOf = (store: UnitContentStore, path: string): TreeEntry => {
@@ -313,6 +317,19 @@ describe("store open (enumeration, fail-closed BEFORE parse)", () => {
     expect(err).toBeInstanceOf(ContentStoreError);
     expect((err as ContentStoreError).code).toBe("ls-tree-failed");
     expect((err as ContentStoreError).message).toContain("not a git repository");
+  });
+  test("store open refuses a nonzero-exit enumeration whose stdout is MALFORMED — the exit check demonstrably runs first", async () => {
+    // valid-bytes-with-exit-1 cannot distinguish exit-first from parse-then-exit; malformed
+    // bytes CAN: parse-first would surface GitFrameError, exit-first the enumeration failure
+    const h = makeHarness({
+      lsResult: { exitCode: 1, stdout: enc.encode("garbage that would fail the parser\0"), stderr: enc.encode("fatal: broken") },
+    });
+    const err = await h.open().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ContentStoreError);
+    expect((err as ContentStoreError).code).toBe("ls-tree-failed");
   });
   test("store open refuses a timed-out enumeration before parsing", async () => {
     const h = makeHarness({ lsResult: { exitCode: 124, timedOut: true, stdout: new Uint8Array(0) } });
@@ -727,18 +744,23 @@ describe("child lifecycle (check 6: deadline, respawn-once, ordered teardown, ab
     expect(store.counters.childRespawns).toBe(1);
     await store.dispose();
   });
-  test("a fallback REJECTION after abort surfaces the abort as the label, carrying the transport failure as diagnosis", async () => {
-    let rejectFallback!: (e: Error) => void;
-    const h = makeHarness({ fallback: () => new Promise((_r, rej) => (rejectFallback = rej)) });
+  test("an ABORT-INDUCED transport failure surfaces the abort as the label, carrying the transport failure as diagnosis", async () => {
+    // models the production shape: the abort reaches the REST layer, whose in-flight call
+    // then fails BECAUSE of it — the transport rejection arrives already-aborted, and the
+    // read's label must be the abort, with the induced failure riding along as diagnosis
+    const holder: { store: UnitContentStore | null } = { store: null };
+    const h = makeHarness({
+      fallback: async () => {
+        holder.store?.abort("branch aborted");
+        throw new Error("transport torn down");
+      },
+    });
     const store = await h.open();
-    const outcome = store.read("link.txt", entryOf(store, "link.txt")).then(
+    holder.store = store;
+    const err = await store.read("link.txt", entryOf(store, "link.txt")).then(
       () => null,
       (e: unknown) => e,
     );
-    await new Promise((r) => setTimeout(r, 5));
-    store.abort("branch aborted");
-    rejectFallback(new Error("transport torn down"));
-    const err = await outcome;
     expect(err).toBeInstanceOf(ContentStoreError);
     expect((err as ContentStoreError).code).toBe("aborted");
     expect((err as ContentStoreError).message).toContain("transport torn down"); // the induced failure rides along
@@ -786,7 +808,7 @@ describe("child lifecycle (check 6: deadline, respawn-once, ordered teardown, ab
     assertOrder(h.events, ["c2-exit", "c2-stdout-drained", "c2-stderr-drained", "c2-stdin-end"], ["permit-released"]);
     expect(h.permits.released).toBe(1);
   });
-  test("a manager-construction failure after the launch kills the child instead of orphaning it", async () => {
+  test("a manager-construction failure after the launch kills the child, surfaces RAW, and never burns the respawn allowance", async () => {
     const killed: string[] = [];
     const h = makeHarness();
     const caps = {
@@ -817,14 +839,88 @@ describe("child lifecycle (check 6: deadline, respawn-once, ordered teardown, ab
       () => null,
       (e: unknown) => e,
     );
-    expect(err).not.toBeNull(); // the read failed (twice, through the respawn allowance)
-    expect(killed.length).toBeGreaterThan(0); // and no launched child was left orphaned
+    // a setup failure is NOT a child death: it surfaces as itself, never as a double death,
+    // and the single respawn allowance stays intact for a real child failure
+    expect((err as Error).message).toContain("reader acquisition failed");
+    expect(store.counters.childRespawns).toBe(0);
+    expect(killed.length).toBe(1); // exactly one launch, killed rather than orphaned
     await store.dispose();
     expect(h.permits.released).toBe(h.permits.acquired); // the permit still came back
   });
-  test("invalid FRAME limits are refused at store OPEN — before any process exists", async () => {
+  test("dispose runs the clone-deletion hook BETWEEN the child teardown and the permit release (check 6's letter)", async () => {
+    const h = makeHarness();
+    const store = await h.open();
+    await store.read("src/a.txt", entryOf(store, "src/a.txt"));
+    const disposal = await store.dispose({
+      beforePermitRelease: () => {
+        h.events.push("clone-deleted");
+      },
+    });
+    expect(disposal.clean).toBe(true);
+    assertOrder(h.events, ["stdin-end", "exit", "stdout-drained", "stderr-drained"], ["clone-deleted"]);
+    assertOrder(h.events, ["clone-deleted"], ["permit-released"]);
+  });
+  test("a throwing clone-deletion hook rejects dispose() but NEVER leaks the permit", async () => {
+    const h = makeHarness();
+    const store = await h.open();
+    await store.read("src/a.txt", entryOf(store, "src/a.txt"));
+    const first = store.dispose({
+      beforePermitRelease: () => {
+        throw new Error("deletion failed");
+      },
+    });
+    const err = await first.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((err as Error).message).toContain("deletion failed");
+    expect(h.permits.released).toBe(1); // released in the hook's finally — never leaked
+    expect(store.dispose() === first).toBe(true); // still one memoized teardown
+  });
+  test("an abort rejects a fallback read whose transport NEVER settles — promptly, not at the transport's bound", async () => {
+    const h = makeHarness({ fallback: () => new Promise(() => undefined) }); // a hung transport
+    const store = await h.open();
+    const outcome = store.read("link.txt", entryOf(store, "link.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    await new Promise((r) => setTimeout(r, 5));
+    store.abort("branch aborted");
+    const err = await outcome; // resolves NOW — the teardown gate rejected the race
+    expect(err).toBeInstanceOf(ContentStoreError);
+    expect((err as ContentStoreError).code).toBe("aborted");
+  });
+  test("an abort landing during the dead child's own teardown leaves an HONEST disposal verdict — the dead child, not 'clean'", async () => {
+    const holder: { store: UnitContentStore | null } = { store: null };
+    const h = makeHarness({
+      childOpts: [
+        {
+          onStdinLine: (_line, fc) => {
+            fc.errS.feed("fatal: died before teardown\n");
+            fc.exit(128);
+          },
+          onEnd: (fc) => {
+            holder.store?.abort("abort during teardown");
+            fc.exit(0);
+          },
+        },
+      ],
+    });
+    const store = await h.open();
+    holder.store = store;
+    const err = await store.read("src/a.txt", entryOf(store, "src/a.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((err as ContentStoreError).code).toBe("aborted");
+    const disposal = await store.dispose();
+    expect(disposal.clean).toBe(false); // the LAST child that existed died at exit 128
+    expect(disposal.detail).toContain("128");
+  });
+  test("invalid FRAME limits are refused at store OPEN — before any process exists, the enumeration included", async () => {
     const h = makeHarness({ limits: { maxHeaderBytes: 4 } }); // below the parser's floor
     await expect(h.open()).rejects.toThrow(GitFrameError);
+    expect(h.counts.lsTree).toBe(0); // the probe runs BEFORE the enumeration capability
     expect(h.launches.length).toBe(0);
     expect(h.permits.acquired).toBe(0);
   });

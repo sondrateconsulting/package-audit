@@ -91,13 +91,25 @@ export interface ContentStoreCounters {
   childRespawns: number;
 }
 
-// The store-level teardown verdict. `clean` means: no child was ever needed, or the FINAL
-// child closed with exit 0 and no protocol fault — `git cat-file --batch` exits 0 on a clean
-// stdin close and nothing else, so anything short of that means delivered bytes cannot be
-// vouched for and the caller must not record the unit as fully read.
+// The store-level teardown verdict. `clean` means: no child was ever needed, or the LAST
+// child that existed closed with exit 0 and no protocol fault — `git cat-file --batch` exits
+// 0 on a clean stdin close and nothing else, so anything short of that means delivered bytes
+// cannot be vouched for and the caller must not record the unit as fully read. (When a
+// consumed respawn's replacement served the unit, the replacement IS the last child and the
+// verdict describes it — the sanctioned single respawn never dirties a successful unit.)
 export interface StoreDisposal {
   clean: boolean;
   detail: string | null;
+}
+
+// dispose()'s ordered-teardown hook (ADR check 6's letter: stdin close → exit await →
+// disposer → CLONE DELETION → permit release): the caller's clone deletion runs here, after
+// the child teardown and STRICTLY BEFORE the permit release, so the pool slot never frees
+// while the disk it paid for is still occupied. Ignored on any call after the first (the
+// teardown runs once). A hook throw propagates as dispose()'s rejection — the permit is
+// still released.
+export interface StoreDisposeHooks {
+  beforePermitRelease?: () => void | Promise<void>;
 }
 
 // ---- the framed interactive child -------------------------------------------------------------
@@ -421,6 +433,10 @@ export class UnitContentStore {
   private abortedReason: string | null = null;
   private disposedP: Promise<StoreDisposal> | null = null;
   private readInFlight = false;
+  // the fallback lane's teardown gate: abort()/dispose() reject a racing fallback read NOW
+  // (the child lane already gets prompt rejection through the poison path) — without it a
+  // hung REST fallback would hold the read pending for the transport's full bounded budget
+  private readonly teardownWaiters = new Set<() => void>();
 
   constructor(caps: ContentStoreCaps, opts: ContentStoreOptions, limits: ContentStoreLimits, index: Map<string, LsTreeEntry>) {
     this.caps = caps;
@@ -465,17 +481,23 @@ export class UnitContentStore {
       );
     this.readInFlight = true;
     try {
+      // Setup failures (permit acquisition, a refused launch, manager construction) surface
+      // as THEMSELVES: they are not child deaths, and routing them through the respawn wrap
+      // would consume the single allowance and relabel a configuration fault as a double
+      // death. Only a live child's read failure is respawn fodder.
+      const child = await this.ensureChild();
       let frame: BatchFrame;
       try {
-        frame = await (await this.ensureChild()).readObject({ oid: ls.oid, size });
+        frame = await child.readObject({ oid: ls.oid, size });
       } catch (e) {
         frame = await this.retryOnceOnFreshChild(ls.oid, size, path, e);
       }
-      // an abort that landed while the frame was in flight must reject THIS read even when
+      // a teardown that landed while the frame was in flight must reject THIS read even when
       // the frame won the race — the same post-await discipline as the fallback lane: a
-      // post-abort delivery would hand scanUnit content for a unit already being torn down
-      if (this.abortedReason !== null)
-        throw new ContentStoreError("aborted", `read of ${path} aborted: ${this.abortedReason}`);
+      // post-abort/post-dispose delivery would hand scanUnit content for a unit already
+      // being torn down
+      const teardown = this.teardownError(path);
+      if (teardown !== null) throw teardown;
       if (frame.kind === "missing")
         throw new ContentStoreError(
           "object-missing",
@@ -505,28 +527,58 @@ export class UnitContentStore {
       this.counters.restFallbackReads.symlink++;
       let text: string | null;
       try {
-        text = await this.caps.readViaRestFallback(path, entry);
+        // raced against the teardown gate: an abort/dispose rejects THIS read promptly even
+        // when the transport never settles — the loser's late settlement stays observed
+        text = await this.raceTeardown(this.caps.readViaRestFallback(path, entry), path);
       } catch (e) {
-        // abort-first on the REJECTION path too: when the abort landed while the request was
-        // in flight, the abort is the operative cause of this read's failure — the transport
-        // error it induced (or raced) rides along as diagnosis, never as the label
-        if (this.abortedReason !== null)
+        // teardown-first on the REJECTION path too: when the abort/dispose landed while the
+        // request was in flight, IT is the operative cause of this read's failure — the
+        // transport error it induced (or raced) rides along as diagnosis, never as the label
+        const teardown = this.teardownError(path);
+        if (teardown !== null && !(e instanceof ContentStoreError && (e.code === "aborted" || e.code === "store-disposed")))
           throw new ContentStoreError(
-            "aborted",
-            `read of ${path} aborted: ${this.abortedReason} (the in-flight fallback also failed: ${e instanceof Error ? e.message : String(e)})`,
+            teardown.code,
+            `${teardown.message.replace(/^CONTENT STORE: /, "")} (the in-flight fallback also failed: ${e instanceof Error ? e.message : String(e)})`,
           );
         throw e;
       }
-      // an abort that landed while the request was in flight must reject THIS read — a
-      // post-abort delivery would hand scanUnit content for a unit already being torn down
-      // (the child route gets the same rejection through the poison path). The spend stands:
-      // the request was already issued when the abort arrived.
-      if (this.abortedReason !== null)
-        throw new ContentStoreError("aborted", `read of ${path} aborted: ${this.abortedReason}`);
+      // a teardown that landed while the request was in flight must reject THIS read even
+      // when the result won the race — a post-abort delivery would hand scanUnit content for
+      // a unit already being torn down (the child route gets the same rejection through the
+      // poison path). The spend stands: the request was already issued.
+      const teardown = this.teardownError(path);
+      if (teardown !== null) throw teardown;
       return text;
     } finally {
       this.readInFlight = false;
     }
+  }
+
+  // The current teardown state as this read's rejection, or null when no teardown has begun.
+  private teardownError(path: string): ContentStoreError | null {
+    if (this.abortedReason !== null)
+      return new ContentStoreError("aborted", `read of ${path} aborted: ${this.abortedReason}`);
+    if (this.disposedP !== null)
+      return new ContentStoreError("store-disposed", `read of ${path} rejected: the store is being disposed`);
+    return null;
+  }
+
+  // Race a lane promise against the teardown gate. The loser's eventual settlement is always
+  // observed (no unhandled rejection), and the gate subscription never outlives the race.
+  private raceTeardown<T>(p: Promise<T>, path: string): Promise<T> {
+    p.catch(() => undefined);
+    let unsubscribe = (): void => undefined;
+    const gate = new Promise<never>((_resolve, reject) => {
+      const fire = (): void => reject(this.teardownError(path) ?? new ContentStoreError("aborted", `read of ${path} aborted`));
+      this.teardownWaiters.add(fire);
+      unsubscribe = () => this.teardownWaiters.delete(fire);
+    });
+    return Promise.race([p, gate]).finally(() => unsubscribe());
+  }
+
+  private notifyTeardown(): void {
+    for (const fire of [...this.teardownWaiters]) fire();
+    this.teardownWaiters.clear();
   }
 
   private async ensureChild(): Promise<FramedChild> {
@@ -555,6 +607,20 @@ export class UnitContentStore {
       this.child = new FramedChild(launched, this.format, this.limits);
     } catch (e) {
       killWithEscalation(launched, []);
+      // bounded settle before control returns: the caller's failure path may delete the
+      // store directory, and the failed launch should be dead — not merely dying — first
+      // (the same bound the disposer's escalated exit wait uses)
+      let settleTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        launched.exited.then(
+          () => undefined,
+          () => undefined,
+        ),
+        new Promise<void>((resolve) => {
+          settleTimer = setTimeout(resolve, SPAWN_KILL_GRACE_MS + 1_000);
+        }),
+      ]);
+      clearTimeout(settleTimer);
       throw e;
     }
     return this.child;
@@ -604,30 +670,45 @@ export class UnitContentStore {
   abort(reason: string): void {
     if (this.abortedReason === null) this.abortedReason = reason;
     this.child?.abort(reason);
+    this.notifyTeardown(); // reject any read racing on the fallback lane's teardown gate
   }
 
-  // Ordered, idempotent store teardown: the child's full bounded teardown FIRST, the child-pool
-  // permit release only after it — and only after THIS resolves may the caller delete the clone
-  // directory (§3.1 "Teardown is owned and ordered"), on completion, failure, and abort alike.
-  dispose(): Promise<StoreDisposal> {
+  // Ordered, idempotent store teardown (§3.1 / check 6's letter): the child's full bounded
+  // teardown FIRST, then the caller's clone deletion (the beforePermitRelease hook), then —
+  // strictly last — the child-pool permit release, on completion, failure, and abort alike.
+  // The hook is honored on the FIRST call only (the teardown runs once); a hook throw
+  // propagates as this promise's rejection, with the permit still released.
+  dispose(hooks?: StoreDisposeHooks): Promise<StoreDisposal> {
     if (this.disposedP !== null) return this.disposedP;
     this.disposedP = (async (): Promise<StoreDisposal> => {
       let verdict: StoreDisposal = { clean: true, detail: null };
+      const uncleanFrom = (d: ChildDisposal): void => {
+        if (d.exitCode !== 0 || d.protocolError !== null) verdict = { clean: false, detail: formatDisposal(d) };
+      };
       if (this.child !== null) {
         try {
-          const d = await this.child.dispose();
-          if (d.exitCode !== 0 || d.protocolError !== null) verdict = { clean: false, detail: formatDisposal(d) };
+          uncleanFrom(await this.child.dispose());
         } catch (e) {
           // a REJECTED dispose() must surface as an unclean verdict, never evaporate
           verdict = { clean: false, detail: `child dispose() itself failed: ${e instanceof Error ? e.message : String(e)}` };
         }
+      } else if (this.firstDisposal !== null) {
+        // no LIVE child, but one existed and died (a respawn that never launched its
+        // replacement — e.g. an abort stopped it): the LAST child that existed is the
+        // verdict's subject, and its death must not read as "no child was ever needed"
+        uncleanFrom(this.firstDisposal);
       }
-      // permit release strictly AFTER the child teardown, as its own step, so a rejected child
-      // dispose can never leak the permit
-      this.permitRelease?.();
-      this.permitRelease = null;
+      try {
+        // check 6's ordering: clone deletion sits BETWEEN the child teardown and the permit
+        // release — the pool slot never frees while the disk it paid for is still occupied
+        if (hooks?.beforePermitRelease !== undefined) await hooks.beforePermitRelease();
+      } finally {
+        this.permitRelease?.();
+        this.permitRelease = null;
+      }
       return verdict;
     })();
+    this.notifyTeardown(); // after the assignment: gate waiters must observe the disposed state
     return this.disposedP;
   }
 }

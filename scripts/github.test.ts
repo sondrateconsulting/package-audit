@@ -3222,6 +3222,29 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     await expect(client.gitBytes(cloneArgv, dir)).rejects.toThrow(/refuses clone/);
     expect(launches.length).toBe(0);
   });
+  test("gitBytes: a reader-acquisition failure after the launch kills the child instead of orphaning it", async () => {
+    const kills: Array<number | undefined> = [];
+    const { client } = makeClient([], {
+      launchImpl: () => {
+        const real = fakeOneShot({ stayOpen: true });
+        return {
+          ...real.child,
+          kill: (signal?: number) => {
+            kills.push(signal);
+            real.child.kill(signal);
+          },
+          stdout: {
+            getReader: (): never => {
+              throw new Error("reader acquisition failed");
+            },
+          },
+        };
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-reader-throw-"));
+    await expect(client.gitBytes(LS_TUPLE, dir)).rejects.toThrow(/reader acquisition failed/);
+    expect(kills.length).toBeGreaterThan(0); // the launched child was escalated, not abandoned
+  });
   test("gitBytes: a non-string argv slot is refused before the guards run", async () => {
     const launches: LaunchRequest[] = [];
     const { client } = makeClient([], {

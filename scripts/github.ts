@@ -1436,8 +1436,17 @@ export class GithubClient {
     let gaveUpTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       const child = this.launch(this.bins.git, argv, { env, cwd, stdin: "ignore" });
-      const outReader = child.stdout.getReader();
-      const errReader = child.stderr.getReader();
+      let outReader: StreamReader;
+      let errReader: StreamReader;
+      try {
+        outReader = child.stdout.getReader();
+        errReader = child.stderr.getReader();
+      } catch (e) {
+        // TRANSACTIONAL: a reader-acquisition failure after a successful launch must not
+        // orphan the child — kill-escalate it (no readers exist to cancel) and surface
+        killWithEscalation(child, []);
+        throw e;
+      }
       const kill = (): void => killWithEscalation(child, [outReader, errReader]);
       let timedOut = false;
       timer = setTimeout(() => {
@@ -1462,9 +1471,18 @@ export class GithubClient {
           }
           return new Uint8Array(0);
         });
+      // a REJECTED exit promise is a local process-wait failure: start the escalation and
+      // surface it, never leave the child running behind an unexplained join rejection
+      const exited = child.exited.then(
+        (c) => c,
+        (): number => {
+          kill();
+          throw new GithubApiError("git exit promise rejected — the child was kill-escalated", {});
+        },
+      );
       // The exit join is BOUNDED once the deadline could have fired: a wedged exit promise
       // must not hang the caller past deadline + escalation grace + margin.
-      const joined = Promise.all([capture(outP), capture(errP), child.exited]);
+      const joined = Promise.all([capture(outP), capture(errP), exited]);
       const bounded = await Promise.race([
         joined,
         new Promise<null>((resolve) => {
