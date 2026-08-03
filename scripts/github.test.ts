@@ -3058,6 +3058,52 @@ describe("spawn-site allowlist (grep-enforced, with two exact-path scanner-test 
       rmSync(root, { recursive: true, force: true });
     }
   });
+  test("the launched git binary is the one captured BEFORE validation, even if an env accessor swaps this.bins mid-call", async () => {
+    // The round-5 fix captures `const bin = this.bins.git` once, before buildGitEnv runs — and
+    // buildGitEnv reads the caller's env object, whose properties may be accessors that fire
+    // AFTER the capture but BEFORE the spawn. Without the capture, re-reading this.bins.git at
+    // the launch would let that accessor swap the executable between check and spawn. Assert the
+    // SpawnFn receives the ORIGINAL binary though the accessor mutated this.bins.git mid-call.
+    const root = mkdtempSync(join(tmpdir(), "bin-toctou-"));
+    let launchedBin: string | undefined;
+    const spy: SpawnFn = async (bin) => {
+      launchedBin = bin;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    let armed = false;
+    // env is stored by reference as baseEnv; buildGitEnv reads PATH (a GIT_PASSTHROUGH key), so
+    // this getter fires DURING the git() call, after the bin capture. Once armed, it swaps the
+    // client's private bins.git — the exact between-check-and-spawn window the fix closes.
+    const clientRef: { c?: GithubClient } = {};
+    const env: Record<string, string> = { HOME: "/home/u", GH_TOKEN: "tok" };
+    Object.defineProperty(env, "PATH", {
+      enumerable: true,
+      get() {
+        if (armed && clientRef.c !== undefined) {
+          (clientRef.c as unknown as { bins: { git: string } }).bins.git = "/opt/bin/EVIL";
+        }
+        return "/bin";
+      },
+    });
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spy,
+      env,
+      binPaths: { gh: "/opt/bin/gh", git: "/opt/bin/git", tar: "/opt/bin/tar" },
+      tempRoot: root,
+    });
+    clientRef.c = client;
+    try {
+      armed = true;
+      await client.git(["rev-parse", "HEAD"], undefined);
+      expect(launchedBin).toBe("/opt/bin/git"); // the captured value, NOT the accessor's swap
+      // and the swap really did land on this.bins — proving the accessor fired and the capture,
+      // not luck, is what protected the launch
+      expect((client as unknown as { bins: { git: string } }).bins.git).toBe("/opt/bin/EVIL");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("sweepStaleTempDirs observability (§0)", () => {
