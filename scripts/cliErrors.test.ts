@@ -74,10 +74,12 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       // name + message), never through the production CLIs' renderFatal, so they are not
       // operator-error-registry material. They must stay EXPORTED (cross-module instanceof:
       // benchProtocol catches benchDrivers' UnitFailure/DriftSignal/RePinRequired; benchSpawn
-      // wraps benchFrame's BenchFrameError), so the exclusion list is the correct home. This is
-      // the second sanctioned bench test-list accommodation, declared in the plan alongside the
-      // github.test.ts chokepoint-allowlist entry.
-      "BenchGrammarViolation", "BenchFrameError", "BenchSpawnError", "BenchConfigError",
+      // wraps the frame error, which since the T2c adoption is an ALIAS of production's
+      // GitFrameError re-exported by the benchFrame shim — no longer a declared class, so it
+      // no longer appears in this scan). This is the second sanctioned bench test-list
+      // accommodation, declared in the plan alongside the github.test.ts chokepoint-allowlist
+      // entry.
+      "BenchGrammarViolation", "BenchSpawnError", "BenchConfigError",
       "BenchScheduleError", "BenchCorpusError", "BenchWorkloadError", "BenchT1Error",
       "BenchHttpError", "BenchProtocolError", "UnitFailure", "DriftSignal", "RePinRequired",
       // a HARNESS fault (a failed local git/tooling call) as opposed to an observation about a
@@ -94,6 +96,13 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       // three informational probes), surfaced only via bench:content's top-level catch.
       "ControlPlaneFailure", "BenchFidelityError", "BenchScoreError", "BenchBoundaryError",
       "BenchProbeError", "BenchOption3Error",
+      // ADR-0001 T2c implementation: the framed-seam grammar violation (gitFrame.ts). It is a
+      // UNIT-scoped failure vehicle — the content store converts it into a per-unit scan error
+      // (an errors[] row via processUnit's catch), never a process-fatal the CLI renders — and
+      // it must stay exported for cross-module instanceof (the store and the bench shim both
+      // catch it). Not operator-error material; the stack-dump consequence on an escape is the
+      // right diagnostic, because an escape would be a wiring bug.
+      "GitFrameError",
     ]);
     const declared = new Set<string>();
     // recursive: scripts/tui/ declares operator-facing classes too (TuiActivationError)
