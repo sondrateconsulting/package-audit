@@ -3178,6 +3178,67 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     release1();
     (await p2)();
   });
+  test("check 9: same-repo clone starts are serialized and spaced ≥ 200ms apart; different repos are unaffected", async () => {
+    const PIN = "a".repeat(40);
+    const { client, calls, sleeps } = makeClient([
+      ok(""), ok(PIN + "\n"), // repo r1, clone A
+      ok(""), ok(PIN + "\n"), // repo r1, clone B — must be gated ≥200ms after A's start
+      ok(""), ok(PIN + "\n"), // repo r2 — a DIFFERENT repo, no spacing sleep
+    ]);
+    await client.cloneNoCheckout("o", "r1", "main", PIN);
+    await client.cloneNoCheckout("o", "r1", "main", PIN);
+    await client.cloneNoCheckout("o", "r2", "main", PIN);
+    expect(calls.filter((c) => c.args[0] === "clone").length).toBe(3);
+    // exactly ONE spacing sleep: the second r1 start (the fake clock advances only via sleeps,
+    // so the r2 start and the first r1 start see no live spacing window of their own)
+    expect(sleeps).toEqual([200]);
+  });
+  test("check 9: clone RETRIES flow through the same gate — their starts are spaced too", async () => {
+    const PIN = "a".repeat(40);
+    const { client, sleeps } = makeClient([
+      err("", "fatal: early EOF", 128),
+      ok(""), ok(PIN + "\n"),
+    ]);
+    await client.cloneNoCheckout("o", "r", "main", PIN);
+    // attempt 1 start (no window) → backoff 2000 → gate: attempt 1's stamp + 200 is already
+    // past on the advanced fake clock, so no second spacing sleep — the RETRY still consulted
+    // the gate (ordering pinned by the sleeps: backoff only)
+    expect(sleeps).toEqual([2000]);
+  });
+  test("rvo Q2: the sweep RETAINS a live-owner dir, removes dead-owner and marker-less dirs", () => {
+    const root = mkdtempSync(join(tmpdir(), "owned-sweep-"));
+    const { client } = makeClient([], { tempRoot: root });
+    // live owner: THIS process — makeRunTempDir stamps the marker itself
+    const live = client.makeRunTempDir();
+    // dead owner: a pid far above the platform ceiling can never be alive
+    const dead = join(root, "pkg-audit-dead1");
+    mkdirSync(dead);
+    writeFileSync(join(dead, ".pkg-audit-owner.json"), JSON.stringify({ pid: 999_999_999, startedAtIso: "2026-01-01T00:00:00Z" }));
+    // marker-less: a legacy leftover from a pre-ownership version
+    const legacy = join(root, "pkg-audit-legacy1");
+    mkdirSync(legacy);
+    // malformed marker: unreadable ownership is UNOWNED, not retained
+    const garbled = join(root, "pkg-audit-garbled1");
+    mkdirSync(garbled);
+    writeFileSync(join(garbled, ".pkg-audit-owner.json"), "not json");
+    const removed = client.sweepStaleTempDirs().sort();
+    expect(removed).toEqual(["pkg-audit-dead1", "pkg-audit-garbled1", "pkg-audit-legacy1"]);
+    expect(existsSync(live)).toBe(true); // the live sibling's clone survives the sweep
+    rmSync(root, { recursive: true, force: true });
+  });
+  test("rvo Q2: makeRunTempDir and the gitcfg dir both stamp the owner marker", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owned-stamp-"));
+    const { client } = makeClient([ok("abc\n")], { tempRoot: root });
+    const dir = client.makeRunTempDir();
+    expect(existsSync(join(dir, ".pkg-audit-owner.json"))).toBe(true);
+    const marker = JSON.parse(readFileSync(join(dir, ".pkg-audit-owner.json"), "utf8")) as { pid: number };
+    expect(marker.pid).toBe(process.pid);
+    await client.git(["rev-parse", "HEAD"], undefined).catch(() => undefined); // materializes the gitcfg dir
+    const cfgDirs = readdirSync(root).filter((n) => n.startsWith("pkg-audit-gitcfg-"));
+    expect(cfgDirs.length).toBe(1);
+    expect(existsSync(join(root, cfgDirs[0]!, ".pkg-audit-owner.json"))).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
   test("readBytesCapped: the byte cap kills mid-stream and rejects (never buffers past the cap)", async () => {
     let cancelled = false;
     let exceeded = 0;

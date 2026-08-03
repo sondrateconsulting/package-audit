@@ -6,7 +6,7 @@
 // `gh api -i` header parsing, the §4 rate-limit classes, api_cache integration (§3), the
 // hardened clone fallback (§0/§5.C), and the startup pkg-audit-* temp sweep.
 
-import { mkdtempSync, readdirSync, lstatSync, rmSync, unlinkSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, lstatSync, rmSync, unlinkSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir, devNull } from "node:os";
 import { join } from "node:path";
 import {
@@ -1098,6 +1098,39 @@ export const SPAWN_TIMEOUT_MS = 15 * 60 * 1000;
 // ADR-0001 T2c (rvo Q1): bounded clone retry — on the common path a single-attempt clone would
 // convert every network blip into a unit error.
 export const CLONE_MAX_ATTEMPTS = 3;
+// ADR-0001 check 9 (§3.9): clone STARTS for the same (host, org, repo) are serialized and
+// spaced at least this far apart — a hard construction that keeps git transport under GitHub's
+// recommended 15 read ops/s/repo whatever the fan-out or failure rate (at a conservative 2
+// transport operations per clone start, ≥200 ms spacing bounds it at ≤10 ops/s/repo).
+export const CLONE_GATE_SPACING_MS = 200;
+
+// ---- owned temp-dir markers (ADR-0001 rvo Q2) ----------------------------------------------
+// Every pkg-audit-* dir this process creates is stamped with its owner; the startup sweep then
+// removes only UNOWNED (marker-less, legacy) or DEAD-OWNER dirs, never a live sibling audit's.
+export const OWNER_MARKER_NAME = ".pkg-audit-owner.json";
+function writeOwnerMarker(dir: string): void {
+  writeFileSync(join(dir, OWNER_MARKER_NAME), JSON.stringify({ pid: process.pid, startedAtIso: new Date().toISOString() }), { mode: 0o600 });
+}
+// null = no readable/parseable marker (an unowned dir, swept); a number = the recorded owner pid.
+function readOwnerPid(dir: string): number | null {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, OWNER_MARKER_NAME), "utf8")) as { pid?: unknown };
+    return typeof raw.pid === "number" && Number.isSafeInteger(raw.pid) && raw.pid > 0 ? raw.pid : null;
+  } catch {
+    return null;
+  }
+}
+// Is the recorded owner still alive? kill(pid, 0) probes without signalling: ESRCH = dead;
+// EPERM = alive but not ours (fail SAFE: retain). Any other failure retains too — the sweep
+// must never delete a dir it cannot prove unowned-or-dead.
+function ownerIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return !(typeof e === "object" && e !== null && (e as { code?: unknown }).code === "ESRCH");
+  }
+}
 
 export interface GithubClientOptions {
   githubHost: string;
@@ -1153,6 +1186,10 @@ export class GithubClient {
   private readonly childPool: Semaphore;
   private readonly core: Bucket = { label: "core", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
   private readonly graphqlBucket: Bucket = { label: "graphql", pausedUntilMs: 0, accountedUntilMs: 0, budgetSpentMs: 0 };
+  // ADR-0001 check 9 (§3.9): the per-repo clone-transport gate — one entry per (host/org/repo)
+  // ever cloned this client lifetime (a string key + two numbers; bounded by the estate's repo
+  // count). `chain` serializes starts; `lastStartMs` enforces the spacing.
+  private readonly cloneGates = new Map<string, { lastStartMs: number; chain: Promise<void> }>();
   private gitConfigPath: string | null = null;
 
   // Observable cache-role: --plan's zero-write contract requires a cache-less client (db: null),
@@ -2216,6 +2253,7 @@ export class GithubClient {
     const dir = mkdtempSync(join(this.tempRoot, "pkg-audit-gitcfg-"));
     const path = join(dir, "gitconfig");
     assertContained(path, [this.tempRoot]);
+    writeOwnerMarker(dir);
     // The `!` helper is a SHELL command — single-quote the gh path unconditionally (with
     // '\'' escaping) so spaces/metacharacters in the path can never be shell-interpreted.
     const ghBin = `'${this.bins.gh.replace(/'/g, `'\\''`)}'`;
@@ -2231,7 +2269,32 @@ export class GithubClient {
   makeRunTempDir(): string {
     const dir = mkdtempSync(join(this.tempRoot, "pkg-audit-"));
     assertContained(dir, [this.tempRoot]);
+    writeOwnerMarker(dir);
     return dir;
+  }
+
+  // ADR-0001 check 9 (§3.9): serialize clone starts per (host, org, repo) and space them at
+  // least CLONE_GATE_SPACING_MS apart. FIFO by chaining: each caller parks behind the previous
+  // caller's promise, sleeps out any remaining spacing, stamps its own start, then releases
+  // the next — so starts can never bunch, whatever fan-out or retry pressure produced them.
+  private async awaitCloneGate(org: string, repo: string): Promise<void> {
+    const key = `${this.githubHost}/${org.toLowerCase()}/${repo.toLowerCase()}`;
+    let gate = this.cloneGates.get(key);
+    if (gate === undefined) {
+      gate = { lastStartMs: Number.NEGATIVE_INFINITY, chain: Promise.resolve() };
+      this.cloneGates.set(key, gate);
+    }
+    const prev = gate.chain;
+    let release!: () => void;
+    gate.chain = new Promise<void>((r) => (release = r));
+    try {
+      await prev;
+      const wait = gate.lastStartMs + CLONE_GATE_SPACING_MS - this.now();
+      if (wait > 0) await this.sleep(wait);
+      gate.lastStartMs = this.now();
+    } finally {
+      release(); // even a rejected sleep must not wedge every later same-repo clone
+    }
   }
 
   // ---- ADR-0001 T2c acquisition (§3.1(1-2)) ----
@@ -2270,6 +2333,10 @@ export class GithubClient {
             break;
           }
         }
+        // check 9: EVERY start — retries included — flows through the per-repo transport
+        // gate, IMMEDIATELY before the spawn (so the gate's stamp IS the start), keeping
+        // ≤15 ops/s/repo by construction whatever the fan-out or failure rate.
+        await this.awaitCloneGate(org, repo);
         attempts++;
         const res = await this.git(args);
         if (res.exitCode === 0) {
@@ -2316,6 +2383,11 @@ export class GithubClient {
   // date read exists. The bench evaluates checkout semantics through its own lanes.)
 
   // ---- startup sweep (§0): stale pkg-audit-* DIRECT children of the temp root only ----
+  // OWNED since the T2c cutover (rvo Q2, a named residual risk closed): every pkg-audit-* dir
+  // this process creates carries an owner marker ({pid, startedAtIso}), and the sweep removes
+  // only marker-less dirs (legacy/compat leftovers) and DEAD-pid dirs — a live sibling audit's
+  // clones are RETAINED, closing "a second concurrent audit deletes the first's live clones",
+  // which the common path's per-unit clones turned from a fallback edge into an everyday hazard.
   sweepStaleTempDirs(): string[] {
     const removed: string[] = [];
     // ENOENT here is benign (a dir vanished mid-sweep under concurrent cleanup); anything else
@@ -2348,6 +2420,13 @@ export class GithubClient {
         if (st.isSymbolicLink()) {
           unlinkSync(full); // remove the link itself, never its target
         } else if (st.isDirectory()) {
+          // ownership gate (rvo Q2): retain a dir whose recorded owner is still ALIVE — it is
+          // a concurrent audit's live clone, not a stale leftover. Marker-less (legacy) and
+          // dead-owner dirs sweep as before. This process's OWN dirs are also retained by the
+          // same rule (their marker carries this live pid), which is correct: its per-unit
+          // teardown owns them.
+          const ownerPid = readOwnerPid(full);
+          if (ownerPid !== null && ownerIsAlive(ownerPid)) continue;
           rmSync(full, { recursive: true, force: true });
         } else {
           unlinkSync(full);
