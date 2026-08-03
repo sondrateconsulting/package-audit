@@ -529,5 +529,30 @@ past tense — a form true after the merge), bench module headers if §4(a).
     unconditionally overwrote the dead first child's real disposal on the respawn path,
     discarding git's own stderr, the very diagnosis `508e820` exists to retain (found by my own
     pass, not by a reviewer).
-  - Round 4: (running)
+  - **Round 4 (A PASS with a P2+P3, B PASS with ZERO findings — the first empty codex list of
+    the arc, C FAIL), verified + fixed at `5abf1be`.** C's **P0** found the "caller code runs
+    after validation" class in a channel no earlier round had touched: the wrapper reads the
+    caller-supplied ENV object (whose properties may be accessors) between the guards and the
+    launch, and the launch assembled its vector with `cmd.push` — so a getter firing in that
+    window can replace `Array.prototype.push` and the vector carries tokens no guard approved,
+    while my own comment claimed the vector was built "by index". It now genuinely is (index
+    assignment in `realLaunch`, `copiedArgv` and `trustedArgv`), pinned structurally since the
+    property lives in HOW the vector is built. Four more real defects: a stderr
+    reader-acquisition failure abandoned the already-acquired stdout reader in BOTH lanes
+    (`gitBytes` and `FramedChild`'s constructor), leaving an unreachable lock that could outlive
+    the clone deletion; `dispose()` racing a construction failure returned CLEAN because the
+    record was written only after the bounded settle (mutation-verified fix); clone attempts
+    were counted before the wrapper ran, so a setup fault that never spawned still reported a
+    network start — inflating exactly the pacing account check 9 asks for; and the
+    proxy/accessor regression only exercised the wrapper's copy, leaving `readOnlyGuard`'s own
+    refusals unpinned (reverting them stayed green because `copiedArgv` rejects first). A's P2
+    was accurate about my own code: `copiedArgv` read `isProxy` live while its comment claimed
+    every intrinsic was captured at module load. **Adjudicated, NOT changed** (C's P1 on the
+    transport label): `outcome: "scanned"` is emitted at the end of `processUnit`, before
+    `processRepo`'s own completion write, so a throw from THAT write leaves a `scanned`
+    transport line beside an errored unit — the event describes the transport and read phase,
+    which did complete, and the `unit` event carries final disposition; moving it would plumb
+    counters into the caller for strictly worse coupling. The wording now says what the field
+    means rather than overclaiming.
+  - Round 5 (the cap): (running)
 - Doc-sweep codex prose pass: (pending)
