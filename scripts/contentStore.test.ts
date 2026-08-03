@@ -390,6 +390,23 @@ describe("reads (canonical child route + mode routing + fallback budget)", () =>
     expect(await store.read("bin.dat", entryOf(store, "bin.dat"))).toBe("a�b");
     await store.dispose();
   });
+  test("a second read while one is in flight rejects busy — the pull-style single-flight contract", async () => {
+    // The seam is pull-style by contract: exactly one read in flight at a time. Child 1's stdin
+    // write hangs, so read #1 never settles and readInFlight stays true; read #2, issued without
+    // awaiting the first, must reject with code "busy" rather than racing a second request onto
+    // the same child. (The guard is the sole serialization the read path has — the symlink
+    // fallback's budget check-then-increment relies on no second read interleaving it.)
+    const h = makeHarness({ childOpts: [{ hangStdinWrite: true }] });
+    const store = await h.open();
+    const first = store.read("src/a.txt", entryOf(store, "src/a.txt")); // parks: stdin never settles
+    const busy = await store.read("tools/run.sh", entryOf(store, "tools/run.sh")).then(
+      () => ({ ok: true as const }),
+      (e: unknown) => ({ ok: false as const, code: e instanceof ContentStoreError ? e.code : "not-a-store-error" }),
+    );
+    expect(busy).toEqual({ ok: false, code: "busy" });
+    void first.catch(() => undefined); // the parked read is abandoned by dispose below
+    await store.dispose();
+  });
   test("mode 120000 routes to the injected REST fallback and never touches the child", async () => {
     const h = makeHarness();
     const store = await h.open();
