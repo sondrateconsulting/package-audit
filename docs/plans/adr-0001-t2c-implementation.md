@@ -404,5 +404,39 @@ past tense — a form true after the merge), bench module headers if §4(a).
     recorded: the disposal verdict does not fold in a consumed first death when a FINAL
     child exists — the died-twice ERROR carries the first diagnosis, which is the surface
     that matters.
+  - **P4+P5 (cloneNoCheckout + Q6 budget + rewire/cutover + fixtures/event + sweep/gate),
+    3 rounds, NOT CONVERGED — corrected, never clean.** A (Opus 4.6 @ xhigh) PASS in all
+    three rounds; B (gpt-5.5 @ xhigh) FAIL / PASS / FAIL — its R2 PASS is the ONLY codex PASS
+    of the whole implementation arc; C (gpt-5.6-sol @ ultra) FAIL in all three. R1 (A PASS,
+    B FAIL, C FAIL), verified + fixed at `c964844`: the clone gate stamped BEFORE git()'s
+    semaphore acquire, so a saturated semaphore let same-repo REAL starts bunch (moved inside
+    the lease, immediately before the spawn, URL-keyed, with a saturation regression); my P3
+    teardown gate had BROKEN the §7 drain discipline (a rejected fallback read let the unit
+    settle while the REST transport — spawn deadline, retries, one-shot permit, cache write —
+    floated toward db.close(); the store now drains gate-detached transports at dispose);
+    owned-dir publication was not atomic (staged dot-prefixed mkdtemp → marker → rename);
+    gitBytes's reader-failure path lacked the bounded settle; two migrated concurrency tests
+    choreographed blocking on retired git/trees traffic (vacuous — re-pointed MID-CLONE via a
+    beforeClone hook). A's two stale-comment finds applied. Adjudicated-DECLINED (recorded):
+    C's "an aborted store can return clean when no reads occur" — boundedPool's settle-all is
+    DRAIN, not cancel. R2 (A PASS, B PASS, C FAIL), verified + fixed at `f4228e4`: my R1
+    staging fix MOVED the marker race (sweepable staging re-opened the marker-less window —
+    a marker-less STAGING dir is now retained as a sibling mid-creation; accepted residue: an
+    empty staged dir per crash in the two-syscall window); a rejecting backoff sleep could
+    mask git's diagnostic; the retired describe's malformed-envelope parser coverage restored
+    as direct parseTreeResponse cases; the check-9 tests now assert REAL spawn instants.
+    R3, the cap (A PASS, B FAIL, C FAIL): verified findings fixed **POST-CAP at `db2c348`
+    and therefore UNREVIEWED — the final whole-diff loop is their first review**: the abort
+    subscription outlived the read phase (B's critical: a sibling fatal after scanUnit
+    poisoned the idle child and voided a fully-read unit — dropped at read-phase end); a
+    gate-sleep rejection inside a retry masked the prior git diagnostic; the unsafe-integer
+    parser case restored; competing-lockfile and retried-clone fixtures added. Adjudicated,
+    recorded: the gate's stamp precedes the spawn by MICROTASKS (sub-ms against 200ms — the
+    construction claim materially holds); C's "clean-scan unsubscribe test head-mismatches"
+    names no locatable test (unverifiable; the final loop may re-raise with a citation).
+    Doc-sweep queue from the loop: stale prose at github.ts:1259-ish (cloneShallow in the
+    spawnBounded note), orchestrate.ts reconcile/processUnit notes (clone-real-HEAD,
+    scanned_commit_date fallback wording), unitPipeline.ts header (truncated-tree fallback),
+    policyIntegration.test.ts intro, PROMPT.md content-path description.
 - Final whole-diff santa loop (cap 5): (pending)
 - Doc-sweep codex prose pass: (pending)
