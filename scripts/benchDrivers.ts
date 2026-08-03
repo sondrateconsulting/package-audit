@@ -28,8 +28,11 @@ import type { DriverId } from "./benchSchedule.ts";
 
 // ---- the retired checkout-walk readers (RELOCATED from orchestrate.ts at the T2c cutover) ----
 // Production's default path no longer materialises a working tree, so these live where their
-// only remaining consumers are: the T2a driver and the pinning lane (which evaluate checkout
-// semantics BY DESIGN). Bodies unchanged from the production originals.
+// only remaining consumers evaluate checkout semantics BY DESIGN: walkClone serves the T0/T1
+// truncated-checkout drivers (via runTruncatedCheckout below) and the pinning lane; cloneReader
+// serves the pinning lane alone (the T0/T1 drivers read through readCheckoutDelivery). The T2a
+// driver uses neither — it reads through enumerateStore + readCheckoutDelivery. Bodies unchanged
+// from the production originals.
 // Walk a cloned working tree into TreeEntry rows (blobs only; size from lstat). Skips .git and
 // symlinks (never followed). Paths are repo-relative POSIX. A readdir/lstat failure PROPAGATES: on a
 // completed clone it means the tree was not fully enumerated, and a silent skip would under-report

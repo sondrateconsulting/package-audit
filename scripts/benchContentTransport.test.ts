@@ -752,8 +752,10 @@ describe("reclaimBenchRoot — command teardowns must never substitute a cleanup
 });
 
 // ---- the relocated checkout-walk readers (moved here from production at the T2c cutover) -----
-// Their only consumers are the bench's checkout lanes (T2a / pinning); the fail-closed claims
-// they carried in production still hold and stay pinned here verbatim.
+// Their consumers are the bench's checkout lanes: walkClone in the T0/T1 truncated-checkout
+// drivers and the pinning lane, cloneReader in the pinning lane alone (not T2a, which reads
+// through enumerateStore + readCheckoutDelivery). The fail-closed claims they carried in
+// production still hold and stay pinned here verbatim.
 describe("checkout-walk readers fail closed (relocated with the T2c cutover)", () => {
   const dummyEntry: TreeEntry = { path: "x", type: "blob", sha: "", size: 0 };
 
