@@ -219,8 +219,10 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
    cutover the precise inventory (verified by non-test caller grep) is: DELETE the
    `tree.truncated` branch, `fetchTreeRecursive`, `cloneShallow` (+ its `git show %cI` call
    and the guard's `show` grammar, which then have zero callers); RELOCATE `walkClone` +
-   `cloneReader` into the bench (the T2a/pinning lanes import them; relocation over dead
-   production exports); KEEP `parseTreeResponse`/`TreeResponse` (bench T0/T1 REST trees) and
+   `cloneReader` into the bench (the T0/T1 truncated-checkout and pinning lanes consume them —
+   NOT T2a, which reads through `enumerateStore` + `readCheckoutDelivery`; this line originally
+   said "the T2a/pinning lanes", the same misattribution the remediation arc's F8 fixed in the
+   bench comments, corrected here in place; relocation over dead production exports); KEEP `parseTreeResponse`/`TreeResponse` (bench T0/T1 REST trees) and
    `BranchHead.treeOid` (bench corpus; orchestrate just stops reading it). The guard's
    checkout clone tuple is retained either way (§3.1 — the bill's letter). Recommendation:
    hard cutover with that inventory.
@@ -616,8 +618,10 @@ EXPORTS.md correctly needs no edit.
   either found a previous round's repair or a phrase fixed in one site and not swept.** The
   ADR's ratified budget formula was deliberately NOT rewritten to match the code — the
   deviation is recorded in Confirmation check 8 instead. Two pre-existing inaccuracies
-  unrelated to this PR are recorded and left alone (README's "landing in this release cycle";
-  PROMPT §5.A's inaccessible-orgs claim).
+  unrelated to this PR were recorded and left alone at the time (README's "landing in this
+  release cycle"; PROMPT §5.A's inaccessible-orgs claim) — both, plus two more this loop never
+  reached (README's content-through-`gh` claim and the subprocess-count phrasing), were fixed
+  by the remediation arc's docs pass below.
 - **PR-body codex loop (gpt-5.5 @ xhigh, fresh session per round): 5 rounds, R5 PASS.** R1 FAIL
   (2 P1: the `--template` fix attributed to `c899cf9` when `git log -S` shows `61b899e` — I
   transcribed the handoff instead of checking the artifact; and the loop range written as
@@ -666,3 +670,85 @@ EXPORTS.md correctly needs no edit.
   what made the phantom retries look plausible enough to need a by-hand disproof — an
   operator meeting REAL absorbed retries has no diagnostic either; (3) resume verified live
   (second run: 6/6 `skip-current`, zero clones, stable findings).
+- **Post-live-test /review-pr remediation arc (2026-08-03): six fresh review agents → per-finding
+  codex validation → 14 fix commits → santa loop CONVERGED at round 2 — the first unanimous
+  round of the whole PR arc.** A six-agent review at `fedca79` (code-reviewer,
+  comment-analyzer, pr-test-analyzer, silent-failure-hunter, type-design-analyzer,
+  code-simplifier) served as the round 6 the capped final loop never got. The code-reviewer's
+  flag-by-flag argv-vs-grammar trace over the four post-cap tails (`3fdd75b` — until then
+  unreviewed — and `c899cf9`/`508e820`/`db2c348`, which only the capped final loop had ever
+  reviewed) returned ZERO findings — the first clean pass on the
+  argv-vs-launch surface in six attempts — while the other agents returned 8 IMPORTANT
+  findings plus advisories. Every finding was validated with codex (fresh sessions) BEFORE any
+  fix: all 8 confirmed, 4 with revisions that changed the work — my proposed runtime-freeze
+  test would have bypassed `realLaunch` entirely (the injectable spawn/launch seams sit above
+  it), so the test now fakes the spawn boundary itself; and my "budget race" rationale for the
+  busy-guard test was WRONG (the check-then-increment has no intervening await) — the guard
+  pins the single-flight contract, and the commit says so. The fixes, atomic commits
+  (one per finding, except that the F7b marker interface rides F1's sweep commit — the same
+  lines — and F7b's reader linkage was completed only by the santa round-1 commit below),
+  RED-first where a runtime RED exists (compile-time REDs demonstrated for the type
+  tightenings, e.g. a typo'd error-code comparison shown compiling clean before the union and
+  failing TS2367 after): the sweep's fail-open `readOwnerPid` (a blanket catch collapsed
+  transient read errors into "unowned" → `rmSync` with no warning on that branch — now
+  three-way owned/unowned/unreadable with retain+warn on unreadable; ENOENT and
+  read-succeeded-but-invalid sweep unchanged); a RUNTIME pin for the round-5 argv-freeze
+  defense (Array.prototype numeric-setter pollution driven through the real launch path — the
+  prior pin was a source-text regex, and a shape regex approves the shape the current fix
+  uses: round 5's holes-and-setters escape lived in a vector build whose source shape its own
+  era's checks approved, which only a runtime test can catch); a captured-binary TOCTOU test (an env `PATH`
+  accessor swaps `bins.git` mid-call; the launch must use the capture); the `readInFlight`
+  busy-guard test; `ContentStoreErrorCode`/`GitFrameErrorCode` literal unions (15 + 28 codes);
+  deeply-readonly public counters over a private mutable view; a structural pick replacing the
+  `as unknown as LaunchedChild` double cast at the launch site (the cmd-vector build is
+  byte-identical; stdin narrows to ONE bottom value); and the benchDrivers relocation
+  comment's consumer list corrected (T2a never called walkClone/cloneReader). Advisories
+  applied: `--version` restored to the guard's verb-enumeration comment; `apiReader`'s parity
+  guard documented as redundant-not-structurally-dead (codex's correction of my own overclaim);
+  four in-file-only exports dropped; an `isLsTreeMode` predicate replacing the adjacency-linked
+  cast; `DEFAULT_CONTENT_STORE_LIMITS` frozen at both levels; `gitBlobOid`/`seamDecode` deduped
+  onto gitFrame.ts (codex OVERRULED my proposed defer — this PR's own extraction created the
+  SECOND copy of each helper, so the duplication is this PR's, not pre-existing — and was
+  right; the D1 commit message says "third copies", the same miscount, corrected here). Deferred with recorded two-party consensus: the
+  dispose()/ensureChild() phase extractions (style-only churn on the hardened lifecycle
+  surface) and the clone retry-loop's documented diagnostic-preserving breaks.
+  **Santa loop over the remediation diff (A = Opus 4.6 @ xhigh, B = gpt-5.5 @ xhigh,
+  C = gpt-5.6-sol @ ultra, fresh per round). Round 1 (A PASS, B FAIL, C FAIL): all three
+  converged on ONE defect — my own F7b overclaim. `OwnerMarker` typed only the WRITER;
+  `readOwnerPid` still parsed an independent `{ pid?: unknown }`, so the drift protection the
+  comment claimed did not exist (a writer-side field rename would compile, after which fresh
+  live-owner markers parse unowned and sweep — C's sharpening). Fixed in the round commit: the
+  reader's parse is keyed through `keyof OwnerMarker` (verified: the rename now yields 4 tsc
+  errors), plus C's root-independent ELOOP fixture replacing the chmod one (which silently
+  skipped under uid 0) and A's note on the vacuous suppressENOENT argument. Round 2 (fresh
+  reviewers): A PASS, B PASS, C PASS — NICE, zero critical issues across all three. After 15
+  prior rounds without one, the first unanimous round arrived on a 700-line remediation diff,
+  not on the full PR — scope discipline, not a claim the PR is clean.** The remediation was
+  then rebased onto `0ea920c` (the live-test fix had landed meanwhile; clean replay, zero
+  conflicts, the reviewed patches byte-identical) and pushed as `e128bf0`; 2,605 tests + tsc
+  clean on the composed head. `ca19952` itself sits outside every review scope above and keeps
+  its own unreviewed disclosure.
+  **Closing docs-accuracy loop over this arc's prose + the repo's claims (gpt-5.6-sol @ ultra,
+  fresh session per round, cap 3): NOT CONVERGED — corrected, never clean.** R1 FAIL (5 P1 +
+  5 P2): three P1s were defects in my description of my own process — the "all three broken
+  fixes would have passed the source regex" overclaim (round 4's fix was index-built, not
+  defineProperty-shaped), the rebase target misnamed as `ca19952` (it was `0ea920c`), and D1's
+  "third copies" miscount — plus §5 Q3 still carrying the F8 misattribution (fix-one-site-
+  miss-the-duplicates, again) and the "only unreviewed tail" claim omitting `0ea920c`. R2: the
+  four target passages verified accurate, but the broader sweep found 4 pre-existing P1s —
+  README's "landing in this release cycle" (all three features ship), README's content-
+  through-`gh` claim (the T2c cutover's own capped doc sweep never reached it), README's
+  subprocess-count phrasing (the semaphores bound LEASES; an unsettled kill-escalated child
+  can transiently outlive its released lease), and PROMPT §5.A's "marked `skipped`" claim —
+  all fixed, including the two the earlier prose loop had recorded-and-left. R3, the cap:
+  FAIL, 2 P1 + 4 P2 — my own R2 PROMPT fix overclaimed in the other direction ("no transition
+  is written": the startup self-healing reset touches undiscovered owners' rows like any
+  current-config row — a fix found wrong by the next round, the recurring pattern), and the
+  PR body's "core.used unchanged" paraphrase contradicted this ledger's own live-test record
+  ("stayed at 1"; preflight's identity check is a core call). Also from R3: "one commit per
+  finding" made precise (F7b rides F1, completed by the santa fix), "suffix" corrected to
+  interior segment, and the discharged-disclosure wording narrowed to what was actually clean
+  (the argv trace) versus what the arc also found there (the missing runtime pins). **R3's
+  fixes are POST-CAP and UNREVIEWED**, disclosed here and in the PR body. Every round found
+  either a previous round's own repair or my self-description wrong — the standing lesson
+  holds.

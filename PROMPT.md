@@ -158,7 +158,10 @@ Effective owner resolution (normative — EVERY run, BOTH modes):
   `includePersonalNamespace`) participate in `config_hash`; the DISCOVERED result
   set does not. Discovery re-runs every invocation, so org-membership changes never
   orphan resumable work: newly visible orgs simply enqueue as new work units on the
-  next run, and orgs no longer accessible are marked `skipped`, never deleted.
+  next run, and orgs no longer accessible simply stop enqueuing — their prior rows are
+  never deleted and no accessibility marker is written for them (the startup
+  self-healing reset still applies to them like any current-config row:
+  `in_progress` under a failed run returns to `pending`).
 - Note: SAML/SSO-enforced orgs may enumerate but 403 on content access until the
   token is SSO-authorized — and under SSO enforcement `user/orgs` may OMIT
   non-authorized orgs entirely, so enumeration itself can under-report until the
