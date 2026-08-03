@@ -3163,27 +3163,21 @@ describe("sweepStaleTempDirs observability (§0)", () => {
     expect(removeWarnings.length).toBe(1); // the non-ENOENT removal failure is surfaced (not the suppressed root path)
   });
   test("rvo Q2: an UNREADABLE owner marker (transient read failure) RETAINS the dir and warns — never fail-open", () => {
-    if (typeof process.getuid === "function" && process.getuid() === 0) return; // root ignores modes
     const root = mkdtempSync(join(tmpdir(), "sweep-marker-"));
-    // The marker records a DEAD owner: if the sweep could read it, the dir would sweep. Retention
-    // therefore proves the unreadable-marker classification, not owner liveness — and it must be
-    // the classification, because the same EACCES/EMFILE/EIO blip on a LIVE sibling's marker
-    // would otherwise delete its clone mid-run (the exact hazard the ownership gate closes).
+    // An unreadable marker whose FAILURE is uid-independent: the marker path is a symlink to
+    // itself, so readFileSync fails with ELOOP for every user, root included (a chmod-based
+    // EACCES fixture silently skips under uid 0). If the sweep could read a marker here it
+    // would see nothing live and sweep — retention therefore proves the unreadable-marker
+    // classification, which is what protects a LIVE sibling's clone from the same read blip
+    // (EMFILE/EACCES/EIO) mid-run.
     const dir = join(root, "pkg-audit-blip1");
     mkdirSync(dir);
     const marker = join(dir, ".pkg-audit-owner.json");
-    writeFileSync(marker, JSON.stringify({ pid: 999_999_999, startedAtIso: "2026-01-01T00:00:00Z" }));
-    chmodSync(marker, 0o000); // readFileSync → EACCES (a stand-in for any transient read failure)
+    symlinkSync(marker, marker); // self-loop: readFileSync(marker) → ELOOP, regardless of uid
     const { client } = makeClient([], { tempRoot: root });
     let removed: string[] = ["sentinel"];
     let events: Record<string, unknown>[] = [];
-    try {
-      events = captureStdout(() => { removed = client.sweepStaleTempDirs(); });
-    } finally {
-      // best-effort restore so the trailing rmSync can recurse — on the fail-open path under
-      // test the sweep has already deleted the marker, and that deletion is the finding itself
-      try { chmodSync(marker, 0o600); } catch { void 0; }
-    }
+    events = captureStdout(() => { removed = client.sweepStaleTempDirs(); });
     expect(removed).toEqual([]); // retained: the sweep cannot prove unowned-or-dead
     expect(existsSync(dir)).toBe(true);
     const markerWarnings = events.filter((e) => e.event === "warning" && e.reason === "temp-sweep-failed" && e.operation === "owner-marker");

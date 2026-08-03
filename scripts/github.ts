@@ -1229,10 +1229,11 @@ const CLONE_GATE_SPACING_MS = 200;
 // sweep reclaims under the SAME ownership rule (see STAGING_PREFIX handling there).
 const OWNER_MARKER_NAME = ".pkg-audit-owner.json";
 const STAGING_PREFIX = ".pkg-audit-stage-";
-// The one marker shape, shared by the writer and the reader so the two cannot silently drift
-// apart on a field name (the reader still validates at runtime — an on-disk marker is external
-// data — and keys on `pid` alone: `startedAtIso` is diagnostic, so older or hand-edited markers
-// that carry only a valid pid stay owned).
+// The one marker shape, shared by the writer and the reader: the writer serializes exactly this
+// interface, and the reader's parse is keyed through `keyof OwnerMarker`, so renaming a field
+// compiles only if BOTH sides move together. The reader still validates at runtime — an on-disk
+// marker is external data — and accepts a valid `pid` alone: `startedAtIso` is diagnostic, so
+// older or hand-edited markers that carry only a valid pid stay owned.
 export interface OwnerMarker {
   pid: number;
   startedAtIso: string;
@@ -1270,7 +1271,9 @@ function readOwnerPid(dir: string): OwnerRead {
     return { kind: "unreadable", error: e };
   }
   try {
-    const parsed = JSON.parse(raw) as { pid?: unknown };
+    // keyed through OwnerMarker (values stay unknown — runtime validation below is the gate):
+    // a writer-side field rename is a compile error HERE, not a silent never-matching read
+    const parsed = JSON.parse(raw) as Partial<Record<keyof OwnerMarker, unknown>>;
     return typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0
       ? { kind: "owned", pid: parsed.pid }
       : { kind: "unowned" };
@@ -2712,6 +2715,8 @@ export class GithubClient {
             // fail SAFE, the same posture as ownerIsAlive: a marker whose READ failed proves
             // nothing, and deleting on it would let a transient blip take out a live sibling's
             // clone. Retain and surface; a genuinely stale dir sweeps on a later startup.
+            // (suppressENOENT false is vacuous here — readOwnerPid maps ENOENT to unowned, so
+            // it can never reach this branch — but an always-warn is the honest default.)
             warnFailure("owner-marker", full, owner.error, false);
             continue;
           }
