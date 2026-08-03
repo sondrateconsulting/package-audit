@@ -9,7 +9,7 @@
 import { buildPermalink } from "./permalink.ts";
 import {
   extractDependencyFacts, installNameSet, locateManifests, nearestLockfile, resolveOwningManifest,
-  dirOf, type DependencyFact, type LockfileRef,
+  dirOf, ALWAYS_SKIP_DIRS, type DependencyFact, type LockfileRef,
 } from "./manifest.ts";
 import { resolveFromLockfile, type LockResolution } from "./lockfile.ts";
 import { scanUsage, type TrackedPackage, type UsageRow } from "./usageScanner.ts";
@@ -96,6 +96,32 @@ export const MAX_SCAN_BYTES = 2 * 1024 * 1024; // skip a huge (minified/generate
 export function makeExcluder(globs: string[]): (path: string) => boolean {
   const matchers = globs.map((g) => new Bun.Glob(g));
   return (path: string) => matchers.some((m) => m.match(path));
+}
+
+// ---- ADR-0001 check 8 (rvo Q6): the REST fallback budget's denominator --------------------
+// A DISCLOSED deviation from the bill's literal `selected`: production selection is
+// content-dependent (lockfiles are read per extracted fact; source reads require a resolving
+// tracked package), so the bench's recorded `selected` exists only after the unit finishes.
+// The ratified denominator is the ENUMERABLE UPPER BOUND from the pure path predicates alone —
+// manifests ∪ ALL lockfile candidates (binary included: they are the bench denominator's
+// no-read election) ∪ scannable source ∪ CLI-scan kinds, after excludeDirGlobs/node_modules,
+// with NO size filter (size-gate skips count in the bench denominator too). Every
+// bench-denominator class is contained in one of these terms, so eligible ⊇ reads ∪ no-reads
+// and the derived budget is ≥ the bill's — deterministically and order-independently.
+export function countBudgetEligible(blobPaths: readonly string[], isExcluded: (path: string) => boolean): number {
+  const { manifests, lockfiles } = locateManifests([...blobPaths], isExcluded);
+  const eligible = new Set<string>(manifests);
+  for (const lf of lockfiles) eligible.add(lf.path);
+  for (const path of blobPaths) {
+    if (ALWAYS_SKIP_DIRS.test(path) || isExcluded(path)) continue;
+    if (SCANNABLE_EXT.test(path) || classifyFile(path) !== "other") eligible.add(path);
+  }
+  return eligible.size;
+}
+
+// The bill's formula over that denominator: max(20, ceil(10% of eligible)).
+export function restFallbackBudgetFromEligible(eligible: number): number {
+  return Math.max(20, Math.ceil(0.1 * eligible));
 }
 
 // `cliTermSets` carries the specifier term plus any introspection-supplied bin names per tracked
@@ -185,7 +211,7 @@ export async function scanUnit(loc: UnitLocation, cfg: UnitConfig, entries: Tree
   const cliFindings: CliRow[] = [];
 
   for (const entry of blobs) {
-    if (isExcluded(entry.path) || /(^|\/)node_modules\//.test(entry.path)) continue;
+    if (isExcluded(entry.path) || ALWAYS_SKIP_DIRS.test(entry.path)) continue;
     if (entry.size !== null && entry.size > MAX_SCAN_BYTES) continue;
 
     // import/usage scan (source files only)

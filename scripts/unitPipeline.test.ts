@@ -1,5 +1,5 @@
 import { expect, test, describe } from "bun:test";
-import { scanUnit, makeExcluder, type TreeEntry, type UnitLocation } from "./unitPipeline.ts";
+import { scanUnit, makeExcluder, countBudgetEligible, restFallbackBudgetFromEligible, type TreeEntry, type UnitLocation } from "./unitPipeline.ts";
 import type { CliTermSet } from "./cliScanner.ts";
 
 const loc: UnitLocation = {
@@ -18,6 +18,53 @@ describe("makeExcluder", () => {
     const ex = makeExcluder(["**/dist/**", "**/vendor/**"]);
     expect(ex("a/dist/x.js")).toBe(true);
     expect(ex("src/index.ts")).toBe(false);
+  });
+});
+
+// ---- ADR-0001 check 8 (rvo Q6): the fallback-budget denominator ------------------------------
+describe("countBudgetEligible + restFallbackBudgetFromEligible (the pure path-predicate superset)", () => {
+  const none = (): boolean => false;
+  test("membership: manifests, ALL lockfile candidates (binary included), scannable source, and CLI kinds — each counted once", () => {
+    const paths = [
+      "package.json", // manifest (also a CLI kind — a Set, never double-counted)
+      "app/package.json",
+      "bun.lockb", // the BINARY lockfile candidate — elected but never content-read
+      "app/pnpm-lock.yaml",
+      "src/index.ts", // scannable source
+      "src/util.mjs",
+      "tools/build.sh", // CLI kinds
+      "Dockerfile",
+      ".github/workflows/ci.yml",
+      "README.md", // none of the terms
+      "logo.png",
+      "data/huge.bin",
+    ];
+    expect(countBudgetEligible(paths, none)).toBe(9);
+  });
+  test("excludeDirGlobs and node_modules drop candidates from EVERY term; size never enters (a path-only predicate)", () => {
+    const paths = [
+      "node_modules/x/package.json",
+      "node_modules/x/index.js",
+      "vendor/tool.sh",
+      "vendor/package.json",
+      "src/big.ts", // eligibility is path-only — the 2 MiB gate's skip still COUNTS here
+    ];
+    const isExcluded = makeExcluder(["vendor/**"]);
+    expect(countBudgetEligible(paths, isExcluded)).toBe(1);
+  });
+  test("the budget formula: floor 20, ceil above it", () => {
+    expect(restFallbackBudgetFromEligible(0)).toBe(20);
+    expect(restFallbackBudgetFromEligible(199)).toBe(20);
+    expect(restFallbackBudgetFromEligible(200)).toBe(20);
+    expect(restFallbackBudgetFromEligible(201)).toBe(21); // ceil(20.1)
+    expect(restFallbackBudgetFromEligible(250)).toBe(25);
+    expect(restFallbackBudgetFromEligible(1000)).toBe(100);
+  });
+  test("order-independence: a shuffled listing yields the same count", () => {
+    const paths = ["package.json", "src/a.ts", "b.sh", "yarn.lock", "docs/x.md"];
+    const reversed = [...paths].reverse();
+    expect(countBudgetEligible(paths, none)).toBe(countBudgetEligible(reversed, none));
+    expect(countBudgetEligible(paths, none)).toBe(4);
   });
 });
 
