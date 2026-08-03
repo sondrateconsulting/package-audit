@@ -618,3 +618,22 @@ EXPORTS.md correctly needs no edit.
   deviation is recorded in Confirmation check 8 instead. Two pre-existing inaccuracies
   unrelated to this PR are recorded and left alone (README's "landing in this release cycle";
   PROMPT §5.A's inaccessible-orgs claim).
+- **PR-body codex loop (gpt-5.5 @ xhigh, fresh session per round): 5 rounds, R5 PASS.** R1 FAIL
+  (2 P1: the `--template` fix attributed to `c899cf9` when `git log -S` shows `61b899e` — I
+  transcribed the handoff instead of checking the artifact; and the loop range written as
+  `8ffad36..HEAD`, which later commits turned into an overclaim), 2 P2 (check 3 cited only the
+  parser tests, not the store-level fail-closed and pre-decode-hash demonstrators; check 8's
+  event claim unscoped). **R1's "2,600 tests green is unverifiable" was REFUTED and recorded:**
+  its `bun test` exited 1 only because its read-only sandbox denies the directory creation
+  several suites need; the suite exits 0 here with 2,600 passing. R2 FAIL (my R1 fix named
+  `40b425a` as the loop's head — merely the round-2 ledger commit; replaced with the four
+  successive fix commits and no head SHA at all). R3 FAIL (I had listed my own pre-loop sweep
+  `2a5f1c3` among the prose loop's ROUND fixes). R4 FAIL (**"every round found a P0, each inside
+  the previous round's fix" was an overstatement** — true of rounds 2, 3 and 5; round 1 found
+  its P0 in earlier hardening and round 4 in a newly reached channel. The same overstatement was
+  in this ledger and was corrected at `cb264c6`). R5, the cap: **PASS**, 3 P2 applied (the child
+  is lazy and may respawn, so "one unit-lived child per unit" overstated it; "every unit touches
+  disk" ignored skipped units; `logVocab` pins the event TOKEN, not the skip behavior).
+  **Four consecutive rounds found a defect in my description of my own process** — a
+  transcribed SHA, an invalidated range, a miscounted sweep, an overstated pattern — while the
+  body's technical claims held. Self-description proved the least reliable content in the record.
