@@ -554,5 +554,35 @@ past tense — a form true after the merge), bench module headers if §4(a).
     which did complete, and the `unit` event carries final disposition; moving it would plumb
     counters into the caller for strictly worse coupling. The wording now says what the field
     means rather than overclaiming.
-  - Round 5 (the cap): (running)
+  - **Round 5, THE CAP (A PASS with 1 P3, B FAIL with a P0+P2, C FAIL with 2 P0s + 4 P1s) —
+    NOT CONVERGED.** Verified findings fixed **POST-CAP at `3fdd75b`, and therefore
+    UNREVIEWED: no reviewer has seen them.** C's first P0 showed round 4's own fix unsound —
+    `new Array(n)` creates HOLES, and assigning into a hole walks the prototype chain, so an
+    inherited numeric SETTER captures the write and the slot reads back as the accessor's value
+    (verified empirically both ways). Every argv/command vector is now built with
+    `Object.defineProperty`, which consults no prototype, and the launch vector is frozen. B's
+    P0 found the same window's second exit — `spawnLabel()` calls `args.slice(1)` on the
+    validated argv inside `spawnBounded` before the spawn, and a poisoned `slice` receives our
+    array as `this` — closed by that freeze rather than by patching the label builder. C's
+    second P0: every wrapper re-read `this.bins.<tool>` at the launch AFTER the caller's env
+    accessors had run, so a mutation there could swap the executable between check and spawn;
+    all five lanes now capture the binary once. Four P1s: the one-shot STRING lane propagated a
+    rejected exit promise with no escalation and no bounded settle (the byte lane's discipline,
+    missing here); `dispose()` could outrun an in-flight construction settle; a first child
+    recorded `exitCode: null` (never settled, possibly alive) still yielded a clean verdict when
+    a replacement served the unit — narrower than the sanctioned-respawn rule, which forgets a
+    child whose DEATH was established; and clone-start accounting, wrong in BOTH directions
+    across rounds 4 and 5, now lives at the only place that means "a start happened" (inside
+    `git()`, after the pacing gate, immediately before the spawn). A's P3 was accurate about my
+    own prose: `canon()`'s comment claimed it avoided mutable prototype methods while using
+    `push`.
+  - **Loop outcome: CAPPED AT 5 ROUNDS, NOT CONVERGED — corrected, never clean.** Not one
+    unanimous round in five, and every round found a P0, each inside the previous round's fix,
+    on the same "what the guards validated is not what launches" surface. The chain closed
+    only when the property was made structural (defineProperty + freeze + captured binaries +
+    no caller code during validation) rather than patched case by case. A further round would
+    likely find more; the post-cap tail at `3fdd75b` is unreviewed and is disclosed as such in
+    the PR body. Across the whole arc (three per-phase loops + this one, 14 rounds) reviewer A
+    passed every round while the codex reviewers found the P0s — a single PASS is never
+    evidence of cleanliness.
 - Doc-sweep codex prose pass: (pending)
