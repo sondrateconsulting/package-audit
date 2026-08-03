@@ -33,7 +33,7 @@ parameterizing the existing launch primitive rather than adding a second call.
 | `readOnlyGuard.ts` | The three new grammars inside `assertReadOnlyGit` (§3.1 below); the "cat-file excluded by name" comment block rewritten with the code. |
 | `gitFrame.ts` (new) | Production home of the framed parsers: `BatchFrameParser`, `parseLsTreeZ`, `ByteRing` (ported per §4), plus `gitBlobOid(body, format)` (`blob <len>\0<body>` via `Bun.CryptoHasher`, sha1/sha256) and `seamDecode` (UTF-8-with-replacement). Pure; no process machinery. |
 | `contentStore.ts` (new) | `UnitContentStore`: the ls-tree index (path → {mode, oid, size}), the OID-only stdin writer, the child manager (lazy spawn, per-read deadline, single respawn, poisoning, ordered teardown — adapted from `benchSpawn.ts`'s review-hardened `BatchChild`), mode routing (symlink → injected REST fallback), the per-unit fallback budget, and the separated counters. Takes injected capabilities (launch, one-shot byte spawn, REST read, child-pool permit) so it holds no spawn surface itself. |
-| `github.ts` | (a) the single `Bun.spawn` site gains a stdin-mode parameter and a structural `LaunchedChild` return used by two consumers: the existing one-shot UTF-8 path (unchanged behavior) and the new byte/interactive paths; (b) `gitBytes(args, cwd)` — one-shot guarded byte-capture spawn (for `ls-tree`; the current string path's irreversible decode would destroy the evidence the parser fails closed on); (c) `launchBatchChild(cwd)` — guarded (`assertSpawnAllowed` + `assertReadOnlyGit(["cat-file","--batch"])` + cwd containment), env-built, NOT semaphore-held (children draw from the child pool); (d) `cloneNoCheckout(org, repo, branch, pinnedOid)` — production argv + `--no-checkout`, bounded retry (§5 Q1), `rev-parse HEAD` must equal `pinnedOid` else fail closed; (e) `buildGitEnv` sets `GIT_NO_REPLACE_OBJECTS=1` unconditionally — for **every** git spawn, not just the child: `rev-parse`/`ls-tree` running with replace refs while `cat-file` runs without them would let the coherence check and the enumeration disagree with the reads; (f) the child permit pool (a second `Semaphore`; size §5 Q4); (g) the owned temp sweep (§5 Q2). |
+| `github.ts` | (a) the single `Bun.spawn` site gains a stdin-mode parameter and a structural `LaunchedChild` return used by two consumers: the existing one-shot UTF-8 path (unchanged behavior) and the new byte/interactive paths; (b) `gitBytes(args, cwd)` — one-shot guarded byte-capture spawn (for `ls-tree`; the current string path's irreversible decode would destroy the evidence the parser fails closed on); (c) `launchBatchChild(cwd)` — guarded (`assertSpawnAllowed` + `assertReadOnlyGit(["cat-file","--batch"])` + cwd containment), env-built, NOT semaphore-held (children draw from the child pool); (d) `cloneNoCheckout(org, repo, branch, pinnedOid)` — production argv + `--no-checkout`, bounded retry (§5 Q1), `rev-parse HEAD` must equal `pinnedOid` else fail closed; (e) `buildGitEnv` sets `GIT_NO_REPLACE_OBJECTS=1` unconditionally — for **every** git spawn, not just the child: `rev-parse`/`ls-tree` running with replace refs while `cat-file` runs without them would let the coherence check and the enumeration disagree with the reads; (f) the child permit pool (a second `Semaphore`; size §5 Q4); (g) the owned temp sweep (§5 Q2); (h) the per-repo clone-transport gate (§3.9 pacing). |
 | `orchestrate.ts` | `processUnit` default path rewired: cloneNoCheckout → store open (ls-tree) → entries from the index → store reader → scanUnit → ordered teardown in `finally` (dispose child → delete clone → release permit). Abort threading: `branchAbort` reaches `processUnit`; on abort the store poisons the in-flight read and the unit fails through the same ordered teardown (§3.1's "kill-escalation on unit end or abort" — ratified, not a new decision). The truncated-tree branch, `walkClone`, `cloneReader` retire per §5 Q3. `apiReader`'s REST read survives as the symlink fallback lane (404 → null parity preserved). |
 | `unitPipeline.ts` | No behavioral change expected: `TreeEntry.size` is now the canonical ls-tree size, so the existing 2 MiB gate reads canonical sizes by construction; manifests/lockfiles stay ungated. `MAX_SCAN_BYTES` export + CI mirror untouched. |
 | `log.ts` + vocab | One new per-unit JSONL event carrying the separated counters (name TBD, e.g. `content-transport`); the log-vocabulary pin and README's event table update together. |
@@ -50,14 +50,15 @@ written), `config.ts` (no new keys — `config_hash` untouched, resume state pre
 
 `assertReadOnlyGit` grows, keeping its 1-arg signature (the wrapper test pins `guard(args)`):
 
-- **Clone**: the grammar becomes the union of (at most) two exact tuples — the existing
+- **Clone**: the grammar becomes the union of exactly two exact tuples — the existing
   checkout tuple and the same tuple + `--no-checkout` required-exactly-once. Union-of-exact
   (rather than a caller-declared shape parameter, which the bench needed to stop driver drift)
   because production's argv is constructed inside `github.ts` from an explicit parameter, so
-  cross-shape drift is structurally impossible at the only call site. If rvo picks full
-  deletion of the checkout path (§5 Q3), the checkout tuple is REMOVED and the grammar is the
-  single no-checkout tuple — the accept/reject table then proves the bare-checkout argv is
-  rejected.
+  cross-shape drift is structurally impossible at the call sites. **Both shapes stay even
+  under full cutover** (§5 Q3): the bill's specified constraint is "a second exact clone
+  shape carrying `--no-checkout`" — removing the first shape would narrow beyond the bill's
+  letter, so if Q3 deletes `cloneShallow` the checkout tuple is retained as deliberately
+  caller-less grammar (it admits only the hardened read-only clone), stated in the PR.
 - **`ls-tree`**: exactly `ls-tree -r -z -l --full-tree <rev>` with `<rev>` = `HEAD` only
   (narrowest: production's sole call site passes `HEAD` after the coherence gate; the bench's
   full-oid rev form stays bench-side in `benchGrammar.ts`). No reordering, no pathspecs (a
@@ -143,13 +144,24 @@ Fan-out test: pool size 2, 4 concurrent units → never more than 2 live childre
 
 Per-unit counters: local canonical reads, REST fallback reads by cause (today: `symlink`),
 fallback-budget spend, clone-transport operations, clone retries. Surfaced as one JSONL event
-per unit (vocab-pinned) and aggregated nowhere else (report schema untouched). The per-unit
-fallback budget is `max(20, ceil(0.10 × selected))` where `selected` is computed up-front from
-the enumerated entries by the SAME pure selection predicates the pipeline uses
-(`locateManifests` + non-binary nearest-lockfile kinds + `SCANNABLE_EXT`/`classifyFile` +
-`excludeDirGlobs`/`node_modules` + the 2 MiB gate) — the bench pinned `selected` the same way
-(bench-config reuses the production classifiers). Exceeding the budget fails the unit with a
-distinct message; a test drives the trip.
+per unit (vocab-pinned) and aggregated nowhere else (report schema untouched).
+
+**The budget denominator needs a production definition (§5 Q6).** The bill's formula is
+`max(20, ceil(10% of selected))`, and the bench's `selected` was the recorded read set of an
+actual pipeline run (`recordSelection` drives `scanUnit` under a recording reader) — known
+up-front only because the workload was pre-recorded. Production selection is content-dependent
+(lockfiles read per extracted fact; source reads require a resolving tracked package), so the
+true `selected` exists only after the unit finishes. Options: (a) **denominate on the
+enumerable upper bound** — `eligible` = blob entries passing the pure path/size predicates
+(`locateManifests` + non-binary lockfile kinds + `SCANNABLE_EXT`/`classifyFile` +
+`excludeDirGlobs`/`node_modules` + the 2 MiB gate), fixed at enumeration time; since
+`eligible ⊇ selected` the budget is ≥ the bill's, preserving the bound's purpose (cap per-unit
+API spend, floor 20 intact) deterministically and order-independently — a DISCLOSED deviation
+from the bill's literal denominator, so it goes to rvo; (b) a running ratio over reads issued
+so far — rejected: order-dependent, and symlinks clustered early would fail units the
+end-of-unit formula allows; (c) end-of-unit enforcement only — rejected: never trips
+mid-unit, so it does not "trip and terminate as defined". Recommendation: (a). Exceeding the
+budget fails the unit with a distinct message; a test drives the trip.
 
 ### 3.9 Operational hardening (check 9)
 
@@ -161,13 +173,15 @@ distinct message; a test drives the trip.
   dead-pid dirs, retains live-pid dirs. Closes "a second concurrent audit deletes the first's
   live clones" — now a common-path hazard.
 - Pacing: git transport per unit is exactly ONE network operation (the clone; `rev-parse`,
-  `ls-tree`, `cat-file` are local). Concurrent clones are bounded by the global subprocess
-  semaphore (default 8) across ALL repos, and per-repo unit fan-out ≤ `concurrency.branches`;
-  a repo's clone rate is therefore ≤ min(semaphore, branches) starts per clone-duration —
-  far under 15 ops/s/repo for any real clone (≥ ~0.5 s). The accounting shows it: the per-unit
-  event counts clone-transport ops, so any future reviewer can recompute the bound. No
-  enforcement machinery (no headroom header exists); the construction argument + counters are
-  the check-9 "shows its accounting".
+  `ls-tree`, `cat-file` are local) — but concurrency knobs reach 64 and fast-FAILING clones
+  plus retries could exceed 15 starts/s/repo, so a concurrency argument alone does not
+  establish check 9 **by construction**. Instead `github.ts` gets a per-repo clone-transport
+  gate: clone starts for the same (host, org, repo) are serialized and spaced ≥ 200 ms apart
+  (a Map-keyed gate the retry loop also flows through). At a conservative 2 transport ops per
+  clone start that is ≤ 10 ops/s/repo whatever the fan-out or failure rate — a hard
+  construction, independent of every knob. Tests: fake clock, two same-repo clones → second
+  start ≥ 200 ms later; different repos unaffected. The per-unit event's clone-transport-op
+  counter is the accounting the check asks the implementation to show.
 
 ## 4. Prototype adoption (benchGrammar.ts / benchFrame.ts) — §5 Q5
 
@@ -184,8 +198,9 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
   stale header comments move the live frozen-surface digest (fine — disclosed; no gate-relevant
   run happens, and any future run needs a fresh §8 amendment regardless).
 - **(b) Import directly.** Production imports `BatchFrameParser` from `benchFrame.ts`. Zero
-  drift, zero bench edits, digest unmoved — but production surface permanently named "bench",
-  EXPORTS.md documents a bench module as a production dependency, and the module headers
+  drift and zero bench-module edits — though NOT digest stability: the freeze digest covers
+  every non-test script, and this implementation moves it regardless by editing `github.ts`
+  et al. Costs: production surface permanently named "bench", and the module headers
   ("production untouched until an ADR adopts these") become false anyway.
 - **(c) Copy.** Fork-and-drift; rejected unless rvo overrides.
 
@@ -194,15 +209,22 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
 1. **Clone retry**: implement bounded retry (3 attempts, backoff) — or accept the
    single-attempt risk with a recorded acceptance in the PR.
 2. **Sweep ownership**: implement the pid-marker owned sweep — or record risk acceptance.
-3. **Rollout / deletion**: hard cutover deleting the retired path in this PR (`walkClone`,
-   `cloneReader`, the truncated-tree branch, `cloneShallow` + the checkout clone tuple + the
-   `git show` date tuple, which then have no callers) — vs keeping any of it behind
-   dead-code/transition cover. Recommendation: full deletion (the ADR retired the path; the
-   guard shrinks to the narrowest live grammar).
+3. **Rollout / deletion**: hard cutover in this PR vs a transition arrangement. Under hard
+   cutover the precise inventory (verified by non-test caller grep) is: DELETE the
+   `tree.truncated` branch, `fetchTreeRecursive`, `cloneShallow` (+ its `git show %cI` call
+   and the guard's `show` grammar, which then have zero callers); RELOCATE `walkClone` +
+   `cloneReader` into the bench (the T2a/pinning lanes import them; relocation over dead
+   production exports); KEEP `parseTreeResponse`/`TreeResponse` (bench T0/T1 REST trees) and
+   `BranchHead.treeOid` (bench corpus; orchestrate just stops reading it). The guard's
+   checkout clone tuple is retained either way (§3.1 — the bill's letter). Recommendation:
+   hard cutover with that inventory.
 4. **Constants**: child pool size (recommend: the subprocess semaphore's size — the ratified
    default) and per-read deadline (recommend 60 s, the ratified bench constant; dispose
    deadline 10 s).
 5. **Prototype adoption mechanics**: §4 (a) move+shim (recommended) / (b) import / (c) copy.
+6. **Fallback-budget denominator**: §3.8 — the enumerable `eligible` upper bound
+   (recommended, a disclosed deviation from the bill's literal `selected`) vs a running ratio
+   vs end-of-unit enforcement.
 
 ## 6. Phases (TDD; commit before reviewers; santa loop per phase batch)
 
@@ -217,7 +239,8 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
 - **P4 — rewiring.** `cloneNoCheckout` (+ coherence), store open, `processUnit` swap, abort
   threading, counters/budget event, retirement deletions per Q3. Fixture-driven end-to-end unit
   tests (check 5's byte fixtures live here or in P3).
-- **P5 — hardening.** Retry + owned sweep per Q1/Q2 (or recorded acceptances in the PR body).
+- **P5 — hardening.** Retry + owned sweep per Q1/Q2 (or recorded acceptances in the PR
+  body) + the per-repo clone-transport pacing gate (§3.9 — not optional; check 9).
 - Throughout: 2412 pre-existing tests green, `tsc --noEmit` clean, new-module coverage ≥ 80%,
   no comment/test spells a scan-tripping token (AST assertions instead of process/dynamic-load
   tricks), signed commits, lease pushes.
@@ -226,8 +249,12 @@ The ADR adopted the prototypes; the mechanics are a decision. Options:
 
 1. Non-UTF-8 blobs: delivered strings become the canonical UTF-8-with-replacement decode
    (REST's transcode measured and disqualified at Step C) — the ratified direction.
-2. Moved branch between discovery and clone: unit fails closed (was: scanned at the moved head
-   on the truncated-clone path only). Self-heals next run.
+2. Moved branch between discovery and clone: a NEW failure mode on every unit. Today's
+   default path reads at the pinned discovery OIDs, so a branch move cannot affect it at all
+   (only the truncated-clone fallback raced, and it ACCEPTED the moved head, recording the
+   clone's real HEAD). Under T2c every unit clones by branch name and fails closed on a HEAD ≠
+   pinned-OID mismatch (ratified §3.1(2)) — fast-moving branches will occasionally error a
+   unit; transient, self-heals via next-run re-discovery.
 3. The 100k-entry/7 MB truncation cliff and its checkout fallback are gone; huge repos now
    enumerate completely — and their symlinks are now visible (walkClone skipped symlinks
    entirely), so symlink findings can APPEAR on repos previously scanned via the fallback.
@@ -247,7 +274,14 @@ past tense — a form true after the merge), bench module headers if §4(a).
 
 ## 9. Review-process ledger (filled as the loops run)
 
-- Plan codex loop: (pending)
+- Plan codex loop: **round 1** (gpt-5.5 @ xhigh, 2026-08-03): CONSULT-FAIL — 1 P1
+  (the fallback-budget `selected` cannot be computed up-front in production; the bench
+  recorded it by running selection — became §5 Q6 with the `eligible` upper-bound
+  recommendation), 3 P2 (pacing needed a real by-construction gate → the per-repo 200 ms
+  clone gate; single-shape guard option reinterpreted the bill → both clone tuples retained;
+  moved-branch disclosure missed that the default path has no race today → §7.2 rewritten),
+  1 P3 (option (b)'s "digest unmoved" claim false → corrected). All five applied. Round 2:
+  (pending)
 - Per-phase santa loops: (pending)
 - Final whole-diff santa loop (cap 5): (pending)
 - Doc-sweep codex prose pass: (pending)
