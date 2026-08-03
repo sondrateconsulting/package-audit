@@ -8,7 +8,14 @@
   before anything runs.
 - **Date:** 2026-07-28
 - **Owner:** rvo
-- **Subject:** [ADR-0001](../adrs/0001-file-content-acquisition-strategy.md), shipped as PR #27, status `proposed`
+- **Subject:** [ADR-0001](../adrs/0001-file-content-acquisition-strategy.md), shipped as PR #27, status `proposed` (→ `accepted` at Step D, 2026-08-03)
+- **Step-D closure (2026-08-03):** the benchmark ran (Steps B–C; PRs #29/#32) and the §4.7 output
+  over the committed evidence — exactly one eligible driver → recommend T2c — was put to rvo and
+  RATIFIED. The ADR's `accepted` rewrite rides the same PR as this note, gated by §4.7's one
+  further adversarial review round before merge; D2 discharged at Step C, and D1 discharges with
+  this recorded decision. The decision record is ratification.json's entry named "Step D, the
+  2026-08-03 ratification: the §4.7 rule output (sole-eligible → recommend T2c) put to rvo and
+  RATIFIED". This note is additive: Step D changes no rule text below.
 
 ADR-0001's Review history records two disagreements with its adversarial reviewer as unresolved.
 This plan resolves both — not by re-arguing them, but by converting each into committed, executable
