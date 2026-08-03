@@ -593,4 +593,26 @@ EXPORTS.md correctly needs no edit.
     returned PASS in every round it completed — 13 of the 14, the exception being the P1+P2
     round it infra-failed, which was re-run and never counted as approval — while the codex
     reviewers found every P0. A single PASS is never evidence of cleanliness.
-- Doc-sweep codex prose pass: (pending)
+- **Doc-sweep codex prose pass (gpt-5.5 @ xhigh, fresh session per round): CAPPED AT 5 ROUNDS,
+  NOT CONVERGED — corrected, never clean.** My own sweep (`2a5f1c3`) landed first and covered
+  barely half of what the rounds then found. R1 **FAIL, 13 findings incl. 2 P1** (`a480ef4`):
+  README described the clone as an oversized-tree FALLBACK in three places — this PR's headline
+  behavior change stated backwards — and PROMPT §5.C still specified the REST content path as
+  THE acquisition flow. R2 **PASS, 4 P2** (`d7c0a88`): its top finding was R1's own repair (my
+  "one clone per scanned unit" ignored the bounded retry), plus the ADR's "`ls-tree` enumerates
+  any tree" overstating what the explicit enumeration bounds deliver. R3 **FAIL, 6 incl. 1 P1**
+  (`9de2d5a`): §5.C still told readers an oversized or non-plain entry "falls back to the
+  hardened shallow clone" — R1 reframed the section's opening and left the sentence inside it —
+  plus two more of my own corrections (the event is one line per unit that ENTERS the scan
+  path; the child is spawned LAZILY, so a unit with nothing to read never starts one). R4
+  **PASS, 8 findings, all ONE class** (`f91bf7c`): the claim that `concurrency.repositories`
+  caps TOTAL in-flight subprocesses, false since this PR added the second pool, surviving in
+  seven sites after I fixed one. R5, the cap: **FAIL, 2 P1 + 7 P2 + 1 P3, fixed POST-CAP at
+  `42d9e6e` and therefore UNREVIEWED** — the same cap claim in two files I had never swept
+  (`config.schema.json`, `config.ts`), and two comments that my own santa-loop round-5 changes
+  had falsified (the respawn-verdict note and the `this.bins` re-read note). **Every round
+  either found a previous round's repair or a phrase fixed in one site and not swept.** The
+  ADR's ratified budget formula was deliberately NOT rewritten to match the code — the
+  deviation is recorded in Confirmation check 8 instead. Two pre-existing inaccuracies
+  unrelated to this PR are recorded and left alone (README's "landing in this release cycle";
+  PROMPT §5.A's inaccessible-orgs claim).
