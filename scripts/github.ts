@@ -243,15 +243,51 @@ export type LaunchFn = (bin: string, args: readonly string[], req: LaunchRequest
 // THE process-launch site — the only one in the audit product (§6; grep-enforced). Both stdin
 // modes flow through this single call: the one-shot paths pass "ignore", the unit-lived
 // cat-file child passes "pipe".
-const realLaunch: LaunchFn = (bin, args, req) =>
-  Bun.spawn({
-    cmd: [bin, ...args],
+//
+// The command vector is assembled BY INDEX rather than by spreading `args`: a spread reads the
+// argument object's own iterator, so an argv whose indexed slots are innocuous but whose
+// iterator yields other tokens would launch a command no guard ever saw. Every wrapper already
+// hands us an owned copy (copiedArgv), which is what makes the argv the guards validated and
+// the argv that launches the same array; building the vector positionally keeps that property
+// structural here rather than resting on caller discipline alone.
+const realLaunch: LaunchFn = (bin, args, req) => {
+  const cmd: string[] = [bin];
+  for (let i = 0; i < args.length; i++) {
+    const token: unknown = args[i];
+    if (typeof token !== "string") throw new GithubApiError(`launch argv slot ${i} is not a string`, {});
+    cmd.push(token);
+  }
+  return Bun.spawn({
+    cmd,
     env: req.env,
     cwd: req.cwd,
     stdin: req.stdin,
     stdout: "pipe",
     stderr: "pipe",
   }) as unknown as LaunchedChild;
+};
+
+// Copy an argv into a fresh, dense array of primitive strings BEFORE the guards run, so that the
+// guards, the containment walks, and the launch all operate on ONE array this module owns. The
+// caller's own object can otherwise diverge from what was validated in two ways:
+//   • the launch builds its command vector from the argv, so an overridden `Symbol.iterator`
+//     (or any other overridden array method a consumer uses) can present tokens the guards never
+//     inspected — hardening readOnlyGuard's internal copy does not help, because the object that
+//     reaches the launch is still the caller's;
+//   • every wrapper awaits a semaphore permit between validation and launch, so a caller holding
+//     a reference can swap a validated slot inside that window.
+// Both close the same way: validate and launch one array we own. A non-array, or any slot that is
+// not an own primitive string, is refused here rather than carried behind a cast.
+function copiedArgv(args: readonly string[], lane: string): string[] {
+  if (!Array.isArray(args)) throw new GithubApiError(`${lane} argv is not an array`, {});
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const token: unknown = args[i];
+    if (typeof token !== "string") throw new GithubApiError(`${lane} argv slot ${i} is not a string`, {});
+    out.push(token);
+  }
+  return out;
+}
 
 // Kill with the §4 escalation shape, shared by every consumer of the launch primitive:
 // terminate now; after the grace, SIGKILL + best-effort group kill + reader cancellation +
@@ -1342,7 +1378,8 @@ export class GithubClient {
   // against the cap but is not pause-aware. The pause-aware, bucketed path is ghBucketedAttempt
   // below (restGet/graphql), which arms any throttle pause INSIDE the lease so the slot is never
   // released into an about-to-open pause window.
-  async gh(args: string[]): Promise<SpawnResult> {
+  async gh(callerArgs: string[]): Promise<SpawnResult> {
+    const args = copiedArgv(callerArgs, "gh"); // validate and launch OUR array, never the caller's
     assertSpawnAllowed(this.bins.gh, args);
     assertReadOnlyGh(args);
     const release = await this.sem.acquire();
@@ -1378,9 +1415,12 @@ export class GithubClient {
   // allocation; omitted on the no-response path). ghBucketedAttempt — already impure — derives
   // and emits the rate-limit snapshot, gated on hasProgressSink(), inside the lease.
   private async ghBucketedAttempt<T>(
-    args: string[], bucket: Bucket,
+    callerArgs: string[], bucket: Bucket,
     analyze: (res: SpawnResult, now: number) => { outcome: T; pauseUntilMs: number | null; rateLimitHeaders?: Record<string, string> },
   ): Promise<T> {
+    // OUR array for the guards and every attempt below: this loop re-spawns across pauses and
+    // permit waits, so the caller's object would otherwise have many windows to diverge.
+    const args = copiedArgv(callerArgs, "gh");
     assertSpawnAllowed(this.bins.gh, args);
     assertReadOnlyGh(args);
     for (;;) {
@@ -1412,7 +1452,11 @@ export class GithubClient {
     }
   }
 
-  async git(args: string[], cwd?: string): Promise<SpawnResult> {
+  async git(callerArgs: string[], cwd?: string): Promise<SpawnResult> {
+    // OUR array from here down — the guards, the clone-destination walk, and the launch all
+    // read the same owned copy (the byte lane's copy-then-check discipline, applied to the
+    // string lane too: the launch would otherwise build its vector from the caller's object).
+    const args = copiedArgv(callerArgs, "git");
     assertSpawnAllowed(this.bins.git, args);
     assertReadOnlyGit(args);
     // §0: git itself is the only process allowed to run with cwd inside a clone.
@@ -1468,18 +1512,11 @@ export class GithubClient {
   // through the §U3.1 funnel. On a deadline expiry the result is ALWAYS the synthetic 124 with
   // EMPTY stdout — a timed-out capture must never surface partial bytes as a complete listing.
   async gitBytes(args: string[], cwd: string): Promise<GitBytesResult> {
-    // Copy FIRST (an index loop — never an iterator or method a hostile array could
-    // override), then guard and launch THE COPY: validating the caller's array and launching
-    // it later would let a mutation inside the semaphore-acquire gap swap the validated
-    // tuple for something else (the guard hardening's copy-then-check discipline, applied at
-    // the launch layer too). A ghost/non-string slot is refused here rather than smuggled
-    // into the copy behind a cast.
-    const argv: string[] = [];
-    for (let i = 0; i < args.length; i++) {
-      const v: unknown = args[i];
-      if (typeof v !== "string") throw new GithubApiError(`gitBytes argv slot ${i} is not a string`, {});
-      argv.push(v);
-    }
+    // Copy FIRST, then guard and launch THE COPY (copiedArgv — the discipline every lane now
+    // shares): validating the caller's array and launching it later would let a mutation
+    // inside the semaphore-acquire gap, or an overridden iterator at the launch, swap the
+    // validated tuple for something else.
+    const argv = copiedArgv(args, "gitBytes");
     assertSpawnAllowed(this.bins.git, argv);
     assertReadOnlyGit(argv);
     // The byte-capture lane serves LOCAL read verbs only. `clone` — allowlisted in the shared
@@ -1606,7 +1643,11 @@ export class GithubClient {
     return this.childPool.acquire();
   }
 
-  async tar(args: string[]): Promise<SpawnResult> {
+  async tar(callerArgs: string[]): Promise<SpawnResult> {
+    // OUR array: the containment walk below reads the argv through array METHODS (`some`,
+    // `includes`) as well as by index, so a caller-owned object could report one shape to the
+    // walk and hand another to the launch.
+    const args = copiedArgv(callerArgs, "tar");
     assertSpawnAllowed(this.bins.tar, args);
     assertReadOnlyTar(args);
     // The argv guard proves read-only INTENT; the wrapper still containment-checks every

@@ -531,6 +531,58 @@ describe("guard wiring", () => {
     await expect(client.tar(["-cf", "x.tar", "dir"])).rejects.toThrow(ReadOnlyViolation);
     expect(calls.length).toBe(0);
   });
+  // The argv the guards validated must be the argv that LAUNCHES. Two ways a caller-owned
+  // object could otherwise diverge, both closed by copying at the wrapper entry (copiedArgv):
+  // an overridden iterator (the command vector is built from the argv) and a mutation landing
+  // in the validate→spawn window. Every string lane is covered because each one validated the
+  // caller's array before this fix (santa final loop, round 1).
+  test("an argv whose ITERATOR disagrees with its slots launches the validated slots, never the iterator's tokens", async () => {
+    const spawned: string[][] = [];
+    const spawn: SpawnFn = async (_bin, args) => {
+      spawned.push([...args]);
+      return ok(http(200, {}, "{}"));
+    };
+    const { client } = makeClient([], { spawnImpl: spawn });
+    const hostile = (slots: string[], yields: string[]): string[] => {
+      const a = [...slots];
+      Object.defineProperty(a, Symbol.iterator, {
+        value: function* (): Generator<string> {
+          for (const t of yields) yield t;
+        },
+      });
+      return a;
+    };
+    await client.git(hostile(["--version"], ["clean", "-fdx"]));
+    await client.gh(hostile(["api", "rate_limit"], ["api", "-X", "DELETE", "repos/o/r"]));
+    expect(spawned).toEqual([["--version"], ["api", "rate_limit"]]);
+  });
+  test("mutating the argv AFTER validation cannot change what spawns (the semaphore-acquire window)", async () => {
+    const spawned: string[][] = [];
+    let releaseHold!: () => void;
+    const hold = new Promise<void>((r) => (releaseHold = r));
+    const spawn: SpawnFn = async (_bin, args) => {
+      spawned.push([...args]);
+      if (args.includes("first")) await hold; // saturate the single slot
+      return ok(http(200, {}, "{}"));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com", spawnImpl: spawn, binPaths: BINS, tempRoot: TEST_TMP, concurrency: 1,
+    });
+    const saturate = client.gh(["api", "rate_limit", "first"]);
+    const argv = ["api", "rate_limit"];
+    const queued = client.gh(argv); // validated now, spawns only after the slot frees
+    await new Promise((r) => setTimeout(r, 5));
+    argv[0] = "api"; argv[1] = "-X"; argv.push("DELETE"); // the window a caller would exploit
+    releaseHold();
+    await Promise.all([saturate, queued]);
+    expect(spawned[1]).toEqual(["api", "rate_limit"]);
+  });
+  test("a non-string argv slot is refused at the wrapper, before any spawn", async () => {
+    const { client, calls } = makeClient([]);
+    await expect(client.git(["--version", 7 as unknown as string])).rejects.toThrow(/argv slot 1 is not a string/);
+    await expect(client.tar(["--version", null as unknown as string])).rejects.toThrow(/argv slot 1 is not a string/);
+    expect(calls.length).toBe(0);
+  });
   test("a denylisted package-manager binary is refused at the chokepoint", async () => {
     const { client, calls } = makeClient([], { binPaths: { ...BINS, gh: "/usr/local/bin/npm" } });
     await expect(client.gh(["api", "rate_limit"])).rejects.toThrow(ReadOnlyViolation);
@@ -3270,17 +3322,37 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     expect(cloneStartTimes.length).toBe(2);
     expect(cloneStartTimes[1]! - cloneStartTimes[0]!).toBeGreaterThanOrEqual(200);
   });
-  test("check 9: clone RETRIES flow through the same gate — their starts are spaced too", async () => {
+  test("check 9: clone RETRIES flow through the same gate — the retry's start sleeps the remaining spacing", async () => {
     const PIN = "a".repeat(40);
-    const { client, sleeps } = makeClient([
-      err("", "fatal: early EOF", 128),
-      ok(""), ok(PIN + "\n"),
-    ]);
+    // The fake clock advances by a FIXED small step per sleep rather than by the sleep's own
+    // duration. That decoupling is what makes the assertion discriminating: with a truthful
+    // clock the 2,000 ms transient backoff would already satisfy the 200 ms spacing, so the
+    // gate would compute no wait and an UNGATED retry would produce exactly the same `[2000]`
+    // — the test could not tell the two apart (santa final loop, round 1). Under-advancing the
+    // clock leaves spacing genuinely due at the retry, so the gate's own sleep is observable.
+    // awaitCloneGate sleeps once on a computed remainder (it does not loop), so a short step
+    // cannot spin.
+    const sleeps: number[] = [];
+    let fakeNow = 1_000_000_000_000;
+    const CLOCK_STEP_MS = 25;
+    const { spawn } = scripted([err("", "fatal: early EOF", 128), ok(""), ok(PIN + "\n")]);
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spawn,
+      sleepImpl: async (ms) => {
+        sleeps.push(ms);
+        fakeNow += CLOCK_STEP_MS;
+      },
+      nowImpl: () => fakeNow,
+      env: { HOME: "/home/u", PATH: "/bin" },
+      binPaths: BINS,
+      tempRoot: TEST_TMP,
+    });
     await client.cloneNoCheckout("o", "r", "main", PIN);
-    // attempt 1 start (no window) → backoff 2000 → gate: attempt 1's stamp + 200 is already
-    // past on the advanced fake clock, so no second spacing sleep — the RETRY still consulted
-    // the gate (ordering pinned by the sleeps: backoff only)
-    expect(sleeps).toEqual([2000]);
+    // attempt 1: gate has no prior stamp for this url → no wait, stamps t0 → spawn fails 128.
+    // backoff 2000 (clock → t0+25). attempt 2: the gate's own consultation finds t0+200 still
+    // in the future and sleeps the remaining 175 — present ONLY because the retry consults it.
+    expect(sleeps).toEqual([2000, 175]);
   });
   test("rvo Q2: a MARKER-LESS STAGING dir is retained (a sibling mid-creation), a dead-owner staged orphan sweeps", () => {
     const root = mkdtempSync(join(tmpdir(), "owned-stage-"));
