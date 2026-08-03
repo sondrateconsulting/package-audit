@@ -637,3 +637,32 @@ EXPORTS.md correctly needs no edit.
   **Four consecutive rounds found a defect in my description of my own process** — a
   transcribed SHA, an invalidated range, a miscounted sweep, an overstated pattern — while the
   body's technical claims held. Self-description proved the least reliable content in the record.
+- **LIVE end-to-end test (2026-08-03, the PR's first run against real GitHub; scoped to
+  `sondratehealth`, 2 repos / 6 branch units, cold DB, branches=2 lanes): 6/6 units scanned,
+  0 errors, 693 local canonical reads, 0 symlink fallbacks, 0 REST content requests (core
+  used stayed at 1 across the whole run), every clone dir reclaimed, all three presentation
+  surfaces green, a permalink spot-check exact. It found ONE defect — the third consecutive
+  miss on the clone-start accounting surface (santa final rounds 4 and 5 each rewrote it):
+  4 of the 6 units reported `cloneAttempts: 2` / `cloneRetries: 1` though NO clone ever
+  failed.** The per-unit count was a client-global counter delta across the unit's clone
+  window, so under concurrent lanes a sibling's start landing inside that window was reported
+  as a phantom retry — check 8's event fabricating exactly the transient-failure signal it
+  exists to measure (and the failure path in `processUnit` shared the same delta). Ruled out
+  as real failures by rerunning the identical hardened argv+env by hand (single, 3× rapid
+  same-repo, and 4× fully concurrent — every clone succeeded first-try), then reproduced
+  deterministically as a test: two concurrent units, every clone succeeding first-try,
+  exactly 2 real spawns — the buggy accounting reports 2/2, the event's claim requires 1/1.
+  **Fixed at `ca19952` (test failed first; 2,601 green + tsc clean): a unit-local sink —
+  `cloneNoCheckout` passes an observer into `git()`, invoked at the SAME ratified spot
+  (post-gate, pre-spawn; the rounds 4-5 placement is unchanged), plus an optional
+  `startsOut` written live so the failure path reads this unit's true count; the
+  client-global counter and getter are retired (their only consumer was that failure path).
+  POST-REVIEW and therefore UNREVIEWED, exactly like the `3fdd75b`/`42d9e6e` tails —
+  disclosed in the PR body.** Non-defect observations, recorded: (1) a clean run leaves ONE
+  `pkg-audit-gitcfg-*` dir behind (the credential-helper gitconfig has no in-process
+  disposal; the NEXT run's startup sweep reclaimed it, verified live — the github.ts comment
+  only promises plan mode leaks none); (2) a retried-then-successful clone's first-failure
+  stderr is recorded nowhere (`lastFailure` surfaces only when ALL attempts fail), which is
+  what made the phantom retries look plausible enough to need a by-hand disproof — an
+  operator meeting REAL absorbed retries has no diagnostic either; (3) resume verified live
+  (second run: 6/6 `skip-current`, zero clones, stable findings).
