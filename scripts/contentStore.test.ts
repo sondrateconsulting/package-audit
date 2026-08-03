@@ -852,6 +852,33 @@ describe("child lifecycle (check 6: deadline, respawn-once, ordered teardown, ab
     expect(disposal.detail).toContain("child manager construction failed");
     expect(h.permits.released).toBe(h.permits.acquired); // the permit still came back
   });
+  test("a dispose CONCURRENT with a construction failure still reports the dead child, not a clean verdict", async () => {
+    // The construction-failure record used to be written only AFTER the bounded settle, so a
+    // dispose() racing that wait saw neither a live child nor a disposal and returned the
+    // "no child was ever needed" clean verdict for a unit whose only child had died (santa
+    // final loop, round 4). The record is now written synchronously, before the wait.
+    const h = makeHarness();
+    const caps = {
+      ...h.caps,
+      launchBatchChild: (): ReturnType<typeof h.caps.launchBatchChild> => {
+        const fc = new FakeChild({ onKill: () => undefined }); // resists termination: never exits
+        return {
+          ...fc.child,
+          stdout: { getReader: (): never => { throw new Error("reader acquisition failed"); } },
+        };
+      },
+    };
+    const store = await openUnitContentStore(caps, {
+      cwd: join(TEST_TMP, "fake-clone"), format: SHA1, restFallbackBudget: 20, limits: TEST_LIMITS,
+    });
+    const read = store.read("src/a.txt", entryOf(store, "src/a.txt")).catch(() => undefined);
+    await Promise.resolve(); // the construction has failed and is inside its bounded settle
+    const disposal = await store.dispose(); // races that settle
+    expect(disposal.clean).toBe(false);
+    expect(disposal.detail).toContain("child manager construction failed");
+    await read;
+  }, 15_000);
+
   test("a REPLACEMENT child's setup failure surfaces RAW — a launch fault is not a second child death", async () => {
     // 508e820 moved the FIRST attempt's setup out of the respawn wrap; the replacement's was
     // still inside it, so a launch/construction fault during the respawn was reported as

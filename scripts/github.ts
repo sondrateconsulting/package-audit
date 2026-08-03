@@ -252,11 +252,17 @@ export type LaunchFn = (bin: string, args: readonly string[], req: LaunchRequest
 // the argv that launches the same array; building the vector positionally keeps that property
 // structural here rather than resting on caller discipline alone.
 const realLaunch: LaunchFn = (bin, args, req) => {
-  const cmd: string[] = [bin];
+  // Assembled by INDEX ASSIGNMENT — not `push`, and not a spread. Both route through mutable
+  // Array.prototype methods, and by this point the wrapper has already read the caller's env
+  // object (whose properties may be accessors), so caller code can have run AFTER argv
+  // validation and swapped those methods. Index writes touch no prototype at all, which is
+  // what makes "the argv the guards validated is the argv that launches" hold here.
+  const cmd: string[] = new Array<string>(args.length + 1);
+  cmd[0] = bin;
   for (let i = 0; i < args.length; i++) {
     const token: unknown = args[i];
     if (typeof token !== "string") throw new GithubApiError(`launch argv slot ${i} is not a string`, {});
-    cmd.push(token);
+    cmd[i + 1] = token;
   }
   return Bun.spawn({
     cmd,
@@ -289,26 +295,30 @@ const realLaunch: LaunchFn = (bin, args, req) => {
 //   • every slot must be an OWN DATA property holding a primitive string — accessors are
 //     refused rather than invoked, and a prototype-backed hole is refused rather than silently
 //     materialised into a shape readOnlyGuard deliberately rejects.
-// The intrinsics used here are captured at module load, so a later mutation of `Array.isArray`
-// or `Object.getOwnPropertyDescriptor` cannot weaken the copy itself.
+// Every intrinsic used here — `isProxy`, `Array.isArray`, `Object.getOwnPropertyDescriptor` —
+// is captured at module load, so a later mutation of any of them cannot weaken the copy, and
+// the arrays this module builds are filled by index rather than through prototype methods.
 //
 // Residual, deliberately out of scope: an actor who can mutate shared intrinsics BEFORE the call
 // already executes arbitrary code in this process and could launch a child directly — no argv
 // guard can bound that. What this boundary does guarantee is that a hostile argv OBJECT cannot
 // make the validated command differ from the launched one.
 const isArrayIntrinsic = Array.isArray;
+const isProxyIntrinsic = runtimeTypes.isProxy;
 const ownDescriptor = Object.getOwnPropertyDescriptor;
 function copiedArgv(args: readonly string[], lane: string): string[] {
-  if (runtimeTypes.isProxy(args)) throw new GithubApiError(`${lane} argv is a proxy (its traps would run during validation)`, {});
+  if (isProxyIntrinsic(args)) throw new GithubApiError(`${lane} argv is a proxy (its traps would run during validation)`, {});
   if (!isArrayIntrinsic(args)) throw new GithubApiError(`${lane} argv is not an array`, {});
   const len = args.length;
   if (!Number.isSafeInteger(len) || len < 0) throw new GithubApiError(`${lane} argv length is not a safe nonnegative integer`, {});
-  const out: string[] = [];
+  // index assignment, never `push`: the copy the guards then judge must not be assembled by a
+  // replaceable prototype method (the same reason the launch builds its vector by index)
+  const out: string[] = new Array<string>(len);
   for (let i = 0; i < len; i++) {
     const slot = ownDescriptor(args, i);
     if (slot === undefined || !("value" in slot) || typeof slot.value !== "string")
       throw new GithubApiError(`${lane} argv slot ${i} is not an own string data property (sparse, prototype-backed, or accessor argv)`, {});
-    out.push(slot.value);
+    out[i] = slot.value;
   }
   return out;
 }
@@ -1563,15 +1573,22 @@ export class GithubClient {
       const child = this.launch(this.bins.git, argv, { env, cwd, stdin: "ignore" });
       let outReader: StreamReader;
       let errReader: StreamReader;
+      const acquired: StreamReader[] = [];
       try {
         outReader = child.stdout.getReader();
+        acquired[0] = outReader; // recorded BEFORE the second acquisition can throw
         errReader = child.stderr.getReader();
+        acquired[1] = errReader;
       } catch (e) {
         // TRANSACTIONAL: a reader-acquisition failure after a successful launch must not
-        // orphan the child — kill-escalate it (no readers exist to cancel), then hold the
-        // return BOUNDEDLY until it settles: the caller's failure path may delete the clone
-        // directory, and the killed child should be dead — not merely dying — first.
-        killWithEscalation(child, []);
+        // orphan the child. Cancel whatever was already acquired NOW rather than leaving it to
+        // the escalation's grace — this lane is abandoning those readers deliberately, and a
+        // lock held on the first stream is unreachable to every other caller — then
+        // kill-escalate and hold the return BOUNDEDLY until the child settles: the caller's
+        // failure path may delete the clone directory, and the killed child should be dead —
+        // not merely dying — first.
+        for (const r of acquired) r.cancel().catch(() => undefined);
+        killWithEscalation(child, acquired);
         let settleTimer: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([
           child.exited.then(
@@ -2488,7 +2505,6 @@ export class GithubClient {
         // semaphore lease, immediately before the spawn — so every start here, retries
         // included, is gated where the start actually happens.)
         attempts++;
-        onAttempt?.(attempts);
         let res: SpawnResult;
         try {
           res = await this.git(args);
@@ -2499,6 +2515,12 @@ export class GithubClient {
           if (lastFailure !== "") break;
           throw e;
         }
+        // Counted only once the attempt actually REACHED the process: git() throws (above)
+        // only for wrapper setup faults — a denied argv, an uncontained destination, a config
+        // failure — which never spawn, and counting those would report network starts that
+        // did not happen. A spawned attempt always resolves, including a timeout (124) and a
+        // nonzero exit, so every real start is still counted.
+        onAttempt?.(attempts);
         if (res.exitCode === 0) {
           cloned = true;
           break;

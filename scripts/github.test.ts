@@ -2920,6 +2920,19 @@ describe("spawn-site allowlist (grep-enforced, with two exact-path scanner-test 
     for (const guard of ["assertReadOnlyGh", "assertReadOnlyGit", "assertReadOnlyTar"])
       expect(src.includes(`${guard}(args)`)).toBe(true);
   });
+  test("the launch site assembles its command vector by INDEX, never through a prototype method", () => {
+    // The wrapper reads the caller's env object (whose properties may be accessors) between
+    // validation and launch, so caller code can run in that window and replace an Array
+    // prototype method. A vector built with `push` or a spread would then carry tokens no
+    // guard approved. Index writes touch no prototype, which is what makes "the argv the
+    // guards validated is the argv that launches" hold at the site itself. Structural, because
+    // the property lives in HOW the vector is built (santa final loop, round 4).
+    const src = readFileSync("./scripts/github.ts", "utf8");
+    const site = src.slice(src.indexOf("const realLaunch"), src.indexOf("// Copy an argv into a fresh"));
+    expect(site).toContain("cmd[0] = bin");
+    expect(site).not.toMatch(/cmd\.push\(/);
+    expect(site).not.toMatch(/cmd:\s*\[bin,\s*\.\.\./);
+  });
 });
 
 describe("sweepStaleTempDirs observability (§0)", () => {
@@ -3250,6 +3263,25 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     expect(order.indexOf("stdout-settled")).toBeLessThan(order.indexOf("returned"));
     expect(order.indexOf("stderr-settled")).toBeLessThan(order.indexOf("returned"));
     expect(order).toContain("killed"); // the escalation still ran
+  });
+  test("gitBytes: a stderr reader-acquisition failure cancels the stdout reader it already took", async () => {
+    // Escalating with an empty reader list left the FIRST acquired reader locked to a stream
+    // nobody would ever drain or cancel — and nothing else can reach it, so a descendant
+    // holding that pipe could outlive the clone deletion (santa final loop, round 4).
+    let outCancelled = 0;
+    const { client } = makeClient([], {
+      launchImpl: () => {
+        const real = fakeOneShot({ stayOpen: true });
+        return {
+          ...real.child,
+          stdout: { getReader: () => ({ read: async () => ({ done: true, value: undefined }), cancel: async () => { outCancelled++; }, releaseLock: () => undefined }) },
+          stderr: { getReader: (): never => { throw new Error("stderr reader acquisition failed"); } },
+        } as unknown as LaunchedChild;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-partial-reader-"));
+    await expect(client.gitBytes(LS_TUPLE, dir)).rejects.toThrow(/stderr reader acquisition failed/);
+    expect(outCancelled).toBe(1);
   });
   test("gitBytes: a non-string argv slot is refused before the guards run", async () => {
     const launches: LaunchRequest[] = [];

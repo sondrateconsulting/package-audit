@@ -1332,6 +1332,31 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("check 8: a clone attempt that never reaches a spawn is NOT counted as a network start", async () => {
+    // The counter used to advance before the wrapper ran, so a setup fault that never spawned
+    // (a denied argv, an uncontained destination, a config failure) still reported a network
+    // start — inflating exactly the pacing account check 9 asks the implementation to show
+    // (santa final loop, round 4).
+    const root = mkdtempSync(join(tmpdir(), "ct-nospawn-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
+    });
+    // make the wrapper itself fail before any spawn, on every attempt
+    (client as unknown as { git: (a: string[], c?: string) => Promise<never> }).git = () => {
+      throw new Error("simulated wrapper setup failure before any spawn");
+    };
+    const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(db.getUnit(key("main"))?.status).toBe("error");
+    const ct = events.filter((e) => e.event === "content-transport");
+    expect(ct.length).toBe(1);
+    expect(ct[0]).toMatchObject({ outcome: "failed", cloneAttempts: 0, cloneRetries: 0 });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("check 8: a retried clone reports cloneAttempts/cloneRetries truthfully in the event", async () => {
     const root = mkdtempSync(join(tmpdir(), "ct-retry-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });

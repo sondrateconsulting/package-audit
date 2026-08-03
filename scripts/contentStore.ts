@@ -172,8 +172,17 @@ class FramedChild {
       frameCeiling: limits.frameCeiling,
     });
     this.ring = new ByteRing(limits.stderrRingBytes);
+    // Acquire BOTH readers transactionally: if the second acquisition throws, the first is
+    // already locked to a stream nobody will ever drain or cancel, and the caller's cleanup
+    // (which only knows about the child) cannot reach it — a descendant holding that pipe
+    // could then outlive the clone deletion. Cancel what we took before rethrowing.
     this.outReader = child.stdout.getReader();
-    this.errReader = child.stderr.getReader();
+    try {
+      this.errReader = child.stderr.getReader();
+    } catch (e) {
+      this.outReader.cancel().catch(() => undefined);
+      throw e;
+    }
     this.child.exited.then(
       (code) => {
         this.exitedCode = code;
@@ -632,6 +641,19 @@ export class UnitContentStore {
       this.child = new FramedChild(launched, this.format, this.limits);
     } catch (e) {
       killWithEscalation(launched, []);
+      // Record the dead child SYNCHRONOUSLY, before the bounded settle below: dispose() can run
+      // during that await, and it would otherwise find neither a live child nor a disposal and
+      // return the "no child was ever needed" clean verdict for a unit whose only child died.
+      // Recorded only when nothing is there yet — on the respawn path a real first-child
+      // disposal already holds git's own stderr, the diagnosis that matters.
+      const recordedHere = this.firstDisposal === null;
+      if (recordedHere)
+        this.firstDisposal = {
+          exitCode: null, // not yet settled; refined below if it settles in time
+          stderrTail: new Uint8Array(0),
+          stderrDroppedBytes: 0,
+          protocolError: `child manager construction failed: ${e instanceof Error ? e.message : String(e)}`,
+        };
       // bounded settle before control returns: the caller's failure path may delete the
       // store directory, and the failed launch should be dead — not merely dying — first
       // (the same bound the disposer's escalated exit wait uses)
@@ -646,18 +668,8 @@ export class UnitContentStore {
         }),
       ]);
       clearTimeout(settleTimer);
-      // A child DID exist and was killed, so the store's teardown verdict must describe it:
-      // without this record dispose() finds neither a live child nor a prior disposal and
-      // reports the "no child was ever needed" clean verdict, which would vouch for a unit
-      // whose only child died. Recorded ONLY when nothing is there yet: on the respawn path a
-      // real first-child disposal is already stored, and that diagnosis — git's own stderr —
-      // is the one that matters; overwriting it with this construction fault would discard it.
-      this.firstDisposal ??= {
-        exitCode: settledExit,
-        stderrTail: new Uint8Array(0),
-        stderrDroppedBytes: 0,
-        protocolError: `child manager construction failed: ${e instanceof Error ? e.message : String(e)}`,
-      };
+      // refine the record written before the wait with the exit it actually reached (if it did)
+      if (recordedHere && this.firstDisposal !== null) this.firstDisposal = { ...this.firstDisposal, exitCode: settledExit };
       throw e;
     }
     return this.child;

@@ -75,13 +75,15 @@ function trustedArgv(raw: readonly string[], what: string): string[] {
   if (!isArrayIntrinsic(raw)) deny(`${what} argv is not an array`);
   const len = raw.length;
   if (!Number.isSafeInteger(len) || len < 0) deny(`${what} argv length is not a safe nonnegative integer`);
-  const out: string[] = [];
+  // filled by index, never `push`: the array the grammar below judges must not be assembled
+  // through a prototype method that something else could have replaced
+  const out: string[] = new Array<string>(len);
   for (let i = 0; i < len; i++) {
     const slot = ownDescriptor(raw, i);
     const value: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
     if (typeof value !== "string")
       deny(`${what} argv slot ${i} is not an own string data property (sparse, prototype-backed, or accessor argv)`);
-    out.push(value as string);
+    out[i] = value as string;
   }
   return out;
 }

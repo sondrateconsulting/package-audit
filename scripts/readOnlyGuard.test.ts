@@ -311,6 +311,27 @@ describe("assertReadOnlyGit — the ls-tree tuple", () => {
     Object.setPrototypeOf(argv, proto);
     throws(() => assertReadOnlyGit(argv));
   });
+  test("a PROXY argv throws AT THE GUARD, with no trap invoked (not merely at the wrapper's copy)", () => {
+    // github.ts's wrapper refuses proxies first, so a wrapper-level test cannot pin THIS
+    // refusal: reverting it there would stay green while direct guard callers could again run
+    // traps during validation (santa final loop, round 4).
+    let traps = 0;
+    const hostile = new Proxy([...LS], {
+      getOwnPropertyDescriptor(t, k) { traps++; return Reflect.getOwnPropertyDescriptor(t, k); },
+      get(t, k, r) { traps++; return Reflect.get(t, k, r); },
+    });
+    throws(() => assertReadOnlyGit(hostile));
+    throws(() => assertReadOnlyGh(new Proxy(["api", "rate_limit"], { get(t, k, r) { traps++; return Reflect.get(t, k, r); } })));
+    throws(() => assertReadOnlyTar(new Proxy(["--version"], { get(t, k, r) { traps++; return Reflect.get(t, k, r); } })));
+    expect(traps).toBe(0); // refused before a single property was read
+  });
+  test("an ACCESSOR-backed argv slot throws at the guard rather than invoking the getter", () => {
+    let getterRuns = 0;
+    const argv = [...LS];
+    Object.defineProperty(argv, 5, { get: () => { getterRuns++; return "HEAD"; }, enumerable: true, configurable: true });
+    throws(() => assertReadOnlyGit(argv));
+    expect(getterRuns).toBe(0);
+  });
   test("reordered flags throw", () => throws(() => assertReadOnlyGit(["ls-tree", "-z", "-r", "-l", "--full-tree", "HEAD"])));
   test("missing -l throws", () => throws(() => assertReadOnlyGit(["ls-tree", "-r", "-z", "--full-tree", "HEAD"])));
   test("a branch-name rev throws (HEAD only)", () => throws(() => assertReadOnlyGit(["ls-tree", "-r", "-z", "-l", "--full-tree", "main"])));
