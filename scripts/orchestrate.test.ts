@@ -167,6 +167,8 @@ function makeClient(
     // async choreography hook: parks the unit MID-CLONE (owner/repo/branch from the argv), so
     // concurrency tests can hold a unit in flight on a live T2c seam
     beforeClone?: (owner: string, repo: string, branch: string) => Promise<void> | void;
+    // per-clone-call exit codes (shifted in call order; default 0) — drives the bounded retry
+    cloneExitCodes?: number[];
     launchImpl?: LaunchFn;
   } = {},
 ): GithubClient {
@@ -182,6 +184,8 @@ function makeClient(
       const url = args[args.length - 2] ?? "";
       const segs = url.replace(/\.git$/, "").split("/");
       await opts.beforeClone?.(segs[segs.length - 2] ?? "", segs[segs.length - 1] ?? "", branch);
+      const exitCode = opts.cloneExitCodes?.shift() ?? 0;
+      if (exitCode !== 0) return { exitCode, stdout: "", stderr: "fatal: transient clone failure" };
       mkdirSync(dest, { recursive: true });
       opts.afterClone?.(dest);
       return { exitCode: 0, stdout: "", stderr: "" };
@@ -1251,6 +1255,23 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
       fallbackBudget: 20, // max(20, ceil(10% of 2 eligible)) — the floor binds
       cloneAttempts: 1, cloneRetries: 0, childRespawns: 0,
     });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("check 8: a retried clone reports cloneAttempts/cloneRetries truthfully in the event", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ct-retry-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const runId = startScanRun(db);
+    const client = makeClient(root, async (_bin, args) => {
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
+      throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
+    }, { cloneExitCodes: [128] }); // first attempt fails transiently; the bounded retry lands
+    const events = await captureJsonl(() => processRepo(db, client, rt(testConfig(root, 25), "h"), runId, "org-a", repo, [], new Set()));
+    expect(db.getUnit(key("main"))?.status).toBe("done");
+    const ct = events.filter((e) => e.event === "content-transport");
+    expect(ct.length).toBe(1);
+    expect(ct[0]).toMatchObject({ cloneAttempts: 2, cloneRetries: 1 });
     db.close();
     rmSync(root, { recursive: true, force: true });
   });

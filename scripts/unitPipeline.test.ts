@@ -60,6 +60,12 @@ describe("countBudgetEligible + restFallbackBudgetFromEligible (the pure path-pr
     expect(restFallbackBudgetFromEligible(250)).toBe(25);
     expect(restFallbackBudgetFromEligible(1000)).toBe(100);
   });
+  test("COMPETING lockfile candidates in one dir each count — the denominator is candidates, not the resolution's winner", () => {
+    // nearestLockfile later picks ONE by precedence, but the bench denominator counted every
+    // elected candidate (the binary no-read election included) — so must the eligible bound
+    const paths = ["package.json", "bun.lock", "bun.lockb", "yarn.lock", "npm-shrinkwrap.json"];
+    expect(countBudgetEligible(paths, () => false)).toBe(5);
+  });
   test("order-independence: a shuffled listing yields the same count", () => {
     const paths = ["package.json", "src/a.ts", "b.sh", "yarn.lock", "docs/x.md"];
     const reversed = [...paths].reverse();

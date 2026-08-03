@@ -1056,6 +1056,9 @@ describe("parseGraphqlEnvelope / parseTreeResponse (pure)", () => {
     const entry = { path: "a.txt", type: "blob", sha: "a".repeat(40) };
     expect(() => parseTreeResponse({ truncated: false, tree: [{ ...entry, size: 1.5 }] }, "ep", null)).toThrow(/non-negative safe integer/);
     expect(() => parseTreeResponse({ truncated: false, tree: [{ ...entry, size: -1 }] }, "ep", null)).toThrow(/non-negative safe integer/);
+    // JSON "1e400" parses to Infinity — typeof number, but never a safe integer
+    expect(() => parseTreeResponse({ truncated: false, tree: [{ ...entry, size: Number.POSITIVE_INFINITY }] }, "ep", null)).toThrow(/non-negative safe integer/);
+    expect(() => parseTreeResponse({ truncated: false, tree: [{ ...entry, size: 2 ** 53 }] }, "ep", null)).toThrow(/non-negative safe integer/);
   });
   test("a blob entry MISSING size fails closed — a null size would bypass the 2 MiB scan cap", () => {
     // unitPipeline skips only entries whose size EXCEEDS the cap; a null size sails through and the

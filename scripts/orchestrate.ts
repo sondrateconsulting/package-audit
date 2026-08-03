@@ -821,6 +821,12 @@ async function processUnit(
     const readFile = (path: string, entry: TreeEntry): Promise<string | null> => boundStore.read(path, entry);
     const loc: UnitLocation = { githubHost: config.githubHost, organization: repo.organization, repository: repo.name, branch: h.name, commitSha };
     const result = await scanUnit(loc, { trackedPackages: config.packages.map((p) => p.name), excludeDirGlobs: config.excludeDirGlobs }, entries, readFile, cliTermSets);
+    // The READ PHASE is over: from here the unit only tears down and writes its own rows. Drop
+    // the abort subscription NOW — the settle-all contract DRAINS in-flight units, and a
+    // sibling's fatal landing after the last read must not poison the idle child mid-teardown
+    // and void a fully-read unit's findings. (The finally's unsubscribe is idempotent.)
+    unsubscribeAbort?.();
+    unsubscribeAbort = undefined;
     // §3.1: the child terminates when the unit's READ PHASE ends — the ordered teardown (child
     // → clone deletion → permit release, check 6's exact order) runs BEFORE the write block,
     // and an unclean close fails the unit rather than recording findings from bytes the child

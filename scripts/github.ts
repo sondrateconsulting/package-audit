@@ -2380,7 +2380,16 @@ export class GithubClient {
         // semaphore lease, immediately before the spawn — so every start here, retries
         // included, is gated where the start actually happens.)
         attempts++;
-        const res = await this.git(args);
+        let res: SpawnResult;
+        try {
+          res = await this.git(args);
+        } catch (e) {
+          // a THROW from the wrapper (e.g. the transport gate's injectable sleep rejecting)
+          // must not replace a PRIOR attempt's git diagnostic; with no prior failure it is
+          // the real, first diagnostic and propagates
+          if (lastFailure !== "") break;
+          throw e;
+        }
         if (res.exitCode === 0) {
           cloned = true;
           break;
