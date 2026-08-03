@@ -701,6 +701,133 @@ describe("child lifecycle (check 6: deadline, respawn-once, ordered teardown, ab
     expect(store.counters.childRespawns).toBe(1); // the allowance was consumed, then the abort stopped it
     await store.dispose();
   });
+  test("an abort during the REPLACEMENT child's read surfaces as the abort — never relabelled a double death", async () => {
+    const h = makeHarness({
+      childOpts: [
+        {
+          onStdinLine: (_line, fc) => {
+            fc.errS.feed("fatal: first death\n");
+            fc.exit(128);
+          },
+        },
+        {}, // child 2: silent — the retried read is pending when the abort lands
+      ],
+    });
+    const store = await h.open();
+    const outcome = store.read("src/a.txt", entryOf(store, "src/a.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    await new Promise((r) => setTimeout(r, 15)); // child 1 died, the respawned read is now in flight
+    expect(h.launches.length).toBe(2);
+    store.abort("branch aborted");
+    const err = await outcome;
+    expect(err).toBeInstanceOf(ContentStoreError);
+    expect((err as ContentStoreError).code).toBe("aborted"); // the abort is its own outcome
+    expect(store.counters.childRespawns).toBe(1);
+    await store.dispose();
+  });
+  test("a fallback REJECTION after abort surfaces the abort as the label, carrying the transport failure as diagnosis", async () => {
+    let rejectFallback!: (e: Error) => void;
+    const h = makeHarness({ fallback: () => new Promise((_r, rej) => (rejectFallback = rej)) });
+    const store = await h.open();
+    const outcome = store.read("link.txt", entryOf(store, "link.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    await new Promise((r) => setTimeout(r, 5));
+    store.abort("branch aborted");
+    rejectFallback(new Error("transport torn down"));
+    const err = await outcome;
+    expect(err).toBeInstanceOf(ContentStoreError);
+    expect((err as ContentStoreError).code).toBe("aborted");
+    expect((err as ContentStoreError).message).toContain("transport torn down"); // the induced failure rides along
+  });
+  test("teardown ordering holds for a child whose exit is ASYNCHRONOUS (not tied to the stdin close tick)", async () => {
+    const h = makeHarness({
+      childOpts: [
+        {
+          onStdinLine: (_line, fc) => fc.serveFrame(OID_A, BODY_A),
+          onEnd: (fc) => {
+            setTimeout(() => fc.exit(0), 15); // the real child's EOF-then-exit is never same-tick
+          },
+        },
+      ],
+    });
+    const store = await h.open();
+    await store.read("src/a.txt", entryOf(store, "src/a.txt"));
+    const disposal = await store.dispose();
+    expect(disposal.clean).toBe(true); // the bounded exit wait genuinely waited
+    assertOrder(h.events, ["stdin-end"], ["exit"]);
+    assertOrder(h.events, ["exit"], ["stdout-drained", "stderr-drained"]);
+    assertOrder(h.events, ["stdout-drained", "stderr-drained"], ["permit-released"]);
+  });
+  test("teardown ordering holds on the FAILURE path too — the second child's teardown is ordered after a double death", async () => {
+    const die = (tag: string) => ({
+      tag,
+      onStdinLine: (_line: string, fc: FakeChild) => {
+        fc.errS.feed("fatal: died\n");
+        fc.exit(128);
+      },
+    });
+    const h = makeHarness({ childOpts: [die("c1-"), die("c2-")] });
+    const store = await h.open();
+    const err = await store.read("src/a.txt", entryOf(store, "src/a.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((err as ContentStoreError).code).toBe("child-died-twice");
+    const disposal = await store.dispose();
+    expect(disposal.clean).toBe(false); // the second child died — never a clean verdict
+    // A child that died BEFORE teardown drains at its death, so stdin-end legitimately comes
+    // after the drains here. The failure path's guarantee is the TAIL of the order: the
+    // teardown still closes stdin, still joins the (already-settled) pumps, and releases the
+    // permit strictly LAST — after every child-2 lifecycle event.
+    assertOrder(h.events, ["c2-exit", "c2-stdout-drained", "c2-stderr-drained", "c2-stdin-end"], ["permit-released"]);
+    expect(h.permits.released).toBe(1);
+  });
+  test("a manager-construction failure after the launch kills the child instead of orphaning it", async () => {
+    const killed: string[] = [];
+    const h = makeHarness();
+    const caps = {
+      ...h.caps,
+      launchBatchChild: (): ReturnType<typeof h.caps.launchBatchChild> => {
+        const fc = new FakeChild({ onKill: (_sig, self) => {
+          killed.push("killed");
+          self.exit(137);
+        } });
+        // a hostile/broken handle: reader acquisition throws AFTER the launch succeeded
+        return {
+          ...fc.child,
+          stdout: {
+            getReader: (): never => {
+              throw new Error("reader acquisition failed");
+            },
+          },
+        };
+      },
+    };
+    const store = await openUnitContentStore(caps, {
+      cwd: join(TEST_TMP, "fake-clone"),
+      format: SHA1,
+      restFallbackBudget: 20,
+      limits: TEST_LIMITS,
+    });
+    const err = await store.read("src/a.txt", entryOf(store, "src/a.txt")).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).not.toBeNull(); // the read failed (twice, through the respawn allowance)
+    expect(killed.length).toBeGreaterThan(0); // and no launched child was left orphaned
+    await store.dispose();
+    expect(h.permits.released).toBe(h.permits.acquired); // the permit still came back
+  });
+  test("invalid FRAME limits are refused at store OPEN — before any process exists", async () => {
+    const h = makeHarness({ limits: { maxHeaderBytes: 4 } }); // below the parser's floor
+    await expect(h.open()).rejects.toThrow(GitFrameError);
+    expect(h.launches.length).toBe(0);
+    expect(h.permits.acquired).toBe(0);
+  });
   test("a protocol fault observed while DRAINING during teardown makes the disposal unclean — never masked by the teardown poison", async () => {
     const h = makeHarness({
       childOpts: [

@@ -268,7 +268,8 @@ class FramedChild {
       }, this.limits.readDeadlineMs);
       this.pending = { resolve, reject, timer };
     });
-    const sink = this.child.stdin;
+    // normalize the runtime's "no pipe" shapes (null AND undefined) before the branch
+    const sink = this.child.stdin ?? null;
     if (sink === null) {
       this.poison("child has no stdin pipe");
     } else {
@@ -299,7 +300,7 @@ class FramedChild {
     this.disposed = (async (): Promise<ChildDisposal> => {
       this.poison("disposed"); // rejects any pending read; first-fatal wins if one is already set
       try {
-        const sink = this.child.stdin;
+        const sink = this.child.stdin ?? null; // normalize the runtime's "no pipe" shapes
         // BOUNDED: a wedged async sink.end must not hang disposal — the exit wait below
         // governs teardown either way
         if (sink !== null) {
@@ -383,6 +384,11 @@ export async function openUnitContentStore(caps: ContentStoreCaps, opts: Content
   const limits = opts.limits ?? DEFAULT_CONTENT_STORE_LIMITS;
   if (!Number.isSafeInteger(opts.restFallbackBudget) || opts.restFallbackBudget < 0)
     throw new ContentStoreError("budget", `restFallbackBudget must be a nonnegative safe integer (got ${opts.restFallbackBudget})`);
+  // Probe-validate the FRAME limits now, before any process exists: BatchFrameParser/ByteRing
+  // validate their bounds at construction, and discovering an invalid limit only at the first
+  // canonical read would burn the unit's respawn allowance on a configuration fault.
+  new BatchFrameParser(opts.format, { maxHeaderBytes: limits.maxHeaderBytes, frameCeiling: limits.frameCeiling });
+  new ByteRing(limits.stderrRingBytes);
   const res = await caps.runLsTree(opts.cwd);
   if (res.timedOut)
     throw new ContentStoreError("ls-tree-failed", `enumeration timed out for the store at ${opts.cwd}`);
@@ -465,6 +471,11 @@ export class UnitContentStore {
       } catch (e) {
         frame = await this.retryOnceOnFreshChild(ls.oid, size, path, e);
       }
+      // an abort that landed while the frame was in flight must reject THIS read even when
+      // the frame won the race — the same post-await discipline as the fallback lane: a
+      // post-abort delivery would hand scanUnit content for a unit already being torn down
+      if (this.abortedReason !== null)
+        throw new ContentStoreError("aborted", `read of ${path} aborted: ${this.abortedReason}`);
       if (frame.kind === "missing")
         throw new ContentStoreError(
           "object-missing",
@@ -492,7 +503,20 @@ export class UnitContentStore {
     try {
       this.counters.fallbackBudgetSpend++;
       this.counters.restFallbackReads.symlink++;
-      const text = await this.caps.readViaRestFallback(path, entry);
+      let text: string | null;
+      try {
+        text = await this.caps.readViaRestFallback(path, entry);
+      } catch (e) {
+        // abort-first on the REJECTION path too: when the abort landed while the request was
+        // in flight, the abort is the operative cause of this read's failure — the transport
+        // error it induced (or raced) rides along as diagnosis, never as the label
+        if (this.abortedReason !== null)
+          throw new ContentStoreError(
+            "aborted",
+            `read of ${path} aborted: ${this.abortedReason} (the in-flight fallback also failed: ${e instanceof Error ? e.message : String(e)})`,
+          );
+        throw e;
+      }
       // an abort that landed while the request was in flight must reject THIS read — a
       // post-abort delivery would hand scanUnit content for a unit already being torn down
       // (the child route gets the same rejection through the poison path). The spend stands:
@@ -524,7 +548,15 @@ export class UnitContentStore {
       }
       this.permitRelease = release;
     }
-    this.child = new FramedChild(this.caps.launchBatchChild(this.cwd), this.format, this.limits);
+    // TRANSACTIONAL: a manager-construction throw after the launch succeeded must not orphan
+    // a live child (it would hold its pipes with no pump, no deadline, and no teardown owner)
+    const launched = this.caps.launchBatchChild(this.cwd);
+    try {
+      this.child = new FramedChild(launched, this.format, this.limits);
+    } catch (e) {
+      killWithEscalation(launched, []);
+      throw e;
+    }
     return this.child;
   }
 
@@ -555,6 +587,11 @@ export class UnitContentStore {
     try {
       return await (await this.ensureChild()).readObject({ oid, size });
     } catch (e2) {
+      // an abort/dispose that landed during the REPLACEMENT read is its own outcome — it must
+      // never be relabelled as a double death (the child was poisoned by the abort, not by git)
+      if (this.abortedReason !== null)
+        throw new ContentStoreError("aborted", `read of ${path} aborted: ${this.abortedReason}`);
+      if (this.disposedP !== null) throw new ContentStoreError("store-disposed", `read of ${path} after dispose()`);
       // an immediately-failing REPLACEMENT is the same double death — the FIRST child's
       // retained diagnosis matters most on exactly this path
       throw new ContentStoreError("child-died-twice", withFirst(`batch child died twice: ${describe(e2)}`));

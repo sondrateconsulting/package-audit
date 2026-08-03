@@ -223,7 +223,9 @@ export interface LaunchedChild {
   readonly pid: number;
   readonly stdout: { getReader(): StreamReader };
   readonly stderr: { getReader(): StreamReader };
-  readonly stdin: StdinSink | null;
+  // honest about the runtime: a non-pipe stdin surfaces as undefined on the real handle and
+  // null on structural fakes — consumers must treat both as "no pipe"
+  readonly stdin: StdinSink | null | undefined;
   readonly exited: Promise<number>;
   kill(signal?: number): void;
   unref(): void;
@@ -1173,11 +1175,13 @@ export class GithubClient {
     if (!Number.isFinite(concurrency) || concurrency < 1)
       throw new Error(`concurrency must be >= 1 (got ${concurrency}) — a zero-slot semaphore hangs the first acquire forever`);
     this.baseEnv = opts.env ?? process.env;
-    this.bins = opts.binPaths ?? {
-      gh: whichIn(this.baseEnv, "gh"),
-      git: whichIn(this.baseEnv, "git"),
-      tar: whichIn(this.baseEnv, "tar"),
-    };
+    // Defensive COPY, never the caller's object: this.bins is re-read at every launch (after
+    // semaphore awaits), so retaining a caller-owned reference would let a post-construction
+    // mutation swap the validated binary for another executable in the acquire gap.
+    const bp = opts.binPaths;
+    this.bins = bp === undefined
+      ? { gh: whichIn(this.baseEnv, "gh"), git: whichIn(this.baseEnv, "git"), tar: whichIn(this.baseEnv, "tar") }
+      : { gh: bp.gh, git: bp.git, tar: bp.tar };
     this.ghEnv = buildGhEnv(this.baseEnv, this.githubHost);
     // PROMPT-TUI §U3.2: the waiter gauge. Both clients (preflight + scan) report their OWN
     // semaphore's queue depth through the one hub — each emission overwrites the scalar, and it
@@ -1404,12 +1408,22 @@ export class GithubClient {
     // override), then guard and launch THE COPY: validating the caller's array and launching
     // it later would let a mutation inside the semaphore-acquire gap swap the validated
     // tuple for something else (the guard hardening's copy-then-check discipline, applied at
-    // the launch layer too). A non-string or ghost slot lands in the copy as-is and the
-    // guard's own-slot sweep rejects it.
+    // the launch layer too). A ghost/non-string slot is refused here rather than smuggled
+    // into the copy behind a cast.
     const argv: string[] = [];
-    for (let i = 0; i < args.length; i++) argv.push(args[i] as string);
+    for (let i = 0; i < args.length; i++) {
+      const v: unknown = args[i];
+      if (typeof v !== "string") throw new GithubApiError(`gitBytes argv slot ${i} is not a string`, {});
+      argv.push(v);
+    }
     assertSpawnAllowed(this.bins.git, argv);
     assertReadOnlyGit(argv);
+    // The byte-capture lane serves LOCAL read verbs only. `clone` — allowlisted in the shared
+    // git grammar — is refused HERE: its destination positional is a write target whose
+    // containment lives in the string lane's wrapper (git()), and a byte-lane clone would
+    // bypass exactly that check. Structural refusal beats duplicating the containment walk.
+    if (argv[0] === "clone")
+      throw new GithubApiError("gitBytes refuses clone — write-destination verbs travel the string lane with its containment", {});
     assertContained(cwd, [this.tempRoot]); // §0: git is the only process allowed cwd inside a clone
     const env = buildGitEnv(this.baseEnv, this.ensureGitConfig());
     const release = await this.sem.acquire();

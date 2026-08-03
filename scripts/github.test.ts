@@ -3193,7 +3193,9 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     const { client } = makeClient([], {
       spawnTimeoutMs: 40,
       launchImpl: () => {
-        fake = fakeOneShot({ stayOpen: true }); // a silent child that never exits on its own
+        // the child EMITS partial listing bytes, then wedges: the synthetic 124 must discard
+        // them — a timed-out capture surfacing partial bytes would read as a complete listing
+        fake = fakeOneShot({ stdout: ["100644 blob aaaa 5\tsrc/x"], stayOpen: true });
         return fake.child;
       },
     });
@@ -3201,8 +3203,55 @@ describe("T2c spawn seam: gitBytes + launchBatchChild + the child permit pool", 
     const res = await client.gitBytes(LS_TUPLE, dir);
     expect(res.timedOut).toBe(true);
     expect(res.exitCode).toBe(124);
-    expect(res.stdout.byteLength).toBe(0); // a timed-out capture is never partial data
+    expect(res.stdout.byteLength).toBe(0); // the partial bytes were discarded, never surfaced
     expect(fake!.kills.length).toBeGreaterThan(0);
+  });
+  test("gitBytes: refuses clone even in its grammar-legal shape — write-destination verbs stay on the string lane", async () => {
+    const launches: LaunchRequest[] = [];
+    const { client } = makeClient([], {
+      launchImpl: (_bin, _args, req) => {
+        launches.push(req);
+        return fakeOneShot({}).child;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-clone-"));
+    const cloneArgv = [
+      "clone", "--depth", "1", "--single-branch", "--branch", "main",
+      "--no-tags", "--no-recurse-submodules", "--template=", "https://github.com/o/r.git", join(dir, "dest"),
+    ];
+    await expect(client.gitBytes(cloneArgv, dir)).rejects.toThrow(/refuses clone/);
+    expect(launches.length).toBe(0);
+  });
+  test("gitBytes: a non-string argv slot is refused before the guards run", async () => {
+    const launches: LaunchRequest[] = [];
+    const { client } = makeClient([], {
+      launchImpl: (_bin, _args, req) => {
+        launches.push(req);
+        return fakeOneShot({}).child;
+      },
+    });
+    const dir = mkdtempSync(join(TEST_TMP, "gb-nonstring-"));
+    const hostile = ["ls-tree", 42, "-z"] as unknown as string[];
+    await expect(client.gitBytes(hostile, dir)).rejects.toThrow(/not a string/);
+    expect(launches.length).toBe(0);
+  });
+  test("binPaths is defensively copied — mutating the caller's object after construction cannot swap the binary", async () => {
+    const callerBins = { ...BINS };
+    const seenBins: string[] = [];
+    const spawn: SpawnFn = async (bin) => {
+      seenBins.push(bin);
+      return ok(http(200, {}, "{}"));
+    };
+    const client = new GithubClient({
+      githubHost: "github.com",
+      spawnImpl: spawn,
+      binPaths: callerBins,
+      tempRoot: TEST_TMP,
+      env: { HOME: "/home/u", PATH: "/bin" },
+    });
+    callerBins.gh = "/evil/replacement"; // post-construction mutation of the caller's object
+    await client.gh(["api", "rate_limit"]);
+    expect(seenBins).toEqual([BINS.gh]); // the client spawned its own copy, not the mutation
   });
   test("launchBatchChild: guarded + containment-checked, launched with a stdin PIPE, and NEVER holding a global permit", async () => {
     let releaseFirst!: () => void;
