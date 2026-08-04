@@ -47,7 +47,7 @@ const FIXED_CTX: DossierContext = {
   runId: "run-fixture",
   generatedAt: T0,
   config: { cutoffDate: "2024-01-01", githubHost: "github.com", organizations: ["org-a"] },
-  summary: { repositoriesScanned: 2, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+  summary: { repositoriesScanned: 2, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesDeferred: 0 },
   formatVersion: XRAY_FORMAT_VERSION,
 };
 
@@ -485,6 +485,14 @@ describe("designed empty state (coverage receipts)", () => {
     expect(html).toContain("1 branch skipped by the 2024-01-01 cutoff");
     expect(html).toContain("Detection is scoped to the scanned slice");
     expect(html).not.toContain("not coupled");
+    // zero deferred renders NO receipt — this suppression is what keeps the golden byte pins valid
+    expect(html).not.toContain("deferred by throttle");
+  });
+
+  test("a nonzero deferred count joins the coverage receipts (an empty page must not imply a complete slice)", () => {
+    const deferredCtx = { ...FIXED_CTX, summary: { ...FIXED_CTX.summary, branchesDeferred: 2 } };
+    const html2 = renderDossier(pkg, deferredCtx);
+    expect(html2).toContain("2 branches deferred by throttle");
   });
 
   test("keeps the byte-identical static script and the format-version footer", () => {

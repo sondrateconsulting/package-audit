@@ -102,8 +102,16 @@ describe("renderIndex", () => {
     expect(html).toContain("1 repository scanned");
     expect(html).toContain("1 branch scanned");
     expect(html).toContain("0 branches skipped by the 2024-01-01 cutoff");
+    // zero deferred renders NO receipt — this suppression is what keeps GOLDEN_INDEX_SHA256 valid
+    expect(html).not.toContain("deferred by throttle");
     expect(html).toContain("run run-fixture");
     expect(html).toContain(`generated ${T0}`);
+  });
+
+  test("a nonzero deferred count joins the coverage receipts (the index must not imply a complete slice)", () => {
+    const base = fixtureReport();
+    const deferred: DossierReport = { ...base, summary: { ...base.summary, branchesDeferred: 3 } };
+    expect(renderIndex(deferred, OPTS)).toContain("3 branches deferred by throttle");
   });
 
   test("carries the BYTE-IDENTICAL static script and the same CSP as every dossier", () => {
@@ -132,7 +140,7 @@ describe("renderIndex — edge states", () => {
     generatedAt: T0,
     config: { cutoffDate: "2024-01-01", githubHost: "github.com", organizations: ["org-a"] },
     packages,
-    summary: { repositoriesScanned: 0, branchesScanned: 0, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+    summary: { repositoriesScanned: 0, branchesScanned: 0, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesDeferred: 0 },
     scanScope: { excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "complete" },
   });
 
@@ -159,7 +167,7 @@ describe("renderIndex — edge states", () => {
   test("scan-scope panel: disposition ledger, subcounts, and esc() on hostile branch names + deny patterns", () => {
     const report: DossierReport = {
       ...baseReport([]),
-      summary: { repositoriesScanned: 1, branchesScanned: 2, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 2, branchesPastCap: 1 },
+      summary: { repositoriesScanned: 1, branchesScanned: 2, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 2, branchesPastCap: 1, branchesDeferred: 0 },
       scanScope: {
         excludedByDeny: 1, excludedByAllow: 1, defaultBranchPolicyOverrides: 1,
         policyBranches: [
@@ -197,7 +205,7 @@ describe("renderIndex — edge states", () => {
     expect(complete).not.toContain("were not fully recorded"); // default fixture is v4-native
     const preUpgrade: DossierReport = {
       ...baseReport([]),
-      summary: { repositoriesScanned: 1, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+      summary: { repositoriesScanned: 1, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesDeferred: 0 },
       scanScope: { excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "pre-upgrade" },
     };
     const html = renderIndex(preUpgrade, OPTS);

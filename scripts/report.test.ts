@@ -81,7 +81,7 @@ describe("buildReport (§7)", () => {
     expect(report.summary).toEqual({
       organizationsScanned: 1, repositoriesScanned: 1, branchesScanned: 1,
       branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
-      totalDependencyFindings: 1, totalUsageFindings: 2,
+      branchesDeferred: 0, totalDependencyFindings: 1, totalUsageFindings: 2,
     });
     // new top-level report fields
     expect(report.formatVersion).toBe(XRAY_FORMAT_VERSION);
@@ -1006,5 +1006,55 @@ describe("parseLockfileLines — corrupted self-produced data degrades to null, 
   });
   test("a valid positive safe-integer array parses (including large in-range values)", () => {
     expect(parseLockfileLines("[1, 42, 999999]")).toEqual([1, 42, 999999]);
+  });
+});
+
+describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", () => {
+  const key = (repository: string, branch: string, configHash = "h") =>
+    ({ configHash, scope: "branch" as const, organization: "org-a", repository, branch });
+
+  test("counts ONLY this config's pending branch-scope queue rows — terminal statuses and foreign configs never count", () => {
+    const db = mem();
+    const run = seed(db); // configHash "h"
+    // two §4-deferred units (throttle leaves them pending, carrying the throttle message)...
+    db.enqueueUnit(key("svc", "feat-a"), run.runId);
+    db.setUnitStatus(key("svc", "feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    db.enqueueUnit(key("svc", "feat-b"), run.runId);
+    db.setUnitStatus(key("svc", "feat-b"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    // ...one of each settled queue status, none of which is deferred work...
+    db.enqueueUnit(key("svc", "main"), run.runId);
+    db.setUnitStatus(key("svc", "main"), { status: "done", runId: run.runId, lastCommitSha: "abc123def", lastCommitDate: "2025-06-01T12:00:00Z" });
+    db.enqueueUnit(key("svc", "old"), run.runId);
+    db.setUnitStatus(key("svc", "old"), { status: "skipped", runId: run.runId });
+    db.enqueueUnit(key("svc", "broken"), run.runId);
+    db.setUnitStatus(key("svc", "broken"), { status: "error", runId: run.runId, errorMessage: "boom" });
+    // ...and another config's pending backlog, which is not this config's deferral.
+    db.enqueueUnit(key("svc", "feat-a", "other-config"), run.runId);
+    const s = buildReport(db, run).summary;
+    expect(s.branchesDeferred).toBe(2);
+    // the partition identity is untouched: deferred is a queue-side count, never an error or a disposition
+    expect(s.branchesErrored).toBe(0);
+    expect(s.branchesScanned).toBe(1);
+    db.close();
+  });
+
+  test("is the CURRENT backlog at generation time: a later run finishing the unit drains an older run's count to 0", () => {
+    const db = mem();
+    const run = seed(db);
+    db.enqueueUnit(key("svc", "feat-a"), run.runId);
+    db.setUnitStatus(key("svc", "feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    expect(buildReport(db, run).summary.branchesDeferred).toBe(1);
+    // The §4 contract: a FUTURE run picks the unit up (a completed run is never resumed — startRun
+    // reattaches only to status='running')...
+    const { runId: nextRunId, resumed } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    expect(resumed).toBe(false);
+    db.setUnitStatus(key("svc", "feat-a"), { status: "done", runId: nextRunId, lastCommitSha: "abc123def", lastCommitDate: "2025-06-01T12:00:00Z" });
+    // ...and re-rendering the OLD run's report then reports the drained (current) backlog, by design:
+    // the count answers "what does this config still owe", which self-expires once a run finishes it.
+    expect(buildReport(db, run).summary.branchesDeferred).toBe(0);
+    db.close();
   });
 });

@@ -1446,7 +1446,8 @@ summary.
                                                  //   packageName/version (§5.E per-version introspection)
   "summary": { "organizationsScanned":0,"repositoriesScanned":0,"branchesScanned":0,
                "branchesSkippedByCutoff":0,"branchesExcludedByPolicy":0,"branchesPastCap":0,
-               "branchesErrored":0,"totalDependencyFindings":0,"totalUsageFindings":0 },
+               "branchesErrored":0,"branchesDeferred":0,
+               "totalDependencyFindings":0,"totalUsageFindings":0 },
   "scanScope": { "excludedByDeny":0,"excludedByAllow":0,"defaultBranchPolicyOverrides":0,
                  "policyBranches":[ ... ],"provenance":"complete" }  // branch allow/deny diagnostics;
                                                  //   provenance: 'complete' | 'pre-upgrade' —
@@ -1458,8 +1459,9 @@ summary.
                                                  //   understate what that run actually evaluated
 }
 ```
-Summary derivation — ALL per-run from the IMMUTABLE `run_unit_head` slice for the reported
-run (NEVER from the mutable work_queue, which is cross-run): `branchesScanned` =
+Summary derivation — every count but ONE from the IMMUTABLE `run_unit_head` slice for the
+reported run, never the mutable cross-run work_queue (`branchesDeferred` is the sanctioned
+exception, defined after the throttle carve-out below): `branchesScanned` =
 COUNT(*) WHERE run_id=R AND status='scanned'; `branchesSkippedByCutoff` = COUNT WHERE
 run_id=R AND status='skipped-cutoff' — GENUINE cutoff only, because a policy exclusion carries
 its OWN status and can never be folded in by an under-specified filter;
@@ -1474,8 +1476,19 @@ it as exactly that, since on a RESUMED run it diverges from "every branch whose 
 in both directions (see scripts/report.ts). Together the five account for every branch that
 reached a TERMINAL outcome — an equality on a single-invocation run, an upper bound on a
 resumed one. A THROTTLE-REQUEUED branch is deferred, not terminal: it writes neither a row nor
-a NEW error, and with no prior same-run error it is in no count (an earlier invocation's
-append-only error still counts it — the resumed-run divergence above). Decide policy dispositions ONLY via both status and policy_status
+a NEW error, and with no prior same-run error it is in none of THOSE counts (an earlier
+invocation's append-only error still counts it — the resumed-run divergence above).
+`branchesDeferred` surfaces exactly that remainder: COUNT of work_queue rows WHERE
+config_hash = the run's AND scope='branch' AND status='pending' at report build — the ONE
+count read from the MUTABLE cross-run queue, sanctioned because the deferred remainder
+exists nowhere else in SQLite. It is therefore the CURRENT backlog at generation time
+(re-rendering an old --run-id after later runs drain the queue reports 0 — §4's contract is
+precisely that a future run finishes the work), it sits OUTSIDE the terminal identity above
+(on a resumed run a deferred branch can also hold an earlier invocation's error or retained
+row, so summing it in would double-count), it UNDERCOUNTS branches a throttled owner/repo
+discovery never enumerated (nothing was enqueued for them — though prior-run pending rows
+beneath such a repo remain counted), and it retains a since-deleted branch's pending row
+(nothing prunes work_queue) until that row is rescanned or removed. Decide policy dispositions ONLY via both status and policy_status
 (scripts/policyDisposition.ts); `policy_status IS NOT NULL` alone is never a proxy for
 "excluded" (a scanned default branch carries the counterfactual). The guard validates the
 WHOLE row, not just those two columns: `is_default_branch` is load-bearing in BOTH

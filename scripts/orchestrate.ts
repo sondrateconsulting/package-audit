@@ -222,6 +222,11 @@ export function runSummaryText(
     `  Organizations scanned:  ${s.organizationsScanned}`,
     `  Repositories scanned:   ${s.repositoriesScanned}`,
     `  Branches scanned:       ${s.branchesScanned} (${s.branchesSkippedByCutoff} skipped by cutoff · ${s.branchesExcludedByPolicy} excluded by policy · ${s.branchesPastCap} past cap · ${s.branchesErrored} scan-errored)`,
+    // Deferred sits OUTSIDE the parenthetical partition above (non-terminal, not a disposition) and
+    // always prints — a zero documents the invariant. Nonzero means §4 rate limiting requeued part of
+    // the estate for a future run, so the line must flag the counters as partial: the exact failure
+    // this guards is a one-shot/CI run under sustained throttling reading as a clean, complete audit.
+    `  Branches deferred:      ${s.branchesDeferred} (throttle-requeued; a future run finishes them)${s.branchesDeferred > 0 ? " — the scanned counts above are PARTIAL" : ""}`,
     `  Dependency findings:    ${s.totalDependencyFindings}`,
     `  Usage findings:         ${s.totalUsageFindings}`,
     `  Errors recorded:        ${errorCount} (fail-soft; details in the report's errors[])`,
@@ -758,7 +763,9 @@ export async function processRepo(
   // but the sentinels alone still settle it.)
   // Sharp edge worth knowing: the ERROR variant is loud (an errors[] row + a JSONL `action:"error"`
   // line, visible beside the stale row), but the THROTTLE variant writes neither — only a stdout
-  // requeue line — so a completed run can present the old head with no in-report signal. Related: the
+  // requeue line plus the unit left pending, which the report's AGGREGATE branchesDeferred counts —
+  // so a completed run still presents the old head with no in-report signal NAMING the branch (the
+  // count says how many were deferred, not which). Related: the
   // retained row also masks that branch from the report's branchesErrored, which counts only errored
   // branches holding NO row (see report.ts).
   const pruned = db.reconcileRunUnitHead(runId, repo.organization, repo.name, heads.map((h) => h.name));

@@ -9,6 +9,7 @@ import { compileRepositoryPolicy, RepoPolicyMatchError } from "./repositoryPolic
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type LaunchedChild, type LaunchFn, type RepoInfo, type SpawnFn, type StreamReader } from "./github.ts";
 import { gitBlobOid } from "./gitFrame.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
+import { buildReport } from "./report.ts";
 import { Aborter } from "./boundedPool.ts";
 import type { Config } from "./config.ts";
 import type { OrchestrateArgs } from "./args.ts";
@@ -1785,17 +1786,32 @@ describe("runSummaryText", () => {
     const text = runSummaryText("run-abc", {
       organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
       branchesSkippedByCutoff: 13, branchesExcludedByPolicy: 5, branchesPastCap: 2, branchesErrored: 4,
-      totalDependencyFindings: 104, totalUsageFindings: 994,
+      branchesDeferred: 0, totalDependencyFindings: 104, totalUsageFindings: 994,
     }, 3, "output/run-run-abc.json");
     // labels + values pinned; column padding is cosmetic and free to change
     expect(text).toContain("AUDIT COMPLETE — run run-abc");
     expect(text).toMatch(/Organizations scanned:\s+2\b/);
     expect(text).toMatch(/Repositories scanned:\s+7\b/);
     expect(text).toMatch(/Branches scanned:\s+88 \(13 skipped by cutoff · 5 excluded by policy · 2 past cap · 4 scan-errored\)/);
+    // the deferred line always prints (a zero documents the invariant), WITHOUT the partial warning
+    expect(text).toMatch(/Branches deferred:\s+0 \(throttle-requeued; a future run finishes them\)/);
+    expect(text).not.toContain("PARTIAL");
     expect(text).toMatch(/Dependency findings:\s+104\b/);
     expect(text).toMatch(/Usage findings:\s+994\b/);
     expect(text).toMatch(/Errors recorded:\s+3 \(fail-soft/);
     expect(text).toContain("output/run-run-abc.json (+ latest.json)");
+  });
+
+  test("a NONZERO deferred count flags the scanned counters as PARTIAL — never a clean-looking summary", () => {
+    const text = runSummaryText("run-abc", {
+      organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
+      branchesSkippedByCutoff: 13, branchesExcludedByPolicy: 5, branchesPastCap: 2, branchesErrored: 0,
+      branchesDeferred: 37, totalDependencyFindings: 104, totalUsageFindings: 994,
+    }, 0, "output/run-run-abc.json");
+    // the exact field condition this line exists for: sustained rate limiting with zero recorded
+    // errors must not read as a complete audit
+    expect(text).toMatch(/Errors recorded:\s+0\b/);
+    expect(text).toMatch(/Branches deferred:\s+37 \(throttle-requeued; a future run finishes them\) — the scanned counts above are PARTIAL/);
   });
 });
 
@@ -1898,6 +1914,20 @@ describe("processRepo throttle requeue (§4)", () => {
     expect(db.getUnit(KEY)?.status).toBe("pending"); // a later run retries it
     const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all();
     expect(errs.length).toBe(0);
+    db.close();
+  });
+
+  test("the report SURFACES the requeued remainder: branchesDeferred counts it, the error partition stays empty", async () => {
+    // End-to-end pin of the §4 → §7 seam: the same requeue that leaves no row and no errors[]
+    // entry (the carve-out) must land in summary.branchesDeferred, so a one-shot run finished
+    // under sustained rate limiting cannot deliver an all-clean report while work was deferred.
+    const { db, runId } = openRun();
+    await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), rt(config, "hash"), runId, "o", repo, [], new Set());
+    db.completeRun(runId);
+    const s = buildReport(db, db.getRun(runId)!).summary;
+    expect(s.branchesDeferred).toBe(1);
+    expect(s.branchesErrored).toBe(0); // deferred stays OUT of the error count (deferred ≠ errored)
+    expect(s.branchesScanned).toBe(0);
     db.close();
   });
 
