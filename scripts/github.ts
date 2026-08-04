@@ -2217,8 +2217,8 @@ export class GithubClient {
         if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
         // DELIBERATELY no broad restGet-style nonzero-exit truncation guard: gh exits 1 BY DESIGN after
         // a COMPLETE HTTP-200 envelope whose body carries `errors` (incl. genuine RATE_LIMITED /
-        // already-exceeded RATE_LIMIT throttles), so a
-        // nonzero exit under a parsed 200 is the NORMAL semantic-error shape, not truncation (a broad
+        // already-exceeded RATE_LIMIT throttles), so a nonzero exit under a parsed 200 is the NORMAL
+        // semantic-error shape, not truncation (a broad
         // guard would blind-retry real throttles). classifyGraphql runs FIRST on whatever error
         // evidence WAS readable: status/header semantics (5xx, throttle, SSO-fatal) are never
         // downgraded by a malformed body — malformation (and a 2xx-non-200 status) only preempts the
