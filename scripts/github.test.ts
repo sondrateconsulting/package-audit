@@ -298,7 +298,10 @@ describe("classifyRest / classifyGraphql / parseRetryAfterMs", () => {
   });
   test("graphql SSO short-circuits the already-exceeded RATE_LIMIT spelling too", () => {
     // Twin of the RATE_LIMITED pin above. SSO precedence over a rate-limit body is intentional
-    // pinned behavior — do NOT read either pin as "a rate-limit body is never fatal".
+    // pinned behavior — do NOT read either pin as "a rate-limit body is never fatal". The SSO
+    // short-circuit returns before bodyErrors is read, so this pin guards SSO-over-throttle
+    // precedence when both signals coexist — not the type literal; the classify fixtures above
+    // pin the literal itself.
     const cls = classifyGraphql(403, { "x-ratelimit-remaining": "0", "x-github-sso": "required" }, [{ type: "RATE_LIMIT" }], NOW);
     expect(cls.kind).toBe("fatal");
     if (cls.kind === "fatal") expect(cls.ssoRequired).toBe(true);
