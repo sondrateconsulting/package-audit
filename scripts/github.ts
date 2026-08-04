@@ -790,8 +790,8 @@ export function classifyGraphql(
 ): Classification {
   const primaryFromHeaders = (): Classification => ({ kind: "primary", untilMs: primaryUntilMs(headers, nowMs) });
   // SSO enforcement is ALWAYS fatal, never a retryable throttle — short-circuit on an error
-  // status BEFORE the RATE_LIMITED body branch, so even a (hypothetical) 403 carrying both an
-  // x-github-sso header and a RATE_LIMITED body stays fatal.
+  // status BEFORE the rate-limit body branch, so even a (hypothetical) 403 carrying both an
+  // x-github-sso header and a rate-limit body (RATE_LIMITED or RATE_LIMIT) stays fatal.
   if ((status === 403 || status === 429) && headers["x-github-sso"] !== undefined)
     return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso). Remediate: gh auth refresh (see README § What the gh token needs)" };
   // §4: GraphQL PRIMARY exhaustion is keyed on the BODY error — never on the status code alone.
