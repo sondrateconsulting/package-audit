@@ -790,13 +790,17 @@ export function classifyGraphql(
 ): Classification {
   const primaryFromHeaders = (): Classification => ({ kind: "primary", untilMs: primaryUntilMs(headers, nowMs) });
   // SSO enforcement is ALWAYS fatal, never a retryable throttle — short-circuit on an error
-  // status BEFORE the RATE_LIMITED body branch, so even a (hypothetical) 403 carrying both an
-  // x-github-sso header and a RATE_LIMITED body stays fatal.
+  // status BEFORE the rate-limit body branch, so even a (hypothetical) 403 carrying both an
+  // x-github-sso header and a rate-limit body (RATE_LIMITED or RATE_LIMIT) stays fatal.
   if ((status === 403 || status === 429) && headers["x-github-sso"] !== undefined)
     return { kind: "fatal", status, ssoRequired: true, message: "SSO authorization required (x-github-sso). Remediate: gh auth refresh (see README § What the gh token needs)" };
-  // §4: GraphQL PRIMARY exhaustion is keyed on the BODY error (arrives as HTTP 200 with
-  // errors[].type == 'RATE_LIMITED' and remaining 0) — never on the status code alone.
-  const rateLimited = bodyErrors.some((e) => e.type === "RATE_LIMITED");
+  // §4: GraphQL PRIMARY exhaustion is keyed on the BODY error — never on the status code alone.
+  // Two spellings ride the HTTP-200 envelope: 'RATE_LIMITED' (documented, mid-window) and
+  // 'RATE_LIMIT' (observed once the window is ALREADY exceeded — "API rate limit already
+  // exceeded for user ID <id>"). Exact type literals only: this branch runs BEFORE the 403
+  // permission handling below, so matching on e.message could reclassify a permission error
+  // that merely quotes a rate-limit phrase.
+  const rateLimited = bodyErrors.some((e) => e.type === "RATE_LIMITED" || e.type === "RATE_LIMIT");
   if (rateLimited) {
     if (headers["x-ratelimit-remaining"] === "0") return primaryFromHeaders();
     return { kind: "secondary", waitMs: retryAfterClampedMs(headers, nowMs) };
@@ -2197,8 +2201,9 @@ export class GithubClient {
 
     // Same lease discipline as restGet: spawn + classify + arm inside ghBucketedAttempt so a queued
     // caller never spawns into an about-to-open pause. GraphQL classification reads the HTTP-200 BODY
-    // (RATE_LIMITED lives there, not just in headers), so parseGraphqlEnvelope + classifyGraphql run
-    // INSIDE the lease; the ok-branch post-checks (exact-200, malformed-envelope) run in the caller.
+    // (the RATE_LIMITED / already-exceeded RATE_LIMIT throttle types live there, not just in headers),
+    // so parseGraphqlEnvelope + classifyGraphql run INSIDE the lease; the ok-branch post-checks
+    // (exact-200, malformed-envelope) run in the caller.
     type GqlOutcome =
       | { kind: "ok"; data: unknown; malformed: string | null; status: number; exitCode: number; stderr: string }
       | { kind: "fatal"; status: number; ssoRequired: boolean; message: string }
@@ -2211,8 +2216,9 @@ export class GithubClient {
         // rides its already-parsed headers out as a reference (PROMPT-TUI §U3.3).
         if (parsed.status === 0) return { outcome: { kind: "no-response", stderr: res.stderr }, pauseUntilMs: null };
         // DELIBERATELY no broad restGet-style nonzero-exit truncation guard: gh exits 1 BY DESIGN after
-        // a COMPLETE HTTP-200 envelope whose body carries `errors` (incl. genuine RATE_LIMITED), so a
-        // nonzero exit under a parsed 200 is the NORMAL semantic-error shape, not truncation (a broad
+        // a COMPLETE HTTP-200 envelope whose body carries `errors` (incl. genuine RATE_LIMITED /
+        // already-exceeded RATE_LIMIT throttles), so a nonzero exit under a parsed 200 is the NORMAL
+        // semantic-error shape, not truncation (a broad
         // guard would blind-retry real throttles). classifyGraphql runs FIRST on whatever error
         // evidence WAS readable: status/header semantics (5xx, throttle, SSO-fatal) are never
         // downgraded by a malformed body — malformation (and a 2xx-non-200 status) only preempts the

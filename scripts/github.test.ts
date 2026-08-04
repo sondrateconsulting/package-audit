@@ -249,6 +249,27 @@ describe("classifyRest / classifyGraphql / parseRetryAfterMs", () => {
     const secondary = classifyGraphql(200, { "x-ratelimit-remaining": "50" }, [{ type: "RATE_LIMITED" }], NOW);
     expect(secondary.kind).toBe("secondary");
   });
+  test("graphql: the already-exceeded RATE_LIMIT spelling is the same throttle, with the exact reset+skew pause (§4)", () => {
+    const primary = classifyGraphql(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1000000100" }, [{ type: "RATE_LIMIT" }], NOW);
+    expect(primary.kind).toBe("primary");
+    if (primary.kind === "primary") expect(primary.untilMs).toBe(1_000_000_100_000 + 5_000);
+    const secondary = classifyGraphql(200, { "x-ratelimit-remaining": "50" }, [{ type: "RATE_LIMIT" }], NOW);
+    expect(secondary.kind).toBe("secondary");
+  });
+  test("regression: the observed already-exceeded envelope (HTTP 200, remaining 0, type RATE_LIMIT) is primary, never fatal", () => {
+    // Field-observed 2026-08-04: once the primary window is already spent, GitHub answers HTTP 200
+    // with errors[].type "RATE_LIMIT" (no "ED"; the documented mid-window spelling is "RATE_LIMITED").
+    // Classifying this shape fatal armed no bucket pause and recorded one permanent
+    // discovery-failure row per repo while every later request sprayed a dead window.
+    const cls = classifyGraphql(
+      200,
+      { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1000000100" },
+      [{ type: "RATE_LIMIT", message: "API rate limit already exceeded for user ID 123" }],
+      NOW,
+    );
+    expect(cls.kind).toBe("primary");
+    if (cls.kind === "primary") expect(cls.untilMs).toBe(1_000_000_100_000 + 5_000);
+  });
   test("graphql 403 disambiguation: Retry-After/abuse → secondary; sso/permission → fatal", () => {
     expect(classifyGraphql(403, { "x-ratelimit-remaining": "5", "retry-after": "30" }, [], NOW).kind).toBe("secondary");
     expect(classifyGraphql(403, { "x-ratelimit-remaining": "5" }, [{ message: "You have exceeded a secondary rate limit" }], NOW).kind).toBe("secondary");
@@ -272,6 +293,16 @@ describe("classifyRest / classifyGraphql / parseRetryAfterMs", () => {
   });
   test("graphql SSO short-circuits even when a RATE_LIMITED body is also present", () => {
     const cls = classifyGraphql(403, { "x-ratelimit-remaining": "0", "x-github-sso": "required" }, [{ type: "RATE_LIMITED" }], NOW);
+    expect(cls.kind).toBe("fatal");
+    if (cls.kind === "fatal") expect(cls.ssoRequired).toBe(true);
+  });
+  test("graphql SSO short-circuits the already-exceeded RATE_LIMIT spelling too", () => {
+    // Twin of the RATE_LIMITED pin above. SSO precedence over a rate-limit body is intentional
+    // pinned behavior — do NOT read either pin as "a rate-limit body is never fatal". The SSO
+    // short-circuit returns before bodyErrors is read, so this pin guards SSO-over-throttle
+    // precedence when both signals coexist — not the type literal; the classify fixtures above
+    // pin the literal itself.
+    const cls = classifyGraphql(403, { "x-ratelimit-remaining": "0", "x-github-sso": "required" }, [{ type: "RATE_LIMIT" }], NOW);
     expect(cls.kind).toBe("fatal");
     if (cls.kind === "fatal") expect(cls.ssoRequired).toBe(true);
   });
@@ -1191,16 +1222,19 @@ describe("throttle wait clamping (§4 hardening)", () => {
     expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
   });
 
-  test("a graphql RATE_LIMITED with a far-future reset sleeps exactly MAX_PAUSE_MS, then retries", async () => {
-    // exit 1 on the throttle page: gh exits nonzero for a 200-with-errors envelope BY DESIGN
-    const { client, sleeps } = makeClient([
-      err(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`), "gh: GraphQL error"),
-      ok(http(200, {}, `{"data":{"x":1}}`)),
-    ]);
-    const data = await client.graphql("query{x}", {});
-    expect(data).toEqual({ x: 1 });
-    expect(sleeps.length).toBeGreaterThanOrEqual(1);
-    expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
+  test("a graphql RATE_LIMITED/RATE_LIMIT with a far-future reset sleeps exactly MAX_PAUSE_MS, then retries", async () => {
+    // both throttle spellings: documented mid-window RATE_LIMITED and already-exceeded RATE_LIMIT
+    for (const spelling of ["RATE_LIMITED", "RATE_LIMIT"]) {
+      // exit 1 on the throttle page: gh exits nonzero for a 200-with-errors envelope BY DESIGN
+      const { client, sleeps } = makeClient([
+        err(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"errors":[{"type":"${spelling}","message":"slow down"}]}`), "gh: GraphQL error"),
+        ok(http(200, {}, `{"data":{"x":1}}`)),
+      ]);
+      const data = await client.graphql("query{x}", {});
+      expect(data).toEqual({ x: 1 });
+      expect(sleeps.length).toBeGreaterThanOrEqual(1);
+      expect(Math.max(...sleeps)).toBe(MAX_PAUSE_MS);
+    }
   });
 
   test("graphql 200 with a PRESENT-but-non-array errors field fails closed — never coerced to 'no errors'", async () => {
@@ -1291,13 +1325,17 @@ describe("throttle wait clamping (§4 hardening)", () => {
   });
 
   test("the graphql bucket has its own cumulative pause budget", async () => {
-    const poisoned = err(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}`), "gh: GraphQL error");
-    const { client, sleeps } = makeClient(Array.from({ length: 12 }, () => poisoned));
-    await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
-    expect(sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(MAX_TOTAL_PAUSE_MS);
-    const sleepsBefore = sleeps.length;
-    await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
-    expect(sleeps.length).toBe(sleepsBefore);
+    // both throttle spellings must charge the budget — a fatal misclassification would throw
+    // GithubApiError on attempt one instead of tripping ThrottleExhausted
+    for (const spelling of ["RATE_LIMITED", "RATE_LIMIT"]) {
+      const poisoned = err(http(200, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": FAR_FUTURE_SEC }, `{"errors":[{"type":"${spelling}","message":"slow down"}]}`), "gh: GraphQL error");
+      const { client, sleeps } = makeClient(Array.from({ length: 12 }, () => poisoned));
+      await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
+      expect(sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(MAX_TOTAL_PAUSE_MS);
+      const sleepsBefore = sleeps.length;
+      await expect(client.graphql("query{x}", {})).rejects.toThrow(ThrottleExhausted);
+      expect(sleeps.length).toBe(sleepsBefore);
+    }
   });
 
   test("the final attempt's pause IS published so a concurrent/follow-up caller waits the still-live window (§4 fan-out)", async () => {
