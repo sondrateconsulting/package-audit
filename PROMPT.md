@@ -752,7 +752,8 @@ plan-mode owner-discovery escape stays fatal) but with different wait computatio
   404 — which IS an `errors` row with its own classification (one exception: a 404 on a
   per-file CONTENT read within a unit is treated as "file absent", not an errors row).
   GraphQL is different: `gh api graphql` PRIMARY exhaustion arrives as HTTP 200 with a
-  body `errors[].type == 'RATE_LIMITED'` and `x-ratelimit-remaining: 0` (NOT a 403/429
+  body `errors[].type == 'RATE_LIMITED'` — or `'RATE_LIMIT'`, the field-observed spelling
+  once the window is ALREADY exceeded — and `x-ratelimit-remaining: 0` (NOT a 403/429
   status), while a SECONDARY/abuse throttle on GraphQL may surface EITHER as a 200 body
   error OR as a 403 with a message — so the branch-discovery path MUST check BOTH the
   HTTP status AND the response BODY (`errors[]`), then apply the same primary/secondary
@@ -837,7 +838,8 @@ B. Discover & prioritize branches: via `gh api graphql` querying
    entirely so the variable defaults to null (GraphQL `after: null` = first page; do NOT
    pass an empty string); on later calls pass the returned non-null cursor. Read each page's rate-limit headers (§4), concatenate
    `data.repository.refs.nodes`, and continue while `pageInfo.hasNextPage`. ALSO check each page BODY for
-   `errors[].type == 'RATE_LIMITED'` (§4 — GraphQL throttles arrive as HTTP 200). Validate
+   `errors[].type == 'RATE_LIMITED'` or the field-observed already-exceeded spelling
+   `'RATE_LIMIT'` (§4 — GraphQL throttles can be body-signalled on HTTP 200). Validate
    each head's `committedDate` as a real ISO instant, not merely a non-empty string: it is
    UNTRUSTED input that steers selection (the cutoff compares its first ten characters
    LEXICALLY), so a malformed value would silently misclassify rather than fail — and note
