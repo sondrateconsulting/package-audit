@@ -252,7 +252,7 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     // guarded only policy-BEARING rows while buildSummary counted by status alone, so a 'policy-excluded'
     // row naming no rule was counted as an exclusion yet never guarded — branchesExcludedByPolicy=1 with
     // excludedByDeny+excludedByAllow=0). Sweeping the whole set makes the two impossible to drift apart.
-    summary: buildSummary(scannedHeads, validatedHeads, depRows, usageRows, branchesErrored, branchesDeferred),
+    summary: buildSummary(scannedHeads, validatedHeads, depRows, usageRows, { branchesErrored, branchesDeferred }),
     scanScope: buildScanScope(validatedHeads),
   };
 }
@@ -264,7 +264,9 @@ function assertHeadsWellFormed(heads: HeadRow[]): HeadRow[] {
   return heads;
 }
 
-function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[], branchesErrored: number, branchesDeferred: number): ReportSummary {
+// The two externally-derived counts arrive as a keyed pair (not trailing positional numbers): a
+// call-site transposition of two same-typed numbers would typecheck, while a swapped KEY cannot.
+function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[], counts: Pick<ReportSummary, "branchesErrored" | "branchesDeferred">): ReportSummary {
   const orgs = new Set(scannedHeads.map((h) => h.organization));
   const repos = new Set(scannedHeads.map((h) => `${h.organization}/${h.repository}`));
   return {
@@ -276,8 +278,8 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
     branchesSkippedByCutoff: allHeads.filter((h) => h.status === "skipped-cutoff").length,
     branchesExcludedByPolicy: allHeads.filter(isPolicyExcluded).length,
     branchesPastCap: allHeads.filter((h) => h.status === "past-cap").length,
-    branchesErrored,
-    branchesDeferred,
+    branchesErrored: counts.branchesErrored,
+    branchesDeferred: counts.branchesDeferred,
     totalDependencyFindings: depRows.length,
     totalUsageFindings: usageRows.length,
   };
