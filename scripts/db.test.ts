@@ -1964,6 +1964,19 @@ describe("work_queue", () => {
     db.close();
   });
 
+  test("settlePastCapUnit: a MIS-SCOPED key carrying branch coordinates settles nothing — the key's own scope gates, not just the SQL", () => {
+    // WorkUnitKey's repository/branch are optional on every scope, so a type-valid scope:'org' key
+    // CAN carry a branch row's exact coordinates; binding them regardless would settle that aliased
+    // branch row. The method must reject the key by its scope, not merely pin scope='branch' in SQL.
+    const db = mem();
+    rawRun(db, "r1", "running");
+    db.enqueueUnit({ configHash: "h", scope: "branch", organization: "o", repository: "r", branch: "stale" }, "r1");
+    db.setUnitStatus({ configHash: "h", scope: "branch", organization: "o", repository: "r", branch: "stale" }, { status: "pending", runId: "r1", errorMessage: "rate limited (core)" });
+    expect(db.settlePastCapUnit({ configHash: "h", scope: "org", organization: "o", repository: "r", branch: "stale" }, "r1")).toBe(false);
+    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "o", repository: "r", branch: "stale" })!.status).toBe("pending");
+    db.close();
+  });
+
   test("listUnits filters by status in insertion order", () => {
     const db = mem();
     rawRun(db, "r1", "running");

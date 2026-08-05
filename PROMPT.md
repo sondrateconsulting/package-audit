@@ -602,7 +602,8 @@ Resumability rules:
   reproducible and truthful about what its own invocation decided (a scanned row's commit_sha
   is "the head it reported", never "the live head" — the report-head invariant below; a
   non-scanned row's commit_sha='' and discovered-head date describe the older evaluation), and
-  the unit is left `error`/`pending` so the next run refreshes it. A head-SHA-aware prune is deliberately NOT used: it would delete
+  the unit is left `error`/`pending` so a later run that still re-enumerates the branch
+  refreshes it (a retry can throttle again). A head-SHA-aware prune is deliberately NOT used: it would delete
   the commit_sha='' sentinels the non-scanned dispositions rely on.
 - Report-head invariant (co-designed with the skip predicate): as each unit is
   processed (scanned OR skipped-as-current), the run upserts `run_unit_head(run_id, org,

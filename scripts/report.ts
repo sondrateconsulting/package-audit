@@ -118,15 +118,17 @@ export interface ReportSummary {
   // Source: the MUTABLE cross-run work_queue — the ONE summary count read outside the immutable
   // run_unit_head slice (PROMPT.md §7 sanctions the exception). By design, then, this is the CURRENT
   // backlog at generation time: re-rendering an old --run-id after later runs drain the queue reports
-  // 0 — the count answers "what does this config still owe", a debt a future run pays only for the
-  // units it still re-enumerates. Known skews, queue-inherited (non-exhaustive): a throttled
+  // 0 — the count answers "what does this config still owe", a debt a future run retries or settles
+  // only for the units it still re-enumerates (a retry can throttle again). Known skews,
+  // queue-inherited (non-exhaustive): a throttled
   // owner/repo DISCOVERY enqueues nothing, so branches it never enumerated are invisible here
   // (UNDERCOUNT — though prior-run pending rows under such a repo remain and do count); and a
   // pending row whose unit is never RE-ENUMERATED lingers (OVERCOUNT — nothing prunes work_queue):
   // its branch deleted, its repo out of the kept set (deleted, renamed, newly archived/fork-filtered,
   // or displaced past maxReposPerOrg — the reconciliation taxonomy), or its owner no longer
-  // discovered or accessible. Re-enumeration settles the row instead: scanned/skip-current → 'done',
-  // skip-cutoff/skip-policy → 'skipped', past-cap → 'skipped' via settlePastCapUnit.
+  // discovered or accessible. Re-enumeration otherwise settles the row (scanned/skip-current →
+  // 'done'; skip-cutoff/skip-policy → 'skipped'; past-cap → 'skipped' via settlePastCapUnit) — or
+  // throttles again and leaves it pending.
   branchesDeferred: number;
   totalDependencyFindings: number;
   totalUsageFindings: number;

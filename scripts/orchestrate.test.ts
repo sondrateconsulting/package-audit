@@ -2059,13 +2059,9 @@ describe("past-cap settles a stale throttle-pending queue row (§4→§7 double-
   // Run B itself is THROTTLE-FREE (its scan failures are permanent GithubApiErrors), so its report
   // must partition feat-x exactly once (past-cap): an unsettled pending row would double-count the
   // branch into branchesDeferred and flag this throttle-free run's summary PARTIAL.
-  // Derived from the shared §4 config (the scanConfig precedent below) rather than a fresh partial
-  // literal, so it inherits every field the stubs rely on and only overrides what this scenario needs.
-  const capConfig = Object.freeze({
-    ...(config as unknown as Record<string, unknown>),
-    maxBranchesPerRepo: 1,
-    branches: null, excludeBranches: [], // explicit unrestricted policy — rt() compiles from these
-  }) as unknown as Config;
+  // A COMPLETE typed Config (no cast): testConfig carries every required field, the branch cap is
+  // its second parameter, and its default branches:null/excludeBranches:[] is the unrestricted
+  // policy rt() compiles from.
   const featX: BranchHead = { name: "feat-x", oid: "c".repeat(40), committedDate: "2026-01-01T00:00:00Z", treeOid: "d".repeat(40) };
   const featY: BranchHead = { name: "feat-y", oid: "e".repeat(40), committedDate: "2026-02-01T00:00:00Z", treeOid: "f".repeat(40) };
   const capMain: BranchHead = { name: "main", oid: "a".repeat(40), committedDate: "2026-03-01T00:00:00Z", treeOid: "b".repeat(40) };
@@ -2078,6 +2074,8 @@ describe("past-cap settles a stale throttle-pending queue row (§4→§7 double-
   });
 
   test("run B (throttle-free) reports the churned-out branch as past-cap ONLY — settled queue row, zero deferred, no PARTIAL", async () => {
+    const root = mkdtempSync(join(tmpdir(), "past-cap-settle-"));
+    const capConfig = testConfig(root, 1); // cap: ONE non-default slot
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     // Run A: heads arrive committedDate DESC; feat-x fills the single non-default slot; both scans throttle.
     const runA = startCapRun(db);
@@ -2101,6 +2099,7 @@ describe("past-cap settles a stale throttle-pending queue row (§4→§7 double-
     // …and the human summary of this throttle-free run must NOT read as partial.
     expect(runSummaryText(runB.runId, s, 2, "output/run-x.json")).not.toContain("PARTIAL");
     db.close();
+    rmSync(root, { recursive: true, force: true });
   });
 });
 
@@ -2113,7 +2112,7 @@ describe("same-name stale-head retention is DISPOSITION-AGNOSTIC", () => {
     // (now eligible, toScan) but its scan ERRORS → no replacement row is written, the name-keyed
     // prune keeps the branch (it is in the live keep-set), and the OLD skipped-cutoff row survives —
     // the report counts the branch in the cutoff bucket this run even though its live head is
-    // eligible. Stale-not-wrong; the next run re-scans (unit left error).
+    // eligible. Stale-not-wrong; a later run that re-enumerates it re-scans (unit left error).
     // branches/excludeBranches EXPLICIT: the shared frozen config omits them, and rt() would compile
     // the missing allowlist into [] (= default-only policy), silently policy-excluding `feat` in both
     // invocations — whose bucket rewrites its row every invocation, defeating the retention scenario.
@@ -2162,7 +2161,7 @@ describe("same-name stale-head retention is DISPOSITION-AGNOSTIC", () => {
     expect(row2.policy_matched_pattern).toBeNull();
     const featErrors = db.read("SELECT message FROM errors WHERE scope='scan' AND branch='feat'").all();
     expect(featErrors.length).toBe(1); // the failed re-scan is loud — the retained row is stale, not silent
-    expect(db.getUnit({ configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "feat" })?.status).toBe("error"); // retryable: the next run re-scans
+    expect(db.getUnit({ configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "feat" })?.status).toBe("error"); // retryable: a later run that re-enumerates it re-scans
     db.close();
   });
 });

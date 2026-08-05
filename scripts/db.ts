@@ -2182,11 +2182,15 @@ export class AuditDb {
   // alive beside that disposition — §7's branchesDeferred is a plain pending count, so an unsettled
   // row would count the same branch twice (past-cap AND deferred) and flag a throttle-free run's
   // summary PARTIAL. Guarded on BOTH sides: only 'pending' settles ('done' survives for the §3
-  // skip-reuse predicate, 'error' for the next-run rescan), and scope is pinned to 'branch' in the
-  // SQL so no key shape can ever settle an org/repo-scope unit. error_message clears with the
-  // settle (setUnitStatus's null-clears semantics — a stale throttle message on a settled row would
-  // misattribute why it sits at 'skipped'). Returns whether a row was settled.
+  // skip-reuse predicate, 'error' for the next-run rescan), and scope is gated TWICE: the key's own
+  // scope is checked (WorkUnitKey's repository/branch are optional on every scope, so a type-valid
+  // mis-scoped key CAN carry a branch row's exact coordinates — binding them regardless would settle
+  // that aliased branch row) and the SQL pins scope='branch' so no org/repo-scope ROW can match
+  // either. error_message clears with the settle (setUnitStatus's null-clears semantics — a stale
+  // throttle message on a settled row would misattribute why it sits at 'skipped'). Returns whether
+  // a row was settled.
   settlePastCapUnit(key: WorkUnitKey, runId: string): boolean {
+    if (key.scope !== "branch") return false;
     const res = this.db
       .query(
         `UPDATE work_queue SET status='skipped', last_run_id = ?, updated_at = ?, error_message = NULL
@@ -2347,7 +2351,8 @@ export class AuditDb {
   // recorded when the old head sat below the cutoff) keeps the branch in its old bucket even though the
   // advanced head became eligible — its commit_sha='' and discovered-head date describe that older
   // evaluation. This is STALE, not WRONG: every retained row is truthful about what its own invocation
-  // decided, and the work_queue unit is left error/pending so the next run re-scans and refreshes it.
+  // decided, and the work_queue unit is left error/pending so a later run that still re-enumerates
+  // the branch re-scans and refreshes it (a retry can throttle again).
   // Accepted, not overlooked — see processRepo's reconciliation note for the rejected alternative.
   //
   // SCOPE, stated precisely because the surrounding docs used to over-claim it: the caller invokes this

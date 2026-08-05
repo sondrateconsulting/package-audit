@@ -761,8 +761,9 @@ export async function processRepo(
   //   - it is NOT a regression: before reconciliation existed there was no prune at all, so the row was retained
   //     identically. The prune is a mitigation this feature ADDED (it removes deleted-branch phantoms
   //     that used to persist forever); it is not the cause.
-  //   - it self-heals: the unit is left error/pending, never done, so the next run re-scans and re-upserts
-  //     at the live head.
+  //   - it self-heals CONDITIONALLY: the unit is left error/pending, never done, so a later run that
+  //     still re-enumerates the branch re-scans and re-upserts at the live head (a retry can throttle
+  //     again, and a never-re-enumerated unit stays as recorded).
   // A head-SHA-aware prune is REJECTED: it would delete the commit_sha='' sentinels the non-scanned
   // dispositions rely on, hiding a real branch's real findings entirely rather than reporting them one
   // commit late. (Scanned rows now always carry the DISCOVERED oid — the T2c coherence gate fails a

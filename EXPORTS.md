@@ -166,8 +166,8 @@ snapshot. Unlike the findings tables, this exports every disposition TYPE (scann
 policy-excluded / past-cap, plus the branch-policy columns that live largely on the non-scanned rows). A discovered branch
 that reached no terminal disposition has NO row here: one whose scan **errored** carries a `scope='scan'`
 entry in the report's `errors[]` (and is counted by the report's `branchesErrored`), while one whose scan
-was **throttle-requeued** is deferred with neither a row nor a new error — it is retried when a later run
-re-enumerates it
+was **throttle-requeued** is deferred with neither a row nor a new error — retried, or settled as a
+non-scanned disposition (cutoff/policy/past-cap), when a later run re-enumerates it; a retry can throttle again
 (on a resume, an EARLIER invocation's append-only error still counts a rowless branch in `branchesErrored`).
 Scoped to the selected run only (`--raw` dumps all runs).
 
