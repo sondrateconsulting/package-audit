@@ -110,6 +110,12 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       // instanceof (orchestrate distinguishes it from transport errors); it never carries
       // operator remediation, so the registry's clean-message rendering does not apply.
       "ContentStoreError",
+      // ADR-0002 Stage P: the pure batch-refs query builder's input-contract violation
+      // (graphqlBatch.ts). Every caller hands it pre-validated identities (production discovery
+      // upstream; the probe's frozen corpus), so an instance is a wiring bug — not operator
+      // remediation — and the stack-dump consequence on an escape is the right diagnostic. It
+      // stays exported for cross-module instanceof once the Stage-I window consumes the builder.
+      "BatchRefsQueryError",
     ]);
     const declared = new Set<string>();
     // recursive: scripts/tui/ declares operator-facing classes too (TuiActivationError)
