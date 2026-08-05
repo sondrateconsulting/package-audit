@@ -42,7 +42,8 @@ export class GithubApiError extends Error {
 // from waitBucket). Either way the orchestrator treats it as TRANSIENT and defers to the
 // NEXT invocation instead of recording a permanent failure:
 // a mid-scan exhaustion resets that unit to `pending` with NO errors row (the §3 skip
-// predicate only skips `done` units, so a later run retries it); a repo/branch discovery
+// predicate only skips `done` units, so a later run that re-enumerates it retries — and can
+// throttle again); a repo/branch discovery
 // exhaustion logs a JSONL requeue event only (discovery re-runs every invocation anyway);
 // and an owner-resolution exhaustion ends the run cleanly WITHOUT starting one (no phantom
 // run row). --plan, which has no DB, instead counts a repo/branch discovery escape into its

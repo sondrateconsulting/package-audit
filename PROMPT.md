@@ -739,8 +739,9 @@ wrapper WAITS through the computed window and RETRIES the request IN PLACE, up t
 attempt budget; `ThrottleExhausted` escapes only when that budget is exhausted, or
 earlier when the client-lifetime cumulative pause budget would be exceeded — the
 orchestrator treats an escape as TRANSIENT: a mid-scan escape (discovery or content
-fetch) resets that unit to `pending` with no errors row and the NEXT invocation retries
-it (the §3 skip predicate only skips units that are `done` at the current head; there
+fetch) resets that unit to `pending` with no errors row and a later invocation that
+re-enumerates it retries it — a retry can throttle again (the §3 skip predicate only
+skips units that are `done` at the current head; there
 is no mid-run re-queue), a repo/branch discovery escape logs a JSONL requeue event
 only, and an owner-resolution escape ends the run cleanly without starting one; --plan,
 which has no DB, counts a repo/branch discovery escape into its failure totals while a
@@ -1493,9 +1494,11 @@ exists nowhere else in SQLite. It is therefore the CURRENT backlog at generation
 that a future run retries the work it still re-enumerates, though a retry can throttle
 again), it sits OUTSIDE the terminal
 identity above (on a resumed run a deferred branch can also hold an earlier invocation's
-error or retained row, so summing it in would double-count; within one invocation the two
-sides are disjoint — every disposition settles or never-creates its pending row, past-cap
-included, which settles a stale one to 'skipped'), it UNDERCOUNTS branches a throttled
+error or retained row, so summing it in would double-count; within one invocation, rendered
+at its own completion, the two sides are disjoint — every disposition settles or
+never-creates its pending row, past-cap included, which settles a stale one to 'skipped' —
+though a HISTORICAL re-render can overlap them again once a later run re-pends a branch
+this run scanned), it UNDERCOUNTS branches a throttled
 owner/repo discovery never enumerated (nothing was enqueued for them — though prior-run
 pending rows beneath such a repo remain counted), and it retains any pending row whose unit
 no run re-enumerates (nothing prunes work_queue) — branch deleted, repo dropped from the

@@ -681,7 +681,8 @@ export async function processRepo(
           if (e instanceof PolicyMatchError) throw e;
           if (e instanceof ThrottleExhausted) {
             // §4: throttle exhaustion is NOT a permanent unit failure — reset to pending so a LATER run
-            // retries it. No same-run spin: the pool dispatches each fixed plan.toScan unit exactly once
+            // that re-enumerates it can retry (and may throttle again). No same-run spin: the pool
+            // dispatches each fixed plan.toScan unit exactly once
             // and nothing re-reads pending units within the run. Handled here (not a fatal), so it never
             // trips branchAbort — one throttled branch must not cancel its siblings.
             db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });

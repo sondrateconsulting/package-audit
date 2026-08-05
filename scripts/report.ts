@@ -105,11 +105,14 @@ export interface ReportSummary {
   // still 'pending' when the report was built — deferred work, throttle-requeued in the common case
   // (crash-recovery resets land here too), that a future run retries WHERE it still re-enumerates
   // the unit. Deliberately NOT a sixth term of the identity above (deferred is non-terminal), and
-  // NEVER folded into branchesErrored: on a single-invocation run the deferred set is disjoint from
-  // every count here — enforced at the SOURCE, not by this query: every disposition path settles or
-  // never-creates its pending row within the run (scanned/skip-current → 'done', skip-cutoff/policy →
-  // 'skipped', past-cap settles a stale one via db.ts::settlePastCapUnit, throttle leaves 'pending'
-  // with NO row) — while on a RESUMED run a deferred branch can ALSO carry an earlier invocation's
+  // NEVER folded into branchesErrored: on a single-invocation run, rendered at its own completion,
+  // the deferred set is disjoint from every count here — enforced at the SOURCE, not by this query:
+  // every disposition path settles or never-creates its pending row within the run
+  // (scanned/skip-current → 'done', skip-cutoff/policy → 'skipped', past-cap settles a stale one via
+  // db.ts::settlePastCapUnit, throttle leaves 'pending' with NO row). A HISTORICAL re-render can
+  // overlap even so — a LATER run's throttle re-pends a branch this run scanned, and the same
+  // generation-time currency that drains this count to 0 refills it — while on a RESUMED run a
+  // deferred branch can ALSO carry an earlier invocation's
   // append-only error (→ branchesErrored) or retained disposition row (→ that bucket) — the same
   // both-ways divergences branchesErrored documents — so summing it into the partition would
   // double-count. It is a QUEUE-side total, not a disposition. 'pending' alone counts: an
@@ -266,8 +269,9 @@ function assertHeadsWellFormed(heads: HeadRow[]): HeadRow[] {
   return heads;
 }
 
-// The two externally-derived counts arrive as a keyed pair (not trailing positional numbers): a
-// call-site transposition of two same-typed numbers would typecheck, while a swapped KEY cannot.
+// The two externally-derived counts arrive as a keyed pair (not trailing positional numbers): keyed
+// passing removes SILENT positional transposition — an argument-order swap cannot compile, though
+// deliberately crossing the two values under the right keys still would.
 function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[], counts: Pick<ReportSummary, "branchesErrored" | "branchesDeferred">): ReportSummary {
   const orgs = new Set(scannedHeads.map((h) => h.organization));
   const repos = new Set(scannedHeads.map((h) => `${h.organization}/${h.repository}`));

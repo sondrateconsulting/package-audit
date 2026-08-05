@@ -1926,7 +1926,7 @@ describe("processRepo throttle requeue (§4)", () => {
   test("ThrottleExhausted puts the unit back to PENDING with no permanent error row", async () => {
     const { db, runId } = openRun();
     await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), rt(config, "hash"), runId, "o", repo, [], new Set());
-    expect(db.getUnit(KEY)?.status).toBe("pending"); // a later run retries it
+    expect(db.getUnit(KEY)?.status).toBe("pending"); // a later run that re-enumerates it retries
     const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all();
     expect(errs.length).toBe(0);
     db.close();
@@ -2068,14 +2068,17 @@ describe("past-cap settles a stale throttle-pending queue row (§4→§7 double-
   const XKEY: WorkUnitKey = { configHash: "cap-hash", scope: "branch", organization: "o", repository: "r", branch: "feat-x" };
   const clientFor = (snapshot: BranchSnapshot, failure: Error): GithubClient =>
     ({ listBranchHeads: async () => snapshot, cloneNoCheckout: async () => { throw failure; } }) as unknown as GithubClient;
+  // Run metadata mirrors the runtime config below: cutoffDate matches testConfig's, and the
+  // discovered owner "o" is coherent because the config's organizations is overridden to null.
   const startCapRun = (db: AuditDb) => db.startRun({
     configHash: "cap-hash", effectiveOwners: ["o"], ownersSource: "discovered",
-    trackedPackages: ["expo"], cutoffDate: "2000-01-01", githubHost: "github.com",
+    trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
   });
 
   test("run B (throttle-free) reports the churned-out branch as past-cap ONLY — settled queue row, zero deferred, no PARTIAL", async () => {
     const root = mkdtempSync(join(tmpdir(), "past-cap-settle-"));
-    const capConfig = testConfig(root, 1); // cap: ONE non-default slot
+    // Complete typed Config, no cast; organizations: null makes the discovered owner "o" coherent.
+    const capConfig: Config = { ...testConfig(root, 1), organizations: null }; // cap: ONE non-default slot
     const db = AuditDb.open({ sqlitePath: ":memory:" });
     // Run A: heads arrive committedDate DESC; feat-x fills the single non-default slot; both scans throttle.
     const runA = startCapRun(db);

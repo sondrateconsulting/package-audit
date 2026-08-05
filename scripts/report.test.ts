@@ -1050,8 +1050,8 @@ describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", 
     db.enqueueUnit(key("feat-a"), run.runId);
     db.setUnitStatus(key("feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
     expect(buildReport(db, run).summary.branchesDeferred).toBe(1);
-    // The §4 contract: a FUTURE run picks the unit up (a completed run is never resumed — startRun
-    // reattaches only to status='running')...
+    // The §4 contract: a FUTURE run that re-enumerates the unit picks it up (a completed run is
+    // never resumed — startRun reattaches only to status='running')...
     const { runId: nextRunId, resumed } = db.startRun({
       configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
@@ -1098,14 +1098,24 @@ describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", 
     // this run" (an anti-join) would zero the deferred signal in exactly the resumed-run case the
     // field comment documents — a retained row presenting the OLD head while the re-scan throttled —
     // so a sustained-throttle resume would read clean again. The double-presence IS the contract.
+    // Full lifecycle: invocation 1 scans feat-a; the resumed invocation 2 finds the head ADVANCED,
+    // re-dispatches, and THROTTLES (§4: back to pending, no new row — reconciliation retains inv 1's).
     const db = mem();
-    const run = seed(db); // configHash "h": one scanned + one skipped-cutoff head of its own
-    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc", branch: "feat-a", commitSha: "sha-old", status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-01-01T00:00:00Z" });
-    db.enqueueUnit(key("feat-a"), run.runId);
-    db.setUnitStatus(key("feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
-    const s = buildReport(db, run).summary;
+    const inv1 = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    db.enqueueUnit(key("feat-a"), inv1.runId);
+    db.setUnitStatus(key("feat-a"), { status: "in_progress", runId: inv1.runId });
+    db.upsertRunUnitHead({ runId: inv1.runId, organization: "org-a", repository: "svc", branch: "feat-a", commitSha: "sha-old", status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-01-01T00:00:00Z" });
+    db.setUnitStatus(key("feat-a"), { status: "done", runId: inv1.runId, lastCommitSha: "sha-old", lastCommitDate: "2025-01-01T00:00:00Z" });
+    // crash before completeRun; invocation 2 reattaches to the still-running run…
+    const inv2 = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    expect(inv2.resumed).toBe(true);
+    // …the advanced head fails the §3 skip predicate (stored sha ≠ live head), so the re-scan runs and throttles.
+    db.setUnitStatus(key("feat-a"), { status: "in_progress", runId: inv2.runId });
+    db.setUnitStatus(key("feat-a"), { status: "pending", runId: inv2.runId, errorMessage: "rate limited (core)" });
+    db.completeRun(inv2.runId);
+    const s = buildReport(db, db.getRun(inv2.runId)!).summary;
     expect(s.branchesDeferred).toBe(1); // counted despite the retained row…
-    expect(s.branchesScanned).toBe(2); // …which stays in its own disposition bucket: the documented double-presence
+    expect(s.branchesScanned).toBe(1); // …which stays in its own disposition bucket: the documented double-presence
     db.close();
   });
 });

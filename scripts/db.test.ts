@@ -1936,6 +1936,10 @@ describe("work_queue", () => {
     db.setUnitStatus(key("finished"), { status: "done", runId: "r1", lastCommitSha: "s1", lastCommitDate: "2024-01-01T00:00:00.000Z" });
     db.enqueueUnit(key("broken"), "r1");
     db.setUnitStatus(key("broken"), { status: "error", runId: "r1", errorMessage: "boom" });
+    db.enqueueUnit(key("paused"), "r1");
+    db.setUnitStatus(key("paused"), { status: "in_progress", runId: "r1" });
+    db.enqueueUnit(key("already-skipped"), "r1");
+    db.setUnitStatus(key("already-skipped"), { status: "skipped", runId: "r1" });
     db.enqueueUnit(key("stale", "other-config"), "r1"); // same branch name under a FOREIGN config
     // pending → settled: skipped, stale throttle message cleared, last_run_id moves to the settling run
     expect(db.settlePastCapUnit(key("stale"), "r2")).toBe(true);
@@ -1943,11 +1947,16 @@ describe("work_queue", () => {
     expect(settled.status).toBe("skipped");
     expect(settled.errorMessage).toBeNull();
     expect(settled.lastRunId).toBe("r2");
-    // done survives for the §3 skip-reuse predicate; error survives for the next-run rescan
+    // done survives for the §3 skip-reuse predicate; error survives for a later re-enumerated rescan
     expect(db.settlePastCapUnit(key("finished"), "r2")).toBe(false);
     expect(db.getUnit(key("finished"))!.status).toBe("done");
     expect(db.settlePastCapUnit(key("broken"), "r2")).toBe(false);
     expect(db.getUnit(key("broken"))!.status).toBe("error");
+    // a live attempt is being ATTEMPTED, not deferred — and an already-settled row settles only once
+    expect(db.settlePastCapUnit(key("paused"), "r2")).toBe(false);
+    expect(db.getUnit(key("paused"))!.status).toBe("in_progress");
+    expect(db.settlePastCapUnit(key("already-skipped"), "r2")).toBe(false);
+    expect(db.getUnit(key("already-skipped"))!.lastRunId).toBe("r1"); // untouched, not merely same-status
     // absent row (a past-cap branch that was never enqueued): clean no-op
     expect(db.settlePastCapUnit(key("never-enqueued"), "r2")).toBe(false);
     // the foreign config's identical key is a different unit entirely
@@ -1959,7 +1968,13 @@ describe("work_queue", () => {
     const db = mem();
     rawRun(db, "r1", "running");
     db.enqueueUnit({ configHash: "h", scope: "org", organization: "o" }, "r1");
+    // an org-scope KEY is rejected by the key gate before any SQL runs…
     expect(db.settlePastCapUnit({ configHash: "h", scope: "org", organization: "o" }, "r1")).toBe(false);
+    expect(db.getUnit({ configHash: "h", scope: "org", organization: "o" })!.status).toBe("pending");
+    // …and the SQL's own scope predicate holds INDEPENDENTLY: a branch-scope key with omitted
+    // repository/branch binds the org row's ''/'' sentinels, REACHES the SQL, and must still match
+    // nothing (dropping `AND scope='branch'` from the UPDATE turns exactly this expectation red).
+    expect(db.settlePastCapUnit({ configHash: "h", scope: "branch", organization: "o" }, "r1")).toBe(false);
     expect(db.getUnit({ configHash: "h", scope: "org", organization: "o" })!.status).toBe("pending");
     db.close();
   });
