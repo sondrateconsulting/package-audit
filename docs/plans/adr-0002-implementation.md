@@ -472,5 +472,22 @@ assumed).
   the placeholder midnight `frozenAtIso` backdated the freeze (now the true post-observation
   instant), and the provenance paraphrased the procedure (now the commands verbatim, both
   strata, including the discarded email-privacy-rejected first template pair).
+- **P3 live run (2026-08-05, `sondrateconsulting-ryan`): DEFAULT PINNED B = 25** — 26 try
+  rows (25 completed pairs + 1 candidate-only attempt), 976 dispatches, 975 measured
+  points; both candidates 10/10 clean; every cost-readable batch priced at exactly 1 point
+  (formula confirmed; the 2× tolerance never consumed); the informational B = 50 paginating
+  cell drew an HTTP 504 on its first 50-alias batch → cell terminated + the runner's
+  1,400 s quarantine to the reset epoch fired exactly as pre-registered; journal + result
+  committed together (`d8dbefe`). The 504 is live corroboration of the ADR's timeout
+  caution at a shape the operator range never reaches.
+- **P4 measured-outcome record + codex review (fresh session
+  `019fd36d-8983-7480-a099-e4e0380fa17b`, 2026-08-05): FAIL — 3 P2, all verified against
+  the journal, all fixed** (`e80bab8` + `11e2f5b`): the every-call cost claim scoped to
+  cost-readable calls (the 504 returned no rider; its penalty deducts unobserved); the
+  header-delta cross-check recorded as noisy and non-corroborating (16/50 clean arm deltas
+  above their rider sums, worst +4 — quiet-credential premise did not hold; gates ride the
+  rider alone, as pre-registered); '26 paired tries' corrected to 25 pairs + 1
+  candidate-only attempt (the P3 commit message carries the same overcount, immutably —
+  the ADR text is the authoritative record).
 - *(the implementation session appends per-step codex outcomes, the santa-loop record, and
   any live-run observations here, exactly as `adr-0001-t2c-implementation.md` §9 did.)*
