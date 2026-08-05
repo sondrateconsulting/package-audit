@@ -118,7 +118,7 @@ export function renderIndex(report: DossierReport, opts: { formatVersion: number
     `${plural(report.summary.branchesSkippedByCutoff, "branch", "branches")} skipped by the ${report.config.cutoffDate} cutoff`,
     // §4 deferral receipt, only when real — the front door must not imply a complete slice when part
     // of the estate was requeued; a zero would add noise (and GOLDEN_INDEX_SHA256 renders a zero).
-    ...(report.summary.branchesDeferred > 0 ? [`${plural(report.summary.branchesDeferred, "branch", "branches")} deferred by throttle`] : []),
+    ...(report.summary.branchesDeferred > 0 ? [`${plural(report.summary.branchesDeferred, "branch", "branches")} still pending`] : []),
   ].join(" · ");
 
   const md = [

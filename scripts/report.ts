@@ -102,8 +102,9 @@ export interface ReportSummary {
   // and so IS counted here, despite being deferred rather than terminal.
   branchesErrored: number;
   // The carve-out above, made VISIBLE (§4): COUNT of this config's work_queue rows (scope='branch')
-  // still 'pending' when the report was built — the throttle-requeued remainder a FUTURE run
-  // finishes. Deliberately NOT a sixth term of the identity above (deferred is non-terminal), and
+  // still 'pending' when the report was built — deferred work, throttle-requeued in the common case
+  // (crash-recovery resets land here too), that a future run retries WHERE it still re-enumerates
+  // the unit. Deliberately NOT a sixth term of the identity above (deferred is non-terminal), and
   // NEVER folded into branchesErrored: on a single-invocation run the deferred set is disjoint from
   // every count here — enforced at the SOURCE, not by this query: every disposition path settles or
   // never-creates its pending row within the run (scanned/skip-current → 'done', skip-cutoff/policy →
@@ -117,11 +118,15 @@ export interface ReportSummary {
   // Source: the MUTABLE cross-run work_queue — the ONE summary count read outside the immutable
   // run_unit_head slice (PROMPT.md §7 sanctions the exception). By design, then, this is the CURRENT
   // backlog at generation time: re-rendering an old --run-id after later runs drain the queue reports
-  // 0 — the count answers "what does this config still owe", which §4 promises a future run pays.
-  // Two known skews, both queue-inherited: a throttled owner/repo DISCOVERY enqueues nothing, so
-  // branches it never enumerated are invisible here (UNDERCOUNT — though prior-run pending rows under
-  // such a repo remain and do count); and a pending row whose branch was since deleted upstream is
-  // never dispatched again (nothing prunes work_queue), so it lingers (OVERCOUNT until rescanned).
+  // 0 — the count answers "what does this config still owe", a debt a future run pays only for the
+  // units it still re-enumerates. Known skews, queue-inherited (non-exhaustive): a throttled
+  // owner/repo DISCOVERY enqueues nothing, so branches it never enumerated are invisible here
+  // (UNDERCOUNT — though prior-run pending rows under such a repo remain and do count); and a
+  // pending row whose unit is never RE-ENUMERATED lingers (OVERCOUNT — nothing prunes work_queue):
+  // its branch deleted, its repo out of the kept set (deleted, renamed, newly archived/fork-filtered,
+  // or displaced past maxReposPerOrg — the reconciliation taxonomy), or its owner no longer
+  // discovered or accessible. Re-enumeration settles the row instead: scanned/skip-current → 'done',
+  // skip-cutoff/skip-policy → 'skipped', past-cap → 'skipped' via settlePastCapUnit.
   branchesDeferred: number;
   totalDependencyFindings: number;
   totalUsageFindings: number;
@@ -218,8 +223,8 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
       .filter((k) => !headKeys.has(k)),
   ).size;
 
-  // §4 carve-out, made visible: the throttle-requeued remainder still pending in this config's
-  // queue. The ONE count sourced from the mutable work_queue — the deferred remainder exists
+  // §4 carve-out, made visible: the deferred remainder still pending in this config's queue.
+  // The ONE count sourced from the mutable work_queue — the deferred remainder exists
   // nowhere else in SQLite; see the ReportSummary field comment for the full semantics.
   const branchesDeferred = (db.read(
     `SELECT COUNT(*) AS n FROM work_queue WHERE config_hash = ? AND scope = 'branch' AND status = 'pending'`,

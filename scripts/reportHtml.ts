@@ -82,7 +82,7 @@ export interface DossierSummary {
   readonly branchesSkippedByCutoff: number;
   readonly branchesExcludedByPolicy: number; // branch allow/deny (§5)
   readonly branchesPastCap: number;
-  readonly branchesDeferred: number; // §4 throttle-requeued remainder (queue-side; see report.ts)
+  readonly branchesDeferred: number; // §4 deferred remainder (queue-side pending; see report.ts)
 }
 // Branch allow/deny scan-scope diagnostics (§5). Defined here (the render layer) so both the report
 // data layer (report.ts, structurally assignable) and the index renderer share ONE shape without a
@@ -917,7 +917,7 @@ function renderEmptyBody(pkg: DossierPackage, ctx: DossierContext): string {
     `${plural(ctx.summary.branchesSkippedByCutoff, "branch", "branches")} skipped by the ${ctx.config.cutoffDate} cutoff`,
     // §4 deferral receipt, only when real — an empty page whose slice was throttled must not imply a
     // complete slice; a zero would add noise to every clean page (and the golden pins render zeros).
-    ...(ctx.summary.branchesDeferred > 0 ? [`${plural(ctx.summary.branchesDeferred, "branch", "branches")} deferred by throttle`] : []),
+    ...(ctx.summary.branchesDeferred > 0 ? [`${plural(ctx.summary.branchesDeferred, "branch", "branches")} still pending`] : []),
   ].join(" · ");
   return (
     `<header id="exec"><p class="meta">package usage dossier</p><h1 class="exec">${esc(sentence)}</h1>` +

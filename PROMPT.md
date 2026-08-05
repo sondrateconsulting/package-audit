@@ -1485,12 +1485,17 @@ config_hash = the run's AND scope='branch' AND status='pending' at report build 
 count read from the MUTABLE cross-run queue, sanctioned because the deferred remainder
 exists nowhere else in SQLite. It is therefore the CURRENT backlog at generation time
 (re-rendering an old --run-id after later runs drain the queue reports 0 — §4's contract is
-precisely that a future run finishes the work), it sits OUTSIDE the terminal identity above
-(on a resumed run a deferred branch can also hold an earlier invocation's error or retained
-row, so summing it in would double-count), it UNDERCOUNTS branches a throttled owner/repo
-discovery never enumerated (nothing was enqueued for them — though prior-run pending rows
-beneath such a repo remain counted), and it retains a since-deleted branch's pending row
-(nothing prunes work_queue) until that row is rescanned or removed. Decide policy dispositions ONLY via both status and policy_status
+that a future run finishes the work it still re-enumerates), it sits OUTSIDE the terminal
+identity above (on a resumed run a deferred branch can also hold an earlier invocation's
+error or retained row, so summing it in would double-count; within one invocation the two
+sides are disjoint — every disposition settles or never-creates its pending row, past-cap
+included, which settles a stale one to 'skipped'), it UNDERCOUNTS branches a throttled
+owner/repo discovery never enumerated (nothing was enqueued for them — though prior-run
+pending rows beneath such a repo remain counted), and it retains any pending row whose unit
+no run re-enumerates (nothing prunes work_queue) — branch deleted, repo dropped from the
+kept set (deleted, renamed, newly archived/fork-filtered, or displaced past
+`maxReposPerOrg`), or owner no longer discovered — until re-enumeration settles it or
+`--rescan-branch`/`--fresh` resets it. Decide policy dispositions ONLY via both status and policy_status
 (scripts/policyDisposition.ts); `policy_status IS NOT NULL` alone is never a proxy for
 "excluded" (a scanned default branch carries the counterfactual). The guard validates the
 WHOLE row, not just those two columns: `is_default_branch` is load-bearing in BOTH

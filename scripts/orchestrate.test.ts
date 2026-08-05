@@ -1796,7 +1796,7 @@ describe("runSummaryText", () => {
     expect(text).toMatch(/Repositories scanned:\s+7\b/);
     expect(text).toMatch(/Branches scanned:\s+88 \(13 skipped by cutoff · 5 excluded by policy · 2 past cap · 4 scan-errored\)/);
     // the deferred line always prints (a zero documents the invariant), WITHOUT the partial warning
-    expect(text).toMatch(/Branches deferred:\s+0 \(throttle-requeued; a future run finishes them\)/);
+    expect(text).toMatch(/Branches deferred:\s+0 \(pending queue; retry requires rediscovery and eligibility\)/);
     expect(text).not.toContain("PARTIAL");
     expect(text).toMatch(/Dependency findings:\s+104\b/);
     expect(text).toMatch(/Usage findings:\s+994\b/);
@@ -1813,7 +1813,7 @@ describe("runSummaryText", () => {
     // the exact field condition this line exists for: sustained rate limiting with zero recorded
     // errors must not read as a complete audit
     expect(text).toMatch(/Errors recorded:\s+0\b/);
-    expect(text).toMatch(/Branches deferred:\s+37 \(throttle-requeued; a future run finishes them\) — the scanned counts above are PARTIAL/);
+    expect(text).toMatch(/Branches deferred:\s+37 \(pending queue; retry requires rediscovery and eligibility\) — the scanned counts above are PARTIAL/);
   });
 });
 

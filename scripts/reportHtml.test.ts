@@ -486,13 +486,13 @@ describe("designed empty state (coverage receipts)", () => {
     expect(html).toContain("Detection is scoped to the scanned slice");
     expect(html).not.toContain("not coupled");
     // zero deferred renders NO receipt — this suppression is what keeps the golden byte pins valid
-    expect(html).not.toContain("deferred by throttle");
+    expect(html).not.toContain("still pending");
   });
 
   test("a nonzero deferred count joins the coverage receipts (an empty page must not imply a complete slice)", () => {
     const deferredCtx = { ...FIXED_CTX, summary: { ...FIXED_CTX.summary, branchesDeferred: 2 } };
     const html2 = renderDossier(pkg, deferredCtx);
-    expect(html2).toContain("2 branches deferred by throttle");
+    expect(html2).toContain("2 branches still pending");
   });
 
   test("keeps the byte-identical static script and the format-version footer", () => {

@@ -223,10 +223,13 @@ export function runSummaryText(
     `  Repositories scanned:   ${s.repositoriesScanned}`,
     `  Branches scanned:       ${s.branchesScanned} (${s.branchesSkippedByCutoff} skipped by cutoff · ${s.branchesExcludedByPolicy} excluded by policy · ${s.branchesPastCap} past cap · ${s.branchesErrored} scan-errored)`,
     // Deferred sits OUTSIDE the parenthetical partition above (non-terminal, not a disposition) and
-    // always prints — a zero documents the invariant. Nonzero means §4 rate limiting requeued part of
-    // the estate for a future run, so the line must flag the counters as partial: the exact failure
-    // this guards is a one-shot/CI run under sustained throttling reading as a clean, complete audit.
-    `  Branches deferred:      ${s.branchesDeferred} (throttle-requeued; a future run finishes them)${s.branchesDeferred > 0 ? " — the scanned counts above are PARTIAL" : ""}`,
+    // always prints — a zero documents the invariant. Nonzero usually means §4 rate limiting requeued
+    // part of the estate (crash-recovery resets and prior-run rows whose unit was never re-enumerated
+    // land here too), so the line must flag the counters as partial: the exact failure this guards is
+    // a one-shot/CI run under sustained throttling reading as a clean, complete audit. The wording
+    // promises no completion — a pending unit is retried only when a future run re-enumerates it AND
+    // it is still eligible (not capped/excluded) then.
+    `  Branches deferred:      ${s.branchesDeferred} (pending queue; retry requires rediscovery and eligibility)${s.branchesDeferred > 0 ? " — the scanned counts above are PARTIAL" : ""}`,
     `  Dependency findings:    ${s.totalDependencyFindings}`,
     `  Usage findings:         ${s.totalUsageFindings}`,
     `  Errors recorded:        ${errorCount} (fail-soft; details in the report's errors[])`,

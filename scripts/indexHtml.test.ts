@@ -103,7 +103,7 @@ describe("renderIndex", () => {
     expect(html).toContain("1 branch scanned");
     expect(html).toContain("0 branches skipped by the 2024-01-01 cutoff");
     // zero deferred renders NO receipt — this suppression is what keeps GOLDEN_INDEX_SHA256 valid
-    expect(html).not.toContain("deferred by throttle");
+    expect(html).not.toContain("still pending");
     expect(html).toContain("run run-fixture");
     expect(html).toContain(`generated ${T0}`);
   });
@@ -111,7 +111,7 @@ describe("renderIndex", () => {
   test("a nonzero deferred count joins the coverage receipts (the index must not imply a complete slice)", () => {
     const base = fixtureReport();
     const deferred: DossierReport = { ...base, summary: { ...base.summary, branchesDeferred: 3 } };
-    expect(renderIndex(deferred, OPTS)).toContain("3 branches deferred by throttle");
+    expect(renderIndex(deferred, OPTS)).toContain("3 branches still pending");
   });
 
   test("carries the BYTE-IDENTICAL static script and the same CSP as every dossier", () => {
