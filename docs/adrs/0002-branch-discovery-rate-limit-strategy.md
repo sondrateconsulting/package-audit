@@ -626,8 +626,12 @@ Confirmation probe, not by this document.
    per-repository page counts — which is exactly what per-tranche admission computes from
    the frozen corpus (the scalar curve is illustrative; the admission bound is computed,
    never assumed) — and the permitted invalidation re-runs can triple a cell, so the matrix
-   must be schedulable across multiple reset windows by construction. The artifact
-   lands beside [boundary-probe.json](0001-benchmark/boundary-probe.json).
+   must be schedulable across multiple reset windows by construction. The artifacts land in
+   [0002-benchmark/](0002-benchmark/) — the frozen corpus (`refs-corpus.json`), the
+   append-only try journal (`refs-probe-journal.jsonl`), and the result (`refs-probe.json`) —
+   evidence directories stay per-ADR; the boundary probe's own artifacts remain in
+   [0001-benchmark/](0001-benchmark/). *(Amended prospectively at the Stage-P corpus freeze,
+   riding PR-P for ratification: the sentence previously registered the 0001 directory.)*
 2. **Scripted-envelope tests for the classified-staged-partitioned order**: a `NOT_FOUND`
    alias among *B* stages exactly one repository's fail-soft failure (committed at
    consumption: errors row in a run, `discoveryErrors` in plan; siblings' snapshots intact);
