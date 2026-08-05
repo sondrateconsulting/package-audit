@@ -170,6 +170,7 @@ export interface RefsProbeDeps {
   outPath: string;
   journalPath: string;
   benchConfigPath: string;
+  benchConfigSha256: string; // hash of the bench-config FILE text — the header's second binding
   existingJournalText: string;
   appendJournal: (row: RefsProbeJournalRow) => void;
   writeResult: (result: RefsProbeResult) => void;
@@ -246,7 +247,13 @@ interface TryRunResult {
   resetHintEpochSec: number | null;
 }
 
-async function runPairedTry(deps: RefsProbeDeps, cell: RefsCorpusCell, slot: number, attempt: number): Promise<TryRunResult> {
+async function runPairedTry(
+  deps: RefsProbeDeps,
+  cell: RefsCorpusCell,
+  slot: number,
+  attempt: number,
+  journalRow: (row: RefsProbeJournalRow) => void,
+): Promise<TryRunResult> {
   const dispatches: RefsProbeDispatchRecord[] = [];
   const walks: RefsRepoWalkRecord[] = [];
   let quarantine = false;
@@ -285,6 +292,16 @@ async function runPairedTry(deps: RefsProbeDeps, cell: RefsCorpusCell, slot: num
       if (d.status === 502 || d.status === 504) {
         quarantine = true;
         resetHintEpochSec = rec.resetEpochSec;
+        // the obligation becomes DURABLE at observation — before even this try's row — so a
+        // crash anywhere after the timeout can never resume into the penalized window. (A
+        // 502/504 carrying no rate-limit headers leaves untilEpochSec null; such a row
+        // cannot be honored across a resume — nothing exists to honor — and the live sleep
+        // below still runs its floor.)
+        journalRow({
+          rowKind: "quarantine", version: 1, atIso: isoOf(deps.now()), cellB: cell.batchSize,
+          stratum: cell.stratum, slot, attempt, untilEpochSec: rec.resetEpochSec,
+          plannedSleepMs: sleepToResetMs(rec.resetEpochSec, deps.now()),
+        });
         return null;
       }
       return d;
@@ -504,6 +521,10 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
       throw new BenchRefsRulesError(
         `resumed journal was recorded against a different corpus (journal ${header.corpusSha256}, current ${deps.corpusSha256})`,
       );
+    if ((header.benchConfigSha256 ?? null) !== deps.benchConfigSha256)
+      throw new BenchRefsRulesError(
+        `resumed journal was recorded under a different bench configuration (journal ${header.benchConfigSha256 ?? "unbound (legacy header)"}, current ${deps.benchConfigSha256})`,
+      );
     if (header.constantsFingerprint !== probeConstantsFingerprint())
       throw new BenchRefsRulesError("resumed journal was recorded under different pre-registered constants — refusing to mix rule revisions");
     // an unexpired quarantine obligation is honored BEFORE any further dispatch anywhere —
@@ -522,7 +543,8 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
     push({
       rowKind: "header", version: 1, atIso: isoOf(deps.now()),
       corpusSha256: deps.corpusSha256, corpusPath: deps.corpusPath,
-      benchConfigPath: deps.benchConfigPath, constantsFingerprint: probeConstantsFingerprint(),
+      benchConfigPath: deps.benchConfigPath, benchConfigSha256: deps.benchConfigSha256,
+      constantsFingerprint: probeConstantsFingerprint(),
     });
   }
   const before = await deps.readRateLimit();
@@ -563,20 +585,16 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
           rowKind: "try-start", version: 1, atIso: isoOf(deps.now()), cellB: cell.batchSize, stratum: cell.stratum,
           slot: state.nextSlot, attempt: state.nextAttempt,
         });
-        const { row, quarantine, resetHintEpochSec } = await runPairedTry(deps, cell, state.nextSlot, state.nextAttempt);
+        const { row, quarantine, resetHintEpochSec } = await runPairedTry(deps, cell, state.nextSlot, state.nextAttempt, push);
         push(row);
         deps.log(`  verdict: ${row.verdict}${row.causes.length > 0 ? ` (${row.causes[0]})` : ""}`);
         if (quarantine) {
           // the documented timeout penalty is unquantified: no admission can price the current
           // window after one, so the runner quarantines to the next reset epoch before ANY
-          // further dispatch anywhere. The obligation row is journaled BEFORE the sleep — a
-          // crash mid-sleep resumes into the quarantine, never past it.
+          // further dispatch anywhere. The obligation row was journaled AT OBSERVATION (inside
+          // the try, before its row) — here we only perform the sleep, on the current clock.
           const hint = resetHintEpochSec ?? (await deps.readRateLimit()).graphql.reset;
           const wait = sleepToResetMs(hint, deps.now());
-          push({
-            rowKind: "quarantine", version: 1, atIso: isoOf(deps.now()), cellB: cell.batchSize, stratum: cell.stratum,
-            slot: state.nextSlot, attempt: state.nextAttempt, untilEpochSec: hint, plannedSleepMs: wait,
-          });
           deps.log(`quarantine: 502/504 observed — sleeping ${Math.ceil(wait / 1000)}s to the next reset epoch`);
           await deps.sleep(wait);
         }
@@ -676,6 +694,7 @@ async function main(): Promise<void> {
   const corpus = parseRefsProbeCorpus(corpusText);
   const corpusSha256 = createHash("sha256").update(corpusText).digest("hex");
   const journalPath = journalPathFor(outPath);
+  const benchConfigSha256 = createHash("sha256").update(readFileSync(BENCH_CONFIG_PATH, "utf8")).digest("hex");
   const cfg = loadBenchConfig(BENCH_CONFIG_PATH);
   const client = new GithubClient({ githubHost: cfg.githubHost, db: null, spawnTimeoutMs: cfg.spawn.timeoutMs });
   const login = ((await client.restGetJson("user")) as { login?: string }).login ?? "unknown";
@@ -698,6 +717,7 @@ async function main(): Promise<void> {
     outPath,
     journalPath,
     benchConfigPath: BENCH_CONFIG_PATH,
+    benchConfigSha256,
     existingJournalText: existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "",
     appendJournal: (row) => appendFileSync(journalPath, `${JSON.stringify(row)}\n`),
     // "wx": the result is append-only evidence — never overwrite, even on a pre-check race

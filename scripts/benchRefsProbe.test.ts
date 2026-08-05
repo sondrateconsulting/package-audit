@@ -187,6 +187,7 @@ function makeDeps(corpus: RefsProbeCorpus, script: ReturnType<typeof scriptedGit
     outPath: "refs-probe.json",
     journalPath: "refs-probe-journal.jsonl",
     benchConfigPath: "bench-config.json",
+    benchConfigSha256: "test-config-sha",
     existingJournalText: "",
     appendJournal: (row) => {
       journal.push(row);
@@ -212,12 +213,13 @@ function makeDeps(corpus: RefsProbeCorpus, script: ReturnType<typeof scriptedGit
   return { deps, journal, results, sleeps, events };
 }
 
-// a valid header row for synthetic resume journals, matching makeDeps' corpus fingerprint
+// a valid header row for synthetic resume journals, matching makeDeps' fingerprints
 const headerLine = (): string =>
   JSON.stringify({
     rowKind: "header", version: 1, atIso: "2026-08-05T00:00:00Z",
     corpusSha256: "test-corpus-sha", corpusPath: "corpus.json",
-    benchConfigPath: "bench-config.json", constantsFingerprint: probeConstantsFingerprint(),
+    benchConfigPath: "bench-config.json", benchConfigSha256: "test-config-sha",
+    constantsFingerprint: probeConstantsFingerprint(),
   });
 
 const tryRows = (journal: readonly RefsProbeJournalRow[]): RefsTryRow[] =>
@@ -330,11 +332,15 @@ describe("runRefsProbe — fault handling", () => {
     expect(q.length).toBe(1);
     // the quarantine slept to the reset epoch (scripted far future → a real sleep happened)
     expect(sleeps.some((ms) => ms >= 30_000)).toBe(true);
-    // the obligation persists BEFORE the sleep: a crash mid-sleep must resume into the
-    // quarantine, not past it
+    // the obligation persists AT OBSERVATION, before even the try row: a crash anywhere
+    // after the 504 — mid-try, before the try row, or mid-sleep — must resume into the
+    // quarantine, never past it
     const qi = events.indexOf("append:quarantine");
-    const bigSleep = events.findIndex((e, i) => i > qi && e.startsWith("sleep:") && Number(e.slice(6)) >= 30_000);
+    const tryAppends = events.map((e, i) => [e, i] as const).filter(([e]) => e === "append:try").map(([, i]) => i);
+    const lastTryAppend = tryAppends[tryAppends.length - 1]!;
     expect(qi).toBeGreaterThanOrEqual(0);
+    expect(qi).toBeLessThan(lastTryAppend); // observed-time durability: quarantine row precedes its try row
+    const bigSleep = events.findIndex((e, i) => i > qi && e.startsWith("sleep:") && Number(e.slice(6)) >= 30_000);
     expect(bigSleep).toBeGreaterThan(qi);
     // the B=25 p1 cell is terminated; B=25 fails; B=10 passed alone → prefix eligible {10},
     // whose floor (6,000 × 0.1 = 600) trips the ship threshold → no-pass
@@ -498,6 +504,18 @@ describe("runRefsProbe — resume from the journal (crash-safe, no double-spend)
     foreign["corpusSha256"] = "someone-elses-corpus";
     const mismatch = makeDeps(corpus, script, { existingJournalText: `${JSON.stringify(foreign)}\n` });
     await expect(runRefsProbe(mismatch.deps)).rejects.toThrow(/corpus/i);
+    // a header recorded under a DIFFERENT bench configuration
+    const cfgDrift = JSON.parse(headerLine()) as Record<string, unknown>;
+    cfgDrift["benchConfigSha256"] = "some-other-config";
+    const cfgMismatch = makeDeps(corpus, script, { existingJournalText: `${JSON.stringify(cfgDrift)}\n` });
+    await expect(runRefsProbe(cfgMismatch.deps)).rejects.toThrow(/config/i);
+    // a LEGACY header (no config binding) still parses — the committed Stage-P journal must
+    // stay readable forever — but a resume against it refuses: absence proves nothing
+    const legacy = JSON.parse(headerLine()) as Record<string, unknown>;
+    delete legacy["benchConfigSha256"];
+    expect(parseJournal(`${JSON.stringify(legacy)}\n`, () => {}).length).toBe(1);
+    const legacyResume = makeDeps(corpus, script, { existingJournalText: `${JSON.stringify(legacy)}\n` });
+    await expect(runRefsProbe(legacyResume.deps)).rejects.toThrow(/config/i);
   });
 
   test("a dangling try-start resumes the same slot at the next attempt (spend visible, no invalidation)", async () => {

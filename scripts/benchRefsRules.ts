@@ -569,8 +569,12 @@ export interface RefsTryRow {
   informational: RefsTryInformational;
 }
 
-// the journal's first row: binds every later row to ONE corpus, config, and rule revision, so
-// a resumed run can never silently reuse completed cells recorded under different rules
+// The journal's first row binds every later row to ONE corpus (file sha256), ONE bench
+// configuration (file sha256), and ONE pre-registered-constants revision (serialized), so a
+// resumed run can never silently reuse rows recorded under a different corpus, config, or
+// constants set. Scope, stated exactly: code revisions of the rules/runner/builder are NOT
+// hashed here — code changes ride the PR review process, and rows recorded before a code
+// change are only ever reused within one probe run of one committed tree.
 export interface RefsHeaderRow {
   rowKind: "header";
   version: 1;
@@ -578,6 +582,10 @@ export interface RefsHeaderRow {
   corpusSha256: string;
   corpusPath: string;
   benchConfigPath: string;
+  // absent on headers written before the whole-PR review added this binding (the committed
+  // Stage-P journal is one) — such journals stay parseable forever, but a RESUME against one
+  // refuses: absence cannot prove configuration identity. The runner always writes it.
+  benchConfigSha256?: string;
   constantsFingerprint: string;
 }
 
@@ -693,6 +701,9 @@ export function parseJournalRow(line: string): RefsProbeJournalRow {
       ["atIso", isStr], ["corpusSha256", isStr], ["corpusPath", isStr],
       ["benchConfigPath", isStr], ["constantsFingerprint", isStr],
     ], "header");
+    // legacy headers (pre-binding) may omit it; when present it must be a string
+    if (Object.hasOwn(root, "benchConfigSha256") && !isStr(root["benchConfigSha256"]))
+      throw new BenchRefsRulesError("journal header row field benchConfigSha256 malformed");
     return root as unknown as RefsHeaderRow;
   }
   if (kind === "try-start") {

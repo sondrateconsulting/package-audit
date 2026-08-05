@@ -686,7 +686,7 @@ describe("parseJournalRow", () => {
   });
   test("operational rows round-trip", () => {
     const rows: RefsProbeJournalRow[] = [
-      { rowKind: "header", version: 1, atIso: "2026-08-05T00:00:00Z", corpusSha256: "ab".repeat(32), corpusPath: "refs-corpus.json", benchConfigPath: "bench-config.json", constantsFingerprint: "{}" },
+      { rowKind: "header", version: 1, atIso: "2026-08-05T00:00:00Z", corpusSha256: "ab".repeat(32), corpusPath: "refs-corpus.json", benchConfigPath: "bench-config.json", benchConfigSha256: "cd".repeat(32), constantsFingerprint: "{}" },
       { rowKind: "admission", version: 1, atIso: "2026-08-05T00:00:00Z", cellB: 10, stratum: "p1", slot: 1, attempt: 1, neededPoints: 73, remainingObserved: 4_000, sleptMs: 0 },
       { rowKind: "try-start", version: 1, atIso: "2026-08-05T00:00:00Z", cellB: 10, stratum: "p1", slot: 1, attempt: 1 },
       { rowKind: "quarantine", version: 1, atIso: "2026-08-05T00:00:00Z", cellB: 10, stratum: "p1", slot: 2, attempt: 1, untilEpochSec: 1_800_000_000, plannedSleepMs: 60_000 },
