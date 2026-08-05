@@ -1013,7 +1013,7 @@ describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", 
   const key = (repository: string, branch: string, configHash = "h") =>
     ({ configHash, scope: "branch" as const, organization: "org-a", repository, branch });
 
-  test("counts ONLY this config's pending branch-scope queue rows — terminal statuses and foreign configs never count", () => {
+  test("counts ONLY this config's pending branch-scope queue rows — terminal statuses, a live in_progress attempt, and foreign configs never count", () => {
     const db = mem();
     const run = seed(db); // configHash "h"
     // two §4-deferred units (throttle leaves them pending, carrying the throttle message)...
@@ -1028,6 +1028,12 @@ describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", 
     db.setUnitStatus(key("svc", "old"), { status: "skipped", runId: run.runId });
     db.enqueueUnit(key("svc", "broken"), run.runId);
     db.setUnitStatus(key("svc", "broken"), { status: "error", runId: run.runId, errorMessage: "boom" });
+    // ...an in_progress attempt held by a LIVE second run of the same config — the exact concurrent-
+    // report shape the field comment names: being attempted is not deferred ('pending' ALONE counts)...
+    const liveRun = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    expect(liveRun.resumed).toBe(false); // run 1 completed; this is a fresh, still-running sibling
+    db.enqueueUnit(key("svc", "live-attempt"), liveRun.runId);
+    db.setUnitStatus(key("svc", "live-attempt"), { status: "in_progress", runId: liveRun.runId });
     // ...and another config's pending backlog, which is not this config's deferral.
     db.enqueueUnit(key("svc", "feat-a", "other-config"), run.runId);
     const s = buildReport(db, run).summary;
