@@ -163,6 +163,16 @@ export function parseRefsProbeCorpus(jsonText: string): RefsProbeCorpus {
         throw new BenchRefsRulesError(`cell ${i} (p1) repo ${owner}/${name} has frozenPages ${frozenPages} — the p1 stratum is single-page`);
       if (stratum === "p2" && frozenPages < 2)
         throw new BenchRefsRulesError(`cell ${i} (p2) repo ${owner}/${name} has frozenPages ${frozenPages} — the p2 stratum paginates`);
+      // the strata are DEFINED on heads (> 100 paginates; exactly 100 is one page), and the
+      // frozen page count must agree with the frozen head count — a disagreement would make
+      // the invalidation baseline internally inconsistent before any try runs
+      if (stratum === "p1" && frozenHeads > 100)
+        throw new BenchRefsRulesError(`cell ${i} (p1) repo ${owner}/${name} has ${frozenHeads} heads — the p1 stratum is at most 100`);
+      if (stratum === "p2" && frozenHeads <= 100)
+        throw new BenchRefsRulesError(`cell ${i} (p2) repo ${owner}/${name} has ${frozenHeads} heads — the p2 stratum needs more than 100`);
+      const expectedPages = Math.ceil(Math.max(frozenHeads, 1) / 100);
+      if (expectedPages !== frozenPages)
+        throw new BenchRefsRulesError(`cell ${i} repo ${owner}/${name}: frozenPages ${frozenPages} disagrees with frozenHeads ${frozenHeads} (${expectedPages} pages expected)`);
       const key = repoKey(owner, name);
       if (seen.has(key)) throw new BenchRefsRulesError(`cell ${i} carries duplicate repo ${owner}/${name}`);
       seen.add(key);
@@ -319,11 +329,18 @@ export interface RefsProbeDispatchRecord {
   dispatchFailure: string | null; // a transport-layer throw (no HTTP response row at all)
 }
 
+// WHY the walk stopped — the drift rule's provenance input. Only "frozen-bound" (still
+// paginating at the frozen depth) and a complete walk at the wrong depth are POSITIVE drift
+// evidence; a walk aborted by a failed dispatch or a shape violation proves nothing about the
+// corpus and must never buy an invalidation re-run for a gate-deciding failure.
+export type RefsWalkStop = "complete" | "frozen-bound" | "dispatch-failure" | "shape";
+
 export interface RefsRepoWalkRecord {
   arm: RefsProbeArm;
   repo: string;
   pagesObserved: number;
   complete: boolean; // the walk reached hasNextPage:false within the frozen-depth bound
+  stoppedBy: RefsWalkStop;
   batteryFailure: string | null;
   identityFailure: string | null; // batched page-1 identity re-assertion (candidate arm only)
   headCount: number;
@@ -356,6 +373,10 @@ export function dispatchUncleanCauses(d: RefsProbeDispatchRecord): string[] {
   if (d.remaining === 0) causes.push("x-ratelimit-remaining 0 (window exhausted during the try)");
   if (hasResourceLimitSignal(d.errorTypes, d.errorMessages)) causes.push("resource-limit signal observed");
   if (d.malformedErrorEntries > 0) causes.push(`${d.malformedErrorEntries} malformed error entrie(s)`);
+  // gh exits nonzero BY DESIGN when the envelope carries errors (already unclean above), but a
+  // nonzero exit under an ok-shaped success is the truncated-transfer precedent's territory —
+  // for a measurement, fail closed
+  if (d.status !== 0 && d.exitCode !== 0) causes.push(`nonzero gh exit ${d.exitCode} under an HTTP ${d.status} response`);
   if (d.classification === "ok" && d.pointsCost === null) causes.push("per-call cost unreadable on an ok response");
   return causes;
 }
@@ -431,14 +452,17 @@ function summarizeArm(
   const page1Points = sumCosts(page1List);
   const continuationPoints = sumCosts(continuation);
   const totalPoints = sumCosts(own);
-  // first minus last readable remaining across the arm — 0 for a single-dispatch arm. A
-  // cross-check ONLY (valid within one reset window on a quiet credential); the run-level
-  // before/after rate_limit snapshots are the real delta reference.
+  // the arm's spend as the headers tell it: (first remaining + first call's own cost) − last
+  // remaining. A cross-check ONLY, valid within ONE reset window on a quiet credential — so it
+  // is withheld (null) unless every readable record shares one non-null reset epoch; the
+  // run-level before/after rate_limit snapshots are the real delta reference.
   const readable = own.filter((d) => d.remaining !== null);
   const first = readable[0];
   const last = readable[readable.length - 1];
-  const headerDelta = first !== undefined && last !== undefined
-    ? (first.remaining as number) - (last.remaining as number)
+  const oneEpoch = readable.length > 0 &&
+    readable.every((d) => d.resetEpochSec !== null && d.resetEpochSec === readable[0]!.resetEpochSec);
+  const headerDelta = oneEpoch && first !== undefined && last !== undefined
+    ? (first.remaining as number) + (first.pointsCost ?? 0) - (last.remaining as number)
     : null;
   return {
     clean: causes.length === 0,
@@ -463,8 +487,10 @@ export function evaluateTry(
   const candidate = summarizeArm("candidate", cell, expectedBatches, dispatches, walks);
   const control = summarizeArm("control", cell, expectedBatches, dispatches, walks);
   const frozenByRepo = new Map(cell.repos.map((r) => [`${r.owner}/${r.name}`.toLowerCase(), r.frozenPages]));
-  // page-count drift: a battery-clean walk whose observed depth differs from the frozen depth —
-  // complete at the wrong count, or still paginating at the frozen bound (either arm)
+  // page-count drift needs POSITIVE evidence: a battery-clean COMPLETE walk at the wrong
+  // depth, or a walk still paginating at the frozen bound (stoppedBy "frozen-bound"). A walk
+  // aborted by a failed dispatch or a shape violation proves nothing about the corpus — the
+  // failure itself decides the try, never an invalidation re-run.
   const drift: string[] = [];
   for (const w of walks) {
     if (w.batteryFailure !== null) continue;
@@ -473,8 +499,10 @@ export function evaluateTry(
       drift.push(`${w.arm} ${w.repo}: walked a repository absent from the frozen corpus`);
       continue;
     }
-    if (!w.complete) drift.push(`${w.arm} ${w.repo}: still paginating at the frozen depth ${frozen}`);
-    else if (w.pagesObserved !== frozen) drift.push(`${w.arm} ${w.repo}: observed ${w.pagesObserved} page(s), frozen ${frozen}`);
+    if (w.complete && w.pagesObserved !== frozen)
+      drift.push(`${w.arm} ${w.repo}: observed ${w.pagesObserved} page(s), frozen ${frozen}`);
+    else if (!w.complete && w.stoppedBy === "frozen-bound")
+      drift.push(`${w.arm} ${w.repo}: still paginating at the frozen depth ${frozen}`);
   }
   const pairRatio = candidate.totalPoints !== null && control.totalPoints !== null && control.totalPoints > 0
     ? candidate.totalPoints / control.totalPoints
@@ -541,6 +569,31 @@ export interface RefsTryRow {
   informational: RefsTryInformational;
 }
 
+// the journal's first row: binds every later row to ONE corpus, config, and rule revision, so
+// a resumed run can never silently reuse completed cells recorded under different rules
+export interface RefsHeaderRow {
+  rowKind: "header";
+  version: 1;
+  atIso: string;
+  corpusSha256: string;
+  corpusPath: string;
+  benchConfigPath: string;
+  constantsFingerprint: string;
+}
+
+// the write-ahead intent for one paired try: appended BEFORE the first dispatch, so a crash
+// mid-try leaves its spend visible in the journal (the matching try row never arrives — a
+// "dangling" start) and the resumed run re-runs that slot at the NEXT attempt ordinal
+export interface RefsTryStartRow {
+  rowKind: "try-start";
+  version: 1;
+  atIso: string;
+  cellB: number;
+  stratum: RefsStratum;
+  slot: number;
+  attempt: number;
+}
+
 export interface RefsAdmissionRow {
   rowKind: "admission";
   version: 1;
@@ -563,6 +616,8 @@ export interface RefsAdmissionInfeasibleRow {
   arithmetic: RefsTrancheAdmission;
 }
 
+// appended BEFORE its sleep (the obligation must survive a crash mid-sleep — resume honors an
+// unexpired untilEpochSec before any further dispatch anywhere)
 export interface RefsQuarantineRow {
   rowKind: "quarantine";
   version: 1;
@@ -572,7 +627,7 @@ export interface RefsQuarantineRow {
   slot: number;
   attempt: number;
   untilEpochSec: number | null;
-  sleptMs: number;
+  plannedSleepMs: number;
 }
 
 export interface RefsWashoutRow {
@@ -583,6 +638,8 @@ export interface RefsWashoutRow {
 }
 
 export type RefsProbeJournalRow =
+  | RefsHeaderRow
+  | RefsTryStartRow
   | RefsTryRow
   | RefsAdmissionRow
   | RefsAdmissionInfeasibleRow
@@ -631,6 +688,19 @@ export function parseJournalRow(line: string): RefsProbeJournalRow {
     }
     return root as unknown as RefsTryRow;
   }
+  if (kind === "header") {
+    requireFields(root, [
+      ["atIso", isStr], ["corpusSha256", isStr], ["corpusPath", isStr],
+      ["benchConfigPath", isStr], ["constantsFingerprint", isStr],
+    ], "header");
+    return root as unknown as RefsHeaderRow;
+  }
+  if (kind === "try-start") {
+    requireFields(root, [
+      ["atIso", isStr], ["cellB", isNum], ["stratum", isStratum], ["slot", isNum], ["attempt", isNum],
+    ], "try-start");
+    return root as unknown as RefsTryStartRow;
+  }
   if (kind === "admission") {
     requireFields(root, [
       ["atIso", isStr], ["cellB", isNum], ["stratum", isStratum], ["slot", isNum], ["attempt", isNum],
@@ -647,7 +717,7 @@ export function parseJournalRow(line: string): RefsProbeJournalRow {
   if (kind === "quarantine") {
     requireFields(root, [
       ["atIso", isStr], ["cellB", isNum], ["stratum", isStratum], ["slot", isNum], ["attempt", isNum],
-      ["untilEpochSec", isNumOrNull], ["sleptMs", isNum],
+      ["untilEpochSec", isNumOrNull], ["plannedSleepMs", isNum],
     ], "quarantine");
     return root as unknown as RefsQuarantineRow;
   }
@@ -676,9 +746,17 @@ export function deriveCellState(cell: RefsCorpusCell, rows: readonly RefsProbeJo
   const tries = own.filter((r): r is RefsTryRow => r.rowKind === "try");
   let invalidationsUsed = 0;
   const cleanSlots = new Set<number>();
-  const attemptsBySlot = new Map<number, number>();
+  // per-slot attempt high-water mark, fed by BOTH try rows and try-start intents: a dangling
+  // start (crash mid-try) advances the attempt ordinal without counting as an invalidation
+  const attemptHighBySlot = new Map<number, number>();
+  const bump = (slot: number, attempt: number): void => {
+    attemptHighBySlot.set(slot, Math.max(attemptHighBySlot.get(slot) ?? 0, attempt));
+  };
+  for (const r of own) {
+    if (r.rowKind === "try-start") bump(r.slot, r.attempt);
+  }
   for (const t of tries) {
-    attemptsBySlot.set(t.slot, (attemptsBySlot.get(t.slot) ?? 0) + 1);
+    bump(t.slot, t.attempt);
     if (t.verdict === "unclean" || t.verdict === "quarantine-unclean")
       return { kind: "terminated-unclean", cause: t.causes[0] ?? t.verdict };
     if (t.verdict === "invalidated") {
@@ -694,7 +772,7 @@ export function deriveCellState(cell: RefsCorpusCell, rows: readonly RefsProbeJo
   }
   for (let slot = 1; slot <= REFS_PROBE_TRIES_PER_CELL; slot++) {
     if (!cleanSlots.has(slot))
-      return { kind: "pending", nextSlot: slot, nextAttempt: (attemptsBySlot.get(slot) ?? 0) + 1, invalidationsUsed };
+      return { kind: "pending", nextSlot: slot, nextAttempt: (attemptHighBySlot.get(slot) ?? 0) + 1, invalidationsUsed };
   }
   return { kind: "complete" };
 }

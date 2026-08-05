@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildBatchRefsQuery } from "./graphqlBatch.ts";
+import { SOLO_REFS_QUERY } from "./benchRefsRules.ts";
 
 // ADR-0002 "The design, concretely" — batch shape. The builder is PURE and lands in Stage P so
 // the Confirmation-1 probe prices the query that ships (plan §4/§5 P1): the probe arm and the
@@ -7,13 +8,16 @@ import { buildBatchRefsQuery } from "./graphqlBatch.ts";
 // rider-equivalence test below pins exactly that.
 
 const repos = (n: number): Array<{ owner: string; name: string }> =>
-  Array.from({ length: n }, (_, i) => ({ owner: `owner-${i}`, name: `repo-${i}` }));
+  Array.from({ length: n }, (_, i) => ({ owner: "batch-owner", name: `repo-${i}` }));
 
-// the solo listBranchHeads page shape (github.ts) minus the after-cursor argument: page 1 of a
-// batched alias never carries a cursor, and the node/pageInfo shape must be the solo one so the
-// existing validation battery transfers unchanged (ADR Confirmation 6).
-const REFS_PAGE1_SELECTION =
-  "refs(refPrefix:\"refs/heads/\",first:100){pageInfo{hasNextPage endCursor}nodes{name target{...on Commit{oid committedDate tree{oid}}}}}";
+// The solo listBranchHeads page shape minus the after-cursor argument: page 1 of a batched
+// alias never carries a cursor, and the node/pageInfo shape must be the solo one so the
+// existing validation battery transfers unchanged (ADR Confirmation 6). DERIVED from
+// SOLO_REFS_QUERY — which is itself source-pinned against github.ts — so the builder and this
+// test cannot drift from the production document together.
+const REFS_PAGE1_SELECTION = SOLO_REFS_QUERY
+  .slice(SOLO_REFS_QUERY.indexOf("refs(refPrefix"), -2)
+  .replace(",after:$endCursor", "");
 
 describe("buildBatchRefsQuery — batch shape", () => {
   test("one aliased repository selection per repo, rN:repository(owner:$oN,name:$nN)", () => {
@@ -41,7 +45,7 @@ describe("buildBatchRefsQuery — batch shape", () => {
     // batched query must bind identities as variables so no identity byte reaches the document
     const hostile = [
       { owner: 'ow"ner{a', name: 'na}me"b' },
-      { owner: "plain", name: "repo" },
+      { owner: 'ow"ner{a', name: "repo" },
     ];
     const b = buildBatchRefsQuery(hostile, {});
     for (let i = 0; i < hostile.length; i++) {
@@ -111,6 +115,27 @@ describe("buildBatchRefsQuery — input validation (fail fast, fail closed)", ()
   test("an empty owner or name segment is rejected", () => {
     expect(() => buildBatchRefsQuery([{ owner: "", name: "x" }], {})).toThrow(/owner/i);
     expect(() => buildBatchRefsQuery([{ owner: "x", name: "" }], {})).toThrow(/name/i);
+  });
+
+  test("mixed-owner batches are rejected — the registered shape is per-owner (cross-owner is deferred)", () => {
+    expect(() =>
+      buildBatchRefsQuery(
+        [
+          { owner: "acme", name: "alpha" },
+          { owner: "globex", name: "beta" },
+        ],
+        {},
+      ),
+    ).toThrow(/owner/i);
+    // case-insensitive: the same owner in different casing is one owner, not a mix
+    const b = buildBatchRefsQuery(
+      [
+        { owner: "Acme", name: "alpha" },
+        { owner: "acme", name: "beta" },
+      ],
+      {},
+    );
+    expect(b.aliasCount).toBe(2);
   });
 });
 

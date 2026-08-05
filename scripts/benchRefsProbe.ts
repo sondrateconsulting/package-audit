@@ -15,7 +15,8 @@
 // washout follow the benchBoundary precedents, upgraded to per-tranche admission where the
 // tranche is the paired try.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { GithubClient } from "./github.ts";
 import { loadBenchConfig } from "./benchConfig.ts";
@@ -73,6 +74,7 @@ import {
   type RefsRepoWalkRecord,
   type RefsTryRow,
   type RefsStratum,
+  type RefsWalkStop,
 } from "./benchRefsRules.ts";
 
 // the artifact schemas and the whole rule executor are re-exported so this module IS the probe
@@ -94,22 +96,65 @@ export function assertProbeIdentity(liveLogin: string, corpus: RefsProbeCorpus):
     );
 }
 
-// tolerate exactly one trailing partial line (a crash mid-append); anything else is corruption
-export function parseJournal(lines: readonly string[], warn: (line: string) => void): RefsProbeJournalRow[] {
-  const nonEmpty = lines.filter((l) => l.trim() !== "");
+// Tolerate exactly one SYNTACTICALLY TORN, non-newline-terminated tail (a crash mid-append);
+// everything else — schema-invalid complete rows included — is corruption and throws. A
+// newline-terminated row completed its write, so its invalidity can never be a tear.
+export function parseJournal(rawText: string, warn: (line: string) => void): RefsProbeJournalRow[] {
+  const endsWithNewline = rawText.endsWith("\n");
+  const nonEmpty = rawText.split("\n").filter((l) => l.trim() !== "");
   const rows: RefsProbeJournalRow[] = [];
   for (let i = 0; i < nonEmpty.length; i++) {
-    try {
-      rows.push(parseJournalRow(nonEmpty[i]!));
-    } catch (e) {
-      if (i === nonEmpty.length - 1) {
-        warn(`journal: dropping one trailing partial line (${e instanceof Error ? e.message : String(e)}) — that attempt re-runs`);
+    const line = nonEmpty[i]!;
+    const isTornCandidate = i === nonEmpty.length - 1 && !endsWithNewline;
+    if (isTornCandidate) {
+      try {
+        JSON.parse(line);
+      } catch {
+        warn("journal: dropping one syntactically torn trailing line — that attempt re-runs");
         break;
       }
-      throw e;
     }
+    rows.push(parseJournalRow(line));
   }
   return rows;
+}
+
+// ---- pre-registered constants as one object (the result artifact + the journal header) ------
+export function probeConstants(): RefsProbeResult["constants"] {
+  return {
+    candidateBatchSizes: [...REFS_PROBE_CANDIDATE_BATCH_SIZES],
+    informationalBatchSizes: REFS_PROBE_ALL_BATCH_SIZES.filter((b) => !REFS_PROBE_CANDIDATE_BATCH_SIZES.includes(b)),
+    triesPerCell: REFS_PROBE_TRIES_PER_CELL,
+    invalidationRerunCap: REFS_PROBE_INVALIDATION_RERUN_CAP,
+    wallGateMs: REFS_PROBE_WALL_GATE_MS,
+    pairCostGateMax: REFS_PROBE_PAIR_COST_GATE_MAX,
+    pointBoundPerAttempt: REFS_PROBE_POINT_BOUND_PER_ATTEMPT,
+    bucketLimitPoints: REFS_PROBE_BUCKET_LIMIT_POINTS,
+    shipThresholdPoints: REFS_PROBE_SHIP_THRESHOLD_POINTS,
+    estate8x750Repos: REFS_PROBE_ESTATE_8X750_REPOS,
+    ageCapMs: REFS_PROBE_AGE_CAP_MS,
+  };
+}
+
+// the rule-revision fingerprint the journal header binds: resumed rows recorded under
+// different pre-registered constants must be refused, never silently reused
+export function probeConstantsFingerprint(): string {
+  return JSON.stringify(probeConstants());
+}
+
+// ---- single-writer lock (one probe runner per journal; concurrent spend would interleave) ----
+export function acquireProbeLock(lockPath: string): void {
+  try {
+    writeFileSync(lockPath, `${process.pid}\n`, { flag: "wx" });
+  } catch {
+    throw new BenchRefsRulesError(
+      `another probe run appears active (${lockPath} exists) — if none is running, remove the stale lock and retry`,
+    );
+  }
+}
+
+export function releaseProbeLock(lockPath: string): void {
+  rmSync(lockPath, { force: true });
 }
 
 // ---- runner dependencies (injectable; main() wires the live ones) ----------------------------
@@ -121,10 +166,11 @@ export interface RefsDispatchOutcome {
 export interface RefsProbeDeps {
   corpus: RefsProbeCorpus;
   corpusPath: string;
+  corpusSha256: string; // hash of the corpus FILE text — the journal header's binding
   outPath: string;
   journalPath: string;
   benchConfigPath: string;
-  existingJournalLines: string[];
+  existingJournalText: string;
   appendJournal: (row: RefsProbeJournalRow) => void;
   writeResult: (result: RefsProbeResult) => void;
   dispatchGraphql: (query: string, fields: Record<string, string>, label: string) => Promise<RefsDispatchOutcome>;
@@ -299,7 +345,7 @@ async function runPairedTry(deps: RefsProbeDeps, cell: RefsCorpusCell, slot: num
       const alias = aliasPages.get(key.toLowerCase());
       if (alias === undefined || alias === null || typeof alias !== "object") {
         walks.push({
-          arm: "candidate", repo: key, pagesObserved: 0, complete: false,
+          arm: "candidate", repo: key, pagesObserved: 0, complete: false, stoppedBy: "shape",
           batteryFailure: "alias absent or null in the batch envelope", identityFailure: null,
           headCount: 0, defaultBranch: null,
         });
@@ -309,22 +355,36 @@ async function runPairedTry(deps: RefsProbeDeps, cell: RefsCorpusCell, slot: num
       const identityFailure = checkAliasIdentity(alias, r.owner, r.name);
       const pages: unknown[] = [alias];
       let pageNo = 1;
+      // WHY the live loop stopped — the drift rule's provenance (only "frozen-bound" and a
+      // complete walk at the wrong depth are positive drift evidence)
+      let stoppedBy: RefsWalkStop = "complete";
       for (;;) {
         const info = livePageInfo(pages[pages.length - 1]);
-        if (!info.hasNextPage) break;
-        // bounded by the frozen depth: one page past it proves drift without unbounded spend
-        if (pageNo >= r.frozenPages) break;
-        if (info.endCursor === null) break; // the strict battery reports the shape violation
+        if (!info.hasNextPage) {
+          stoppedBy = "complete";
+          break;
+        }
+        // bounded by the frozen depth: stopping here proves drift without unbounded spend
+        if (pageNo >= r.frozenPages) {
+          stoppedBy = "frozen-bound";
+          break;
+        }
+        if (info.endCursor === null) {
+          stoppedBy = "shape"; // the strict battery reports the violation
+          break;
+        }
         pageNo++;
         const d = await dispatchOne(soloQuery, { owner: r.owner, name: r.name, endCursor: info.endCursor }, `${labelBase}.cont.${r.name}.p${pageNo}`, {
           arm: "candidate", callKind: "solo-page", repo: key, batchOrdinal: null, pageOrdinal: pageNo,
         });
         if (d === null) {
+          stoppedBy = "dispatch-failure";
           candidateFailed = !quarantine;
           break;
         }
         const last = dispatches[dispatches.length - 1]!;
         if (last.classification !== "ok") {
+          stoppedBy = "dispatch-failure";
           candidateFailed = true;
           break;
         }
@@ -333,8 +393,8 @@ async function runPairedTry(deps: RefsProbeDeps, cell: RefsCorpusCell, slot: num
       }
       const walk = assembleRefsWalk(pages);
       walks.push(walk.ok
-        ? { arm: "candidate", repo: key, pagesObserved: walk.pages, complete: walk.complete, batteryFailure: null, identityFailure, headCount: walk.headCount, defaultBranch: walk.defaultBranch }
-        : { arm: "candidate", repo: key, pagesObserved: pages.length, complete: false, batteryFailure: walk.failure, identityFailure, headCount: 0, defaultBranch: null });
+        ? { arm: "candidate", repo: key, pagesObserved: walk.pages, complete: walk.complete, stoppedBy, batteryFailure: null, identityFailure, headCount: walk.headCount, defaultBranch: walk.defaultBranch }
+        : { arm: "candidate", repo: key, pagesObserved: pages.length, complete: false, stoppedBy, batteryFailure: walk.failure, identityFailure, headCount: 0, defaultBranch: null });
     }
   }
   const contEnd = deps.now();
@@ -348,6 +408,7 @@ async function runPairedTry(deps: RefsProbeDeps, cell: RefsCorpusCell, slot: num
       const pages: unknown[] = [];
       let cursor: string | null = null;
       let pageNo = 0;
+      let stoppedBy: RefsWalkStop = "complete";
       for (;;) {
         pageNo++;
         const fields: Record<string, string> = { owner: r.owner, name: r.name };
@@ -356,27 +417,38 @@ async function runPairedTry(deps: RefsProbeDeps, cell: RefsCorpusCell, slot: num
           arm: "control", callKind: "solo-page", repo: key, batchOrdinal: null, pageOrdinal: pageNo,
         });
         if (d === null) {
+          stoppedBy = "dispatch-failure";
           controlAborted = !quarantine;
           break;
         }
         const last = dispatches[dispatches.length - 1]!;
         if (last.classification !== "ok") {
+          stoppedBy = "dispatch-failure";
           controlAborted = true;
           break;
         }
         const repoObj = (d.data as Record<string, unknown> | null)?.["repository"];
         pages.push(repoObj);
         const info = livePageInfo(repoObj);
-        if (!info.hasNextPage) break;
-        if (pageNo >= r.frozenPages) break; // drift bound, same as the candidate walk
-        if (info.endCursor === null) break;
+        if (!info.hasNextPage) {
+          stoppedBy = "complete";
+          break;
+        }
+        if (pageNo >= r.frozenPages) {
+          stoppedBy = "frozen-bound"; // drift bound, same as the candidate walk
+          break;
+        }
+        if (info.endCursor === null) {
+          stoppedBy = "shape";
+          break;
+        }
         cursor = info.endCursor;
       }
       if (pages.length > 0) {
         const walk = assembleRefsWalk(pages);
         walks.push(walk.ok
-          ? { arm: "control", repo: key, pagesObserved: walk.pages, complete: walk.complete, batteryFailure: null, identityFailure: null, headCount: walk.headCount, defaultBranch: walk.defaultBranch }
-          : { arm: "control", repo: key, pagesObserved: pages.length, complete: false, batteryFailure: walk.failure, identityFailure: null, headCount: 0, defaultBranch: null });
+          ? { arm: "control", repo: key, pagesObserved: walk.pages, complete: walk.complete, stoppedBy, batteryFailure: null, identityFailure: null, headCount: walk.headCount, defaultBranch: walk.defaultBranch }
+          : { arm: "control", repo: key, pagesObserved: pages.length, complete: false, stoppedBy, batteryFailure: walk.failure, identityFailure: null, headCount: 0, defaultBranch: null });
       }
     }
   }
@@ -415,14 +487,45 @@ const sleepToResetMs = (resetEpochSec: number | null, nowMs: number): number =>
   Math.max(resetEpochSec === null ? 0 : resetEpochSec * 1000 + 5_000 - nowMs, 30_000);
 
 export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult> {
-  const rows: RefsProbeJournalRow[] = parseJournal(deps.existingJournalLines, deps.log);
+  const rows: RefsProbeJournalRow[] = parseJournal(deps.existingJournalText, deps.log);
   const resumedFromJournal = rows.length > 0;
-  if (resumedFromJournal) deps.log(`journal: resuming with ${rows.length} recorded row(s)`);
-  const before = await deps.readRateLimit();
   const push = (row: RefsProbeJournalRow): void => {
     rows.push(row);
     deps.appendJournal(row);
   };
+  if (resumedFromJournal) {
+    deps.log(`journal: resuming with ${rows.length} recorded row(s)`);
+    // the header binds every recorded row to ONE corpus and rule revision — a journal from a
+    // different corpus, config, or constants set must be refused, never silently reused
+    const header = rows[0];
+    if (header === undefined || header.rowKind !== "header")
+      throw new BenchRefsRulesError("resumed journal has no header row — refusing to reuse unbound rows");
+    if (header.corpusSha256 !== deps.corpusSha256)
+      throw new BenchRefsRulesError(
+        `resumed journal was recorded against a different corpus (journal ${header.corpusSha256}, current ${deps.corpusSha256})`,
+      );
+    if (header.constantsFingerprint !== probeConstantsFingerprint())
+      throw new BenchRefsRulesError("resumed journal was recorded under different pre-registered constants — refusing to mix rule revisions");
+    // an unexpired quarantine obligation is honored BEFORE any further dispatch anywhere —
+    // the row was written before its sleep precisely so a crash mid-sleep cannot skip it
+    let outstandingUntil: number | null = null;
+    for (const r of rows) {
+      if (r.rowKind === "quarantine" && r.untilEpochSec !== null)
+        outstandingUntil = Math.max(outstandingUntil ?? 0, r.untilEpochSec);
+    }
+    if (outstandingUntil !== null && outstandingUntil * 1000 + 5_000 > deps.now()) {
+      const wait = sleepToResetMs(outstandingUntil, deps.now());
+      deps.log(`resume: honoring an unexpired quarantine — sleeping ${Math.ceil(wait / 1000)}s before any dispatch`);
+      await deps.sleep(wait);
+    }
+  } else {
+    push({
+      rowKind: "header", version: 1, atIso: isoOf(deps.now()),
+      corpusSha256: deps.corpusSha256, corpusPath: deps.corpusPath,
+      benchConfigPath: deps.benchConfigPath, constantsFingerprint: probeConstantsFingerprint(),
+    });
+  }
+  const before = await deps.readRateLimit();
   let finalWashoutMs = 0;
   try {
     for (const cell of deps.corpus.cells) {
@@ -454,21 +557,28 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
           slot: state.nextSlot, attempt: state.nextAttempt, neededPoints: arithmetic.neededPoints, remainingObserved, sleptMs,
         });
         deps.log(`try B=${cell.batchSize} ${cell.stratum} slot ${state.nextSlot} attempt ${state.nextAttempt} (admitted ${arithmetic.neededPoints} worst-case points)`);
+        // the write-ahead intent: a crash mid-try leaves this dangling, so the spend stays
+        // visible in the journal and the resumed run advances to the next attempt ordinal
+        push({
+          rowKind: "try-start", version: 1, atIso: isoOf(deps.now()), cellB: cell.batchSize, stratum: cell.stratum,
+          slot: state.nextSlot, attempt: state.nextAttempt,
+        });
         const { row, quarantine, resetHintEpochSec } = await runPairedTry(deps, cell, state.nextSlot, state.nextAttempt);
         push(row);
         deps.log(`  verdict: ${row.verdict}${row.causes.length > 0 ? ` (${row.causes[0]})` : ""}`);
         if (quarantine) {
           // the documented timeout penalty is unquantified: no admission can price the current
           // window after one, so the runner quarantines to the next reset epoch before ANY
-          // further dispatch anywhere
+          // further dispatch anywhere. The obligation row is journaled BEFORE the sleep — a
+          // crash mid-sleep resumes into the quarantine, never past it.
           const hint = resetHintEpochSec ?? (await deps.readRateLimit()).graphql.reset;
           const wait = sleepToResetMs(hint, deps.now());
-          deps.log(`quarantine: 502/504 observed — sleeping ${Math.ceil(wait / 1000)}s to the next reset epoch`);
-          await deps.sleep(wait);
           push({
             rowKind: "quarantine", version: 1, atIso: isoOf(deps.now()), cellB: cell.batchSize, stratum: cell.stratum,
-            slot: state.nextSlot, attempt: state.nextAttempt, untilEpochSec: hint, sleptMs: wait,
+            slot: state.nextSlot, attempt: state.nextAttempt, untilEpochSec: hint, plannedSleepMs: wait,
           });
+          deps.log(`quarantine: 502/504 observed — sleeping ${Math.ceil(wait / 1000)}s to the next reset epoch`);
+          await deps.sleep(wait);
         }
         state = deriveCellState(cell, rows);
       }
@@ -521,19 +631,7 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
     journalPath: deps.journalPath,
     benchConfigPath: deps.benchConfigPath,
     resumedFromJournal,
-    constants: {
-      candidateBatchSizes: [...REFS_PROBE_CANDIDATE_BATCH_SIZES],
-      informationalBatchSizes: REFS_PROBE_ALL_BATCH_SIZES.filter((b) => !REFS_PROBE_CANDIDATE_BATCH_SIZES.includes(b)),
-      triesPerCell: REFS_PROBE_TRIES_PER_CELL,
-      invalidationRerunCap: REFS_PROBE_INVALIDATION_RERUN_CAP,
-      wallGateMs: REFS_PROBE_WALL_GATE_MS,
-      pairCostGateMax: REFS_PROBE_PAIR_COST_GATE_MAX,
-      pointBoundPerAttempt: REFS_PROBE_POINT_BOUND_PER_ATTEMPT,
-      bucketLimitPoints: REFS_PROBE_BUCKET_LIMIT_POINTS,
-      shipThresholdPoints: REFS_PROBE_SHIP_THRESHOLD_POINTS,
-      estate8x750Repos: REFS_PROBE_ESTATE_8X750_REPOS,
-      ageCapMs: REFS_PROBE_AGE_CAP_MS,
-    },
+    constants: probeConstants(),
     before,
     after,
     finalWashoutMs,
@@ -574,7 +672,9 @@ async function main(): Promise<void> {
   }
   if (existsSync(outPath))
     throw new BenchRefsRulesError(`${outPath} already exists — results are append-only; name a new artifact (refs-probe-2.json, …)`);
-  const corpus = parseRefsProbeCorpus(readFileSync(corpusPath, "utf8"));
+  const corpusText = readFileSync(corpusPath, "utf8");
+  const corpus = parseRefsProbeCorpus(corpusText);
+  const corpusSha256 = createHash("sha256").update(corpusText).digest("hex");
   const journalPath = journalPathFor(outPath);
   const cfg = loadBenchConfig(BENCH_CONFIG_PATH);
   const client = new GithubClient({ githubHost: cfg.githubHost, db: null, spawnTimeoutMs: cfg.spawn.timeoutMs });
@@ -587,15 +687,21 @@ async function main(): Promise<void> {
     record: () => {}, now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   };
   mkdirSync(dirname(outPath), { recursive: true });
+  // one runner per journal: concurrent probes would interleave rows and double-spend. The lock
+  // releases only on clean completion — a crash leaves it for the operator to acknowledge.
+  const lockPath = `${journalPath}.lock`;
+  acquireProbeLock(lockPath);
   const result = await runRefsProbe({
     corpus,
     corpusPath,
+    corpusSha256,
     outPath,
     journalPath,
     benchConfigPath: BENCH_CONFIG_PATH,
-    existingJournalLines: existsSync(journalPath) ? readFileSync(journalPath, "utf8").split("\n") : [],
+    existingJournalText: existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "",
     appendJournal: (row) => appendFileSync(journalPath, `${JSON.stringify(row)}\n`),
-    writeResult: (r) => writeFileSync(outPath, `${JSON.stringify(r, null, 2)}\n`),
+    // "wx": the result is append-only evidence — never overwrite, even on a pre-check race
+    writeResult: (r) => writeFileSync(outPath, `${JSON.stringify(r, null, 2)}\n`, { flag: "wx" }),
     dispatchGraphql: async (query, fields, label) => {
       let captured: BenchHttpAttemptRecord | null = null;
       const ctx: BenchGhContext = { ...gh, record: (r) => { captured = r; } };
@@ -611,6 +717,7 @@ async function main(): Promise<void> {
     now: Date.now,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   });
+  releaseProbeLock(lockPath);
   log(`result written to ${outPath} (${result.outcome.kind})`);
 }
 

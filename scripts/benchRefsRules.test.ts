@@ -125,6 +125,7 @@ const okWalk = (over: Partial<RefsRepoWalkRecord> = {}): RefsRepoWalkRecord => (
   repo: "probe-owner/refs-probe-p1-0",
   pagesObserved: 1,
   complete: true,
+  stoppedBy: "complete",
   batteryFailure: null,
   identityFailure: null,
   headCount: 2,
@@ -302,6 +303,18 @@ describe("parseRefsProbeCorpus", () => {
     const b = validCorpus() as { cells: Array<Record<string, unknown>> };
     b.cells[0] = { batchSize: 10, stratum: "p1", feasible: false, infeasibleCause: null, repos: [] };
     expect(() => parseRefsProbeCorpus(JSON.stringify(b))).toThrow(BenchRefsRulesError);
+  });
+  test("the p2 stratum requires more than 100 heads, and head/page counts must agree", () => {
+    // > 100 heads is the registered paginating-stratum definition (exactly 100 is one page)
+    const a = validCorpus() as { cells: Array<{ repos: RefsCorpusRepo[] }> };
+    a.cells[1]!.repos[0] = { ...a.cells[1]!.repos[0]!, frozenHeads: 100 };
+    expect(() => parseRefsProbeCorpus(JSON.stringify(a))).toThrow(/heads/);
+    const b = validCorpus() as { cells: Array<{ repos: RefsCorpusRepo[] }> };
+    b.cells[1]!.repos[0] = { ...b.cells[1]!.repos[0]!, frozenHeads: 250 }; // 250 heads ≠ 2 frozen pages
+    expect(() => parseRefsProbeCorpus(JSON.stringify(b))).toThrow(/pages/i);
+    const c = validCorpus() as { cells: Array<{ repos: RefsCorpusRepo[] }> };
+    c.cells[0]!.repos[0] = { ...c.cells[0]!.repos[0]!, frozenHeads: 150 }; // p1 with paginating heads
+    expect(() => parseRefsProbeCorpus(JSON.stringify(c))).toThrow(/heads/);
   });
   test("malformed shapes are rejected loudly", () => {
     expect(() => parseRefsProbeCorpus("not json")).toThrow(BenchRefsRulesError);
@@ -505,6 +518,9 @@ describe("dispatchUncleanCauses", () => {
   test("malformed error entries are unclean", () => {
     expect(dispatchUncleanCauses(okDispatch({ malformedErrorEntries: 1 })).length).toBeGreaterThan(0);
   });
+  test("a nonzero gh exit under an ok-shaped 200 is unclean (the truncated-transfer precedent)", () => {
+    expect(dispatchUncleanCauses(okDispatch({ exitCode: 1 })).join(" ")).toMatch(/exit/);
+  });
 });
 
 // ---- try evaluation --------------------------------------------------------------------------
@@ -561,13 +577,24 @@ describe("evaluateTry", () => {
     expect(ev.verdict).toBe("invalidated");
     expect(ev.invalidationCause).toMatch(/drift/);
   });
-  test("page-count drift in the control arm invalidates (incomplete at the frozen bound)", () => {
+  test("page-count drift in the control arm invalidates (still paginating at the frozen bound)", () => {
     const { dispatches, walks } = cleanTryParts(p1cell);
     const i = walks.findIndex((w) => w.arm === "control");
-    walks[i] = { ...walks[i]!, complete: false };
+    walks[i] = { ...walks[i]!, complete: false, stoppedBy: "frozen-bound" };
     const ev = evaluateTry(p1cell, dispatches, walks);
     expect(ev.verdict).toBe("invalidated");
     expect(ev.invalidationCause).toMatch(/drift/);
+  });
+  test("an incomplete walk from a failed dispatch is NOT drift — the candidate failure decides the gate", () => {
+    // a transient 500 mid-continuation aborts the walk; misreading that as page-count
+    // drift would buy an illegitimate re-run for a gate-deciding unclean try
+    const { dispatches, walks } = cleanTryParts(p2cell);
+    const di = dispatches.findIndex((d) => d.arm === "candidate" && d.callKind === "solo-page");
+    dispatches[di] = { ...dispatches[di]!, status: 500, classification: "transient", pointsCost: null };
+    const wi = walks.findIndex((w) => w.arm === "candidate" && w.repo === dispatches[di]!.repo);
+    walks[wi] = { ...walks[wi]!, pagesObserved: 1, complete: false, stoppedBy: "dispatch-failure" };
+    const ev = evaluateTry(p2cell, dispatches, walks);
+    expect(ev.verdict).toBe("unclean");
   });
   test("a candidate-arm failure with a clean control fails the try unclean (gate-deciding)", () => {
     const { dispatches, walks } = cleanTryParts(p1cell);
@@ -631,12 +658,22 @@ describe("evaluateTry", () => {
     expect(ev.verdict).toBe("invalidated");
     expect(ev.invalidationCause).toMatch(/control/);
   });
-  test("header deltas are recorded per arm (cross-check only)", () => {
+  test("header deltas include the first request's own cost (cross-check only)", () => {
     const { dispatches, walks } = cleanTryParts(p1cell);
     dispatches.forEach((d, i) => { dispatches[i] = { ...d, remaining: 5_000 - i }; });
     const ev = evaluateTry(p1cell, dispatches, walks);
-    expect(ev.candidate.headerDelta).not.toBeNull();
-    expect(ev.control.headerDelta).not.toBeNull();
+    // control arm: 10 solo pages, remaining walks down by 1 each, every cost 1 —
+    // (first.remaining + first.cost) − last.remaining = the arm's full spend, 10
+    expect(ev.control.headerDelta).toBe(10);
+    // candidate arm: a single batch — its own cost is the whole delta
+    expect(ev.candidate.headerDelta).toBe(1);
+  });
+  test("a header delta spanning different reset epochs is withheld (misleading across windows)", () => {
+    const { dispatches, walks } = cleanTryParts(p1cell);
+    const i = dispatches.findIndex((d) => d.arm === "control");
+    dispatches[i] = { ...dispatches[i]!, resetEpochSec: 1_800_003_600 };
+    const ev = evaluateTry(p1cell, dispatches, walks);
+    expect(ev.control.headerDelta).toBeNull();
   });
 });
 
@@ -649,8 +686,10 @@ describe("parseJournalRow", () => {
   });
   test("operational rows round-trip", () => {
     const rows: RefsProbeJournalRow[] = [
+      { rowKind: "header", version: 1, atIso: "2026-08-05T00:00:00Z", corpusSha256: "ab".repeat(32), corpusPath: "refs-corpus.json", benchConfigPath: "bench-config.json", constantsFingerprint: "{}" },
       { rowKind: "admission", version: 1, atIso: "2026-08-05T00:00:00Z", cellB: 10, stratum: "p1", slot: 1, attempt: 1, neededPoints: 73, remainingObserved: 4_000, sleptMs: 0 },
-      { rowKind: "quarantine", version: 1, atIso: "2026-08-05T00:00:00Z", cellB: 10, stratum: "p1", slot: 2, attempt: 1, untilEpochSec: 1_800_000_000, sleptMs: 60_000 },
+      { rowKind: "try-start", version: 1, atIso: "2026-08-05T00:00:00Z", cellB: 10, stratum: "p1", slot: 1, attempt: 1 },
+      { rowKind: "quarantine", version: 1, atIso: "2026-08-05T00:00:00Z", cellB: 10, stratum: "p1", slot: 2, attempt: 1, untilEpochSec: 1_800_000_000, plannedSleepMs: 60_000 },
       { rowKind: "washout", version: 1, atIso: "2026-08-05T00:00:00Z", sleptMs: 60_000 },
     ];
     for (const r of rows) expect(parseJournalRow(JSON.stringify(r))).toEqual(r);
@@ -714,6 +753,19 @@ describe("deriveCellState", () => {
   test("rows for other cells are ignored", () => {
     const rows = [tryRow({ cellB: 25, slot: 1 }), tryRow({ stratum: "p2", slot: 1 })];
     expect(deriveCellState(cell, rows)).toEqual({ kind: "pending", nextSlot: 1, nextAttempt: 1, invalidationsUsed: 0 });
+  });
+  test("a dangling try-start (a crash mid-try) advances the attempt without an invalidation", () => {
+    const rows: RefsProbeJournalRow[] = [
+      { rowKind: "try-start", version: 1, atIso: "2026-08-05T00:00:00Z", cellB: 10, stratum: "p1", slot: 1, attempt: 1 },
+    ];
+    expect(deriveCellState(cell, rows)).toEqual({ kind: "pending", nextSlot: 1, nextAttempt: 2, invalidationsUsed: 0 });
+  });
+  test("a try-start matched by its try row does not double-count the attempt", () => {
+    const rows: RefsProbeJournalRow[] = [
+      { rowKind: "try-start", version: 1, atIso: "2026-08-05T00:00:00Z", cellB: 10, stratum: "p1", slot: 1, attempt: 1 },
+      tryRow({ slot: 1, attempt: 1 }),
+    ];
+    expect(deriveCellState(cell, rows)).toEqual({ kind: "pending", nextSlot: 2, nextAttempt: 1, invalidationsUsed: 0 });
   });
 });
 

@@ -52,9 +52,14 @@ export function buildBatchRefsQuery(repos: readonly BatchRefsRepo[], opts: Batch
   // duplicate (owner,name) pairs are rejected case-insensitively — GitHub identities are — with
   // the same collision-proof tuple key mapRepoPage uses (no separator ambiguity).
   const seen = new Set<string>();
+  // the registered batch shape is PER-OWNER ("page 1 for each of B repositories of one
+  // owner"); cross-owner batching is deferred, not adopted, so a mixed batch is a wiring bug
+  const firstOwner = repos[0]?.owner.toLowerCase() ?? "";
   repos.forEach((r, i) => {
     if (r.owner.length === 0) throw new BatchRefsQueryError(`owner is empty at index ${i}`);
     if (r.name.length === 0) throw new BatchRefsQueryError(`name is empty at index ${i}`);
+    if (r.owner.toLowerCase() !== firstOwner)
+      throw new BatchRefsQueryError(`batch spans multiple owners (${repos[0]!.owner}, ${r.owner}) — the registered shape is per-owner`);
     const key = JSON.stringify([r.owner.toLowerCase(), r.name.toLowerCase()]);
     if (seen.has(key)) throw new BatchRefsQueryError(`duplicate repository ${r.owner}/${r.name} at index ${i}`);
     seen.add(key);
