@@ -1,6 +1,6 @@
 ---
-status: "proposed"
-date: 2026-08-04
+status: "accepted"
+date: 2026-08-05
 decision-makers: rvo (repository owner)
 consulted: Codex (gpt-5.6-sol) — adversarial ADR review rounds; see Review history
 informed: operators running `bun run audit` against multi-organization estates
@@ -192,9 +192,10 @@ reproducing today's behavior exactly. The reduction is structural on the page-1 
 owner at full batches; the continuation term for branch-heavy repositories is unchanged), and
 there is no database-schema change and no new trust boundary.
 
-The recommendation is definitive; per this repository's practice the ADR stays `proposed` until
-the decision-maker ratifies it, and the batch-size default is pinned by the pre-registered
-Confirmation probe, not by this document.
+The recommendation is definitive. Per this repository's practice the ADR remained `proposed`
+until the decision-maker ratified it: **rvo ratified Option 1 on 2026-08-05** at the Stage-P
+gate (PR #40), with the batch-size default pinned by the pre-registered Confirmation probe —
+**B = 25** — not by this document.
 
 ### The design, concretely
 
@@ -1012,9 +1013,10 @@ the formula's 1-point-per-query floor):
 The uniform-*p* = 2 column shows the continuation term unmoved by this decision — the
 disclosed scope: this option removes the per-repository page-1 minimum, not the
 branch-heavy tail. **The `discovery.batchSize` operator range's ceiling is therefore the
-probe-pinned default, B = 25**, recorded here for the implementation stage; per this
-repository's practice the ADR stays `proposed` until the decision-maker ratifies, and the
-`proposed → accepted` flip rides the probe PR only on rvo's explicit word.
+probe-pinned default, B = 25**, recorded here for the implementation stage. Per this
+repository's practice the flip to `accepted` rode the probe PR only on rvo's explicit word:
+**rvo ratified Option 1 with the pinned default B = 25 on 2026-08-05** (the Stage-P
+ratification gate on PR #40), and the status above records it.
 
 ### Review history
 

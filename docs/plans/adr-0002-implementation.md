@@ -502,5 +502,11 @@ assumed).
   append-only claim scoped, disclosing the one pre-measurement corpus remediation). This
   run also hit the timeout wrapper mid-analysis and was recovered by the §8.1 resume
   message, like P1's.
+- **Ratification (2026-08-05): rvo ratified Option 1 with the pinned default B = 25** at the
+  Stage-P gate — the question was put with CI green on PR #40 and the ten-round REVISE
+  disclosure restated; the answer was "Ratify — accept @ B = 25". The `proposed → accepted`
+  flip landed on the PR-P branch on that explicit word, with both gate-dependent ADR
+  sentences reconciled to the post-gate truth. Stage I remains gated on PR-P's MERGE (the
+  evidence, corrected ADR, pinned default, and accepted status must all be on `main`).
 - *(the implementation session appends per-step codex outcomes, the santa-loop record, and
   any live-run observations here, exactly as `adr-0001-t2c-implementation.md` §9 did.)*
