@@ -96,7 +96,7 @@ export interface ReportSummary {
   // identity above stays an UPPER BOUND (never a double-count) rather than an equality on a resume.
   //
   // Throttle carve-out, precisely: a branch throttle-requeued with NO prior error has neither a row nor
-  // an error — deferred, not terminal, finished next run — so it is in none of the PARTITION counts
+  // an error — deferred, not terminal, retried when a later run re-enumerates it — so it is in none of the PARTITION counts
   // (branchesDeferred below is where it shows). That holds absolutely
   // only WITHIN a single invocation; after an earlier-invocation error the branch DOES carry an error
   // and so IS counted here, despite being deferred rather than terminal.

@@ -1611,10 +1611,19 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     ];
     expect(policyWarnEvents(planEvents)).toEqual(expected);
     expect(policyWarnEvents(runEvents)).toEqual(expected); // identical to --plan
-    // The done event embeds the report's summary — logLine is shape-unchecked (Record<string,
-    // unknown>, so dropping the embed would still compile); this pins the README's "also on the
-    // `done` event" claim at the emission seam, branchesDeferred riding along.
-    expect(runEvents.find((e) => e["event"] === "done")).toMatchObject({ summary: { branchesDeferred: 0 } });
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("the done event embeds the report's summary — branchesDeferred rides the wire", async () => {
+    // Single cause: the embed alone. logLine is shape-unchecked (Record<string, unknown>, so
+    // dropping the summary embed would still compile); this pins the README's "also on the `done`
+    // event" claim at the emission seam.
+    const root = mkdtempSync(join(tmpdir(), "done-embed-"));
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const events = await captureJsonl(async () => { await runScan(db, fullClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main"), rt(config, "h"), noArgsT7, null); });
+    db.close();
+    expect(events.find((e) => e["event"] === "done")).toMatchObject({ summary: { branchesDeferred: 0 } });
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -2050,12 +2059,12 @@ describe("past-cap settles a stale throttle-pending queue row (§4→§7 double-
   // Run B itself is THROTTLE-FREE (its scan failures are permanent GithubApiErrors), so its report
   // must partition feat-x exactly once (past-cap): an unsettled pending row would double-count the
   // branch into branchesDeferred and flag this throttle-free run's summary PARTIAL.
+  // Derived from the shared §4 config (the scanConfig precedent below) rather than a fresh partial
+  // literal, so it inherits every field the stubs rely on and only overrides what this scenario needs.
   const capConfig = Object.freeze({
-    cutoffDate: "2000-01-01", maxBranchesPerRepo: 1, maxReposPerOrg: 10,
-    includeArchived: true, includeForks: true, includePersonalNamespace: false,
-    organizations: null, excludeOrganizations: [], excludeRepositories: [],
+    ...(config as unknown as Record<string, unknown>),
+    maxBranchesPerRepo: 1,
     branches: null, excludeBranches: [], // explicit unrestricted policy — rt() compiles from these
-    concurrency: { organizations: 1, repositories: 1, branches: 1 },
   }) as unknown as Config;
   const featX: BranchHead = { name: "feat-x", oid: "c".repeat(40), committedDate: "2026-01-01T00:00:00Z", treeOid: "d".repeat(40) };
   const featY: BranchHead = { name: "feat-y", oid: "e".repeat(40), committedDate: "2026-02-01T00:00:00Z", treeOid: "f".repeat(40) };

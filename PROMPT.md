@@ -458,9 +458,11 @@ CREATE TABLE IF NOT EXISTS run_unit_head (
                                        -- immutable: lets the report count each disposition for THIS
                                        -- run alone (work_queue is mutable and cross-run).
                                        -- 'past-cap' (v4): eligible but past maxBranchesPerRepo —
-                                       -- recorded for report VISIBILITY only; its work_queue row is
+                                       -- recorded for report VISIBILITY; a 'done' work_queue row is
                                        -- untouched, so a later cap-order shift promotes it without a
-                                       -- rescan. 'policy-excluded' (v4): dropped by branch allow/deny.
+                                       -- rescan (a stale 'pending' row is settled to 'skipped' so §7
+                                       -- never double-counts a surfaced branch as deferred).
+                                       -- 'policy-excluded' (v4): dropped by branch allow/deny.
                                        -- The four are DISJOINT — status alone identifies the
                                        -- disposition; no read surface needs a second column to tell
                                        -- a policy exclusion from a genuine cutoff skip. It is named
@@ -1480,12 +1482,15 @@ reached a TERMINAL outcome — an equality on a single-invocation run, an upper 
 resumed one. A THROTTLE-REQUEUED branch is deferred, not terminal: it writes neither a row nor
 a NEW error, and with no prior same-run error it is in none of THOSE counts (an earlier
 invocation's append-only error still counts it — the resumed-run divergence above).
-`branchesDeferred` surfaces exactly that remainder: COUNT of work_queue rows WHERE
+`branchesDeferred` surfaces that remainder as the config's still-pending queue rows (a
+count that also carries crash-recovery resets and prior-run rows no run has re-enumerated):
+COUNT of work_queue rows WHERE
 config_hash = the run's AND scope='branch' AND status='pending' at report build — the ONE
 count read from the MUTABLE cross-run queue, sanctioned because the deferred remainder
 exists nowhere else in SQLite. It is therefore the CURRENT backlog at generation time
 (re-rendering an old --run-id after later runs drain the queue reports 0 — §4's contract is
-that a future run finishes the work it still re-enumerates), it sits OUTSIDE the terminal
+that a future run retries the work it still re-enumerates, though a retry can throttle
+again), it sits OUTSIDE the terminal
 identity above (on a resumed run a deferred branch can also hold an earlier invocation's
 error or retained row, so summing it in would double-count; within one invocation the two
 sides are disjoint — every disposition settles or never-creates its pending row, past-cap
@@ -1494,8 +1499,9 @@ owner/repo discovery never enumerated (nothing was enqueued for them — though 
 pending rows beneath such a repo remain counted), and it retains any pending row whose unit
 no run re-enumerates (nothing prunes work_queue) — branch deleted, repo dropped from the
 kept set (deleted, renamed, newly archived/fork-filtered, or displaced past
-`maxReposPerOrg`), or owner no longer discovered — until re-enumeration settles it or
-`--rescan-branch`/`--fresh` resets it. Decide policy dispositions ONLY via both status and policy_status
+`maxReposPerOrg`), or owner no longer discovered — until a run re-enumerates it (settling
+or re-attempting it) or `--fresh` drops the queue; `--rescan-branch` cannot clear such a
+row (it only sets an already-pending row pending again). Decide policy dispositions ONLY via both status and policy_status
 (scripts/policyDisposition.ts); `policy_status IS NOT NULL` alone is never a proxy for
 "excluded" (a scanned default branch carries the counterfactual). The guard validates the
 WHOLE row, not just those two columns: `is_default_branch` is load-bearing in BOTH
