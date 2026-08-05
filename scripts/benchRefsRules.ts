@@ -482,17 +482,21 @@ export function evaluateTry(
   const base = { candidate, control, pairRatio };
   // precedence: the documented-timeout quarantine first (terminal, any arm), then the control
   // prerequisite and the drift rule (both invalidate and re-run), then candidate cleanliness
-  // (gate-deciding), then clean.
+  // (gate-deciding), then clean. One carve-out: a control arm that never STARTED is not a
+  // dirty denominator — the runner may skip it once a candidate failure has already decided
+  // the gate ("terminate early, its partial record committed with the cause"); the candidate
+  // verdict then stands. A clean candidate with no control still invalidates (no denominator).
+  const controlStarted = dispatches.some((d) => d.arm === "control") || walks.some((w) => w.arm === "control");
   if (dispatches.some((d) => d.status === 502 || d.status === 504)) {
     return {
       ...base, verdict: "quarantine-unclean", invalidationCause: null,
       causes: [...candidate.causes, ...control.causes],
     };
   }
-  if (!control.clean) {
+  if (!control.clean && (controlStarted || candidate.clean)) {
     return {
       ...base, verdict: "invalidated",
-      invalidationCause: `dirty-control: ${control.causes[0] ?? "unclean"}`,
+      invalidationCause: `dirty-control: ${controlStarted ? control.causes[0] ?? "unclean" : "control arm never ran"}`,
       causes: control.causes,
     };
   }

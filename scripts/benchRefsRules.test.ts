@@ -614,6 +614,23 @@ describe("evaluateTry", () => {
     dispatches[bi] = { ...dispatches[bi]!, status: 500, classification: "transient", pointsCost: null };
     expect(evaluateTry(p1cell, dispatches, walks).verdict).toBe("invalidated");
   });
+  test("a candidate failure with a never-started control is unclean, not invalidated (the runner may skip the denominator once the gate is decided)", () => {
+    const { dispatches, walks } = cleanTryParts(p1cell);
+    const candOnlyDispatches = dispatches.filter((d) => d.arm === "candidate");
+    const candOnlyWalks = walks.filter((w) => w.arm === "candidate");
+    const bi = candOnlyDispatches.findIndex((d) => d.callKind === "batch-page1");
+    candOnlyDispatches[bi] = { ...candOnlyDispatches[bi]!, status: 500, classification: "transient", pointsCost: null };
+    const ev = evaluateTry(p1cell, candOnlyDispatches, candOnlyWalks);
+    expect(ev.verdict).toBe("unclean");
+  });
+  test("a clean candidate with a never-started control invalidates (no denominator, no verdict)", () => {
+    const { dispatches, walks } = cleanTryParts(p1cell);
+    const candOnlyDispatches = dispatches.filter((d) => d.arm === "candidate");
+    const candOnlyWalks = walks.filter((w) => w.arm === "candidate");
+    const ev = evaluateTry(p1cell, candOnlyDispatches, candOnlyWalks);
+    expect(ev.verdict).toBe("invalidated");
+    expect(ev.invalidationCause).toMatch(/control/);
+  });
   test("header deltas are recorded per arm (cross-check only)", () => {
     const { dispatches, walks } = cleanTryParts(p1cell);
     dispatches.forEach((d, i) => { dispatches[i] = { ...d, remaining: 5_000 - i }; });
