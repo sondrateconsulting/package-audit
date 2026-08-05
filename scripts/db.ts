@@ -2177,6 +2177,26 @@ export class AuditDb {
       );
   }
 
+  // Past-cap settle (§5.B → §7): when a run surfaces a branch as past-cap it records a fresh
+  // run_unit_head row, and it must not leave an earlier run's throttle-deferred 'pending' queue row
+  // alive beside that disposition — §7's branchesDeferred is a plain pending count, so an unsettled
+  // row would count the same branch twice (past-cap AND deferred) and flag a throttle-free run's
+  // summary PARTIAL. Guarded on BOTH sides: only 'pending' settles ('done' survives for the §3
+  // skip-reuse predicate, 'error' for the next-run rescan), and scope is pinned to 'branch' in the
+  // SQL so no key shape can ever settle an org/repo-scope unit. error_message clears with the
+  // settle (setUnitStatus's null-clears semantics — a stale throttle message on a settled row would
+  // misattribute why it sits at 'skipped'). Returns whether a row was settled.
+  settlePastCapUnit(key: WorkUnitKey, runId: string): boolean {
+    const res = this.db
+      .query(
+        `UPDATE work_queue SET status='skipped', last_run_id = ?, updated_at = ?, error_message = NULL
+         WHERE config_hash = ? AND scope = 'branch' AND organization = ? AND repository = ? AND branch = ?
+           AND status = 'pending'`,
+      )
+      .run(runId, nowIso(), key.configHash, key.organization, key.repository ?? "", key.branch ?? "");
+    return res.changes > 0;
+  }
+
   // --rescan-branch (§3): reset the matching branch-scope row of the CURRENT config_hash only.
   // Returns false when no row matched (orchestrate surfaces that to the user).
   rescanBranch(configHash: string, organization: string, repository: string, branch: string): boolean {

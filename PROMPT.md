@@ -575,8 +575,10 @@ Resumability rules:
   (its usage is genuinely stale), and it just isn't refreshed into new runs. What "retains" does
   NOT mean is "this run says nothing about it", and the two cases differ: a PAST-CAP branch DOES
   get a FRESH `run_unit_head` row this run (`status='past-cap'`, commit_sha='') recorded purely
-  for report VISIBILITY — the work queue is left untouched, so a later cap-order shift promotes it
-  without a re-scan; a DELETED branch is not surfaced at all, and stale-row reconciliation prunes any row
+  for report VISIBILITY — a `done` work-queue row is left untouched, so a later cap-order shift
+  promotes it without a re-scan, while a stale `pending` row (an earlier run's throttle deferral)
+  is settled to 'skipped' so §7's `branchesDeferred` never double-counts a branch this run already
+  surfaced as past-cap; a DELETED branch is not surfaced at all, and stale-row reconciliation prunes any row
   a prior resume-invocation of THIS run left for it (earlier runs' rows are immutable and stay). That
   prune is REPO-SCOPED, and deliberately so: it runs inside the per-repo path, so it can only speak for
   repos this run re-discovered AND kept. A repo that dropped out of the kept set between invocations —

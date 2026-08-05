@@ -105,7 +105,10 @@ export interface ReportSummary {
   // still 'pending' when the report was built — the throttle-requeued remainder a FUTURE run
   // finishes. Deliberately NOT a sixth term of the identity above (deferred is non-terminal), and
   // NEVER folded into branchesErrored: on a single-invocation run the deferred set is disjoint from
-  // every count here, while on a RESUMED run a deferred branch can ALSO carry an earlier invocation's
+  // every count here — enforced at the SOURCE, not by this query: every disposition path settles or
+  // never-creates its pending row within the run (scanned/skip-current → 'done', skip-cutoff/policy →
+  // 'skipped', past-cap settles a stale one via db.ts::settlePastCapUnit, throttle leaves 'pending'
+  // with NO row) — while on a RESUMED run a deferred branch can ALSO carry an earlier invocation's
   // append-only error (→ branchesErrored) or retained disposition row (→ that bucket) — the same
   // both-ways divergences branchesErrored documents — so summing it into the partition would
   // double-count. It is a QUEUE-side total, not a disposition. 'pending' alone counts: an

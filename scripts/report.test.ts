@@ -1057,4 +1057,20 @@ describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", 
     expect(buildReport(db, run).summary.branchesDeferred).toBe(0);
     db.close();
   });
+
+  test("RESUME overlap: a deferred branch holding an earlier invocation's retained row still counts — deferred is queue-side, never row-gated", () => {
+    // Regression guard for the tempting wrong fix: gating the count on "holds no run_unit_head row
+    // this run" (an anti-join) would zero the deferred signal in exactly the resumed-run case the
+    // field comment documents — a retained row presenting the OLD head while the re-scan throttled —
+    // so a sustained-throttle resume would read clean again. The double-presence IS the contract.
+    const db = mem();
+    const run = seed(db); // configHash "h": one scanned + one skipped-cutoff head of its own
+    db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc", branch: "feat-a", commitSha: "sha-old", status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-01-01T00:00:00Z" });
+    db.enqueueUnit(key("svc", "feat-a"), run.runId);
+    db.setUnitStatus(key("svc", "feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    const s = buildReport(db, run).summary;
+    expect(s.branchesDeferred).toBe(1); // counted despite the retained row…
+    expect(s.branchesScanned).toBe(2); // …which stays in its own disposition bucket: the documented double-presence
+    db.close();
+  });
 });

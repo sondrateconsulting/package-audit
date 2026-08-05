@@ -816,7 +816,7 @@ describe("runPlan org-level discovery failure (fail-soft continue)", () => {
   });
 });
 
-describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-cap untouched)", () => {
+describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-cap done-reuse)", () => {
   // defaultBranch is REQUIRED and explicit: inferring it (a hardcoded "main", or "the first head")
   // would make a fixture agree with whatever the code resolved and hide a default-resolution defect.
   const graphqlHeads = (nodes: Array<{ name: string; oid: string; date: string }>, defaultBranch: string | null): string =>
@@ -859,7 +859,8 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
 
     // run_unit_head: stale → skipped-cutoff (empty sha), main+dev → scanned at their live heads with
     // the REAL default-branch flag (1 for main, 0 otherwise), and feat → a NEW past-cap row (a
-    // past-cap branch is now recorded for report visibility, though its work queue stays untouched).
+    // past-cap branch is recorded for report visibility; only a stale PENDING queue row would be
+    // settled beside it — none here, feat holds no row).
     const headRows = db.read(`SELECT branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
     expect(headRows).toEqual([
       { branch: "dev", commit_sha: hexOid("o-dev"), status: "scanned", is_default_branch: 0 },
@@ -868,7 +869,8 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
       { branch: "stale", commit_sha: "", status: "skipped-cutoff", is_default_branch: 0 },
     ]);
     // work-queue state: stale skipped, main+dev still done (reused), feat never enqueued (past-cap
-    // retains prior queue state so a later cap-order promotion can reuse a done scan).
+    // never creates a row and leaves 'done' untouched so a later cap-order promotion can reuse a
+    // done scan; only a stale 'pending' row would be settled — see settlePastCapUnit).
     expect(db.getUnit(key("stale"))?.status).toBe("skipped");
     expect(db.getUnit(key("main"))?.status).toBe("done");
     expect(db.getUnit(key("dev"))?.status).toBe("done");
@@ -2034,6 +2036,57 @@ describe("processRepo throttle requeue (§4)", () => {
     rmSync(root, { recursive: true, force: true });
     expect(db.getUnit(KEY)?.status).toBe("done");
     expect(db.read("SELECT message FROM errors").all().length).toBe(0);
+    db.close();
+  });
+});
+
+describe("past-cap settles a stale throttle-pending queue row (§4→§7 double-count guard)", () => {
+  // Run A throttles both units (pending queue rows, no head rows — the §4 carve-out). Before run B
+  // the repo grows a NEWER sibling; with ONE non-default cap slot, run B ranks feat-x past the cap.
+  // Run B itself is THROTTLE-FREE (its scan failures are permanent GithubApiErrors), so its report
+  // must partition feat-x exactly once (past-cap): an unsettled pending row would double-count the
+  // branch into branchesDeferred and flag this throttle-free run's summary PARTIAL.
+  const capConfig = Object.freeze({
+    cutoffDate: "2000-01-01", maxBranchesPerRepo: 1, maxReposPerOrg: 10,
+    includeArchived: true, includeForks: true, includePersonalNamespace: false,
+    organizations: null, excludeOrganizations: [], excludeRepositories: [],
+    branches: null, excludeBranches: [], // explicit unrestricted policy — rt() compiles from these
+    concurrency: { organizations: 1, repositories: 1, branches: 1 },
+  }) as unknown as Config;
+  const featX: BranchHead = { name: "feat-x", oid: "c".repeat(40), committedDate: "2026-01-01T00:00:00Z", treeOid: "d".repeat(40) };
+  const featY: BranchHead = { name: "feat-y", oid: "e".repeat(40), committedDate: "2026-02-01T00:00:00Z", treeOid: "f".repeat(40) };
+  const capMain: BranchHead = { name: "main", oid: "a".repeat(40), committedDate: "2026-03-01T00:00:00Z", treeOid: "b".repeat(40) };
+  const XKEY: WorkUnitKey = { configHash: "cap-hash", scope: "branch", organization: "o", repository: "r", branch: "feat-x" };
+  const clientFor = (snapshot: BranchSnapshot, failure: Error): GithubClient =>
+    ({ listBranchHeads: async () => snapshot, cloneNoCheckout: async () => { throw failure; } }) as unknown as GithubClient;
+  const startCapRun = (db: AuditDb) => db.startRun({
+    configHash: "cap-hash", effectiveOwners: ["o"], ownersSource: "discovered",
+    trackedPackages: ["expo"], cutoffDate: "2000-01-01", githubHost: "github.com",
+  });
+
+  test("run B (throttle-free) reports the churned-out branch as past-cap ONLY — settled queue row, zero deferred, no PARTIAL", async () => {
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // Run A: heads arrive committedDate DESC; feat-x fills the single non-default slot; both scans throttle.
+    const runA = startCapRun(db);
+    await processRepo(db, clientFor({ heads: [capMain, featX], defaultBranch: "main" }, new ThrottleExhausted("core bucket")), rt(capConfig, "cap-hash"), runA.runId, "o", repo, [], new Set());
+    db.completeRun(runA.runId);
+    expect(db.getUnit(XKEY)?.status).toBe("pending"); // the §4 carve-out left feat-x deferred
+    // Run B, same config: feat-y (newer) claims the slot, feat-x is past-cap; failures are PERMANENT.
+    const runB = startCapRun(db);
+    expect(runB.resumed).toBe(false);
+    await processRepo(db, clientFor({ heads: [capMain, featY, featX], defaultBranch: "main" }, new GithubApiError("boom", { endpoint: "x" })), rt(capConfig, "cap-hash"), runB.runId, "o", repo, [], new Set());
+    db.completeRun(runB.runId);
+    // the stale pending row is settled the moment run B surfaces feat-x as past-cap…
+    const settled = db.getUnit(XKEY)!;
+    expect(settled.status).toBe("skipped");
+    expect(settled.errorMessage).toBeNull(); // the stale throttle message clears with the settle
+    // …so the report partitions feat-x exactly once (past-cap) with no deferred double-count…
+    const s = buildReport(db, db.getRun(runB.runId)!).summary;
+    expect(s.branchesPastCap).toBe(1);
+    expect(s.branchesDeferred).toBe(0);
+    expect(s.branchesErrored).toBe(2); // main + feat-y: permanent scan errors, run B's real story
+    // …and the human summary of this throttle-free run must NOT read as partial.
+    expect(runSummaryText(runB.runId, s, 2, "output/run-x.json")).not.toContain("PARTIAL");
     db.close();
   });
 });

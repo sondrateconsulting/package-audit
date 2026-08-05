@@ -602,12 +602,16 @@ export async function processRepo(
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-cutoff" });
   }
 
-  // Past-cap (policy-eligible, after cutoff, past the cap): record ONLY a run_unit_head row for report
-  // visibility — do NOT enqueue or touch the work queue, so a prior 'done' scan survives and a later
-  // run can promote this branch (cap-order shift) without a re-scan.
+  // Past-cap (policy-eligible, after cutoff, past the cap): record a run_unit_head row for report
+  // visibility — never enqueue, and never touch a 'done' queue row, so a prior scan survives and a
+  // later run can promote this branch (cap-order shift) without a re-scan. A stale 'pending' row
+  // (an earlier run's §4 throttle deferral) IS settled to 'skipped', though: §7's queue-side
+  // branchesDeferred would otherwise count the same branch this run just surfaced as past-cap — a
+  // double count that flags a throttle-free run PARTIAL (see settlePastCapUnit).
   for (const d of plan.pastCap) {
     const h = d.head;
     db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "past-cap", isDefaultBranch: d.isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
+    db.settlePastCapUnit(keyFor(h.name), runId);
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "past-cap" });
   }
 
