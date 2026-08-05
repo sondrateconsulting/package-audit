@@ -969,26 +969,32 @@ under Option 1 and Follow-on is the shape that would address it if it ever is.
 The Confirmation-1 probe ran to completion against the frozen corpus (100 synthetic fixture
 repositories under the `sondrateconsulting` organization; corpus, append-only try journal,
 and result all in [0002-benchmark/](0002-benchmark/), the journal and result committed
-together at completion): 26 paired tries, 976 dispatches, 975 measured points, no
-invalidations, no resume. **The pre-registered rule pinned the default at B = 25.**
+together at completion): 26 try rows — **25 completed pairs plus one candidate-only attempt
+terminated by the 504 below** — 976 dispatches, 975 measured points, no invalidations, no
+resume. **The pre-registered rule pinned the default at B = 25.**
 
-Measured values replaced no formula estimates because they differed nowhere: every batched
-page-1 call priced at **exactly 1 point** at B ∈ {10, 25, 50} — the published formula held
-exactly for this query shape, and the absolute gate's 2× tolerance was never consumed — and
-every continuation page priced at exactly 1 point. Per-repository page-1 reducers (max over
-clean tries, *p* = 1 stratum): 0.10 at B = 10, **0.04 at B = 25**, 0.02 at B = 50
-(informational). Candidate/control pair ratios in the *p* = 1 stratum: 0.10 / 0.04 / 0.02 —
-all far under the ½ gate; the paginating stratum's ratios (0.55 at B = 10, 0.52 at B = 25)
-sat above ½ exactly as the algebraic floor above predicts (the reason that gate binds the
-*p* = 1 stratum only). Batched page-1 walls tracked response size: 1.5 s / 2.2 s / 4.0 s in
-the *p* = 1 stratum and 3.6 s / 4.77 s in the paginating stratum at B = 10 / 25 — inside
-the 5 s gate. The informational **B = 50 paginating cell drew an HTTP 504 on its first
-50-alias batch** (5,000 requested ref nodes): per the pre-registered rule the try failed
-unclean, the cell terminated, and the runner quarantined itself to the next reset epoch —
-a live corroboration of the timeout caution above, at a shape the operator range never
-reaches. (The quarantine sleep straddled a reset window, so the run-level before/after
-bucket delta is not a valid spend cross-check; the per-try, single-epoch header deltas are
-the recorded cross-check.)
+Measured values replaced no formula estimates because they differed nowhere: every
+**cost-readable** batched page-1 call priced at **exactly 1 point** at B ∈ {10, 25, 50} —
+the published formula held exactly for this query shape, and the absolute gate's 2×
+tolerance was never consumed — and every continuation page priced at exactly 1 point. (The
+one call with no readable cost is the 504'd batch below: a timed-out request returns no
+rider, and its documented penalty is deducted unobserved.) Per-repository page-1 reducers
+(max over clean tries, *p* = 1 stratum): 0.10 at B = 10, **0.04 at B = 25**, 0.02 at
+B = 50 (informational). Candidate/control pair ratios in the *p* = 1 stratum: 0.10 / 0.04 /
+0.02 — all far under the ½ gate; the paginating stratum's ratios (0.55 at B = 10, 0.52 at
+B = 25) sat above ½ exactly as the algebraic floor above predicts (the reason that gate
+binds the *p* = 1 stratum only). Batched page-1 walls tracked response size: 1.5 s / 2.2 s
+/ 4.0 s in the *p* = 1 stratum and 3.6 s / 4.77 s in the paginating stratum at B = 10 / 25
+— inside the 5 s gate. The informational **B = 50 paginating cell drew an HTTP 504 on its
+first 50-alias batch** (5,000 requested ref nodes): per the pre-registered rule the try
+failed unclean, the cell terminated, and the runner quarantined itself to the next reset
+epoch — a live corroboration of the timeout caution above, at a shape the operator range
+never reaches. The header-delta cross-check did **not** independently corroborate the
+rider costs and is recorded as noisy, nothing more: the quarantine sleep straddled a reset
+window (invalidating the run-level before/after bucket delta), and 16 of the 50 clean arm
+summaries show a per-arm delta above their rider-cost sum (worst +4) — the
+otherwise-quiet-credential premise did not hold. Every gate and reducer rides the per-call
+rider alone, as pre-registered.
 
 Both candidates passed every gate, so the Worked-arithmetic floors above stand as
 **measured**, not merely estimated, and the ship threshold passes: the 8 × 750 estate's
