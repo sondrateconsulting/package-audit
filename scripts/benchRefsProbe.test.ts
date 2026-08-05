@@ -1,11 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import type { BenchGraphqlDispatch, BenchHttpAttemptRecord, RateLimitSnapshot } from "./benchGh.ts";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import {
   BenchRefsRulesError,
+  acquireProbeLock,
   assertProbeIdentity,
   journalPathFor,
   parseJournal,
   parseRefsProbeCorpus,
+  probeConstantsFingerprint,
+  releaseProbeLock,
   runRefsProbe,
   type RefsDispatchOutcome,
   type RefsProbeCorpus,
@@ -169,6 +174,7 @@ function makeDeps(corpus: RefsProbeCorpus, script: ReturnType<typeof scriptedGit
   const journal: RefsProbeJournalRow[] = [];
   const results: RefsProbeResult[] = [];
   const sleeps: number[] = [];
+  const events: string[] = []; // interleaved order of appends, sleeps, and dispatches
   const rl = (remaining: number): RateLimitSnapshot => ({
     core: { remaining: 5_000, reset: 1_900_000_000, used: 0 },
     graphql: { remaining, reset: 1_900_000_000, used: 5_000 - remaining },
@@ -177,13 +183,20 @@ function makeDeps(corpus: RefsProbeCorpus, script: ReturnType<typeof scriptedGit
   const deps: RefsProbeDeps = {
     corpus,
     corpusPath: "corpus.json",
+    corpusSha256: "test-corpus-sha",
     outPath: "refs-probe.json",
     journalPath: "refs-probe-journal.jsonl",
     benchConfigPath: "bench-config.json",
-    existingJournalLines: [],
-    appendJournal: (row) => journal.push(row),
+    existingJournalText: "",
+    appendJournal: (row) => {
+      journal.push(row);
+      events.push(`append:${row.rowKind}`);
+    },
     writeResult: (r) => results.push(r),
-    dispatchGraphql: script.dispatch,
+    dispatchGraphql: (query, fields, label) => {
+      events.push(`dispatch:${label}`);
+      return script.dispatch(query, fields, label);
+    },
     readRateLimit: async () => rl(4_900),
     outstandingHorizonMs: () => 0,
     headroomFactor: 1.1,
@@ -192,11 +205,20 @@ function makeDeps(corpus: RefsProbeCorpus, script: ReturnType<typeof scriptedGit
     now: () => (clock += 10),
     sleep: async (ms) => {
       sleeps.push(ms);
+      events.push(`sleep:${ms}`);
     },
     ...over,
   };
-  return { deps, journal, results, sleeps };
+  return { deps, journal, results, sleeps, events };
 }
+
+// a valid header row for synthetic resume journals, matching makeDeps' corpus fingerprint
+const headerLine = (): string =>
+  JSON.stringify({
+    rowKind: "header", version: 1, atIso: "2026-08-05T00:00:00Z",
+    corpusSha256: "test-corpus-sha", corpusPath: "corpus.json",
+    benchConfigPath: "bench-config.json", constantsFingerprint: probeConstantsFingerprint(),
+  });
 
 const tryRows = (journal: readonly RefsProbeJournalRow[]): RefsTryRow[] =>
   journal.filter((r): r is RefsTryRow => r.rowKind === "try");
@@ -214,12 +236,28 @@ describe("pure helpers", () => {
     expect(() => assertProbeIdentity(LOGIN, corpus)).not.toThrow();
     expect(() => assertProbeIdentity("someone-else", corpus)).toThrow(/someone-else/);
   });
-  test("parseJournal drops exactly one trailing partial line, rejects mid-file corruption", () => {
+  test("parseJournal drops only a syntactically torn, non-newline-terminated tail", () => {
     const good = JSON.stringify({ rowKind: "washout", version: 1, atIso: "2026-08-05T00:00:00Z", sleptMs: 1 });
     const warns: string[] = [];
-    expect(parseJournal([good, '{"rowKind":"washout","ver'], (l) => warns.push(l)).length).toBe(1);
+    // a torn append: the file ends mid-JSON with no trailing newline — dropped with a warning
+    expect(parseJournal(`${good}\n{"rowKind":"washout","ver`, (l) => warns.push(l)).length).toBe(1);
     expect(warns.length).toBe(1);
-    expect(() => parseJournal(['{"broken', good], () => {})).toThrow(BenchRefsRulesError);
+    // a COMPLETE but schema-invalid last line (newline-terminated) is corruption, not a tear
+    expect(() => parseJournal(`${good}\n{"rowKind":"mystery"}\n`, () => {})).toThrow(BenchRefsRulesError);
+    // parseable-but-wrong JSON without a newline is still corruption (the write completed)
+    expect(() => parseJournal(`${good}\n{"rowKind":"mystery"}`, () => {})).toThrow(BenchRefsRulesError);
+    // mid-file corruption always throws
+    expect(() => parseJournal(`{"broken\n${good}\n`, () => {})).toThrow(BenchRefsRulesError);
+  });
+  test("the probe lock is exclusive: second acquisition fails with remediation, release frees it", () => {
+    const dir = join(process.env["TMPDIR"] ?? "/tmp", `refs-probe-lock-test-${process.pid}`);
+    mkdirSync(dir, { recursive: true });
+    const lock = join(dir, "refs-probe-journal.jsonl.lock");
+    acquireProbeLock(lock);
+    expect(() => acquireProbeLock(lock)).toThrow(/another/i);
+    releaseProbeLock(lock);
+    acquireProbeLock(lock);
+    releaseProbeLock(lock);
   });
 });
 
@@ -232,12 +270,19 @@ describe("runRefsProbe — the full matrix on a clean scripted estate", () => {
 
     expect(results.length).toBe(1);
     expect(result.outcome).toEqual({ kind: "default-pinned", defaultBatchSize: 25, page1PerRepo: 0.04, correctedFloor8x750: 240 });
+    // a fresh journal begins with the binding header (corpus + rule fingerprints)
+    expect(journal[0]!.rowKind).toBe("header");
+    if (journal[0]!.rowKind === "header") {
+      expect(journal[0]!.corpusSha256).toBe("test-corpus-sha");
+      expect(journal[0]!.constantsFingerprint).toBe(probeConstantsFingerprint());
+    }
     // every cell completed all five slots cleanly, so 30 try rows total
     const tries = tryRows(journal);
     expect(tries.length).toBe(30);
     expect(tries.every((t) => t.verdict === "clean")).toBe(true);
-    // one admission row per try, and the final washout row
+    // one admission row and one try-start intent per try, and the final washout row
     expect(journal.filter((r) => r.rowKind === "admission").length).toBe(30);
+    expect(journal.filter((r) => r.rowKind === "try-start").length).toBe(30);
     expect(journal.filter((r) => r.rowKind === "washout").length).toBe(1);
     // per-try dispatch accounting on the B=10 p1 cell: 1 batch + 10 control pages
     const p1b10 = tries.find((t) => t.cellB === 10 && t.stratum === "p1")!;
@@ -278,13 +323,19 @@ describe("runRefsProbe — fault handling", () => {
         return null;
       },
     });
-    const { deps, journal, results, sleeps } = makeDeps(corpus, script);
+    const { deps, journal, results, sleeps, events } = makeDeps(corpus, script);
     const result = await runRefsProbe(deps);
     expect(fired).toBe(true);
     const q = journal.filter((r) => r.rowKind === "quarantine");
     expect(q.length).toBe(1);
     // the quarantine slept to the reset epoch (scripted far future → a real sleep happened)
     expect(sleeps.some((ms) => ms >= 30_000)).toBe(true);
+    // the obligation persists BEFORE the sleep: a crash mid-sleep must resume into the
+    // quarantine, not past it
+    const qi = events.indexOf("append:quarantine");
+    const bigSleep = events.findIndex((e, i) => i > qi && e.startsWith("sleep:") && Number(e.slice(6)) >= 30_000);
+    expect(qi).toBeGreaterThanOrEqual(0);
+    expect(bigSleep).toBeGreaterThan(qi);
     // the B=25 p1 cell is terminated; B=25 fails; B=10 passed alone → prefix eligible {10},
     // whose floor (6,000 × 0.1 = 600) trips the ship threshold → no-pass
     const cell = result.cells.find((c) => c.batchSize === 25 && c.stratum === "p1")!;
@@ -403,11 +454,12 @@ describe("runRefsProbe — resume from the journal (crash-safe, no double-spend)
     const run1 = makeDeps(corpus, first);
     await runRefsProbe(run1.deps);
     // replay journal rows for the two B=10 cells only — as if the run crashed after them
-    const keepLines = run1.journal
-      .filter((r) => "cellB" in r && r.cellB === 10)
-      .map((r) => JSON.stringify(r));
+    const keepLines = [
+      headerLine(),
+      ...run1.journal.filter((r) => "cellB" in r && r.cellB === 10).map((r) => JSON.stringify(r)),
+    ];
     const second = scriptedGithub(corpus);
-    const run2 = makeDeps(corpus, second, { existingJournalLines: keepLines });
+    const run2 = makeDeps(corpus, second, { existingJournalText: `${keepLines.join("\n")}\n` });
     const result = await runRefsProbe(run2.deps);
     expect(result.resumedFromJournal).toBe(true);
     // no dispatch for the completed B=10 cells; the rest re-ran in full
@@ -424,11 +476,56 @@ describe("runRefsProbe — resume from the journal (crash-safe, no double-spend)
     await runRefsProbe(run1.deps);
     const b10p1 = run1.journal.filter((r) => "cellB" in r && r.cellB === 10 && r.stratum === "p1" && r.rowKind === "try").slice(0, 2);
     const second = scriptedGithub(corpus);
-    const run2 = makeDeps(corpus, second, { existingJournalLines: b10p1.map((r) => JSON.stringify(r)) });
+    const run2 = makeDeps(corpus, second, {
+      existingJournalText: `${[headerLine(), ...b10p1.map((r) => JSON.stringify(r))].join("\n")}\n`,
+    });
     await runRefsProbe(run2.deps);
     const resumed = tryRows(run2.journal).filter((t) => t.cellB === 10 && t.stratum === "p1");
     expect(resumed.length).toBe(3); // slots 3..5 only
     expect(resumed.map((t) => t.slot)).toEqual([3, 4, 5]);
+  });
+
+  test("a resumed journal must open with a matching header (foreign journals refused)", async () => {
+    const corpus = corpusJson();
+    const script = scriptedGithub(corpus);
+    // no header at all
+    const noHeader = makeDeps(corpus, script, {
+      existingJournalText: `${JSON.stringify({ rowKind: "washout", version: 1, atIso: "2026-08-05T00:00:00Z", sleptMs: 1 })}\n`,
+    });
+    await expect(runRefsProbe(noHeader.deps)).rejects.toThrow(/header/i);
+    // a header from a DIFFERENT corpus
+    const foreign = JSON.parse(headerLine()) as Record<string, unknown>;
+    foreign["corpusSha256"] = "someone-elses-corpus";
+    const mismatch = makeDeps(corpus, script, { existingJournalText: `${JSON.stringify(foreign)}\n` });
+    await expect(runRefsProbe(mismatch.deps)).rejects.toThrow(/corpus/i);
+  });
+
+  test("a dangling try-start resumes the same slot at the next attempt (spend visible, no invalidation)", async () => {
+    const corpus = corpusJson();
+    const script = scriptedGithub(corpus);
+    const dangling = JSON.stringify({ rowKind: "try-start", version: 1, atIso: "2026-08-05T00:00:00Z", cellB: 10, stratum: "p1", slot: 1, attempt: 1 });
+    const { deps, journal } = makeDeps(corpus, script, {
+      existingJournalText: `${headerLine()}\n${dangling}\n`,
+    });
+    await runRefsProbe(deps);
+    const b10p1 = tryRows(journal).filter((t) => t.cellB === 10 && t.stratum === "p1");
+    expect(b10p1.map((t) => [t.slot, t.attempt])).toEqual([[1, 2], [2, 1], [3, 1], [4, 1], [5, 1]]);
+  });
+
+  test("an unexpired quarantine in the journal is honored before any resumed dispatch", async () => {
+    const corpus = corpusJson();
+    const script = scriptedGithub(corpus);
+    // untilEpochSec far past the fake clock start (1_754_000_000_000 ms → 1.754e9 s)
+    const q = JSON.stringify({
+      rowKind: "quarantine", version: 1, atIso: "2026-08-05T00:00:00Z",
+      cellB: 10, stratum: "p1", slot: 1, attempt: 1, untilEpochSec: 1_754_000_600, plannedSleepMs: 600_000,
+    });
+    const { deps, events } = makeDeps(corpus, script, { existingJournalText: `${headerLine()}\n${q}\n` });
+    await runRefsProbe(deps);
+    const firstDispatch = events.findIndex((e) => e.startsWith("dispatch:"));
+    const firstBigSleep = events.findIndex((e) => e.startsWith("sleep:") && Number(e.slice(6)) >= 30_000);
+    expect(firstBigSleep).toBeGreaterThanOrEqual(0);
+    expect(firstBigSleep).toBeLessThan(firstDispatch);
   });
 });
 
