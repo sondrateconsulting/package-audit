@@ -608,7 +608,8 @@ export async function processRepo(
   // Past-cap (policy-eligible, after cutoff, past the cap): record a run_unit_head row for report
   // visibility — never enqueue, and never touch a 'done' queue row, so a prior scan survives and a
   // later run can promote this branch (cap-order shift) without a re-scan. A stale 'pending' row
-  // (an earlier run's §4 throttle deferral) IS settled to 'skipped', though: §7's queue-side
+  // IS settled to 'skipped', though — however it arose (§4 throttle deferral, crash-recovery
+  // reset, or --rescan-branch): §7's queue-side
   // branchesDeferred would otherwise count the same branch this run just surfaced as past-cap — a
   // double count that flags a throttle-free run PARTIAL (see settlePastCapUnit).
   for (const d of plan.pastCap) {

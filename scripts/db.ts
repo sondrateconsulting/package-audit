@@ -2178,8 +2178,9 @@ export class AuditDb {
   }
 
   // Past-cap settle (§5.B → §7): when a run surfaces a branch as past-cap it records a fresh
-  // run_unit_head row, and it must not leave an earlier run's throttle-deferred 'pending' queue row
-  // alive beside that disposition — §7's branchesDeferred is a plain pending count, so an unsettled
+  // run_unit_head row, and it must not leave a stale 'pending' queue row — throttle-deferred,
+  // crash-reset, or manually re-pended — alive beside that disposition — §7's branchesDeferred is a
+  // plain pending count, so an unsettled
   // row would count the same branch twice (past-cap AND deferred) and flag a throttle-free run's
   // summary PARTIAL. Guarded on BOTH sides: only 'pending' settles ('done' survives for the §3
   // skip-reuse predicate, 'error' for the next-run rescan), and scope is gated TWICE: the key's own

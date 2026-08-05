@@ -18,9 +18,10 @@ import type { PolicyStatus } from "./db.ts";
 // eligible units); older survivors past the cap are `pastCap` — NOT scanned this run, but still
 // SURFACED: processRepo records a `past-cap` run_unit_head row for report visibility, leaves a
 // 'done' WORK-QUEUE row untouched (so a prior scan survives and a later cap-order shift can promote
-// the branch without a re-scan), and settles a stale 'pending' queue row to 'skipped' — an earlier
-// run's §4 throttle deferral must not double into §7's branchesDeferred beside this run's past-cap
-// disposition (db.ts::settlePastCapUnit). ("Retains prior state" is about 'done' reuse, never the report.)
+// the branch without a re-scan), and settles a stale 'pending' queue row to 'skipped' — a pending
+// row (typically an earlier run's §4 throttle deferral) must not double into §7's branchesDeferred
+// beside this run's past-cap disposition (db.ts::settlePastCapUnit). ("Retains prior state" is
+// about 'done' reuse, never the report.)
 // Order within each group preserves the input order. A defaultBranch
 // not among the live heads admits nothing — heads are never synthesized. This runs over an
 // ALREADY-policy-filtered head list (see planRepoBranches), so the cap counts only ELIGIBLE branches.
