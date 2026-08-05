@@ -459,5 +459,18 @@ assumed).
   (`a9899be`): that slice's implementation was drafted before its tests; the RED run was taken
   against a stubbed runner (12 failures for the intended reason) and the implementation
   restored to green — the failing run is real; the draft order was not test-first.
+- **P2 corpus + rvo gate (2026-08-05): the live estate could not furnish any full batch**
+  (largest owner: 9 repositories; nothing over 100 branches), so the synthetic corpus was
+  constructed per the plan — after rvo's explicit go-ahead, asked and answered before any
+  creation: **owner namespace = the `sondrateconsulting` organization; full matrix, 100
+  repositories** (50 × p1 at 2 heads, 50 × p2 at 101 heads; private; retained until rvo
+  authorizes deletion). Construction and the REST observation pass are recorded verbatim in
+  the corpus provenance. Freeze commit `8825d29` (corpus + the prospective ADR artifact-path
+  amendment, one commit, before any measured try).
+- **P2 codex review (gpt-5.6-sol @ ultra, fresh session `019fd340-f458-7780-9aed-973b4cd3c423`,
+  2026-08-05): FAIL — 1 P1 + 1 P2, both verified, both fixed before P3** (commit `242c4b2`):
+  the placeholder midnight `frozenAtIso` backdated the freeze (now the true post-observation
+  instant), and the provenance paraphrased the procedure (now the commands verbatim, both
+  strata, including the discarded email-privacy-rejected first template pair).
 - *(the implementation session appends per-step codex outcomes, the santa-loop record, and
   any live-run observations here, exactly as `adr-0001-t2c-implementation.md` §9 did.)*
