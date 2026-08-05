@@ -1611,6 +1611,10 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     ];
     expect(policyWarnEvents(planEvents)).toEqual(expected);
     expect(policyWarnEvents(runEvents)).toEqual(expected); // identical to --plan
+    // The done event embeds the report's summary — logLine is shape-unchecked (Record<string,
+    // unknown>, so dropping the embed would still compile); this pins the README's "also on the
+    // `done` event" claim at the emission seam, branchesDeferred riding along.
+    expect(runEvents.find((e) => e["event"] === "done")).toMatchObject({ summary: { branchesDeferred: 0 } });
     rmSync(root, { recursive: true, force: true });
   });
 
