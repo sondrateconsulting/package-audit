@@ -263,6 +263,11 @@ Confirmation probe, not by this document.
   during the continuation phase and scoped to the current window — it counts the heads
   resident in the window's staged items at the moment of the check (a failed or discarded
   item's heads leave the count with it): a memory bound, not a cumulative-observation cap.
+  The budget is per-window and windows are per-owner, so with owners fanned out the
+  run-wide resident envelope is `concurrency.organizations ×` (the budget + one
+  repository's `MAX_PAGES`-bounded overshoot — up to `MAX_PAGES × 100` heads,
+  [github.ts:689](../../scripts/github.ts#L689)); the budget bounds each window, not the
+  process.
   Crossing it *completes the in-flight repository's pagination* (a single snapshot is never truncated; `MAX_PAGES` alone
   bounds one repository, so the budget can overshoot by at most one repository's heads) but
   starts no further continuation and dispatches no further batch for this window — completed
@@ -289,7 +294,9 @@ Confirmation probe, not by this document.
   the solo path's narrower gap would usually have dodged (re-validating staged failures at
   consumption was rejected: it would re-spend a query per staged failure to buy what the next
   run's live re-discovery already provides, and the age cap bounds the false-failure window
-  exactly as it bounds snapshot staleness — staged failures carry age epochs too). Only the
+  exactly as it bounds snapshot staleness — staged failures carry age epochs too; the
+  age-exempt staged *throttle* outcome commits only a deferral, never a permanent record, so
+  everything that can become a permanent record stays age-bounded). Only the
   clone path fails loud on movement (the §5.C pinned-OID check). All four are self-healing at
   the next run's live re-discovery. This is a wider instance of an existing disclosed window —
   not a new staleness class.
@@ -317,7 +324,12 @@ Confirmation probe, not by this document.
      **Exhaustion is cause-tagged on the batched path** — today's untagged `ThrottleExhausted`
      cannot distinguish a throttle-exhausted call from a transient-exhausted one
      ([github.ts:2262-2263](../../scripts/github.ts#L2262)), and the two are dispositioned
-     differently: *throttle* exhaustion (and an unfundable pause) stages the whole window as
+     differently. **A mixed retry sequence resolves by evidence, not recency: if any attempt
+     in the exhausted sequence observed a throttle signal (primary or secondary), the
+     exhaustion is throttle-tagged** — §4's posture is defer, and degrading a window whose
+     bucket throttled mid-sequence would solo-re-fetch *B* repositories into a bucket the
+     contract says waits; only a sequence with no throttle evidence anywhere is
+     transient-tagged. The dispositions: *throttle* exhaustion (and an unfundable pause) stages the whole window as
      `requeue-throttle` — the batched analog of today's per-repository requeue, disclosed as
      such — while *transient* exhaustion degrades (step 2). In `--plan`, at consumption, staged
      window transients become per-repository `discoveryErrors` counts, never labeled a
@@ -334,10 +346,13 @@ Confirmation probe, not by this document.
      [github.ts:2217](../../scripts/github.ts#L2217), so the two are indistinguishable and
      share one disposition) degrades-and-downshifts: it may *be* a size-induced timeout, and
      the per-repo path re-applies today's exact no-response semantics truthfully. **Every
-     other throw that escapes the batched page-1 call before response classification shares
-     that disposition** — expected transport failures (the output cap, stream errors, spawn
-     failure) and unexpected invariant or programmer errors alike are caught at the window
-     boundary and degrade-and-downshift. Two routes take precedence over this arm and are
+     other non-throttle throw from the batched pipeline shares that disposition** — thrown
+     before response classification (the output cap, stream errors, spawn failure) or from
+     the classification, envelope-validation, staging, or partition machinery itself (the
+     existing validation battery throws invariants throughout,
+     [github.ts:2344-2473](../../scripts/github.ts#L2344)) — expected transport failures
+     and unexpected invariant or programmer errors alike are caught at the window boundary
+     and degrade-and-downshift. Two routes take precedence over this arm and are
      not part of it: `ThrottleExhausted` — including the pre-dispatch unfundable-pause
      throw ([github.ts:1918-1927](../../scripts/github.ts#L1918)) — always rides the
      cause-tagged throttle door of step 1, and continuation-phase throws are
@@ -384,10 +399,11 @@ Confirmation probe, not by this document.
      extra per-repo pass.
 * **Degrade and downshift, with defined triggers.** Every anomaly that degrades also
   downshifts — the trigger list is exhaustive: envelope anomalies, batched 502/504,
-  no-response, 5xx retry exhaustion, truncation-shape retry exhaustion, and every
-  non-throttle pre-envelope throw from the batched page-1 call (output cap, stream errors,
-  spawn failure, unexpected errors — `ThrottleExhausted` rides the throttle door, and
-  continuation-phase throws are repository-local, so neither triggers a downshift). The
+  no-response, 5xx retry exhaustion, truncation-shape retry exhaustion, the step-3
+  call-scope fatals (SSO and permission shapes, redirects, unexpected 2xx shapes, residual
+  statuses), and every non-throttle throw from the batched pipeline (output cap, stream
+  errors, spawn failure, unexpected errors — `ThrottleExhausted` rides the throttle door,
+  and continuation-phase throws are repository-local, so neither triggers a downshift). The
   output cap and an oversized-argv spawn failure are direct batch-size evidence; the rest
   downshift conservatively — a wrongly-halved batch is the cheap error, repeating a shape
   the transport just rejected is not. Age-cap expiry and head-budget stops are *planned
@@ -436,7 +452,9 @@ Confirmation probe, not by this document.
 * Bad, because the discovery-to-scan window widens as stated above — silent-until-next-run
   effects on skip-current, policy/cutoff/cap classification, newly-created branches, and
   staged failures that commit after their cause has cleared, plus loud pinned-OID unit
-  failures on the clone path — bounded by *B*, the age cap, and the `batchSize: 1` bypass.
+  failures on the clone path — bounded by *B*, the age cap (which covers every staged item
+  that can become a permanent record; the exempt staged throttle outcome commits only a
+  deferral), and the `batchSize: 1` bypass.
 * Bad, because the prefetch window is new stateful machinery: staging, an age cap, a head
   budget, and a downshift each add a rule that can misfire — though each misfire's designed
   outcome is the per-repo status quo, not a wrong snapshot.
@@ -451,9 +469,10 @@ Confirmation probe, not by this document.
 * Neutral, because the REST listing spend (§5.A), the content path (ADR-0001), the database
   schema, and the §4 buckets, pause accounting, and taxonomy are untouched — the batched path
   *adds* a classifier stage and deliberately reroutes batched 502/504 and no-response from
-  transient retry to degrade, retains the truncation-shape retry, catches every pre-envelope
-  throw at the window boundary (the solo path's per-repository catch, reproduced through the
-  lazy solo re-fetch), and sends *throttle-caused*
+  transient retry to degrade, retains the truncation-shape retry, catches every non-throttle
+  pre-envelope throw from the batched page-1 call at the window boundary (the solo path's
+  per-repository catch, reproduced through the lazy solo re-fetch — throttle throws keep the
+  throttle door, continuation-phase throws stay repository-local), and sends *throttle-caused*
   window exhaustion to a window-scoped requeue while transient exhaustion degrades (the
   cause-tagged distinction): disclosed deltas, not taxonomy changes. Secondary-limit exposure is not proven either way: batching
   cuts the page-1 *request count* ~*B*× (less pressure on the per-minute point cap), but
@@ -468,15 +487,21 @@ Confirmation probe, not by this document.
    **every tested batch size must be exercised by at least one full same-owner batch of
    exactly *B* repositories per stratum** — a two-repository corpus cannot call itself
    B = 25. (The single-owner floor `ceil(n/B)` generalizes to `Σ over o of ceil(n(o)/B)` if a
-   multi-owner corpus is ever used.) Cells B ∈ {1 (control), 10, 25, 50} × two strata —
+   multi-owner corpus is ever used.) Candidate cells B ∈ {10, 25, 50} × two strata —
    single-page repositories (*p* = 1) and a paginating stratum (**> 100 heads, i.e. *p* ≥ 2**;
-   exactly 100 heads is still one page) — **exactly 5 tries per cell**, candidate and control
-   arms interleaved over the fixed corpus, with **observed page counts recorded per arm: a
+   exactly 100 heads is still one page) — each cell carrying its own interleaved **B = 1
+   control arm** over the identical corpus (the control is the denominator, not a candidate,
+   and is never gated as one) — **exactly 5 tries per cell**, candidate and control
+   arms interleaved over the fixed corpus (a cell whose gate outcome is already decided by an
+   unclean try may terminate early, its partial record committed with the cause), with **observed page counts recorded per arm: a
    paired try whose page counts differ between arms is invalidated and re-run** (ref churn
    across the 100-head boundary would silently change the control's denominator).
    Invalidation is bounded: a cell invalidated more than twice — dirty control or page-count
    drift — is committed as `invalid` with its cause rather than re-run unbounded, and an
-   invalid cell fails the contiguous-prefix rule below like a failing one.
+   invalid cell fails the contiguous-prefix rule below like a failing one. A 502/504 in any
+   arm fails its try unclean, terminates the cell early, and **quarantines the runner to the
+   next reset epoch** before any further dispatch anywhere — the documented timeout penalty
+   is unquantified, so no admission can price the current window after one.
    Instrumentation is identical in both arms and external to production code: **both arms are
    probe-authored queries carrying a per-call `rateLimit { cost }` field — the boundary
    probe's per-call method (its `bucketBefore`/`bucketAfter` deltas were sweep-wide, not
@@ -498,19 +523,27 @@ Confirmation probe, not by this document.
    maximum batched page-1 call duration in the candidate arm** — the only call shape batching
    changes; continuation and control call durations are recorded informational, since a slow
    solo continuation exists identically in both arms and disqualifies nothing (full-snapshot
-   elapsed time is recorded separately, informational). **Shipped default = the largest
-   B ≤ 25 whose every try in both strata is clean, whose batched page-1 wall maximum is
-   ≤ 5 s, whose every *p* = 1 pair passes the half-cost gate — and whose smaller tested sizes
-   also passed: a non-monotone result
-   (B = 10 fails while B = 25 passes) is committed as an anomaly and no default ships without
-   decision-maker review, since the operator range's monotonicity assumption would be
-   falsified.** The cost gate binds on the *p* = 1 stratum only — a paginating stratum's
+   elapsed time is recorded separately, informational). **A candidate B passes only if: every try in both strata is clean; its batched page-1
+   wall maximum is ≤ 5 s; every *p* = 1 pair passes the half-cost gate; and — the absolute
+   gate — every clean try's measured batched page-1 cost is ≤ 2 × `max(1, round(B/100))`
+   points per batch in *both* strata (the formula predicts 1; 2 tolerates rounding drift,
+   and a half-the-control-but-many-points result must not pass on the ratio alone).
+   Shipped default = among candidates ≤ 25 whose every smaller candidate also passed (a
+   non-monotone result — B = 10 fails while B = 25 passes — is committed as an anomaly and
+   no default ships without decision-maker review, since the operator range's monotonicity
+   assumption would be falsified), the one with the LOWEST measured per-repository page-1
+   cost in the *p* = 1 stratum, ties to the smaller B: largest-passing is not a selection
+   rule, cheapest-measured is.** Before acceptance the Worked-arithmetic floors are
+   recomputed from the measured costs (the correction below), and the default ships only if
+   the corrected 8 × 750 estate's page-1 floor stays under 10% of one window — otherwise
+   the no-pass outcome fires. The cost gate binds on the *p* = 1 stratum only — a paginating stratum's
    candidate/control ratio has an algebraic floor of
    `(Σ over o of ceil(n(o)/B) + Σ over r of (pages(r) − 1)) / Σ over r of pages(r)` —
    `(ceil(n/B)/n + p − 1)/p` in the uniform single-owner case — above ½ whenever every
    repository paginates (*pages(r)* ≥ 2), so a half-cost gate there would reject batching
    precisely where it claims no
-   win; the paginating stratum gates on cleanliness and wall alone, its cost recorded.
+   win; the paginating stratum gates on cleanliness, wall, and the absolute page-1 cost
+   gate — its continuation cost recorded, not gated (unchanged machinery).
    The B = 50 cell is informational only: raising the default past 25 widens the disclosed
    window and needs its own ratified change. **If no B ≥ 10 passes, that outcome is committed
    and this ADR returns to the decision-maker rather than shipping a default.** If measured
@@ -519,17 +552,22 @@ Confirmation probe, not by this document.
    discipline, upgraded to this matrix's scale: admission is **per-tranche, not one-shot** —
    before each tranche (at most one cell), the runner pre-admits that tranche's worst case
    (every candidate and control attempt at a conservative per-attempt cost bound with the
-   boundary probe's headroom factor, times the tranche's remaining permitted invalidation
-   re-runs) against the live `remaining`, sleeping to the reset epoch when short, and the
+   boundary probe's headroom factor, times one plus the tranche's remaining permitted
+   invalidation re-runs) against the live `remaining`, sleeping to the reset epoch when
+   short, and the
    run ends with a full washout of its own throttle horizon
    ([benchBoundary.ts:146-160](../../scripts/benchBoundary.ts#L146),
    [benchBoundary.ts:215-224](../../scripts/benchBoundary.ts#L215)). One-shot whole-matrix
    admission cannot work here: the spend is dominated by the control arms the full-batch
-   rule requires (a cell's control arm costs B × *p* points per try), the clean-baseline
-   matrix costs `860·p + 40` points — ≈ 1,760 at the minimum paginating depth (*p* = 2),
-   crossing a full 5,000-point window near *p* = 6 before a single invalidation — and the
-   permitted two invalidation re-runs can triple a cell, so the matrix must be schedulable
-   across multiple reset windows by construction. The artifact
+   rule requires (a cell's control arm costs B × *p* points per try), and on the *minimum*
+   corpus topology — each cell exactly one full batch (n = B) at uniform depth *p* — the
+   clean-baseline matrix costs `850·p + 30` points: ≈ 1,730 at the minimum paginating depth
+   (*p* = 2), crossing a full 5,000-point window near *p* = 6 before a single invalidation.
+   A larger frozen corpus or heterogeneous page depths price higher by summing the recorded
+   per-repository page counts — which is exactly what per-tranche admission computes from
+   the frozen corpus (the scalar curve is illustrative; the admission bound is computed,
+   never assumed) — and the permitted invalidation re-runs can triple a cell, so the matrix
+   must be schedulable across multiple reset windows by construction. The artifact
    lands beside [boundary-probe.json](0001-benchmark/boundary-probe.json).
 2. **Scripted-envelope tests for the classified-staged-partitioned order**: a `NOT_FOUND`
    alias among *B* stages exactly one repository's fail-soft failure (committed at
@@ -540,7 +578,7 @@ Confirmation probe, not by this document.
    field-observed `RATE_LIMIT` bodies **with `x-ratelimit-remaining: 0` headers** classify
    primary, and without them secondary, on the batched path (the PR #36 regression fixtures
    extended to batches, headers included); the SSO-fatal combination and a permission-shaped
-   403 degrade with no batch-stamped permanent rows; an **alias-rooted resource-limit error**
+   403 degrade-and-downshift with no batch-stamped permanent rows; an **alias-rooted resource-limit error**
    (node-limit wording beside partial data) triggers degrade-and-downshift, not a
    per-repository errors row.
 3. **Partial-response fail-closed test**: an envelope missing an alias with no matching error
@@ -550,11 +588,15 @@ Confirmation probe, not by this document.
    batched 500 retries transiently at the same size and degrades-and-downshifts only on
    exhaustion; the truncation shape (200, unparseable body, nonzero exit) retries transiently
    and degrades-and-downshifts only on exhaustion; a no-response degrades-and-downshifts (one
-   disposition, deadline-kill included); a pre-envelope throw from the batched page-1 call — scripted output-cap,
+   disposition, deadline-kill included); a non-throttle throw from the batched pipeline — scripted output-cap,
    stream-error, spawn-failure, and a deliberate invariant throw — degrades-and-downshifts
-   uniformly (the invariant case's lazy solo re-fetch reproduces that one repository's
-   errors row), while the same throws in the continuation phase stage only that
-   repository's failure with sibling snapshots intact and no downshift; **cause-tagged exhaustion**: throttle exhaustion stages the window as
+   uniformly, where a *batch-only* invariant (scripted into the batch builder or router)
+   leaves the lazy solo re-fetches *succeeding* with no permanent rows, and a *shared*
+   fault (scripted into machinery both paths use) reproduces that one repository's errors
+   row solo; the same throws in the continuation phase stage only that repository's failure
+   with sibling snapshots intact and no downshift; **mixed exhaustion sequences** resolve by
+   the any-throttle-evidence rule — throttle-then-transient and transient-then-throttle both
+   stage `requeue-throttle`, an all-transient sequence degrades; **cause-tagged exhaustion**: throttle exhaustion stages the window as
    `requeue-throttle` while transient exhaustion degrades it; an age-cap expiry or head-budget
    stop falls back per-repo **without** downshifting; a **continuation-phase** fatal or
    throttle exhaustion stages that one repository's fail-soft outcome with sibling snapshots
@@ -744,14 +786,21 @@ per installation, scaling to 12,500 with repository/user count; GHEC installatio
 ### Option 6 — Fused listing + discovery (owner-scoped nested query)
 
 One `repositoryOwner(login: $login) { repositories(first: 100, after: $cursor,
-orderBy: {field: PUSHED_AT, direction: DESC}) { pageInfo{…} nodes { name … defaultBranchRef{name}
-refs(refPrefix: "refs/heads/", first: 100){…} } } }` query pages through an owner's repositories
+ownerAffiliations: [OWNER], orderBy: {field: PUSHED_AT, direction: DESC}) { pageInfo{…}
+nodes { name … defaultBranchRef{name} refs(refPrefix: "refs/heads/", first: 100){…} } } }`
+query — the affiliation restriction mirrors §5.A's `affiliation=owner` personal listing
+([PROMPT.md:791-794](../../PROMPT.md#L791),
+[github.ts:2290-2292](../../scripts/github.ts#L2290)); without it the connection admits
+collaborator and organization-member repositories the REST lane excludes — pages through an
+owner's repositories
 with page-1 refs nested inside each node — replacing both the §5.A REST listing call and page-1
 discovery in one stroke ([`RepositoryOwner.repositories`](https://docs.github.com/en/graphql/reference/interfaces#repositoryowner)
 is the documented interface). Under the published formula, one outer 100-repository page plus
 its 100 nested refs connections price at `round(101/100)` = **1 point per 100 repositories,
-listing included**. The page count runs over *raw listed* counts — `Σ over o of ceil(L(o)/100)`
-— because nested refs are fetched before the client-side denylist, archived/fork filter, and
+listing included**. The page count runs over *raw listed* counts —
+`Σ over o of max(1, ceil(L(o)/100))`, the same one-query minimum per owner the REST
+comparison uses (an empty connection still costs its discovery query) — because nested refs
+are fetched before the client-side denylist, archived/fork filter, and
 cap run: the 8 × 750 estate prices at 64 points only under a no-filtered-extras premise,
 against Option 1's 240 at B = 25, and the REST listing requests disappear entirely.
 Continuation pages for > 100-head repositories still run per-repository, exactly as in
@@ -767,8 +816,10 @@ Option 1.
   ([github.ts:2168-2192](../../scripts/github.ts#L2168),
   [PROMPT.md:795-816](../../PROMPT.md#L795)): refs fetched on early outer pages age across
   the owner's entire remaining listing and post-processing — an owner-wide
-  discovery-to-consumption window with no bound at all unless this option grows its own
-  window machinery. Wider than Option 1's *B*-bounded, age-capped window, not narrower.
+  discovery-to-consumption window with no *staleness* bound analogous to Option 1's *B* and
+  age cap (only coarse transport bounds — `MAX_PAGES`, deadlines, retry limits — which bound
+  duration, not decision staleness) unless this option grows its own window machinery. Wider
+  than Option 1's *B*-bounded, age-capped window, not narrower.
 * Bad, because it rewrites the §5.A listing lane in the same stroke: the REST listing's
   validated field battery (`mapRestRepo`,
   [github.ts:1039-1074](../../scripts/github.ts#L1039)), denylist evidence, `maxReposPerOrg`
@@ -984,9 +1035,40 @@ arithmetic now runs over raw listed counts `L(o)`, the 64-point figure marked
 no-filtered-extras. The consequence summary gained the fourth widened-window effect, and the
 prefetcher is named what it is: tumbling windows, disjoint, never refilled.
 
-**Loop status (current): seven rounds run, REVISE × 7, no APPROVE yet; the reopened loop
+**Round 8 (2026-08-05): REVISE — 13 P1, 3 P2; every finding verified against the sources and
+applied.** The application audit accepted six of nine round-7 applications and caught three
+consistency escapes: the tranche-admission multiplier under-counted by one (worst case is the
+current execution *plus* the remaining re-runs — now `1 +` re-runs), and two summary claims
+still spoke unqualified where the detailed rules carry exceptions (uniform age bounding — the
+staged throttle outcome is exempt but commits only a deferral, so everything that can become
+a permanent record stays age-bounded; the Neutral bullet's "every pre-envelope throw" —
+re-scoped to non-throttle batched-pipeline throws). The fresh pass then found the round's
+substance: the "exhaustive" downshift list omitted the step-3 call-scope fatals (added — they
+downshift under the uniform rule); mixed throttle/transient retry sequences had no
+cause-selection rule (added: **any-throttle-evidence tags the exhaustion throttle**, both
+orderings fixtured); throws from the new classification/validation/staging/partition
+machinery had no route (the catch boundary is now the whole batched pipeline); the probe's
+B = 1 cell could never pass its own self-pair, making the contiguous prefix impossible
+(cells restructured: candidates {10, 25, 50}, B = 1 is the ungated control arm); the ½-ratio
+gate proved nothing absolute (a new absolute gate — measured page-1 cost ≤ 2 ×
+`max(1, round(B/100))` per batch in both strata — plus a corrected-estate threshold: the
+default ships only if the recomputed 8 × 750 page-1 floor stays under 10% of a window);
+largest-passing-B was not cost-rational (selection is now cheapest-measured with
+smaller-B ties); "exactly 5 tries" conflicted with the unquantified 502/504 penalty (a
+timeout response now terminates its cell and quarantines the runner to the next reset
+epoch); the matrix curve was restated on its minimum-topology premise (`850·p + 30` with
+admission computed from the frozen corpus, never the scalar); Option 6's sketch gained
+`ownerAffiliations: [OWNER]` (the REST lane's `affiliation=owner`,
+[github.ts:2290-2292](../../scripts/github.ts#L2290)) and the `max(1, …)` per-owner
+minimum; the invariant-throw fixture was split batch-only-vs-shared (a batch-only defect's
+solo re-fetches *succeed*); the head budget gained its run-wide envelope
+(`concurrency.organizations ×` window bound + `MAX_PAGES` overshoot); and Option 6's "no
+bound at all" was tightened to "no staleness bound" (transport bounds exist, decision-
+staleness bounds do not).
+
+**Loop status (current): eight rounds run, REVISE × 8, no APPROVE yet; the reopened loop
 continues (through round 10 at most).** Ratification should weigh this document as
-seven-times-adversarially-reviewed but not reviewer-approved.
+eight-times-adversarially-reviewed but not reviewer-approved.
 
 ### Follow-on work
 
@@ -1000,9 +1082,9 @@ seven-times-adversarially-reviewed but not reviewer-approved.
   branch-heavy stratum shows the continuation term binding in practice: same seam, same
   staging and partition rules, one new probed batch shape, its own ratified decision.
 * **Option 6's fused owner-scoped query** if the post-batching discovery floor ever binds
-  again: it subsumes the listing lane and re-prices page 1 at one point per 100 repositories,
-  but needs the §5.A re-specification and the positional-routing containment work its option
-  notes — its own ADR, not an amendment.
+  again: it subsumes the listing lane and re-prices page 1 at
+  `max(1, ceil(L(o)/100))` points per owner, but needs the §5.A re-specification and the
+  positional-routing containment work its option notes — its own ADR, not an amendment.
 * **Option 3 as the long-arc direction.** If the git transport continues absorbing the pipeline
   (the ADR-0001 trajectory), git-protocol discovery deserves a first-class evaluation — variant
   (b)'s one-operation filtered clone measured for pack-negotiation cost at estate scale, and
