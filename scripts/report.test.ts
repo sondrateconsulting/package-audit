@@ -1064,6 +1064,35 @@ describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", 
     db.close();
   });
 
+  test("RESUME overlap: the SAME row-less branch counts in BOTH branchesErrored and branchesDeferred — never summed, never deduped", () => {
+    // The documented don't-sum contract, pinned end-to-end at the state level: invocation 1's scan of
+    // feat-z ERRORS (append-only errors[] row, unit left 'error', no run_unit_head row); the resumed
+    // invocation 2 re-dispatches it (error units are re-scanned) and THROTTLES (in_progress →
+    // pending — still no row, no NEW error). One discovered branch, two counters. Summing them into
+    // one partition, or "deduplicating" by subtracting the overlap from either side, would miscount —
+    // a future dedup flips this RED.
+    const db = mem();
+    const inv1 = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    db.enqueueUnit(key("svc", "feat-z"), inv1.runId);
+    db.setUnitStatus(key("svc", "feat-z"), { status: "in_progress", runId: inv1.runId });
+    db.insertError({ runId: inv1.runId, scope: "scan", organization: "org-a", repository: "svc", branch: "feat-z", message: "tree fetch failed" });
+    db.setUnitStatus(key("svc", "feat-z"), { status: "error", runId: inv1.runId, errorMessage: "tree fetch failed" });
+    // crash before completeRun; the next startup reattaches to the still-running run…
+    const inv2 = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    expect(inv2.resumed).toBe(true);
+    expect(inv2.runId).toBe(inv1.runId);
+    // …and the retry throttles: §4 leaves the unit pending with no row and no new error.
+    db.setUnitStatus(key("svc", "feat-z"), { status: "in_progress", runId: inv2.runId });
+    db.setUnitStatus(key("svc", "feat-z"), { status: "pending", runId: inv2.runId, errorMessage: "rate limited (core)" });
+    db.completeRun(inv2.runId);
+    const s = buildReport(db, db.getRun(inv2.runId)!).summary;
+    expect(s.branchesErrored).toBe(1); // the append-only invocation-1 error, row-less
+    expect(s.branchesDeferred).toBe(1); // the invocation-2 throttle, SAME branch
+    const heads = db.read("SELECT COUNT(*) AS n FROM run_unit_head WHERE run_id = ?").get(inv2.runId) as { n: number };
+    expect(heads.n).toBe(0); // no disposition row — the overlap lives entirely outside the partition
+    db.close();
+  });
+
   test("RESUME overlap: a deferred branch holding an earlier invocation's retained row still counts — deferred is queue-side, never row-gated", () => {
     // Regression guard for the tempting wrong fix: gating the count on "holds no run_unit_head row
     // this run" (an anti-join) would zero the deferred signal in exactly the resumed-run case the
