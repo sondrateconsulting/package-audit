@@ -491,8 +491,7 @@ describe("designed empty state (coverage receipts)", () => {
 
   test("a nonzero deferred count joins the coverage receipts (an empty page must not imply a complete slice)", () => {
     const deferredCtx = { ...FIXED_CTX, summary: { ...FIXED_CTX.summary, branchesDeferred: 2 } };
-    const html2 = renderDossier(pkg, deferredCtx);
-    expect(html2).toContain("2 branches still pending");
+    expect(renderDossier(pkg, deferredCtx)).toContain("2 branches still pending");
   });
 
   test("keeps the byte-identical static script and the format-version footer", () => {

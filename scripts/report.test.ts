@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AuditDb, nowIso, type UnitHeadStatus } from "./db.ts";
+import { AuditDb, nowIso, type UnitHeadStatus, type WorkUnitKey } from "./db.ts";
 import { downgradeToFaithfulV2 } from "./testFixtures.ts";
 import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
@@ -1010,32 +1010,32 @@ describe("parseLockfileLines — corrupted self-produced data degrades to null, 
 });
 
 describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", () => {
-  const key = (repository: string, branch: string, configHash = "h") =>
-    ({ configHash, scope: "branch" as const, organization: "org-a", repository, branch });
+  const key = (branch: string, configHash = "h"): WorkUnitKey =>
+    ({ configHash, scope: "branch", organization: "org-a", repository: "svc", branch });
 
   test("counts ONLY this config's pending branch-scope queue rows — terminal statuses, a live in_progress attempt, and foreign configs never count", () => {
     const db = mem();
     const run = seed(db); // configHash "h"
     // two §4-deferred units (throttle leaves them pending, carrying the throttle message)...
-    db.enqueueUnit(key("svc", "feat-a"), run.runId);
-    db.setUnitStatus(key("svc", "feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
-    db.enqueueUnit(key("svc", "feat-b"), run.runId);
-    db.setUnitStatus(key("svc", "feat-b"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    db.enqueueUnit(key("feat-a"), run.runId);
+    db.setUnitStatus(key("feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    db.enqueueUnit(key("feat-b"), run.runId);
+    db.setUnitStatus(key("feat-b"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
     // ...one of each settled queue status, none of which is deferred work...
-    db.enqueueUnit(key("svc", "main"), run.runId);
-    db.setUnitStatus(key("svc", "main"), { status: "done", runId: run.runId, lastCommitSha: "abc123def", lastCommitDate: "2025-06-01T12:00:00Z" });
-    db.enqueueUnit(key("svc", "old"), run.runId);
-    db.setUnitStatus(key("svc", "old"), { status: "skipped", runId: run.runId });
-    db.enqueueUnit(key("svc", "broken"), run.runId);
-    db.setUnitStatus(key("svc", "broken"), { status: "error", runId: run.runId, errorMessage: "boom" });
+    db.enqueueUnit(key("main"), run.runId);
+    db.setUnitStatus(key("main"), { status: "done", runId: run.runId, lastCommitSha: "abc123def", lastCommitDate: "2025-06-01T12:00:00Z" });
+    db.enqueueUnit(key("old"), run.runId);
+    db.setUnitStatus(key("old"), { status: "skipped", runId: run.runId });
+    db.enqueueUnit(key("broken"), run.runId);
+    db.setUnitStatus(key("broken"), { status: "error", runId: run.runId, errorMessage: "boom" });
     // ...an in_progress attempt held by a LIVE second run of the same config — the exact concurrent-
     // report shape the field comment names: being attempted is not deferred ('pending' ALONE counts)...
     const liveRun = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
     expect(liveRun.resumed).toBe(false); // run 1 completed; this is a fresh, still-running sibling
-    db.enqueueUnit(key("svc", "live-attempt"), liveRun.runId);
-    db.setUnitStatus(key("svc", "live-attempt"), { status: "in_progress", runId: liveRun.runId });
+    db.enqueueUnit(key("live-attempt"), liveRun.runId);
+    db.setUnitStatus(key("live-attempt"), { status: "in_progress", runId: liveRun.runId });
     // ...and another config's pending backlog, which is not this config's deferral.
-    db.enqueueUnit(key("svc", "feat-a", "other-config"), run.runId);
+    db.enqueueUnit(key("feat-a", "other-config"), run.runId);
     const s = buildReport(db, run).summary;
     expect(s.branchesDeferred).toBe(2);
     // the partition identity is untouched: deferred is a queue-side count, never an error or a disposition
@@ -1047,8 +1047,8 @@ describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", 
   test("is the CURRENT backlog at generation time: a later run finishing the unit drains an older run's count to 0", () => {
     const db = mem();
     const run = seed(db);
-    db.enqueueUnit(key("svc", "feat-a"), run.runId);
-    db.setUnitStatus(key("svc", "feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    db.enqueueUnit(key("feat-a"), run.runId);
+    db.setUnitStatus(key("feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
     expect(buildReport(db, run).summary.branchesDeferred).toBe(1);
     // The §4 contract: a FUTURE run picks the unit up (a completed run is never resumed — startRun
     // reattaches only to status='running')...
@@ -1057,7 +1057,7 @@ describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", 
       trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
     });
     expect(resumed).toBe(false);
-    db.setUnitStatus(key("svc", "feat-a"), { status: "done", runId: nextRunId, lastCommitSha: "abc123def", lastCommitDate: "2025-06-01T12:00:00Z" });
+    db.setUnitStatus(key("feat-a"), { status: "done", runId: nextRunId, lastCommitSha: "abc123def", lastCommitDate: "2025-06-01T12:00:00Z" });
     // ...and re-rendering the OLD run's report then reports the drained (current) backlog, by design:
     // the count answers "what does this config still owe", which self-expires once a run finishes it.
     expect(buildReport(db, run).summary.branchesDeferred).toBe(0);
@@ -1073,17 +1073,17 @@ describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", 
     // a future dedup flips this RED.
     const db = mem();
     const inv1 = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
-    db.enqueueUnit(key("svc", "feat-z"), inv1.runId);
-    db.setUnitStatus(key("svc", "feat-z"), { status: "in_progress", runId: inv1.runId });
+    db.enqueueUnit(key("feat-z"), inv1.runId);
+    db.setUnitStatus(key("feat-z"), { status: "in_progress", runId: inv1.runId });
     db.insertError({ runId: inv1.runId, scope: "scan", organization: "org-a", repository: "svc", branch: "feat-z", message: "tree fetch failed" });
-    db.setUnitStatus(key("svc", "feat-z"), { status: "error", runId: inv1.runId, errorMessage: "tree fetch failed" });
+    db.setUnitStatus(key("feat-z"), { status: "error", runId: inv1.runId, errorMessage: "tree fetch failed" });
     // crash before completeRun; the next startup reattaches to the still-running run…
     const inv2 = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
     expect(inv2.resumed).toBe(true);
     expect(inv2.runId).toBe(inv1.runId);
     // …and the retry throttles: §4 leaves the unit pending with no row and no new error.
-    db.setUnitStatus(key("svc", "feat-z"), { status: "in_progress", runId: inv2.runId });
-    db.setUnitStatus(key("svc", "feat-z"), { status: "pending", runId: inv2.runId, errorMessage: "rate limited (core)" });
+    db.setUnitStatus(key("feat-z"), { status: "in_progress", runId: inv2.runId });
+    db.setUnitStatus(key("feat-z"), { status: "pending", runId: inv2.runId, errorMessage: "rate limited (core)" });
     db.completeRun(inv2.runId);
     const s = buildReport(db, db.getRun(inv2.runId)!).summary;
     expect(s.branchesErrored).toBe(1); // the append-only invocation-1 error, row-less
@@ -1101,8 +1101,8 @@ describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", 
     const db = mem();
     const run = seed(db); // configHash "h": one scanned + one skipped-cutoff head of its own
     db.upsertRunUnitHead({ runId: run.runId, organization: "org-a", repository: "svc", branch: "feat-a", commitSha: "sha-old", status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-01-01T00:00:00Z" });
-    db.enqueueUnit(key("svc", "feat-a"), run.runId);
-    db.setUnitStatus(key("svc", "feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    db.enqueueUnit(key("feat-a"), run.runId);
+    db.setUnitStatus(key("feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
     const s = buildReport(db, run).summary;
     expect(s.branchesDeferred).toBe(1); // counted despite the retained row…
     expect(s.branchesScanned).toBe(2); // …which stays in its own disposition bucket: the documented double-presence
