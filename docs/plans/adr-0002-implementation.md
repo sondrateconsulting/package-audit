@@ -439,5 +439,25 @@ assumed).
   orchestration-level abandoned-window fixture (real DB + captured taps) joined I6; PR-P's
   *merge* became PR-I's explicit base condition; and this ledger entry itself was the
   review's final requirement.
+- **P1 codex review (gpt-5.6-sol @ ultra, fresh session `019fd11b-0e83-7ae3-ad39-ec9deb1b0981`,
+  2026-08-05): FAIL — 5 P1 + 6 P2; every finding verified, none refuted; all 11 fixed before
+  P2 began** (commit `38dabb7`). The run hit the skill's timeout mid-analysis and was resumed
+  with the §8.1 recovery message, which produced the full numbered findings. Headlines: the
+  drift rule could be satisfied by a walk aborted mid-continuation (fabricated drift buying an
+  invalidation re-run for a gate-deciding candidate failure) — fixed with a `stoppedBy`
+  provenance field so only positive evidence (complete-at-wrong-depth, stopped-at-frozen-bound)
+  invalidates; the quarantine obligation journaled only after its sleep (a crash mid-sleep
+  would resume past it) — now written before, and resume honors any unexpired horizon; a crash
+  mid-try left its spend invisible — a `try-start` intent row now precedes every first
+  dispatch; nonzero-exit ok-shaped envelopes were clean — now unclean per the
+  truncated-transfer precedent; concurrent runners could interleave one journal — a
+  single-writer lock plus exclusive result creation; plus a journal header binding corpus
+  sha256 + constants fingerprint on resume, tail tolerance narrowed to syntactic tears,
+  header deltas made cost-inclusive and single-epoch-only, p2 stratum head-count enforcement,
+  same-owner batch enforcement in the builder, and the page-1 shape test re-derived from the
+  source-pinned solo document. One process disclosure, recorded in the runner slice's commit
+  (`a9899be`): that slice's implementation was drafted before its tests; the RED run was taken
+  against a stubbed runner (12 failures for the intended reason) and the implementation
+  restored to green — the failing run is real; the draft order was not test-first.
 - *(the implementation session appends per-step codex outcomes, the santa-loop record, and
   any live-run observations here, exactly as `adr-0001-t2c-implementation.md` §9 did.)*
