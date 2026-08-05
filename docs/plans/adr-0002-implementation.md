@@ -489,5 +489,18 @@ assumed).
   rider alone, as pre-registered); '26 paired tries' corrected to 25 pairs + 1
   candidate-only attempt (the P3 commit message carries the same overcount, immutably —
   the ADR text is the authoritative record).
+- **P5 whole-PR codex review (fresh session `019fd375-03d6-7323-b525-cebf5e1c5153`,
+  2026-08-05): FAIL — 1 P1 + 5 P2, all verified, all fixed** (`aabbfdb` + the PR body). The
+  P1: the quarantine obligation became durable only at the post-try row append — a crash
+  between the 504 observation and that write would have resumed into the penalized window;
+  the row now journals AT OBSERVATION, before even its try row (order-pinned by test). The
+  P2s: the journal header's binding gained the bench-config file sha256 with its scope
+  stated exactly (legacy pre-binding headers — the committed Stage-P journal is one — stay
+  parseable forever but refuse resume), and four PR-body accuracy corrections (wall claim
+  scoped to clean calls — the 504'd batch ran 11.7 s; resume claim scoped to completed
+  tries with whole-try replay disclosed; the two ADR changes described as they are; the
+  append-only claim scoped, disclosing the one pre-measurement corpus remediation). This
+  run also hit the timeout wrapper mid-analysis and was recovered by the §8.1 resume
+  message, like P1's.
 - *(the implementation session appends per-step codex outcomes, the santa-loop record, and
   any live-run observations here, exactly as `adr-0001-t2c-implementation.md` §9 did.)*
