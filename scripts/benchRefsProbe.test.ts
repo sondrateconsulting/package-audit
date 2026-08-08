@@ -613,6 +613,20 @@ describe("runRefsProbe — resume from the journal (crash-safe, no double-spend)
     await expect(runRefsProbe(legacyResume.deps)).rejects.toThrow(/config/i);
   });
 
+  // The third of three symmetric resume bindings. Corpus and bench-config mismatches each have a
+  // refusal test; this one had none, so a resume after a gate-constant edit could silently mix
+  // rows evaluated under two different rule revisions into one "pre-registered" result.
+  test("a journal recorded under different pre-registered constants is refused", async () => {
+    const corpus = corpusJson();
+    const script = scriptedGithub(corpus);
+    const drifted = JSON.parse(headerLine()) as Record<string, unknown>;
+    drifted["constantsFingerprint"] = "a-different-rule-revision";
+    const { deps } = makeDeps(corpus, script, { existingJournalText: `${JSON.stringify(drifted)}\n` });
+    await expect(runRefsProbe(deps)).rejects.toThrow(/different pre-registered constants/i);
+    // refused BEFORE any spend
+    expect(script.calls.length).toBe(0);
+  });
+
   test("a dangling try-start resumes the same slot at the next attempt (spend visible, no invalidation)", async () => {
     const corpus = corpusJson();
     const script = scriptedGithub(corpus);
