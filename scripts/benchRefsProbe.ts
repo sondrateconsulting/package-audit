@@ -16,7 +16,7 @@
 // tranche is the paired try.
 
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { GithubClient } from "./github.ts";
 import { loadBenchConfig } from "./benchConfig.ts";
@@ -147,12 +147,15 @@ export function classifyJournalTail(rawText: string): JournalTailKind {
   const buf = Buffer.from(rawText, "utf8");
   if (buf.byteLength === 0 || buf[buf.byteLength - 1] === 0x0a) return "none";
   const tailStart = buf.lastIndexOf(0x0a) + 1;
-  if (tailStart === 0) return "headless";
+  // Parse FIRST. Sealing is a pure append, so it is safe even when the torn record is the ONLY
+  // line — which is exactly the shape a crash right after the header write leaves behind.
+  // Deciding "headless" before parsing would refuse that journal forever.
   try {
     JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buf.subarray(tailStart)));
     return "sealable";
   } catch {
-    return "malformed";
+    // malformed: truncation is the only repair, and it must never empty the file
+    return tailStart === 0 ? "headless" : "malformed";
   }
 }
 
@@ -625,21 +628,6 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
       );
     if (header.constantsFingerprint !== probeConstantsFingerprint())
       throw new BenchRefsRulesError("resumed journal was recorded under different pre-registered constants — refusing to mix rule revisions");
-    // Dropped bytes are unrecoverable, so the runner cannot know what they held — and one thing
-    // they MIGHT have held is a quarantine row, which is appended before its sleep exactly so a
-    // crash cannot skip the obligation. Assume the worst and back off before spending again. The
-    // row is written BEFORE the sleep for the same reason the quarantine row is.
-    if (deps.droppedTornTailBytes !== null) {
-      push({
-        rowKind: "tear-recovered", version: 1, atIso: isoOf(deps.now()),
-        droppedBytes: deps.droppedTornTailBytes, conservativeSleepMs: deps.washoutFloorMs,
-      });
-      deps.log(
-        `resume: dropped ${deps.droppedTornTailBytes} torn byte(s) of unknown content — ` +
-        `sleeping ${Math.ceil(deps.washoutFloorMs / 1000)}s before any dispatch in case a quarantine obligation was lost`,
-      );
-      await deps.sleep(deps.washoutFloorMs);
-    }
     // an unexpired quarantine obligation is honored BEFORE any further dispatch anywhere —
     // the row was written before its sleep precisely so a crash mid-sleep cannot skip it
     let outstandingUntil: number | null = null;
@@ -661,6 +649,24 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
     });
   }
   const before = await deps.readRateLimit(recordRestMeta);
+  // Dropped bytes are unrecoverable, so the runner cannot know what they held — and one thing they
+  // MIGHT have held is a quarantine row, appended before its sleep exactly so a crash cannot skip
+  // the obligation. Assume the worst. The replacement must be at least what a real quarantine
+  // would have cost: sleep to the graphql RESET, not the (shorter) washout floor — a floor-length
+  // nap would look conservative while still landing inside an active penalty window. The row is
+  // written BEFORE the sleep for the same reason the quarantine row is.
+  if (deps.droppedTornTailBytes !== null) {
+    const wait = sleepToResetMs(before.graphql.reset, deps.now());
+    push({
+      rowKind: "tear-recovered", version: 1, atIso: isoOf(deps.now()),
+      droppedBytes: deps.droppedTornTailBytes, conservativeSleepMs: wait,
+    });
+    deps.log(
+      `resume: dropped ${deps.droppedTornTailBytes} torn byte(s) of unknown content — ` +
+      `sleeping ${Math.ceil(wait / 1000)}s before any dispatch in case a quarantine obligation was lost`,
+    );
+    await deps.sleep(wait);
+  }
   let finalWashoutMs = 0;
   try {
     for (const cell of deps.corpus.cells) {
@@ -788,12 +794,28 @@ const REPO_ROOT = join(import.meta.dir, "..");
 // Evidence records repo-relative paths only. A path outside the repo has no portable form, so it
 // is refused rather than silently recorded as a machine path — the defect this closes.
 export function repoRelativeEvidencePath(p: string, repoRoot: string): string {
-  const rel = relative(resolve(repoRoot), resolve(repoRoot, p));
+  const rel = relative(realPathDeep(resolve(repoRoot)), realPathDeep(resolve(repoRoot, p)));
   if (rel === "" || rel.startsWith("..") || isAbsolute(rel))
     throw new BenchRefsRulesError(
       `${p} is outside the repository — evidence paths must be repo-relative so an artifact is portable; place it under the repo and retry`,
     );
   return rel;
+}
+
+// A purely lexical resolve() is fooled by an in-repo symlink pointing outside: the recorded path
+// looks repo-relative while the bytes live elsewhere. Resolve symlinks for real. The target need
+// not exist yet (--out usually does not), so resolve the nearest EXISTING ancestor and re-append
+// the rest — realpathSync throws on a missing leaf.
+function realPathDeep(abs: string): string {
+  const parts: string[] = [];
+  let cur = abs;
+  for (;;) {
+    if (existsSync(cur)) return parts.length === 0 ? realpathSync(cur) : join(realpathSync(cur), ...parts.reverse());
+    const parent = dirname(cur);
+    if (parent === cur) return abs; // reached the filesystem root without finding anything real
+    parts.push(cur.slice(parent.length + 1));
+    cur = parent;
+  }
 }
 
 const log = (line: string): void => {
@@ -820,13 +842,16 @@ async function main(): Promise<void> {
   }
   if (existsSync(outPath))
     throw new BenchRefsRulesError(`${outPath} already exists — results are append-only; name a new artifact (refs-probe-2.json, …)`);
+  // Portability is checked BEFORE anything observable happens: no corpus read, no identity
+  // traffic, no mkdir, no lock. A refusal that fired later would leave a stale lock behind.
+  const corpusEvidencePath = repoRelativeEvidencePath(corpusPath, REPO_ROOT);
+  const journalEvidencePath = repoRelativeEvidencePath(journalPathFor(outPath), REPO_ROOT);
   const corpusText = readFileSync(corpusPath, "utf8");
   const corpus = parseRefsProbeCorpus(corpusText);
   const corpusSha256 = createHash("sha256").update(corpusText).digest("hex");
   const journalPath = journalPathFor(outPath);
   const benchConfigSha256 = createHash("sha256").update(readFileSync(BENCH_CONFIG_PATH, "utf8")).digest("hex");
   const cfg = loadBenchConfig(BENCH_CONFIG_PATH);
-  const journalText = existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "";
   const client = new GithubClient({ githubHost: cfg.githubHost, db: null, spawnTimeoutMs: cfg.spawn.timeoutMs });
   const login = probeLoginFromUserPayload(await client.restGetJson("user"));
   assertProbeIdentity(login, corpus);
@@ -841,13 +866,16 @@ async function main(): Promise<void> {
   // releases only on clean completion — a crash leaves it for the operator to acknowledge.
   const lockPath = `${journalPath}.lock`;
   acquireProbeLock(lockPath);
+  // read UNDER the lock: a journal read before it could be stale by the time this run starts
+  // appending, which is exactly the double-spend the single-writer lock exists to prevent
+  const journalText = existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "";
   const result = await runRefsProbe({
     corpus,
-    corpusPath: repoRelativeEvidencePath(corpusPath, REPO_ROOT),
+    corpusPath: corpusEvidencePath,
     corpusSha256,
     outPath,
     // recorded in the result artifact; the operational paths stay as given for I/O
-    journalPath: repoRelativeEvidencePath(journalPath, REPO_ROOT),
+    journalPath: journalEvidencePath,
     benchConfigPath: BENCH_CONFIG_EVIDENCE_PATH,
     benchConfigSha256,
     existingJournalText: journalText,
