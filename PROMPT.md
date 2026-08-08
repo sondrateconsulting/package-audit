@@ -458,9 +458,11 @@ CREATE TABLE IF NOT EXISTS run_unit_head (
                                        -- immutable: lets the report count each disposition for THIS
                                        -- run alone (work_queue is mutable and cross-run).
                                        -- 'past-cap' (v4): eligible but past maxBranchesPerRepo —
-                                       -- recorded for report VISIBILITY only; its work_queue row is
+                                       -- recorded for report VISIBILITY; a 'done' work_queue row is
                                        -- untouched, so a later cap-order shift promotes it without a
-                                       -- rescan. 'policy-excluded' (v4): dropped by branch allow/deny.
+                                       -- rescan (a stale 'pending' row is settled to 'skipped' so §7
+                                       -- never double-counts a surfaced branch as deferred).
+                                       -- 'policy-excluded' (v4): dropped by branch allow/deny.
                                        -- The four are DISJOINT — status alone identifies the
                                        -- disposition; no read surface needs a second column to tell
                                        -- a policy exclusion from a genuine cutoff skip. It is named
@@ -575,8 +577,11 @@ Resumability rules:
   (its usage is genuinely stale), and it just isn't refreshed into new runs. What "retains" does
   NOT mean is "this run says nothing about it", and the two cases differ: a PAST-CAP branch DOES
   get a FRESH `run_unit_head` row this run (`status='past-cap'`, commit_sha='') recorded purely
-  for report VISIBILITY — the work queue is left untouched, so a later cap-order shift promotes it
-  without a re-scan; a DELETED branch is not surfaced at all, and stale-row reconciliation prunes any row
+  for report VISIBILITY — a `done` work-queue row is left untouched, so a later cap-order shift
+  promotes it without a re-scan, while a stale `pending` row — however it arose (throttle
+  deferral, crash-recovery reset, or `--rescan-branch`) — is settled to 'skipped' so §7's
+  `branchesDeferred` never double-counts a branch this run already
+  surfaced as past-cap; a DELETED branch is not surfaced at all, and stale-row reconciliation prunes any row
   a prior resume-invocation of THIS run left for it (earlier runs' rows are immutable and stay). That
   prune is REPO-SCOPED, and deliberately so: it runs inside the per-repo path, so it can only speak for
   repos this run re-discovered AND kept. A repo that dropped out of the kept set between invocations —
@@ -598,7 +603,8 @@ Resumability rules:
   reproducible and truthful about what its own invocation decided (a scanned row's commit_sha
   is "the head it reported", never "the live head" — the report-head invariant below; a
   non-scanned row's commit_sha='' and discovered-head date describe the older evaluation), and
-  the unit is left `error`/`pending` so the next run refreshes it. A head-SHA-aware prune is deliberately NOT used: it would delete
+  the unit is left `error`/`pending` so a later run that still re-enumerates the branch
+  refreshes it (a retry can throttle again). A head-SHA-aware prune is deliberately NOT used: it would delete
   the commit_sha='' sentinels the non-scanned dispositions rely on.
 - Report-head invariant (co-designed with the skip predicate): as each unit is
   processed (scanned OR skipped-as-current), the run upserts `run_unit_head(run_id, org,
@@ -734,8 +740,9 @@ wrapper WAITS through the computed window and RETRIES the request IN PLACE, up t
 attempt budget; `ThrottleExhausted` escapes only when that budget is exhausted, or
 earlier when the client-lifetime cumulative pause budget would be exceeded — the
 orchestrator treats an escape as TRANSIENT: a mid-scan escape (discovery or content
-fetch) resets that unit to `pending` with no errors row and the NEXT invocation retries
-it (the §3 skip predicate only skips units that are `done` at the current head; there
+fetch) resets that unit to `pending` with no errors row and a later invocation that
+re-enumerates it retries it — a retry can throttle again (the §3 skip predicate only
+skips units that are `done` at the current head; there
 is no mid-run re-queue), a repo/branch discovery escape logs a JSONL requeue event
 only, and an owner-resolution escape ends the run cleanly without starting one; --plan,
 which has no DB, counts a repo/branch discovery escape into its failure totals while a
@@ -1448,7 +1455,8 @@ summary.
                                                  //   packageName/version (§5.E per-version introspection)
   "summary": { "organizationsScanned":0,"repositoriesScanned":0,"branchesScanned":0,
                "branchesSkippedByCutoff":0,"branchesExcludedByPolicy":0,"branchesPastCap":0,
-               "branchesErrored":0,"totalDependencyFindings":0,"totalUsageFindings":0 },
+               "branchesErrored":0,"branchesDeferred":0,
+               "totalDependencyFindings":0,"totalUsageFindings":0 },
   "scanScope": { "excludedByDeny":0,"excludedByAllow":0,"defaultBranchPolicyOverrides":0,
                  "policyBranches":[ ... ],"provenance":"complete" }  // branch allow/deny diagnostics;
                                                  //   provenance: 'complete' | 'pre-upgrade' —
@@ -1460,8 +1468,9 @@ summary.
                                                  //   understate what that run actually evaluated
 }
 ```
-Summary derivation — ALL per-run from the IMMUTABLE `run_unit_head` slice for the reported
-run (NEVER from the mutable work_queue, which is cross-run): `branchesScanned` =
+Summary derivation — every count but ONE from the IMMUTABLE `run_unit_head` slice for the
+reported run, never the mutable cross-run work_queue (`branchesDeferred` is the sanctioned
+exception, defined after the throttle carve-out below): `branchesScanned` =
 COUNT(*) WHERE run_id=R AND status='scanned'; `branchesSkippedByCutoff` = COUNT WHERE
 run_id=R AND status='skipped-cutoff' — GENUINE cutoff only, because a policy exclusion carries
 its OWN status and can never be folded in by an under-specified filter;
@@ -1476,8 +1485,30 @@ it as exactly that, since on a RESUMED run it diverges from "every branch whose 
 in both directions (see scripts/report.ts). Together the five account for every branch that
 reached a TERMINAL outcome — an equality on a single-invocation run, an upper bound on a
 resumed one. A THROTTLE-REQUEUED branch is deferred, not terminal: it writes neither a row nor
-a NEW error, and with no prior same-run error it is in no count (an earlier invocation's
-append-only error still counts it — the resumed-run divergence above). Decide policy dispositions ONLY via both status and policy_status
+a NEW error, and with no prior same-run error it is in none of THOSE counts (an earlier
+invocation's append-only error still counts it — the resumed-run divergence above).
+`branchesDeferred` surfaces that remainder as the config's still-pending queue rows (a
+count that also carries crash-recovery resets and prior-run rows no run has re-enumerated):
+COUNT of work_queue rows WHERE
+config_hash = the run's AND scope='branch' AND status='pending' at report build — the ONE
+count read from the MUTABLE cross-run queue, sanctioned because the deferred remainder
+exists nowhere else in SQLite. It is therefore the CURRENT backlog at generation time
+(re-rendering an old --run-id after later runs drain the queue reports 0 — §4's contract is
+that a future run retries the work it still re-enumerates, though a retry can throttle
+again), it sits OUTSIDE the terminal
+identity above (on a resumed run a deferred branch can also hold an earlier invocation's
+error or retained row, so summing it in would double-count; within one invocation, rendered
+at its own completion, the two sides are disjoint — every disposition settles or
+never-creates its pending row, past-cap included, which settles a stale one to 'skipped' —
+though a HISTORICAL re-render can overlap them again once a later run re-pends a branch
+this run scanned), it UNDERCOUNTS branches a throttled
+owner/repo discovery never enumerated (nothing was enqueued for them — though prior-run
+pending rows beneath such a repo remain counted), and it retains any pending row whose unit
+no run re-enumerates (nothing prunes work_queue) — branch deleted, repo dropped from the
+kept set (deleted, renamed, newly archived/fork-filtered, or displaced past
+`maxReposPerOrg`), or owner no longer discovered — until a run re-enumerates it (settling
+or re-attempting it) or `--fresh` drops the queue; `--rescan-branch` cannot clear such a
+row (it only sets an already-pending row pending again). Decide policy dispositions ONLY via both status and policy_status
 (scripts/policyDisposition.ts); `policy_status IS NOT NULL` alone is never a proxy for
 "excluded" (a scanned default branch carries the counterfactual). The guard validates the
 WHOLE row, not just those two columns: `is_default_branch` is load-bearing in BOTH

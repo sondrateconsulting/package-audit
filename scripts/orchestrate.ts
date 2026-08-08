@@ -222,6 +222,14 @@ export function runSummaryText(
     `  Organizations scanned:  ${s.organizationsScanned}`,
     `  Repositories scanned:   ${s.repositoriesScanned}`,
     `  Branches scanned:       ${s.branchesScanned} (${s.branchesSkippedByCutoff} skipped by cutoff · ${s.branchesExcludedByPolicy} excluded by policy · ${s.branchesPastCap} past cap · ${s.branchesErrored} scan-errored)`,
+    // Deferred sits OUTSIDE the parenthetical partition above (non-terminal, not a disposition) and
+    // always prints — a zero documents the invariant. Nonzero usually means §4 rate limiting requeued
+    // part of the estate (crash-recovery resets and prior-run rows whose unit was never re-enumerated
+    // land here too), so the line must flag the counters as partial: the exact failure this guards is
+    // a one-shot/CI run under sustained throttling reading as a clean, complete audit. The wording
+    // promises no completion — a pending unit is retried only when a future run re-enumerates it AND
+    // it is still eligible (not capped/excluded) then.
+    `  Branches deferred:      ${s.branchesDeferred} (pending queue; retry requires rediscovery and eligibility)${s.branchesDeferred > 0 ? " — the scanned counts above are PARTIAL" : ""}`,
     `  Dependency findings:    ${s.totalDependencyFindings}`,
     `  Usage findings:         ${s.totalUsageFindings}`,
     `  Errors recorded:        ${errorCount} (fail-soft; details in the report's errors[])`,
@@ -597,12 +605,17 @@ export async function processRepo(
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-cutoff" });
   }
 
-  // Past-cap (policy-eligible, after cutoff, past the cap): record ONLY a run_unit_head row for report
-  // visibility — do NOT enqueue or touch the work queue, so a prior 'done' scan survives and a later
-  // run can promote this branch (cap-order shift) without a re-scan.
+  // Past-cap (policy-eligible, after cutoff, past the cap): record a run_unit_head row for report
+  // visibility — never enqueue, and never touch a 'done' queue row, so a prior scan survives and a
+  // later run can promote this branch (cap-order shift) without a re-scan. A stale 'pending' row
+  // IS settled to 'skipped', though — however it arose (§4 throttle deferral, crash-recovery
+  // reset, or --rescan-branch): §7's queue-side
+  // branchesDeferred would otherwise count the same branch this run just surfaced as past-cap — a
+  // double count that flags a throttle-free run PARTIAL (see settlePastCapUnit).
   for (const d of plan.pastCap) {
     const h = d.head;
     db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "past-cap", isDefaultBranch: d.isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
+    db.settlePastCapUnit(keyFor(h.name), runId);
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "past-cap" });
   }
 
@@ -669,7 +682,8 @@ export async function processRepo(
           if (e instanceof PolicyMatchError) throw e;
           if (e instanceof ThrottleExhausted) {
             // §4: throttle exhaustion is NOT a permanent unit failure — reset to pending so a LATER run
-            // retries it. No same-run spin: the pool dispatches each fixed plan.toScan unit exactly once
+            // that re-enumerates it can retry (and may throttle again). No same-run spin: the pool
+            // dispatches each fixed plan.toScan unit exactly once
             // and nothing re-reads pending units within the run. Handled here (not a fatal), so it never
             // trips branchAbort — one throttled branch must not cancel its siblings.
             db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
@@ -749,8 +763,9 @@ export async function processRepo(
   //   - it is NOT a regression: before reconciliation existed there was no prune at all, so the row was retained
   //     identically. The prune is a mitigation this feature ADDED (it removes deleted-branch phantoms
   //     that used to persist forever); it is not the cause.
-  //   - it self-heals: the unit is left error/pending, never done, so the next run re-scans and re-upserts
-  //     at the live head.
+  //   - it self-heals CONDITIONALLY: the unit is left error/pending, never done, so a later run that
+  //     still re-enumerates the branch re-scans and re-upserts at the live head (a retry can throttle
+  //     again, and a never-re-enumerated unit stays as recorded).
   // A head-SHA-aware prune is REJECTED: it would delete the commit_sha='' sentinels the non-scanned
   // dispositions rely on, hiding a real branch's real findings entirely rather than reporting them one
   // commit late. (Scanned rows now always carry the DISCOVERED oid — the T2c coherence gate fails a
@@ -758,7 +773,9 @@ export async function processRepo(
   // but the sentinels alone still settle it.)
   // Sharp edge worth knowing: the ERROR variant is loud (an errors[] row + a JSONL `action:"error"`
   // line, visible beside the stale row), but the THROTTLE variant writes neither — only a stdout
-  // requeue line — so a completed run can present the old head with no in-report signal. Related: the
+  // requeue line plus the unit left pending, which the report's AGGREGATE branchesDeferred counts —
+  // so a completed run still presents the old head with no in-report signal NAMING the branch (the
+  // count says how many were deferred, not which). Related: the
   // retained row also masks that branch from the report's branchesErrored, which counts only errored
   // branches holding NO row (see report.ts).
   const pruned = db.reconcileRunUnitHead(runId, repo.organization, repo.name, heads.map((h) => h.name));

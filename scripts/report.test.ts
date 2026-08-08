@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AuditDb, nowIso, type UnitHeadStatus } from "./db.ts";
+import { AuditDb, nowIso, type UnitHeadStatus, type WorkUnitKey } from "./db.ts";
 import { downgradeToFaithfulV2 } from "./testFixtures.ts";
 import { buildNotReportableNotice, buildReport, emitDossiers, parseLockfileLines, runReport } from "./report.ts";
 import { reportSchema, notReportableSchema, summarySchema } from "./reportSchema.ts";
@@ -81,7 +81,7 @@ describe("buildReport (§7)", () => {
     expect(report.summary).toEqual({
       organizationsScanned: 1, repositoriesScanned: 1, branchesScanned: 1,
       branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
-      totalDependencyFindings: 1, totalUsageFindings: 2,
+      branchesDeferred: 0, totalDependencyFindings: 1, totalUsageFindings: 2,
     });
     // new top-level report fields
     expect(report.formatVersion).toBe(XRAY_FORMAT_VERSION);
@@ -1006,5 +1006,116 @@ describe("parseLockfileLines — corrupted self-produced data degrades to null, 
   });
   test("a valid positive safe-integer array parses (including large in-range values)", () => {
     expect(parseLockfileLines("[1, 42, 999999]")).toEqual([1, 42, 999999]);
+  });
+});
+
+describe("summary.branchesDeferred (the §4 throttle carve-out, made visible)", () => {
+  const key = (branch: string, configHash = "h"): WorkUnitKey =>
+    ({ configHash, scope: "branch", organization: "org-a", repository: "svc", branch });
+
+  test("counts ONLY this config's pending branch-scope queue rows — terminal statuses, a live in_progress attempt, and foreign configs never count", () => {
+    const db = mem();
+    const run = seed(db); // configHash "h"
+    // two §4-deferred units (throttle leaves them pending, carrying the throttle message)...
+    db.enqueueUnit(key("feat-a"), run.runId);
+    db.setUnitStatus(key("feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    db.enqueueUnit(key("feat-b"), run.runId);
+    db.setUnitStatus(key("feat-b"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    // ...one of each settled queue status, none of which is deferred work...
+    db.enqueueUnit(key("main"), run.runId);
+    db.setUnitStatus(key("main"), { status: "done", runId: run.runId, lastCommitSha: "abc123def", lastCommitDate: "2025-06-01T12:00:00Z" });
+    db.enqueueUnit(key("old"), run.runId);
+    db.setUnitStatus(key("old"), { status: "skipped", runId: run.runId });
+    db.enqueueUnit(key("broken"), run.runId);
+    db.setUnitStatus(key("broken"), { status: "error", runId: run.runId, errorMessage: "boom" });
+    // ...an in_progress attempt held by a LIVE second run of the same config — the exact concurrent-
+    // report shape the field comment names: being attempted is not deferred ('pending' ALONE counts)...
+    const liveRun = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    expect(liveRun.resumed).toBe(false); // run 1 completed; this is a fresh, still-running sibling
+    db.enqueueUnit(key("live-attempt"), liveRun.runId);
+    db.setUnitStatus(key("live-attempt"), { status: "in_progress", runId: liveRun.runId });
+    // ...and another config's pending backlog, which is not this config's deferral.
+    db.enqueueUnit(key("feat-a", "other-config"), run.runId);
+    const s = buildReport(db, run).summary;
+    expect(s.branchesDeferred).toBe(2);
+    // the partition identity is untouched: deferred is a queue-side count, never an error or a disposition
+    expect(s.branchesErrored).toBe(0);
+    expect(s.branchesScanned).toBe(1);
+    db.close();
+  });
+
+  test("is the CURRENT backlog at generation time: a later run finishing the unit drains an older run's count to 0", () => {
+    const db = mem();
+    const run = seed(db);
+    db.enqueueUnit(key("feat-a"), run.runId);
+    db.setUnitStatus(key("feat-a"), { status: "pending", runId: run.runId, errorMessage: "rate limited (core)" });
+    expect(buildReport(db, run).summary.branchesDeferred).toBe(1);
+    // The §4 contract: a FUTURE run that re-enumerates the unit picks it up (a completed run is
+    // never resumed — startRun reattaches only to status='running')...
+    const { runId: nextRunId, resumed } = db.startRun({
+      configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered",
+      trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+    });
+    expect(resumed).toBe(false);
+    db.setUnitStatus(key("feat-a"), { status: "done", runId: nextRunId, lastCommitSha: "abc123def", lastCommitDate: "2025-06-01T12:00:00Z" });
+    // ...and re-rendering the OLD run's report then reports the drained (current) backlog, by design:
+    // the count answers "what does this config still owe", which self-expires once a run finishes it.
+    expect(buildReport(db, run).summary.branchesDeferred).toBe(0);
+    db.close();
+  });
+
+  test("RESUME overlap: the SAME row-less branch counts in BOTH branchesErrored and branchesDeferred — never summed, never deduped", () => {
+    // The documented don't-sum contract, pinned end-to-end at the state level: invocation 1's scan of
+    // feat-z ERRORS (append-only errors[] row, unit left 'error', no run_unit_head row); the resumed
+    // invocation 2 re-dispatches it (error units are re-scanned) and THROTTLES (in_progress →
+    // pending — still no row, no NEW error). One discovered branch, two counters. Summing them into
+    // one partition, or "deduplicating" by subtracting the overlap from either side, would miscount —
+    // a future dedup flips this RED.
+    const db = mem();
+    const inv1 = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    db.enqueueUnit(key("feat-z"), inv1.runId);
+    db.setUnitStatus(key("feat-z"), { status: "in_progress", runId: inv1.runId });
+    db.insertError({ runId: inv1.runId, scope: "scan", organization: "org-a", repository: "svc", branch: "feat-z", message: "tree fetch failed" });
+    db.setUnitStatus(key("feat-z"), { status: "error", runId: inv1.runId, errorMessage: "tree fetch failed" });
+    // crash before completeRun; the next startup reattaches to the still-running run…
+    const inv2 = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    expect(inv2.resumed).toBe(true);
+    expect(inv2.runId).toBe(inv1.runId);
+    // …and the retry throttles: §4 leaves the unit pending with no row and no new error.
+    db.setUnitStatus(key("feat-z"), { status: "in_progress", runId: inv2.runId });
+    db.setUnitStatus(key("feat-z"), { status: "pending", runId: inv2.runId, errorMessage: "rate limited (core)" });
+    db.completeRun(inv2.runId);
+    const s = buildReport(db, db.getRun(inv2.runId)!).summary;
+    expect(s.branchesErrored).toBe(1); // the append-only invocation-1 error, row-less
+    expect(s.branchesDeferred).toBe(1); // the invocation-2 throttle, SAME branch
+    const heads = db.read("SELECT COUNT(*) AS n FROM run_unit_head WHERE run_id = ?").get(inv2.runId) as { n: number };
+    expect(heads.n).toBe(0); // no disposition row — the overlap lives entirely outside the partition
+    db.close();
+  });
+
+  test("RESUME overlap: a deferred branch holding an earlier invocation's retained row still counts — deferred is queue-side, never row-gated", () => {
+    // Regression guard for the tempting wrong fix: gating the count on "holds no run_unit_head row
+    // this run" (an anti-join) would zero the deferred signal in exactly the resumed-run case the
+    // field comment documents — a retained row presenting the OLD head while the re-scan throttled —
+    // so a sustained-throttle resume would read clean again. The double-presence IS the contract.
+    // Full lifecycle: invocation 1 scans feat-a; the resumed invocation 2 finds the head ADVANCED,
+    // re-dispatches, and THROTTLES (§4: back to pending, no new row — reconciliation retains inv 1's).
+    const db = mem();
+    const inv1 = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    db.enqueueUnit(key("feat-a"), inv1.runId);
+    db.setUnitStatus(key("feat-a"), { status: "in_progress", runId: inv1.runId });
+    db.upsertRunUnitHead({ runId: inv1.runId, organization: "org-a", repository: "svc", branch: "feat-a", commitSha: "sha-old", status: "scanned", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-01-01T00:00:00Z" });
+    db.setUnitStatus(key("feat-a"), { status: "done", runId: inv1.runId, lastCommitSha: "sha-old", lastCommitDate: "2025-01-01T00:00:00Z" });
+    // crash before completeRun; invocation 2 reattaches to the still-running run…
+    const inv2 = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    expect(inv2.resumed).toBe(true);
+    // …the advanced head fails the §3 skip predicate (stored sha ≠ live head), so the re-scan runs and throttles.
+    db.setUnitStatus(key("feat-a"), { status: "in_progress", runId: inv2.runId });
+    db.setUnitStatus(key("feat-a"), { status: "pending", runId: inv2.runId, errorMessage: "rate limited (core)" });
+    db.completeRun(inv2.runId);
+    const s = buildReport(db, db.getRun(inv2.runId)!).summary;
+    expect(s.branchesDeferred).toBe(1); // counted despite the retained row…
+    expect(s.branchesScanned).toBe(1); // …which stays in its own disposition bucket: the documented double-presence
+    db.close();
   });
 });
