@@ -1,8 +1,9 @@
 # Plan: implement ADR-0002 — alias-batched refs page-1 branch discovery
 
 Status: pre-implementation plan, written at the close of the ADR's ten-round adversarial
-review (Phase B of `adr-0002-continuation-handoff.md`), then revised through one codex plan
-review (§12). **You, the reader, are assumed to be a fresh implementation session with no
+review (Phase B of the review-loop continuation handoff — a spent session brief removed from
+the tree once both its phases completed; the loop's authoritative record is the ADR's Review
+history), then revised through one codex plan review (§12). **You, the reader, are assumed to be a fresh implementation session with no
 other context: this document plus the files it cites are the complete brief.** §12 is the
 ledger the implementation fills in as its own review loops run.
 
