@@ -625,13 +625,35 @@ describe("evaluateTry", () => {
     const ev = evaluateTry(p1cell, again.dispatches, noCtrlWalk);
     expect(ev.verdict).toBe("invalidated");
   });
-  test("quarantine precedence beats drift and dirty control", () => {
+  test("quarantine precedence beats dirty control", () => {
     const { dispatches, walks } = cleanTryParts(p1cell);
     const ci = dispatches.findIndex((d) => d.arm === "control");
     dispatches[ci] = { ...dispatches[ci]!, status: 502, classification: "transient", pointsCost: null };
-    const wi = walks.findIndex((w) => w.arm === "candidate");
-    walks[wi] = { ...walks[wi]!, complete: false };
     expect(evaluateTry(p1cell, dispatches, walks).verdict).toBe("quarantine-unclean");
+  });
+  // Drift needs complete===false AND stoppedBy==="frozen-bound" (or complete===true at the wrong
+  // depth). Setting complete alone leaves stoppedBy "complete", which registers NO drift — so a
+  // fixture built that way silently proves nothing about drift. The witness below pins that the
+  // setup really does drift BEFORE the precedence claim is made.
+  test("quarantine precedence beats a genuine page-count drift", () => {
+    const { dispatches, walks } = cleanTryParts(p1cell);
+    const wi = walks.findIndex((w) => w.arm === "candidate");
+    walks[wi] = { ...walks[wi]!, complete: false, stoppedBy: "frozen-bound" };
+
+    // witness: this fixture, on its own, really is a drift invalidation
+    const driftOnly = evaluateTry(p1cell, dispatches, walks);
+    expect(driftOnly.verdict).toBe("invalidated");
+    expect(driftOnly.invalidationCause).toMatch(/page-count-drift/);
+
+    // now add the 502 to the CANDIDATE arm, leaving the control clean, so the only contest is
+    // quarantine vs drift
+    const qi = dispatches.findIndex((d) => d.callKind === "batch-page1");
+    dispatches[qi] = { ...dispatches[qi]!, status: 502, classification: "transient", pointsCost: null };
+    const ev = evaluateTry(p1cell, dispatches, walks);
+    expect(ev.control.clean).toBe(true);
+    expect(ev.verdict).toBe("quarantine-unclean");
+    // and it is NOT recorded as an invalidation — only the quarantine path takes the reset sleep
+    expect(ev.invalidationCause).toBeNull();
   });
   test("dirty control takes precedence over a candidate failure (invalid before gate-deciding)", () => {
     const { dispatches, walks } = cleanTryParts(p1cell);
@@ -718,6 +740,15 @@ describe("deriveCellState", () => {
   test("an invalidated attempt re-runs the same slot", () => {
     const rows = [tryRow({ slot: 1, verdict: "invalidated", invalidationCause: "page-count-drift" })];
     expect(deriveCellState(cell, rows)).toEqual({ kind: "pending", nextSlot: 1, nextAttempt: 2, invalidationsUsed: 1 });
+  });
+  test("exactly two invalidations still leave the cell its budgeted re-run", () => {
+    // the cap is a re-run BUDGET: committing invalid at 2 would spend only 2 of 3 permitted
+    // attempts and could flip a legitimate default-pinned result to anomaly/no-pass
+    const rows = [
+      tryRow({ slot: 1, attempt: 1, verdict: "invalidated", invalidationCause: "page-count-drift" }),
+      tryRow({ slot: 1, attempt: 2, verdict: "invalidated", invalidationCause: "dirty-control" }),
+    ];
+    expect(deriveCellState(cell, rows)).toEqual({ kind: "pending", nextSlot: 1, nextAttempt: 3, invalidationsUsed: 2 });
   });
   test("more than two invalidations commit the cell invalid", () => {
     const rows = [
@@ -833,6 +864,15 @@ describe("evaluateCandidate (every gate, both strata)", () => {
     expect(v.passed).toBe(false);
     expect(v.causes.join(" ")).toMatch(/wall/);
   });
+  // Every gate below pins the value EXACTLY AT its threshold. The comparators are correct today,
+  // so these pass now; each one goes RED against the corresponding >= / > mutation, which is the
+  // regression they exist to catch. Without them a one-character drift in a pre-registered gate
+  // ships silently.
+  test("the wall gate passes AT the limit — 5 s is inside the bound, not outside it", () => {
+    const atLimit = cleanRows(10, "p2", (s) => (s === 3 ? { candidate: cleanSummary({ page1MaxWallMs: 5_000 }) } : {}));
+    const v = evaluateCandidate(10, completeOutcome(p1rows()), completeOutcome(atLimit));
+    expect(v.passed).toBe(true);
+  });
   test("the pair gate binds per pair in the p1 stratum — one bad pair fails even when the mean would pass", () => {
     const rows = cleanRows(10, "p1", (s) => (s === 2 ? { pairRatio: 0.6 } : { pairRatio: 0.04 }));
     const v = evaluateCandidate(10, completeOutcome(rows), completeOutcome(p2rows()));
@@ -851,6 +891,14 @@ describe("evaluateCandidate (every gate, both strata)", () => {
     const v = evaluateCandidate(10, completeOutcome(rows), completeOutcome(p2rows()));
     expect(v.passed).toBe(true);
   });
+  test("a ratio a hair over one half fails — the cutoff cannot drift upward unnoticed", () => {
+    // 0.51/0.6 alone leave the window (0.5, ~0.51] unpinned: an effective cutoff of 0.505 would
+    // pass every other test in this file.
+    const rows = cleanRows(10, "p1", () => ({ pairRatio: 0.5001 }));
+    const v = evaluateCandidate(10, completeOutcome(rows), completeOutcome(p2rows()));
+    expect(v.passed).toBe(false);
+    expect(v.causes.join(" ")).toMatch(/pair/);
+  });
   test("the pair gate does not bind in the p2 stratum (algebraic floor above one half)", () => {
     const rows = cleanRows(10, "p2", () => ({
       candidate: cleanSummary({ continuationPoints: 10, continuationPagesObserved: 10, totalPoints: 11 }),
@@ -868,6 +916,11 @@ describe("evaluateCandidate (every gate, both strata)", () => {
     const heavyP2 = cleanRows(10, "p2", (s) => (s === 1 ? { candidate: cleanSummary({ page1Points: 3, perBatchPoints: [3], continuationPoints: 10, continuationPagesObserved: 10 }) } : {}));
     const v2 = evaluateCandidate(10, completeOutcome(p1rows()), completeOutcome(heavyP2));
     expect(v2.passed).toBe(false);
+  });
+  test("the absolute gate passes AT the per-batch limit — 2 points is inside the bound", () => {
+    const atLimit = cleanRows(10, "p1", (s) => (s === 5 ? { candidate: cleanSummary({ page1Points: 2, perBatchPoints: [2] }) } : {}));
+    const v = evaluateCandidate(10, completeOutcome(atLimit), completeOutcome(p2rows()));
+    expect(v.passed).toBe(true);
   });
   test("B = 50 evaluates as informational, never a candidate", () => {
     const v = evaluateCandidate(50, completeOutcome(cleanRows(50, "p1")), completeOutcome(cleanRows(50, "p2")));
@@ -912,6 +965,19 @@ describe("selectOutcome (contiguous prefix, cheapest measured, smaller-B ties)",
   test("no candidate passing is the no-pass outcome", () => {
     const out = selectOutcome([verdict(10, false), verdict(25, false)], reductions({ 10: null, 25: null }));
     expect(out.kind).toBe("no-pass");
+  });
+  // The literal ship/no-ship decision the ratified default rests on. The comparator is `floor >=
+  // threshold` — "must stay UNDER 10% of one window" — so exactly 500 must NOT ship. Both sides of
+  // that edge were previously untested (only 240 and 600 appeared, far from it).
+  test("the ship threshold is exclusive: a corrected floor of exactly 500 does not ship", () => {
+    const out = selectOutcome([verdict(10, true), verdict(25, false)], reductions({ 10: 500 / 6_000, 25: null }));
+    expect(out.kind).toBe("no-pass");
+    if (out.kind === "no-pass") expect(out.correctedFloor8x750).toBe(500);
+  });
+  test("a corrected floor a hair under 500 ships", () => {
+    const out = selectOutcome([verdict(10, true), verdict(25, false)], reductions({ 10: 499.998 / 6_000, 25: null }));
+    expect(out.kind).toBe("default-pinned");
+    if (out.kind === "default-pinned") expect(out.correctedFloor8x750).toBe(499.998);
   });
   test("the ship threshold fires no-pass when the corrected floor reaches 10% of a window", () => {
     // reducer 0.1 → corrected 8×750 floor = 6,000 × 0.1 = 600 ≥ 500 → the default must not ship
