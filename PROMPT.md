@@ -379,10 +379,11 @@ CREATE TABLE IF NOT EXISTS runs (
   discovery_scopes_deferred INTEGER    -- §4 discovery-throttle evidence (v5), NULLABLE: how many
                                        -- DISTINCT discovery scopes (one per owner repo-listing,
                                        -- one per repository branch-listing) exhausted their
-                                       -- RETRY budget this run (rate limiting raises it, and so
-                                       -- do repeated HTTP 5xx responses burning the same bounded
-                                       -- allowance; a network failure has no HTTP response and
-                                       -- exhausts as a permanent error, so it is NOT counted).
+                                       -- RETRY/PAUSE budget this run. ThrottleExhausted has TWO
+                                       -- mechanisms: a call running out of retries (rate limiting
+                                       -- or repeated HTTP 5xx), or the RUN spending its cumulative
+                                       -- pause budget. A network failure has no HTTP response and
+                                       -- exhausts as a permanent error, so it is NOT counted.
                                        -- Such a scope enumerates
                                        -- NOTHING, so it enqueues no work unit and records no
                                        -- errors row — invisible to §7's branchesDeferred AND

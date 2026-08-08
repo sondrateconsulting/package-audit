@@ -83,7 +83,7 @@ export interface DossierSummary {
   readonly branchesExcludedByPolicy: number; // branch allow/deny (§5)
   readonly branchesPastCap: number;
   readonly branchesDeferred: number; // §4 deferred remainder (queue-side pending; see report.ts)
-  // §4 discovery blind spot: SCOPES whose listing exhausted its retry budget (per-run sealed evidence).
+  // §4 discovery blind spot: SCOPES whose listing exhausted its retry/pause budget (per-run sealed evidence).
   // null = UNKNOWN (running, failed, pre-v5, or RESUMED with no exhaustion seen by the completing
   // invocation) — renderers must never show that as 0. See report.ts.
   readonly discoveryScopesDeferred: number | null;
@@ -924,7 +924,7 @@ function renderFooter(ctx: DossierContext): string {
     ...(s.discoveryScopesDeferred === null
       ? ["discovery retry-budget exhaustion not recorded for this run"]
       : s.discoveryScopesDeferred > 0
-        ? [`${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} gave up after retries`]
+        ? [`${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} exhausted their retry/pause budget`]
         : []),
   ];
   // ONE clause under ONE anchor — two receipts would mean two competing scan-scope links.

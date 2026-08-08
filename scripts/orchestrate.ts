@@ -240,7 +240,7 @@ export function runSummaryText(
         // Scoped to THIS run's attempt: on a RESUMED run, rows retained from an earlier invocation
         // can still place branches of a now-throttled repo into the counts above, so claiming they
         // appear in NO count would be false.
-        ? " — owners/repos whose listing gave up after retries (rate limiting, or repeated HTTP 5xx); this invocation never enumerated them, so the counts above are PARTIAL"
+        ? " — owners/repos whose listing exhausted their retry/pause budget (rate limiting, repeated HTTP 5xx, or the run's cumulative pause budget); this invocation never enumerated them, so the counts above are PARTIAL"
         : ""
     }`,
     `  Dependency findings:    ${s.totalDependencyFindings}`,

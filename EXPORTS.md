@@ -255,19 +255,23 @@ Notes: `effective_owners` and `tracked_packages` are JSON arrays serialized as t
 DuckDB reads them with `from_json(...)`, jq with `fromjson`.
 
 `discovery_scopes_deferred` is the §4 discovery-throttle evidence: how many DISTINCT discovery
-scopes (one per owner repo-listing, one per repository branch-listing) exhausted their RETRY
-budget during this run — `ThrottleExhausted`, which GitHub rate limiting raises but so does a
-repeated HTTP 5xx responses burning the same bounded retry allowance. (A network failure has no
-HTTP response and exhausts as a permanent error instead, so it is NOT counted here.) Those scopes enumerated nothing, so they enqueue no work and record no
-error — they are invisible to both `branchesErrored` and the report's `branchesDeferred`, which is
-why the count is persisted here instead of being derived. **`null` means UNKNOWN, never zero**: a
+scopes (one per owner repo-listing, one per repository branch-listing) exhausted their RETRY/PAUSE
+budget during this run. That is `ThrottleExhausted`, which has TWO distinct mechanisms: a single
+call running out of retries (GitHub rate limiting, or repeated HTTP 5xx responses burning the same
+bounded retry allowance), or the RUN spending its cumulative pause budget. A network failure has no
+HTTP response and exhausts as a permanent error instead, so it is NOT counted here.
+
+Those scopes enumerated nothing, so they enqueue no NEW work and record no error. Branches absent
+from prior queue state are therefore invisible to both `branchesErrored` and `branchesDeferred`
+(pre-existing pending rows beneath such a scope still count, since `branchesDeferred` reads every
+pending row for the config) — which is why this count is persisted here instead of being derived. **`null` means UNKNOWN, never zero**: a
 run that is still running, that failed, or that predates schema v5 sealed no evidence. A completed
 run MIGRATED from pre-v5 also keeps its `null`. So does a RESUMED run whose completing invocation
 saw no discovery throttles: the accumulator lives in memory for one invocation, so that invocation
 cannot vouch for what an earlier one hit, and writing `0` would assert coverage it never checked.
 "Completed" therefore never implies a number on its own.
 
-On a resumed run a POSITIVE value is a LOWER BOUND — at least this many scopes gave up,
+On a resumed run a POSITIVE value is a LOWER BOUND — at least this many scopes exhausted their budget,
 counted by the completing invocation; earlier invocations of the same `run_id` may have hit more.
 On a fresh (non-resumed) run the value is exact.
 Read it as per-run immutable evidence — unlike the report's `branchesDeferred`, which is the

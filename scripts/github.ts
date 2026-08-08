@@ -54,7 +54,7 @@ export class ThrottleExhausted extends Error {
   readonly endpoint: string;
   constructor(endpoint: string) {
     super(
-      `retry/pause budget exhausted for ${endpoint} (rate limiting, or repeated HTTP 5xx) — wait and re-run; a resumed run skips already-completed units`,
+      `retry/pause budget exhausted for ${endpoint} — either this call ran out of retries (rate limiting or repeated HTTP 5xx) or the run spent its cumulative pause budget; wait and re-run, and a resumed run skips already-completed units`,
     );
     this.name = "ThrottleExhausted";
     this.endpoint = endpoint;

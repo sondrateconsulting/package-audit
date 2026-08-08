@@ -98,7 +98,7 @@ function renderScanScope(report: DossierReport): string {
         // Scoped to THIS run's discovery attempt on purpose. "their branches appear in NO count"
         // would be false on a RESUMED run: run_unit_head rows retained from an earlier invocation
         // can still place branches of a now-throttled repository into the dispositions above.
-        ? `<p class="note">${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} exhausted their retry budget (rate limiting, or repeated HTTP 5xx) — the completing invocation never enumerated those owners/repositories, so nothing it discovered there is reflected above (on a resumed run an EARLIER invocation may have enumerated them, and its retained rows can still appear) and the scanned counts are PARTIAL.</p>`
+        ? `<p class="note">${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} exhausted their retry/pause budget (retries ran out under rate limiting or repeated HTTP 5xx, or the run spent its cumulative pause budget) — the completing invocation never enumerated those owners/repositories, so nothing it discovered there is reflected above (on a resumed run an EARLIER invocation may have enumerated them, and its retained rows can still appear) and the scanned counts are PARTIAL.</p>`
         : "";
   const caveat =
     sc.provenance === "pre-upgrade"

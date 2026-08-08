@@ -153,7 +153,7 @@ describe("renderIndex", () => {
       const h = renderIndex(r, OPTS);
       return h.slice(h.indexOf('id="scan-scope"'), h.indexOf('id="packages"'));
     };
-    expect(panel({ ...base, summary: { ...base.summary, discoveryScopesDeferred: 2 } })).toContain("2 discovery scopes exhausted their retry budget");
+    expect(panel({ ...base, summary: { ...base.summary, discoveryScopesDeferred: 2 } })).toContain("2 discovery scopes exhausted their retry/pause budget");
     // null is UNKNOWN — an explicit caveat, never silence and never 0
     const unknown = panel({ ...base, summary: { ...base.summary, discoveryScopesDeferred: null } });
     expect(unknown).toContain("not recorded");

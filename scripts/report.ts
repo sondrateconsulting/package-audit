@@ -138,8 +138,10 @@ export interface ReportSummary {
   // see. A throttled owner repo-listing or repository branch-listing enumerates nothing, so it
   // enqueues no work unit and (by §4 design) records no errors row: its branches are invisible to
   // the queue count above AND to branchesErrored. This counts the DISTINCT discovery scopes that
-  // exhausted their bounded RETRY budget during the reported run — ThrottleExhausted, which GitHub
-  // rate limiting raises but so do repeated HTTP 5xx responses burning the same allowance.
+  // exhausted their bounded RETRY/PAUSE budget during the reported run — ThrottleExhausted, which has
+  // TWO distinct mechanisms: a single call running out of retries (rate limiting or repeated HTTP
+  // 5xx), or the RUN spending its cumulative pause budget. A network/no-response failure exhausts as
+  // a permanent error instead and is NOT counted here.
   //
   // Read it as the OPPOSITE currency to branchesDeferred, and never sum the two:
   //   - branchesDeferred      = the CURRENT pending backlog for the whole config, re-read at
