@@ -118,7 +118,9 @@ function okOutcome(data: Record<string, unknown>, label: string, ordinal: number
   return { d, rec };
 }
 
-export function faultOutcome(over: { status: number; classification?: string; label: string; ordinal: number }): RefsDispatchOutcome {
+export function faultOutcome(
+  over: { status: number; classification?: string; label: string; ordinal: number; resetEpochSec?: number },
+): RefsDispatchOutcome {
   const d: BenchGraphqlDispatch = {
     status: over.status, exitCode: 1, headers: {}, bodyText: "",
     data: null, errors: [], malformedErrorEntries: 0, jsonParseable: false,
@@ -129,7 +131,8 @@ export function faultOutcome(over: { status: number; classification?: string; la
     type: "http-attempt", atMs: over.ordinal, wallMs: 25, kind: "graphql", requestClass: "graphql-batch",
     label: over.label, attempt: 1, status: over.status, exitCode: 1,
     classification: over.classification ?? "transient", secondarySignal: null,
-    pointsCost: null, remaining: 4_000, resetEpochSec: 1_900_000_000, servedFromCache: false, bodyBytes: 0,
+    pointsCost: null, remaining: 4_000, resetEpochSec: over.resetEpochSec ?? 1_900_000_000,
+    servedFromCache: false, bodyBytes: 0,
   };
   return { d, rec };
 }
@@ -180,7 +183,7 @@ function makeDeps(corpus: RefsProbeCorpus, script: ReturnType<typeof scriptedGit
   const journal: RefsProbeJournalRow[] = [];
   const results: RefsProbeResult[] = [];
   const sleeps: number[] = [];
-  const events: string[] = []; // interleaved order of appends, sleeps, and dispatches
+  const events: string[] = []; // interleaved order of appends, sleeps, dispatches, and rate-limit reads
   const rl = (remaining: number): RateLimitSnapshot => ({
     core: { remaining: 5_000, reset: 1_900_000_000, used: 0 },
     graphql: { remaining, reset: 1_900_000_000, used: 5_000 - remaining },
@@ -205,7 +208,12 @@ function makeDeps(corpus: RefsProbeCorpus, script: ReturnType<typeof scriptedGit
       events.push(`dispatch:${label}`);
       return script.dispatch(query, fields, label);
     },
-    readRateLimit: async () => rl(4_900),  // default: no attempt records
+    // default: no attempt records. The event marks WHERE a /rate_limit read fell in the
+    // sequence — the quarantine fallback is the one site that must never need one.
+    readRateLimit: async () => {
+      events.push("rate-limit");
+      return rl(4_900);
+    },
     outstandingHorizonMs: () => 0,
     headroomFactor: 1.1,
     washoutFloorMs: 60_000,
@@ -468,6 +476,78 @@ describe("runRefsProbe — fault handling", () => {
     expect(cell.status.kind).toBe("terminated-unclean");
     expect(result.outcome.kind).toBe("no-pass");
     expect(results.length).toBe(1); // the result still writes — committed with the cause
+  });
+
+  // A try dispatches from THREE phases — the candidate's batch page-1 loop, its continuation
+  // walk, and the control arm — and a documented timeout can land in any of them. Only the first
+  // site was pinned, so the quarantine contract at the other two rested on reading the code. All
+  // three must behave identically: the obligation is journalled AT OBSERVATION (before the try
+  // row, so a crash mid-sleep still resumes into it), the try stops dispatching immediately, the
+  // verdict is terminal, and the sleep is priced from the fault's OWN reset hint — never from a
+  // second /rate_limit read, which would be both a spend and a wrong (later) clock.
+  describe("a documented-timeout quarantine behaves identically at every dispatch site", () => {
+    const LABEL_BASE = "refs.B10.p2.s1.a1"; // cell B=10 stratum p2, slot 1, attempt 1
+    // deliberately NOT the 1_900_000_000 the deps' /rate_limit snapshot reports, so a sleep
+    // priced off the fallback snapshot is ~1.4e11 ms away from one priced off the hint
+    const FAULT_RESET_EPOCH = 1_760_000_000;
+    const CLOCK_START_MS = 1_754_000_000_000; // makeDeps' fake clock origin
+    const sleepFromEpoch = (epochSec: number): number => epochSec * 1_000 + 5_000 - CLOCK_START_MS;
+
+    const SITES = [
+      // B=10 p2 is one chunk of ten 2-page repos: 1 batch call, then 10 continuations, then control
+      { site: "the candidate's batch page 1", dispatchCount: 1, matches: (l: string) => l === `${LABEL_BASE}.b0` },
+      { site: "the first candidate continuation", dispatchCount: 2, matches: (l: string) => l.startsWith(`${LABEL_BASE}.cont.`) },
+      { site: "the first control dispatch", dispatchCount: 12, matches: (l: string) => l.startsWith(`${LABEL_BASE}.ctl.`) },
+    ] as const;
+
+    for (const { site, dispatchCount, matches } of SITES) {
+      for (const status of [502, 504] as const) {
+        test(`${status} at ${site}`, async () => {
+          const corpus = corpusJson();
+          let fired = false;
+          const script = scriptedGithub(corpus, {
+            intercept: (call) => {
+              if (fired || !matches(call.label)) return null;
+              fired = true;
+              return faultOutcome({ status, label: call.label, ordinal: call.ordinal, resetEpochSec: FAULT_RESET_EPOCH });
+            },
+          });
+          const { deps, journal, events } = makeDeps(corpus, script);
+          await runRefsProbe(deps);
+          expect(fired).toBe(true);
+
+          // ---- exactly one obligation, carrying the FAULT's epoch, written before its try row ----
+          const quarantines = journal.filter((r) => r.rowKind === "quarantine");
+          expect(quarantines.length).toBe(1);
+          expect(quarantines[0]).toMatchObject({
+            cellB: 10, stratum: "p2", slot: 1, attempt: 1, untilEpochSec: FAULT_RESET_EPOCH,
+          });
+          const qi = events.indexOf("append:quarantine");
+          expect(qi).toBeGreaterThanOrEqual(0);
+          const tryAfter = events.indexOf("append:try", qi);
+          expect(tryAfter).toBeGreaterThan(qi); // observed-time durability
+
+          // ---- the try stops dispatching the instant the fault is observed ----
+          expect(events.slice(qi, tryAfter).some((e) => e.startsWith("dispatch:"))).toBe(false);
+          const faulted = tryRows(journal).filter((t) => t.verdict === "quarantine-unclean");
+          expect(faulted.length).toBe(1);
+          const row = faulted[0]!;
+          expect([row.cellB, row.stratum, row.slot, row.attempt]).toEqual([10, "p2", 1, 1]);
+          // the faulted call is the LAST one the try made — and the phase it landed in is pinned
+          // by the count, so a fault that silently moved sites would fail here
+          expect(row.dispatches.length).toBe(dispatchCount);
+          expect(row.dispatches[row.dispatches.length - 1]!.status).toBe(status);
+          expect(row.dispatches.filter((d) => d.status === status).length).toBe(1);
+
+          // ---- the sleep is priced from the hint, and costs no second /rate_limit read ----
+          const sleepIdx = events.findIndex((e, i) => i > tryAfter && e.startsWith("sleep:"));
+          expect(sleepIdx).toBeGreaterThan(tryAfter);
+          expect(events.slice(qi, sleepIdx)).not.toContain("rate-limit");
+          const slept = Number(events[sleepIdx]!.slice("sleep:".length));
+          expect(Math.abs(slept - sleepFromEpoch(FAULT_RESET_EPOCH))).toBeLessThan(100_000);
+        });
+      }
+    }
   });
 
   test("persistent page-count drift invalidates three times and commits the cell invalid", async () => {
