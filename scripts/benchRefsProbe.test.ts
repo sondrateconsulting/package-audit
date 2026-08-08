@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { BenchGraphqlDispatch, BenchHttpAttemptRecord, RateLimitSnapshot } from "./benchGh.ts";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { MAX_ATTEMPTS } from "./github.ts";
 import {
   BENCH_CONFIG_EVIDENCE_PATH,
   BenchRefsRulesError,
@@ -273,6 +274,19 @@ describe("pure helpers", () => {
     // outside the repo there IS no portable form — refuse rather than bake in a machine path
     expect(() => repoRelativeEvidencePath("/tmp/x.json", root)).toThrow(BenchRefsRulesError);
     expect(() => repoRelativeEvidencePath("../x.json", root)).toThrow(BenchRefsRulesError);
+  });
+
+  // The identity preflight spends real REST-core budget before the lock, the journal header, or
+  // the rate-limit baseline exist, so it can appear in none of the three artifacts. It cannot be
+  // journalled after the fact: invocations that fail on a foreign identity, lose the lock race, or
+  // crash still spent. The honest close is a NAMED exemption in the ADR — pinned here so the code
+  // and the disclosure cannot drift apart.
+  test("the ADR names the pre-lock identity call as an accepted traffic exemption", () => {
+    const adr = readFileSync(join(import.meta.dir, "..", "docs", "adrs", "0002-branch-discovery-rate-limit-strategy.md"), "utf8");
+    expect(adr).toContain("Accepted preflight traffic exemption");
+    expect(adr).toContain("pre-lock `GET /user` REST-core attempt chain");
+    // the bound it claims must be the real one the client enforces
+    expect(adr).toContain(`\`MAX_ATTEMPTS\` = ${MAX_ATTEMPTS}`);
   });
 
   test("classifyJournalTail names what a crash left behind, without touching the file", () => {

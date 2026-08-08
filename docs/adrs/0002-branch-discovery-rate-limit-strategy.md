@@ -1018,6 +1018,45 @@ repository's practice the flip to `accepted` rode the probe PR only on rvo's exp
 **rvo ratified Option 1 with the pinned default B = 25 on 2026-08-05** (the Stage-P
 ratification gate on PR #40), and the status above records it.
 
+### Accepted preflight traffic exemption
+
+The probe's artifacts account for every GraphQL dispatch it makes, and the measured points
+above are complete for the bucket this decision gates on. One category of live traffic sits
+**outside** that boundary and is named here rather than left implicit.
+
+Before it takes the single-writer lock, writes the journal header, or reads its rate-limit
+baseline, `benchRefsProbe.ts` validates that the live credential is the identity the frozen
+corpus was enumerated under. That check issues a `GET /user` against the **REST core**
+bucket — a different bucket from the GraphQL one every gate in this ADR reads. Because it
+runs before any artifact exists, it produces no journal row, no dispatch record, and no
+result field; the only trace is a line on stderr. Under the production client's retry policy
+one such logical call can expand to as many as `MAX_ATTEMPTS` = 6 physical attempts
+(`scripts/github.ts`), so the exemption is stated as an attempt *chain*, not a single request.
+
+This is a **pre-lock `GET /user` REST-core attempt chain**, once per CLI invocation that
+reaches identity validation — including invocations that then fail on a foreign identity, lose
+the lock race, or crash. That is precisely why the boundary cannot be closed by journalling it
+after the fact: those invocations spend before any journal or result can exist. Recording it
+would require an artifact that, in exactly the failing cases, is never written.
+
+The exemption does not touch the measured result. It bills a different bucket, it is bounded
+(one chain per invocation, at most six attempts), and no gate, reducer, or estate figure in
+this ADR reads REST-core spend.
+
+### Disclosed defect in the Stage-P evidence: a machine-local path
+
+`refs-probe.json` and the journal header of the Stage-P run record `benchConfigPath` as an
+**absolute** path naming an unrelated worktree on the operator's machine
+(`.../worktrees/zizmor-cli-version-update-09dc9a/...`), while the sibling `corpusPath` in the
+same header is repo-relative. That value resolves on no other machine.
+
+It is disclosed rather than corrected: these artifacts are append-only evidence of a run that
+happened, and editing them to look tidier would be the precise thing §8 forbids. Nothing
+downstream reads the field — resume binds on `corpusSha256`, `benchConfigSha256`, and
+`constantsFingerprint`, never on a path — so no gate, reduction, or reported number is
+affected. The runner now records repo-relative evidence paths and refuses a `--corpus`/`--out`
+outside the repository, so no future run can reproduce it.
+
 ### Review history
 
 This ADR is under the adversarial review loop this repository uses for decision documents
