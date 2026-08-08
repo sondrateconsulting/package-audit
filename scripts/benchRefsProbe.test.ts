@@ -14,6 +14,7 @@ import {
   parseJournal,
   parseRefsProbeCorpus,
   probeConstantsFingerprint,
+  probeLoginFromUserPayload,
   releaseProbeLock,
   repoRelativeEvidencePath,
   runRefsProbe,
@@ -238,6 +239,16 @@ describe("pure helpers", () => {
     expect(journalPathFor("docs/adrs/0002-benchmark/refs-probe.json")).toBe("docs/adrs/0002-benchmark/refs-probe-journal.jsonl");
     expect(journalPathFor("refs-probe-2.json")).toBe("refs-probe-2-journal.jsonl");
     expect(() => journalPathFor("refs-probe.txt")).toThrow(BenchRefsRulesError);
+  });
+  // The /user payload is untrusted `unknown` from restGetJson. The old cast+`?? "unknown"` turned
+  // a malformed response into the literal login "unknown" — which a corpus could legitimately be
+  // named, since the corpus parser accepts any non-empty login. Identity is evidence-critical:
+  // fail on a malformed payload rather than silently substituting a login nobody authenticated as.
+  test("probeLoginFromUserPayload validates the /user payload instead of casting it", () => {
+    expect(probeLoginFromUserPayload({ login: LOGIN })).toBe(LOGIN);
+    for (const bad of [{ login: 42 }, {}, { login: "" }, null, [], "nope", undefined]) {
+      expect(() => probeLoginFromUserPayload(bad)).toThrow(BenchRefsRulesError);
+    }
   });
   test("assertProbeIdentity refuses a foreign login", () => {
     const corpus = corpusJson();
