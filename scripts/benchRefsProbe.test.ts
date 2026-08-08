@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { BenchGraphqlDispatch, BenchHttpAttemptRecord, RateLimitSnapshot } from "./benchGh.ts";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   BenchRefsRulesError,
   acquireProbeLock,
   assertProbeIdentity,
+  classifyJournalTail,
+  fileJournalAppender,
   journalPathFor,
   parseJournal,
   parseRefsProbeCorpus,
@@ -251,6 +253,77 @@ describe("pure helpers", () => {
     // mid-file corruption always throws
     expect(() => parseJournal(`{"broken\n${good}\n`, () => {})).toThrow(BenchRefsRulesError);
   });
+  test("classifyJournalTail names what a crash left behind, without touching the file", () => {
+    const good = JSON.stringify({ rowKind: "washout", version: 1, atIso: "2026-08-05T00:00:00Z", sleptMs: 1 });
+    expect(classifyJournalTail("")).toBe("none");
+    expect(classifyJournalTail(`${good}\n`)).toBe("none");
+    // a complete record that lost only its newline — its content survived the crash
+    expect(classifyJournalTail(`${good}\n${good}`)).toBe("sealable");
+    // genuinely torn bytes — the write never completed
+    expect(classifyJournalTail(`${good}\n{"rowKind":"was`)).toBe("malformed");
+    // no newline anywhere: truncating would empty the file, so it is never a truncate candidate
+    expect(classifyJournalTail(`{"rowKind":"was`)).toBe("headless");
+  });
+
+  // A crash mid-append leaves the journal's last line unterminated. parseJournal tolerates that
+  // IN MEMORY, but the file itself still ends mid-record: the next appendFileSync writes at EOF
+  // with no separator and GLUES its row onto the torn bytes, producing one permanently
+  // unparseable line. Sealing/truncating on disk before the first append is what keeps the
+  // append-only journal replayable — the same seal-vs-truncate split benchContentTransport.ts
+  // already applies to the ADR-0001 evidence logs.
+  describe("fileJournalAppender repairs a torn tail before its first append", () => {
+    const tmpDir = join(process.env["TMPDIR"] ?? "/tmp", `refs-probe-journal-test-${process.pid}`);
+    const row = { rowKind: "washout", version: 1, atIso: "2026-08-05T00:00:00Z", sleptMs: 7 } as const;
+    const good = JSON.stringify({ rowKind: "washout", version: 1, atIso: "2026-08-05T00:00:00Z", sleptMs: 1 });
+    const write = (name: string, body: string): string => {
+      mkdirSync(tmpDir, { recursive: true });
+      const p = join(tmpDir, name);
+      writeFileSync(p, body);
+      return p;
+    };
+
+    test("a complete record that lost only its newline is SEALED, never discarded", () => {
+      const p = write("sealable.jsonl", `${good}\n${good}`);
+      const append = fileJournalAppender(p, () => {});
+      append(row as unknown as RefsProbeJournalRow);
+      const text = readFileSync(p, "utf8");
+      expect(text).toBe(`${good}\n${good}\n${JSON.stringify(row)}\n`);
+      // the whole file replays: the crash cost nothing, and no line was glued
+      expect(parseJournal(text, () => {}).length).toBe(3);
+      rmSync(p, { force: true });
+    });
+
+    test("genuinely torn bytes are TRUNCATED so the next row starts its own line", () => {
+      const p = write("malformed.jsonl", `${good}\n{"rowKind":"was`);
+      const append = fileJournalAppender(p, () => {});
+      append(row as unknown as RefsProbeJournalRow);
+      const text = readFileSync(p, "utf8");
+      expect(text).toBe(`${good}\n${JSON.stringify(row)}\n`);
+      expect(parseJournal(text, () => {}).length).toBe(2);
+      rmSync(p, { force: true });
+    });
+
+    test("repair happens once, not on every append", () => {
+      const p = write("once.jsonl", `${good}\n${good}`);
+      const logs: string[] = [];
+      const append = fileJournalAppender(p, (l) => logs.push(l));
+      append(row as unknown as RefsProbeJournalRow);
+      append(row as unknown as RefsProbeJournalRow);
+      expect(logs.filter((l) => l.includes("repaired")).length).toBe(1);
+      expect(parseJournal(readFileSync(p, "utf8"), () => {}).length).toBe(4);
+      rmSync(p, { force: true });
+    });
+
+    test("a torn tail with no newline anywhere is refused, not silently emptied", () => {
+      const p = write("headless.jsonl", `{"rowKind":"was`);
+      const append = fileJournalAppender(p, () => {});
+      expect(() => append(row as unknown as RefsProbeJournalRow)).toThrow(BenchRefsRulesError);
+      // the bytes are left exactly as the crash left them for the operator to inspect
+      expect(readFileSync(p, "utf8")).toBe(`{"rowKind":"was`);
+      rmSync(p, { force: true });
+    });
+  });
+
   test("the probe lock is exclusive: second acquisition fails with remediation, release frees it", () => {
     const dir = join(process.env["TMPDIR"] ?? "/tmp", `refs-probe-lock-test-${process.pid}`);
     mkdirSync(dir, { recursive: true });
