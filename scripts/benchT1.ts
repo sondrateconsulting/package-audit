@@ -86,9 +86,14 @@ export function buildBatchQuery(
   // graphql argv). This is a PREREGISTERED ADMISSION cap on the serialized argv PAYLOAD — a
   // deliberately conservative proxy for E2BIG, not kernel-accurate accounting: argv[0], the fixed
   // `api -i graphql` prefix, per-argument NUL terminators, the pointer array and the environment
-  // block all sit outside it. The cap is frozen (split-trigger geometry depends on the resulting
-  // batch-size vector), so it must not be "corrected" post-ratification.
-  let argvBytes = Buffer.byteLength(`query=${query}`, "utf8") + 2 * "-f".length;
+  // block all sit outside it. The CAP VALUE is frozen (split-trigger geometry depends on the
+  // resulting batch-size vector), so it must not be "corrected" post-ratification.
+  // ONE "-f" precedes the query field, exactly as github.ts/benchGh.ts build the argv and as the
+  // paragraph above already describes; this counted two and overstated every batch by 2 B (the
+  // same defect fixed in graphqlBatch.ts, 61dbcec). Correcting the FORMULA cannot move the frozen
+  // batch-size vector: the alias and 48 KiB query-document caps bind first, so argvBytes tops out
+  // near 99 KB against this 128 KiB cap — a 2 B shift has no boundary to cross.
+  let argvBytes = Buffer.byteLength(`query=${query}`, "utf8") + "-f".length;
   for (const [k, v] of Object.entries(fields)) argvBytes += Buffer.byteLength(`${k}=${v}`, "utf8") + "-f".length;
   const contentEstimateBytes = entries.reduce((n, e) => n + e.size, 0);
   return { label: opts.label, entries: [...entries], query, fields, queryBytes, argvBytes, contentEstimateBytes };

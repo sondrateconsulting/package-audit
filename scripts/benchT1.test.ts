@@ -84,6 +84,18 @@ describe("query construction + packing", () => {
     const byContent = packBatches(big, CFG, { owner: "o", repo: "r", sha: sha("0"), roundLabel: "r2" });
     expect(byContent.length).toBeGreaterThanOrEqual(2); // 3 MB does not fit the 1.5 MiB estimate cap
   });
+  test("argvBytes counts the argv gh is ACTUALLY handed — ONE -f before the query field", () => {
+    const b = buildBatchQuery([entry("a.ts"), entry("b.ts")], {
+      owner: "o", repo: "r", sha: sha("0"),
+      aliasSelection: CFG.t1.aliasSelection, rateLimitRider: CFG.t1.rateLimitRider, label: "t.b0",
+    });
+    expect(b.queryBytes).toBe(Buffer.byteLength(b.query, "utf8"));
+    // Oracle built from the argv gh is ACTUALLY handed (github.ts and benchGh.ts both build
+    // ["api","-i","graphql","-f",`query=…`] then one "-f" per variable), NOT from a copy of the
+    // implementation's own expression — a mirrored formula cannot catch a wrong flag count.
+    const rawFieldArgv = ["-f", `query=${b.query}`, ...Object.entries(b.fields).flatMap(([k, v]) => ["-f", `${k}=${v}`])];
+    expect(b.argvBytes).toBe(rawFieldArgv.reduce((sum, a) => sum + Buffer.byteLength(a, "utf8"), 0));
+  });
 });
 
 // ---- the transition table --------------------------------------------------------------------
