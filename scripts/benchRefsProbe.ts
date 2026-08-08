@@ -239,6 +239,11 @@ export interface RefsProbeDeps {
   benchConfigPath: string;
   benchConfigSha256: string; // hash of the bench-config FILE text — the header's second binding
   existingJournalText: string;
+  // byte count of genuinely torn bytes dropped from the journal's tail (classifyJournalTail ===
+  // "malformed"), or null when nothing was dropped. What they held is unrecoverable, so the runner
+  // backs off conservatively before spending again. A SEALED tail is not a drop — its record
+  // survived intact — so it leaves this null.
+  droppedTornTailBytes: number | null;
   appendJournal: (row: RefsProbeJournalRow) => void;
   writeResult: (result: RefsProbeResult) => void;
   dispatchGraphql: (query: string, fields: Record<string, string>, label: string) => Promise<RefsDispatchOutcome>;
@@ -594,6 +599,21 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
       );
     if (header.constantsFingerprint !== probeConstantsFingerprint())
       throw new BenchRefsRulesError("resumed journal was recorded under different pre-registered constants — refusing to mix rule revisions");
+    // Dropped bytes are unrecoverable, so the runner cannot know what they held — and one thing
+    // they MIGHT have held is a quarantine row, which is appended before its sleep exactly so a
+    // crash cannot skip the obligation. Assume the worst and back off before spending again. The
+    // row is written BEFORE the sleep for the same reason the quarantine row is.
+    if (deps.droppedTornTailBytes !== null) {
+      push({
+        rowKind: "tear-recovered", version: 1, atIso: isoOf(deps.now()),
+        droppedBytes: deps.droppedTornTailBytes, conservativeSleepMs: deps.washoutFloorMs,
+      });
+      deps.log(
+        `resume: dropped ${deps.droppedTornTailBytes} torn byte(s) of unknown content — ` +
+        `sleeping ${Math.ceil(deps.washoutFloorMs / 1000)}s before any dispatch in case a quarantine obligation was lost`,
+      );
+      await deps.sleep(deps.washoutFloorMs);
+    }
     // an unexpired quarantine obligation is honored BEFORE any further dispatch anywhere —
     // the row was written before its sleep precisely so a crash mid-sleep cannot skip it
     let outstandingUntil: number | null = null;
@@ -763,6 +783,7 @@ async function main(): Promise<void> {
   const journalPath = journalPathFor(outPath);
   const benchConfigSha256 = createHash("sha256").update(readFileSync(BENCH_CONFIG_PATH, "utf8")).digest("hex");
   const cfg = loadBenchConfig(BENCH_CONFIG_PATH);
+  const journalText = existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "";
   const client = new GithubClient({ githubHost: cfg.githubHost, db: null, spawnTimeoutMs: cfg.spawn.timeoutMs });
   const login = ((await client.restGetJson("user")) as { login?: string }).login ?? "unknown";
   assertProbeIdentity(login, corpus);
@@ -785,7 +806,12 @@ async function main(): Promise<void> {
     journalPath,
     benchConfigPath: BENCH_CONFIG_PATH,
     benchConfigSha256,
-    existingJournalText: existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "",
+    existingJournalText: journalText,
+    // classified read-only here; the physical repair happens on the first append, after the
+    // resume bindings have been checked
+    droppedTornTailBytes: classifyJournalTail(journalText) === "malformed"
+      ? Buffer.byteLength(journalText, "utf8") - (Buffer.from(journalText, "utf8").lastIndexOf(0x0a) + 1)
+      : null,
     // the first append repairs a crash-torn tail on disk, so a resumed run can never glue its
     // next row onto half a record (parseJournal only ever fixed the in-memory view)
     appendJournal: fileJournalAppender(journalPath, log),

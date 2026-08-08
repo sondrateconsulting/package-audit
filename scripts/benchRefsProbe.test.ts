@@ -191,6 +191,7 @@ function makeDeps(corpus: RefsProbeCorpus, script: ReturnType<typeof scriptedGit
     benchConfigPath: "bench-config.json",
     benchConfigSha256: "test-config-sha",
     existingJournalText: "",
+    droppedTornTailBytes: null,
     appendJournal: (row) => {
       journal.push(row);
       events.push(`append:${row.rowKind}`);
@@ -601,6 +602,42 @@ describe("runRefsProbe — resume from the journal (crash-safe, no double-spend)
     await runRefsProbe(deps);
     const b10p1 = tryRows(journal).filter((t) => t.cellB === 10 && t.stratum === "p1");
     expect(b10p1.map((t) => [t.slot, t.attempt])).toEqual([[1, 2], [2, 1], [3, 1], [4, 1], [5, 1]]);
+  });
+
+  // A quarantine row is appended BEFORE its sleep precisely so a crash mid-sleep cannot skip the
+  // obligation. If that very append is what tore, the row is unparseable and gets dropped — and
+  // with it the backoff. The dropped bytes are unrecoverable, so the runner cannot know what it
+  // lost; it must assume the worst and back off before spending again.
+  test("a dropped torn tail forces a conservative backoff before any dispatch", async () => {
+    const corpus = corpusJson();
+    const script = scriptedGithub(corpus);
+    const { deps, journal, events } = makeDeps(corpus, script, {
+      existingJournalText: `${headerLine()}\n`,
+      droppedTornTailBytes: 42,
+    });
+    await runRefsProbe(deps);
+    const recovered = journal.filter((r) => r.rowKind === "tear-recovered");
+    expect(recovered.length).toBe(1);
+    const firstDispatch = events.findIndex((e) => e.startsWith("dispatch:"));
+    const firstBigSleep = events.findIndex((e) => e.startsWith("sleep:") && Number(e.slice(6)) >= 30_000);
+    expect(firstBigSleep).toBeGreaterThanOrEqual(0);
+    expect(firstBigSleep).toBeLessThan(firstDispatch);
+    // and the obligation is durable: the row is written before the sleep, so a second crash
+    // during THIS backoff still leaves the evidence that a tear was recovered
+    expect(journal.findIndex((r) => r.rowKind === "tear-recovered")).toBeLessThan(
+      journal.findIndex((r) => r.rowKind === "admission"),
+    );
+  });
+
+  test("a sealed (non-lossy) torn tail needs no backoff — nothing was dropped", async () => {
+    const corpus = corpusJson();
+    const script = scriptedGithub(corpus);
+    const { deps, journal } = makeDeps(corpus, script, {
+      existingJournalText: `${headerLine()}\n`,
+      droppedTornTailBytes: null,
+    });
+    await runRefsProbe(deps);
+    expect(journal.filter((r) => r.rowKind === "tear-recovered").length).toBe(0);
   });
 
   test("an unexpired quarantine in the journal is honored before any resumed dispatch", async () => {

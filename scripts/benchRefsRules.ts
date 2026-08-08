@@ -645,6 +645,18 @@ export interface RefsWashoutRow {
   sleptMs: number;
 }
 
+// a resumed run dropped genuinely torn bytes from the journal's tail. Their content is
+// unrecoverable, so the runner cannot know what it lost — and one of the things it MIGHT have lost
+// is a quarantine row, which is written before its sleep exactly so a crash cannot skip the
+// obligation. This row records the conservative backoff taken in its place.
+export interface RefsTearRecoveredRow {
+  rowKind: "tear-recovered";
+  version: 1;
+  atIso: string;
+  droppedBytes: number;
+  conservativeSleepMs: number;
+}
+
 export type RefsProbeJournalRow =
   | RefsHeaderRow
   | RefsTryStartRow
@@ -652,6 +664,7 @@ export type RefsProbeJournalRow =
   | RefsAdmissionRow
   | RefsAdmissionInfeasibleRow
   | RefsQuarantineRow
+  | RefsTearRecoveredRow
   | RefsWashoutRow;
 
 const TRY_VERDICTS: readonly RefsTryVerdict[] = ["clean", "unclean", "invalidated", "quarantine-unclean"];
@@ -731,6 +744,12 @@ export function parseJournalRow(line: string): RefsProbeJournalRow {
       ["untilEpochSec", isNumOrNull], ["plannedSleepMs", isNum],
     ], "quarantine");
     return root as unknown as RefsQuarantineRow;
+  }
+  if (kind === "tear-recovered") {
+    requireFields(root, [
+      ["atIso", isStr], ["droppedBytes", isNum], ["conservativeSleepMs", isNum],
+    ], "tear-recovered");
+    return root as unknown as RefsTearRecoveredRow;
   }
   if (kind === "washout") {
     requireFields(root, [["atIso", isStr], ["sleptMs", isNum]], "washout");
