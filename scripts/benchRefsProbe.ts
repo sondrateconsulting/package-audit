@@ -87,6 +87,20 @@ export function journalPathFor(outPath: string): string {
   return `${outPath.slice(0, -".json".length)}-journal.jsonl`;
 }
 
+// restGetJson returns `unknown` — genuinely untrusted. Casting it and coalescing a missing login
+// to "unknown" would turn a malformed response into a login that a corpus could legitimately be
+// named (the corpus parser accepts any non-empty login), so a broken payload could pass the
+// identity check instead of failing it. Identity binds every measured point to a credential:
+// validate it like every other boundary read in this module.
+export function probeLoginFromUserPayload(payload: unknown): string {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload))
+    throw new BenchRefsRulesError("the /user identity response was not a JSON object — cannot confirm the probe identity");
+  const login = (payload as Record<string, unknown>)["login"];
+  if (typeof login !== "string" || login === "")
+    throw new BenchRefsRulesError("the /user identity response carried no usable login — cannot confirm the probe identity");
+  return login;
+}
+
 // the live credential must be the corpus's enumeration identity — measuring under a different
 // login would price a different estate's visibility and quietly break reproducibility
 export function assertProbeIdentity(liveLogin: string, corpus: RefsProbeCorpus): void {
@@ -802,7 +816,7 @@ async function main(): Promise<void> {
   const cfg = loadBenchConfig(BENCH_CONFIG_PATH);
   const journalText = existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "";
   const client = new GithubClient({ githubHost: cfg.githubHost, db: null, spawnTimeoutMs: cfg.spawn.timeoutMs });
-  const login = ((await client.restGetJson("user")) as { login?: string }).login ?? "unknown";
+  const login = probeLoginFromUserPayload(await client.restGetJson("user"));
   assertProbeIdentity(login, corpus);
   log(`identity confirmed: ${login}`);
   const buckets = makeBuckets();
