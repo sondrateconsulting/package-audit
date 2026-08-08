@@ -252,10 +252,24 @@ describe("renderDossier — footer scan-scope receipt (§5)", () => {
       expect(html).toContain("2 discovery scopes rate-limited");
       expect(html.split("2 discovery scopes rate-limited").length - 1).toBe(1);
     }
-    // zero stays suppressed (keeps the golden byte pins valid); null says nothing on this surface
+    // an explicit sealed ZERO stays suppressed (that suppression is what keeps the golden pins valid)
     expect(renderDossier(pkgs[0]!, FIXED_CTX)).not.toContain("discovery scope");
+  });
+
+  test("UNKNOWN discovery evidence is DISCLOSED on the dossier — a pre-v5 page must not read like a clean one", () => {
+    // A dossier is a standalone artifact: someone opens left-pad.html without ever seeing the index.
+    // If null (no evidence recorded) rendered identically to a sealed 0 (checked, none found), that
+    // page would silently assert coverage it never verified — the exact conflation this field exists
+    // to prevent. Distinct from a positive count, which asserts the run WAS incomplete.
+    const pkgs = fixturePackages();
     const unknown = { ...FIXED_CTX, summary: { ...FIXED_CTX.summary, discoveryScopesDeferred: null } };
-    expect(renderDossier(pkgs[0]!, unknown)).not.toContain("discovery scope");
+    for (const pkg of [pkgs[0]!, pkgs[1]!]) {
+      const html = renderDossier(pkg, unknown);
+      expect(html).toContain("not recorded");
+      expect(html).not.toContain("0 discovery scopes"); // never a fabricated zero
+    }
+    // and a sealed zero says nothing at all — the three states stay distinguishable
+    expect(renderDossier(pkgs[0]!, FIXED_CTX)).not.toContain("not recorded");
   });
 
   test("deferred joins the policy/past-cap siblings in ONE clause under ONE anchor", () => {

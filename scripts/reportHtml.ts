@@ -916,11 +916,14 @@ function renderFooter(ctx: DossierContext): string {
     ...(s.branchesDeferred > 0 ? [`${plural(s.branchesDeferred, "branch", "branches")} still pending`] : []),
     // The DISCOVERY blind spot needs its own clause because the branch counts CANNOT express it: a
     // rate-limited owner/repo listing enumerated nothing, so it contributes no queue row and no
-    // error. Zero and null both stay silent here — null is UNKNOWN, and the run index's #scan-scope
-    // panel is where that caveat is stated rather than repeated on every package page.
-    ...(s.discoveryScopesDeferred !== null && s.discoveryScopesDeferred > 0
-      ? [`${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} rate-limited`]
-      : []),
+    // error. THREE distinct states, and collapsing any two of them is the failure this guards —
+    // a dossier is a standalone artifact, so a reader who never opens the index still has to be
+    // able to tell "checked, none" from "never recorded". Only an explicit sealed 0 is silent.
+    ...(s.discoveryScopesDeferred === null
+      ? ["discovery rate-limiting not recorded for this run"]
+      : s.discoveryScopesDeferred > 0
+        ? [`${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} rate-limited`]
+        : []),
   ];
   // ONE clause under ONE anchor — two receipts would mean two competing scan-scope links.
   const coverageReceipt =

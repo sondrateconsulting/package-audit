@@ -1103,6 +1103,53 @@ describe("ownership — every database this tool legitimately produces still ope
     }
   });
 
+  test("the v4→v5 step still HEALS a damaged run_unit_head — the bump must not skip the shape repair", () => {
+    // Before v5 existed, a v4-STAMPED database carrying a recognized PREDECESSOR run_unit_head shape
+    // was the healable-damage class: it landed in the current-stamp self-heal branch and got
+    // healRunUnitHeadShape plus the fingerprint/FK verification on its first open. Bumping
+    // SCHEMA_VERSION moves that same file into the MIGRATION branch, so a v4→v5 step that only adds
+    // its column and stamps 5 would leave that database stamped CURRENT while still damaged.
+    const path = nextFile();
+    const seedDb = AuditDb.open({ sqlitePath: path });
+    const runId = seedDb.startRun(runInput()).runId;
+    seedDb.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    seedDb.completeRun(runId, { discoveryScopesDeferred: 0 });
+    seedDb.close();
+    const d = new Database(path, { strict: true });
+    d.exec("ALTER TABLE runs DROP COLUMN discovery_scopes_deferred");
+    for (const sql of RUH_V3_ERA_REBUILD) d.exec(sql);
+    d.exec("PRAGMA user_version = 4");
+    d.close();
+
+    const db = AuditDb.open({ sqlitePath: path });
+    expect((raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+    // REPAIRED, not merely re-stamped: the v4 policy columns are back and the row rode through
+    expect(raw(db).query("SELECT branch, policy_status, scanned_commit_date FROM run_unit_head").all())
+      .toEqual([{ branch: "main", policy_status: null, scanned_commit_date: null }]);
+    expect(raw(db).query(`PRAGMA foreign_key_check`).all()).toEqual([]);
+    db.close();
+  });
+
+  test("openReadOnly REFUSES a current-stamped database missing the v5 column instead of reading undefined", () => {
+    // openReadOnly cannot heal, so it must refuse LOUDLY. Silently accepting the damaged shape makes
+    // getRun map the absent column to undefined, which JSON.stringify then DROPS — emitting a report
+    // whose required summary field is simply missing, which its own strict schema rejects.
+    const path = nextFile();
+    const w = AuditDb.open({ sqlitePath: path });
+    w.completeRun(w.startRun(runInput()).runId, { discoveryScopesDeferred: 4 });
+    w.close();
+    const d = new Database(path, { strict: true });
+    d.exec("ALTER TABLE runs DROP COLUMN discovery_scopes_deferred"); // stamp stays CURRENT
+    d.close();
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/discovery_scopes_deferred/);
+    // ...and the writable open still HEALS it, so the refusal's advice is actionable
+    const healed = AuditDb.open({ sqlitePath: path });
+    const run = healed.latestReportableRun()!;
+    expect(run.discoveryScopesDeferred).toBeNull(); // healed to UNKNOWN, never a fabricated 0
+    expect(JSON.stringify(run)).toContain("discoveryScopesDeferred"); // and never undefined
+    healed.close();
+  });
+
   test("a foreign table matching an audit table's column NAMES but not its types is refused", () => {
     // The repair path must prove same-TABLE, not same-names: identical column names with
     // all-INTEGER types, no NOT NULLs and no PK is someone else's table wearing our labels.
@@ -1894,6 +1941,26 @@ describe("run lifecycle — startup rules (§3)", () => {
     const c = db.startRun(runInput({ configHash: "hash-8" })).runId;
     db.failRun(c);
     expect(db.getRun(c)!.discoveryScopesDeferred).toBeNull();
+    db.close();
+  });
+
+  test("completeRun SEALS: evidence cannot be rewritten, a failed run cannot be revived, a missing run cannot pass silently", () => {
+    const db = mem();
+    const a = db.startRun(runInput()).runId;
+    db.completeRun(a, { discoveryScopesDeferred: 2 });
+    // "sealed" has to MEAN something. Without this the field's contract — immutable per-run
+    // evidence, in contrast to the mutable queue backlog — is a comment rather than a guarantee,
+    // and a second completion could launder a recorded throttle into a reassuring 0.
+    expect(() => db.completeRun(a, { discoveryScopesDeferred: 0 })).toThrow();
+    expect(db.getRun(a)!.discoveryScopesDeferred).toBe(2);
+    // a FAILED run must not be revivable into completed: its coverage is unknowable, not clean
+    const b = db.startRun(runInput({ configHash: "h-b" })).runId;
+    db.failRun(b);
+    expect(() => db.completeRun(b, { discoveryScopesDeferred: 0 })).toThrow();
+    expect(db.getRun(b)!.status).toBe("failed");
+    expect(db.getRun(b)!.discoveryScopesDeferred).toBeNull();
+    // a nonexistent run id must be LOUD, not an UPDATE that matches nothing and "succeeds"
+    expect(() => db.completeRun("no-such-run", { discoveryScopesDeferred: 0 })).toThrow();
     db.close();
   });
 

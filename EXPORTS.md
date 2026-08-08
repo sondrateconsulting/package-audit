@@ -76,7 +76,7 @@ Row order is total (each table's full unique key) and documented per table below
 
 ## Versioning
 
-The manifest's `formatVersion` (currently 2) covers the artifact set, the manifest shape,
+The manifest's `formatVersion` (currently 3) covers the artifact set, the manifest shape,
 and the column contract below. Any breaking change to this contract bumps it; bumping it is
 the one sanctioned way the golden fixtures change. (v2 added the `run_unit_head` table.)
 

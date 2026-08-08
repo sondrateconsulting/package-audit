@@ -95,7 +95,10 @@ function renderScanScope(report: DossierReport): string {
     s.discoveryScopesDeferred === null
       ? `<p class="note">Discovery rate-limiting was not recorded for this run (it predates that evidence, or did not complete) — whether any owner or repository went unenumerated is UNKNOWN.</p>`
       : s.discoveryScopesDeferred > 0
-        ? `<p class="note">${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} rate-limited — those owners/repositories were never enumerated, so their branches appear in NO count above and the scanned counts are PARTIAL.</p>`
+        // Scoped to THIS run's discovery attempt on purpose. "their branches appear in NO count"
+        // would be false on a RESUMED run: run_unit_head rows retained from an earlier invocation
+        // can still place branches of a now-throttled repository into the dispositions above.
+        ? `<p class="note">${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} rate-limited — this run never enumerated those owners/repositories, so nothing it discovered there is reflected above (a resumed run may still show rows retained from an earlier invocation) and the scanned counts are PARTIAL.</p>`
         : "";
   const caveat =
     sc.provenance === "pre-upgrade"

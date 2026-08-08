@@ -237,7 +237,10 @@ export function runSummaryText(
     // cannot tell us either way, and rendering that as 0 would assert completeness we never verified.
     `  Discovery scopes deferred: ${s.discoveryScopesDeferred === null ? "unknown (run predates this evidence, or did not complete)" : s.discoveryScopesDeferred}${
       s.discoveryScopesDeferred !== null && s.discoveryScopesDeferred > 0
-        ? " — owners/repos whose listing was rate-limited; their branches were NEVER enumerated, so the counts above are PARTIAL"
+        // Scoped to THIS run's attempt: on a RESUMED run, rows retained from an earlier invocation
+        // can still place branches of a now-throttled repo into the counts above, so claiming they
+        // appear in NO count would be false.
+        ? " — owners/repos whose listing was rate-limited; this run never enumerated them, so the counts above are PARTIAL"
         : ""
     }`,
     `  Dependency findings:    ${s.totalDependencyFindings}`,

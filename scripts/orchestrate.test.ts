@@ -2642,6 +2642,44 @@ describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations
     return thrown;
   };
 
+  // END-TO-END wiring. The unit tests above hand the accumulator Set to processOwner/processRepo
+  // directly, so they cannot catch the mutations that matter most in production: runScan sealing a
+  // hardcoded 0, runScan allocating a per-owner Set instead of sharing one across the fan-out, or
+  // the field never reaching completeRun / the done event / the report. This drives the REAL
+  // runScan across TWO CONCURRENT owners, one of which throttles its repo listing.
+  test("a throttled owner listing survives the concurrent fan-out and reaches the DB, the report, and the done event", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owner-throttle-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // org-a lists + scans normally; org-b's repo listing exhausts its budget.
+    const client = makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads };
+      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+      const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
+      if (decodeURIComponent(owner) === "org-b") throw new ThrottleExhausted("core bucket");
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    const events = await captureJsonl(() => runScan(db, client, rt(twoOwnerConfig(root), "h"), noArgs, null));
+
+    expect(runStatus(db)).toBe("completed"); // the run still COMPLETES — that is the whole hazard
+    expect(scannedOrgs(db)).toEqual(["org-a"]); // only one owner was ever enumerated
+    // 1. sealed into the DB by runScan (mutation: sealing a hardcoded 0 dies here)
+    const run = db.getRun((db.read(`SELECT run_id FROM runs`).get() as { run_id: string }).run_id)!;
+    expect(run.discoveryScopesDeferred).toBe(1);
+    // 2. and the two counts that CANNOT see it are both legitimately zero — the false all-clear
+    const s = buildReport(db, run).summary;
+    expect(s.discoveryScopesDeferred).toBe(1);
+    expect(s.branchesDeferred).toBe(0);
+    expect(s.branchesErrored).toBe(0);
+    // 3. and it rides the done event (mutation: dropping it from the embedded summary dies here)
+    const done = events.find((e) => e.event === "done") as { summary?: Record<string, unknown> } | undefined;
+    expect(done?.summary?.discoveryScopesDeferred).toBe(1);
+    // 4. and the human summary flags PARTIAL despite zero branches deferred and zero errors
+    expect(runSummaryText("r", s, 0, "p")).toContain("PARTIAL");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("two owners fan out and BOTH scan (concurrency.organizations:2), run completes", async () => {
     const root = mkdtempSync(join(tmpdir(), "owner-fanout-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });

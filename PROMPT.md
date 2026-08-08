@@ -319,6 +319,15 @@ a repo whose scans all errored wrote nothing): such a repo carries no NULL senti
 that run under v4 could report authoritative provenance over an unknowable pre-v4 scope. The next
 invocation starts a fresh all-v4 run; the unchanged config_hash lets its completed work-queue
 units skip-as-current.
+Then the v4→v5 step (§4 discovery-throttle evidence), additive: `runs` gains a NULLABLE
+`discovery_scopes_deferred` via `ALTER TABLE ADD COLUMN`, so pre-v5 rows backfill NULL BY
+CONSTRUCTION — UNKNOWN, never 0, because reporting 0 would assert the very completeness the
+column exists to disprove. The step ALSO re-runs the shared `run_unit_head` shape heal and the
+fingerprint/foreign-key verification: raising the current version moves a v4-STAMPED database
+carrying a recognized predecessor `run_unit_head` shape out of the current-stamp self-heal branch
+and into this migration branch, so without those the bump would stamp a still-damaged database as
+current. `openReadOnly` cannot heal, so it REFUSES a current-stamped `runs` missing the column
+with repair advice rather than reading it back as `undefined`.
 Its three new columns (`policy_status`, `policy_matched_pattern`, `scanned_commit_date`) are NULL on
 backfilled rows BY CONSTRUCTION — a pre-v4 run recorded no branch policy and never persisted
 past-cap branches — so a NULL `scanned_commit_date` is the sentinel marking that run's scan
@@ -366,7 +375,17 @@ CREATE TABLE IF NOT EXISTS runs (
                                        -- (same commit, different tracked set) into the report
   cutoff_date TEXT NOT NULL DEFAULT '',   -- so §7's config.cutoffDate is derivable from SQLite alone
   github_host TEXT NOT NULL DEFAULT 'github.com',  -- echoed in the report
-  status TEXT NOT NULL CHECK (status IN ('running','completed','failed'))
+  status TEXT NOT NULL CHECK (status IN ('running','completed','failed')),
+  discovery_scopes_deferred INTEGER    -- §4 discovery-throttle evidence (v5), NULLABLE: how many
+                                       -- DISTINCT discovery scopes (one per owner repo-listing,
+                                       -- one per repository branch-listing) exhausted their
+                                       -- rate-limit budget this run. Such a scope enumerates
+                                       -- NOTHING, so it enqueues no work unit and records no
+                                       -- errors row — invisible to §7's branchesDeferred AND
+                                       -- branchesErrored, which is why it is persisted here.
+                                       -- Sealed by completeRun once the owner pool drained, and
+                                       -- only over a 'running' row. NULL means UNKNOWN (still
+                                       -- running, failed, or migrated from pre-v5), NEVER "none"
 );
 CREATE TABLE IF NOT EXISTS work_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1453,8 +1472,10 @@ summary.
                                                  //   packageName/version (§5.E per-version introspection)
   "summary": { "organizationsScanned":0,"repositoriesScanned":0,"branchesScanned":0,
                "branchesSkippedByCutoff":0,"branchesExcludedByPolicy":0,"branchesPastCap":0,
-               "branchesErrored":0,"branchesDeferred":0,
-               "totalDependencyFindings":0,"totalUsageFindings":0 },
+               "branchesErrored":0,"branchesDeferred":0,"discoveryScopesDeferred":0,
+               "totalDependencyFindings":0,"totalUsageFindings":0 },  // discoveryScopesDeferred is
+                                                 //   number|null — null = UNKNOWN (pre-v5 or
+                                                 //   unsealed run), never "none"
   "scanScope": { "excludedByDeny":0,"excludedByAllow":0,"defaultBranchPolicyOverrides":0,
                  "policyBranches":[ ... ],"provenance":"complete" }  // branch allow/deny diagnostics;
                                                  //   provenance: 'complete' | 'pre-upgrade' —
@@ -1466,9 +1487,12 @@ summary.
                                                  //   understate what that run actually evaluated
 }
 ```
-Summary derivation — every count but ONE from the IMMUTABLE `run_unit_head` slice for the
-reported run, never the mutable cross-run work_queue (`branchesDeferred` is the sanctioned
-exception, defined after the throttle carve-out below): `branchesScanned` =
+Summary derivation — every count but TWO from the IMMUTABLE `run_unit_head` slice for the
+reported run. The two exceptions are named here so the rule and the practice agree:
+`branchesDeferred` reads the mutable cross-run work_queue (the sanctioned exception, defined
+after the throttle carve-out below), and `discoveryScopesDeferred` reads the reported run's own
+`runs.discovery_scopes_deferred` — sealed evidence, not a derivation, because the fact it records
+exists nowhere else in SQLite. The `run_unit_head`-derived counts: `branchesScanned` =
 COUNT(*) WHERE run_id=R AND status='scanned'; `branchesSkippedByCutoff` = COUNT WHERE
 run_id=R AND status='skipped-cutoff' — GENUINE cutoff only, because a policy exclusion carries
 its OWN status and can never be folded in by an under-specified filter;

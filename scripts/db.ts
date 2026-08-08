@@ -986,10 +986,18 @@ function migrateV2toV3(db: Database): void {
 // UNKNOWN, because reporting 0 would assert the very completeness the column exists to disprove.
 // SCHEMA_SQL runs FIRST for the same reason migrateV2toV3 does: a `--fresh` drop can remove `runs`
 // while preserved caches keep the database non-empty, so the ALTER needs the table to exist.
+// It ALSO runs the shared run_unit_head heal + fingerprint/FK verification, and that is not
+// belt-and-braces — it is a REGRESSION GUARD created by the bump itself. A v4-STAMPED database
+// carrying a recognized predecessor run_unit_head shape used to land in the current-stamp self-heal
+// branch (userVersion === SCHEMA_VERSION) and be repaired on its first open. Raising SCHEMA_VERSION
+// moves that exact file into this migration branch instead, so without these two calls the bump
+// would silently stamp a still-damaged database as current. Same teeth, same one definition.
 function migrateV4toV5(db: Database): void {
   db.transaction(() => {
     db.exec(SCHEMA_SQL);
     addColumnIfMissing(db, "runs", "discovery_scopes_deferred", "INTEGER");
+    healRunUnitHeadShape(db);
+    verifyRunUnitHeadFingerprint(db, "v4→v5 migration");
     setUserVersion(db, V5_TARGET_VERSION);
   })();
 }
@@ -1914,7 +1922,7 @@ export class AuditDb {
       if (readUserVersion(db) < V4_TARGET_VERSION) migrateV3toV4(db);
       if (readUserVersion(db) < V5_TARGET_VERSION) migrateV4toV5(db);
     } else {
-      // Current-stamp (v4) self-heal, SHAPE-keyed: the compatibility gate already rejected every
+      // Current-stamp self-heal, SHAPE-keyed: the compatibility gate already rejected every
       // UNRECOGNIZED shape, but a recognized PREDECESSOR era under the current stamp (external
       // damage — e.g. a partial restore that regressed run_unit_head to its v2/v3 body) is
       // deliberately admitted as healable, per the ownership span's contract. The heal runs the
@@ -2016,7 +2024,7 @@ export class AuditDb {
         fail(`database is incompatible with this tool build (${why}) — use the matching tool build or a new database path`);
       const cls = classifyRunUnitHead(db);
       if (cls.kind === "incompatible") incompatible(cls.reason);
-      // The stamp is == SCHEMA_VERSION (4) here (older/newer both rejected above). Mirror the writer
+      // The stamp is == SCHEMA_VERSION here (older/newer both rejected above). Mirror the writer
       // gate's cross-table invariants BEFORE the missing-table advice — "run bun run audit" cannot
       // repair THESE (the writer open rejects the same file):
       if (!tableExists(db, "run_unit_head") && tableExists(db, "runs"))
@@ -2029,6 +2037,13 @@ export class AuditDb {
       // cannot migrate or heal).
       if (tableExists(db, "run_unit_head") && (cls.kind === "exact-v3" || cls.kind === "exact-v2"))
         fail("database run_unit_head is missing the v4 policy columns — run `bun run audit` once to repair it, then retry");
+      // Same healable-damage class for the v5 `runs` column. Refusing HERE is what keeps the report
+      // honest: SELECT * over a runs table without it maps the field to `undefined`, which
+      // JSON.stringify DROPS — emitting a report whose required summary field is simply absent, and
+      // which its own strict schema would then reject. A missing-column SQL error mid-render (or,
+      // worse, a silently field-less report) is not an acceptable substitute for this message.
+      if (tableExists(db, "runs") && !columnExists(db, "runs", "discovery_scopes_deferred"))
+        fail("database runs is missing the discovery_scopes_deferred column — run `bun run audit` once to repair it, then retry");
       for (const t of AUDIT_TABLES) {
         if (!tableExists(db, t))
           fail(`database is missing the ${t} table — run \`bun run audit\` once to repair it, then retry`);
@@ -2110,11 +2125,22 @@ export class AuditDb {
     const n = evidence.discoveryScopesDeferred;
     // Validated HERE, not by a SQL CHECK: keeping the column constraint-free keeps the v4→v5 ALTER
     // additive and the table's shape fingerprint (the ownership oracle) trivially comparable.
-    if (!Number.isInteger(n) || n < 0)
-      fail(`completeRun: discoveryScopesDeferred must be a non-negative integer (got ${String(n)})`);
-    this.db
-      .query(`UPDATE runs SET status='completed', completed_at = ?, discovery_scopes_deferred = ? WHERE run_id = ?`)
+    // isSafeInteger (not isInteger): 2^53 is an "integer" that SQLite would store lossily.
+    if (!Number.isSafeInteger(n) || n < 0)
+      fail(`completeRun: discoveryScopesDeferred must be a non-negative safe integer (got ${String(n)})`);
+    // status='running' in the WHERE is what makes "sealed" true rather than merely claimed. An
+    // unconditional UPDATE would let a second completion REWRITE recorded evidence (laundering a
+    // throttled run's count into a reassuring 0), revive a FAILED run into completed, and match
+    // zero rows for a bogus run_id while reporting success. The affected-row assertion turns all
+    // three into loud failures — a report must never rest on a completion that did not happen.
+    const res = this.db
+      .query(
+        `UPDATE runs SET status='completed', completed_at = ?, discovery_scopes_deferred = ?
+         WHERE run_id = ? AND status = 'running'`,
+      )
       .run(nowIso(), n, runId);
+    if (res.changes !== 1)
+      fail(`completeRun: run ${runId} is not a running run (already completed/failed, or unknown) — refusing to seal evidence over it`);
   }
 
   // completed_at stays NULL on failure — §7's generatedAt falls back to started_at.
@@ -2617,7 +2643,11 @@ function mapRun(row: RunRow): RunRecord {
     cutoffDate: row.cutoff_date,
     githubHost: row.github_host,
     status: row.status,
-    discoveryScopesDeferred: row.discovery_scopes_deferred,
+    // ?? null, not a bare read: SELECT * over a runs table that LOST this column yields `undefined`,
+    // and undefined is the one value that must never escape here — JSON.stringify drops the key
+    // entirely, so the report would omit a required summary field instead of reporting UNKNOWN.
+    // openReadOnly refuses that shape outright; this is the defense behind it.
+    discoveryScopesDeferred: row.discovery_scopes_deferred ?? null,
   };
 }
 
