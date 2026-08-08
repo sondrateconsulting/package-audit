@@ -17,7 +17,7 @@
 
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { GithubClient } from "./github.ts";
 import { loadBenchConfig } from "./benchConfig.ts";
 import {
@@ -751,7 +751,24 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
 }
 
 // ---- live wiring -----------------------------------------------------------------------------
-const BENCH_CONFIG_PATH = join(import.meta.dir, "..", "docs", "adrs", "0001-benchmark", "bench-config.json");
+// Two paths, deliberately: the RECORDED one is repo-relative so an artifact means the same thing
+// on any machine, and the OPERATIONAL one is absolute so reads work from any cwd. The Stage-P run
+// recorded the absolute form and baked a machine-local worktree name into committed evidence;
+// that artifact stays as-is (it is evidence), and this keeps every future run portable.
+export const BENCH_CONFIG_EVIDENCE_PATH = "docs/adrs/0001-benchmark/bench-config.json";
+const BENCH_CONFIG_PATH = join(import.meta.dir, "..", BENCH_CONFIG_EVIDENCE_PATH);
+const REPO_ROOT = join(import.meta.dir, "..");
+
+// Evidence records repo-relative paths only. A path outside the repo has no portable form, so it
+// is refused rather than silently recorded as a machine path — the defect this closes.
+export function repoRelativeEvidencePath(p: string, repoRoot: string): string {
+  const rel = relative(resolve(repoRoot), resolve(repoRoot, p));
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel))
+    throw new BenchRefsRulesError(
+      `${p} is outside the repository — evidence paths must be repo-relative so an artifact is portable; place it under the repo and retry`,
+    );
+  return rel;
+}
 
 const log = (line: string): void => {
   process.stderr.write(`${line}\n`);
@@ -800,11 +817,12 @@ async function main(): Promise<void> {
   acquireProbeLock(lockPath);
   const result = await runRefsProbe({
     corpus,
-    corpusPath,
+    corpusPath: repoRelativeEvidencePath(corpusPath, REPO_ROOT),
     corpusSha256,
     outPath,
-    journalPath,
-    benchConfigPath: BENCH_CONFIG_PATH,
+    // recorded in the result artifact; the operational paths stay as given for I/O
+    journalPath: repoRelativeEvidencePath(journalPath, REPO_ROOT),
+    benchConfigPath: BENCH_CONFIG_EVIDENCE_PATH,
     benchConfigSha256,
     existingJournalText: journalText,
     // classified read-only here; the physical repair happens on the first append, after the
