@@ -90,12 +90,11 @@ export function buildBatchQuery(
   // batch-size vector are all part of the ratified measurement surface (split-trigger geometry
   // depends on the vector), so none of them may change post-ratification without a §8 amendment.
   // ONE "-f" precedes the query field, exactly as github.ts/benchGh.ts build the argv and as the
-  // paragraph above already describes; this counted two and overstated every batch by 2 B (the
-  // same defect fixed in graphqlBatch.ts, 61dbcec). The amendment recorded for this correction
-  // ("argv field-flag accounting correction" in ratification.json) shows the vector cannot move:
-  // the 250-alias cap binds first in this corpus — queryBytes is 28,530 B there, well under the
-  // 48 KiB document cap, which is NOT co-binding — so cap-respecting argvBytes peaks at 53,306 B,
-  // 77,766 B below this 128 KiB cap.
+  // paragraph above already describes; this counted two and overstated every batch by 2 B. The
+  // amendment recorded for it ("argv field-flag accounting correction" in ratification.json)
+  // shows the vector cannot move: the 250-alias cap binds first in this corpus — queryBytes is
+  // 28,530 B there, well under the 48 KiB document cap, which is NOT co-binding — so
+  // cap-respecting argvBytes peaks at 53,306 B, 77,766 B below this 128 KiB cap.
   let argvBytes = Buffer.byteLength(`query=${query}`, "utf8") + "-f".length;
   for (const [k, v] of Object.entries(fields)) argvBytes += Buffer.byteLength(`${k}=${v}`, "utf8") + "-f".length;
   const contentEstimateBytes = entries.reduce((n, e) => n + e.size, 0);
