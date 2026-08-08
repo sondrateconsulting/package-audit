@@ -379,7 +379,11 @@ CREATE TABLE IF NOT EXISTS runs (
   discovery_scopes_deferred INTEGER    -- §4 discovery-throttle evidence (v5), NULLABLE: how many
                                        -- DISTINCT discovery scopes (one per owner repo-listing,
                                        -- one per repository branch-listing) exhausted their
-                                       -- rate-limit budget this run. Such a scope enumerates
+                                       -- RETRY budget this run (rate limiting raises it, and so
+                                       -- do repeated HTTP 5xx responses burning the same bounded
+                                       -- allowance; a network failure has no HTTP response and
+                                       -- exhausts as a permanent error, so it is NOT counted).
+                                       -- Such a scope enumerates
                                        -- NOTHING, so it enqueues no work unit and records no
                                        -- errors row — invisible to §7's branchesDeferred AND
                                        -- branchesErrored, which is why it is persisted here.
@@ -470,7 +474,7 @@ CREATE TABLE IF NOT EXISTS usage_findings (
 );
 -- immutable per-run snapshot: the head commit each run REPORTED for each unit.
 -- report.ts joins findings through this (not the mutable work_queue.last_commit_sha),
--- so `report --run-id` reconstructs the exact state of the world as of that run even
+-- so `report --run-id` reconstructs that run's per-unit head/disposition selection (NOT the whole document: `summary.branchesDeferred` is the generation-time config-wide backlog, and a same-commit rescan can refresh shared finding fields) even
 -- after a later same-config run advances the head.
 CREATE TABLE IF NOT EXISTS run_unit_head (
   run_id TEXT NOT NULL REFERENCES runs(run_id),

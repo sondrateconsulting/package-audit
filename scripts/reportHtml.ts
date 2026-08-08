@@ -83,8 +83,9 @@ export interface DossierSummary {
   readonly branchesExcludedByPolicy: number; // branch allow/deny (§5)
   readonly branchesPastCap: number;
   readonly branchesDeferred: number; // §4 deferred remainder (queue-side pending; see report.ts)
-  // §4 discovery blind spot: SCOPES whose listing was rate-limited (per-run sealed evidence).
-  // null = UNKNOWN (pre-v5 / unsealed run) — renderers must never show that as 0. See report.ts.
+  // §4 discovery blind spot: SCOPES whose listing exhausted its retry budget (per-run sealed evidence).
+  // null = UNKNOWN (running, failed, pre-v5, or RESUMED with no exhaustion seen by the completing
+  // invocation) — renderers must never show that as 0. See report.ts.
   readonly discoveryScopesDeferred: number | null;
 }
 // Branch allow/deny scan-scope diagnostics (§5). Defined here (the render layer) so both the report
@@ -899,7 +900,8 @@ function renderBands(m: DossierModel): string {
 
 function renderFooter(ctx: DossierContext): string {
   const s = ctx.summary;
-  // Compact global coverage receipt: shown only when something actually reduced the scanned slice.
+  // Compact global coverage receipt: shown when a coverage reduction is REAL (positive counts) or
+  // when discovery completeness is UNKNOWN (null evidence) — silence means "checked, nothing to say".
   // The full per-branch ledger lives in the run index's #scan-scope panel — a package-centric
   // dossier does not duplicate it N times (the href is a static literal, no injection).
   // THIS FOOTER IS THE SINGLE SITE for all three coverage-reduction counts, and it is shared by the
@@ -915,14 +917,14 @@ function renderFooter(ctx: DossierContext): string {
     // stale rows no run re-enumerates, so naming a cause here would over-claim (see report.ts).
     ...(s.branchesDeferred > 0 ? [`${plural(s.branchesDeferred, "branch", "branches")} still pending`] : []),
     // The DISCOVERY blind spot needs its own clause because the branch counts CANNOT express it: a
-    // rate-limited owner/repo listing enumerated nothing, so it contributes no queue row and no
+    // listing that exhausted its retry budget enumerated nothing, so it contributes no queue row and no
     // error. THREE distinct states, and collapsing any two of them is the failure this guards —
     // a dossier is a standalone artifact, so a reader who never opens the index still has to be
     // able to tell "checked, none" from "never recorded". Only an explicit sealed 0 is silent.
     ...(s.discoveryScopesDeferred === null
-      ? ["discovery rate-limiting not recorded for this run"]
+      ? ["discovery retry-budget exhaustion not recorded for this run"]
       : s.discoveryScopesDeferred > 0
-        ? [`${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} rate-limited`]
+        ? [`${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} gave up after retries`]
         : []),
   ];
   // ONE clause under ONE anchor — two receipts would mean two competing scan-scope links.

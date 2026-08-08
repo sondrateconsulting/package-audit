@@ -54,7 +54,7 @@ export class ThrottleExhausted extends Error {
   readonly endpoint: string;
   constructor(endpoint: string) {
     super(
-      `rate-limit throttling persisted beyond the retry/pause budget for ${endpoint} — wait for the rate-limit window to reset, then re-run; a resumed run skips already-completed units`,
+      `retry/pause budget exhausted for ${endpoint} (rate limiting, or repeated HTTP 5xx) — wait and re-run; a resumed run skips already-completed units`,
     );
     this.name = "ThrottleExhausted";
     this.endpoint = endpoint;
@@ -694,7 +694,7 @@ export type Classification =
   | { kind: "ok" }
   | { kind: "primary"; untilMs: number } // wait until the x-ratelimit-reset epoch
   | { kind: "secondary"; waitMs: number | null } // Retry-After if present, else caller backoff
-  | { kind: "transient" } // 5xx / spawn-level network failure — bounded backoff retry
+  | { kind: "transient" } // HTTP 5xx — bounded backoff retry (a spawn-level network failure has no HTTP response and takes the separate no-response path, which exhausts as GithubApiError, never ThrottleExhausted)
   | { kind: "fatal"; status: number; ssoRequired: boolean; message: string };
 
 const CLOCK_SKEW_MS = 5_000;

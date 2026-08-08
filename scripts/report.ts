@@ -64,7 +64,7 @@ export interface ReportSummary {
   //   discovered (terminal) <= that sum                             — on a RESUMED run; see branchesErrored
   //                                                                   for exactly which branches inflate it.
   //   branchesDeferred is OUTSIDE this identity on purpose: non-terminal work, counted from the queue,
-  //   overlapping these buckets only in the resumed-run cases its own comment spells out.
+  //   overlapping these buckets on RESUMED runs and on HISTORICAL RE-RENDERS, both spelled out below.
   // branchesScanned INCLUDES scanned default-override rows (they WERE scanned). branchesSkippedByCutoff is
   // GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket.
   branchesExcludedByPolicy: number;
@@ -121,8 +121,8 @@ export interface ReportSummary {
   // Source: the MUTABLE cross-run work_queue — one of TWO summary counts read outside the immutable
   // run_unit_head slice (PROMPT.md §7 sanctions both; the other is discoveryScopesDeferred, which
   // reads the run row's sealed evidence). By design, then, this is the CURRENT
-  // backlog at generation time: re-rendering an old --run-id after later runs drain the queue reports
-  // 0 — the count answers "what does this config still owe", a debt a future run retries or settles
+  // backlog at generation time: re-rendering an old --run-id reports 0 IF later runs drained the queue (a row no run
+  // re-enumerates never drains) — the count answers "what does this config still owe", a debt a future run retries or settles
   // only for the units it still re-enumerates (a retry can throttle again). Known skews,
   // queue-inherited (non-exhaustive): a throttled
   // owner/repo DISCOVERY enqueues nothing, so branches it never enumerated are invisible here
@@ -138,7 +138,8 @@ export interface ReportSummary {
   // see. A throttled owner repo-listing or repository branch-listing enumerates nothing, so it
   // enqueues no work unit and (by §4 design) records no errors row: its branches are invisible to
   // the queue count above AND to branchesErrored. This counts the DISTINCT discovery scopes that
-  // exhausted their budget during the reported run.
+  // exhausted their bounded RETRY budget during the reported run — ThrottleExhausted, which GitHub
+  // rate limiting raises but so do repeated HTTP 5xx responses burning the same allowance.
   //
   // Read it as the OPPOSITE currency to branchesDeferred, and never sum the two:
   //   - branchesDeferred      = the CURRENT pending backlog for the whole config, re-read at

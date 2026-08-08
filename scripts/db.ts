@@ -2661,9 +2661,9 @@ function mapRun(row: RunRow): RunRecord {
     // can hold TEXT, a negative, or a fraction. Unvalidated, those flow into report JSON and the
     // exports, and the HTML (which only tests `> 0`) would suppress a NEGATIVE exactly like a clean
     // zero: the silent all-clear this whole feature exists to prevent. Fail closed instead.
-    // The `?? null` also covers the missing-column read: `undefined` must never escape, because
-    // JSON.stringify drops the key and the report would omit a required field rather than say
-    // UNKNOWN. openReadOnly refuses that shape outright; this is the defense behind it.
+    // It also covers the missing-column read: `undefined` must never escape, because JSON.stringify
+    // drops the key and the report would omit a required field rather than say UNKNOWN.
+    // openReadOnly refuses that shape outright; readDiscoveryEvidence is the defense behind it.
     discoveryScopesDeferred: readDiscoveryEvidence(row.discovery_scopes_deferred),
   };
 }

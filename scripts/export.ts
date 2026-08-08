@@ -143,7 +143,8 @@ const RUNS_COLUMNS = [
   { name: "status", type: "string" },
   // §4 discovery-throttle evidence (v5). NULLABLE on purpose, and the null is load-bearing: a run
   // that is still running, that failed, or that predates v5 recorded NO evidence, which is a
-  // different claim from "nothing was deferred". A consumer must read null as UNKNOWN, never 0.
+  // different claim from "nothing was deferred" — as is a RESUMED run whose completing invocation saw
+  // no exhaustion. A consumer must read null as UNKNOWN, never 0.
   { name: "discovery_scopes_deferred", type: "nullable-number" },
 ] as const satisfies readonly ExportColumn[];
 

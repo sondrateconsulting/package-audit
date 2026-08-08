@@ -93,12 +93,12 @@ function renderScanScope(report: DossierReport): string {
   // explicit 0 means the run checked and found none, which needs no words.
   const discovery =
     s.discoveryScopesDeferred === null
-      ? `<p class="note">Discovery rate-limiting was not recorded for this run (it predates that evidence, or did not complete) — whether any owner or repository went unenumerated is UNKNOWN.</p>`
+      ? `<p class="note">Discovery retry-budget exhaustion was not recorded for this run (it predates that evidence, did not complete, or resumed a run whose earlier invocations cannot be vouched for) — whether any owner or repository went unenumerated is UNKNOWN.</p>`
       : s.discoveryScopesDeferred > 0
         // Scoped to THIS run's discovery attempt on purpose. "their branches appear in NO count"
         // would be false on a RESUMED run: run_unit_head rows retained from an earlier invocation
         // can still place branches of a now-throttled repository into the dispositions above.
-        ? `<p class="note">${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} rate-limited — the completing invocation never enumerated those owners/repositories, so nothing it discovered there is reflected above (on a resumed run an EARLIER invocation may have enumerated them, and its retained rows can still appear) and the scanned counts are PARTIAL.</p>`
+        ? `<p class="note">${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} exhausted their retry budget (rate limiting, or repeated HTTP 5xx) — the completing invocation never enumerated those owners/repositories, so nothing it discovered there is reflected above (on a resumed run an EARLIER invocation may have enumerated them, and its retained rows can still appear) and the scanned counts are PARTIAL.</p>`
         : "";
   const caveat =
     sc.provenance === "pre-upgrade"

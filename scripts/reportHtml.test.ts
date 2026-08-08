@@ -249,8 +249,8 @@ describe("renderDossier — footer scan-scope receipt (§5)", () => {
     const ctx = { ...FIXED_CTX, summary: { ...FIXED_CTX.summary, branchesDeferred: 0, discoveryScopesDeferred: 2 } };
     for (const pkg of [pkgs[0]!, pkgs[1]!]) {
       const html = renderDossier(pkg, ctx);
-      expect(html).toContain("2 discovery scopes rate-limited");
-      expect(html.split("2 discovery scopes rate-limited").length - 1).toBe(1);
+      expect(html).toContain("2 discovery scopes gave up after retries");
+      expect(html.split("2 discovery scopes gave up after retries").length - 1).toBe(1);
     }
     // an explicit sealed ZERO stays suppressed (that suppression is what keeps the golden pins valid)
     expect(renderDossier(pkgs[0]!, FIXED_CTX)).not.toContain("discovery scope");
