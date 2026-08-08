@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { BenchGraphqlDispatch, BenchHttpAttemptRecord, RateLimitSnapshot } from "./benchGh.ts";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
+  BENCH_CONFIG_EVIDENCE_PATH,
   BenchRefsRulesError,
   acquireProbeLock,
   assertProbeIdentity,
@@ -13,6 +14,7 @@ import {
   parseRefsProbeCorpus,
   probeConstantsFingerprint,
   releaseProbeLock,
+  repoRelativeEvidencePath,
   runRefsProbe,
   type RefsDispatchOutcome,
   type RefsProbeCorpus,
@@ -254,6 +256,25 @@ describe("pure helpers", () => {
     // mid-file corruption always throws
     expect(() => parseJournal(`{"broken\n${good}\n`, () => {})).toThrow(BenchRefsRulesError);
   });
+  // Evidence must mean the same thing on any machine. The Stage-P run recorded an absolute
+  // benchConfigPath naming an unrelated worktree, while its sibling corpusPath was repo-relative;
+  // these pin the asymmetry closed for every future run. The committed artifacts are historical
+  // evidence and are deliberately NOT rewritten — see the ADR's disclosure.
+  test("recorded evidence paths are repo-relative, never machine-local", () => {
+    expect(BENCH_CONFIG_EVIDENCE_PATH).toBe("docs/adrs/0001-benchmark/bench-config.json");
+    expect(isAbsolute(BENCH_CONFIG_EVIDENCE_PATH)).toBe(false);
+  });
+
+  test("repoRelativeEvidencePath normalizes in-repo paths and refuses to record a path outside it", () => {
+    const root = "/repo";
+    expect(repoRelativeEvidencePath("docs/x.json", root)).toBe("docs/x.json");
+    expect(repoRelativeEvidencePath("/repo/docs/x.json", root)).toBe("docs/x.json");
+    expect(repoRelativeEvidencePath("./docs/../docs/x.json", root)).toBe("docs/x.json");
+    // outside the repo there IS no portable form — refuse rather than bake in a machine path
+    expect(() => repoRelativeEvidencePath("/tmp/x.json", root)).toThrow(BenchRefsRulesError);
+    expect(() => repoRelativeEvidencePath("../x.json", root)).toThrow(BenchRefsRulesError);
+  });
+
   test("classifyJournalTail names what a crash left behind, without touching the file", () => {
     const good = JSON.stringify({ rowKind: "washout", version: 1, atIso: "2026-08-05T00:00:00Z", sleptMs: 1 });
     expect(classifyJournalTail("")).toBe("none");
