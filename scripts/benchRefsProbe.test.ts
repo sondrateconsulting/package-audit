@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { BenchGraphqlDispatch, BenchHttpAttemptRecord, RateLimitSnapshot } from "./benchGh.ts";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { MAX_ATTEMPTS } from "./github.ts";
 import {
@@ -287,6 +287,23 @@ describe("pure helpers", () => {
     expect(() => repoRelativeEvidencePath("../x.json", root)).toThrow(BenchRefsRulesError);
   });
 
+  test("repoRelativeEvidencePath refuses an in-repo SYMLINK that escapes the repo", () => {
+    // a lexical resolve() is fooled by this: the path looks repo-relative while the bytes live
+    // outside, so the evidence would claim portability it does not have
+    const base = join(process.env["TMPDIR"] ?? "/tmp", `refs-probe-symlink-${process.pid}`);
+    const repo = join(base, "repo");
+    const outside = join(base, "outside");
+    mkdirSync(repo, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "corpus.json"), "{}");
+    symlinkSync(outside, join(repo, "escape"));
+    expect(() => repoRelativeEvidencePath("escape/corpus.json", repo)).toThrow(BenchRefsRulesError);
+    // a real in-repo file still resolves
+    writeFileSync(join(repo, "real.json"), "{}");
+    expect(repoRelativeEvidencePath("real.json", repo)).toBe("real.json");
+    rmSync(base, { recursive: true, force: true });
+  });
+
   // The identity preflight spends real REST-core budget before the lock, the journal header, or
   // the rate-limit baseline exist, so it can appear in none of the three artifacts. It cannot be
   // journalled after the fact: invocations that fail on a foreign identity, lose the lock race, or
@@ -308,8 +325,12 @@ describe("pure helpers", () => {
     expect(classifyJournalTail(`${good}\n${good}`)).toBe("sealable");
     // genuinely torn bytes — the write never completed
     expect(classifyJournalTail(`${good}\n{"rowKind":"was`)).toBe("malformed");
-    // no newline anywhere: truncating would empty the file, so it is never a truncate candidate
+    // no newline anywhere AND malformed: truncating would empty the file, so it is refused
     expect(classifyJournalTail(`{"rowKind":"was`)).toBe("headless");
+    // ...but a lone COMPLETE record that only lost its newline is still sealable. This is the
+    // shape a crash right after the header write leaves, and deciding "headless" on the missing
+    // newline alone would refuse that journal forever.
+    expect(classifyJournalTail(good)).toBe("sealable");
   });
 
   // A crash mid-append leaves the journal's last line unterminated. parseJournal tolerates that
@@ -358,6 +379,15 @@ describe("pure helpers", () => {
       append(row as unknown as RefsProbeJournalRow);
       expect(logs.filter((l) => l.includes("repaired")).length).toBe(1);
       expect(parseJournal(readFileSync(p, "utf8"), () => {}).length).toBe(4);
+      rmSync(p, { force: true });
+    });
+
+    test("a lone complete record that lost its newline is sealed, not refused", () => {
+      const p = write("lone.jsonl", good);
+      const append = fileJournalAppender(p, () => {});
+      append(row as unknown as RefsProbeJournalRow);
+      expect(readFileSync(p, "utf8")).toBe(`${good}\n${JSON.stringify(row)}\n`);
+      expect(parseJournal(readFileSync(p, "utf8"), () => {}).length).toBe(2);
       rmSync(p, { force: true });
     });
 
@@ -716,13 +746,22 @@ describe("runRefsProbe — resume from the journal (crash-safe, no double-spend)
   test("a dropped torn tail forces a conservative backoff before any dispatch", async () => {
     const corpus = corpusJson();
     const script = scriptedGithub(corpus);
-    const { deps, journal, events } = makeDeps(corpus, script, {
+    const { deps, journal, events, sleeps } = makeDeps(corpus, script, {
       existingJournalText: `${headerLine()}\n`,
       droppedTornTailBytes: 42,
     });
     await runRefsProbe(deps);
     const recovered = journal.filter((r) => r.rowKind === "tear-recovered");
     expect(recovered.length).toBe(1);
+    // the replacement must be at least what a real quarantine would have cost: sleep to the
+    // graphql RESET (reset*1000 + 5s from now), not the far shorter washout floor. A floor-length
+    // nap would read as conservative while still landing inside an active penalty window.
+    const wait = (recovered[0] as { conservativeSleepMs: number }).conservativeSleepMs;
+    expect(sleeps).toContain(wait); // the row records exactly the sleep that was taken
+    // reset is far in the future relative to the fake clock, so a reset-based wait is enormous;
+    // the washout floor is seconds. Pinning the ORDER OF MAGNITUDE proves which rule was used
+    // without coupling to the clock's exact position when the tear was recovered.
+    expect(wait).toBeGreaterThan(deps.washoutFloorMs * 1_000);
     const firstDispatch = events.findIndex((e) => e.startsWith("dispatch:"));
     const firstBigSleep = events.findIndex((e) => e.startsWith("sleep:") && Number(e.slice(6)) >= 30_000);
     expect(firstBigSleep).toBeGreaterThanOrEqual(0);
