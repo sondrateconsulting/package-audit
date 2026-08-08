@@ -92,9 +92,16 @@ export function buildBatchQuery(
   // ONE "-f" precedes the query field, exactly as github.ts/benchGh.ts build the argv and as the
   // paragraph above already describes; this counted two and overstated every batch by 2 B. The
   // amendment recorded for it ("argv field-flag accounting correction" in ratification.json)
-  // shows the vector cannot move: the 250-alias cap binds first in this corpus — queryBytes is
-  // 28,530 B there, well under the 48 KiB document cap, which is NOT co-binding — so
-  // cap-respecting argvBytes peaks at 53,306 B, 77,766 B below this 128 KiB cap.
+  // shows the vector cannot move. Batch growth stops at whichever of the four caps binds first —
+  // in this corpus that is often the CONTENT cap, not the alias cap: the round-level candidate
+  // (up to 250 entries — planRounds partitions before packing, so C1's round-2 candidates run
+  // 210-218 entries) exceeds the 1,572,864 B content cap in several committed workloads. At the
+  // 250-alias
+  // boundary-probe rows queryBytes is 28,530 B, under the 48 KiB document cap, so THAT cap is not
+  // co-binding there. Among the RECORDED rows respecting the alias and document caps, the largest
+  // argvBytes is 53,304 B under THIS formula (boundary-probe.json records 53,306 B for that row,
+  // measured under the old one), i.e. 77,768 B clear of this 128 KiB cap. That is the recorded
+  // maximum, not a proven bound over every constructible batch.
   let argvBytes = Buffer.byteLength(`query=${query}`, "utf8") + "-f".length;
   for (const [k, v] of Object.entries(fields)) argvBytes += Buffer.byteLength(`${k}=${v}`, "utf8") + "-f".length;
   const contentEstimateBytes = entries.reduce((n, e) => n + e.size, 0);
