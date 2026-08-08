@@ -78,7 +78,9 @@ export function buildBatchRefsQuery(repos: readonly BatchRefsRepo[], opts: Batch
   const queryBytes = Buffer.byteLength(query, "utf8");
   // argv accounting mirrors the gh raw-field shape the production client and the bench dispatch
   // layer both use (one query field + one field per variable) — the probe's admission input.
-  let argvBytes = Buffer.byteLength(`query=${query}`, "utf8") + 2 * "-f".length;
+  // ONE "-f" precedes the query field, exactly as github.ts/benchGh.ts build the argv — the
+  // long-standing benchT1.ts copy of this formula counts two and overstates every batch by 2 B
+  let argvBytes = Buffer.byteLength(`query=${query}`, "utf8") + "-f".length;
   for (const [k, v] of Object.entries(fields)) argvBytes += Buffer.byteLength(`${k}=${v}`, "utf8") + "-f".length;
   return { query, fields, aliasCount: repos.length, expected, queryBytes, argvBytes };
 }
