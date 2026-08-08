@@ -1,6 +1,6 @@
 ---
-status: "proposed"
-date: 2026-08-04
+status: "accepted"
+date: 2026-08-05
 decision-makers: rvo (repository owner)
 consulted: Codex (gpt-5.6-sol) — adversarial ADR review rounds; see Review history
 informed: operators running `bun run audit` against multi-organization estates
@@ -192,9 +192,10 @@ reproducing today's behavior exactly. The reduction is structural on the page-1 
 owner at full batches; the continuation term for branch-heavy repositories is unchanged), and
 there is no database-schema change and no new trust boundary.
 
-The recommendation is definitive; per this repository's practice the ADR stays `proposed` until
-the decision-maker ratifies it, and the batch-size default is pinned by the pre-registered
-Confirmation probe, not by this document.
+The recommendation is definitive. Per this repository's practice the ADR remained `proposed`
+until the decision-maker ratified it: **rvo ratified Option 1 on 2026-08-05** at the Stage-P
+gate (PR #40), with the batch-size default pinned by the pre-registered Confirmation probe —
+**B = 25** — not by this document.
 
 ### The design, concretely
 
@@ -626,8 +627,12 @@ Confirmation probe, not by this document.
    per-repository page counts — which is exactly what per-tranche admission computes from
    the frozen corpus (the scalar curve is illustrative; the admission bound is computed,
    never assumed) — and the permitted invalidation re-runs can triple a cell, so the matrix
-   must be schedulable across multiple reset windows by construction. The artifact
-   lands beside [boundary-probe.json](0001-benchmark/boundary-probe.json).
+   must be schedulable across multiple reset windows by construction. The artifacts land in
+   [0002-benchmark/](0002-benchmark/) — the frozen corpus (`refs-corpus.json`), the
+   append-only try journal (`refs-probe-journal.jsonl`), and the result (`refs-probe.json`) —
+   evidence directories stay per-ADR; the boundary probe's own artifacts remain in
+   [0001-benchmark/](0001-benchmark/). *(Amended prospectively at the Stage-P corpus freeze,
+   riding PR-P for ratification: the sentence previously registered the 0001 directory.)*
 2. **Scripted-envelope tests for the classified-staged-partitioned order**: a `NOT_FOUND`
    alias among *B* stages exactly one repository's fail-soft failure (committed at
    consumption: errors row in a run, `discoveryErrors` in plan; siblings' snapshots intact);
@@ -959,6 +964,59 @@ estate's *shape* — not just its total — sets the cost:
 The last row is the honest degenerate case: per-owner batching buys nothing where no owner has
 a second repository. That estate was not the complaint — and the cross-owner variant recorded
 under Option 1 and Follow-on is the shape that would address it if it ever is.
+
+### Measured outcome (Stage P probe, 2026-08-05)
+
+The Confirmation-1 probe ran to completion against the frozen corpus (100 synthetic fixture
+repositories under the `sondrateconsulting` organization; corpus, append-only try journal,
+and result all in [0002-benchmark/](0002-benchmark/), the journal and result committed
+together at completion): 26 try rows — **25 completed pairs plus one candidate-only attempt
+terminated by the 504 below** — 976 dispatches, 975 measured points, no invalidations, no
+resume. **The pre-registered rule pinned the default at B = 25.**
+
+Measured values replaced no formula estimates because they differed nowhere: every
+**cost-readable** batched page-1 call priced at **exactly 1 point** at B ∈ {10, 25, 50} —
+the published formula held exactly for this query shape, and the absolute gate's 2×
+tolerance was never consumed — and every continuation page priced at exactly 1 point. (The
+one call with no readable cost is the 504'd batch below: a timed-out request returns no
+rider, and its documented penalty is deducted unobserved.) Per-repository page-1 reducers
+(max over clean tries, *p* = 1 stratum): 0.10 at B = 10, **0.04 at B = 25**, 0.02 at
+B = 50 (informational). Candidate/control pair ratios in the *p* = 1 stratum: 0.10 / 0.04 /
+0.02 — all far under the ½ gate; the paginating stratum's ratios (0.55 at B = 10, 0.52 at
+B = 25) sat above ½ exactly as the algebraic floor above predicts (the reason that gate
+binds the *p* = 1 stratum only). Batched page-1 walls tracked response size: 1.5 s / 2.2 s
+/ 4.0 s in the *p* = 1 stratum and 3.6 s / 4.77 s in the paginating stratum at B = 10 / 25
+— inside the 5 s gate. The informational **B = 50 paginating cell drew an HTTP 504 on its
+first 50-alias batch** (5,000 requested ref nodes): per the pre-registered rule the try
+failed unclean, the cell terminated, and the runner quarantined itself to the next reset
+epoch — a live corroboration of the timeout caution above, at a shape the operator range
+never reaches. The header-delta cross-check did **not** independently corroborate the
+rider costs and is recorded as noisy, nothing more: the quarantine sleep straddled a reset
+window (invalidating the run-level before/after bucket delta), and 16 of the 50 clean arm
+summaries show a per-arm delta above their rider-cost sum (worst +4) — the
+otherwise-quiet-credential premise did not hold. Every gate and reducer rides the per-call
+rider alone, as pre-registered.
+
+Both candidates passed every gate, so the Worked-arithmetic floors above stand as
+**measured**, not merely estimated, and the ship threshold passes: the 8 × 750 estate's
+corrected page-1 floor is **240 points — under 10% of one window**. Continuation-inclusive
+estate totals under the stated premises (measured reducers; single-repository owners keep
+the formula's 1-point-per-query floor):
+
+| Estate shape | Today (page 1) | B = 25 page-1 (measured) | All-single-page total | Uniform *p* = 2 total |
+|---|---:|---:|---:|---:|
+| 1 org × 1,000 | 1,000 | 40 | 40 | 1,040 |
+| 8 orgs × 750 | 6,000 | 240 | 240 | 6,240 |
+| 25 orgs × 400 | 10,000 | 400 | 400 | 10,400 |
+| 1,000 owners × 1 | 1,000 | 1,000 | 1,000 | 2,000 |
+
+The uniform-*p* = 2 column shows the continuation term unmoved by this decision — the
+disclosed scope: this option removes the per-repository page-1 minimum, not the
+branch-heavy tail. **The `discovery.batchSize` operator range's ceiling is therefore the
+probe-pinned default, B = 25**, recorded here for the implementation stage. Per this
+repository's practice the flip to `accepted` rode the probe PR only on rvo's explicit word:
+**rvo ratified Option 1 with the pinned default B = 25 on 2026-08-05** (the Stage-P
+ratification gate on PR #40), and the status above records it.
 
 ### Review history
 
