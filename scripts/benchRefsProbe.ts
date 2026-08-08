@@ -336,6 +336,17 @@ interface TryRunResult {
   resetHintEpochSec: number | null;
 }
 
+// What one dispatch did, told to the caller rather than smuggled out through shared flags.
+// "failed" covers both halves of a dispatch that produced no usable page — a transport throw and
+// a response whose recorded classification is not "ok" — because every call site treats them
+// identically. "quarantine" carries the fault's OWN reset hint (null when the 502/504 arrived
+// without rate-limit headers), which is what lets the caller price its sleep with no second
+// /rate_limit read.
+type DispatchAttempt =
+  | { kind: "ok"; d: BenchGraphqlDispatch }
+  | { kind: "quarantine"; resetHintEpochSec: number | null }
+  | { kind: "failed" };
+
 async function runPairedTry(
   deps: RefsProbeDeps,
   cell: RefsCorpusCell,
@@ -352,12 +363,16 @@ async function runPairedTry(
   const soloQuery = buildProbeSoloQuery(REFS_PROBE_RATE_LIMIT_RIDER);
   const labelBase = `refs.B${cell.batchSize}.${cell.stratum}.s${slot}.a${attempt}`;
 
+  // Records the attempt, and — on a documented timeout — makes the quarantine obligation durable.
+  // It decides nothing about the run: the verdict goes back to the caller as a value, so each
+  // site's own break/abort logic reads on its own terms rather than against a flag this closure
+  // flipped behind it.
   const dispatchOne = async (
     query: string,
     fields: Record<string, string>,
     label: string,
     meta: Pick<RefsProbeDispatchRecord, "arm" | "callKind" | "repo" | "batchOrdinal" | "pageOrdinal">,
-  ): Promise<BenchGraphqlDispatch | null> => {
+  ): Promise<DispatchAttempt> => {
     try {
       const { d, rec } = await deps.dispatchGraphql(query, fields, label);
       const record: RefsProbeDispatchRecord = {
@@ -379,21 +394,20 @@ async function runPairedTry(
       };
       dispatches.push(record);
       if (d.status === 502 || d.status === 504) {
-        quarantine = true;
-        resetHintEpochSec = rec.resetEpochSec;
-        // the obligation becomes DURABLE at observation — before even this try's row — so a
-        // crash anywhere after the timeout can never resume into the penalized window. (A
-        // 502/504 carrying no rate-limit headers leaves untilEpochSec null; such a row
-        // cannot be honored across a resume — nothing exists to honor — and the live sleep
-        // below still runs its floor.)
+        // the obligation becomes DURABLE at observation — before even this try's row, and so
+        // before the caller has done anything with the result — so a crash anywhere after the
+        // timeout can never resume into the penalized window. (A 502/504 carrying no rate-limit
+        // headers leaves untilEpochSec null; such a row cannot be honored across a resume —
+        // nothing exists to honor — and the caller's live sleep still runs its floor.)
         journalRow({
           rowKind: "quarantine", version: 1, atIso: isoOf(deps.now()), cellB: cell.batchSize,
           stratum: cell.stratum, slot, attempt, untilEpochSec: rec.resetEpochSec,
           plannedSleepMs: sleepToResetMs(rec.resetEpochSec, deps.now()),
         });
-        return null;
+        return { kind: "quarantine", resetHintEpochSec: rec.resetEpochSec };
       }
-      return d;
+      if (record.classification !== "ok") return { kind: "failed" };
+      return { kind: "ok", d };
     } catch (e) {
       dispatches.push({
         ...meta,
@@ -412,7 +426,7 @@ async function runPairedTry(
         malformedErrorEntries: 0,
         dispatchFailure: (e instanceof Error ? e.message : String(e)).slice(0, 300),
       });
-      return null;
+      return { kind: "failed" };
     }
   };
 
@@ -423,19 +437,21 @@ async function runPairedTry(
   for (let b = 0; b < chunks.length && !quarantine && !candidateFailed; b++) {
     const chunk = chunks[b]!;
     const built = buildBatchRefsQuery(chunk, { rateLimitRider: REFS_PROBE_RATE_LIMIT_RIDER });
-    const d = await dispatchOne(built.query, built.fields, `${labelBase}.b${b}`, {
+    const batch = await dispatchOne(built.query, built.fields, `${labelBase}.b${b}`, {
       arm: "candidate", callKind: "batch-page1", repo: null, batchOrdinal: b, pageOrdinal: null,
     });
-    if (d === null) {
-      candidateFailed = !quarantine;
+    if (batch.kind === "quarantine") {
+      // terminal for the whole try, and it outranks a candidate failure: the timeout penalty,
+      // not the candidate's cleanliness, is what decides this row
+      quarantine = true;
+      resetHintEpochSec = batch.resetHintEpochSec;
       break;
     }
-    const last = dispatches[dispatches.length - 1]!;
-    if (last.classification !== "ok") {
+    if (batch.kind === "failed") {
       candidateFailed = true;
       break;
     }
-    const data = d.data ?? {};
+    const data = batch.d.data ?? {};
     for (const expected of built.expected) {
       aliasPages.set(`${expected.owner}/${expected.name}`.toLowerCase(), (data as Record<string, unknown>)[expected.alias]);
     }
@@ -480,21 +496,21 @@ async function runPairedTry(
           break;
         }
         pageNo++;
-        const d = await dispatchOne(soloQuery, { owner: r.owner, name: r.name, endCursor: info.endCursor }, `${labelBase}.cont.${r.name}.p${pageNo}`, {
+        const page = await dispatchOne(soloQuery, { owner: r.owner, name: r.name, endCursor: info.endCursor }, `${labelBase}.cont.${r.name}.p${pageNo}`, {
           arm: "candidate", callKind: "solo-page", repo: key, batchOrdinal: null, pageOrdinal: pageNo,
         });
-        if (d === null) {
+        if (page.kind === "quarantine") {
           stoppedBy = "dispatch-failure";
-          candidateFailed = !quarantine;
+          quarantine = true; // outranks candidateFailed — see the batch-page-1 site
+          resetHintEpochSec = page.resetHintEpochSec;
           break;
         }
-        const last = dispatches[dispatches.length - 1]!;
-        if (last.classification !== "ok") {
+        if (page.kind === "failed") {
           stoppedBy = "dispatch-failure";
           candidateFailed = true;
           break;
         }
-        const repoObj = (d.data as Record<string, unknown> | null)?.["repository"];
+        const repoObj = (page.d.data as Record<string, unknown> | null)?.["repository"];
         pages.push(repoObj);
       }
       const walk = assembleRefsWalk(pages);
@@ -519,21 +535,21 @@ async function runPairedTry(
         pageNo++;
         const fields: Record<string, string> = { owner: r.owner, name: r.name };
         if (cursor !== null) fields["endCursor"] = cursor;
-        const d = await dispatchOne(soloQuery, fields, `${labelBase}.ctl.${r.name}.p${pageNo}`, {
+        const page = await dispatchOne(soloQuery, fields, `${labelBase}.ctl.${r.name}.p${pageNo}`, {
           arm: "control", callKind: "solo-page", repo: key, batchOrdinal: null, pageOrdinal: pageNo,
         });
-        if (d === null) {
+        if (page.kind === "quarantine") {
           stoppedBy = "dispatch-failure";
-          controlAborted = !quarantine;
+          quarantine = true; // outranks controlAborted — see the batch-page-1 site
+          resetHintEpochSec = page.resetHintEpochSec;
           break;
         }
-        const last = dispatches[dispatches.length - 1]!;
-        if (last.classification !== "ok") {
+        if (page.kind === "failed") {
           stoppedBy = "dispatch-failure";
           controlAborted = true;
           break;
         }
-        const repoObj = (d.data as Record<string, unknown> | null)?.["repository"];
+        const repoObj = (page.d.data as Record<string, unknown> | null)?.["repository"];
         pages.push(repoObj);
         const info = livePageInfo(repoObj);
         if (!info.hasNextPage) {
