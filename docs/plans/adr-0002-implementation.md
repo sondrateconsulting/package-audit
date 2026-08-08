@@ -441,7 +441,7 @@ assumed).
   review's final requirement.
 - **P1 codex review (gpt-5.6-sol @ ultra, fresh session `019fd11b-0e83-7ae3-ad39-ec9deb1b0981`,
   2026-08-05): FAIL — 5 P1 + 6 P2; every finding verified, none refuted; all 11 fixed before
-  P2 began** (commit `bf87011`). The run hit the skill's timeout mid-analysis and was resumed
+  P2 began** (commit `1b917cc`). The run hit the skill's timeout mid-analysis and was resumed
   with the §8.1 recovery message, which produced the full numbered findings. Headlines: the
   drift rule could be satisfied by a walk aborted mid-continuation (fabricated drift buying an
   invalidation re-run for a gate-deciding candidate failure) — fixed with a `stoppedBy`
@@ -456,7 +456,7 @@ assumed).
   header deltas made cost-inclusive and single-epoch-only, p2 stratum head-count enforcement,
   same-owner batch enforcement in the builder, and the page-1 shape test re-derived from the
   source-pinned solo document. One process disclosure, recorded in the runner slice's commit
-  (`7d3edf6`): that slice's implementation was drafted before its tests; the RED run was taken
+  (`1164c93`): that slice's implementation was drafted before its tests; the RED run was taken
   against a stubbed runner (12 failures for the intended reason) and the implementation
   restored to green — the failing run is real; the draft order was not test-first.
 - **P2 corpus + rvo gate (2026-08-05): the live estate could not furnish any full batch**
@@ -465,10 +465,10 @@ assumed).
   creation: **owner namespace = the `sondrateconsulting` organization; full matrix, 100
   repositories** (50 × p1 at 2 heads, 50 × p2 at 101 heads; private; retained until rvo
   authorizes deletion). Construction and the REST observation pass are recorded verbatim in
-  the corpus provenance. Freeze commit `024918d` (corpus + the prospective ADR artifact-path
+  the corpus provenance. Freeze commit `c3a13ce` (corpus + the prospective ADR artifact-path
   amendment, one commit, before any measured try).
 - **P2 codex review (gpt-5.6-sol @ ultra, fresh session `019fd340-f458-7780-9aed-973b4cd3c423`,
-  2026-08-05): FAIL — 1 P1 + 1 P2, both verified, both fixed before P3** (commit `9fd14a9`):
+  2026-08-05): FAIL — 1 P1 + 1 P2, both verified, both fixed before P3** (commit `ad17cb1`):
   the placeholder midnight `frozenAtIso` backdated the freeze (now the true post-observation
   instant), and the provenance paraphrased the procedure (now the commands verbatim, both
   strata, including the discarded email-privacy-rejected first template pair).
@@ -478,11 +478,11 @@ assumed).
   (formula confirmed; the 2× tolerance never consumed); the informational B = 50 paginating
   cell drew an HTTP 504 on its first 50-alias batch → cell terminated + the runner's
   1,400 s quarantine to the reset epoch fired exactly as pre-registered; journal + result
-  committed together (`c3e3b3f`). The 504 is live corroboration of the ADR's timeout
+  committed together (`2f61245`). The 504 is live corroboration of the ADR's timeout
   caution at a shape the operator range never reaches.
 - **P4 measured-outcome record + codex review (fresh session
   `019fd36d-8983-7480-a099-e4e0380fa17b`, 2026-08-05): FAIL — 3 P2, all verified against
-  the journal, all fixed** (`f8579b1` + `de47029`): the every-call cost claim scoped to
+  the journal, all fixed** (`bfc1d38` + `69a073f`): the every-call cost claim scoped to
   cost-readable calls (the 504 returned no rider; its penalty deducts unobserved); the
   header-delta cross-check recorded as noisy and non-corroborating (16/50 clean arm deltas
   above their rider sums, worst +4 — quiet-credential premise did not hold; gates ride the
@@ -490,7 +490,7 @@ assumed).
   candidate-only attempt (the P3 commit message carries the same overcount, immutably —
   the ADR text is the authoritative record).
 - **P5 whole-PR codex review (fresh session `019fd375-03d6-7323-b525-cebf5e1c5153`,
-  2026-08-05): FAIL — 1 P1 + 5 P2, all verified, all fixed** (`6d7a268` + the PR body). The
+  2026-08-05): FAIL — 1 P1 + 5 P2, all verified, all fixed** (`32ee05f` + the PR body). The
   P1: the quarantine obligation became durable only at the post-try row append — a crash
   between the 504 observation and that write would have resumed into the penalized window;
   the row now journals AT OBSERVATION, before even its try row (order-pinned by test). The
