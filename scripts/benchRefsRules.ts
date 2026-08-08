@@ -645,6 +645,25 @@ export interface RefsWashoutRow {
   sleptMs: number;
 }
 
+// Every physical /rate_limit attempt, recorded as it happens. These are control-plane reads, not
+// measured GraphQL spend — they bill no primary point — but benchGh's recorder exists so accounting
+// can prove ZERO unexplained traffic, and a discarded attempt proves nothing. Retries and transient
+// failures on this endpoint are exactly what would otherwise vanish. Fields mirror
+// BenchHttpAttemptRecord without importing it: the rule executor stays free of transport types.
+export interface RefsRestMetaRow {
+  rowKind: "rest-meta";
+  version: 1;
+  atIso: string;
+  label: string; // the endpoint, never a token-bearing string
+  requestClass: string;
+  attempt: number; // 1-based physical attempt within one logical call
+  status: number;
+  classification: string;
+  wallMs: number;
+  remaining: number | null;
+  resetEpochSec: number | null;
+}
+
 // a resumed run dropped genuinely torn bytes from the journal's tail. Their content is
 // unrecoverable, so the runner cannot know what it lost — and one of the things it MIGHT have lost
 // is a quarantine row, which is written before its sleep exactly so a crash cannot skip the
@@ -664,6 +683,7 @@ export type RefsProbeJournalRow =
   | RefsAdmissionRow
   | RefsAdmissionInfeasibleRow
   | RefsQuarantineRow
+  | RefsRestMetaRow
   | RefsTearRecoveredRow
   | RefsWashoutRow;
 
@@ -744,6 +764,14 @@ export function parseJournalRow(line: string): RefsProbeJournalRow {
       ["untilEpochSec", isNumOrNull], ["plannedSleepMs", isNum],
     ], "quarantine");
     return root as unknown as RefsQuarantineRow;
+  }
+  if (kind === "rest-meta") {
+    requireFields(root, [
+      ["atIso", isStr], ["label", isStr], ["requestClass", isStr], ["attempt", isNum],
+      ["status", isNum], ["classification", isStr], ["wallMs", isNum],
+      ["remaining", isNumOrNull], ["resetEpochSec", isNumOrNull],
+    ], "rest-meta");
+    return root as unknown as RefsRestMetaRow;
   }
   if (kind === "tear-recovered") {
     requireFields(root, [

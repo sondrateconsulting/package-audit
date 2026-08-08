@@ -261,7 +261,10 @@ export interface RefsProbeDeps {
   appendJournal: (row: RefsProbeJournalRow) => void;
   writeResult: (result: RefsProbeResult) => void;
   dispatchGraphql: (query: string, fields: Record<string, string>, label: string) => Promise<RefsDispatchOutcome>;
-  readRateLimit: () => Promise<RateLimitSnapshot>;
+  // takes a recorder so every PHYSICAL attempt (retries and transient failures included) is
+  // journalled as it happens — benchGh builds these records precisely so accounting can prove
+  // zero unexplained traffic, and the base context used to discard them
+  readRateLimit: (record: (r: BenchHttpAttemptRecord) => void) => Promise<RateLimitSnapshot>;
   outstandingHorizonMs: () => number;
   headroomFactor: number;
   washoutFloorMs: number;
@@ -596,6 +599,15 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
     rows.push(row);
     deps.appendJournal(row);
   };
+  // journalled at observation time, so a chain that ends in exhaustion still leaves its attempts
+  const recordRestMeta = (r: BenchHttpAttemptRecord): void => {
+    push({
+      rowKind: "rest-meta", version: 1, atIso: isoOf(deps.now()),
+      label: r.label, requestClass: r.requestClass, attempt: r.attempt,
+      status: r.status, classification: r.classification, wallMs: r.wallMs,
+      remaining: r.remaining, resetEpochSec: r.resetEpochSec,
+    });
+  };
   if (resumedFromJournal) {
     deps.log(`journal: resuming with ${rows.length} recorded row(s)`);
     // the header binds every recorded row to ONE corpus and rule revision — a journal from a
@@ -648,7 +660,7 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
       constantsFingerprint: probeConstantsFingerprint(),
     });
   }
-  const before = await deps.readRateLimit();
+  const before = await deps.readRateLimit(recordRestMeta);
   let finalWashoutMs = 0;
   try {
     for (const cell of deps.corpus.cells) {
@@ -667,7 +679,7 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
         let sleptMs = 0;
         let remainingObserved = 0;
         for (;;) {
-          const snap = await deps.readRateLimit();
+          const snap = await deps.readRateLimit(recordRestMeta);
           remainingObserved = snap.graphql.remaining;
           if (snap.graphql.remaining >= arithmetic.neededPoints) break;
           const wait = sleepToResetMs(snap.graphql.reset, deps.now());
@@ -694,7 +706,7 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
           // window after one, so the runner quarantines to the next reset epoch before ANY
           // further dispatch anywhere. The obligation row was journaled AT OBSERVATION (inside
           // the try, before its row) — here we only perform the sleep, on the current clock.
-          const hint = resetHintEpochSec ?? (await deps.readRateLimit()).graphql.reset;
+          const hint = resetHintEpochSec ?? (await deps.readRateLimit(recordRestMeta)).graphql.reset;
           const wait = sleepToResetMs(hint, deps.now());
           deps.log(`quarantine: 502/504 observed — sleeping ${Math.ceil(wait / 1000)}s to the next reset epoch`);
           await deps.sleep(wait);
@@ -711,7 +723,7 @@ export async function runRefsProbe(deps: RefsProbeDeps): Promise<RefsProbeResult
     await deps.sleep(finalWashoutMs);
     push({ rowKind: "washout", version: 1, atIso: isoOf(deps.now()), sleptMs: finalWashoutMs });
   }
-  const after = await deps.readRateLimit();
+  const after = await deps.readRateLimit(recordRestMeta);
 
   // ---- reduce, gate, select (all pre-registered rules) ----
   const tryRowsFor = (b: number, s: RefsStratum): RefsTryRow[] =>
@@ -856,7 +868,7 @@ async function main(): Promise<void> {
       if (captured === null) throw new BenchRefsRulesError("dispatch recorded no attempt row");
       return { d, rec: captured };
     },
-    readRateLimit: () => readRateLimit(gh),
+    readRateLimit: (record) => readRateLimit({ ...gh, record }),
     outstandingHorizonMs: () => outstandingHorizonMs(gh),
     headroomFactor: cfg.budget.headroomFactor,
     washoutFloorMs: washoutMs(cfg, 0, 0),

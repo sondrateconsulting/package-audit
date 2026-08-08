@@ -1043,6 +1043,15 @@ The exemption does not touch the measured result. It bills a different bucket, i
 (one chain per invocation, at most six attempts), and no gate, reducer, or estate figure in
 this ADR reads REST-core spend.
 
+`GET /rate_limit` is deliberately **not** covered by this exemption. Those reads happen after
+the journal header exists, so they can be recorded and now are: each physical attempt is
+appended as a `rest-meta` row at observation time, which keeps a chain that ends in exhaustion
+visible even though the result artifact is written only on success. The Stage-P journal below
+predates that accounting and therefore contains no `rest-meta` rows; its `/rate_limit` reads
+are unrecorded. That is a gap in the historical evidence, disclosed rather than backfilled —
+the artifact is append-only, and those attempts bill no primary point, so no measured figure
+in this ADR depends on them.
+
 ### Disclosed defect in the Stage-P evidence: a machine-local path
 
 `refs-probe.json` and the journal header of the Stage-P run record `benchConfigPath` as an
