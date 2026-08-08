@@ -87,7 +87,7 @@ function seedTwoRuns(db: AuditDb): { oldRun: RunRecord; newRun: RunRecord } {
     exportName: "oldExport", context: "", filePath: "src/old.ts", lineNumber: 9,
     permalink: perma("aaa111", "src/old.ts", 9), snippet: "old-run snippet", foundAt: T1,
   });
-  db.completeRun(r1);
+  db.completeRun(r1, { discoveryScopesDeferred: 0 });
 
   // Surfaces for BOTH versions; 49.0.0 is resolved only via the OLD run's rows, so the NEW
   // run's default export must slice it out. writeApiSurface appends the '__complete__' marker.
@@ -130,7 +130,7 @@ function seedTwoRuns(db: AuditDb): { oldRun: RunRecord; newRun: RunRecord } {
     exportName: "", context: "", filePath: "src/b.ts", lineNumber: 7,
     permalink: perma("bbb222", "src/b.ts", 7), snippet: 'const e = require("expo"), x = 1;\nnext', foundAt: T2,
   });
-  db.completeRun(r2);
+  db.completeRun(r2, { discoveryScopesDeferred: 0 });
   return { oldRun: db.getRun(r1)!, newRun: db.getRun(r2)! };
 }
 
@@ -342,7 +342,7 @@ describe("CSV / JSONL goldens (exact bytes)", () => {
     // header claimed four: policy exclusions moved to their own status and took the last skipped-cutoff
     // row with them.
     db.upsertRunUnitHead({ ...base, branch: "ancient", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null });
-    db.completeRun(runId);
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
     return db.getRun(runId)!;
   }
 
@@ -607,12 +607,12 @@ describe("head-join discrimination (dual-review round 1)", () => {
     const { runId: rA } = db.startRun(input);
     db.upsertRunUnitHead({ runId: rA, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.upsertUsageFinding({ runId: rA, ...finding });
-    db.completeRun(rA);
+    db.completeRun(rA, { discoveryScopesDeferred: 0 });
     Bun.sleepSync(2);
     const { runId: rB } = db.startRun(input);
     db.upsertRunUnitHead({ runId: rB, ...unit, status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.upsertUsageFinding({ runId: rB, ...finding }); // same UNIQUE key → run_id moves to rB
-    db.completeRun(rB);
+    db.completeRun(rB, { discoveryScopesDeferred: 0 });
 
     // Precondition: the row's run_id really did move (otherwise this test discriminates nothing).
     const moved = db.read("SELECT run_id FROM usage_findings WHERE file_path = 'src/shared.ts'").get() as { run_id: string };
@@ -660,7 +660,7 @@ describe("api-surface export requires the completion marker (F5)", () => {
     }
     // Strip 2.0.0's completion marker — the legacy-migration shape (rows preserved, no marker).
     rawDb.exec(`DELETE FROM package_api_surface WHERE version = '2.0.0' AND export_kind = '__complete__'`);
-    db.completeRun(runId);
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
     const run = db.getRun(runId)!;
 
     const out = mkdtempSync(join(tmpdir(), "export-f5-"));
@@ -683,7 +683,7 @@ describe("export — run_unit_head soundness gate (same whole-row rules as repor
     const path = join(DB_ROOT, "guard-gate.db");
     const db = AuditDb.open({ sqlitePath: path });
     const { runId } = db.startRun({ configHash: "h", effectiveOwners: ["org-a"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
-    db.completeRun(runId);
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
     db.close();
     // A DEFAULT branch marked policy-excluded: no SQL CHECK covers defaultness, so NO pragma is
     // needed — the read gate is this row's only defense, and before it existed the default export

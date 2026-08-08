@@ -1801,7 +1801,7 @@ describe("runSummaryText", () => {
     const text = runSummaryText("run-abc", {
       organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
       branchesSkippedByCutoff: 13, branchesExcludedByPolicy: 5, branchesPastCap: 2, branchesErrored: 4,
-      branchesDeferred: 0, totalDependencyFindings: 104, totalUsageFindings: 994,
+      branchesDeferred: 0, discoveryScopesDeferred: 0, totalDependencyFindings: 104, totalUsageFindings: 994,
     }, 3, "output/run-run-abc.json");
     // labels + values pinned; column padding is cosmetic and free to change
     expect(text).toContain("AUDIT COMPLETE — run run-abc");
@@ -1821,12 +1821,49 @@ describe("runSummaryText", () => {
     const text = runSummaryText("run-abc", {
       organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
       branchesSkippedByCutoff: 13, branchesExcludedByPolicy: 5, branchesPastCap: 2, branchesErrored: 0,
-      branchesDeferred: 37, totalDependencyFindings: 104, totalUsageFindings: 994,
+      branchesDeferred: 37, discoveryScopesDeferred: 0, totalDependencyFindings: 104, totalUsageFindings: 994,
     }, 0, "output/run-run-abc.json");
     // the exact field condition this line exists for: sustained rate limiting with zero recorded
     // errors must not read as a complete audit
     expect(text).toMatch(/Errors recorded:\s+0\b/);
     expect(text).toMatch(/Branches deferred:\s+37 \(pending queue; retry requires rediscovery and eligibility\) — the scanned counts above are PARTIAL/);
+  });
+
+  // The §4 DISCOVERY blind spot: a throttled owner/repo listing enqueues nothing and errors nothing,
+  // so branchesDeferred AND errors are both legitimately 0 while part of the estate was never seen.
+  // Before this line the summary printed two reassuring zeros and no warning at all.
+  test("a DISCOVERY deferral alone flags PARTIAL — zero branches deferred, zero errors, still not complete", () => {
+    const text = runSummaryText("run-abc", {
+      organizationsScanned: 1, repositoriesScanned: 0, branchesScanned: 0,
+      branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
+      branchesDeferred: 0, discoveryScopesDeferred: 2, totalDependencyFindings: 0, totalUsageFindings: 0,
+    }, 0, "output/run-run-abc.json");
+    expect(text).toMatch(/Branches deferred:\s+0\b/); // the queue really is empty…
+    expect(text).toMatch(/Errors recorded:\s+0\b/); // …and nothing errored…
+    expect(text).toMatch(/Discovery scopes deferred:\s+2\b/); // …but two scopes were never enumerated
+    expect(text).toContain("PARTIAL");
+  });
+
+  test("UNKNOWN discovery evidence prints unknown, never 0 — a pre-v5 or unsealed run claims nothing", () => {
+    const text = runSummaryText("run-abc", {
+      organizationsScanned: 1, repositoriesScanned: 1, branchesScanned: 1,
+      branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
+      branchesDeferred: 0, discoveryScopesDeferred: null, totalDependencyFindings: 0, totalUsageFindings: 0,
+    }, 0, "output/run-run-abc.json");
+    expect(text).toMatch(/Discovery scopes deferred:\s+unknown/);
+    expect(text).not.toMatch(/Discovery scopes deferred:\s+0\b/); // rendering null as 0 would over-claim
+    // unknown is not a positive deferral, so it must not shout PARTIAL — it says "cannot tell"
+    expect(text).not.toContain("PARTIAL");
+  });
+
+  test("a clean run states an explicit zero on BOTH deferral lines and stays non-PARTIAL", () => {
+    const text = runSummaryText("run-abc", {
+      organizationsScanned: 1, repositoriesScanned: 1, branchesScanned: 1,
+      branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
+      branchesDeferred: 0, discoveryScopesDeferred: 0, totalDependencyFindings: 0, totalUsageFindings: 0,
+    }, 0, "output/run-run-abc.json");
+    expect(text).toMatch(/Discovery scopes deferred:\s+0\b/);
+    expect(text).not.toContain("PARTIAL");
   });
 });
 
@@ -1938,11 +1975,58 @@ describe("processRepo throttle requeue (§4)", () => {
     // under sustained rate limiting cannot deliver an all-clean report while work was deferred.
     const { db, runId } = openRun();
     await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), rt(config, "hash"), runId, "o", repo, [], new Set());
-    db.completeRun(runId);
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
     const s = buildReport(db, db.getRun(runId)!).summary;
     expect(s.branchesDeferred).toBe(1);
     expect(s.branchesErrored).toBe(0); // deferred stays OUT of the error count (deferred ≠ errored)
     expect(s.branchesScanned).toBe(0);
+    db.close();
+  });
+
+  // §4 DISCOVERY-scope throttle evidence. A throttled owner/repo discovery enqueues NOTHING and
+  // records NO error, so branchesDeferred (a work_queue count) structurally cannot see it: without
+  // this accumulator a run whose whole owner listing throttled completes and prints
+  // "Branches deferred: 0 / Errors recorded: 0" — the exact false all-clear this PR exists to kill.
+  test("a throttled BRANCH discovery records one repo-scope deferral (no queue row, no errors row)", async () => {
+    const { db, runId } = openRun();
+    const throttling = { listBranchHeads: async () => { throw new ThrottleExhausted("core bucket"); } } as unknown as GithubClient;
+    const deferred = new Set<string>();
+    const cov = await processRepo(db, throttling, rt(config, "hash"), runId, "o", repo, [], new Set(), new Set(), undefined, undefined, deferred);
+    expect(cov).toBeNull(); // discovery failed — this repo contributes no coverage
+    expect(deferred.size).toBe(1); // ...but the deferral is now EVIDENCE, not silence
+    // and it is invisible to both existing surfaces, which is why it needed its own counter
+    expect(db.read("SELECT COUNT(*) AS n FROM work_queue").get()).toEqual({ n: 0 });
+    expect(db.read("SELECT COUNT(*) AS n FROM errors").get()).toEqual({ n: 0 });
+    db.close();
+  });
+
+  test("a throttled OWNER repo-listing records one org-scope deferral", async () => {
+    const { db, runId } = openRun();
+    const throttling = { listOrgRepos: async () => { throw new ThrottleExhausted("core bucket"); } } as unknown as GithubClient;
+    const deferred = new Set<string>();
+    const cov = await processOwner(db, throttling, rt(config, "hash"), runId, "o", null, [], new Set(), new Set(), undefined, undefined, deferred);
+    expect(cov).toEqual([]);
+    expect(deferred.size).toBe(1);
+    db.close();
+  });
+
+  test("deferrals are DISTINCT scopes, so a re-processed scope cannot inflate the count", async () => {
+    const { db, runId } = openRun();
+    const throttling = { listBranchHeads: async () => { throw new ThrottleExhausted("core bucket"); } } as unknown as GithubClient;
+    const deferred = new Set<string>();
+    await processRepo(db, throttling, rt(config, "hash"), runId, "o", repo, [], new Set(), new Set(), undefined, undefined, deferred);
+    await processRepo(db, throttling, rt(config, "hash"), runId, "o", repo, [], new Set(), new Set(), undefined, undefined, deferred);
+    expect(deferred.size).toBe(1);
+    db.close();
+  });
+
+  test("a PERMANENT discovery failure is NOT a deferral — it already has an errors row", async () => {
+    const { db, runId } = openRun();
+    const failing = { listBranchHeads: async () => { throw new GithubApiError("boom", { endpoint: "x" }); } } as unknown as GithubClient;
+    const deferred = new Set<string>();
+    await processRepo(db, failing, rt(config, "hash"), runId, "o", repo, [], new Set(), new Set(), undefined, undefined, deferred);
+    expect(deferred.size).toBe(0); // counted as an ERROR, never double-counted as deferred work
+    expect(db.read("SELECT COUNT(*) AS n FROM errors").get()).toEqual({ n: 1 });
     db.close();
   });
 
@@ -2083,13 +2167,13 @@ describe("past-cap settles a stale throttle-pending queue row (§4→§7 double-
     // Run A: heads arrive committedDate DESC; feat-x fills the single non-default slot; both scans throttle.
     const runA = startCapRun(db);
     await processRepo(db, clientFor({ heads: [capMain, featX], defaultBranch: "main" }, new ThrottleExhausted("core bucket")), rt(capConfig, "cap-hash"), runA.runId, "o", repo, [], new Set());
-    db.completeRun(runA.runId);
+    db.completeRun(runA.runId, { discoveryScopesDeferred: 0 });
     expect(db.getUnit(XKEY)?.status).toBe("pending"); // the §4 carve-out left feat-x deferred
     // Run B, same config: feat-y (newer) claims the slot, feat-x is past-cap; failures are PERMANENT.
     const runB = startCapRun(db);
     expect(runB.resumed).toBe(false);
     await processRepo(db, clientFor({ heads: [capMain, featY, featX], defaultBranch: "main" }, new GithubApiError("boom", { endpoint: "x" })), rt(capConfig, "cap-hash"), runB.runId, "o", repo, [], new Set());
-    db.completeRun(runB.runId);
+    db.completeRun(runB.runId, { discoveryScopesDeferred: 0 });
     // the stale pending row is settled the moment run B surfaces feat-x as past-cap…
     const settled = db.getUnit(XKEY)!;
     expect(settled.status).toBe("skipped");

@@ -31,7 +31,7 @@ function fixtureReport(): DossierReport {
     permalink: "https://github.com/org-a/app/blob/abc123def4567/src/icons.tsx#L3",
     snippet: "import { Ionicons } from '@expo/vector-icons';", foundAt: T0,
   });
-  db.completeRun(runId);
+  db.completeRun(runId, { discoveryScopesDeferred: 0 });
   const report = buildReport(db, db.getRun(runId)!) as unknown as DossierReport;
   db.close();
   // Pin the two nondeterministic envelope fields so the index renders byte-identically
@@ -48,7 +48,26 @@ const OPTS = { formatVersion: XRAY_FORMAT_VERSION };
 // re-pass bidi-isolation rule moved these bytes. Same sanction rule as reportHtml.test.ts.
 // PRE-LAUNCH RE-PIN (M4 bidi fix): `.branchnote` gains `unicode-bidi:isolate` in the shared
 // PAGE_CSS, shifting the index bytes too. CSS-only.
-const GOLDEN_INDEX_SHA256 = "f0083ae7cee2dcfff907b64d7d3b9650e5c5556ab06de81f9e41968add38ca40";
+// SANCTIONED RE-PIN (v2 → v3, §4 throttle visibility): XRAY_FORMAT_VERSION moved 2 → 3, which is
+// the ONE condition under which this pin may change. Proven non-laundering by the re-pin guard
+// above: the v2 render still hashes to GOLDEN_INDEX_SHA256_V2, and substituting the two version
+// needles reproduces this v3 render exactly — no other byte moved.
+const GOLDEN_INDEX_SHA256 = "c644fea642f0f1f138fffd7c047aed42194f1d67afd31161374b2a68bdf98c67";
+
+// The v2 pin this replaced, kept as the RE-PIN PROOF (see reportHtml.test.ts for the full rationale).
+const GOLDEN_INDEX_SHA256_V2 = "f0083ae7cee2dcfff907b64d7d3b9650e5c5556ab06de81f9e41968add38ca40";
+
+describe("golden re-pin guard (v2 → v3): the bump is the ONLY byte change", () => {
+  test("index: v2 hash unchanged, v3 differs only by the version digits", () => {
+    const report = fixtureReport();
+    const v2 = renderIndex(report, { formatVersion: 2 });
+    expect(createHash("sha256").update(v2, "utf8").digest("hex")).toBe(GOLDEN_INDEX_SHA256_V2);
+    const bumped = v2
+      .replaceAll(`<meta name="xray-format-version" content="2">`, `<meta name="xray-format-version" content="3">`)
+      .replaceAll("report-format version 2 ·", "report-format version 3 ·");
+    expect(bumped).toBe(renderIndex(report, { formatVersion: 3 }));
+  });
+});
 
 describe("renderIndex — copy-as-markdown neutralizes a hostile value through the real render path", () => {
   // Package names are validated and versionsSeen is the valid-semver slice, so a payload cannot
@@ -114,6 +133,37 @@ describe("renderIndex", () => {
     expect(renderIndex(deferred, OPTS)).toContain("3 branches still pending");
   });
 
+  // Every dossier footer links to #scan-scope for the full coverage story, so that panel must
+  // actually CARRY the deferred count — otherwise the link sends a reader looking for it to a
+  // panel that shows only the four terminal dispositions and silently omits the remainder.
+  test("the #scan-scope panel the dossier footers link to carries the deferred count", () => {
+    const base = fixtureReport();
+    const deferred: DossierReport = { ...base, summary: { ...base.summary, branchesDeferred: 3 } };
+    const panel = (html: string) => html.slice(html.indexOf('id="scan-scope"'), html.indexOf('id="packages"'));
+    expect(panel(renderIndex(deferred, OPTS))).toContain("3 branches still pending");
+    // zero stays suppressed here too — this is what keeps GOLDEN_INDEX_SHA256 valid
+    expect(panel(renderIndex(base, OPTS))).not.toContain("still pending");
+  });
+
+  // The discovery blind spot on the run's canonical coverage panel. Unlike branchesDeferred this can
+  // be UNKNOWN (null) for a pre-v5 or unsealed run, and unknown must never render as a reassuring 0.
+  test("#scan-scope carries the discovery-deferral count, and says UNKNOWN rather than zero when unsealed", () => {
+    const base = fixtureReport();
+    const panel = (r: DossierReport) => {
+      const h = renderIndex(r, OPTS);
+      return h.slice(h.indexOf('id="scan-scope"'), h.indexOf('id="packages"'));
+    };
+    expect(panel({ ...base, summary: { ...base.summary, discoveryScopesDeferred: 2 } })).toContain("2 discovery scopes rate-limited");
+    // null is UNKNOWN — an explicit caveat, never silence and never 0
+    const unknown = panel({ ...base, summary: { ...base.summary, discoveryScopesDeferred: null } });
+    expect(unknown).toContain("not recorded");
+    expect(unknown).not.toContain("0 discovery scopes");
+    // an explicit sealed zero says nothing (that suppression keeps GOLDEN_INDEX_SHA256 valid)
+    const clean = panel(base);
+    expect(clean).not.toContain("discovery scope");
+    expect(clean).not.toContain("not recorded");
+  });
+
   test("carries the BYTE-IDENTICAL static script and the same CSP as every dossier", () => {
     expect(html).toContain(`<script>${STATIC_SCRIPT}</script>`);
     expect(html.split("<script").length - 1).toBe(1);
@@ -140,7 +190,7 @@ describe("renderIndex — edge states", () => {
     generatedAt: T0,
     config: { cutoffDate: "2024-01-01", githubHost: "github.com", organizations: ["org-a"] },
     packages,
-    summary: { repositoriesScanned: 0, branchesScanned: 0, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesDeferred: 0 },
+    summary: { repositoriesScanned: 0, branchesScanned: 0, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesDeferred: 0, discoveryScopesDeferred: 0 },
     scanScope: { excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "complete" },
   });
 
@@ -167,7 +217,7 @@ describe("renderIndex — edge states", () => {
   test("scan-scope panel: disposition ledger, subcounts, and esc() on hostile branch names + deny patterns", () => {
     const report: DossierReport = {
       ...baseReport([]),
-      summary: { repositoriesScanned: 1, branchesScanned: 2, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 2, branchesPastCap: 1, branchesDeferred: 0 },
+      summary: { repositoriesScanned: 1, branchesScanned: 2, branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 2, branchesPastCap: 1, branchesDeferred: 0, discoveryScopesDeferred: 0 },
       scanScope: {
         excludedByDeny: 1, excludedByAllow: 1, defaultBranchPolicyOverrides: 1,
         policyBranches: [
@@ -205,7 +255,7 @@ describe("renderIndex — edge states", () => {
     expect(complete).not.toContain("were not fully recorded"); // default fixture is v4-native
     const preUpgrade: DossierReport = {
       ...baseReport([]),
-      summary: { repositoriesScanned: 1, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesDeferred: 0 },
+      summary: { repositoriesScanned: 1, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesDeferred: 0, discoveryScopesDeferred: 0 },
       scanScope: { excludedByDeny: 0, excludedByAllow: 0, defaultBranchPolicyOverrides: 0, policyBranches: [], provenance: "pre-upgrade" },
     };
     const html = renderIndex(preUpgrade, OPTS);

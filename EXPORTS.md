@@ -242,11 +242,22 @@ rows are always `0`.
 | cutoff_date | string |
 | github_host | string |
 | status | string |
+| discovery_scopes_deferred | nullable-number |
 
 Row order: `run_id`
 
 Notes: `effective_owners` and `tracked_packages` are JSON arrays serialized as text —
 DuckDB reads them with `from_json(...)`, jq with `fromjson`.
+
+`discovery_scopes_deferred` is the §4 discovery-throttle evidence: how many DISTINCT discovery
+scopes (one per owner repo-listing, one per repository branch-listing) exhausted their rate-limit
+budget during this run. Those scopes enumerated nothing, so they enqueue no work and record no
+error — they are invisible to both `branchesErrored` and the report's `branchesDeferred`, which is
+why the count is persisted here instead of being derived. **`null` means UNKNOWN, never zero**: a
+run that is still running, that failed, or that predates schema v5 sealed no evidence. Only
+`completeRun` writes it, so a completed run always carries an explicit integer (`0` included).
+Read it as per-run immutable evidence — unlike the report's `branchesDeferred`, which is the
+current pending-queue backlog for the whole config at the moment the report was generated.
 
 ## Analyzing the exports
 

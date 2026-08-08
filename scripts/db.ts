@@ -44,7 +44,7 @@ function assertNever(x: never, what: string): never {
 // Bump when the schema changes; older on-disk versions run the §3 VERSION-STEPPED migration
 // chain — each step is one transaction that stamps its own target version, so a crash between
 // steps leaves a valid intermediate database that the next open resumes from.
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 // Every migration step stamps its own PINNED target version — never the mutable
 // SCHEMA_VERSION. (If a step stamped SCHEMA_VERSION, bumping the constant would make a crash
 // between two steps leave an intermediate-SHAPED database stamped at the new version, and every
@@ -56,6 +56,10 @@ const V3_TARGET_VERSION = 3;
 // TABLE REBUILD, and the migration classifies the on-disk shape first to reject an incompatible v4
 // (e.g. a sibling branch that also stamped 4 with a different run_unit_head) rather than adopting it.
 const V4_TARGET_VERSION = 4;
+// migrateV4toV5's target (§4 discovery-throttle evidence: runs gains a NULLABLE
+// discovery_scopes_deferred). Additive ALTER only — no table rebuild, so a pre-v5 row backfills
+// NULL by construction: "no evidence recorded" is a DIFFERENT claim from "nothing was deferred".
+const V5_TARGET_VERSION = 5;
 
 // §0 OWNERSHIP PROOF. The OLDEST version this tool has ever stamped: db.ts shipped at
 // SCHEMA_VERSION = 2 in its first commit and has stamped >= 2 ever since. `PRAGMA user_version`
@@ -136,6 +140,11 @@ export interface RunRecord {
   cutoffDate: string;
   githubHost: string;
   status: RunStatus;
+  // §4 discovery-throttle evidence, sealed by completeRun. NULL = UNKNOWN, never "none": a run that
+  // is still RUNNING, that FAILED, or that predates v5 recorded no evidence. A completed v5 run
+  // always carries an explicit integer (0 included). Immutable per-run evidence — contrast
+  // ReportSummary.branchesDeferred, which is the mutable current-config queue backlog.
+  discoveryScopesDeferred: number | null;
 }
 
 export interface RunInput {
@@ -324,7 +333,8 @@ CREATE TABLE IF NOT EXISTS runs (
   tracked_packages TEXT NOT NULL DEFAULT '[]',
   cutoff_date TEXT NOT NULL DEFAULT '',
   github_host TEXT NOT NULL DEFAULT 'github.com',
-  status TEXT NOT NULL CHECK (status IN ('running','completed','failed'))
+  status TEXT NOT NULL CHECK (status IN ('running','completed','failed')),
+  discovery_scopes_deferred INTEGER
 );
 CREATE TABLE IF NOT EXISTS work_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -508,7 +518,8 @@ export function tableShapesAt(version: number): ReadonlyMap<string, string> {
   if (cached !== undefined) return new Map(cached);
   const ref = new Database(":memory:", { strict: true });
   try {
-    ref.exec(SCHEMA_SQL); // the CURRENT (v4) schema
+    ref.exec(SCHEMA_SQL); // the CURRENT (v5) schema
+    if (version < V5_TARGET_VERSION) ref.exec("ALTER TABLE runs DROP COLUMN discovery_scopes_deferred");
     if (version < V4_TARGET_VERSION) {
       ref.exec("DROP TABLE run_unit_head");
       ref.exec(`CREATE TABLE run_unit_head (${RUN_UNIT_HEAD_V3_BODY});`);
@@ -967,6 +978,19 @@ function migrateV2toV3(db: Database): void {
     db.exec(SCHEMA_SQL);
     addColumnIfMissing(db, "run_unit_head", "is_default_branch", "INTEGER");
     setUserVersion(db, V3_TARGET_VERSION);
+  })();
+}
+
+// migrateV4toV5 — additive: runs gains a nullable discovery_scopes_deferred. Pre-v5 rows backfill
+// NULL by construction (ALTER ADD COLUMN), NEVER 0 — a run that recorded no evidence must render as
+// UNKNOWN, because reporting 0 would assert the very completeness the column exists to disprove.
+// SCHEMA_SQL runs FIRST for the same reason migrateV2toV3 does: a `--fresh` drop can remove `runs`
+// while preserved caches keep the database non-empty, so the ALTER needs the table to exist.
+function migrateV4toV5(db: Database): void {
+  db.transaction(() => {
+    db.exec(SCHEMA_SQL);
+    addColumnIfMissing(db, "runs", "discovery_scopes_deferred", "INTEGER");
+    setUserVersion(db, V5_TARGET_VERSION);
   })();
 }
 
@@ -1888,6 +1912,7 @@ export class AuditDb {
       // MIN_OWNED_VERSION rather than adopting and rebuilding it, so userVersion is >= 2 here.
       if (readUserVersion(db) < V3_TARGET_VERSION) migrateV2toV3(db);
       if (readUserVersion(db) < V4_TARGET_VERSION) migrateV3toV4(db);
+      if (readUserVersion(db) < V5_TARGET_VERSION) migrateV4toV5(db);
     } else {
       // Current-stamp (v4) self-heal, SHAPE-keyed: the compatibility gate already rejected every
       // UNRECOGNIZED shape, but a recognized PREDECESSOR era under the current stamp (external
@@ -1900,6 +1925,13 @@ export class AuditDb {
       // failed here (the migration-boundary rule belongs to migrateV3toV4 alone).
       db.transaction(() => {
         healRunUnitHeadShape(db);
+        // v5 span entry: a current-stamped database whose `runs` lost discovery_scopes_deferred
+        // (the same external-damage class) is healable by the same additive ALTER the migration
+        // uses. Idempotent, and it restores NULL — the honest "no evidence recorded" value, never 0.
+        // tableExists-guarded because a `--fresh` drop leaves the preserved caches keeping this
+        // database non-empty while `runs` itself is GONE; verifyRunUnitHeadFingerprint's SCHEMA_SQL
+        // below recreates it (already v5-shaped), so the ALTER must not fire on the missing table.
+        if (tableExists(db, "runs")) addColumnIfMissing(db, "runs", "discovery_scopes_deferred", "INTEGER");
         verifyRunUnitHeadFingerprint(db, "self-heal");
       })();
     }
@@ -2068,10 +2100,21 @@ export class AuditDb {
     return tx();
   }
 
-  completeRun(runId: string): void {
+  // Seals the run: status, completion timestamp, and the §4 discovery-throttle evidence move in ONE
+  // statement, so a completed run can never exist without its evidence. The parameter is MANDATORY
+  // and has no default — an implicit 0 is exactly the false all-clear this evidence exists to
+  // prevent, and requiring it at the type level forces every completion site to state what it saw.
+  // Only completeRun writes the column: failRun deliberately leaves NULL, because a failed run's
+  // coverage is unknowable rather than zero.
+  completeRun(runId: string, evidence: { discoveryScopesDeferred: number }): void {
+    const n = evidence.discoveryScopesDeferred;
+    // Validated HERE, not by a SQL CHECK: keeping the column constraint-free keeps the v4→v5 ALTER
+    // additive and the table's shape fingerprint (the ownership oracle) trivially comparable.
+    if (!Number.isInteger(n) || n < 0)
+      fail(`completeRun: discoveryScopesDeferred must be a non-negative integer (got ${String(n)})`);
     this.db
-      .query(`UPDATE runs SET status='completed', completed_at = ? WHERE run_id = ?`)
-      .run(nowIso(), runId);
+      .query(`UPDATE runs SET status='completed', completed_at = ?, discovery_scopes_deferred = ? WHERE run_id = ?`)
+      .run(nowIso(), n, runId);
   }
 
   // completed_at stays NULL on failure — §7's generatedAt falls back to started_at.
@@ -2537,6 +2580,7 @@ interface RunRow {
   run_id: string; started_at: string; completed_at: string | null; config_hash: string;
   effective_owners: string; owners_source: OwnersSource; tracked_packages: string;
   cutoff_date: string; github_host: string; status: RunStatus;
+  discovery_scopes_deferred: number | null;
 }
 interface WorkQueueRow {
   id: number; config_hash: string; created_run_id: string; last_run_id: string;
@@ -2573,6 +2617,7 @@ function mapRun(row: RunRow): RunRecord {
     cutoffDate: row.cutoff_date,
     githubHost: row.github_host,
     status: row.status,
+    discoveryScopesDeferred: row.discovery_scopes_deferred,
   };
 }
 

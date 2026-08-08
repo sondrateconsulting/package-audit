@@ -133,6 +133,24 @@ export interface ReportSummary {
   // 'done'; skip-cutoff/skip-policy → 'skipped'; past-cap → 'skipped' via settlePastCapUnit) — or
   // throttles again and leaves it pending.
   branchesDeferred: number;
+  // The §4 DISCOVERY blind spot, made visible — the one hole branchesDeferred structurally cannot
+  // see. A throttled owner repo-listing or repository branch-listing enumerates nothing, so it
+  // enqueues no work unit and (by §4 design) records no errors row: its branches are invisible to
+  // the queue count above AND to branchesErrored. This counts the DISTINCT discovery scopes that
+  // exhausted their budget during the reported run.
+  //
+  // Read it as the OPPOSITE currency to branchesDeferred, and never sum the two:
+  //   - branchesDeferred      = the CURRENT pending backlog for the whole config, re-read at
+  //                             generation time (a later run drains it; re-rendering reports 0).
+  //   - discoveryScopesDeferred = IMMUTABLE per-run evidence, sealed by completeRun when the owner
+  //                             pool drained. Re-rendering an old run cannot launder it clean.
+  // One scope can hide an unbounded number of repos/branches, which is why it counts SCOPES and its
+  // name says so — it is not a branch count and must never be added to one.
+  //
+  // NULL means UNKNOWN, never "none": the run is still running, it failed, or it predates schema v5
+  // (migrated rows backfill NULL by construction). A surface that renders NULL as 0 would assert the
+  // very completeness this field exists to disprove — say "unknown", or say nothing.
+  discoveryScopesDeferred: number | null;
   totalDependencyFindings: number;
   totalUsageFindings: number;
 }
@@ -257,7 +275,11 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     // guarded only policy-BEARING rows while buildSummary counted by status alone, so a 'policy-excluded'
     // row naming no rule was counted as an exclusion yet never guarded — branchesExcludedByPolicy=1 with
     // excludedByDeny+excludedByAllow=0). Sweeping the whole set makes the two impossible to drift apart.
-    summary: buildSummary(scannedHeads, validatedHeads, depRows, usageRows, { branchesErrored, branchesDeferred }),
+    // discoveryScopesDeferred rides the RUN ROW, not a query: it was sealed at completion, and
+    // re-deriving it here would reintroduce the generation-time drift it exists to avoid.
+    summary: buildSummary(scannedHeads, validatedHeads, depRows, usageRows, {
+      branchesErrored, branchesDeferred, discoveryScopesDeferred: run.discoveryScopesDeferred,
+    }),
     scanScope: buildScanScope(validatedHeads),
   };
 }
@@ -272,7 +294,7 @@ function assertHeadsWellFormed(heads: HeadRow[]): HeadRow[] {
 // The two externally-derived counts arrive as a keyed pair (not trailing positional numbers): keyed
 // passing removes SILENT positional transposition — an argument-order swap cannot compile, though
 // deliberately crossing the two values under the right keys still would.
-function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[], counts: Pick<ReportSummary, "branchesErrored" | "branchesDeferred">): ReportSummary {
+function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[], counts: Pick<ReportSummary, "branchesErrored" | "branchesDeferred" | "discoveryScopesDeferred">): ReportSummary {
   const orgs = new Set(scannedHeads.map((h) => h.organization));
   const repos = new Set(scannedHeads.map((h) => `${h.organization}/${h.repository}`));
   return {
@@ -286,6 +308,7 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
     branchesPastCap: allHeads.filter((h) => h.status === "past-cap").length,
     branchesErrored: counts.branchesErrored,
     branchesDeferred: counts.branchesDeferred,
+    discoveryScopesDeferred: counts.discoveryScopesDeferred,
     totalDependencyFindings: depRows.length,
     totalUsageFindings: usageRows.length,
   };

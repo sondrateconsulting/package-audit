@@ -141,6 +141,10 @@ const RUNS_COLUMNS = [
   { name: "cutoff_date", type: "string" },
   { name: "github_host", type: "string" },
   { name: "status", type: "string" },
+  // §4 discovery-throttle evidence (v5). NULLABLE on purpose, and the null is load-bearing: a run
+  // that is still running, that failed, or that predates v5 recorded NO evidence, which is a
+  // different claim from "nothing was deferred". A consumer must read null as UNKNOWN, never 0.
+  { name: "discovery_scopes_deferred", type: "nullable-number" },
 ] as const satisfies readonly ExportColumn[];
 
 const USAGE_FINDINGS_COLUMNS = [
@@ -241,6 +245,7 @@ export type RunsExportRow = {
   run_id: string; started_at: string; completed_at: string | null; config_hash: string;
   effective_owners: string; owners_source: string; tracked_packages: string;
   cutoff_date: string; github_host: string; status: string;
+  discovery_scopes_deferred: number | null;
 };
 export type UsageFindingsExportRow = {
   run_id: string; organization: string; repository: string; branch: string; commit_sha: string;
