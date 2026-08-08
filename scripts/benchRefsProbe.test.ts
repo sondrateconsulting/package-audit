@@ -205,7 +205,7 @@ function makeDeps(corpus: RefsProbeCorpus, script: ReturnType<typeof scriptedGit
       events.push(`dispatch:${label}`);
       return script.dispatch(query, fields, label);
     },
-    readRateLimit: async () => rl(4_900),
+    readRateLimit: async () => rl(4_900),  // default: no attempt records
     outstandingHorizonMs: () => 0,
     headroomFactor: 1.1,
     washoutFloorMs: 60_000,
@@ -668,6 +668,51 @@ describe("runRefsProbe — resume from the journal (crash-safe, no double-spend)
   // obligation. If that very append is what tore, the row is unparseable and gets dropped — and
   // with it the backoff. The dropped bytes are unrecoverable, so the runner cannot know what it
   // lost; it must assume the worst and back off before spending again.
+  // benchGh builds an attempt record for every physical /rate_limit call so accounting can prove
+  // zero unexplained traffic; the runner's base context used to discard them, so retries and
+  // transient failures on that endpoint vanished. A completion-only counter would not do: the
+  // result is written ONLY on success, so a chain that ends in exhaustion would leave no trace.
+  test("every physical rate_limit attempt is journalled, even when the chain then fails", async () => {
+    const corpus = corpusJson();
+    const script = scriptedGithub(corpus);
+    const attempt = (n: number, status: number, classification: string): BenchHttpAttemptRecord => ({
+      type: "http-attempt", atMs: n, wallMs: 12, kind: "rest", requestClass: "rest-meta",
+      label: "rate_limit", attempt: n, status, exitCode: status === 200 ? 0 : 1, classification,
+      secondarySignal: null, pointsCost: null, remaining: 4_900, resetEpochSec: 1_900_000_000,
+      servedFromCache: false, bodyBytes: 10,
+    });
+    let call = 0;
+    const { deps, journal, results } = makeDeps(corpus, script, {
+      readRateLimit: async (record) => {
+        call += 1;
+        if (call === 1) {
+          record(attempt(1, 200, "ok"));
+          return {
+            core: { remaining: 5_000, reset: 1_900_000_000, used: 0 },
+            graphql: { remaining: 4_900, reset: 1_900_000_000, used: 100 },
+            atMs: 1,
+          };
+        }
+        // the admission read burns two physical attempts and then gives up
+        record(attempt(1, 502, "transient"));
+        record(attempt(2, 502, "transient"));
+        throw new Error("rate_limit attempts exhausted");
+      },
+    });
+    await expect(runRefsProbe(deps)).rejects.toThrow(/exhausted/);
+    // no result on a failed run — which is exactly why a completion-only counter cannot work
+    expect(results.length).toBe(0);
+    const meta = journal.filter((r) => r.rowKind === "rest-meta");
+    expect(meta.length).toBe(3);
+    expect(meta.map((r) => (r as { attempt: number }).attempt)).toEqual([1, 1, 2]);
+    expect(meta.every((r) => (r as { label: string }).label === "rate_limit")).toBe(true);
+    // the baseline attempt is journalled after the header, never before it
+    expect(journal[0]!.rowKind).toBe("header");
+    // and the rows survive a round-trip through the parser
+    const text = journal.map((r) => JSON.stringify(r)).join("\n") + "\n";
+    expect(parseJournal(text, () => {}).filter((r) => r.rowKind === "rest-meta").length).toBe(3);
+  });
+
   test("a dropped torn tail forces a conservative backoff before any dispatch", async () => {
     const corpus = corpusJson();
     const script = scriptedGithub(corpus);
