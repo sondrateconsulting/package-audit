@@ -328,7 +328,7 @@ carrying a recognized predecessor `run_unit_head` shape out of the current-stamp
 and into this migration branch, so without those the bump would stamp a still-damaged database as
 current. `openReadOnly` cannot heal, so it REFUSES a current-stamped `runs` missing the column
 with repair advice rather than reading it back as `undefined`.
-Its three new columns (`policy_status`, `policy_matched_pattern`, `scanned_commit_date`) are NULL on
+The v3→v4 step's three new columns (`policy_status`, `policy_matched_pattern`, `scanned_commit_date`) are NULL on
 backfilled rows BY CONSTRUCTION — a pre-v4 run recorded no branch policy and never persisted
 past-cap branches — so a NULL `scanned_commit_date` is the sentinel marking that run's scan
 scope UNVERIFIABLE (§7 `provenance`), never a claim that it excluded nothing. A STRUCTURAL
@@ -385,7 +385,11 @@ CREATE TABLE IF NOT EXISTS runs (
                                        -- branchesErrored, which is why it is persisted here.
                                        -- Sealed by completeRun once the owner pool drained, and
                                        -- only over a 'running' row. NULL means UNKNOWN (still
-                                       -- running, failed, or migrated from pre-v5), NEVER "none"
+                                       -- running, failed, migrated from pre-v5, or RESUMED with no
+                                       -- throttle seen by the completing invocation), NEVER "none".
+                                       -- The accumulator is per-invocation and in memory, so on a
+                                       -- RESUMED run a positive value is a LOWER BOUND; on a fresh
+                                       -- run it is exact
 );
 CREATE TABLE IF NOT EXISTS work_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -141,8 +141,10 @@ export interface RunRecord {
   githubHost: string;
   status: RunStatus;
   // §4 discovery-throttle evidence, sealed by completeRun. NULL = UNKNOWN, never "none": a run that
-  // is still RUNNING, that FAILED, or that predates v5 recorded no evidence. A completed v5 run
-  // always carries an explicit integer (0 included). Immutable per-run evidence — contrast
+  // is still RUNNING, that FAILED, that predates v5, or that was RESUMED and whose completing
+  // invocation saw no throttles (that invocation cannot vouch for an earlier one — the accumulator
+  // is per-invocation and in memory). On a resumed run a POSITIVE value is a LOWER BOUND; on a
+  // fresh run it is exact. Immutable per-run evidence once sealed — contrast
   // ReportSummary.branchesDeferred, which is the mutable current-config queue backlog.
   discoveryScopesDeferred: number | null;
 }
@@ -2148,8 +2150,14 @@ export class AuditDb {
   }
 
   // completed_at stays NULL on failure — §7's generatedAt falls back to started_at.
+  // Guarded exactly like completeRun, and for the same reason: every surface documents "failed ⇒ no
+  // evidence (null)". An unguarded UPDATE could demote a COMPLETED run, leaving its sealed integer
+  // attached to a 'failed' row and falsifying that claim — and would silently succeed on an unknown
+  // run id. Only a RUNNING run may fail, and exactly one row must move.
   failRun(runId: string): void {
-    this.db.query(`UPDATE runs SET status='failed' WHERE run_id = ?`).run(runId);
+    const res = this.db.query(`UPDATE runs SET status='failed' WHERE run_id = ? AND status = 'running'`).run(runId);
+    if (res.changes !== 1)
+      fail(`failRun: run ${runId} is not a running run (already completed/failed, or unknown) — refusing to demote it`);
   }
 
   getRun(runId: string): RunRecord | null {
@@ -2647,12 +2655,26 @@ function mapRun(row: RunRow): RunRecord {
     cutoffDate: row.cutoff_date,
     githubHost: row.github_host,
     status: row.status,
-    // ?? null, not a bare read: SELECT * over a runs table that LOST this column yields `undefined`,
-    // and undefined is the one value that must never escape here — JSON.stringify drops the key
-    // entirely, so the report would omit a required summary field instead of reporting UNKNOWN.
-    // openReadOnly refuses that shape outright; this is the defense behind it.
-    discoveryScopesDeferred: row.discovery_scopes_deferred ?? null,
+    // Validated on READ, not just on write. completeRun guards the write path, but the column
+    // carries no SQL CHECK (kept constraint-free so the v4→v5 ALTER stays additive and the shape
+    // fingerprint stays comparable) and `runs` is not STRICT — so a hand-edited or corrupted file
+    // can hold TEXT, a negative, or a fraction. Unvalidated, those flow into report JSON and the
+    // exports, and the HTML (which only tests `> 0`) would suppress a NEGATIVE exactly like a clean
+    // zero: the silent all-clear this whole feature exists to prevent. Fail closed instead.
+    // The `?? null` also covers the missing-column read: `undefined` must never escape, because
+    // JSON.stringify drops the key and the report would omit a required field rather than say
+    // UNKNOWN. openReadOnly refuses that shape outright; this is the defense behind it.
+    discoveryScopesDeferred: readDiscoveryEvidence(row.discovery_scopes_deferred),
   };
+}
+
+// The single read-side gate for runs.discovery_scopes_deferred (see mapRun). null = UNKNOWN is
+// legitimate; anything else must be a non-negative safe integer or the row is not trustworthy.
+function readDiscoveryEvidence(raw: unknown): number | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 0)
+    fail(`runs.discovery_scopes_deferred holds ${JSON.stringify(raw)} — expected NULL or a non-negative integer; the database has been modified outside this tool`);
+  return raw;
 }
 
 function mapUnit(row: WorkQueueRow): WorkUnit {

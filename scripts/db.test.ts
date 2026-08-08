@@ -1977,6 +1977,46 @@ describe("run lifecycle — startup rules (§3)", () => {
     db.close();
   });
 
+  test("MALFORMED persisted discovery evidence fails loudly on READ, never leaks into a report", () => {
+    // completeRun validates on WRITE, but the database is a local file an operator can edit and the
+    // column carries no CHECK (kept constraint-free so the v4→v5 ALTER stays additive and the shape
+    // fingerprint stays comparable). Without a READ-side gate a hand-edited TEXT/negative/fractional
+    // value flows straight through getRun into report JSON and the exports — and the HTML, which
+    // only tests `> 0`, would suppress a NEGATIVE exactly like a clean zero. Fail closed instead.
+    const db = mem();
+    const r = db.startRun(runInput()).runId;
+    db.completeRun(r, { discoveryScopesDeferred: 1 });
+    for (const bogus of ["'bogus'", "-1", "1.5"]) {
+      raw(db).exec(`UPDATE runs SET discovery_scopes_deferred = ${bogus} WHERE run_id = '${r}'`);
+      expect(() => db.getRun(r)).toThrow(/discovery_scopes_deferred/);
+    }
+    // ...and a legitimately NULL or non-negative integer still reads fine
+    raw(db).exec(`UPDATE runs SET discovery_scopes_deferred = NULL WHERE run_id = '${r}'`);
+    expect(db.getRun(r)!.discoveryScopesDeferred).toBeNull();
+    raw(db).exec(`UPDATE runs SET discovery_scopes_deferred = 0 WHERE run_id = '${r}'`);
+    expect(db.getRun(r)!.discoveryScopesDeferred).toBe(0);
+    db.close();
+  });
+
+  test("failRun cannot demote a COMPLETED run — a sealed run's evidence stays sealed", () => {
+    // Every surface documents "failed => no evidence (null)". An unguarded failRun would break that
+    // by leaving a completed run's integer evidence attached to a 'failed' row, and would also
+    // silently succeed on an unknown run id. Guard it exactly like completeRun.
+    const db = mem();
+    const a = db.startRun(runInput()).runId;
+    db.completeRun(a, { discoveryScopesDeferred: 3 });
+    expect(() => db.failRun(a)).toThrow();
+    expect(db.getRun(a)!.status).toBe("completed"); // still completed, evidence intact
+    expect(db.getRun(a)!.discoveryScopesDeferred).toBe(3);
+    expect(() => db.failRun("no-such-run")).toThrow();
+    // a RUNNING run still fails normally, and keeps null evidence
+    const b = db.startRun(runInput({ configHash: "h-f" })).runId;
+    db.failRun(b);
+    expect(db.getRun(b)!.status).toBe("failed");
+    expect(db.getRun(b)!.discoveryScopesDeferred).toBeNull();
+    db.close();
+  });
+
   test("completeRun REJECTS a non-integer or negative discovery-scope count", () => {
     const db = mem();
     for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {

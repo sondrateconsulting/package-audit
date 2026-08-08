@@ -148,9 +148,13 @@ export interface ReportSummary {
   // One scope can hide an unbounded number of repos/branches, which is why it counts SCOPES and its
   // name says so — it is not a branch count and must never be added to one.
   //
-  // NULL means UNKNOWN, never "none": the run is still running, it failed, or it predates schema v5
-  // (migrated rows backfill NULL by construction). A surface that renders NULL as 0 would assert the
-  // very completeness this field exists to disprove — say "unknown", or say nothing.
+  // NULL means UNKNOWN, never "none": the run is still running, it failed, it predates schema v5
+  // (migrated rows backfill NULL by construction), or it was RESUMED and its completing invocation
+  // saw no throttles — that invocation cannot vouch for an earlier one, because the accumulator is
+  // per-invocation and in memory. A surface that renders NULL as 0 would assert the very
+  // completeness this field exists to disprove — say "unknown", or say nothing.
+  // EXACTNESS: on a fresh run the value is exact; on a RESUMED run a positive value is a LOWER
+  // BOUND (what the completing invocation counted), since earlier invocations' scopes are gone.
   discoveryScopesDeferred: number | null;
   totalDependencyFindings: number;
   totalUsageFindings: number;

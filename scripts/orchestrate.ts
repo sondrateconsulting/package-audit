@@ -235,7 +235,7 @@ export function runSummaryText(
     // per-run rather than re-read from the queue. Never add it to the branch counts.
     // `unknown` (null) is printed verbatim and does NOT flag PARTIAL: a pre-v5 or unsealed run
     // cannot tell us either way, and rendering that as 0 would assert completeness we never verified.
-    `  Discovery scopes deferred: ${s.discoveryScopesDeferred === null ? "unknown (run predates this evidence, or did not complete)" : s.discoveryScopesDeferred}${
+    `  Discovery scopes deferred: ${s.discoveryScopesDeferred === null ? "unknown (run predates this evidence, did not complete, or resumed one whose earlier invocations cannot be vouched for)" : s.discoveryScopesDeferred}${
       s.discoveryScopesDeferred !== null && s.discoveryScopesDeferred > 0
         // Scoped to THIS run's attempt: on a RESUMED run, rows retained from an earlier invocation
         // can still place branches of a now-throttled repo into the counts above, so claiming they

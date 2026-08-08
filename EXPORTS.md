@@ -258,10 +258,15 @@ scopes (one per owner repo-listing, one per repository branch-listing) exhausted
 budget during this run. Those scopes enumerated nothing, so they enqueue no work and record no
 error — they are invisible to both `branchesErrored` and the report's `branchesDeferred`, which is
 why the count is persisted here instead of being derived. **`null` means UNKNOWN, never zero**: a
-run that is still running, that failed, or that predates schema v5 sealed no evidence. Only
-`completeRun` writes it, so a run COMPLETED UNDER v5 carries an explicit integer (`0` included) —
-but a completed run MIGRATED from pre-v5 keeps its `null`, because no evidence was ever recorded
-for it. "Completed" alone therefore does not imply a number; only "completed under v5" does.
+run that is still running, that failed, or that predates schema v5 sealed no evidence. A completed
+run MIGRATED from pre-v5 also keeps its `null`. So does a RESUMED run whose completing invocation
+saw no discovery throttles: the accumulator lives in memory for one invocation, so that invocation
+cannot vouch for what an earlier one hit, and writing `0` would assert coverage it never checked.
+"Completed" therefore never implies a number on its own.
+
+On a resumed run a POSITIVE value is a LOWER BOUND — at least this many scopes were rate-limited,
+counted by the completing invocation; earlier invocations of the same `run_id` may have hit more.
+On a fresh (non-resumed) run the value is exact.
 Read it as per-run immutable evidence — unlike the report's `branchesDeferred`, which is the
 current pending-queue backlog for the whole config at the moment the report was generated.
 
