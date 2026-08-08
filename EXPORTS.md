@@ -169,6 +169,10 @@ entry in the report's `errors[]` (and is counted by the report's `branchesErrore
 was **throttle-requeued** is deferred with neither a row nor a new error — retried, or settled as a
 non-scanned disposition (cutoff/policy/past-cap), when a later run re-enumerates it; a retry can throttle again
 (on a resume, an EARLIER invocation's append-only error still counts a rowless branch in `branchesErrored`).
+Deferred does not mean uncounted: while its queue row stays pending the report's current-backlog `branchesDeferred` counts it,
+and the stderr summary flags the run's scanned counts PARTIAL. Neither count can see a branch whose OWNER or REPOSITORY
+listing was rate-limited — nothing was enumerated, so nothing was enqueued; the report's `discoveryScopesDeferred`
+(and the `runs.discovery_scopes_deferred` column) is the evidence for that case.
 Scoped to the selected run only (`--raw` dumps all runs).
 
 On a **resumed** run (one interrupted and re-invoked, which reuses the same `run_id`), the report's

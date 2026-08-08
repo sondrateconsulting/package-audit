@@ -1203,8 +1203,9 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const runId = startScanRun(db);
     // discovery: main@o-main. The clone lands on a HEAD that moved to o-moved: the ratified
     // §3.1(2) coherence gate refuses it (the retired checkout fallback ACCEPTED the moved head
-    // and recorded the clone's real HEAD — that behavior is deliberately gone). Transient:
-    // self-heals via the next run's re-discovery.
+    // and recorded the clone's real HEAD — that behavior is deliberately gone). Transient, but
+    // only CONDITIONALLY recoverable: a later run retries this branch if it still re-enumerates
+    // it, and that retry can fail or throttle again.
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
       throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
@@ -1213,6 +1214,14 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     expect(db.getUnit(key("main"))?.status).toBe("error"); // failed closed, never scanned at either head
     const errs = db.read(`SELECT message FROM errors WHERE run_id = ? AND scope = 'scan'`).all(runId) as Array<{ message: string }>;
     expect(errs.length).toBe(1);
+    // The message is PERSISTED into errors[] and shown to operators, so its retry claim must carry
+    // the same conditions the rest of the repo now states: a later run retries this branch only if
+    // it still re-enumerates it, and that retry can fail or throttle again. The old unconditional
+    // "self-heals via the next run's re-discovery" was simply false for a branch that is deleted,
+    // goes past-cap, becomes policy-excluded, or whose repo drops out of the kept set.
+    expect(errs[0]!.message).not.toContain("self-heals via the next run");
+    expect(errs[0]!.message).toContain("re-enumerates");
+    expect(errs[0]!.message).toMatch(/throttle again|fail or throttle/);
     expect(errs[0]!.message).toMatch(/does not match the discovery-pinned/);
     // no run_unit_head row is written for the failed unit (the scan-error arm writes none)
     expect(headRowsOf(db, runId)).toEqual([]);

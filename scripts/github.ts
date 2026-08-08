@@ -2644,7 +2644,7 @@ export class GithubClient {
       // mismatch is NOT transient (the branch genuinely moved), so it is never retried.
       if (headSha.toLowerCase() !== pinnedOid.toLowerCase())
         throw new GithubApiError(
-          `clone HEAD ${headSha} does not match the discovery-pinned ${pinnedOid} for ${org}/${repo}@${branch} — the branch moved between discovery and clone; failing closed (self-heals via the next run's re-discovery)`,
+          `clone HEAD ${headSha} does not match the discovery-pinned ${pinnedOid} for ${org}/${repo}@${branch} — the branch moved between discovery and clone; failing closed — a later run retries this branch only if it still re-enumerates it (re-discovered repo, still scan-eligible), and that retry can fail or throttle again`,
           { endpoint: url },
         );
       return { dir: dest, cloneAttempts: starts.count };
