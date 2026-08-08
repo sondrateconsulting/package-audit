@@ -16,7 +16,7 @@
 // tranche is the paired try.
 
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { GithubClient } from "./github.ts";
 import { loadBenchConfig } from "./benchConfig.ts";
@@ -117,6 +117,73 @@ export function parseJournal(rawText: string, warn: (line: string) => void): Ref
     rows.push(parseJournalRow(line));
   }
   return rows;
+}
+
+// What a crash left at the end of the journal. parseJournal tolerates a torn tail IN MEMORY, but
+// the FILE still ends mid-record: appendFileSync writes at EOF with no separator, so the next row
+// is GLUED onto the torn bytes and that line is unparseable forever. Classifying is read-only —
+// repair is a separate, deliberate step.
+export type JournalTailKind =
+  | "none" // newline-terminated (or empty): nothing to repair
+  | "sealable" // a COMPLETE record that lost only its newline — its content survived
+  | "malformed" // genuinely torn bytes: the write never completed
+  | "headless"; // torn with no complete line before it — truncating would empty the file
+
+export function classifyJournalTail(rawText: string): JournalTailKind {
+  const buf = Buffer.from(rawText, "utf8");
+  if (buf.byteLength === 0 || buf[buf.byteLength - 1] === 0x0a) return "none";
+  const tailStart = buf.lastIndexOf(0x0a) + 1;
+  if (tailStart === 0) return "headless";
+  try {
+    JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buf.subarray(tailStart)));
+    return "sealable";
+  } catch {
+    return "malformed";
+  }
+}
+
+// The live journal writer. Its FIRST append repairs whatever a crash left behind, mirroring the
+// seal-vs-truncate split benchContentTransport.ts already applies to the ADR-0001 evidence logs:
+// a record that lost only its newline is SEALED (truncating would silently delete a recorded
+// outcome), and only genuinely torn bytes are dropped. Repairing on the first append — rather than
+// at startup — means a RESUMED run has already passed runRefsProbe's corpus/config/constants
+// binding checks, so a foreign journal is refused before this ever writes to it.
+//
+// KNOWN LIMIT, stated plainly: this repairs the WORKING file. Unlike benchContentTransport's
+// git-backed check it does not prove the torn bytes were uncommitted; it relies on the discipline
+// that a committed journal always ends newline-terminated. A tear with no complete line before it
+// is refused rather than truncated, so no journal can be emptied by this path.
+export function fileJournalAppender(
+  journalPath: string,
+  log: (line: string) => void,
+): (row: RefsProbeJournalRow) => void {
+  let repaired = false;
+  return (row) => {
+    if (!repaired) {
+      repairTornJournalTail(journalPath, log);
+      repaired = true;
+    }
+    appendFileSync(journalPath, `${JSON.stringify(row)}\n`);
+  };
+}
+
+function repairTornJournalTail(journalPath: string, log: (line: string) => void): void {
+  if (!existsSync(journalPath)) return;
+  const buf = readFileSync(journalPath);
+  const kind = classifyJournalTail(buf.toString("utf8"));
+  if (kind === "none") return;
+  if (kind === "headless")
+    throw new BenchRefsRulesError(
+      `${journalPath} ends mid-record with no complete line before it — refusing to truncate the whole journal; inspect it by hand`,
+    );
+  const tailStart = buf.lastIndexOf(0x0a) + 1;
+  if (kind === "sealable") {
+    appendFileSync(journalPath, "\n");
+    log(`repaired ${journalPath}: sealed a complete final record that lost only its newline`);
+    return;
+  }
+  truncateSync(journalPath, tailStart);
+  log(`repaired ${journalPath}: truncated a ${buf.byteLength - tailStart}-byte torn tail (crash mid-append)`);
 }
 
 // ---- pre-registered constants as one object (the result artifact + the journal header) ------
@@ -719,7 +786,9 @@ async function main(): Promise<void> {
     benchConfigPath: BENCH_CONFIG_PATH,
     benchConfigSha256,
     existingJournalText: existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "",
-    appendJournal: (row) => appendFileSync(journalPath, `${JSON.stringify(row)}\n`),
+    // the first append repairs a crash-torn tail on disk, so a resumed run can never glue its
+    // next row onto half a record (parseJournal only ever fixed the in-memory view)
+    appendJournal: fileJournalAppender(journalPath, log),
     // "wx": the result is append-only evidence — never overwrite, even on a pre-check race
     writeResult: (r) => writeFileSync(outPath, `${JSON.stringify(r, null, 2)}\n`, { flag: "wx" }),
     dispatchGraphql: async (query, fields, label) => {
