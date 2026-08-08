@@ -942,7 +942,7 @@ describe("admitTranche (per-tranche worst case; the tranche is the try)", () => 
     expect(a.controlPages).toBe(10);
     expect(a.dispatchesPerTry).toBe(11);
     expect(a.rerunMultiplier).toBe(3);
-    expect(a.neededPoints).toBe(Math.ceil(11 * 2 * 1.1 * 3)); // 73
+    expect(a.neededPoints).toBe(73); // ceil(11 dispatches x 2 pts x 1.1 headroom x 3 attempts)
     expect(a.feasible).toBe(true);
   });
   test("a paginating cell counts continuations in both arms", () => {

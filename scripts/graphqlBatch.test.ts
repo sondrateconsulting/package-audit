@@ -144,8 +144,10 @@ describe("buildBatchRefsQuery — argv accounting (the admission input)", () => 
     const input = repos(2);
     const b = buildBatchRefsQuery(input, { rateLimitRider: "rateLimit{cost}" });
     expect(b.queryBytes).toBe(Buffer.byteLength(b.query, "utf8"));
-    let argvBytes = Buffer.byteLength(`query=${b.query}`, "utf8") + 2 * "-f".length;
-    for (const [k, v] of Object.entries(b.fields)) argvBytes += Buffer.byteLength(`${k}=${v}`, "utf8") + "-f".length;
-    expect(b.argvBytes).toBe(argvBytes);
+    // Oracle built from the argv gh is ACTUALLY handed (github.ts / benchGh.ts both build
+    // ["api","-i","graphql","-f",`query=…`] then one "-f" per variable), not from a copy of the
+    // implementation's own expression — a mirrored formula cannot catch a wrong flag count.
+    const rawFieldArgv = ["-f", `query=${b.query}`, ...Object.entries(b.fields).flatMap(([k, v]) => ["-f", `${k}=${v}`])];
+    expect(b.argvBytes).toBe(rawFieldArgv.reduce((sum, arg) => sum + Buffer.byteLength(arg, "utf8"), 0));
   });
 });
