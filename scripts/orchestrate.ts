@@ -240,7 +240,7 @@ export function runSummaryText(
         // Scoped to THIS run's attempt: on a RESUMED run, rows retained from an earlier invocation
         // can still place branches of a now-throttled repo into the counts above, so claiming they
         // appear in NO count would be false.
-        ? " — owners/repos whose listing was rate-limited; this run never enumerated them, so the counts above are PARTIAL"
+        ? " — owners/repos whose listing was rate-limited; this invocation never enumerated them, so the counts above are PARTIAL"
         : ""
     }`,
     `  Dependency findings:    ${s.totalDependencyFindings}`,
@@ -423,7 +423,19 @@ export async function runScan(
   // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at). The discovery
   // evidence seals HERE, after the owner pool has fully drained, so the count is final and this
   // completed run can never exist without it.
-  db.completeRun(runId, { discoveryScopesDeferred: deferredDiscoveryScopes.size });
+  // RESUMED-RUN HONESTY: a resumed run reuses its run_id, but this accumulator is per-invocation
+  // and in memory — an earlier invocation's throttled scopes are simply gone. Sealing this
+  // invocation's 0 over them would launder a real deferral into a clean number, the precise failure
+  // this evidence exists to prevent. So on a resume we seal what we can defend:
+  //   • saw throttles here (n > 0) → seal n. It is a LOWER BOUND, and it still flags PARTIAL —
+  //     strictly better than claiming unknown when we know the run was incomplete.
+  //   • saw none here (n === 0)    → seal NULL (UNKNOWN). We verified nothing about the earlier
+  //     invocation, and 0 would assert coverage this invocation never checked.
+  // A fresh run always seals its exact count, 0 included.
+  const scopesThisInvocation = deferredDiscoveryScopes.size;
+  db.completeRun(runId, {
+    discoveryScopesDeferred: resumed && scopesThisInvocation === 0 ? null : scopesThisInvocation,
+  });
   markPhase("report");
   // §8 step 7: produce the consolidated §7 report (run-<id>.json + latest.json) from SQLite,
   // then the machine done-event (stdout) and the human summary — BOTH derived from the emitted

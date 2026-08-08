@@ -118,8 +118,9 @@ export interface ReportSummary {
   // double-count. It is a QUEUE-side total, not a disposition. 'pending' alone counts: an
   // in_progress row seen by a report generated beside a live audit is being attempted, not deferred.
   //
-  // Source: the MUTABLE cross-run work_queue — the ONE summary count read outside the immutable
-  // run_unit_head slice (PROMPT.md §7 sanctions the exception). By design, then, this is the CURRENT
+  // Source: the MUTABLE cross-run work_queue — one of TWO summary counts read outside the immutable
+  // run_unit_head slice (PROMPT.md §7 sanctions both; the other is discoveryScopesDeferred, which
+  // reads the run row's sealed evidence). By design, then, this is the CURRENT
   // backlog at generation time: re-rendering an old --run-id after later runs drain the queue reports
   // 0 — the count answers "what does this config still owe", a debt a future run retries or settles
   // only for the units it still re-enumerates (a retry can throttle again). Known skews,
@@ -169,7 +170,8 @@ export interface ReportSummary {
 // contract is separately enforced by reportSchema.ts in tests. errors[] stays untyped (leaf only).
 export interface EmittedReport {
   // PINNED to the constant, not a bare `number` (the COMPARE_FORMAT_VERSION precedent): this shape IS
-  // v2, so a build that emitted some other version here would be mislabelling itself, and reportSchema
+  // whatever XRAY_FORMAT_VERSION currently names, so a build that emitted some other version here
+  // would be mislabelling itself, and reportSchema
   // — the authoritative contract, but a TEST-ONLY one by design — would only catch it in the suite.
   formatVersion: typeof XRAY_FORMAT_VERSION; // the report/export/HTML artifact-set version
   runId: string;

@@ -1964,6 +1964,19 @@ describe("run lifecycle — startup rules (§3)", () => {
     db.close();
   });
 
+  test("completeRun accepts an EXPLICIT null — a resumed run whose earlier invocations are unknowable", () => {
+    // A resumed run REUSES its run_id, but the discovery accumulator is per-invocation and in
+    // memory: an earlier invocation's throttles are gone. Sealing this invocation's 0 over them
+    // would launder a real deferral into a clean number — the exact failure this evidence exists to
+    // prevent. null (UNKNOWN) is the honest value, and it is passed EXPLICITLY, never defaulted.
+    const db = mem();
+    const r = db.startRun(runInput()).runId;
+    db.completeRun(r, { discoveryScopesDeferred: null });
+    expect(db.getRun(r)!.status).toBe("completed");
+    expect(db.getRun(r)!.discoveryScopesDeferred).toBeNull();
+    db.close();
+  });
+
   test("completeRun REJECTS a non-integer or negative discovery-scope count", () => {
     const db = mem();
     for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {

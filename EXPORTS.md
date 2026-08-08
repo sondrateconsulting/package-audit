@@ -259,7 +259,9 @@ budget during this run. Those scopes enumerated nothing, so they enqueue no work
 error — they are invisible to both `branchesErrored` and the report's `branchesDeferred`, which is
 why the count is persisted here instead of being derived. **`null` means UNKNOWN, never zero**: a
 run that is still running, that failed, or that predates schema v5 sealed no evidence. Only
-`completeRun` writes it, so a completed run always carries an explicit integer (`0` included).
+`completeRun` writes it, so a run COMPLETED UNDER v5 carries an explicit integer (`0` included) —
+but a completed run MIGRATED from pre-v5 keeps its `null`, because no evidence was ever recorded
+for it. "Completed" alone therefore does not imply a number; only "completed under v5" does.
 Read it as per-run immutable evidence — unlike the report's `branchesDeferred`, which is the
 current pending-queue backlog for the whole config at the moment the report was generated.
 

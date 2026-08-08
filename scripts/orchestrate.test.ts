@@ -2680,6 +2680,56 @@ describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations
     rmSync(root, { recursive: true, force: true });
   });
 
+  // C-2: the end-to-end test above throttles the OWNER listing, which never reaches processRepo.
+  // Dropping the Set forwarding from processOwner to processRepo would break every REPOSITORY
+  // branch-list deferral while that test still passed. This drives the repo-scope path for real.
+  test("a throttled REPOSITORY branch-listing also reaches the sealed evidence end-to-end", async () => {
+    const root = mkdtempSync(join(tmpdir(), "repo-throttle-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // both owners list their repos fine; the BRANCH listing (graphql) throttles for every repo
+    const client = makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (args.some((a) => a === "graphql")) throw new ThrottleExhausted("core bucket");
+      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+      const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    await captureJsonl(() => runScan(db, client, rt(twoOwnerConfig(root), "h"), noArgs, null));
+    const run = db.getRun((db.read(`SELECT run_id FROM runs`).get() as { run_id: string }).run_id)!;
+    // one repo-scope deferral per owner, distinct — and NOT collapsed with the org scope
+    expect(run.discoveryScopesDeferred).toBe(2);
+    expect(buildReport(db, run).summary.branchesDeferred).toBe(0); // still invisible to the queue count
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a RESUMED run cannot launder an earlier invocation's discovery throttle into a clean zero", async () => {
+    // The accumulator is per-invocation and in memory. A run interrupted after a discovery throttle
+    // keeps its run_id, so the next invocation resumes it with an EMPTY Set — sealing 0 would erase
+    // evidence that a real deferral happened. This invocation cannot see the earlier one, so the
+    // honest seal is UNKNOWN, not a number it did not verify.
+    const root = mkdtempSync(join(tmpdir(), "resume-throttle-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // invocation 1: leave a RUNNING run behind (as a crash would), simulating the interrupted run
+    const first = db.startRun({ configHash: "h", effectiveOwners: ["org-a", "org-b"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    expect(first.resumed).toBe(false);
+    // invocation 2: same config -> RESUMES that run_id, and throttles nothing at all
+    const clean = makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads };
+      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+      const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    await captureJsonl(() => runScan(db, clean, rt(twoOwnerConfig(root), "h"), noArgs, null));
+    const run = db.getRun(first.runId)!;
+    expect(run.status).toBe("completed");
+    // UNKNOWN, not 0: this invocation verified nothing about the earlier one's discovery
+    expect(run.discoveryScopesDeferred).toBeNull();
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("two owners fan out and BOTH scan (concurrency.organizations:2), run completes", async () => {
     const root = mkdtempSync(join(tmpdir(), "owner-fanout-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });

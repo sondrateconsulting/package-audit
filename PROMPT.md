@@ -340,7 +340,7 @@ and again on the writable connection — through any recovered WAL — before th
 flip and before `--fresh`, so an incompatible state committed only into `-wal` frames (a sibling
 build's v4 over a common v3 base) is still refused before it can be adopted or dropped, at the
 documented cost of sidecar recovery on that file.
-A current-version (v4) database self-heals idempotently on open, SHAPE-keyed: re-run the
+A current-version database self-heals idempotently on open, SHAPE-keyed: re-run the
 new-shape CREATEs, so a file missing a table or the `ix_ruh_loc` index is repaired rather than
 left a dead end, and a `run_unit_head` regressed to a RECOGNIZED predecessor era (the v2/v3 body
 — external damage) is healed by the same rebuild the v3→v4 migration uses, rows riding through —
@@ -1425,7 +1425,7 @@ it, §5.E.) A run with no findings still emits the full shape with empty arrays 
 summary.
 ```jsonc
 {
-  "formatVersion": 2,                            // XRAY_FORMAT_VERSION — the report/export/HTML
+  "formatVersion": 3,                            // XRAY_FORMAT_VERSION — the report/export/HTML
                                                  //   artifact-set version. REQUIRED, and
                                                  //   INDEPENDENT of the compare format version
   "runId": "...",
@@ -1487,12 +1487,14 @@ summary.
                                                  //   understate what that run actually evaluated
 }
 ```
-Summary derivation — every count but TWO from the IMMUTABLE `run_unit_head` slice for the
-reported run. The two exceptions are named here so the rule and the practice agree:
-`branchesDeferred` reads the mutable cross-run work_queue (the sanctioned exception, defined
-after the throttle carve-out below), and `discoveryScopesDeferred` reads the reported run's own
-`runs.discovery_scopes_deferred` — sealed evidence, not a derivation, because the fact it records
-exists nowhere else in SQLite. The `run_unit_head`-derived counts: `branchesScanned` =
+Summary derivation — by SOURCE, stated per field rather than as a count, because "all but N" goes
+stale the moment a field is added. The four DISPOSITION counts below read the IMMUTABLE
+`run_unit_head` slice for the reported run. `branchesErrored` reads the append-only `errors[]`
+table (keyed against `run_unit_head` only to EXCLUDE row-bearing branches). Two fields read
+neither: `branchesDeferred` reads the mutable cross-run work_queue (the sanctioned exception,
+defined after the throttle carve-out below), and `discoveryScopesDeferred` reads the reported run's
+own `runs.discovery_scopes_deferred` — sealed evidence, not a derivation, because the fact it
+records exists nowhere else in SQLite. The `run_unit_head`-derived counts: `branchesScanned` =
 COUNT(*) WHERE run_id=R AND status='scanned'; `branchesSkippedByCutoff` = COUNT WHERE
 run_id=R AND status='skipped-cutoff' — GENUINE cutoff only, because a policy exclusion carries
 its OWN status and can never be folded in by an under-specified filter;

@@ -2121,13 +2121,17 @@ export class AuditDb {
   // prevent, and requiring it at the type level forces every completion site to state what it saw.
   // Only completeRun writes the column: failRun deliberately leaves NULL, because a failed run's
   // coverage is unknowable rather than zero.
-  completeRun(runId: string, evidence: { discoveryScopesDeferred: number }): void {
+  completeRun(runId: string, evidence: { discoveryScopesDeferred: number | null }): void {
     const n = evidence.discoveryScopesDeferred;
-    // Validated HERE, not by a SQL CHECK: keeping the column constraint-free keeps the v4→v5 ALTER
-    // additive and the table's shape fingerprint (the ownership oracle) trivially comparable.
+    // null is ALLOWED but never DEFAULTED — the caller must choose it. It is the honest seal for a
+    // RESUMED run whose earlier invocations' discovery evidence is unknowable (the accumulator is
+    // per-invocation and in memory), where writing this invocation's count would launder a real
+    // prior deferral into a verified-looking number.
+    // Otherwise validated HERE, not by a SQL CHECK: keeping the column constraint-free keeps the
+    // v4→v5 ALTER additive and the table's shape fingerprint (the ownership oracle) comparable.
     // isSafeInteger (not isInteger): 2^53 is an "integer" that SQLite would store lossily.
-    if (!Number.isSafeInteger(n) || n < 0)
-      fail(`completeRun: discoveryScopesDeferred must be a non-negative safe integer (got ${String(n)})`);
+    if (n !== null && (!Number.isSafeInteger(n) || n < 0))
+      fail(`completeRun: discoveryScopesDeferred must be a non-negative safe integer or null (got ${String(n)})`);
     // status='running' in the WHERE is what makes "sealed" true rather than merely claimed. An
     // unconditional UPDATE would let a second completion REWRITE recorded evidence (laundering a
     // throttled run's count into a reassuring 0), revive a FAILED run into completed, and match
