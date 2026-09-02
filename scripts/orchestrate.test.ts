@@ -9,6 +9,7 @@ import { compileRepositoryPolicy, RepoPolicyMatchError } from "./repositoryPolic
 import { GithubApiError, GithubClient, ThrottleExhausted, type BranchHead, type BranchSnapshot, type LaunchedChild, type LaunchFn, type RepoInfo, type SpawnFn, type StreamReader } from "./github.ts";
 import { gitBlobOid } from "./gitFrame.ts";
 import { AuditDb, nowIso, type WorkUnitKey } from "./db.ts";
+import { buildReport } from "./report.ts";
 import { Aborter } from "./boundedPool.ts";
 import type { Config } from "./config.ts";
 import type { OrchestrateArgs } from "./args.ts";
@@ -815,7 +816,7 @@ describe("runPlan org-level discovery failure (fail-soft continue)", () => {
   });
 });
 
-describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-cap untouched)", () => {
+describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-cap done-reuse)", () => {
   // defaultBranch is REQUIRED and explicit: inferring it (a hardcoded "main", or "the first head")
   // would make a fixture agree with whatever the code resolved and hide a default-resolution defect.
   const graphqlHeads = (nodes: Array<{ name: string; oid: string; date: string }>, defaultBranch: string | null): string =>
@@ -858,7 +859,8 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
 
     // run_unit_head: stale → skipped-cutoff (empty sha), main+dev → scanned at their live heads with
     // the REAL default-branch flag (1 for main, 0 otherwise), and feat → a NEW past-cap row (a
-    // past-cap branch is now recorded for report visibility, though its work queue stays untouched).
+    // past-cap branch is recorded for report visibility; only a stale PENDING queue row would be
+    // settled beside it — none here, feat holds no row).
     const headRows = db.read(`SELECT branch, commit_sha, status, is_default_branch FROM run_unit_head WHERE run_id = ? ORDER BY branch`).all(runId) as Array<Record<string, unknown>>;
     expect(headRows).toEqual([
       { branch: "dev", commit_sha: hexOid("o-dev"), status: "scanned", is_default_branch: 0 },
@@ -867,7 +869,8 @@ describe("processRepo wiring (§5.B/§3: cutoff-skip, skip-current reuse, past-c
       { branch: "stale", commit_sha: "", status: "skipped-cutoff", is_default_branch: 0 },
     ]);
     // work-queue state: stale skipped, main+dev still done (reused), feat never enqueued (past-cap
-    // retains prior queue state so a later cap-order promotion can reuse a done scan).
+    // never creates a row and leaves 'done' untouched so a later cap-order promotion can reuse a
+    // done scan; only a stale 'pending' row would be settled — see settlePastCapUnit).
     expect(db.getUnit(key("stale"))?.status).toBe("skipped");
     expect(db.getUnit(key("main"))?.status).toBe("done");
     expect(db.getUnit(key("dev"))?.status).toBe("done");
@@ -1200,8 +1203,9 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     const runId = startScanRun(db);
     // discovery: main@o-main. The clone lands on a HEAD that moved to o-moved: the ratified
     // §3.1(2) coherence gate refuses it (the retired checkout fallback ACCEPTED the moved head
-    // and recorded the clone's real HEAD — that behavior is deliberately gone). Transient:
-    // self-heals via the next run's re-discovery.
+    // and recorded the clone's real HEAD — that behavior is deliberately gone). Transient, but
+    // only CONDITIONALLY recoverable: a later run retries this branch if it still re-enumerates
+    // it, and that retry can fail or throttle again.
     const client = makeClient(root, async (_bin, args) => {
       if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: graphqlHeads([{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main") };
       throw new Error(`unexpected one-shot spawn: ${args.join(" ")}`);
@@ -1210,6 +1214,14 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     expect(db.getUnit(key("main"))?.status).toBe("error"); // failed closed, never scanned at either head
     const errs = db.read(`SELECT message FROM errors WHERE run_id = ? AND scope = 'scan'`).all(runId) as Array<{ message: string }>;
     expect(errs.length).toBe(1);
+    // The message is PERSISTED into errors[] and shown to operators, so its retry claim must carry
+    // the same conditions the rest of the repo now states: a later run retries this branch only if
+    // it still re-enumerates it, and that retry can fail or throttle again. The old unconditional
+    // "self-heals via the next run's re-discovery" was simply false for a branch that is deleted,
+    // goes past-cap, becomes policy-excluded, or whose repo drops out of the kept set.
+    expect(errs[0]!.message).not.toContain("self-heals via the next run");
+    expect(errs[0]!.message).toContain("re-enumerates");
+    expect(errs[0]!.message).toMatch(/throttle again|fail or throttle/);
     expect(errs[0]!.message).toMatch(/does not match the discovery-pinned/);
     // no run_unit_head row is written for the failed unit (the scan-error arm writes none)
     expect(headRowsOf(db, runId)).toEqual([]);
@@ -1611,6 +1623,19 @@ describe("processRepo / runScan — branch allow/deny wiring", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("the done event embeds the report's summary — branchesDeferred rides the wire", async () => {
+    // Single cause: the embed alone. logLine is shape-unchecked (Record<string, unknown>, so
+    // dropping the summary embed would still compile); this pins the README's "also on the `done`
+    // event" claim at the emission seam.
+    const root = mkdtempSync(join(tmpdir(), "done-embed-"));
+    const config = { ...testConfig(root, 25), organizations: ["org-a"], packages: [] };
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    const events = await captureJsonl(async () => { await runScan(db, fullClient(root, [{ name: "main", oid: hexOid("o-main"), date: "2025-06-01T00:00:00Z" }], "main"), rt(config, "h"), noArgsT7, null); });
+    db.close();
+    expect(events.find((e) => e["event"] === "done")).toMatchObject({ summary: { branchesDeferred: 0 } });
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("runScan SUPPRESSES warnings when branch discovery fails for every repo (the null-coverage seam)", async () => {
     const root = mkdtempSync(join(tmpdir(), "warn-scan-suppress-"));
     const db = AuditDb.open({ sqlitePath: ":memory:" });
@@ -1785,17 +1810,69 @@ describe("runSummaryText", () => {
     const text = runSummaryText("run-abc", {
       organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
       branchesSkippedByCutoff: 13, branchesExcludedByPolicy: 5, branchesPastCap: 2, branchesErrored: 4,
-      totalDependencyFindings: 104, totalUsageFindings: 994,
+      branchesDeferred: 0, discoveryScopesDeferred: 0, totalDependencyFindings: 104, totalUsageFindings: 994,
     }, 3, "output/run-run-abc.json");
     // labels + values pinned; column padding is cosmetic and free to change
     expect(text).toContain("AUDIT COMPLETE — run run-abc");
     expect(text).toMatch(/Organizations scanned:\s+2\b/);
     expect(text).toMatch(/Repositories scanned:\s+7\b/);
     expect(text).toMatch(/Branches scanned:\s+88 \(13 skipped by cutoff · 5 excluded by policy · 2 past cap · 4 scan-errored\)/);
+    // the deferred line always prints (a zero documents the invariant), WITHOUT the partial warning
+    expect(text).toMatch(/Branches deferred:\s+0 \(pending queue; retry requires rediscovery and eligibility\)/);
+    expect(text).not.toContain("PARTIAL");
     expect(text).toMatch(/Dependency findings:\s+104\b/);
     expect(text).toMatch(/Usage findings:\s+994\b/);
     expect(text).toMatch(/Errors recorded:\s+3 \(fail-soft/);
     expect(text).toContain("output/run-run-abc.json (+ latest.json)");
+  });
+
+  test("a NONZERO deferred count flags the scanned counters as PARTIAL — never a clean-looking summary", () => {
+    const text = runSummaryText("run-abc", {
+      organizationsScanned: 2, repositoriesScanned: 7, branchesScanned: 88,
+      branchesSkippedByCutoff: 13, branchesExcludedByPolicy: 5, branchesPastCap: 2, branchesErrored: 0,
+      branchesDeferred: 37, discoveryScopesDeferred: 0, totalDependencyFindings: 104, totalUsageFindings: 994,
+    }, 0, "output/run-run-abc.json");
+    // the exact field condition this line exists for: sustained rate limiting with zero recorded
+    // errors must not read as a complete audit
+    expect(text).toMatch(/Errors recorded:\s+0\b/);
+    expect(text).toMatch(/Branches deferred:\s+37 \(pending queue; retry requires rediscovery and eligibility\) — the scanned counts above are PARTIAL/);
+  });
+
+  // The §4 DISCOVERY blind spot: a throttled owner/repo listing enqueues nothing and errors nothing,
+  // so branchesDeferred AND errors are both legitimately 0 while part of the estate was never seen.
+  // Before this line the summary printed two reassuring zeros and no warning at all.
+  test("a DISCOVERY deferral alone flags PARTIAL — zero branches deferred, zero errors, still not complete", () => {
+    const text = runSummaryText("run-abc", {
+      organizationsScanned: 1, repositoriesScanned: 0, branchesScanned: 0,
+      branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
+      branchesDeferred: 0, discoveryScopesDeferred: 2, totalDependencyFindings: 0, totalUsageFindings: 0,
+    }, 0, "output/run-run-abc.json");
+    expect(text).toMatch(/Branches deferred:\s+0\b/); // the queue really is empty…
+    expect(text).toMatch(/Errors recorded:\s+0\b/); // …and nothing errored…
+    expect(text).toMatch(/Discovery scopes deferred:\s+2\b/); // …but two scopes were never enumerated
+    expect(text).toContain("PARTIAL");
+  });
+
+  test("UNKNOWN discovery evidence prints unknown, never 0 — a pre-v5 or unsealed run claims nothing", () => {
+    const text = runSummaryText("run-abc", {
+      organizationsScanned: 1, repositoriesScanned: 1, branchesScanned: 1,
+      branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
+      branchesDeferred: 0, discoveryScopesDeferred: null, totalDependencyFindings: 0, totalUsageFindings: 0,
+    }, 0, "output/run-run-abc.json");
+    expect(text).toMatch(/Discovery scopes deferred:\s+unknown/);
+    expect(text).not.toMatch(/Discovery scopes deferred:\s+0\b/); // rendering null as 0 would over-claim
+    // unknown is not a positive deferral, so it must not shout PARTIAL — it says "cannot tell"
+    expect(text).not.toContain("PARTIAL");
+  });
+
+  test("a clean run states an explicit zero on BOTH deferral lines and stays non-PARTIAL", () => {
+    const text = runSummaryText("run-abc", {
+      organizationsScanned: 1, repositoriesScanned: 1, branchesScanned: 1,
+      branchesSkippedByCutoff: 0, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesErrored: 0,
+      branchesDeferred: 0, discoveryScopesDeferred: 0, totalDependencyFindings: 0, totalUsageFindings: 0,
+    }, 0, "output/run-run-abc.json");
+    expect(text).toMatch(/Discovery scopes deferred:\s+0\b/);
+    expect(text).not.toContain("PARTIAL");
   });
 });
 
@@ -1895,9 +1972,70 @@ describe("processRepo throttle requeue (§4)", () => {
   test("ThrottleExhausted puts the unit back to PENDING with no permanent error row", async () => {
     const { db, runId } = openRun();
     await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), rt(config, "hash"), runId, "o", repo, [], new Set());
-    expect(db.getUnit(KEY)?.status).toBe("pending"); // a later run retries it
+    expect(db.getUnit(KEY)?.status).toBe("pending"); // a later run that re-enumerates it retries
     const errs = db.read("SELECT message FROM errors WHERE scope='scan'").all();
     expect(errs.length).toBe(0);
+    db.close();
+  });
+
+  test("the report SURFACES the requeued remainder: branchesDeferred counts it, the error partition stays empty", async () => {
+    // End-to-end pin of the §4 → §7 seam: the same requeue that leaves no row and no errors[]
+    // entry (the carve-out) must land in summary.branchesDeferred, so a one-shot run finished
+    // under sustained rate limiting cannot deliver an all-clean report while work was deferred.
+    const { db, runId } = openRun();
+    await processRepo(db, fakeClient(new ThrottleExhausted("core bucket")), rt(config, "hash"), runId, "o", repo, [], new Set());
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
+    const s = buildReport(db, db.getRun(runId)!).summary;
+    expect(s.branchesDeferred).toBe(1);
+    expect(s.branchesErrored).toBe(0); // deferred stays OUT of the error count (deferred ≠ errored)
+    expect(s.branchesScanned).toBe(0);
+    db.close();
+  });
+
+  // §4 DISCOVERY-scope throttle evidence. A throttled owner/repo discovery enqueues NOTHING and
+  // records NO error, so branchesDeferred (a work_queue count) structurally cannot see it: without
+  // this accumulator a run whose whole owner listing throttled completes and prints
+  // "Branches deferred: 0 / Errors recorded: 0" — the exact false all-clear this PR exists to kill.
+  test("a throttled BRANCH discovery records one repo-scope deferral (no queue row, no errors row)", async () => {
+    const { db, runId } = openRun();
+    const throttling = { listBranchHeads: async () => { throw new ThrottleExhausted("core bucket"); } } as unknown as GithubClient;
+    const deferred = new Set<string>();
+    const cov = await processRepo(db, throttling, rt(config, "hash"), runId, "o", repo, [], new Set(), new Set(), undefined, undefined, deferred);
+    expect(cov).toBeNull(); // discovery failed — this repo contributes no coverage
+    expect(deferred.size).toBe(1); // ...but the deferral is now EVIDENCE, not silence
+    // and it is invisible to both existing surfaces, which is why it needed its own counter
+    expect(db.read("SELECT COUNT(*) AS n FROM work_queue").get()).toEqual({ n: 0 });
+    expect(db.read("SELECT COUNT(*) AS n FROM errors").get()).toEqual({ n: 0 });
+    db.close();
+  });
+
+  test("a throttled OWNER repo-listing records one org-scope deferral", async () => {
+    const { db, runId } = openRun();
+    const throttling = { listOrgRepos: async () => { throw new ThrottleExhausted("core bucket"); } } as unknown as GithubClient;
+    const deferred = new Set<string>();
+    const cov = await processOwner(db, throttling, rt(config, "hash"), runId, "o", null, [], new Set(), new Set(), undefined, undefined, deferred);
+    expect(cov).toEqual([]);
+    expect(deferred.size).toBe(1);
+    db.close();
+  });
+
+  test("deferrals are DISTINCT scopes, so a re-processed scope cannot inflate the count", async () => {
+    const { db, runId } = openRun();
+    const throttling = { listBranchHeads: async () => { throw new ThrottleExhausted("core bucket"); } } as unknown as GithubClient;
+    const deferred = new Set<string>();
+    await processRepo(db, throttling, rt(config, "hash"), runId, "o", repo, [], new Set(), new Set(), undefined, undefined, deferred);
+    await processRepo(db, throttling, rt(config, "hash"), runId, "o", repo, [], new Set(), new Set(), undefined, undefined, deferred);
+    expect(deferred.size).toBe(1);
+    db.close();
+  });
+
+  test("a PERMANENT discovery failure is NOT a deferral — it already has an errors row", async () => {
+    const { db, runId } = openRun();
+    const failing = { listBranchHeads: async () => { throw new GithubApiError("boom", { endpoint: "x" }); } } as unknown as GithubClient;
+    const deferred = new Set<string>();
+    await processRepo(db, failing, rt(config, "hash"), runId, "o", repo, [], new Set(), new Set(), undefined, undefined, deferred);
+    expect(deferred.size).toBe(0); // counted as an ERROR, never double-counted as deferred work
+    expect(db.read("SELECT COUNT(*) AS n FROM errors").get()).toEqual({ n: 1 });
     db.close();
   });
 
@@ -2008,6 +2146,59 @@ describe("processRepo throttle requeue (§4)", () => {
   });
 });
 
+describe("past-cap settles a stale throttle-pending queue row (§4→§7 double-count guard)", () => {
+  // Run A throttles both units (pending queue rows, no head rows — the §4 carve-out). Before run B
+  // the repo grows a NEWER sibling; with ONE non-default cap slot, run B ranks feat-x past the cap.
+  // Run B itself is THROTTLE-FREE (its scan failures are permanent GithubApiErrors), so its report
+  // must partition feat-x exactly once (past-cap): an unsettled pending row would double-count the
+  // branch into branchesDeferred and flag this throttle-free run's summary PARTIAL.
+  // A COMPLETE typed Config (no cast): testConfig carries every required field, the branch cap is
+  // its second parameter, and its default branches:null/excludeBranches:[] is the unrestricted
+  // policy rt() compiles from.
+  const featX: BranchHead = { name: "feat-x", oid: "c".repeat(40), committedDate: "2026-01-01T00:00:00Z", treeOid: "d".repeat(40) };
+  const featY: BranchHead = { name: "feat-y", oid: "e".repeat(40), committedDate: "2026-02-01T00:00:00Z", treeOid: "f".repeat(40) };
+  const capMain: BranchHead = { name: "main", oid: "a".repeat(40), committedDate: "2026-03-01T00:00:00Z", treeOid: "b".repeat(40) };
+  const XKEY: WorkUnitKey = { configHash: "cap-hash", scope: "branch", organization: "o", repository: "r", branch: "feat-x" };
+  const clientFor = (snapshot: BranchSnapshot, failure: Error): GithubClient =>
+    ({ listBranchHeads: async () => snapshot, cloneNoCheckout: async () => { throw failure; } }) as unknown as GithubClient;
+  // Run metadata mirrors the runtime config below: cutoffDate matches testConfig's, and the
+  // discovered owner "o" is coherent because the config's organizations is overridden to null.
+  const startCapRun = (db: AuditDb) => db.startRun({
+    configHash: "cap-hash", effectiveOwners: ["o"], ownersSource: "discovered",
+    trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com",
+  });
+
+  test("run B (throttle-free) reports the churned-out branch as past-cap ONLY — settled queue row, zero deferred, no PARTIAL", async () => {
+    const root = mkdtempSync(join(tmpdir(), "past-cap-settle-"));
+    // Complete typed Config, no cast; organizations: null makes the discovered owner "o" coherent.
+    const capConfig: Config = { ...testConfig(root, 1), organizations: null }; // cap: ONE non-default slot
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // Run A: heads arrive committedDate DESC; feat-x fills the single non-default slot; both scans throttle.
+    const runA = startCapRun(db);
+    await processRepo(db, clientFor({ heads: [capMain, featX], defaultBranch: "main" }, new ThrottleExhausted("core bucket")), rt(capConfig, "cap-hash"), runA.runId, "o", repo, [], new Set());
+    db.completeRun(runA.runId, { discoveryScopesDeferred: 0 });
+    expect(db.getUnit(XKEY)?.status).toBe("pending"); // the §4 carve-out left feat-x deferred
+    // Run B, same config: feat-y (newer) claims the slot, feat-x is past-cap; failures are PERMANENT.
+    const runB = startCapRun(db);
+    expect(runB.resumed).toBe(false);
+    await processRepo(db, clientFor({ heads: [capMain, featY, featX], defaultBranch: "main" }, new GithubApiError("boom", { endpoint: "x" })), rt(capConfig, "cap-hash"), runB.runId, "o", repo, [], new Set());
+    db.completeRun(runB.runId, { discoveryScopesDeferred: 0 });
+    // the stale pending row is settled the moment run B surfaces feat-x as past-cap…
+    const settled = db.getUnit(XKEY)!;
+    expect(settled.status).toBe("skipped");
+    expect(settled.errorMessage).toBeNull(); // the stale throttle message clears with the settle
+    // …so the report partitions feat-x exactly once (past-cap) with no deferred double-count…
+    const s = buildReport(db, db.getRun(runB.runId)!).summary;
+    expect(s.branchesPastCap).toBe(1);
+    expect(s.branchesDeferred).toBe(0);
+    expect(s.branchesErrored).toBe(2); // main + feat-y: permanent scan errors, run B's real story
+    // …and the human summary of this throttle-free run must NOT read as partial.
+    expect(runSummaryText(runB.runId, s, 2, "output/run-x.json")).not.toContain("PARTIAL");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
 describe("same-name stale-head retention is DISPOSITION-AGNOSTIC", () => {
   test("a prior skipped-cutoff row survives a failed re-scan of the now-eligible advanced head", async () => {
     // Round-4 review finding: the retention docs used to describe the retained row as "scanned at
@@ -2017,7 +2208,7 @@ describe("same-name stale-head retention is DISPOSITION-AGNOSTIC", () => {
     // (now eligible, toScan) but its scan ERRORS → no replacement row is written, the name-keyed
     // prune keeps the branch (it is in the live keep-set), and the OLD skipped-cutoff row survives —
     // the report counts the branch in the cutoff bucket this run even though its live head is
-    // eligible. Stale-not-wrong; the next run re-scans (unit left error).
+    // eligible. Stale-not-wrong; a later run that re-enumerates it re-scans (unit left error).
     // branches/excludeBranches EXPLICIT: the shared frozen config omits them, and rt() would compile
     // the missing allowlist into [] (= default-only policy), silently policy-excluding `feat` in both
     // invocations — whose bucket rewrites its row every invocation, defeating the retention scenario.
@@ -2066,7 +2257,7 @@ describe("same-name stale-head retention is DISPOSITION-AGNOSTIC", () => {
     expect(row2.policy_matched_pattern).toBeNull();
     const featErrors = db.read("SELECT message FROM errors WHERE scope='scan' AND branch='feat'").all();
     expect(featErrors.length).toBe(1); // the failed re-scan is loud — the retained row is stale, not silent
-    expect(db.getUnit({ configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "feat" })?.status).toBe("error"); // retryable: the next run re-scans
+    expect(db.getUnit({ configHash: "hash", scope: "branch", organization: "o", repository: "r", branch: "feat" })?.status).toBe("error"); // retryable: a later run that re-enumerates it re-scans
     db.close();
   });
 });
@@ -2450,6 +2641,94 @@ describe("runScan owner fan-out + drain lifecycle (P5: concurrency.organizations
     await captureJsonl(async () => { thrown = await runScan(db, multiOwnerClient(root), rt(twoOwnerConfig(root), "h"), noArgs, null).then(() => null, (e: unknown) => e); });
     return thrown;
   };
+
+  // END-TO-END wiring. The unit tests above hand the accumulator Set to processOwner/processRepo
+  // directly, so they cannot catch the mutations that matter most in production: runScan sealing a
+  // hardcoded 0, runScan allocating a per-owner Set instead of sharing one across the fan-out, or
+  // the field never reaching completeRun / the done event / the report. This drives the REAL
+  // runScan across TWO CONCURRENT owners, one of which throttles its repo listing.
+  test("a throttled owner listing survives the concurrent fan-out and reaches the DB, the report, and the done event", async () => {
+    const root = mkdtempSync(join(tmpdir(), "owner-throttle-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // org-a lists + scans normally; org-b's repo listing exhausts its budget.
+    const client = makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads };
+      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+      const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
+      if (decodeURIComponent(owner) === "org-b") throw new ThrottleExhausted("core bucket");
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    const events = await captureJsonl(() => runScan(db, client, rt(twoOwnerConfig(root), "h"), noArgs, null));
+
+    expect(runStatus(db)).toBe("completed"); // the run still COMPLETES — that is the whole hazard
+    expect(scannedOrgs(db)).toEqual(["org-a"]); // only one owner was ever enumerated
+    // 1. sealed into the DB by runScan (mutation: sealing a hardcoded 0 dies here)
+    const run = db.getRun((db.read(`SELECT run_id FROM runs`).get() as { run_id: string }).run_id)!;
+    expect(run.discoveryScopesDeferred).toBe(1);
+    // 2. and the two counts that CANNOT see it are both legitimately zero — the false all-clear
+    const s = buildReport(db, run).summary;
+    expect(s.discoveryScopesDeferred).toBe(1);
+    expect(s.branchesDeferred).toBe(0);
+    expect(s.branchesErrored).toBe(0);
+    // 3. and it rides the done event (mutation: dropping it from the embedded summary dies here)
+    const done = events.find((e) => e.event === "done") as { summary?: Record<string, unknown> } | undefined;
+    expect(done?.summary?.discoveryScopesDeferred).toBe(1);
+    // 4. and the human summary flags PARTIAL despite zero branches deferred and zero errors
+    expect(runSummaryText("r", s, 0, "p")).toContain("PARTIAL");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // C-2: the end-to-end test above throttles the OWNER listing, which never reaches processRepo.
+  // Dropping the Set forwarding from processOwner to processRepo would break every REPOSITORY
+  // branch-list deferral while that test still passed. This drives the repo-scope path for real.
+  test("a throttled REPOSITORY branch-listing also reaches the sealed evidence end-to-end", async () => {
+    const root = mkdtempSync(join(tmpdir(), "repo-throttle-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // both owners list their repos fine; the BRANCH listing (graphql) throttles for every repo
+    const client = makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (args.some((a) => a === "graphql")) throw new ThrottleExhausted("core bucket");
+      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+      const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    await captureJsonl(() => runScan(db, client, rt(twoOwnerConfig(root), "h"), noArgs, null));
+    const run = db.getRun((db.read(`SELECT run_id FROM runs`).get() as { run_id: string }).run_id)!;
+    // one repo-scope deferral per owner, distinct — and NOT collapsed with the org scope
+    expect(run.discoveryScopesDeferred).toBe(2);
+    expect(buildReport(db, run).summary.branchesDeferred).toBe(0); // still invisible to the queue count
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a RESUMED run cannot launder an earlier invocation's discovery throttle into a clean zero", async () => {
+    // The accumulator is per-invocation and in memory. A run interrupted after a discovery throttle
+    // keeps its run_id, so the next invocation resumes it with an EMPTY Set — sealing 0 would erase
+    // evidence that a real deferral happened. This invocation cannot see the earlier one, so the
+    // honest seal is UNKNOWN, not a number it did not verify.
+    const root = mkdtempSync(join(tmpdir(), "resume-throttle-"));
+    const db = AuditDb.open({ sqlitePath: ":memory:" });
+    // invocation 1: leave a RUNNING run behind (as a crash would), simulating the interrupted run
+    const first = db.startRun({ configHash: "h", effectiveOwners: ["org-a", "org-b"], ownersSource: "discovered", trackedPackages: ["expo"], cutoffDate: "2024-01-01", githubHost: "github.com" });
+    expect(first.resumed).toBe(false);
+    // invocation 2: same config -> RESUMES that run_id, and throttles nothing at all
+    const clean = makeClient(root, async (_bin, args) => {
+      const j = args.join(" ");
+      if (args.some((a) => a === "graphql")) return { exitCode: 0, stderr: "", stdout: heads };
+      if (j.includes("git/trees")) return { exitCode: 0, stderr: "", stdout: treeBody(args) };
+      const owner = /orgs\/([^/?]+)\/repos/.exec(j)?.[1] ?? "org-a";
+      return { exitCode: 0, stderr: "", stdout: `HTTP/2.0 200 X\r\n\r\n${JSON.stringify([{ name: "svc", owner: { login: decodeURIComponent(owner) }, default_branch: "main", pushed_at: "2025-01-01T00:00:00Z", archived: false, fork: false, private: false }])}` };
+    });
+    await captureJsonl(() => runScan(db, clean, rt(twoOwnerConfig(root), "h"), noArgs, null));
+    const run = db.getRun(first.runId)!;
+    expect(run.status).toBe("completed");
+    // UNKNOWN, not 0: this invocation verified nothing about the earlier one's discovery
+    expect(run.discoveryScopesDeferred).toBeNull();
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
 
   test("two owners fan out and BOTH scan (concurrency.organizations:2), run completes", async () => {
     const root = mkdtempSync(join(tmpdir(), "owner-fanout-"));

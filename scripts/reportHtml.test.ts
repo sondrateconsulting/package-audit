@@ -47,7 +47,7 @@ const FIXED_CTX: DossierContext = {
   runId: "run-fixture",
   generatedAt: T0,
   config: { cutoffDate: "2024-01-01", githubHost: "github.com", organizations: ["org-a"] },
-  summary: { repositoriesScanned: 2, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0 },
+  summary: { repositoriesScanned: 2, branchesScanned: 3, branchesSkippedByCutoff: 1, branchesExcludedByPolicy: 0, branchesPastCap: 0, branchesDeferred: 0, discoveryScopesDeferred: 0 },
   formatVersion: XRAY_FORMAT_VERSION,
 };
 
@@ -94,7 +94,7 @@ function seed(db: AuditDb) {
     { exportName: "unusedThing", exportKind: "named", source: "index.d.ts" },
     { exportName: "expo", exportKind: "cli-bin", source: "package.json#bin" },
   ] });
-  db.completeRun(runId);
+  db.completeRun(runId, { discoveryScopesDeferred: 0 });
   return db.getRun(runId)!;
 }
 
@@ -139,8 +139,43 @@ const syntheticPkg = (units: DossierUnit[], over: Partial<DossierPackage> = {}):
 // now emitted as a `<https://…>` angle-bracket autolink (was a bare URL through mdCell) so a path
 // with `(`/`)` keeps a correct link destination. Copy-markdown `<template>` bytes only (dossier
 // golden); the visible dossier HTML permalink (permalinkAnchor) is byte-unchanged.
-const GOLDEN_DOSSIER_SHA256 = "1b82113ec0f20fdfb49475f0457dd2c294a5d211bdb4da874ec019b123fac93a";
-const GOLDEN_EMPTY_SHA256 = "36ccb2eccf26d98e30bf1c10a0337c6b78cd9a8f1ea6466a5c880c2e9010e97c";
+// SANCTIONED RE-PIN (v2 → v3, §4 throttle visibility): XRAY_FORMAT_VERSION moved 2 → 3 — the ONE
+// condition under which these pins may change. Proven non-laundering by the re-pin guard below:
+// each v2 render still hashes to its historical *_V2 constant, and substituting the two version
+// needles reproduces the v3 render exactly, so no unrelated output change rode along.
+const GOLDEN_DOSSIER_SHA256 = "2d3a2b7c5f05301bcfcaa23d020d87cd61f8a9c4cedbf97caf500537c50fa475";
+const GOLDEN_EMPTY_SHA256 = "03cacd9d3fb87ba53eeff010d073312395820f2cb189b3254ecbbc3e6d824126";
+
+// The v2 pins these replaced, kept as the RE-PIN PROOF rather than deleted. The guard below renders
+// the same fixtures at formatVersion 2 and shows they still hash to exactly these values — so the v3
+// pins above cannot have absorbed an unrelated output change under cover of the sanctioned bump.
+const GOLDEN_DOSSIER_SHA256_V2 = "1b82113ec0f20fdfb49475f0457dd2c294a5d211bdb4da874ec019b123fac93a";
+const GOLDEN_EMPTY_SHA256_V2 = "36ccb2eccf26d98e30bf1c10a0337c6b78cd9a8f1ea6466a5c880c2e9010e97c";
+
+describe("golden re-pin guard (v2 → v3): the bump is the ONLY byte change", () => {
+  // A version bump is the one sanctioned way these pins may move, which makes it the one moment an
+  // unrelated rendering change could ride along unnoticed. This makes that impossible to do quietly:
+  // the v2 render must still equal its historical hash, and substituting the two version needles
+  // must reproduce the v3 render EXACTLY — byte for byte, nothing else moved.
+  const bumpNeedles = (html: string): string =>
+    html
+      .replaceAll(`<meta name="xray-format-version" content="2">`, `<meta name="xray-format-version" content="3">`)
+      .replaceAll("report-format version 2 ·", "report-format version 3 ·");
+
+  test("populated dossier: v2 hash unchanged, v3 differs only by the version digits", () => {
+    const [pkg] = fixturePackages();
+    const v2 = renderDossier(pkg!, { ...FIXED_CTX, formatVersion: 2 });
+    expect(createHash("sha256").update(v2, "utf8").digest("hex")).toBe(GOLDEN_DOSSIER_SHA256_V2);
+    expect(bumpNeedles(v2)).toBe(renderDossier(pkg!, { ...FIXED_CTX, formatVersion: 3 }));
+  });
+
+  test("empty dossier: v2 hash unchanged, v3 differs only by the version digits", () => {
+    const pkg = fixturePackages()[1]!;
+    const v2 = renderDossier(pkg, { ...FIXED_CTX, formatVersion: 2 });
+    expect(createHash("sha256").update(v2, "utf8").digest("hex")).toBe(GOLDEN_EMPTY_SHA256_V2);
+    expect(bumpNeedles(v2)).toBe(renderDossier(pkg, { ...FIXED_CTX, formatVersion: 3 }));
+  });
+});
 
 describe("renderDossier — determinism and golden bytes", () => {
   test("double-render byte equality (same DB, two builds, two renders)", () => {
@@ -176,6 +211,75 @@ describe("renderDossier — footer scan-scope receipt (§5)", () => {
     });
     expect(withPolicy).toContain("4 excluded by policy, 2 past cap");
     expect(withPolicy).toContain('<a href="index.html#scan-scope">scan scope</a>');
+  });
+
+  // §4 deferral rides the SHARED footer, not the empty-state header: a POPULATED dossier is the
+  // most-read artifact, and it must not present findings as if the slice behind them were complete.
+  // Its two SIBLING coverage-reduction counts (policy, past-cap) were already footer-borne; deferred
+  // being the only one absent was an inconsistency, not a design choice.
+  test("pending branch work rides the shared footer — ONE site, on the populated page too", () => {
+    const pkgs = fixturePackages();
+    const populated = pkgs[0]!; // real findings
+    const empty = pkgs[1]!; // left-pad: zero findings
+    const deferredCtx = { ...FIXED_CTX, summary: { ...FIXED_CTX.summary, branchesDeferred: 3 } };
+
+    const populatedHtml = renderDossier(populated, deferredCtx);
+    const emptyHtml = renderDossier(empty, deferredCtx);
+    // the finding this pins: the populated path reaches ONLY renderFooter, so an empty-state-only
+    // receipt leaves every findings-bearing page silent about the deferred remainder.
+    expect(populatedHtml).toContain("3 branches still pending");
+    expect(emptyHtml).toContain("3 branches still pending");
+    // exactly ONE site per document — a second copy means the empty-state header kept its own,
+    // duplicating run-global information that the footer already carries on both paths.
+    expect(populatedHtml.split("3 branches still pending").length - 1).toBe(1);
+    expect(emptyHtml.split("3 branches still pending").length - 1).toBe(1);
+    // one clause, one anchor — never two competing scan-scope links in one footer
+    expect(emptyHtml.split('href="index.html#scan-scope"').length - 1).toBe(1);
+
+    // zero stays suppressed on BOTH paths — the suppression is what keeps the golden byte pins valid
+    expect(renderDossier(populated, FIXED_CTX)).not.toContain("still pending");
+    expect(renderDossier(empty, FIXED_CTX)).not.toContain("still pending");
+  });
+
+  // A throttled owner/repo LISTING enqueues nothing, so branchesDeferred stays 0 while whole
+  // repositories were never enumerated. Without its own receipt the dossier footer would read
+  // completely clean for a run that never saw part of the estate.
+  test("a DISCOVERY deferral reaches the footer even when the branch queue is empty", () => {
+    const pkgs = fixturePackages();
+    const ctx = { ...FIXED_CTX, summary: { ...FIXED_CTX.summary, branchesDeferred: 0, discoveryScopesDeferred: 2 } };
+    for (const pkg of [pkgs[0]!, pkgs[1]!]) {
+      const html = renderDossier(pkg, ctx);
+      expect(html).toContain("2 discovery scopes exhausted their retry/pause budget");
+      expect(html.split("2 discovery scopes exhausted their retry/pause budget").length - 1).toBe(1);
+    }
+    // an explicit sealed ZERO stays suppressed (that suppression is what keeps the golden pins valid)
+    expect(renderDossier(pkgs[0]!, FIXED_CTX)).not.toContain("discovery scope");
+  });
+
+  test("UNKNOWN discovery evidence is DISCLOSED on the dossier — a pre-v5 page must not read like a clean one", () => {
+    // A dossier is a standalone artifact: someone opens left-pad.html without ever seeing the index.
+    // If null (no evidence recorded) rendered identically to a sealed 0 (checked, none found), that
+    // page would silently assert coverage it never verified — the exact conflation this field exists
+    // to prevent. Distinct from a positive count, which asserts the run WAS incomplete.
+    const pkgs = fixturePackages();
+    const unknown = { ...FIXED_CTX, summary: { ...FIXED_CTX.summary, discoveryScopesDeferred: null } };
+    for (const pkg of [pkgs[0]!, pkgs[1]!]) {
+      const html = renderDossier(pkg, unknown);
+      expect(html).toContain("not recorded");
+      expect(html).not.toContain("0 discovery scopes"); // never a fabricated zero
+    }
+    // and a sealed zero says nothing at all — the three states stay distinguishable
+    expect(renderDossier(pkgs[0]!, FIXED_CTX)).not.toContain("not recorded");
+  });
+
+  test("deferred joins the policy/past-cap siblings in ONE clause under ONE anchor", () => {
+    const [pkg] = fixturePackages();
+    const html = renderDossier(pkg!, {
+      ...FIXED_CTX,
+      summary: { ...FIXED_CTX.summary, branchesExcludedByPolicy: 4, branchesPastCap: 2, branchesDeferred: 3 },
+    });
+    expect(html).toContain("4 excluded by policy, 2 past cap, 3 branches still pending");
+    expect(html.split('href="index.html#scan-scope"').length - 1).toBe(1);
   });
 });
 
@@ -313,7 +417,7 @@ describe("adversarial fixture — hostile snippets, paths, branch names (escape-
     // hostile permalink: must never become an href
     use(main, "e", "src/e.ts", 5, "import { e } from 'evil';", "javascript:alert(1)");
     use(hostileBranch, "a", "src/f.ts", 6, "import { a } from 'evil';");
-    db.completeRun(runId);
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
     const report = buildReport(db, db.getRun(runId)!);
     db.close();
     return report.packages[0]!;
@@ -378,7 +482,7 @@ describe("copy-as-markdown: hostile identifiers cannot inject links/images (H1)"
     use(BEACON, "src/b.ts", 2);
     use(BEACON, "src/c.ts", 3);
     use("plain", "src/d.ts", 4);
-    db.completeRun(runId);
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
     const report = buildReport(db, db.getRun(runId)!);
     db.close();
     return report.packages[0]!;
@@ -419,7 +523,7 @@ describe("bidi controls in a hostile export name are neutralized in observation 
     use(`use${RLO}State`, "src/b.ts", 2);
     use(`use${RLO}State`, "src/c.ts", 3);
     use("plain", "src/d.ts", 4);
-    db.completeRun(runId);
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
     const report = buildReport(db, db.getRun(runId)!);
     db.close();
     return report.packages[0]!;
@@ -485,6 +589,13 @@ describe("designed empty state (coverage receipts)", () => {
     expect(html).toContain("1 branch skipped by the 2024-01-01 cutoff");
     expect(html).toContain("Detection is scoped to the scanned slice");
     expect(html).not.toContain("not coupled");
+    // zero deferred renders NO receipt — this suppression is what keeps the golden byte pins valid
+    expect(html).not.toContain("still pending");
+  });
+
+  test("a nonzero deferred count joins the coverage receipts (an empty page must not imply a complete slice)", () => {
+    const deferredCtx = { ...FIXED_CTX, summary: { ...FIXED_CTX.summary, branchesDeferred: 2 } };
+    expect(renderDossier(pkg, deferredCtx)).toContain("2 branches still pending");
   });
 
   test("keeps the byte-identical static script and the format-version footer", () => {
@@ -781,7 +892,7 @@ test("the CLI usage location cell is wrapped in .loc so a hostile repo/file name
     context: "npx expo", filePath: "scripts/‮lmth.evil", lineNumber: 1,
     permalink: `https://github.com/org-a/svc/blob/${main.commitSha}/x#L1`, snippet: "npx expo start", foundAt: T0,
   });
-  db.completeRun(runId);
+  db.completeRun(runId, { discoveryScopesDeferred: 0 });
   const report = buildReport(db, db.getRun(runId)!);
   const html = renderDossier(report.packages[0]!, FIXED_CTX);
   db.close();

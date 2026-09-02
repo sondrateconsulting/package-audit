@@ -88,7 +88,7 @@ export function generateFixtureExports(outputDir: string): { runId: string } {
         ],
       });
     }
-    db.completeRun(runId);
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
     exportRun(db, db.getRun(runId)!, outputDir, { raw: false });
     return { runId };
   } finally {

@@ -222,6 +222,27 @@ export function runSummaryText(
     `  Organizations scanned:  ${s.organizationsScanned}`,
     `  Repositories scanned:   ${s.repositoriesScanned}`,
     `  Branches scanned:       ${s.branchesScanned} (${s.branchesSkippedByCutoff} skipped by cutoff · ${s.branchesExcludedByPolicy} excluded by policy · ${s.branchesPastCap} past cap · ${s.branchesErrored} scan-errored)`,
+    // Deferred sits OUTSIDE the parenthetical partition above (non-terminal, not a disposition) and
+    // always prints — a zero documents the invariant. Nonzero usually means §4 rate limiting requeued
+    // part of the estate (crash-recovery resets and prior-run rows whose unit was never re-enumerated
+    // land here too), so the line must flag the counters as partial: the exact failure this guards is
+    // a one-shot/CI run under sustained throttling reading as a clean, complete audit. The wording
+    // promises no completion — a pending unit is retried only when a future run re-enumerates it AND
+    // it is still eligible (not capped/excluded) then.
+    `  Branches deferred:      ${s.branchesDeferred} (pending queue; retry requires rediscovery and eligibility)${s.branchesDeferred > 0 ? " — the scanned counts above are PARTIAL" : ""}`,
+    // The §4 DISCOVERY blind spot, on its own line because it is a DIFFERENT unit and a different
+    // currency: SCOPES (one throttled owner listing can hide any number of repos/branches), sealed
+    // per-run rather than re-read from the queue. Never add it to the branch counts.
+    // `unknown` (null) is printed verbatim and does NOT flag PARTIAL: a pre-v5 or unsealed run
+    // cannot tell us either way, and rendering that as 0 would assert completeness we never verified.
+    `  Discovery scopes deferred: ${s.discoveryScopesDeferred === null ? "unknown (run predates this evidence, did not complete, or resumed one whose earlier invocations cannot be vouched for)" : s.discoveryScopesDeferred}${
+      s.discoveryScopesDeferred !== null && s.discoveryScopesDeferred > 0
+        // Scoped to THIS run's attempt: on a RESUMED run, rows retained from an earlier invocation
+        // can still place branches of a now-throttled repo into the counts above, so claiming they
+        // appear in NO count would be false.
+        ? " — owners/repos whose listing exhausted their retry/pause budget (rate limiting, repeated HTTP 5xx, or the run's cumulative pause budget); this invocation never enumerated them, so the counts above are PARTIAL"
+        : ""
+    }`,
     `  Dependency findings:    ${s.totalDependencyFindings}`,
     `  Usage findings:         ${s.totalUsageFindings}`,
     `  Errors recorded:        ${errorCount} (fail-soft; details in the report's errors[])`,
@@ -346,12 +367,17 @@ export async function runScan(
   // idempotent, so the two paths compose without double-firing.
   const aborter = new Aborter();
   const onFatal = (): void => aborter.abort();
+  // §4 discovery-throttle evidence, accumulated across the owner fan-out and sealed by completeRun.
+  // A Set of scope identities, not a counter: owners fan out concurrently, and re-processing a scope
+  // must not inflate the total. Safe under the pool because every add() is synchronous (no await
+  // between the read and the write) — the same discipline scheduledRepoKeys already relies on.
+  const deferredDiscoveryScopes = new Set<string>();
   markPhase("scan");
   const ownerResults = await boundedPool(owners, config.concurrency.organizations, async (owner) => {
     // owner bracket (PROMPT-TUI §U3.6): end in finally, so throw paths still close the row
     if (hasProgressSink()) emitProgress({ type: "owner-start", owner });
     try {
-      return await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, aborter, onFatal);
+      return await processOwner(db, client, runtime, runId, owner, personalLogin, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, aborter, onFatal, deferredDiscoveryScopes);
     } catch (e) {
       aborter.abort(); // trip so sibling owners stop dispatching new work immediately
       throw e; // captured by the pool; the run lifecycle is decided AFTER every owner has drained
@@ -394,8 +420,22 @@ export async function runScan(
   markPhase("reconcile");
   await reconcileIntrospection(db, client, config, runId);
 
-  // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at).
-  db.completeRun(runId);
+  // §8 step 6: mark completed BEFORE the report reads (so generatedAt=completed_at). The discovery
+  // evidence seals HERE, after the owner pool has fully drained, so the count is final and this
+  // completed run can never exist without it.
+  // RESUMED-RUN HONESTY: a resumed run reuses its run_id, but this accumulator is per-invocation
+  // and in memory — an earlier invocation's throttled scopes are simply gone. Sealing this
+  // invocation's 0 over them would launder a real deferral into a clean number, the precise failure
+  // this evidence exists to prevent. So on a resume we seal what we can defend:
+  //   • saw throttles here (n > 0) → seal n. It is a LOWER BOUND, and it still flags PARTIAL —
+  //     strictly better than claiming unknown when we know the run was incomplete.
+  //   • saw none here (n === 0)    → seal NULL (UNKNOWN). We verified nothing about the earlier
+  //     invocation, and 0 would assert coverage this invocation never checked.
+  // A fresh run always seals its exact count, 0 included.
+  const scopesThisInvocation = deferredDiscoveryScopes.size;
+  db.completeRun(runId, {
+    discoveryScopesDeferred: resumed && scopesThisInvocation === 0 ? null : scopesThisInvocation,
+  });
   markPhase("report");
   // §8 step 7: produce the consolidated §7 report (run-<id>.json + latest.json) from SQLite,
   // then the machine done-event (stdout) and the human summary — BOTH derived from the emitted
@@ -452,6 +492,7 @@ export async function processOwner(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, personalLogin: string | null, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
   scheduledRepoKeys: Set<string> = new Set(), signal?: AbortLike, onFatal?: () => void,
+  deferredDiscoveryScopes: Set<string> = new Set(),
 ): Promise<RepoPolicyCoverage[]> {
   // Personal-vs-org routing is CASE-INSENSITIVE to match ownerResolve's owner fold: a configured
   // "Alice" that collapsed onto personal login "alice" must still route through listUserRepos, not
@@ -459,7 +500,15 @@ export async function processOwner(
   // gates whether personal routing applies — the `personalLogin !== null` check is just defensive.)
   const isPersonal = runtime.config.includePersonalNamespace && personalLogin !== null && owner.toLowerCase() === personalLogin.toLowerCase();
   const outcome = await discoverOwnerRepos(db, client, runtime.config, runtime.repositoryPolicy, runId, owner, isPersonal);
-  if (!outcome.ok) return []; // repo discovery failed/throttled — nothing to process, no coverage
+  if (!outcome.ok) {
+    // §4 evidence: a THROTTLED owner listing enumerated nothing, so it enqueued no work units and
+    // (deliberately) recorded no errors row — it is invisible to BOTH branchesDeferred (a work_queue
+    // count) and branchesErrored. Record the scope itself, or this run completes looking clean.
+    // A PERMANENT failure is excluded: it already carries an errors row, and counting it here too
+    // would double-report one owner as both errored and deferred.
+    if (outcome.reason === "throttled") deferredDiscoveryScopes.add(`org\0${owner.toLowerCase()}`);
+    return []; // repo discovery failed/throttled — nothing to process, no coverage
+  }
   // Repos stay SEQUENTIAL within an owner (§4): each repo's discover→plan→scan→reconcile must be
   // atomic (branches fan out INSIDE processRepo). Check the run-level abort before each repo so a
   // fatal in a SIBLING owner stops this owner from dispatching more work promptly (boundary-only
@@ -470,7 +519,7 @@ export async function processOwner(
     // repo bracket (PROMPT-TUI §U3.6): end in finally, so a throwing repo still closes its row
     if (hasProgressSink()) emitProgress({ type: "repo-start", owner, repo: repo.name });
     try {
-      const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, signal, onFatal);
+      const cov = await processRepo(db, client, runtime, runId, owner, repo, cliTermSets, nonRegistrySkipSeen, scheduledRepoKeys, signal, onFatal, deferredDiscoveryScopes);
       if (cov !== null) coverages.push(cov);
     } finally {
       if (hasProgressSink()) emitProgress({ type: "repo-end", owner, repo: repo.name });
@@ -547,10 +596,18 @@ export async function processRepo(
   db: AuditDb, client: GithubClient, runtime: AuditRuntime, runId: string,
   owner: string, repo: RepoInfo, cliTermSets: CliTermSet[], nonRegistrySkipSeen: Set<string>,
   scheduledRepoKeys: Set<string> = new Set(), signal?: AbortLike, onFatal?: () => void,
+  deferredDiscoveryScopes: Set<string> = new Set(),
 ): Promise<RepoPolicyCoverage | null> {
   const { config, configHash, branchPolicy } = runtime;
   const outcome = await discoverBranchHeads(db, client, runId, repo);
-  if (!outcome.ok) return null; // failed/throttled — this repo isn't "discovered"; contributes no coverage
+  if (!outcome.ok) {
+    // Same §4 evidence rule as the owner scope above: a THROTTLED branch listing enqueued nothing
+    // and recorded nothing, so without this the repo's whole branch set vanishes from every count.
+    // Keyed by scope identity (not a bare ++) so re-processing one repo cannot inflate the total.
+    if (outcome.reason === "throttled")
+      deferredDiscoveryScopes.add(`repo\0${repo.organization.toLowerCase()}\0${repo.name.toLowerCase()}`);
+    return null; // failed/throttled — this repo isn't "discovered"; contributes no coverage
+  }
   // §5.A exclusivity backstop (P0): claim this repo's canonical (org, repo) BEFORE any per-branch
   // write, so a double-scheduled repo fails LOUD rather than racing two fibers on the same rows
   // under fan-out. The check-then-add is synchronous (no await between .has and .add), so it stays
@@ -597,12 +654,17 @@ export async function processRepo(
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "skip-cutoff" });
   }
 
-  // Past-cap (policy-eligible, after cutoff, past the cap): record ONLY a run_unit_head row for report
-  // visibility — do NOT enqueue or touch the work queue, so a prior 'done' scan survives and a later
-  // run can promote this branch (cap-order shift) without a re-scan.
+  // Past-cap (policy-eligible, after cutoff, past the cap): record a run_unit_head row for report
+  // visibility — never enqueue, and never touch a 'done' queue row, so a prior scan survives and a
+  // later run can promote this branch (cap-order shift) without a re-scan. A stale 'pending' row
+  // IS settled to 'skipped', though — however it arose (§4 throttle deferral, crash-recovery
+  // reset, or --rescan-branch): §7's queue-side
+  // branchesDeferred would otherwise count the same branch this run just surfaced as past-cap — a
+  // double count that flags a throttle-free run PARTIAL (see settlePastCapUnit).
   for (const d of plan.pastCap) {
     const h = d.head;
     db.upsertRunUnitHead({ runId, organization: repo.organization, repository: repo.name, branch: h.name, commitSha: "", status: "past-cap", isDefaultBranch: d.isDefaultBranch, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: h.committedDate });
+    db.settlePastCapUnit(keyFor(h.name), runId);
     logLine({ event: "unit", org: repo.organization, repo: repo.name, branch: h.name, commit: "", action: "past-cap" });
   }
 
@@ -669,7 +731,8 @@ export async function processRepo(
           if (e instanceof PolicyMatchError) throw e;
           if (e instanceof ThrottleExhausted) {
             // §4: throttle exhaustion is NOT a permanent unit failure — reset to pending so a LATER run
-            // retries it. No same-run spin: the pool dispatches each fixed plan.toScan unit exactly once
+            // that re-enumerates it can retry (and may throttle again). No same-run spin: the pool
+            // dispatches each fixed plan.toScan unit exactly once
             // and nothing re-reads pending units within the run. Handled here (not a fatal), so it never
             // trips branchAbort — one throttled branch must not cancel its siblings.
             db.setUnitStatus(key, { status: "pending", runId, errorMessage: (e as Error).message });
@@ -749,8 +812,9 @@ export async function processRepo(
   //   - it is NOT a regression: before reconciliation existed there was no prune at all, so the row was retained
   //     identically. The prune is a mitigation this feature ADDED (it removes deleted-branch phantoms
   //     that used to persist forever); it is not the cause.
-  //   - it self-heals: the unit is left error/pending, never done, so the next run re-scans and re-upserts
-  //     at the live head.
+  //   - it self-heals CONDITIONALLY: the unit is left error/pending, never done, so a later run that
+  //     still re-enumerates the branch re-scans and re-upserts at the live head (a retry can throttle
+  //     again, and a never-re-enumerated unit stays as recorded).
   // A head-SHA-aware prune is REJECTED: it would delete the commit_sha='' sentinels the non-scanned
   // dispositions rely on, hiding a real branch's real findings entirely rather than reporting them one
   // commit late. (Scanned rows now always carry the DISCOVERED oid — the T2c coherence gate fails a
@@ -758,7 +822,9 @@ export async function processRepo(
   // but the sentinels alone still settle it.)
   // Sharp edge worth knowing: the ERROR variant is loud (an errors[] row + a JSONL `action:"error"`
   // line, visible beside the stale row), but the THROTTLE variant writes neither — only a stdout
-  // requeue line — so a completed run can present the old head with no in-report signal. Related: the
+  // requeue line plus the unit left pending, which the report's AGGREGATE branchesDeferred counts —
+  // so a completed run still presents the old head with no in-report signal NAMING the branch (the
+  // count says how many were deferred, not which). Related: the
   // retained row also masks that branch from the report's branchesErrored, which counts only errored
   // branches holding NO row (see report.ts).
   const pruned = db.reconcileRunUnitHead(runId, repo.organization, repo.name, heads.map((h) => h.name));
