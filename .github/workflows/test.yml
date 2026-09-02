@@ -57,7 +57,7 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.14
-      - uses: opt-nc/setup-duckdb-action@22132a85b3becf964d0cde69af578453248c09bb # v1.2.11
+      - uses: opt-nc/setup-duckdb-action@fa80fdfeb64bf6f04b37034552d64798888e182b # v1.2.12
         with:
           version: v1.5.4
       - run: bun install --frozen-lockfile
