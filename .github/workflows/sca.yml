@@ -49,6 +49,6 @@ jobs:
           persist-credentials: false
       - uses: zizmorcore/zizmor-action@70fb788f84895a7701f5643d103d587e460b5c99 # v0.6.3
         with:
-          version: 1.29.0          # pin the zizmor CLI (the action defaults to "latest"); 1.29.0 is the action v0.6.2 default
+          version: 1.30.0          # pin the zizmor CLI (the action defaults to "latest"); 1.30.0 is the action v0.6.3 default
           advanced-security: false # private repo w/o GHAS: fail the job on findings instead of uploading SARIF
           annotations: true        # surface findings as inline GitHub annotations
