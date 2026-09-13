@@ -76,7 +76,7 @@ Row order is total (each table's full unique key) and documented per table below
 
 ## Versioning
 
-The manifest's `formatVersion` (currently 2) covers the artifact set, the manifest shape,
+The manifest's `formatVersion` (currently 3) covers the artifact set, the manifest shape,
 and the column contract below. Any breaking change to this contract bumps it; bumping it is
 the one sanctioned way the golden fixtures change. (v2 added the `run_unit_head` table.)
 
@@ -166,8 +166,14 @@ snapshot. Unlike the findings tables, this exports every disposition TYPE (scann
 policy-excluded / past-cap, plus the branch-policy columns that live largely on the non-scanned rows). A discovered branch
 that reached no terminal disposition has NO row here: one whose scan **errored** carries a `scope='scan'`
 entry in the report's `errors[]` (and is counted by the report's `branchesErrored`), while one whose scan
-was **throttle-requeued** is deferred with neither a row nor a new error — it is finished on the next run
+was **throttle-requeued** is deferred with neither a row nor a new error — retried, or settled as a
+non-scanned disposition (cutoff/policy/past-cap), when a later run re-enumerates it; a retry can throttle again
 (on a resume, an EARLIER invocation's append-only error still counts a rowless branch in `branchesErrored`).
+Deferred does not mean uncounted: while its queue row stays pending the report's current-backlog `branchesDeferred` counts it,
+and the stderr summary flags the run's scanned counts PARTIAL. A listing that exhausted its retry budget enqueues NO NEW branch rows, so branches absent from prior
+queue state are invisible to both counts (pre-existing pending rows beneath that scope still count,
+since `branchesDeferred` reads every pending row for the config); the report's `discoveryScopesDeferred`
+(and the `runs.discovery_scopes_deferred` column) is the evidence for that case.
 Scoped to the selected run only (`--raw` dumps all runs).
 
 On a **resumed** run (one interrupted and re-invoked, which reuses the same `run_id`), the report's
@@ -241,11 +247,35 @@ rows are always `0`.
 | cutoff_date | string |
 | github_host | string |
 | status | string |
+| discovery_scopes_deferred | nullable-number |
 
 Row order: `run_id`
 
 Notes: `effective_owners` and `tracked_packages` are JSON arrays serialized as text —
 DuckDB reads them with `from_json(...)`, jq with `fromjson`.
+
+`discovery_scopes_deferred` is the §4 discovery-throttle evidence: how many DISTINCT discovery
+scopes (one per owner repo-listing, one per repository branch-listing) exhausted their RETRY/PAUSE
+budget during this run. That is `ThrottleExhausted`, which has TWO distinct mechanisms: a single
+call running out of retries (GitHub rate limiting, or repeated HTTP 5xx responses burning the same
+bounded retry allowance), or the RUN spending its cumulative pause budget. A network failure has no
+HTTP response and exhausts as a permanent error instead, so it is NOT counted here.
+
+Those scopes enumerated nothing, so they enqueue no NEW work and record no error. Branches absent
+from prior queue state are therefore invisible to both `branchesErrored` and `branchesDeferred`
+(pre-existing pending rows beneath such a scope still count, since `branchesDeferred` reads every
+pending row for the config) — which is why this count is persisted here instead of being derived. **`null` means UNKNOWN, never zero**: a
+run that is still running, that failed, or that predates schema v5 sealed no evidence. A completed
+run MIGRATED from pre-v5 also keeps its `null`. So does a RESUMED run whose completing invocation
+saw no discovery throttles: the accumulator lives in memory for one invocation, so that invocation
+cannot vouch for what an earlier one hit, and writing `0` would assert coverage it never checked.
+"Completed" therefore never implies a number on its own.
+
+On a resumed run a POSITIVE value is a LOWER BOUND — at least this many scopes exhausted their budget,
+counted by the completing invocation; earlier invocations of the same `run_id` may have hit more.
+On a fresh (non-resumed) run the value is exact.
+Read it as per-run immutable evidence — unlike the report's `branchesDeferred`, which is the
+current pending-queue backlog for the whole config at the moment the report was generated.
 
 ## Analyzing the exports
 

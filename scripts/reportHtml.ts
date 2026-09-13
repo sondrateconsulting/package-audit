@@ -82,6 +82,11 @@ export interface DossierSummary {
   readonly branchesSkippedByCutoff: number;
   readonly branchesExcludedByPolicy: number; // branch allow/deny (§5)
   readonly branchesPastCap: number;
+  readonly branchesDeferred: number; // §4 deferred remainder (queue-side pending; see report.ts)
+  // §4 discovery blind spot: SCOPES whose listing exhausted its retry/pause budget (per-run sealed evidence).
+  // null = UNKNOWN (running, failed, pre-v5, or RESUMED with no exhaustion seen by the completing
+  // invocation) — renderers must never show that as 0. See report.ts.
+  readonly discoveryScopesDeferred: number | null;
 }
 // Branch allow/deny scan-scope diagnostics (§5). Defined here (the render layer) so both the report
 // data layer (report.ts, structurally assignable) and the index renderer share ONE shape without a
@@ -895,14 +900,37 @@ function renderBands(m: DossierModel): string {
 
 function renderFooter(ctx: DossierContext): string {
   const s = ctx.summary;
-  // Compact global scan-scope receipt: shown only when policy actually dropped
-  // or deferred branches. The full per-branch ledger lives in the run index's #scan-scope panel — a
-  // package-centric dossier does not duplicate it N times (the href is a static literal, no injection).
-  const policyReceipt =
-    s.branchesExcludedByPolicy > 0 || s.branchesPastCap > 0
-      ? ` · ${num(s.branchesExcludedByPolicy)} excluded by policy, ${num(s.branchesPastCap)} past cap — <a href="index.html#scan-scope">scan scope</a>`
-      : "";
-  return `<footer>package usage x-ray · report-format version ${num(ctx.formatVersion)} · run ${esc(ctx.runId)} · generated ${esc(ctx.generatedAt)}${policyReceipt}</footer>`;
+  // Compact global coverage receipt: shown when a coverage reduction is REAL (positive counts) or
+  // when discovery completeness is UNKNOWN (null evidence) — silence means "checked, nothing to say".
+  // The full per-branch ledger lives in the run index's #scan-scope panel — a package-centric
+  // dossier does not duplicate it N times (the href is a static literal, no injection).
+  // THIS FOOTER IS THE SINGLE SITE for all three coverage-reduction counts, and it is shared by the
+  // empty AND populated dossier paths — which is the point: a page WITH findings is the most-read
+  // artifact, so it is exactly where an incomplete slice must be disclosed. §4 deferral joins its
+  // two siblings here rather than riding the empty-state header alone (where the populated path,
+  // which never calls renderEmptyBody, could never see it).
+  const coverageParts = [
+    ...(s.branchesExcludedByPolicy > 0 || s.branchesPastCap > 0
+      ? [`${num(s.branchesExcludedByPolicy)} excluded by policy, ${num(s.branchesPastCap)} past cap`]
+      : []),
+    // "still pending", never "deferred by throttle": the count also admits crash-recovery resets and
+    // stale rows no run re-enumerates, so naming a cause here would over-claim (see report.ts).
+    ...(s.branchesDeferred > 0 ? [`${plural(s.branchesDeferred, "branch", "branches")} still pending`] : []),
+    // The DISCOVERY blind spot needs its own clause because the branch counts CANNOT express it: a
+    // listing that exhausted its retry budget enumerated nothing, so it contributes no queue row and no
+    // error. THREE distinct states, and collapsing any two of them is the failure this guards —
+    // a dossier is a standalone artifact, so a reader who never opens the index still has to be
+    // able to tell "checked, none" from "never recorded". Only an explicit sealed 0 is silent.
+    ...(s.discoveryScopesDeferred === null
+      ? ["discovery retry-budget exhaustion not recorded for this run"]
+      : s.discoveryScopesDeferred > 0
+        ? [`${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} exhausted their retry/pause budget`]
+        : []),
+  ];
+  // ONE clause under ONE anchor — two receipts would mean two competing scan-scope links.
+  const coverageReceipt =
+    coverageParts.length === 0 ? "" : ` · ${coverageParts.join(", ")} — <a href="index.html#scan-scope">scan scope</a>`;
+  return `<footer>package usage x-ray · report-format version ${num(ctx.formatVersion)} · run ${esc(ctx.runId)} · generated ${esc(ctx.generatedAt)}${coverageReceipt}</footer>`;
 }
 
 // The designed EMPTY state: coverage receipts, never "not coupled" —
@@ -914,6 +942,8 @@ function renderEmptyBody(pkg: DossierPackage, ctx: DossierContext): string {
     `${plural(ctx.summary.repositoriesScanned, "repository", "repositories")} scanned`,
     `${plural(ctx.summary.branchesScanned, "branch", "branches")} scanned`,
     `${plural(ctx.summary.branchesSkippedByCutoff, "branch", "branches")} skipped by the ${ctx.config.cutoffDate} cutoff`,
+    // NB: the §4 deferral receipt is deliberately NOT here — it rides renderFooter, which BOTH this
+    // empty path and the populated path render, so the disclosure reaches every dossier exactly once.
   ].join(" · ");
   return (
     `<header id="exec"><p class="meta">package usage dossier</p><h1 class="exec">${esc(sentence)}</h1>` +

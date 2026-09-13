@@ -46,10 +46,17 @@ export const XRAY_DIR_NAME = "xray";
 // after launch, any manifest-shape change bumps this.)
 // v2 (branch allow/deny): the report JSON gains formatVersion + scanScope + policy summary counts,
 // a new run_unit_head export table, and the HTML scan-scope panel — an artifact-set change.
+// v3 (§4 throttle visibility): the report JSON's summary gains TWO required fields —
+// `branchesDeferred` (the pending work_queue backlog) and `discoveryScopesDeferred` (nullable
+// per-run evidence of rate-limited owner/repo listings) — and the `runs` export gains a
+// `discovery_scopes_deferred` column. Same class of change as v2's "report JSON gains … policy
+// summary counts": summarySchema is a z.strictObject, so a v2 artifact and a v3 artifact are
+// mutually unparseable while both would otherwise claim version 2. Additive-and-therefore-exempt
+// is NOT a rule this constant recognizes — the strict schema is the published contract.
 // `as const` is documentary, not load-bearing (a const number literal already infers the literal type)
 // — it states, at the definition, that consumers may PIN to this exact version: reportSchema's
 // z.literal() and EmittedReport.formatVersion both do. Mirrors compare.ts's COMPARE_FORMAT_VERSION.
-export const XRAY_FORMAT_VERSION = 2 as const;
+export const XRAY_FORMAT_VERSION = 3 as const;
 
 // Injectable failure seam for the crash-behavior tests; production always uses node:fs.
 export interface AtomicWriteIo {

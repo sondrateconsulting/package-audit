@@ -76,6 +76,30 @@ function renderScanScope(report: DossierReport): string {
   // When provenance is unverifiable — a migrated pre-v4 run (no past-cap/policy recording) OR a run
   // with zero recorded heads — the cap/policy counts may understate reality, so caveat them rather
   // than presenting an authoritative 0.
+  // §4 deferred remainder — rendered only when real, and DELIBERATELY its own line rather than a
+  // fifth term of `counts` above: that line is the TERMINAL disposition partition, and deferred work
+  // is non-terminal (queue-side, still pending), so folding it in would misread as a fifth bucket.
+  // It belongs on this panel because every dossier footer links here for the full coverage story —
+  // a #scan-scope that omitted the remainder would send the reader to a page that hides it.
+  // A zero renders nothing (that suppression is what keeps GOLDEN_INDEX_SHA256 valid).
+  const deferred =
+    s.branchesDeferred > 0
+      ? `<p class="note">${plural(s.branchesDeferred, "branch", "branches")} still pending — deferred work, counted outside the partition above; the scanned counts are PARTIAL.</p>`
+      : "";
+  // The §4 DISCOVERY blind spot, stated on the canonical coverage panel. Three distinct states, and
+  // conflating any two of them is the failure this guards: a positive count means whole owners/repos
+  // were never enumerated (so the counts above cannot even bound what was missed); null means the
+  // run recorded NO evidence (pre-v5 or unsealed) and we must say so rather than imply coverage; an
+  // explicit 0 means the run checked and found none, which needs no words.
+  const discovery =
+    s.discoveryScopesDeferred === null
+      ? `<p class="note">Discovery retry-budget exhaustion was not recorded for this run (it predates that evidence, did not complete, or resumed a run whose earlier invocations cannot be vouched for) — whether any owner or repository went unenumerated is UNKNOWN.</p>`
+      : s.discoveryScopesDeferred > 0
+        // Scoped to THIS run's discovery attempt on purpose. "their branches appear in NO count"
+        // would be false on a RESUMED run: run_unit_head rows retained from an earlier invocation
+        // can still place branches of a now-throttled repository into the dispositions above.
+        ? `<p class="note">${plural(s.discoveryScopesDeferred, "discovery scope", "discovery scopes")} exhausted their retry/pause budget (retries ran out under rate limiting or repeated HTTP 5xx, or the run spent its cumulative pause budget) — the completing invocation never enumerated those owners/repositories, so nothing it discovered there is reflected above (on a resumed run an EARLIER invocation may have enumerated them, and its retained rows can still appear) and the scanned counts are PARTIAL.</p>`
+        : "";
   const caveat =
     sc.provenance === "pre-upgrade"
       ? `<p class="note">Branch-policy and per-repo-cap dispositions were not fully recorded for this run (it predates that tracking, or recorded no branches); the counts above may understate what it omitted.</p>`
@@ -102,7 +126,7 @@ function renderScanScope(report: DossierReport): string {
         `\n</tbody></table></div>`;
   return (
     `<section id="scan-scope" aria-labelledby="h-scan-scope"><h2 id="h-scan-scope">Scan scope &amp; branch policy</h2>` +
-    `<p class="meta num">${counts}</p>${caveat}${breakdown}${table}</section>`
+    `<p class="meta num">${counts}</p>${deferred}${discovery}${caveat}${breakdown}${table}</section>`
   );
 }
 
@@ -116,6 +140,9 @@ export function renderIndex(report: DossierReport, opts: { formatVersion: number
     `${plural(report.summary.repositoriesScanned, "repository", "repositories")} scanned`,
     `${plural(report.summary.branchesScanned, "branch", "branches")} scanned`,
     `${plural(report.summary.branchesSkippedByCutoff, "branch", "branches")} skipped by the ${report.config.cutoffDate} cutoff`,
+    // §4 deferral receipt, only when real — the front door must not imply a complete slice when part
+    // of the estate was requeued; a zero would add noise (and GOLDEN_INDEX_SHA256 renders a zero).
+    ...(report.summary.branchesDeferred > 0 ? [`${plural(report.summary.branchesDeferred, "branch", "branches")} still pending`] : []),
   ].join(" · ");
 
   const md = [

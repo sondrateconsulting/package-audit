@@ -37,7 +37,7 @@ function startCompleted(db: AuditDb, trackedPackages: string[], configHash = "h"
     configHash, effectiveOwners: ["org-a"], ownersSource: "discovered",
     trackedPackages, cutoffDate: "2024-01-01", githubHost: "github.com",
   });
-  db.completeRun(runId);
+  db.completeRun(runId, { discoveryScopesDeferred: 0 });
   return db.getRun(runId)!;
 }
 

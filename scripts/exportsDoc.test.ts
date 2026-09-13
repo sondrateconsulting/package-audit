@@ -60,6 +60,13 @@ describe("EXPORTS.md prose claims ↔ code reality", () => {
     expect(EXPORTS_PROSE).toContain("every branch that REACHED a terminal disposition");
     expect(EXPORTS_PROSE).toContain("A branch whose scan errored or was throttle-requeued before the row was written has none");
   });
+  test("a rowless branch's section names BOTH counts that can hold it — errored AND deferred", () => {
+    // The section already told a reader where a rowless ERRORED branch shows up (branchesErrored),
+    // but said nothing about where a rowless THROTTLE-REQUEUED one does — leaving the deferred
+    // remainder looking uncounted on the very surface that documents its absence from this table.
+    expect(EXPORTS_PROSE).toContain("branchesErrored");
+    expect(EXPORTS_PROSE).toContain("while its queue row stays pending the report's current-backlog `branchesDeferred` counts it");
+  });
   test("the determinism claim keeps its starting-xray/ qualifier and the adoption sentence", () => {
     // code reality: ArtifactBundle.finalize folds adoptableEntries — still-present same-run
     // manifest entries of the OTHER kind — into manifest.json (artifactWrite.ts), so identical
