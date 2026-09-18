@@ -13,7 +13,7 @@
 // Every overflow THROWS (DtsLimitError → introspectVersion's catch → errors row, no marker) — none
 // silently truncates.
 
-import ts from "typescript";
+import ts from "./tsCompilerApi.ts"; // `typescript`, surface-checked at load (never import it directly)
 
 export type ExportKind = "named" | "default" | "type";
 
