@@ -1,0 +1,209 @@
+{
+  "version": 1,
+  "generatedAtIso": "2026-08-05T19:33:07.727Z",
+  "login": "sondrateconsulting-ryan",
+  "corpusPath": "docs/adrs/0002-benchmark/refs-corpus.json",
+  "journalPath": "docs/adrs/0002-benchmark/refs-probe-journal.jsonl",
+  "benchConfigPath": "/Users/creature/git/package-audit/.claude/worktrees/zizmor-cli-version-update-09dc9a/docs/adrs/0001-benchmark/bench-config.json",
+  "resumedFromJournal": false,
+  "constants": {
+    "candidateBatchSizes": [
+      10,
+      25
+    ],
+    "informationalBatchSizes": [
+      50
+    ],
+    "triesPerCell": 5,
+    "invalidationRerunCap": 2,
+    "wallGateMs": 5000,
+    "pairCostGateMax": 0.5,
+    "pointBoundPerAttempt": 2,
+    "bucketLimitPoints": 5000,
+    "shipThresholdPoints": 500,
+    "estate8x750Repos": 6000,
+    "ageCapMs": 600000
+  },
+  "before": {
+    "core": {
+      "remaining": 4876,
+      "reset": 1785958156,
+      "used": 124
+    },
+    "graphql": {
+      "remaining": 4787,
+      "reset": 1785958322,
+      "used": 213
+    },
+    "atMs": 1785955995829
+  },
+  "after": {
+    "core": {
+      "remaining": 5000,
+      "reset": 1785961987,
+      "used": 0
+    },
+    "graphql": {
+      "remaining": 5000,
+      "reset": 1785961987,
+      "used": 0
+    },
+    "atMs": 1785958387723
+  },
+  "finalWashoutMs": 60000,
+  "cells": [
+    {
+      "batchSize": 10,
+      "stratum": "p1",
+      "status": {
+        "kind": "complete"
+      },
+      "reduction": {
+        "cleanTryCount": 5,
+        "page1PerRepoMax": 0.1,
+        "continuationPerPageMax": null,
+        "page1WallMaxMs": 1527
+      },
+      "tryRowCount": 5,
+      "cleanTryCount": 5
+    },
+    {
+      "batchSize": 10,
+      "stratum": "p2",
+      "status": {
+        "kind": "complete"
+      },
+      "reduction": {
+        "cleanTryCount": 5,
+        "page1PerRepoMax": 0.1,
+        "continuationPerPageMax": 1,
+        "page1WallMaxMs": 3606
+      },
+      "tryRowCount": 5,
+      "cleanTryCount": 5
+    },
+    {
+      "batchSize": 25,
+      "stratum": "p1",
+      "status": {
+        "kind": "complete"
+      },
+      "reduction": {
+        "cleanTryCount": 5,
+        "page1PerRepoMax": 0.04,
+        "continuationPerPageMax": null,
+        "page1WallMaxMs": 2162
+      },
+      "tryRowCount": 5,
+      "cleanTryCount": 5
+    },
+    {
+      "batchSize": 25,
+      "stratum": "p2",
+      "status": {
+        "kind": "complete"
+      },
+      "reduction": {
+        "cleanTryCount": 5,
+        "page1PerRepoMax": 0.04,
+        "continuationPerPageMax": 1,
+        "page1WallMaxMs": 4769
+      },
+      "tryRowCount": 5,
+      "cleanTryCount": 5
+    },
+    {
+      "batchSize": 50,
+      "stratum": "p1",
+      "status": {
+        "kind": "complete"
+      },
+      "reduction": {
+        "cleanTryCount": 5,
+        "page1PerRepoMax": 0.02,
+        "continuationPerPageMax": null,
+        "page1WallMaxMs": 4022
+      },
+      "tryRowCount": 5,
+      "cleanTryCount": 5
+    },
+    {
+      "batchSize": 50,
+      "stratum": "p2",
+      "status": {
+        "kind": "terminated-unclean",
+        "cause": "candidate batch 0: documented timeout status 504"
+      },
+      "reduction": {
+        "cleanTryCount": 0,
+        "page1PerRepoMax": null,
+        "continuationPerPageMax": null,
+        "page1WallMaxMs": null
+      },
+      "tryRowCount": 1,
+      "cleanTryCount": 0
+    }
+  ],
+  "verdicts": [
+    {
+      "batchSize": 10,
+      "candidate": true,
+      "passed": true,
+      "causes": []
+    },
+    {
+      "batchSize": 25,
+      "candidate": true,
+      "passed": true,
+      "causes": []
+    },
+    {
+      "batchSize": 50,
+      "candidate": false,
+      "passed": false,
+      "causes": [
+        "cell p2 terminated-unclean: candidate batch 0: documented timeout status 504"
+      ]
+    }
+  ],
+  "outcome": {
+    "kind": "default-pinned",
+    "defaultBatchSize": 25,
+    "page1PerRepo": 0.04,
+    "correctedFloor8x750": 240
+  },
+  "estates": [
+    {
+      "label": "1 org x 1,000",
+      "keptRepos": 1000,
+      "todayPage1Points": 1000,
+      "measuredPage1Points": 40,
+      "allSinglePageTotal": 40,
+      "uniformP2Total": 1040
+    },
+    {
+      "label": "8 orgs x 750",
+      "keptRepos": 6000,
+      "todayPage1Points": 6000,
+      "measuredPage1Points": 240,
+      "allSinglePageTotal": 240,
+      "uniformP2Total": 6240
+    },
+    {
+      "label": "25 orgs x 400",
+      "keptRepos": 10000,
+      "todayPage1Points": 10000,
+      "measuredPage1Points": 400,
+      "allSinglePageTotal": 400,
+      "uniformP2Total": 10400
+    },
+    {
+      "label": "1,000 owners x 1",
+      "keptRepos": 1000,
+      "todayPage1Points": 1000,
+      "measuredPage1Points": 1000,
+      "allSinglePageTotal": 1000,
+      "uniformP2Total": 2000
+    }
+  ]
+}

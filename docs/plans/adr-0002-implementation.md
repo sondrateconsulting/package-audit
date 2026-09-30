@@ -439,5 +439,79 @@ assumed).
   orchestration-level abandoned-window fixture (real DB + captured taps) joined I6; PR-P's
   *merge* became PR-I's explicit base condition; and this ledger entry itself was the
   review's final requirement.
+- **P1 codex review (gpt-5.6-sol @ ultra, fresh session `019fd11b-0e83-7ae3-ad39-ec9deb1b0981`,
+  2026-08-05): FAIL — 5 P1 + 6 P2; every finding verified, none refuted; all 11 fixed before
+  P2 began** (commit `1b917cc`). The run hit the skill's timeout mid-analysis and was resumed
+  with the §8.1 recovery message, which produced the full numbered findings. Headlines: the
+  drift rule could be satisfied by a walk aborted mid-continuation (fabricated drift buying an
+  invalidation re-run for a gate-deciding candidate failure) — fixed with a `stoppedBy`
+  provenance field so only positive evidence (complete-at-wrong-depth, stopped-at-frozen-bound)
+  invalidates; the quarantine obligation journaled only after its sleep (a crash mid-sleep
+  would resume past it) — now written before, and resume honors any unexpired horizon; a crash
+  mid-try left its spend invisible — a `try-start` intent row now precedes every first
+  dispatch; nonzero-exit ok-shaped envelopes were clean — now unclean per the
+  truncated-transfer precedent; concurrent runners could interleave one journal — a
+  single-writer lock plus exclusive result creation; plus a journal header binding corpus
+  sha256 + constants fingerprint on resume, tail tolerance narrowed to syntactic tears,
+  header deltas made cost-inclusive and single-epoch-only, p2 stratum head-count enforcement,
+  same-owner batch enforcement in the builder, and the page-1 shape test re-derived from the
+  source-pinned solo document. One process disclosure, recorded in the runner slice's commit
+  (`1164c93`): that slice's implementation was drafted before its tests; the RED run was taken
+  against a stubbed runner (12 failures for the intended reason) and the implementation
+  restored to green — the failing run is real; the draft order was not test-first.
+- **P2 corpus + rvo gate (2026-08-05): the live estate could not furnish any full batch**
+  (largest owner: 9 repositories; nothing over 100 branches), so the synthetic corpus was
+  constructed per the plan — after rvo's explicit go-ahead, asked and answered before any
+  creation: **owner namespace = the `sondrateconsulting` organization; full matrix, 100
+  repositories** (50 × p1 at 2 heads, 50 × p2 at 101 heads; private; retained until rvo
+  authorizes deletion). Construction and the REST observation pass are recorded verbatim in
+  the corpus provenance. Freeze commit `c3a13ce` (corpus + the prospective ADR artifact-path
+  amendment, one commit, before any measured try).
+- **P2 codex review (gpt-5.6-sol @ ultra, fresh session `019fd340-f458-7780-9aed-973b4cd3c423`,
+  2026-08-05): FAIL — 1 P1 + 1 P2, both verified, both fixed before P3** (commit `ad17cb1`):
+  the placeholder midnight `frozenAtIso` backdated the freeze (now the true post-observation
+  instant), and the provenance paraphrased the procedure (now the commands verbatim, both
+  strata, including the discarded email-privacy-rejected first template pair).
+- **P3 live run (2026-08-05, `sondrateconsulting-ryan`): DEFAULT PINNED B = 25** — 26 try
+  rows (25 completed pairs + 1 candidate-only attempt), 976 dispatches, 975 measured
+  points; both candidates 10/10 clean; every cost-readable batch priced at exactly 1 point
+  (formula confirmed; the 2× tolerance never consumed); the informational B = 50 paginating
+  cell drew an HTTP 504 on its first 50-alias batch → cell terminated + the runner's
+  1,400 s quarantine to the reset epoch fired exactly as pre-registered; journal + result
+  committed together (`2f61245`). The 504 is live corroboration of the ADR's timeout
+  caution at a shape the operator range never reaches.
+- **P4 measured-outcome record + codex review (fresh session
+  `019fd36d-8983-7480-a099-e4e0380fa17b`, 2026-08-05): FAIL — 3 P2, all verified against
+  the journal, all fixed** (`bfc1d38` + `69a073f`): the every-call cost claim scoped to
+  cost-readable calls (the 504 returned no rider; its penalty deducts unobserved); the
+  header-delta cross-check recorded as noisy and non-corroborating (16/50 clean arm deltas
+  above their rider sums, worst +4 — quiet-credential premise did not hold; gates ride the
+  rider alone, as pre-registered); '26 paired tries' corrected to 25 pairs + 1
+  candidate-only attempt (the P3 commit message carries the same overcount, immutably —
+  the ADR text is the authoritative record).
+- **P5 whole-PR codex review (fresh session `019fd375-03d6-7323-b525-cebf5e1c5153`,
+  2026-08-05): FAIL — 1 P1 + 5 P2, all verified, all fixed** (`32ee05f` + the PR body). The
+  P1: the quarantine obligation became durable only at the post-try row append — a crash
+  between the 504 observation and that write would have resumed into the penalized window;
+  the row now journals AT OBSERVATION, before even its try row (order-pinned by test). The
+  P2s: the journal header's binding gained the bench-config file sha256 with its scope
+  stated exactly (legacy pre-binding headers — the committed Stage-P journal is one — stay
+  parseable forever but refuse resume), and four PR-body accuracy corrections (wall claim
+  scoped to clean calls — the 504'd batch ran 11.7 s; resume claim scoped to completed
+  tries with whole-try replay disclosed; the two ADR changes described as they are; the
+  append-only claim scoped, disclosing the one pre-measurement corpus remediation). This
+  run also hit the timeout wrapper mid-analysis and was recovered by the §8.1 resume
+  message, like P1's.
+- **Ratification (2026-08-05): rvo ratified Option 1 with the pinned default B = 25** at the
+  Stage-P gate — the question was put with CI green on PR #40 and the ten-round REVISE
+  disclosure restated; the answer was "Ratify — accept @ B = 25". The `proposed → accepted`
+  flip landed on the PR-P branch on that explicit word, with both gate-dependent ADR
+  sentences reconciled to the post-gate truth. Stage I remains gated on PR-P's MERGE (the
+  evidence, corrected ADR, pinned default, and accepted status must all be on `main`).
+- **Restack (2026-08-08, rvo):** after PR #38 squash-merged to `main` (`0d7760f`, which also
+  removed the spent continuation handoff), rvo force-updated the PR-P branch, replaying the
+  Stage-P commits onto the new `main` — content-identical diffs under new hashes. The commit
+  hashes cited in the entries above were rewritten to the surviving replays in the same
+  sweep; the original hashes live only in this ledger's own history now.
 - *(the implementation session appends per-step codex outcomes, the santa-loop record, and
   any live-run observations here, exactly as `adr-0001-t2c-implementation.md` §9 did.)*
