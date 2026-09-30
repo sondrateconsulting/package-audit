@@ -319,7 +319,16 @@ a repo whose scans all errored wrote nothing): such a repo carries no NULL senti
 that run under v4 could report authoritative provenance over an unknowable pre-v4 scope. The next
 invocation starts a fresh all-v4 run; the unchanged config_hash lets its completed work-queue
 units skip-as-current.
-Its three new columns (`policy_status`, `policy_matched_pattern`, `scanned_commit_date`) are NULL on
+Then the v4→v5 step (§4 discovery-throttle evidence), additive: `runs` gains a NULLABLE
+`discovery_scopes_deferred` via `ALTER TABLE ADD COLUMN`, so pre-v5 rows backfill NULL BY
+CONSTRUCTION — UNKNOWN, never 0, because reporting 0 would assert the very completeness the
+column exists to disprove. The step ALSO re-runs the shared `run_unit_head` shape heal and the
+fingerprint/foreign-key verification: raising the current version moves a v4-STAMPED database
+carrying a recognized predecessor `run_unit_head` shape out of the current-stamp self-heal branch
+and into this migration branch, so without those the bump would stamp a still-damaged database as
+current. `openReadOnly` cannot heal, so it REFUSES a current-stamped `runs` missing the column
+with repair advice rather than reading it back as `undefined`.
+The v3→v4 step's three new columns (`policy_status`, `policy_matched_pattern`, `scanned_commit_date`) are NULL on
 backfilled rows BY CONSTRUCTION — a pre-v4 run recorded no branch policy and never persisted
 past-cap branches — so a NULL `scanned_commit_date` is the sentinel marking that run's scan
 scope UNVERIFIABLE (§7 `provenance`), never a claim that it excluded nothing. A STRUCTURAL
@@ -331,7 +340,7 @@ and again on the writable connection — through any recovered WAL — before th
 flip and before `--fresh`, so an incompatible state committed only into `-wal` frames (a sibling
 build's v4 over a common v3 base) is still refused before it can be adopted or dropped, at the
 documented cost of sidecar recovery on that file.
-A current-version (v4) database self-heals idempotently on open, SHAPE-keyed: re-run the
+A current-version database self-heals idempotently on open, SHAPE-keyed: re-run the
 new-shape CREATEs, so a file missing a table or the `ix_ruh_loc` index is repaired rather than
 left a dead end, and a `run_unit_head` regressed to a RECOGNIZED predecessor era (the v2/v3 body
 — external damage) is healed by the same rebuild the v3→v4 migration uses, rows riding through —
@@ -366,7 +375,26 @@ CREATE TABLE IF NOT EXISTS runs (
                                        -- (same commit, different tracked set) into the report
   cutoff_date TEXT NOT NULL DEFAULT '',   -- so §7's config.cutoffDate is derivable from SQLite alone
   github_host TEXT NOT NULL DEFAULT 'github.com',  -- echoed in the report
-  status TEXT NOT NULL CHECK (status IN ('running','completed','failed'))
+  status TEXT NOT NULL CHECK (status IN ('running','completed','failed')),
+  discovery_scopes_deferred INTEGER    -- §4 discovery-throttle evidence (v5), NULLABLE: how many
+                                       -- DISTINCT discovery scopes (one per owner repo-listing,
+                                       -- one per repository branch-listing) exhausted their
+                                       -- RETRY/PAUSE budget this run. ThrottleExhausted has TWO
+                                       -- mechanisms: a call running out of retries (rate limiting
+                                       -- or repeated HTTP 5xx), or the RUN spending its cumulative
+                                       -- pause budget. A network failure has no HTTP response and
+                                       -- exhausts as a permanent error, so it is NOT counted.
+                                       -- Such a scope enumerates
+                                       -- NOTHING, so it enqueues no work unit and records no
+                                       -- errors row — invisible to §7's branchesDeferred AND
+                                       -- branchesErrored, which is why it is persisted here.
+                                       -- Sealed by completeRun once the owner pool drained, and
+                                       -- only over a 'running' row. NULL means UNKNOWN (still
+                                       -- running, failed, migrated from pre-v5, or RESUMED with no
+                                       -- throttle seen by the completing invocation), NEVER "none".
+                                       -- The accumulator is per-invocation and in memory, so on a
+                                       -- RESUMED run a positive value is a LOWER BOUND; on a fresh
+                                       -- run it is exact
 );
 CREATE TABLE IF NOT EXISTS work_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -447,7 +475,7 @@ CREATE TABLE IF NOT EXISTS usage_findings (
 );
 -- immutable per-run snapshot: the head commit each run REPORTED for each unit.
 -- report.ts joins findings through this (not the mutable work_queue.last_commit_sha),
--- so `report --run-id` reconstructs the exact state of the world as of that run even
+-- so `report --run-id` reconstructs that run's per-unit head/disposition selection (NOT the whole document: `summary.branchesDeferred` is the generation-time config-wide backlog, and a same-commit rescan can refresh shared finding fields) even
 -- after a later same-config run advances the head.
 CREATE TABLE IF NOT EXISTS run_unit_head (
   run_id TEXT NOT NULL REFERENCES runs(run_id),
@@ -458,9 +486,11 @@ CREATE TABLE IF NOT EXISTS run_unit_head (
                                        -- immutable: lets the report count each disposition for THIS
                                        -- run alone (work_queue is mutable and cross-run).
                                        -- 'past-cap' (v4): eligible but past maxBranchesPerRepo —
-                                       -- recorded for report VISIBILITY only; its work_queue row is
+                                       -- recorded for report VISIBILITY; a 'done' work_queue row is
                                        -- untouched, so a later cap-order shift promotes it without a
-                                       -- rescan. 'policy-excluded' (v4): dropped by branch allow/deny.
+                                       -- rescan (a stale 'pending' row is settled to 'skipped' so §7
+                                       -- never double-counts a surfaced branch as deferred).
+                                       -- 'policy-excluded' (v4): dropped by branch allow/deny.
                                        -- The four are DISJOINT — status alone identifies the
                                        -- disposition; no read surface needs a second column to tell
                                        -- a policy exclusion from a genuine cutoff skip. It is named
@@ -575,8 +605,11 @@ Resumability rules:
   (its usage is genuinely stale), and it just isn't refreshed into new runs. What "retains" does
   NOT mean is "this run says nothing about it", and the two cases differ: a PAST-CAP branch DOES
   get a FRESH `run_unit_head` row this run (`status='past-cap'`, commit_sha='') recorded purely
-  for report VISIBILITY — the work queue is left untouched, so a later cap-order shift promotes it
-  without a re-scan; a DELETED branch is not surfaced at all, and stale-row reconciliation prunes any row
+  for report VISIBILITY — a `done` work-queue row is left untouched, so a later cap-order shift
+  promotes it without a re-scan, while a stale `pending` row — however it arose (throttle
+  deferral, crash-recovery reset, or `--rescan-branch`) — is settled to 'skipped' so §7's
+  `branchesDeferred` never double-counts a branch this run already
+  surfaced as past-cap; a DELETED branch is not surfaced at all, and stale-row reconciliation prunes any row
   a prior resume-invocation of THIS run left for it (earlier runs' rows are immutable and stay). That
   prune is REPO-SCOPED, and deliberately so: it runs inside the per-repo path, so it can only speak for
   repos this run re-discovered AND kept. A repo that dropped out of the kept set between invocations —
@@ -598,7 +631,8 @@ Resumability rules:
   reproducible and truthful about what its own invocation decided (a scanned row's commit_sha
   is "the head it reported", never "the live head" — the report-head invariant below; a
   non-scanned row's commit_sha='' and discovered-head date describe the older evaluation), and
-  the unit is left `error`/`pending` so the next run refreshes it. A head-SHA-aware prune is deliberately NOT used: it would delete
+  the unit is left `error`/`pending` so a later run that still re-enumerates the branch
+  refreshes it (a retry can throttle again). A head-SHA-aware prune is deliberately NOT used: it would delete
   the commit_sha='' sentinels the non-scanned dispositions rely on.
 - Report-head invariant (co-designed with the skip predicate): as each unit is
   processed (scanned OR skipped-as-current), the run upserts `run_unit_head(run_id, org,
@@ -734,8 +768,9 @@ wrapper WAITS through the computed window and RETRIES the request IN PLACE, up t
 attempt budget; `ThrottleExhausted` escapes only when that budget is exhausted, or
 earlier when the client-lifetime cumulative pause budget would be exceeded — the
 orchestrator treats an escape as TRANSIENT: a mid-scan escape (discovery or content
-fetch) resets that unit to `pending` with no errors row and the NEXT invocation retries
-it (the §3 skip predicate only skips units that are `done` at the current head; there
+fetch) resets that unit to `pending` with no errors row and a later invocation that
+re-enumerates it retries it — a retry can throttle again (the §3 skip predicate only
+skips units that are `done` at the current head; there
 is no mid-run re-queue), a repo/branch discovery escape logs a JSONL requeue event
 only, and an owner-resolution escape ends the run cleanly without starting one; --plan,
 which has no DB, counts a repo/branch discovery escape into its failure totals while a
@@ -1401,7 +1436,7 @@ it, §5.E.) A run with no findings still emits the full shape with empty arrays 
 summary.
 ```jsonc
 {
-  "formatVersion": 2,                            // XRAY_FORMAT_VERSION — the report/export/HTML
+  "formatVersion": 3,                            // XRAY_FORMAT_VERSION — the report/export/HTML
                                                  //   artifact-set version. REQUIRED, and
                                                  //   INDEPENDENT of the compare format version
   "runId": "...",
@@ -1448,7 +1483,10 @@ summary.
                                                  //   packageName/version (§5.E per-version introspection)
   "summary": { "organizationsScanned":0,"repositoriesScanned":0,"branchesScanned":0,
                "branchesSkippedByCutoff":0,"branchesExcludedByPolicy":0,"branchesPastCap":0,
-               "branchesErrored":0,"totalDependencyFindings":0,"totalUsageFindings":0 },
+               "branchesErrored":0,"branchesDeferred":0,"discoveryScopesDeferred":0,
+               "totalDependencyFindings":0,"totalUsageFindings":0 },  // discoveryScopesDeferred is
+                                                 //   number|null — null = UNKNOWN (pre-v5 or
+                                                 //   unsealed run), never "none"
   "scanScope": { "excludedByDeny":0,"excludedByAllow":0,"defaultBranchPolicyOverrides":0,
                  "policyBranches":[ ... ],"provenance":"complete" }  // branch allow/deny diagnostics;
                                                  //   provenance: 'complete' | 'pre-upgrade' —
@@ -1460,8 +1498,14 @@ summary.
                                                  //   understate what that run actually evaluated
 }
 ```
-Summary derivation — ALL per-run from the IMMUTABLE `run_unit_head` slice for the reported
-run (NEVER from the mutable work_queue, which is cross-run): `branchesScanned` =
+Summary derivation — by SOURCE, stated per field rather than as a count, because "all but N" goes
+stale the moment a field is added. The four DISPOSITION counts below read the IMMUTABLE
+`run_unit_head` slice for the reported run. `branchesErrored` reads the append-only `errors[]`
+table (keyed against `run_unit_head` only to EXCLUDE row-bearing branches). Two fields read
+neither: `branchesDeferred` reads the mutable cross-run work_queue (the sanctioned exception,
+defined after the throttle carve-out below), and `discoveryScopesDeferred` reads the reported run's
+own `runs.discovery_scopes_deferred` — sealed evidence, not a derivation, because the fact it
+records exists nowhere else in SQLite. The `run_unit_head`-derived counts: `branchesScanned` =
 COUNT(*) WHERE run_id=R AND status='scanned'; `branchesSkippedByCutoff` = COUNT WHERE
 run_id=R AND status='skipped-cutoff' — GENUINE cutoff only, because a policy exclusion carries
 its OWN status and can never be folded in by an under-specified filter;
@@ -1476,8 +1520,30 @@ it as exactly that, since on a RESUMED run it diverges from "every branch whose 
 in both directions (see scripts/report.ts). Together the five account for every branch that
 reached a TERMINAL outcome — an equality on a single-invocation run, an upper bound on a
 resumed one. A THROTTLE-REQUEUED branch is deferred, not terminal: it writes neither a row nor
-a NEW error, and with no prior same-run error it is in no count (an earlier invocation's
-append-only error still counts it — the resumed-run divergence above). Decide policy dispositions ONLY via both status and policy_status
+a NEW error, and with no prior same-run error it is in none of THOSE counts (an earlier
+invocation's append-only error still counts it — the resumed-run divergence above).
+`branchesDeferred` surfaces that remainder as the config's still-pending queue rows (a
+count that also carries crash-recovery resets and prior-run rows no run has re-enumerated):
+COUNT of work_queue rows WHERE
+config_hash = the run's AND scope='branch' AND status='pending' at report build — the ONE
+count read from the MUTABLE cross-run queue, sanctioned because the deferred remainder
+exists nowhere else in SQLite. It is therefore the CURRENT backlog at generation time
+(re-rendering an old --run-id after later runs drain the queue reports 0 — §4's contract is
+that a future run retries the work it still re-enumerates, though a retry can throttle
+again), it sits OUTSIDE the terminal
+identity above (on a resumed run a deferred branch can also hold an earlier invocation's
+error or retained row, so summing it in would double-count; within one invocation, rendered
+at its own completion, the two sides are disjoint — every disposition settles or
+never-creates its pending row, past-cap included, which settles a stale one to 'skipped' —
+though a HISTORICAL re-render can overlap them again once a later run re-pends a branch
+this run scanned), it UNDERCOUNTS branches a throttled
+owner/repo discovery never enumerated (nothing was enqueued for them — though prior-run
+pending rows beneath such a repo remain counted), and it retains any pending row whose unit
+no run re-enumerates (nothing prunes work_queue) — branch deleted, repo dropped from the
+kept set (deleted, renamed, newly archived/fork-filtered, or displaced past
+`maxReposPerOrg`), or owner no longer discovered — until a run re-enumerates it (settling
+or re-attempting it) or `--fresh` drops the queue; `--rescan-branch` cannot clear such a
+row (it only sets an already-pending row pending again). Decide policy dispositions ONLY via both status and policy_status
 (scripts/policyDisposition.ts); `policy_status IS NOT NULL` alone is never a proxy for
 "excluded" (a scanned default branch carries the counterfactual). The guard validates the
 WHOLE row, not just those two columns: `is_default_branch` is load-bearing in BOTH
