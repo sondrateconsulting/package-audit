@@ -5,7 +5,7 @@
 import { useEffect, useReducer } from "react";
 import { Box, Text, useStdout } from "ink";
 import type { TuiStore } from "./store.ts";
-import type { DimsAwareStream, RawDims } from "./dims.ts";
+import { readRawDims, type DimsAwareStream, type RawDims } from "./dims.ts";
 import { planLayout, sanitizeLine } from "./format.ts";
 import { bannerLineCount, CompactFrame, Footer, Header, LimitsPanel, NetPanel, ProblemsPanel, ThrottleBanner, WorkPanel } from "./panels.tsx";
 
@@ -29,10 +29,12 @@ export function App({ store, subscribe, nowMs, mountedAtMs }: AppProps) {
   // the ambient terminal (§U5). Layout therefore reads the RAW dimensions: the lifecycle proxy
   // pins the ink-facing columns/rows to safe positive integers (ink's OWN internal layout calls
   // that same spawn-capable helper on falsy values) and exposes the truth via getRawDims() —
-  // function-detected here so direct capture-stream mounts (tests, ITL) fall back to the plain
-  // props unchanged.
+  // function-detected here so direct capture-stream mounts (tests, ITL) fall back to the stream's
+  // own props, read through readRawDims — the same reader behind getRawDims. ink@8 types
+  // useStdout()'s stream as a generic NodeJS.WritableStream, which promises no columns/rows at
+  // all, so the fallback reads them as unknown rather than asserting a type onto them.
   const rawDims = (stdout as unknown as Partial<DimsAwareStream>).getRawDims;
-  const dims: RawDims = rawDims !== undefined ? rawDims() : { columns: stdout.columns, rows: stdout.rows };
+  const dims: RawDims = rawDims !== undefined ? rawDims() : readRawDims(stdout);
 
   const snap = store.snapshot();
   const now = nowMs();

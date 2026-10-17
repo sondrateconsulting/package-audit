@@ -195,9 +195,11 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
         stderr: opts.out,
         exitOnCtrlC: false, // §U0 display-only: SIGINT keeps its default kill-and-resume semantics
         patchConsole: true, // stray console.* (React warnings!) render ABOVE the frame, never smear it
-        // `stdin` is deliberately ABSENT (not `stdin: undefined`): Ink spreads the caller's options
-        // over its defaults, so an explicit undefined CLOBBERS the default stream and silently wedges
-        // rendering (P0 finding). Display-only — nothing here ever reads input.
+        // `stdin` is deliberately ABSENT (not `stdin: undefined`). P0 finding, ink@7: Ink spread the
+        // caller's options over its defaults, so an explicit undefined CLOBBERED the default stream
+        // and silently wedged rendering. ink@8 destructures with defaults instead, so absence is no
+        // longer load-bearing there — but it stays correct under both. Display-only — nothing here
+        // ever reads input.
       },
     );
   } catch (e) {
@@ -222,13 +224,14 @@ export function mountTui(store: TuiStore, opts: MountTuiOptions): TuiHandle {
   try {
     timer = scheduler.setInterval(tick, tickMs);
     opts.out.on("resize", onResize);
-    // The exit promise is obtained ONCE and shared: ink's waitUntilExit() (re)registers a
-    // process 'beforeExit' handler whenever none is present — calling it again through the
-    // handle AFTER requestUnmount (which removes that handler) would re-register it, retaining
-    // the instance and a process-level listener until process exit. One call, one registration;
-    // the handle reuses the memoized promise. Its rejection handler is attached AT MOUNT (§U5):
-    // an unhandled waitUntilExit rejection would violate degrade-never-kill (§U0), and a dead
-    // React tree cannot be relied on to poll any latch.
+    // The exit promise is obtained ONCE and shared: ink@7's waitUntilExit() (re)registered a
+    // process 'beforeExit' handler whenever none was present — calling it again through the
+    // handle AFTER requestUnmount (which removes that handler) re-registered it, retaining the
+    // instance and a process-level listener until process exit. ink@8 skips that registration
+    // once unmounting has begun; the memo does not rely on that guard. One call, one
+    // registration; the handle reuses the memoized promise. Its rejection handler is attached
+    // AT MOUNT (§U5): an unhandled waitUntilExit rejection would violate degrade-never-kill
+    // (§U0), and a dead React tree cannot be relied on to poll any latch.
     const exitPromise = instance.waitUntilExit();
     exitPromise.catch((e: unknown) => {
       onCrash(causeText(e));
