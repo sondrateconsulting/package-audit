@@ -1,7 +1,10 @@
-import { expect, test, describe } from "bun:test";
+import { expect, test, describe, spyOn } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { KNOWN_OPERATOR_ERRORS, isKnownOperatorError, renderFatal } from "./cliErrors.ts";
+import {
+  FATAL_DRAIN_DEADLINE_MS, KNOWN_OPERATOR_ERRORS, PROCESS_FATAL_HOST, armUnrefBackstop, exitFatal, isKnownOperatorError,
+  renderFatal, type FatalExitHost,
+} from "./cliErrors.ts";
 import { ArgsError, ORCHESTRATE_USAGE } from "./args.ts";
 import { PreflightError } from "./preflight.ts";
 import { ConfigError } from "./config.ts";
@@ -161,5 +164,96 @@ describe("renderFatal", () => {
     expect(out.toLowerCase()).toContain("wait");
     expect(out.toLowerCase()).toContain("re-run");
     expect(out).not.toContain("    at "); // no stack frames
+  });
+});
+
+describe("exitFatal — no synchronous hard exit; only the bounded backstop calls exit", () => {
+  // The defect this pins: the entrypoints' fatal handler used to write the diagnosis and hard-exit
+  // at once, and a hard exit discards whatever the runtime still buffers for a piped stdout — the
+  // JSONL loses its tail and can end mid-line, while a natural exit (exitCode set, event loop
+  // allowed to empty) delivered every line in the same measurements (cliErrors.ts). The loss
+  // happens AT the hard exit, so the contract is about when exit runs: never synchronously, only
+  // from the bounded backstop. Observing the runtime's flush itself needs a child process, which
+  // this repo's spawn-site allowlist reserves for its sanctioned sites — so the control flow is
+  // pinned here.
+  function recordingHost(): { host: FatalExitHost; calls: string[]; fireBackstop: () => void } {
+    const calls: string[] = [];
+    let armed: (() => void) | null = null;
+    const host: FatalExitHost = {
+      stderr: { write: (chunk) => calls.push(`stderr:${chunk}`) },
+      setExitCode: (code) => calls.push(`exitCode=${code}`),
+      exit: (code) => calls.push(`exit(${code})`),
+      armBackstop: (fire, ms) => {
+        calls.push(`backstop(${ms})`);
+        armed = fire;
+      },
+    };
+    return { host, calls, fireBackstop: () => armed?.() };
+  }
+
+  test("renders to stderr, sets exitCode 1 and arms the backstop — no synchronous hard exit", () => {
+    const { host, calls } = recordingHost();
+    const err = new ConfigError("cutoffDate must be YYYY-MM-DD");
+    exitFatal(err, OPTS, host);
+    expect(calls).toEqual([`stderr:${renderFatal(err, OPTS)}`, "exitCode=1", `backstop(${FATAL_DRAIN_DEADLINE_MS})`]);
+  });
+
+  test("only the backstop calls exit, with code 1 — the bound on how long a fatal waits to drain", () => {
+    const { host, calls, fireBackstop } = recordingHost();
+    exitFatal(new TypeError("undefined is not a function"), OPTS, host);
+    expect(calls.filter((c) => c.startsWith("exit("))).toEqual([]);
+    fireBackstop();
+    expect(calls.filter((c) => c.startsWith("exit("))).toEqual(["exit(1)"]);
+  });
+
+  test("the real backstop timer is unref'd: it never itself holds the process open", () => {
+    // a REF'd backstop would hold every fatal open for the full deadline even after stdout drained
+    const timer = armUnrefBackstop(() => {
+      throw new Error("the backstop must not fire during this test");
+    }, 60_000);
+    try {
+      expect(timer.hasRef()).toBe(false);
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  test("the production host forwards to the real process: stderr, exitCode, exit and the unref'd backstop", () => {
+    // a host that dropped setExitCode would print the diagnosis and exit 0 — worse than truncation
+    expect(PROCESS_FATAL_HOST.stderr).toBe(process.stderr);
+    expect(PROCESS_FATAL_HOST.armBackstop).toBe(armUnrefBackstop);
+    const prevExitCode = process.exitCode;
+    const exitSpy = spyOn(process, "exit").mockImplementation((() => undefined) as unknown as typeof process.exit);
+    try {
+      PROCESS_FATAL_HOST.setExitCode(1);
+      expect(process.exitCode).toBe(1);
+      PROCESS_FATAL_HOST.exit(1);
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    } finally {
+      exitSpy.mockRestore();
+      // `?? 0`: Bun 1.4.3 ignores an assignment of undefined, which would leak this test's 1 into
+      // the test runner's own exit status; 0 exits the same as unset
+      process.exitCode = prevExitCode ?? 0;
+    }
+  });
+});
+
+describe("fatal exit routing (source pin)", () => {
+  test("no source hard-exits outside cliErrors.ts, and each audit entrypoint's catch routes through exitFatal", () => {
+    // A hard exit anywhere else would reintroduce the truncation exitFatal exists to prevent: it
+    // discards whatever the runtime still buffers for a piped stdout, possibly mid-line.
+    const hardExits: string[] = [];
+    for (const file of readdirSync(import.meta.dir, { recursive: true }) as string[]) {
+      if (!file.endsWith(".ts") && !file.endsWith(".tsx")) continue;
+      if (file.includes(".test.") || file === "cliErrors.ts") continue;
+      const src = readFileSync(join(import.meta.dir, file), "utf8");
+      if (/\bprocess\.exit\s*\(/.test(src)) hardExits.push(file);
+    }
+    expect(hardExits).toEqual([]);
+    for (const command of ["orchestrate", "report", "export", "compare"]) {
+      const src = readFileSync(join(import.meta.dir, `${command}.ts`), "utf8");
+      const guard = src.slice(src.lastIndexOf("if (import.meta.main)"));
+      expect(guard).toContain(`exitFatal(e, { command: "${command}"`);
+    }
   });
 });

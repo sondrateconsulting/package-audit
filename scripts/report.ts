@@ -19,7 +19,7 @@ import { isPolicyExcluded, isDefaultOverride, assertRunUnitHeadSound, policyStat
 import { assertNever } from "./assertNever.ts";
 import { parseSemver, compareForReport } from "./semver.ts";
 import { parseReportArgs, REPORT_HELP, REPORT_USAGE } from "./args.ts";
-import { renderFatal } from "./cliErrors.ts";
+import { exitFatal } from "./cliErrors.ts";
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -554,8 +554,5 @@ function mkdirCanonical(outputDir: string): void {
 }
 
 if (import.meta.main) {
-  main().catch((e) => {
-    process.stderr.write(renderFatal(e, { command: "report", usage: REPORT_USAGE }));
-    process.exit(1);
-  });
+  main().catch((e) => exitFatal(e, { command: "report", usage: REPORT_USAGE }));
 }

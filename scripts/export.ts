@@ -18,7 +18,7 @@ import { parseSemver } from "./semver.ts";
 import { logLine } from "./log.ts";
 import { assertRunUnitHeadSound } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
-import { renderFatal } from "./cliErrors.ts";
+import { exitFatal } from "./cliErrors.ts";
 
 // ---- usage / help -----------------------------------------------------------------------------
 export const EXPORT_USAGE =
@@ -519,8 +519,5 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch((e) => {
-    process.stderr.write(renderFatal(e, { command: "export", usage: EXPORT_USAGE }));
-    process.exit(1);
-  });
+  main().catch((e) => exitFatal(e, { command: "export", usage: EXPORT_USAGE }));
 }

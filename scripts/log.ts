@@ -12,7 +12,21 @@
 // fd) and Node/Bun stream writes are ordered, so concurrently-produced events queue and emit whole, one
 // after another — they never interleave. This is NOT a kernel-level >PIPE_BUF atomicity claim (a lone
 // >64KB write to a pipe shared with an INDEPENDENT process could still be split by the OS); it is the
-// in-process guarantee that the JSONL a consumer parses is always whole lines. Enforced by log.test.ts.
+// in-process guarantee that logLine hands the active sink whole lines only, never a fragment.
+// Enforced by log.test.ts.
+//
+// WHOLE LINES MUST ALSO SURVIVE THE EXIT, which no write discipline here can ensure: a hard exit
+// discards whatever the runtime still buffers for a piped stdout, losing the tail and possibly
+// cutting a line mid-way. A normal return lets the event loop flush stdout before the process
+// ends, and the fatal path orchestrate, report, export and compare share (exitFatal, cliErrors.ts)
+// does the same for up to FATAL_DRAIN_DEADLINE_MS — both measured on macOS with Bun 1.4.3 and
+// Node 24 (figures in cliErrors.ts). So, for those entrypoints, a consumer that keeps up parses
+// only whole lines whether main() returns or rejects. No other ending carries that guarantee: a
+// fatal whose consumer is still behind at that deadline, a kill signal, or an uncaught exception
+// outside main()'s promise chain can lose the tail, partial last line included. Lines an
+// installed sink accepts never face that loss: lifecycle.ts's divert writes each one synchronously
+// (writeSync, short writes looped) before logLine returns, leaving nothing buffered for the exit
+// to discard; a line the sink throws on is re-emitted to stdout, where the above applies.
 //
 // SINK/TAP SEAM (PROMPT-TUI §U1) — dependency-free, injected; this module imports nothing new.
 // The default sink is process.stdout; an interactive TUI run may divert the IDENTICAL bytes to a
