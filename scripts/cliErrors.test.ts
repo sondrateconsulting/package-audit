@@ -110,6 +110,16 @@ describe("KNOWN_OPERATOR_ERRORS registry sync (name-string matching must never d
       // instanceof (orchestrate distinguishes it from transport errors); it never carries
       // operator remediation, so the registry's clean-message rendering does not apply.
       "ContentStoreError",
+      // ADR-0002 Stage P: the pure batch-refs query builder's input-contract violation
+      // (graphqlBatch.ts). Every caller hands it pre-validated identities (production discovery
+      // upstream; the probe's frozen corpus), so an instance is a wiring bug — not operator
+      // remediation — and the stack-dump consequence on an escape is the right diagnostic. It
+      // stays exported for cross-module instanceof once the Stage-I window consumes the builder.
+      "BatchRefsQueryError",
+      // ADR-0002 Stage P: the refs probe's pre-registered rule executor (benchRefsRules.ts) —
+      // a bench-executor error surfaced only via the probe runner's top-level catch, the
+      // BenchBoundaryError/BenchProbeError rationale exactly.
+      "BenchRefsRulesError",
     ]);
     const declared = new Set<string>();
     // recursive: scripts/tui/ declares operator-facing classes too (TuiActivationError)
