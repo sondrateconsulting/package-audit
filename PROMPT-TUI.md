@@ -122,7 +122,8 @@ Rules (normative; the function IS the matrix, unit-tested row by row):
   house pattern), exit 1. An ineligible ENVIRONMENT is an operator error only when the
   operator explicitly demanded the UI; auto mode just runs without it.
 - `uiFlag === true || (uiFlag === null && eligible)` → on; `divert = stdoutIsTTY`.
-- NO_COLOR is NOT consulted: it affects styling only (chalk honors it), never routing.
+- NO_COLOR is NOT consulted: styling never affects routing. (chalk does not read NO_COLOR
+  either; FORCE_COLOR=0 is what turns its styling off.)
 
 | stderr TTY | stdout TTY | env               | flags     | TUI | JSONL destination      |
 |-----------:|-----------:|-------------------|-----------|-----|------------------------|
@@ -595,8 +596,8 @@ physical row in an unusable viewport. Never unmount on shrink (resize is transie
 unmount is one-way). Row
 truncation uses INK's layout (`<Text wrap="truncate-end">` inside width-constrained
 `<Box>`), never naive string slicing — org/repo/branch names can contain CJK/emoji
-whose cell width chars can't measure. Colors via `<Text color/dimColor>`; NO_COLOR is
-honored by Ink's chalk.
+whose cell width chars can't measure. Colors via `<Text color/dimColor>`; Ink's chalk
+ignores NO_COLOR, and FORCE_COLOR=0 renders them unstyled.
 
 ================================================================================
 U6. LIFECYCLE & FAILURE POLICY (degrade, never kill — §U0)

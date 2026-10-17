@@ -7,7 +7,7 @@
 // process's own typed producers. Row truncation is Ink's layout
 // (<Text wrap="truncate-end"> inside a width-constrained <Box>) — never naive string slicing
 // (org/repo/branch names can carry CJK/emoji whose cell width chars can't measure). Colors
-// via <Text color/dimColor>; NO_COLOR is honored by Ink's chalk.
+// via <Text color/dimColor>; Ink's chalk ignores NO_COLOR, and FORCE_COLOR=0 renders them unstyled.
 import { Box, Text } from "ink";
 import type { ReactNode } from "react";
 import { assertNever } from "../assertNever.ts";

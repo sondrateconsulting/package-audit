@@ -69,8 +69,8 @@ function eligibility(i: ActivationInput): { eligible: boolean; blockers: string[
   return { eligible: blockers.length === 0, blockers };
 }
 
-// NO_COLOR is deliberately NOT consulted: it affects styling only (Ink's chalk honors it),
-// never routing.
+// NO_COLOR is deliberately NOT consulted: styling never affects routing. (Ink's chalk does not
+// read NO_COLOR either; FORCE_COLOR=0 is what turns its styling off.)
 export function decideTuiActivation(i: ActivationInput): ActivationDecision {
   // plan → off. The `--ui --plan` combination never reaches here — args.ts rejected it.
   if (i.plan) return { mode: "off" };
