@@ -104,7 +104,7 @@ describe("planRepoBranches — policy is applied BEFORE cutoff/cap", () => {
     // globs that THROW at .match() time; "[" compiles and (as pinned here) matches neither the
     // default nor a feature head, so it must exclude nothing and land in NO coverage set — the advisory
     // unmatched-pattern warning is its surface.
-    // Bun.Glob-VERSION-SENSITIVE (CI pins 1.3.14): if a Bun upgrade starts rejecting "[" at
+    // Bun.Glob-VERSION-SENSITIVE (CI pins 1.4.3): if a Bun upgrade starts rejecting "[" at
     // construction, this test goes red so the load/validation story is re-decided consciously.
     const policy = compileBranchPolicy(null, ["["]);
     const p = planRepoBranches(snap([head("feature-x", "2025-01-01T00:00:00Z")], "main"), policy, "2024-01-01", 25);

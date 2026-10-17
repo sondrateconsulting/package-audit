@@ -49,7 +49,7 @@ Checked at startup with actionable errors (nothing here is silently assumed):
 
 | Requirement | Why |
 |---|---|
-| [Bun](https://bun.sh) ≥ 1.1 (CI tests against 1.3.14) | runtime (`bun:sqlite`, shell, glob) |
+| [Bun](https://bun.sh) ≥ 1.1 (CI tests against 1.4.3) | runtime (`bun:sqlite`, shell, glob) |
 | `gh` CLI, authenticated | GitHub API access (`gh auth status` must pass); every scanned branch unit also makes a hardened no-checkout `git clone` over HTTPS |
 | git ≥ 2.45.1 | the per-unit shallow clones; older releases carry the May-2024 clone CVEs |
 | `tar` (GNU or bsdtar) | registry tarball extraction |
