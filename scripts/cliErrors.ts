@@ -1,4 +1,4 @@
-// cliErrors.ts — shared fatal-error rendering for the CLI entrypoints (§8). KNOWN operator-facing
+// cliErrors.ts — shared fatal-error rendering and exit for the CLI entrypoints (§8). KNOWN operator-facing
 // failures (bad flags, invalid config, failed preflight, exhausted throttles, guard violations, …)
 // print their message WITHOUT a stack trace — a stack makes an expected condition read as a
 // crash. Most of these messages carry their remediation directly (auth/SSO/config/preflight/
@@ -60,4 +60,52 @@ export function renderFatal(e: unknown, opts: { command: string; usage: string }
   }
   const err = e instanceof Error ? e : new Error(String(e));
   return `${opts.command} failed (unexpected): ${err.stack ?? err.message}\n`;
+}
+
+// ---- the fatal exit -------------------------------------------------------------------------
+// The audit entrypoints (orchestrate, report, export, compare) hand main()'s rejection here, and
+// this never hard-exits on the spot: a hard exit (process.exit) discards whatever the runtime
+// still buffers for a piped stdout or stderr. Measured on macOS: of 2,001 JSONL lines written
+// into a slow consumer, a hard exit delivered 284 whole lines on both Bun 1.4.3 and Node 24 — on
+// Bun exactly one 64 KiB pipe buffer, so a 285th line arrived cut mid-way — while a natural exit
+// delivered all 2,001 on both (stderr behaved the same on both: 299 of 2,001 versus all). On Bun
+// 1.4.3, process.stdout reported writableLength 0 and no pending drain while those bytes were
+// still unflushed, so waiting for the stream's 'drain' cannot close that gap there. Instead the
+// exit code is set and control returns; the event loop stays alive until both streams have
+// flushed (the natural exit measured above), then the process exits 1 on its own. The backstop
+// bounds that wait: it is unref'd (it never holds the process open itself) and hard-exits 1 only
+// if the loop has not emptied within FATAL_DRAIN_DEADLINE_MS — a consumer that stopped reading,
+// or a handle a fatal left open. A fatal therefore ends by that deadline at the latest; a consumer
+// still behind then loses the unflushed tail.
+export const FATAL_DRAIN_DEADLINE_MS = 10_000;
+
+// The process surface exitFatal drives — injected so tests can observe it without exiting.
+export interface FatalExitHost {
+  readonly stderr: { write(chunk: string): unknown };
+  setExitCode(code: number): void;
+  exit(code: number): void;
+  armBackstop(fire: () => void, ms: number): void; // must not hold the process open
+}
+
+// The production backstop; returns the timer so a test can confirm it is unref'd.
+export function armUnrefBackstop(fire: () => void, ms: number): ReturnType<typeof setTimeout> {
+  const timer = setTimeout(fire, ms);
+  timer.unref();
+  return timer;
+}
+
+// The real process; exported only so a test can pin its wiring.
+export const PROCESS_FATAL_HOST: FatalExitHost = {
+  stderr: process.stderr,
+  setExitCode: (code) => {
+    process.exitCode = code;
+  },
+  exit: (code) => process.exit(code),
+  armBackstop: armUnrefBackstop,
+};
+
+export function exitFatal(e: unknown, opts: { command: string; usage: string }, host: FatalExitHost = PROCESS_FATAL_HOST): void {
+  host.stderr.write(renderFatal(e, opts));
+  host.setExitCode(1);
+  host.armBackstop(() => host.exit(1), FATAL_DRAIN_DEADLINE_MS);
 }

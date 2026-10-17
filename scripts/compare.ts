@@ -26,7 +26,7 @@ import { loadConfig, type Config } from "./config.ts";
 import { AuditDb, type AuditDbReader, type PolicyStatus, type RunRecord } from "./db.ts";
 import { isPolicyExcluded, isDefaultOverride, assertRunUnitHeadSound, policyStatusOrThrow } from "./policyDisposition.ts";
 import { ArgsError, assertRunId } from "./args.ts";
-import { renderFatal } from "./cliErrors.ts";
+import { exitFatal } from "./cliErrors.ts";
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -574,8 +574,5 @@ export async function main(argv: string[] = Bun.argv.slice(2)): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch((e) => {
-    process.stderr.write(renderFatal(e, { command: "compare", usage: COMPARE_USAGE }));
-    process.exit(1);
-  });
+  main().catch((e) => exitFatal(e, { command: "compare", usage: COMPARE_USAGE }));
 }

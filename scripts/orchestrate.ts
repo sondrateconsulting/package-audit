@@ -36,7 +36,7 @@ import { discovered, discoveryFailed, type DiscoveryOutcome } from "./discovery.
 import { computePolicyWarnings, isEmptyAllowlist, policyWarningLines, type PolicyWarning } from "./policyWarnings.ts";
 import { assertContained } from "./readOnlyGuard.ts";
 import { parseArgs, ORCHESTRATE_HELP, ORCHESTRATE_USAGE, type OrchestrateArgs } from "./args.ts";
-import { renderFatal } from "./cliErrors.ts";
+import { exitFatal } from "./cliErrors.ts";
 import { runPreflight } from "./preflight.ts";
 import { resolveEffectiveOwners, type OwnersSource } from "./ownerResolve.ts";
 import { scanUnit, makeExcluder, countBudgetEligible, restFallbackBudgetFromEligible, type TreeEntry, type UnitLocation } from "./unitPipeline.ts";
@@ -1243,8 +1243,5 @@ export function planSummaryText(
 
 // Entry point (guarded so importing this module — e.g. from tests — never launches an audit).
 if (import.meta.main) {
-  main().catch((e) => {
-    process.stderr.write(renderFatal(e, { command: "orchestrate", usage: ORCHESTRATE_USAGE }));
-    process.exit(1);
-  });
+  main().catch((e) => exitFatal(e, { command: "orchestrate", usage: ORCHESTRATE_USAGE }));
 }
