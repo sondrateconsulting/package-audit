@@ -11,7 +11,7 @@ import { setLogSink, setLogTap } from "../log.ts";
 import { setProgressSink, hasProgressSink, emitProgress, reportTuiFailure, reportDivertFailure, tuiFailure, resetTuiFailure, causeText } from "../progress.ts";
 import { assertContained } from "../readOnlyGuard.ts";
 import { sanitizeLine } from "./format.ts";
-import { GET_RAW_DIMS, isPositiveIntegerDim, type RawDims, type DimsAwareStream } from "./dims.ts";
+import { GET_RAW_DIMS, isPositiveIntegerDim, readRawDims, type RawDims, type DimsAwareStream } from "./dims.ts";
 import { createTuiStore, type TuiStore } from "./store.ts";
 import type { ActivationDecision } from "./activation.ts";
 import type { mountTui, TuiHandle } from "./mount.tsx";
@@ -204,11 +204,7 @@ export function makeSealableStderr(real: NodeJS.WriteStream, onWriteFailure: (ca
     }
     return lastGood[axis];
   };
-  const rawDim = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
-  const getRawDims = (): RawDims => ({
-    columns: rawDim((real as { columns?: unknown }).columns),
-    rows: rawDim((real as { rows?: unknown }).rows),
-  });
+  const getRawDims = (): RawDims => readRawDims(real);
   const overrides: Record<PropertyKey, unknown> = { write };
   const stream = new Proxy(real, {
     get(target, prop) {
