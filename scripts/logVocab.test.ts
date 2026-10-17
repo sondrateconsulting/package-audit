@@ -1,40 +1,901 @@
 import { expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import ts from "typescript";
 
-// The stdout JSONL is a CONTRACT: every `event`/`action` token the tool writes with logLine is
-// part of the machine-readable output a consumer switches on. This source scan requires every
-// emitted literal to appear (backticked) somewhere in the README — the missing
-// tripwire that let `owner-discovery-throttled` / `requeue-throttle` / `retry-next-run` go
-// undocumented (house precedent: EXPORTS.md↔registry, config.schema.json↔config.ts,
-// reportSchema↔db.ts). Scope note: this matches `event:`/`action:` object-literal keys in the
-// non-test sources; every such literal is an emitted stdout token today, and any future one belongs in the
-// contract too, so demanding it be documented is the intended invariant.
+// The stdout JSONL is a CONTRACT: every `event`/`action` token the tool writes to stdout is
+// part of the machine-readable output a consumer switches on. (Most go through `logLine`, but
+// not all — `export-summary` is hand-serialized and written by export.ts's main().) PINNED_VOCAB
+// below IS that contract, frozen — the source scan must equal it in BOTH directions:
+//   • an emitted token absent from the pin (a new or renamed token) fails: add it to
+//     PINNED_VOCAB and EVER_PINNED_VOCAB, and document it (backticked) in the README;
+//   • a pinned token no longer emitted (a removed or renamed token) fails: delete it from
+//     PINNED_VOCAB and record it in RETIRED_VOCAB with a rationale — leaving the contract is
+//     as deliberate and visible an act as joining it.
+// The earlier subset-only design (emitted ⊆ README) let removals and renames pass silently;
+// the README requirement itself was the tripwire that caught `owner-discovery-throttled` /
+// `requeue-throttle` / `retry-next-run` going undocumented, and it is retained here over the
+// pin (house precedent for frozen ledgers: EXPORTS.md↔registry, config.schema.json↔config.ts,
+// reportSchema↔db.ts).
+//
+// Scope note: the scan is SYNTACTIC, not textual. It parses each non-test source and collects
+// `event:`/`action:` object-literal properties. A direct string literal counts ANYWHERE, because
+// not every stdout token passes through logLine at all: `export-summary` is built as a plain
+// object at export.ts:451, hand-serialized, and written by main() at export.ts:518. A scan
+// restricted to logLine payloads would never see it.
+//
+// Inside a `logLine()` payload the scan tries harder, because that is where a missed token
+// becomes an undocumented public emission. There it also reads shorthand (`logLine({ event })`),
+// computed keys spelled by a literal or a const, identifiers bound by an unambiguous same-file
+// `const`, a payload handed over by name (`logLine(payload)`), and a const object spread into
+// the payload — in both cases unwrapping `as const`/`satisfies`/parentheses first. Anything it
+// still cannot read there — an unreadable value or key, a GETTER, an unexpandable payload — is
+// reported as BLINDNESS and fails its own test. A method or set-only accessor is NOT flagged:
+// `JSON.stringify` drops both, so neither can emit. Outside logLine a non-literal value is left
+// alone as display plumbing: tui/lifecycle.ts passes `event: ev` to emitProgress, which emits
+// no stdout token.
+//
+// Why syntactic: token-shaped text in a comment or string must not count as an emission (a
+// stale comment naming a removed token would otherwise keep it looking alive), and hoisting a
+// literal into a const must not read as a removal.
+//
+// Known limits, stated in the direction they actually fail. An unreadable spread is NOT
+// addition-safe — this was wrong when first written here, and a reviewer's counterexample
+// disproved it:
+//   • A spread the scan cannot expand can both hide a new token and mask a removed one:
+//     `logLine({ event: "done", ...makePayload() })` emits whatever makePayload returns, and the
+//     scan sees only `done`. Const-object spreads ARE expanded, so of the three real spread
+//     sites only orchestrate.ts:269 (`...w`, a for-of binding) is genuinely unreadable; failing
+//     on it would reject valid code, so it is tolerated rather than defended against.
+//   • A literal in a non-emitting object literal still counts, so a dead `{ event: "done" }`
+//     left behind after a removal keeps that token looking alive.
+//   • A payload mutated after construction (`p.action = X`), an aliased emitter, or a
+//     const-backed raw `process.stdout.write` are all invisible for the same reason: telling an
+//     emitting object from an inert one needs whole-program data flow, which is far past what a
+//     guard test should carry. The README and the pin diff are the backstop.
 
 const SCRIPTS_DIR = import.meta.dir;
 const README = readFileSync(join(SCRIPTS_DIR, "..", "README.md"), "utf8");
 
-function emittedLiterals(key: "event" | "action"): string[] {
-  const found = new Set<string>();
-  const re = new RegExp(`${key}:\\s*"([^"]+)"`, "g");
+const VOCAB_SECTION_HEADING = "## Reading a run";
+
+// The vocabulary is documented in one README section, and the check reads only that section.
+// Searching the whole file would let unrelated prose satisfy it: `export` is also a CLI
+// subcommand, headed "### Data exports (`export`)", so the export EVENT could disappear from
+// the documented vocabulary while the test stayed green on the subcommand's heading.
+// Fence-aware: a `## ` line inside a code block is sample text, not structure. Without this a
+// fenced heading could either truncate the section early (hiding tokens that ARE documented) or
+// pose as the section itself (documenting tokens with example text).
+function vocabularySection(readme: string): string {
+  const lines = readme.split("\n");
+  let fence: { marker: string; length: number } | undefined;
+  let start = -1;
+  let end = lines.length;
+  for (const [index, raw] of lines.entries()) {
+    const line = raw.replace(/\r$/, "");
+    // Up to three spaces of indent still opens a fence; four makes it code.
+    const fenceAt = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (fence !== undefined) {
+      // Only the same marker, at least as long as the opener, closes a fence.
+      if (fenceAt !== null) {
+        const [matched = "", run = ""] = fenceAt;
+        const trailing = line.slice(matched.length);
+        // A closer carries nothing but whitespace; anything else is an info string, which opens.
+        if (run.startsWith(fence.marker) && run.length >= fence.length && trailing.trim() === "") {
+          fence = undefined;
+        }
+      }
+      continue;
+    }
+    if (fenceAt !== null) {
+      const [, run = ""] = fenceAt;
+      fence = { marker: run[0] ?? "`", length: run.length };
+      continue;
+    }
+    if (start === -1) {
+      if (line === VOCAB_SECTION_HEADING) start = index;
+      continue;
+    }
+    // A setext underline turns the PREVIOUS line into a heading, so the section ends above it.
+    const previous = (lines[index - 1] ?? "").replace(/\r$/, "");
+    if (/^ {0,3}-+ *$/.test(line) && previous.trim().length > 0 && index - 1 > start) {
+      end = index - 1;
+      break;
+    }
+    if (line.startsWith("## ") || line.startsWith("# ")) {
+      end = index;
+      break;
+    }
+  }
+  return start === -1 ? "" : lines.slice(start + 1, end).join("\n");
+}
+
+test("the README vocabulary section excludes prose from the rest of the file", () => {
+  const section = vocabularySection(
+    ["# Title", "### Data exports (`export`)", "", `${VOCAB_SECTION_HEADING}`, "Vocabulary: `done`.", "", "## Report anatomy", "`not-vocabulary`"].join("\n"),
+  );
+  expect(section, "the documented vocabulary must come from the vocabulary section").toContain("`done`");
+  expect(section, "a backticked token elsewhere in the README does not document it").not.toContain("Data exports");
+  expect(section).not.toContain("not-vocabulary");
+});
+
+test("a renamed README vocabulary section yields nothing rather than silently matching", () => {
+  expect(vocabularySection("# Title\n\n## Something else\n\n`done`\n")).toBe("");
+});
+
+const README_VOCAB = vocabularySection(README);
+
+test(`the README keeps its "${VOCAB_SECTION_HEADING}" section`, () => {
+  expect(
+    README_VOCAB.trim().length,
+    `the vocabulary check reads the "${VOCAB_SECTION_HEADING}" section — renaming it would silently document nothing`,
+  ).toBeGreaterThan(0);
+});
+
+// The loop below iterates VOCAB_KEYS and VocabKey is derived from it, so the two can never
+// drift: adding a third discriminant grows the type, the Records, AND the test loop together.
+const VOCAB_KEYS = ["event", "action"] as const;
+type VocabKey = (typeof VOCAB_KEYS)[number];
+
+interface ScanResult {
+  readonly tokens: Readonly<Record<VocabKey, readonly string[]>>;
+  /**
+   * `logLine()` discriminants the scanner could not statically resolve. These are scanner
+   * BLINDNESS, not absence — reported separately so a token the scan merely stopped seeing
+   * is never mistaken for a token the tool stopped emitting.
+   */
+  readonly unresolved: readonly string[];
+}
+
+// Pure and fixture-testable: the vocabulary a single source emits. Split out from the tree
+// walk so the matching rules are covered by hand-written sources (below) rather than only by
+// whatever the repo happens to contain today.
+// `"unit" as const` / `satisfies` / parentheses do not change the value, and the old regex read
+// straight through them — unwrapping keeps that shape working.
+function unwrapValue(node: ts.Node): ts.Node {
+  let current = node;
+  while (
+    ts.isAsExpression(current) ||
+    ts.isSatisfiesExpression(current) ||
+    ts.isParenthesizedExpression(current) ||
+    ts.isNonNullExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return current;
+}
+
+function staticString(node: ts.Node): string | undefined {
+  const current = unwrapValue(node);
+  return ts.isStringLiteral(current) || ts.isNoSubstitutionTemplateLiteral(current) ? current.text : undefined;
+}
+
+/** `resolveIdentifier` lets a computed key spelled by a const (`{ [KEY]: … }`) name its key. */
+function vocabKeyOf(
+  name: ts.PropertyName,
+  resolveIdentifier: (text: string) => string | undefined = () => undefined,
+): VocabKey | undefined {
+  const text = ts.isIdentifier(name)
+    ? name.text
+    : ts.isComputedPropertyName(name)
+      ? (staticString(name.expression) ??
+        (ts.isIdentifier(name.expression) ? resolveIdentifier(name.expression.text) : undefined))
+      : staticString(name);
+  return VOCAB_KEYS.find((key) => key === text);
+}
+
+function isLogLineCall(node: ts.Node): boolean {
+  if (!ts.isCallExpression(node)) return false;
+  let callee: ts.Expression = node.expression;
+  while (ts.isParenthesizedExpression(callee)) callee = callee.expression;
+  return ts.isIdentifier(callee) && callee.text === "logLine";
+}
+
+function scanSourceVocabulary(source: string, fileName = "scan.ts"): ScanResult {
+  const found: Record<VocabKey, Set<string>> = { event: new Set(), action: new Set() };
+  const unresolved: string[] = [];
+  const sourceFile = ts.createSourceFile(
+    fileName,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    fileName.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+
+  // Same-file `const NAME = "literal"` bindings, so hoisting a literal out of its call site is
+  // a refactor the scan FOLLOWS rather than a token it loses.
+  //
+  // Only `const` counts: a `let`/`var` can be reassigned, so its initializer is not evidence of
+  // what gets emitted. Resolution is by name, not by lexical scope (a full binding resolver
+  // would need a TypeChecker over the whole program), so every OTHER binding of the same name —
+  // a parameter, a destructured element, a function/class/import — poisons the entry to null.
+  // That keeps name-based lookup from reaching across an unrelated binding: the cost of a
+  // collision is an unresolved token (reported as blindness), never a wrong one.
+  const consts = new Map<string, string | null>();
+  // `const NAME = { … }` bodies, so a payload built beside the call is still readable at it.
+  const constObjects = new Map<string, ts.ObjectLiteralExpression | null>();
+  const bind = (name: string, value: string | null): void => {
+    consts.set(name, consts.has(name) ? null : value);
+  };
+  const collectConsts = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      const declaredConst =
+        node.parent !== undefined &&
+        ts.isVariableDeclarationList(node.parent) &&
+        (node.parent.flags & ts.NodeFlags.Const) !== 0;
+      const value =
+        declaredConst && node.initializer !== undefined ? staticString(node.initializer) : undefined;
+      bind(node.name.text, value ?? null);
+      const unwrapped =
+        declaredConst && node.initializer !== undefined ? unwrapValue(node.initializer) : undefined;
+      const body =
+        unwrapped !== undefined && ts.isObjectLiteralExpression(unwrapped) ? unwrapped : null;
+      constObjects.set(node.name.text, constObjects.has(node.name.text) ? null : body);
+    } else if (
+      (ts.isParameter(node) ||
+        ts.isBindingElement(node) ||
+        ts.isFunctionDeclaration(node) ||
+        ts.isFunctionExpression(node) ||
+        ts.isImportEqualsDeclaration(node) ||
+        ts.isClassDeclaration(node) ||
+        ts.isClassExpression(node) ||
+        ts.isEnumDeclaration(node) ||
+        ts.isModuleDeclaration(node) ||
+        ts.isImportSpecifier(node) ||
+        ts.isImportClause(node) ||
+        ts.isNamespaceImport(node)) &&
+      node.name !== undefined &&
+      ts.isIdentifier(node.name)
+    ) {
+      bind(node.name.text, null);
+      constObjects.set(node.name.text, null);
+    }
+    ts.forEachChild(node, collectConsts);
+  };
+  collectConsts(sourceFile);
+
+  const blind = (node: ts.Node, what: string): void => {
+    unresolved.push(`${fileName}:${sourceFile.getLineAndCharacterOfPosition(node.getStart()).line + 1} ${what}`);
+  };
+
+  // A file that does not parse yields no nodes, which would otherwise read as "emits nothing" —
+  // the exact silent-blindness shape this guard exists to prevent. `parseDiagnostics` is not on
+  // the public SourceFile type, hence the narrow cast.
+  const parseErrors = (sourceFile as unknown as { parseDiagnostics?: readonly unknown[] }).parseDiagnostics;
+  if (parseErrors !== undefined && parseErrors.length > 0) {
+    unresolved.push(`${fileName}:1 unparsed source (${parseErrors.length} syntax error(s))`);
+  }
+
+  // `inLogLine` decides how hard the scan tries. A direct string literal is a token anywhere —
+  // `export-summary` is built as a plain object and hand-serialized to stdout without ever
+  // reaching logLine, so restricting collection to logLine payloads would lose it.
+  // An IDENTIFIER, though, only counts inside a logLine payload: elsewhere a non-literal
+  // `event:` is display plumbing (tui/lifecycle.ts passes one to emitProgress) that emits no
+  // stdout token, and resolving those would invent contract tokens out of UI state.
+  const constString = (text: string): string | undefined => {
+    const bound = consts.get(text);
+    return typeof bound === "string" ? bound : undefined;
+  };
+
+  // Keyed by node AND context: a payload object is walked once plainly and again with logLine
+  // context when a call expands it, so the guard must not swallow the second, richer pass.
+  const visitObject = (object: ts.ObjectLiteralExpression, inLogLine: boolean, seen: Set<string>): void => {
+    const visit = `${object.pos}:${inLogLine}`;
+    if (seen.has(visit)) return;
+    seen.add(visit);
+    for (const prop of object.properties) {
+      if (ts.isPropertyAssignment(prop)) {
+        if (
+          ts.isComputedPropertyName(prop.name) &&
+          staticString(prop.name.expression) === undefined &&
+          !(ts.isIdentifier(prop.name.expression) && constString(prop.name.expression.text) !== undefined)
+        ) {
+          // The key could be `event` — an unreadable one has to fail closed.
+          if (inLogLine) blind(prop, "computed key");
+          continue;
+        }
+        const key = vocabKeyOf(prop.name, constString);
+        if (key === undefined) continue;
+        const literal = staticString(prop.initializer);
+        if (literal !== undefined) {
+          found[key].add(literal);
+        } else if (inLogLine) {
+          const bound = ts.isIdentifier(prop.initializer) ? constString(prop.initializer.text) : undefined;
+          if (bound !== undefined) found[key].add(bound);
+          else blind(prop, key);
+        }
+      } else if (ts.isShorthandPropertyAssignment(prop)) {
+        // `logLine({ event })` emits whatever `event` holds — as real an emission as `event: "x"`.
+        const key = vocabKeyOf(prop.name);
+        if (key === undefined || !inLogLine) continue;
+        const bound = constString(prop.name.text);
+        if (bound !== undefined) found[key].add(bound);
+        else blind(prop, key);
+      } else if (ts.isSpreadAssignment(prop)) {
+        // A readable spread is expanded so it cannot hide a rename. An unreadable one is a
+        // documented limit, not blindness: orchestrate.ts:269 spreads a for-of binding, and
+        // failing on it would reject valid code.
+        const body = ts.isIdentifier(prop.expression) ? constObjects.get(prop.expression.text) : undefined;
+        if (body) visitObject(body, inLogLine, seen);
+      } else if (inLogLine && !ts.isMethodDeclaration(prop) && !ts.isSetAccessorDeclaration(prop)) {
+        // A GETTER named `event` is read by JSON.stringify, so it emits and must fail closed.
+        // A method or set-only accessor is dropped by JSON.stringify and emits nothing, so
+        // flagging those would be a false failure.
+        const key = vocabKeyOf(prop.name ?? prop, constString);
+        if (key !== undefined) blind(prop, `${key} (unreadable property kind)`);
+      }
+    }
+  };
+
+  const walk = (node: ts.Node, inLogLine: boolean, seen: Set<string>): void => {
+    if (isLogLineCall(node) && ts.isCallExpression(node)) {
+      for (const arg of node.arguments) {
+        if (ts.isObjectLiteralExpression(arg)) continue; // handled by the object walk below
+        const body = ts.isIdentifier(arg) ? constObjects.get(arg.text) : undefined;
+        if (body) visitObject(body, true, seen);
+        else blind(arg, "payload");
+      }
+    }
+    const nested = inLogLine || isLogLineCall(node);
+    if (ts.isObjectLiteralExpression(node)) visitObject(node, nested, seen);
+    ts.forEachChild(node, (child) => walk(child, nested, seen));
+  };
+  walk(sourceFile, false, new Set<string>());
+
+  return {
+    tokens: { event: [...found.event].sort(), action: [...found.action].sort() },
+    unresolved,
+  };
+}
+
+// The scanner's own rules, pinned against hand-written sources. Without these the scanner is
+// only ever exercised by today's tree, so a blind spot in it looks exactly like a clean run.
+test("the scan counts syntactic vocabulary properties only, not token-shaped prose", () => {
+  const source = [
+    '// action:"comment-line"',
+    '/* action: "comment-block" */',
+    "const prose = `action:\"string-prose\"`;",
+    'logLine({ url: "https://example.test/a//b", action: "after-url" });',
+    'logLine({ left: "/*", action: "between-markers", right: "*/" });',
+  ].join("\n");
+  expect(
+    scanSourceVocabulary(source).tokens.action,
+    "a token mentioned in a comment or a string is not an emitted token",
+  ).toEqual(["after-url", "between-markers"]);
+});
+
+test("the scan resolves a vocabulary value held in a same-file const", () => {
+  const source = 'const EVENT_UNIT = "unit";\nlogLine({ event: EVENT_UNIT });';
+  expect(
+    scanSourceVocabulary(source).tokens.event,
+    "hoisting a literal to a const must not read as a removed token",
+  ).toEqual(["unit"]);
+});
+
+test("an unresolvable logLine discriminant is reported as blindness, not absence", () => {
+  const scanned = scanSourceVocabulary("logLine({ event: pickEvent() });", "blind.ts");
+  expect(scanned.tokens.event).toEqual([]);
+  expect(
+    scanned.unresolved.join(""),
+    "an event the scanner cannot read must be surfaced, not silently dropped",
+  ).toContain("blind.ts");
+});
+
+test("a reassignable let is not treated as a stable token", () => {
+  const scanned = scanSourceVocabulary('let EVENT = "unit";\nEVENT = pick();\nlogLine({ event: EVENT });', "let.ts");
+  expect(scanned.tokens.event, "only a const binding is stable enough to read as an emitted token").toEqual([]);
+  expect(scanned.unresolved.join(""), "an unstable binding is blindness, not absence").toContain("let.ts");
+});
+
+test("a const shadowed by another binding of the same name does not resolve", () => {
+  const source = 'const X = "foo";\nfunction f(X: string) { logLine({ event: X }); }';
+  const scanned = scanSourceVocabulary(source, "shadow.ts");
+  expect(scanned.tokens.event, "resolution must not cross an unrelated binding of the same name").toEqual([]);
+  expect(scanned.unresolved.join("")).toContain("shadow.ts");
+});
+
+test("a non-literal event outside logLine is display plumbing, not a blind spot", () => {
+  // scripts/tui/lifecycle.ts does exactly this: `emitProgress({ type: "jsonl", event: ev })`.
+  const scanned = scanSourceVocabulary('emitProgress({ type: "jsonl", event: ev });');
+  expect(scanned.tokens.event).toEqual([]);
+  expect(scanned.unresolved).toEqual([]);
+});
+
+test("a const-backed event outside logLine is display plumbing, not a stdout token", () => {
+  const scanned = scanSourceVocabulary(
+    'const DISPLAY_EVENT = "render";\nemitProgress({ type: "jsonl", event: DISPLAY_EVENT });',
+  );
+  expect(
+    scanned.tokens.event,
+    "identifier resolution exists for logLine payloads; elsewhere only a direct literal is a token",
+  ).toEqual([]);
+  expect(scanned.unresolved).toEqual([]);
+});
+
+test("a resolvable shorthand discriminant inside logLine is collected", () => {
+  const scanned = scanSourceVocabulary('const action = "new-action";\nlogLine({ event: "unit", action });');
+  expect(
+    scanned.tokens.action,
+    "shorthand emits a real token — dropping it would let a brand-new token ship undetected",
+  ).toEqual(["new-action"]);
+  expect(scanned.unresolved).toEqual([]);
+});
+
+test("an unresolvable shorthand discriminant inside logLine is blindness", () => {
+  const scanned = scanSourceVocabulary("logLine({ event });", "shorthand.ts");
+  expect(scanned.tokens.event).toEqual([]);
+  expect(scanned.unresolved.join("")).toContain("shorthand.ts");
+});
+
+test("a computed key spelled by a static string is the key it spells", () => {
+  const scanned = scanSourceVocabulary('logLine({ ["event"]: "computed-event" });');
+  expect(scanned.tokens.event).toEqual(["computed-event"]);
+});
+
+test("a computed key inside logLine that is not statically readable is blindness", () => {
+  const scanned = scanSourceVocabulary('logLine({ [pickKey()]: "x" });', "computed.ts");
+  expect(
+    scanned.unresolved.join(""),
+    "an unreadable key could be `event` — failing closed is the only safe reading",
+  ).toContain("computed.ts");
+});
+
+test("a literal wrapped in `as const` still reads as a token", () => {
+  const scanned = scanSourceVocabulary('logLine({ event: "unit" as const });');
+  expect(scanned.tokens.event, "the old regex matched this shape; the syntactic scan must not regress it").toEqual([
+    "unit",
+  ]);
+});
+
+test("a named function expression poisons an outer const of the same name", () => {
+  const scanned = scanSourceVocabulary(
+    'const X = "done";\nconst f = function X() { logLine({ event: X }); };',
+    "fnexpr.ts",
+  );
+  expect(scanned.tokens.event, "the inner binding is the function, not the outer string").toEqual([]);
+  expect(scanned.unresolved.join("")).toContain("fnexpr.ts");
+});
+
+test("a binding that shadows a const-object payload name blocks expansion", () => {
+  const scanned = scanSourceVocabulary(
+    'const payload = { event: "done" };\nfunction f(payload: Record<string, unknown>) { logLine(payload); }',
+    "shadowpayload.ts",
+  );
+  // `done` is still collected — it is a real literal in the source, which the anywhere-rule
+  // counts. What must NOT happen is the call silently expanding that stale object as if it were
+  // the payload, because then a token passed in through the parameter would escape unseen.
+  expect(
+    scanned.unresolved.join(""),
+    "a shadowed payload name is unknowable — expanding the outer object instead would be a wrong answer, not a safe one",
+  ).toContain("shadowpayload.ts");
+});
+
+test("a const object wrapped in `as const` is still expandable", () => {
+  // export.ts's RAW_EXPORT_WARNING has exactly this shape and is spread into logLine.
+  const scanned = scanSourceVocabulary(
+    'const NEXT = "new-token";\nconst rest = { event: NEXT } as const;\nlogLine({ ...rest });',
+  );
+  expect(scanned.tokens.event, "a type-only wrapper must not make a payload unreadable").toEqual(["new-token"]);
+  expect(scanned.unresolved).toEqual([]);
+});
+
+test("a method or setter discriminant is not an emission and is not flagged", () => {
+  // JSON.stringify drops function-valued properties and set-only accessors.
+  const scanned = scanSourceVocabulary('logLine({ event() { return "x"; }, set action(v) {} });');
+  expect(scanned.tokens.event).toEqual([]);
+  expect(scanned.unresolved, "flagging a property that cannot serialize would be a false failure").toEqual([]);
+});
+
+test("a parenthesized logLine callee is still logLine", () => {
+  const scanned = scanSourceVocabulary('const NEXT = "new-token";\n(logLine)({ event: NEXT });');
+  expect(scanned.tokens.event).toEqual(["new-token"]);
+});
+
+test("a level-1 heading also ends the vocabulary section", () => {
+  const section = vocabularySection([VOCAB_SECTION_HEADING, "`done`", "# Part Two", "`no`"].join("\n"));
+  expect(section).toContain("`done`");
+  expect(section).not.toContain("`no`");
+});
+
+test("a fence closer carrying trailing text does not close the fence", () => {
+  const section = vocabularySection(
+    [VOCAB_SECTION_HEADING, "```", "``` js", "## fake", "```", "`done`", "## Next", "`no`"].join("\n"),
+  );
+  expect(section, "an info-string line opens or continues a block, it never closes one").toContain("`done`");
+  expect(section).not.toContain("`no`");
+});
+
+test("an accessor discriminant inside logLine is blindness, not silence", () => {
+  const scanned = scanSourceVocabulary('logLine({ get event() { return "new-token"; } });', "getter.ts");
+  expect(scanned.tokens.event).toEqual([]);
+  expect(
+    scanned.unresolved.join(""),
+    "a getter is serialized like any property — skipping it silently would hide a new token",
+  ).toContain("getter.ts");
+});
+
+test("a const-object payload handed to logLine is expanded", () => {
+  const scanned = scanSourceVocabulary(
+    'const T = "new-token";\nconst payload = { event: T };\nlogLine(payload);',
+  );
+  expect(scanned.tokens.event, "building the payload separately is still an emission").toEqual(["new-token"]);
+  expect(scanned.unresolved).toEqual([]);
+});
+
+test("a logLine payload the scan cannot expand is blindness", () => {
+  const scanned = scanSourceVocabulary("logLine(buildPayload());", "opaque.ts");
+  expect(scanned.unresolved.join("")).toContain("opaque.ts");
+});
+
+test("a const-object spread into a logLine payload is expanded", () => {
+  const scanned = scanSourceVocabulary(
+    'const T = "new-token";\nconst rest = { event: T };\nlogLine({ action: "scanned", ...rest });',
+  );
+  expect(scanned.tokens.event, "a readable spread must not be able to hide a rename").toEqual(["new-token"]);
+});
+
+test("a computed key backed by a const resolves to that key", () => {
+  const scanned = scanSourceVocabulary('const KEY = "event";\nlogLine({ [KEY]: "new-token" });');
+  expect(scanned.tokens.event).toEqual(["new-token"]);
+});
+
+test("a non-null assertion does not hide a literal", () => {
+  expect(scanSourceVocabulary('logLine({ event: "unit"! });').tokens.event).toEqual(["unit"]);
+});
+
+test("a `satisfies` wrapper does not hide a literal", () => {
+  expect(scanSourceVocabulary('logLine({ event: "unit" satisfies string });').tokens.event).toEqual(["unit"]);
+});
+
+test("an import-equals binding poisons a same-named const", () => {
+  const scanned = scanSourceVocabulary(
+    'const X = "done";\nimport X = require("m");\nlogLine({ event: X });',
+    "importeq.ts",
+  );
+  expect(scanned.tokens.event, "an import binding shadows the literal — resolving it would be wrong").toEqual([]);
+  expect(scanned.unresolved.join("")).toContain("importeq.ts");
+});
+
+test("a source that does not parse is blindness, not an empty scan", () => {
+  const scanned = scanSourceVocabulary('logLine({ event: "unit"', "broken.ts");
+  expect(
+    scanned.unresolved.join(""),
+    "an unparsed file contributes no tokens — that must be loud, not read as 'emits nothing'",
+  ).toContain("broken.ts");
+});
+
+test("a tilde fence does not close a backtick fence", () => {
+  const section = vocabularySection(
+    [VOCAB_SECTION_HEADING, "```", "~~~", "## fake", "```", "`done`", "## Next", "`no`"].join("\n"),
+  );
+  expect(section, "only a matching marker closes a fence").toContain("`done`");
+  expect(section).not.toContain("`no`");
+});
+
+test("a setext level-2 heading bounds the section", () => {
+  const section = vocabularySection([VOCAB_SECTION_HEADING, "`done`", "Next section", "---", "`no`"].join("\n"));
+  expect(section).toContain("`done`");
+  expect(section, "an underlined heading ends the section just as `## ` does").not.toContain("`no`");
+});
+
+test("a level-2 heading inside a fenced code block does not bound the section", () => {
+  const section = vocabularySection(
+    [VOCAB_SECTION_HEADING, "```", "## not a heading", "```", "`done`", "", "## Next", "`nope`"].join("\n"),
+  );
+  expect(section, "a fenced heading must not truncate the vocabulary").toContain("`done`");
+  expect(section).not.toContain("`nope`");
+});
+
+test("a fenced heading does not start the section", () => {
+  const readme = ["```", VOCAB_SECTION_HEADING, "`decoy`", "```", "", VOCAB_SECTION_HEADING, "`real`", ""].join("\n");
+  expect(vocabularySection(readme)).toContain("`real`");
+  expect(vocabularySection(readme), "a heading shown as sample text does not document anything").not.toContain("`decoy`");
+});
+
+// The frozen stdout JSONL vocabulary. Sorted (default string sort), duplicate-free, and
+// backtick-documented in the README — all three are asserted below.
+const PINNED_VOCAB: Record<VocabKey, readonly string[]> = {
+  event: [
+    "cli-terms",
+    "concurrency",
+    "config",
+    "content-transport",
+    "discovery",
+    "done",
+    "dossier",
+    "dossier-summary",
+    "export",
+    "export-summary",
+    "introspection",
+    "owner-discovery-throttled",
+    "owners",
+    "plan",
+    "plan-excluded",
+    "plan-summary",
+    "policy-warning",
+    "preflight",
+    "reconciliation",
+    "rescan-branch",
+    "run",
+    "unit",
+    "warning",
+  ],
+  action: [
+    "error",
+    "past-cap",
+    "prune-excluded-owner",
+    "prune-stale",
+    "requeue-throttle",
+    "retry-next-run",
+    "scanned",
+    "skip-current",
+    "skip-cutoff",
+    "skip-policy",
+  ],
+};
+
+interface RetiredToken {
+  readonly token: string;
+  /** Why the token left the contract — the retirement record kept for reviewers and maintainers. */
+  readonly rationale: string;
+}
+
+// Tokens deliberately removed from the contract. Moving an entry here (instead of just deleting
+// it from PINNED_VOCAB) is the required paper trail for a removal or rename; the tests below
+// hold each entry to being genuinely gone from the sources and carrying a non-empty rationale.
+const RETIRED_VOCAB: Record<VocabKey, readonly RetiredToken[]> = {
+  event: [],
+  action: [],
+};
+
+// Every token that has EVER been part of the contract, retired or not. PINNED_VOCAB and
+// RETIRED_VOCAB must together partition it exactly, which is what makes a retirement checkable:
+// without it, "retire `don`" (a typo for `done`) satisfies every other rule, since a name that
+// never existed is trivially not pinned and not emitted.
+//
+// Honest limit: this is a mutable file, so it is a REVIEW AID, not proof. Nothing stops the same
+// commit that invents a retirement from also adding the invented token here — it just cannot
+// happen by accident, and the diff makes it obvious to a reviewer. Real proof of prior
+// membership needs immutable history (git, a released manifest), which is out of scope for a
+// test that must stay fast and offline.
+const EVER_PINNED_VOCAB: Record<VocabKey, readonly string[]> = {
+  event: [
+    "cli-terms",
+    "concurrency",
+    "config",
+    "content-transport",
+    "discovery",
+    "done",
+    "dossier",
+    "dossier-summary",
+    "export",
+    "export-summary",
+    "introspection",
+    "owner-discovery-throttled",
+    "owners",
+    "plan",
+    "plan-excluded",
+    "plan-summary",
+    "policy-warning",
+    "preflight",
+    "reconciliation",
+    "rescan-branch",
+    "run",
+    "unit",
+    "warning",
+  ],
+  action: [
+    "error",
+    "past-cap",
+    "prune-excluded-owner",
+    "prune-stale",
+    "requeue-throttle",
+    "retry-next-run",
+    "scanned",
+    "skip-current",
+    "skip-cutoff",
+    "skip-policy",
+  ],
+};
+
+interface RetirementInput {
+  readonly key: VocabKey;
+  readonly retired: readonly RetiredToken[];
+  readonly pinned: ReadonlySet<string>;
+  readonly emitted: ReadonlySet<string>;
+  readonly everPinned: ReadonlySet<string>;
+}
+
+// Pure, so the ledger's rules are covered by the fixtures below even while the real ledger is
+// empty. Returns every problem rather than throwing on the first, so one run lists them all.
+function retirementProblems({ key, retired, pinned, emitted, everPinned }: RetirementInput): string[] {
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  for (const { token, rationale } of retired) {
+    if (seen.has(token)) problems.push(`retired ${key} \`${token}\` is listed twice`);
+    seen.add(token);
+    if (rationale.trim().length === 0) problems.push(`retired ${key} \`${token}\` needs a non-empty rationale`);
+    if (pinned.has(token)) problems.push(`\`${token}\` cannot be both pinned and retired`);
+    if (emitted.has(token)) problems.push(`retired ${key} \`${token}\` is still emitted — restore its pin or finish removing it`);
+    if (!everPinned.has(token))
+      problems.push(
+        `retired ${key} \`${token}\` was never pinned — EVER_PINNED_VOCAB.${key} has no record of it (typo, or a token that never shipped)`,
+      );
+  }
+  return problems;
+}
+
+interface HistoryInput {
+  readonly key: VocabKey;
+  readonly pinned: readonly string[];
+  readonly retired: readonly RetiredToken[];
+  readonly everPinned: readonly string[];
+}
+
+// PINNED_VOCAB and RETIRED_VOCAB must exactly partition EVER_PINNED_VOCAB. The "unaccounted"
+// half is what turns a typo into two failures instead of none: retiring `don` leaves the real
+// `done` in the catalog but in neither list, so the mistake surfaces from both directions.
+function contractHistoryProblems({ key, pinned, retired, everPinned }: HistoryInput): string[] {
+  const problems: string[] = [];
+  const history = new Set(everPinned);
+  const accounted = new Set([...pinned, ...retired.map((entry) => entry.token)]);
+  for (const token of pinned)
+    if (!history.has(token))
+      problems.push(`pinned ${key} \`${token}\` is missing from EVER_PINNED_VOCAB.${key} — add it there too`);
+  for (const token of everPinned)
+    if (!accounted.has(token))
+      problems.push(`${key} \`${token}\` is in EVER_PINNED_VOCAB but neither pinned nor retired — it left the contract with no paper trail`);
+  return problems;
+}
+
+test("a token dropped from the pin without a retirement is unaccounted for", () => {
+  const problems = contractHistoryProblems({
+    key: "event",
+    pinned: [],
+    retired: [{ token: "don", rationale: "typo of done" }],
+    everPinned: ["done"],
+  }).join("\n");
+  expect(problems, "a typo'd retirement must also surface as the real token going missing").toContain(
+    "`done` is in EVER_PINNED_VOCAB but neither pinned nor retired",
+  );
+});
+
+const NO_TOKENS: ReadonlySet<string> = new Set();
+
+test("a completed retirement raises no problems", () => {
+  expect(
+    retirementProblems({
+      key: "event",
+      retired: [{ token: "gone", rationale: "renamed to `done`" }],
+      pinned: NO_TOKENS,
+      emitted: NO_TOKENS,
+      everPinned: new Set(["gone"]),
+    }),
+  ).toEqual([]);
+});
+
+test("the ledger rejects duplicates, blank rationales, and half-finished removals", () => {
+  const problems = retirementProblems({
+    key: "action",
+    retired: [
+      { token: "dup", rationale: "ok" },
+      { token: "dup", rationale: "ok" },
+      { token: "blank", rationale: "   " },
+      { token: "still-pinned", rationale: "ok" },
+      { token: "still-emitted", rationale: "ok" },
+    ],
+    pinned: new Set(["still-pinned"]),
+    emitted: new Set(["still-emitted"]),
+    everPinned: new Set(["dup", "blank", "still-pinned", "still-emitted"]),
+  }).join("\n");
+  expect(problems).toContain("`dup` is listed twice");
+  expect(problems).toContain("`blank` needs a non-empty rationale");
+  expect(problems).toContain("`still-pinned` cannot be both pinned and retired");
+  expect(problems).toContain("`still-emitted` is still emitted");
+});
+
+test("retiring a token that was never in the contract is rejected", () => {
+  const problems = retirementProblems({
+    key: "event",
+    retired: [{ token: "totally-fabricated-token-xyz", rationale: "made up" }],
+    pinned: NO_TOKENS,
+    emitted: NO_TOKENS,
+    everPinned: new Set(["done"]),
+  }).join("\n");
+  expect(problems, "an invented or typo'd retirement must not pass silently").toContain(
+    "retired event `totally-fabricated-token-xyz` was never pinned",
+  );
+});
+
+// One walk for both keys: parsing each source is the expensive part, so it happens once.
+function scanTree(): ScanResult {
+  const found: Record<VocabKey, Set<string>> = { event: new Set(), action: new Set() };
+  const unresolved: string[] = [];
   // RECURSIVE and .tsx-inclusive (PROMPT-TUI §U8.14): scripts/tui/ can never emit an
   // undocumented stdout token either. (The TUI's own hub deliberately uses a different
   // discriminant key — `type:` — so display plumbing never collides with this scan.)
   for (const file of readdirSync(SCRIPTS_DIR, { recursive: true }) as string[]) {
     if (!file.endsWith(".ts") && !file.endsWith(".tsx")) continue;
-    if (file.includes(".test.")) continue;
-    const src = readFileSync(join(SCRIPTS_DIR, file), "utf8");
-    for (const m of src.matchAll(re)) found.add(m[1]!);
+    if (/\.test\.tsx?$/.test(file)) continue;
+    const scanned = scanSourceVocabulary(readFileSync(join(SCRIPTS_DIR, file), "utf8"), file);
+    for (const key of VOCAB_KEYS) for (const token of scanned.tokens[key]) found[key].add(token);
+    unresolved.push(...scanned.unresolved);
   }
-  return [...found].sort();
+  return {
+    tokens: { event: [...found.event].sort(), action: [...found.action].sort() },
+    unresolved,
+  };
 }
 
-for (const key of ["event", "action"] as const) {
-  test(`every emitted ${key}: literal is documented in the README vocabulary`, () => {
-    const literals = emittedLiterals(key);
-    expect(literals.length).toBeGreaterThan(0); // the scan must actually find tokens
-    for (const token of literals) {
-      expect(README, `README must document the \`${token}\` ${key} (stdout JSONL is a contract)`).toContain(`\`${token}\``);
-    }
+const TREE = scanTree();
+
+// Blindness must never masquerade as absence. If the scan cannot read a logLine discriminant,
+// that token silently leaves the emitted set and every pinned-but-gone check starts lying.
+test("every logLine discriminant in the sources is statically readable", () => {
+  expect(
+    TREE.unresolved,
+    "a logLine event/action the scan cannot resolve reads exactly like a removed token — give it a string literal or a same-file const",
+  ).toEqual([]);
+});
+
+for (const key of VOCAB_KEYS) {
+  const emitted = TREE.tokens[key];
+  const emittedSet = new Set(emitted);
+  const pinned = PINNED_VOCAB[key];
+  const pinnedSet = new Set(pinned);
+  const retired = RETIRED_VOCAB[key];
+
+  test(`the pinned and all-time ${key} vocabularies are sorted and duplicate-free`, () => {
+    expect(pinned, `keep PINNED_VOCAB.${key} sorted so contract diffs stay reviewable`).toEqual([...pinned].sort());
+    expect(pinnedSet.size, `PINNED_VOCAB.${key} must not contain duplicates`).toBe(pinned.length);
+    const history = EVER_PINNED_VOCAB[key];
+    expect(history, `keep EVER_PINNED_VOCAB.${key} sorted too — it is read alongside the pin`).toEqual([...history].sort());
+    expect(new Set(history).size, `EVER_PINNED_VOCAB.${key} must not contain duplicates`).toBe(history.length);
+  });
+
+  test(`every emitted ${key}: literal is pinned (a new token is a contract change)`, () => {
+    expect(emitted.length).toBeGreaterThan(0); // the scan must actually find tokens
+    const unpinned = emitted.filter((token) => !pinnedSet.has(token));
+    expect(
+      unpinned,
+      `new ${key} tokens must be added to PINNED_VOCAB and EVER_PINNED_VOCAB, and documented (backticked) in the README's "${VOCAB_SECTION_HEADING}" section`,
+    ).toEqual([]);
+  });
+
+  test(`every pinned ${key} token is still emitted (a removal or rename is a contract change)`, () => {
+    const gone = pinned.filter((token) => !emittedSet.has(token));
+    expect(
+      gone,
+      `${key} tokens missing from the source scan. If the emitter really dropped them, move them from PINNED_VOCAB to RETIRED_VOCAB with a rationale — but check the emitter first: a token whose value stopped being statically readable looks identical here, and retiring one that is still live would put a false record in the ledger`,
+    ).toEqual([]);
+  });
+
+  test(`every pinned ${key} token is documented in the README vocabulary`, () => {
+    const undocumented = pinned.filter((token) => !README_VOCAB.includes(`\`${token}\``));
+    expect(
+      undocumented,
+      `these ${key} tokens are missing from the README's "${VOCAB_SECTION_HEADING}" vocabulary (stdout JSONL is a contract)`,
+    ).toEqual([]);
+  });
+
+  test(`retired ${key} tokens carry a rationale and are gone from the pin and the sources`, () => {
+    const problems = retirementProblems({
+      key,
+      retired,
+      pinned: pinnedSet,
+      emitted: emittedSet,
+      everPinned: new Set(EVER_PINNED_VOCAB[key]),
+    });
+    expect(problems, `RETIRED_VOCAB.${key} entries must each be a completed, documented retirement`).toEqual([]);
+  });
+
+  test(`the pinned and retired ${key} vocabularies account for every token ever pinned`, () => {
+    const problems = contractHistoryProblems({
+      key,
+      pinned,
+      retired,
+      everPinned: EVER_PINNED_VOCAB[key],
+    });
+    expect(problems, `PINNED_VOCAB.${key} + RETIRED_VOCAB.${key} must partition EVER_PINNED_VOCAB.${key}`).toEqual([]);
   });
 }
