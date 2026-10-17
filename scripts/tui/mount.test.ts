@@ -26,9 +26,10 @@ afterEach(() => {
 
 // A fake interactive terminal: the surface Ink's RENDER path drives (write/isTTY/columns/rows/
 // on/off), capturing every byte ever written. NOT the exhaustive set Ink touches — its
-// unmount/flush path also reads Writable-state props (destroyed, writableEnded, writable,
-// _writableState, writableLength, via ink.js getWritableStreamState). CaptureStream deliberately
-// leaves those undefined, so Ink's finish-unmount write-barrier takes its setImmediate branch here.
+// unmount/flush path also reads Writable-state props (destroyed, writableEnded, writable, via
+// ink.js getWritableStreamState). CaptureStream deliberately leaves those undefined, so Ink treats
+// it as writable and its finish-unmount barrier is a write("", cb) — the callback write() below
+// always acknowledges.
 // Production is unaffected because makeSealableStderr delegates every non-overridden member to the
 // real stream via Reflect.get fallthrough (lifecycle.ts) — that pass-through must stay COMPLETE;
 // do NOT narrow the production proxy to this render-only subset.
@@ -393,9 +394,10 @@ describe("post-render rollback + adapter cleanup (§U6 remediation)", () => {
   });
 
   test("the handle reuses ONE memoized exit promise — ink's waitUntilExit is never re-invoked after unmount", async () => {
-    // ink's waitUntilExit() re-registers a process 'beforeExit' handler whenever none is
+    // ink@7's waitUntilExit() re-registered a process 'beforeExit' handler whenever none was
     // present; calling it through the handle after requestUnmount (which removed the handler)
-    // would retain the instance and a process listener until process exit.
+    // retained the instance and a process listener until process exit. ink@8 guards that case
+    // itself; this pins the handle's memo, which keeps it correct without that guard.
     let waitCalls = 0;
     let resolveExit: () => void = () => {};
     const instance = {
@@ -489,7 +491,9 @@ describe("P0 ink-testing-library verdict (§U7)", () => {
   // stdout receives live frames pre-unmount (non-interactive append mode) and lastFrame() tracks
   // them. This test IS the verdict: if a future Ink bump breaks the pairing, it fails loudly and
   // the panel tests must switch to mounting via the real adapter against capture streams instead.
-  test("ink-testing-library renders ink@7 content and tracks lastFrame()", async () => {
+  // Re-passed at the ink@8.0.0 bump. ITL declares ink only as a devDependency (^5.0.0) — no runtime
+  // or peer dependency — so the "ink" it imports resolves to this repo's pinned one.
+  test("ink-testing-library renders the pinned ink's content and tracks lastFrame()", async () => {
     const [{ render }, { createElement }, ink] = await Promise.all([
       import("ink-testing-library"),
       import("react"),
