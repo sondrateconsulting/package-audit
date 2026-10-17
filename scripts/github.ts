@@ -42,7 +42,8 @@ export class GithubApiError extends Error {
 // from waitBucket). Either way the orchestrator treats it as TRANSIENT and defers to the
 // NEXT invocation instead of recording a permanent failure:
 // a mid-scan exhaustion resets that unit to `pending` with NO errors row (the §3 skip
-// predicate only skips `done` units, so a later run retries it); a repo/branch discovery
+// predicate only skips `done` units, so a later run that re-enumerates it retries — and can
+// throttle again); a repo/branch discovery
 // exhaustion logs a JSONL requeue event only (discovery re-runs every invocation anyway);
 // and an owner-resolution exhaustion ends the run cleanly WITHOUT starting one (no phantom
 // run row). --plan, which has no DB, instead counts a repo/branch discovery escape into its
@@ -53,7 +54,7 @@ export class ThrottleExhausted extends Error {
   readonly endpoint: string;
   constructor(endpoint: string) {
     super(
-      `rate-limit throttling persisted beyond the retry/pause budget for ${endpoint} — wait for the rate-limit window to reset, then re-run; a resumed run skips already-completed units`,
+      `retry/pause budget exhausted for ${endpoint} — either this call ran out of retries (rate limiting or repeated HTTP 5xx) or the run spent its cumulative pause budget; wait and re-run, and a resumed run skips already-completed units`,
     );
     this.name = "ThrottleExhausted";
     this.endpoint = endpoint;
@@ -693,7 +694,7 @@ export type Classification =
   | { kind: "ok" }
   | { kind: "primary"; untilMs: number } // wait until the x-ratelimit-reset epoch
   | { kind: "secondary"; waitMs: number | null } // Retry-After if present, else caller backoff
-  | { kind: "transient" } // 5xx / spawn-level network failure — bounded backoff retry
+  | { kind: "transient" } // HTTP 5xx — bounded backoff retry (a spawn-level network failure has no HTTP response and takes the separate no-response path, which exhausts as GithubApiError, never ThrottleExhausted)
   | { kind: "fatal"; status: number; ssoRequired: boolean; message: string };
 
 const CLOCK_SKEW_MS = 5_000;
@@ -2649,7 +2650,7 @@ export class GithubClient {
       // mismatch is NOT transient (the branch genuinely moved), so it is never retried.
       if (headSha.toLowerCase() !== pinnedOid.toLowerCase())
         throw new GithubApiError(
-          `clone HEAD ${headSha} does not match the discovery-pinned ${pinnedOid} for ${org}/${repo}@${branch} — the branch moved between discovery and clone; failing closed (self-heals via the next run's re-discovery)`,
+          `clone HEAD ${headSha} does not match the discovery-pinned ${pinnedOid} for ${org}/${repo}@${branch} — the branch moved between discovery and clone; failing closed — a later run retries this branch only if it still re-enumerates it (re-discovered repo, still scan-eligible), and that retry can fail or throttle again`,
           { endpoint: url },
         );
       return { dir: dest, cloneAttempts: starts.count };

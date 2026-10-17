@@ -136,7 +136,7 @@ describe("open — fresh create", () => {
     const path = nextFile();
     const db1 = AuditDb.open({ sqlitePath: path });
     const { runId } = db1.startRun(runInput());
-    db1.completeRun(runId);
+    db1.completeRun(runId, { discoveryScopesDeferred: 0 });
     db1.close();
     const db2 = AuditDb.open({ sqlitePath: path });
     expect(db2.getRun(runId)?.status).toBe("completed");
@@ -968,6 +968,9 @@ describe("ownership — every database this tool legitimately produces still ope
   // into an era shape: its table-level CHECKs reference the policy columns (SQLite refuses the
   // DROP) and no ALTER can un-widen the status CHECK, so a genuine era fixture must rebuild.
   // The v2 era is this rebuild plus a DROP of is_default_branch (no CHECK references it).
+  // The v4 era down-transform: `runs` before it gained the nullable §4 discovery-throttle evidence
+  // column. A plain DROP suffices — the v4→v5 step is a pure additive ALTER with no CHECK to unwind.
+  const DROP_V5_RUNS_COLUMN = "ALTER TABLE runs DROP COLUMN discovery_scopes_deferred";
   const RUH_V3_ERA_REBUILD: readonly string[] = [
     `CREATE TABLE run_unit_head__era (
       run_id TEXT NOT NULL REFERENCES runs(run_id),
@@ -1032,8 +1035,9 @@ describe("ownership — every database this tool legitimately produces still ope
     // DOWN_TRANSFORMS (and the self-heal that makes the new span entry true) fails here loudly,
     // by design.
     const DOWN_TRANSFORMS: Record<number, readonly string[]> = {
-      2: [...RUH_V3_ERA_REBUILD, "ALTER TABLE run_unit_head DROP COLUMN is_default_branch"],
-      3: RUH_V3_ERA_REBUILD,
+      2: [...RUH_V3_ERA_REBUILD, "ALTER TABLE run_unit_head DROP COLUMN is_default_branch", DROP_V5_RUNS_COLUMN],
+      3: [...RUH_V3_ERA_REBUILD, DROP_V5_RUNS_COLUMN],
+      4: [DROP_V5_RUNS_COLUMN],
     };
     for (let v = 2; v < SCHEMA_VERSION; v++) expect(DOWN_TRANSFORMS[v]?.length ?? 0).toBeGreaterThan(0);
 
@@ -1082,15 +1086,68 @@ describe("ownership — every database this tool legitimately produces still ope
       const healed = new Database(path, { readonly: true, strict: true });
       for (const t of AUDIT_TABLE_NAMES) expect(shapeOf(healed, t)).toBe(refShapes.get(t)!);
       // Rows rode through: the run survived and the head row kept its fields (a drop-and-recreate
-      // "heal" would fail here). Columns the era-v transform destroyed read NULL — every era loses
-      // the v4 policy columns (the seeded scanned_commit_date proves the loss is honest, never
+      // "heal" would fail here). Columns the era-v transform destroyed read NULL — the pre-v4 eras
+      // lose the v4 policy columns (the seeded scanned_commit_date proves the loss is honest, never
       // refabricated); the v2 transform additionally loses is_default_branch, while the v3 era
-      // KEEPS it (its body carries the column, so the heal must preserve the stored 1).
+      // KEEPS it (its body carries the column, so the heal must preserve the stored 1). The v4 era
+      // touches run_unit_head not at all — it only drops the v5 `runs` column — so its head row must
+      // survive INTACT, scanned_commit_date included: a heal that nulled it there would be
+      // destroying data the era never damaged.
       expect((healed.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n).toBe(1);
       expect(healed.query("SELECT branch, commit_sha, is_default_branch, scanned_commit_date FROM run_unit_head").all())
-        .toEqual([{ branch: "main", commit_sha: "s", is_default_branch: v >= 3 ? 1 : null, scanned_commit_date: null }]);
+        .toEqual([{ branch: "main", commit_sha: "s", is_default_branch: v >= 3 ? 1 : null, scanned_commit_date: v >= 4 ? "2025-06-01T12:00:00Z" : null }]);
+      // The v5 column is restored by the heal, and honestly EMPTY: the era-4 database recorded no
+      // discovery evidence, so NULL (unknown) is the only truthful value — never a fabricated 0.
+      expect((healed.query("SELECT discovery_scopes_deferred AS d FROM runs").get() as { d: number | null }).d).toBeNull();
       healed.close();
     }
+  });
+
+  test("the v4→v5 step still HEALS a damaged run_unit_head — the bump must not skip the shape repair", () => {
+    // Before v5 existed, a v4-STAMPED database carrying a recognized PREDECESSOR run_unit_head shape
+    // was the healable-damage class: it landed in the current-stamp self-heal branch and got
+    // healRunUnitHeadShape plus the fingerprint/FK verification on its first open. Bumping
+    // SCHEMA_VERSION moves that same file into the MIGRATION branch, so a v4→v5 step that only adds
+    // its column and stamps 5 would leave that database stamped CURRENT while still damaged.
+    const path = nextFile();
+    const seedDb = AuditDb.open({ sqlitePath: path });
+    const runId = seedDb.startRun(runInput()).runId;
+    seedDb.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
+    seedDb.completeRun(runId, { discoveryScopesDeferred: 0 });
+    seedDb.close();
+    const d = new Database(path, { strict: true });
+    d.exec("ALTER TABLE runs DROP COLUMN discovery_scopes_deferred");
+    for (const sql of RUH_V3_ERA_REBUILD) d.exec(sql);
+    d.exec("PRAGMA user_version = 4");
+    d.close();
+
+    const db = AuditDb.open({ sqlitePath: path });
+    expect((raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+    // REPAIRED, not merely re-stamped: the v4 policy columns are back and the row rode through
+    expect(raw(db).query("SELECT branch, policy_status, scanned_commit_date FROM run_unit_head").all())
+      .toEqual([{ branch: "main", policy_status: null, scanned_commit_date: null }]);
+    expect(raw(db).query(`PRAGMA foreign_key_check`).all()).toEqual([]);
+    db.close();
+  });
+
+  test("openReadOnly REFUSES a current-stamped database missing the v5 column instead of reading undefined", () => {
+    // openReadOnly cannot heal, so it must refuse LOUDLY. Silently accepting the damaged shape makes
+    // getRun map the absent column to undefined, which JSON.stringify then DROPS — emitting a report
+    // whose required summary field is simply missing, which its own strict schema rejects.
+    const path = nextFile();
+    const w = AuditDb.open({ sqlitePath: path });
+    w.completeRun(w.startRun(runInput()).runId, { discoveryScopesDeferred: 4 });
+    w.close();
+    const d = new Database(path, { strict: true });
+    d.exec("ALTER TABLE runs DROP COLUMN discovery_scopes_deferred"); // stamp stays CURRENT
+    d.close();
+    expect(() => AuditDb.openReadOnly({ sqlitePath: path })).toThrow(/discovery_scopes_deferred/);
+    // ...and the writable open still HEALS it, so the refusal's advice is actionable
+    const healed = AuditDb.open({ sqlitePath: path });
+    const run = healed.latestReportableRun()!;
+    expect(run.discoveryScopesDeferred).toBeNull(); // healed to UNKNOWN, never a fabricated 0
+    expect(JSON.stringify(run)).toContain("discoveryScopesDeferred"); // and never undefined
+    healed.close();
   });
 
   test("a foreign table matching an audit table's column NAMES but not its types is refused", () => {
@@ -1665,7 +1722,7 @@ describe("--fresh / --purge-cache", () => {
     depFinding(db1, { runId });
     db1.putApiCache({ method: "GET", url: "u", variantHash: "", etag: "e", responseBody: "b" });
     db1.writeApiSurface({ packageName: "expo", version: "50.0.0", versionSource: "lockfile", rows: [] });
-    db1.completeRun(runId);
+    db1.completeRun(runId, { discoveryScopesDeferred: 0 });
     db1.close();
 
     let db2!: AuditDb;
@@ -1849,7 +1906,7 @@ describe("run lifecycle — startup rules (§3)", () => {
   test("completeRun sets completed_at; failRun leaves it NULL", () => {
     const db = mem();
     const a = db.startRun(runInput()).runId;
-    db.completeRun(a);
+    db.completeRun(a, { discoveryScopesDeferred: 0 });
     const doneRun = db.getRun(a)!;
     expect(doneRun.status).toBe("completed");
     expect(doneRun.completedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
@@ -1861,11 +1918,144 @@ describe("run lifecycle — startup rules (§3)", () => {
     db.close();
   });
 
+  // §4 discovery-throttle evidence (v5). This is PER-RUN IMMUTABLE evidence, deliberately unlike
+  // branchesDeferred's mutable current-config backlog: a throttled owner/repo DISCOVERY enqueues
+  // NOTHING and records NO error, so the queue can never carry the fact and a regenerated report
+  // would silently read clean. completeRun seals it with the status+timestamp in ONE statement.
+  test("completeRun seals discovery-scope evidence atomically with status and completed_at", () => {
+    const db = mem();
+    const a = db.startRun(runInput()).runId;
+    // a RUNNING run has not yet sealed its evidence — unknown, never 0
+    expect(db.getRun(a)!.discoveryScopesDeferred).toBeNull();
+    db.completeRun(a, { discoveryScopesDeferred: 2 });
+    const done = db.getRun(a)!;
+    expect(done.status).toBe("completed");
+    expect(done.completedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(done.discoveryScopesDeferred).toBe(2);
+    // a clean run seals an explicit 0 — "we looked and nothing was deferred" is a DIFFERENT claim
+    // from the NULL a pre-v5 or unfinished run carries.
+    const b = db.startRun(runInput({ configHash: "hash-9" })).runId;
+    db.completeRun(b, { discoveryScopesDeferred: 0 });
+    expect(db.getRun(b)!.discoveryScopesDeferred).toBe(0);
+    // failRun never seals evidence: a failed run's coverage is unknowable, not zero
+    const c = db.startRun(runInput({ configHash: "hash-8" })).runId;
+    db.failRun(c);
+    expect(db.getRun(c)!.discoveryScopesDeferred).toBeNull();
+    db.close();
+  });
+
+  test("completeRun SEALS: evidence cannot be rewritten, a failed run cannot be revived, a missing run cannot pass silently", () => {
+    const db = mem();
+    const a = db.startRun(runInput()).runId;
+    db.completeRun(a, { discoveryScopesDeferred: 2 });
+    // "sealed" has to MEAN something. Without this the field's contract — immutable per-run
+    // evidence, in contrast to the mutable queue backlog — is a comment rather than a guarantee,
+    // and a second completion could launder a recorded throttle into a reassuring 0.
+    expect(() => db.completeRun(a, { discoveryScopesDeferred: 0 })).toThrow();
+    expect(db.getRun(a)!.discoveryScopesDeferred).toBe(2);
+    // a FAILED run must not be revivable into completed: its coverage is unknowable, not clean
+    const b = db.startRun(runInput({ configHash: "h-b" })).runId;
+    db.failRun(b);
+    expect(() => db.completeRun(b, { discoveryScopesDeferred: 0 })).toThrow();
+    expect(db.getRun(b)!.status).toBe("failed");
+    expect(db.getRun(b)!.discoveryScopesDeferred).toBeNull();
+    // a nonexistent run id must be LOUD, not an UPDATE that matches nothing and "succeeds"
+    expect(() => db.completeRun("no-such-run", { discoveryScopesDeferred: 0 })).toThrow();
+    db.close();
+  });
+
+  test("completeRun accepts an EXPLICIT null — a resumed run whose earlier invocations are unknowable", () => {
+    // A resumed run REUSES its run_id, but the discovery accumulator is per-invocation and in
+    // memory: an earlier invocation's throttles are gone. Sealing this invocation's 0 over them
+    // would launder a real deferral into a clean number — the exact failure this evidence exists to
+    // prevent. null (UNKNOWN) is the honest value, and it is passed EXPLICITLY, never defaulted.
+    const db = mem();
+    const r = db.startRun(runInput()).runId;
+    db.completeRun(r, { discoveryScopesDeferred: null });
+    expect(db.getRun(r)!.status).toBe("completed");
+    expect(db.getRun(r)!.discoveryScopesDeferred).toBeNull();
+    db.close();
+  });
+
+  test("MALFORMED persisted discovery evidence fails loudly on READ, never leaks into a report", () => {
+    // completeRun validates on WRITE, but the database is a local file an operator can edit and the
+    // column carries no CHECK (kept constraint-free so the v4→v5 ALTER stays additive and the shape
+    // fingerprint stays comparable). Without a READ-side gate a hand-edited TEXT/negative/fractional
+    // value flows straight through getRun into report JSON and the exports — and the HTML, which
+    // only tests `> 0`, would suppress a NEGATIVE exactly like a clean zero. Fail closed instead.
+    const db = mem();
+    const r = db.startRun(runInput()).runId;
+    db.completeRun(r, { discoveryScopesDeferred: 1 });
+    for (const bogus of ["'bogus'", "-1", "1.5"]) {
+      raw(db).exec(`UPDATE runs SET discovery_scopes_deferred = ${bogus} WHERE run_id = '${r}'`);
+      expect(() => db.getRun(r)).toThrow(/discovery_scopes_deferred/);
+    }
+    // ...and a legitimately NULL or non-negative integer still reads fine
+    raw(db).exec(`UPDATE runs SET discovery_scopes_deferred = NULL WHERE run_id = '${r}'`);
+    expect(db.getRun(r)!.discoveryScopesDeferred).toBeNull();
+    raw(db).exec(`UPDATE runs SET discovery_scopes_deferred = 0 WHERE run_id = '${r}'`);
+    expect(db.getRun(r)!.discoveryScopesDeferred).toBe(0);
+    db.close();
+  });
+
+  test("failRun cannot demote a COMPLETED run — a sealed run's evidence stays sealed", () => {
+    // Every surface documents "failed => no evidence (null)". An unguarded failRun would break that
+    // by leaving a completed run's integer evidence attached to a 'failed' row, and would also
+    // silently succeed on an unknown run id. Guard it exactly like completeRun.
+    const db = mem();
+    const a = db.startRun(runInput()).runId;
+    db.completeRun(a, { discoveryScopesDeferred: 3 });
+    expect(() => db.failRun(a)).toThrow();
+    expect(db.getRun(a)!.status).toBe("completed"); // still completed, evidence intact
+    expect(db.getRun(a)!.discoveryScopesDeferred).toBe(3);
+    expect(() => db.failRun("no-such-run")).toThrow();
+    // a RUNNING run still fails normally, and keeps null evidence
+    const b = db.startRun(runInput({ configHash: "h-f" })).runId;
+    db.failRun(b);
+    expect(db.getRun(b)!.status).toBe("failed");
+    expect(db.getRun(b)!.discoveryScopesDeferred).toBeNull();
+    db.close();
+  });
+
+  test("completeRun REJECTS a non-integer or negative discovery-scope count", () => {
+    const db = mem();
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const r = db.startRun(runInput({ configHash: `h-${bad}` })).runId;
+      expect(() => db.completeRun(r, { discoveryScopesDeferred: bad })).toThrow();
+      // the run must NOT have been completed by a rejected call
+      expect(db.getRun(r)!.status).toBe("running");
+    }
+    db.close();
+  });
+
+  test("v4→v5 is additive: runs gains a NULLABLE discovery_scopes_deferred, old rows backfill NULL never 0", () => {
+    const path = nextFile();
+    // build a CURRENT database, then DOWN-transform to a faithful v4: drop the v5 column, re-stamp
+    const seed = AuditDb.open({ sqlitePath: path });
+    const runId = seed.startRun(runInput()).runId;
+    seed.completeRun(runId, { discoveryScopesDeferred: 3 });
+    seed.close();
+    const d = new Database(path, { strict: true });
+    d.exec("ALTER TABLE runs DROP COLUMN discovery_scopes_deferred");
+    d.exec("PRAGMA user_version = 4");
+    d.close();
+
+    const db = AuditDb.open({ sqlitePath: path }); // reopening migrates v4 → v5
+    expect((raw(db).query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION);
+    const run = db.getRun(runId)!;
+    expect(run.status).toBe("completed"); // faithful v4 data survives the ALTER
+    expect(run.configHash).toBe("hash-1");
+    // NULL, never 0 — a pre-v5 run has no evidence, which is NOT the same as "nothing was deferred"
+    expect(run.discoveryScopesDeferred).toBeNull();
+    expect(raw(db).query(`PRAGMA foreign_key_check`).all()).toEqual([]);
+    db.close();
+  });
+
   test("latestReportableRun: completed + non-empty tracked_packages, latest first", () => {
     const db = mem();
     expect(db.latestReportableRun()).toBeNull();
     const a = db.startRun(runInput()).runId;
-    db.completeRun(a);
+    db.completeRun(a, { discoveryScopesDeferred: 0 });
     // an empty-tracked (pre-migration-shaped) completed run must never win
     raw(db)
       .query(
@@ -1922,6 +2112,73 @@ describe("work_queue", () => {
     unit = db.getUnit(key)!;
     expect(unit.lastCommitDate).toBeNull(); // explicit null clears
     expect(unit.errorMessage).toBeNull(); // omitted errorMessage clears stale message
+    db.close();
+  });
+
+  test("settlePastCapUnit: settles ONLY a pending branch row — done/error/absent/foreign-config rows untouched", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    rawRun(db, "r2", "running");
+    const key = (branch: string, configHash = "h") => ({ configHash, scope: "branch" as const, organization: "o", repository: "r", branch });
+    db.enqueueUnit(key("stale"), "r1");
+    db.setUnitStatus(key("stale"), { status: "pending", runId: "r1", errorMessage: "rate limited (core)" });
+    db.enqueueUnit(key("finished"), "r1");
+    db.setUnitStatus(key("finished"), { status: "done", runId: "r1", lastCommitSha: "s1", lastCommitDate: "2024-01-01T00:00:00.000Z" });
+    db.enqueueUnit(key("broken"), "r1");
+    db.setUnitStatus(key("broken"), { status: "error", runId: "r1", errorMessage: "boom" });
+    db.enqueueUnit(key("paused"), "r1");
+    db.setUnitStatus(key("paused"), { status: "in_progress", runId: "r1" });
+    db.enqueueUnit(key("already-skipped"), "r1");
+    db.setUnitStatus(key("already-skipped"), { status: "skipped", runId: "r1" });
+    db.enqueueUnit(key("stale", "other-config"), "r1"); // same branch name under a FOREIGN config
+    // pending → settled: skipped, stale throttle message cleared, last_run_id moves to the settling run
+    expect(db.settlePastCapUnit(key("stale"), "r2")).toBe(true);
+    const settled = db.getUnit(key("stale"))!;
+    expect(settled.status).toBe("skipped");
+    expect(settled.errorMessage).toBeNull();
+    expect(settled.lastRunId).toBe("r2");
+    // done survives for the §3 skip-reuse predicate; error survives for a later re-enumerated rescan
+    expect(db.settlePastCapUnit(key("finished"), "r2")).toBe(false);
+    expect(db.getUnit(key("finished"))!.status).toBe("done");
+    expect(db.settlePastCapUnit(key("broken"), "r2")).toBe(false);
+    expect(db.getUnit(key("broken"))!.status).toBe("error");
+    // a live attempt is being ATTEMPTED, not deferred — and an already-settled row settles only once
+    expect(db.settlePastCapUnit(key("paused"), "r2")).toBe(false);
+    expect(db.getUnit(key("paused"))!.status).toBe("in_progress");
+    expect(db.settlePastCapUnit(key("already-skipped"), "r2")).toBe(false);
+    expect(db.getUnit(key("already-skipped"))!.lastRunId).toBe("r1"); // untouched, not merely same-status
+    // absent row (a past-cap branch that was never enqueued): clean no-op
+    expect(db.settlePastCapUnit(key("never-enqueued"), "r2")).toBe(false);
+    // the foreign config's identical key is a different unit entirely
+    expect(db.getUnit(key("stale", "other-config"))!.status).toBe("pending");
+    db.close();
+  });
+
+  test("settlePastCapUnit: pinned to scope='branch' in SQL — an org-scope pending row can never be settled by it", () => {
+    const db = mem();
+    rawRun(db, "r1", "running");
+    db.enqueueUnit({ configHash: "h", scope: "org", organization: "o" }, "r1");
+    // an org-scope KEY is rejected by the key gate before any SQL runs…
+    expect(db.settlePastCapUnit({ configHash: "h", scope: "org", organization: "o" }, "r1")).toBe(false);
+    expect(db.getUnit({ configHash: "h", scope: "org", organization: "o" })!.status).toBe("pending");
+    // …and the SQL's own scope predicate holds INDEPENDENTLY: a branch-scope key with omitted
+    // repository/branch binds the org row's ''/'' sentinels, REACHES the SQL, and must still match
+    // nothing (dropping `AND scope='branch'` from the UPDATE turns exactly this expectation red).
+    expect(db.settlePastCapUnit({ configHash: "h", scope: "branch", organization: "o" }, "r1")).toBe(false);
+    expect(db.getUnit({ configHash: "h", scope: "org", organization: "o" })!.status).toBe("pending");
+    db.close();
+  });
+
+  test("settlePastCapUnit: a MIS-SCOPED key carrying branch coordinates settles nothing — the key's own scope gates, not just the SQL", () => {
+    // WorkUnitKey's repository/branch are optional on every scope, so a type-valid scope:'org' key
+    // CAN carry a branch row's exact coordinates; binding them regardless would settle that aliased
+    // branch row. The method must reject the key by its scope, not merely pin scope='branch' in SQL.
+    const db = mem();
+    rawRun(db, "r1", "running");
+    db.enqueueUnit({ configHash: "h", scope: "branch", organization: "o", repository: "r", branch: "stale" }, "r1");
+    db.setUnitStatus({ configHash: "h", scope: "branch", organization: "o", repository: "r", branch: "stale" }, { status: "pending", runId: "r1", errorMessage: "rate limited (core)" });
+    expect(db.settlePastCapUnit({ configHash: "h", scope: "org", organization: "o", repository: "r", branch: "stale" }, "r1")).toBe(false);
+    expect(db.getUnit({ configHash: "h", scope: "branch", organization: "o", repository: "r", branch: "stale" })!.status).toBe("pending");
     db.close();
   });
 
@@ -2700,8 +2957,8 @@ describe("--fresh drop-time warning", () => {
   test("--fresh over completed runs emits ONE warning event with the dropped count", () => {
     const path = nextFile();
     const db1 = AuditDb.open({ sqlitePath: path });
-    db1.completeRun(db1.startRun(runInput()).runId);
-    db1.completeRun(db1.startRun(runInput({ configHash: "hash-2" })).runId);
+    db1.completeRun(db1.startRun(runInput()).runId, { discoveryScopesDeferred: 0 });
+    db1.completeRun(db1.startRun(runInput({ configHash: "hash-2" })).runId, { discoveryScopesDeferred: 0 });
     db1.close();
 
     let db2: AuditDb | null = null;
@@ -3140,7 +3397,7 @@ describe("openReadOnly (read seam)", () => {
     const db = AuditDb.open({ sqlitePath: path });
     const { runId } = db.startRun(runInput());
     db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
-    db.completeRun(runId);
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
     db.close();
     return runId;
   }
@@ -3266,14 +3523,14 @@ describe("openReadOnly (read seam)", () => {
     const writer = AuditDb.open({ sqlitePath: path });
     try {
       const { runId } = writer.startRun(runInput());
-      writer.completeRun(runId);
+      writer.completeRun(runId, { discoveryScopesDeferred: 0 });
       // writer connection still open (live -wal/-shm) — the reader must see committed state
       const reader = AuditDb.openReadOnly({ sqlitePath: path });
       try {
         expect(reader.getRun(runId)?.status).toBe("completed");
         // …and later writer commits become visible to subsequent reads on the same reader
         const second = writer.startRun(runInput({ configHash: "hash-2" })).runId;
-        writer.completeRun(second);
+        writer.completeRun(second, { discoveryScopesDeferred: 0 });
         expect(reader.getRun(second)?.status).toBe("completed");
       } finally {
         reader.close();
@@ -3315,7 +3572,7 @@ describe("open — version check precedes the --fresh drop", () => {
   test("a NEWER-versioned database is rejected by --fresh with all data intact", () => {
     const path = nextFile();
     const db1 = AuditDb.open({ sqlitePath: path });
-    db1.completeRun(db1.startRun(runInput()).runId);
+    db1.completeRun(db1.startRun(runInput()).runId, { discoveryScopesDeferred: 0 });
     db1.close();
     const bump = new Database(path, { strict: true });
     bump.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
@@ -3336,7 +3593,7 @@ describe("open — a corrupt v4 run_unit_head (missing a column) is REJECTED, ne
     const db1 = AuditDb.open({ sqlitePath: path });
     const { runId } = db1.startRun(runInput());
     db1.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
-    db1.completeRun(runId);
+    db1.completeRun(runId, { discoveryScopesDeferred: 0 });
     db1.close();
     // Forge a corrupt shape: current stamp, run_unit_head missing a column. An atomic migration can
     // never produce this, so the tool refuses it rather than guessing — the policy columns carry
@@ -3368,7 +3625,7 @@ describe("migration — v3→v4 rebuild + v4 collision defense (CRITICAL data sa
     const { runId } = db.startRun(runInput());
     db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "main", commitSha: "s", status: "scanned", isDefaultBranch: true, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
     db.upsertRunUnitHead({ runId, organization: "o", repository: "r", branch: "old", commitSha: "", status: "skipped-cutoff", isDefaultBranch: false, policyStatus: null, policyMatchedPattern: null, scannedCommitDate: "2025-06-01T12:00:00Z" });
-    db.completeRun(runId);
+    db.completeRun(runId, { discoveryScopesDeferred: 0 });
     db.close();
     return runId;
   }
@@ -4342,7 +4599,7 @@ describe("live compat backstop — states the base-image preflight cannot see", 
     // preflight's zero-handle guarantee is driven directly: assertOwnedDatabase itself must throw.
     const path = nextFile();
     const raw = new Database(path, { create: true, strict: true });
-    raw.exec("PRAGMA user_version = 5"); // zero objects, stamp newer than SCHEMA_VERSION (4)
+    raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`); // zero objects, stamp newer than this build
     raw.close();
     expect(() => assertOwnedDatabase(path)).toThrow(/newer than this tool's/);
     // …while an empty file at the CURRENT stamp stays adoptable — the exact on-disk state a

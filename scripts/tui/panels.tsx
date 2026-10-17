@@ -128,7 +128,7 @@ function bannerRow(r: BannerReason, nowMs: number): ReactNode {
     case "budget-exhausted":
       return (
         <Row key="budget">
-          <Text color="red">✖ pause budget exhausted — remaining throttled work defers to the next run</Text>
+          <Text color="red">✖ pause budget exhausted — remaining throttled work stays pending for a future run</Text>
         </Row>
       );
     default:

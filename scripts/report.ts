@@ -63,6 +63,8 @@ export interface ReportSummary {
   //                           + branchesPastCap + branchesErrored   — EXACT on a SINGLE-INVOCATION run.
   //   discovered (terminal) <= that sum                             — on a RESUMED run; see branchesErrored
   //                                                                   for exactly which branches inflate it.
+  //   branchesDeferred is OUTSIDE this identity on purpose: non-terminal work, counted from the queue,
+  //   overlapping these buckets on RESUMED runs and on HISTORICAL RE-RENDERS, both spelled out below.
   // branchesScanned INCLUDES scanned default-override rows (they WERE scanned). branchesSkippedByCutoff is
   // GENUINE cutoff only (policy_status IS NULL) — policy exclusions are their own bucket.
   branchesExcludedByPolicy: number;
@@ -94,10 +96,69 @@ export interface ReportSummary {
   // identity above stays an UPPER BOUND (never a double-count) rather than an equality on a resume.
   //
   // Throttle carve-out, precisely: a branch throttle-requeued with NO prior error has neither a row nor
-  // an error — deferred, not terminal, finished next run — so it is in no count. That holds absolutely
+  // an error — deferred, not terminal, retried when a later run re-enumerates it — so it is in none of the PARTITION counts
+  // (branchesDeferred below is where it shows). That holds absolutely
   // only WITHIN a single invocation; after an earlier-invocation error the branch DOES carry an error
   // and so IS counted here, despite being deferred rather than terminal.
   branchesErrored: number;
+  // The carve-out above, made VISIBLE (§4): COUNT of this config's work_queue rows (scope='branch')
+  // still 'pending' when the report was built — deferred work, throttle-requeued in the common case
+  // (crash-recovery resets land here too), that a future run retries WHERE it still re-enumerates
+  // the unit. Deliberately NOT a sixth term of the identity above (deferred is non-terminal), and
+  // NEVER folded into branchesErrored: on a single-invocation run, rendered at its own completion,
+  // the deferred set is disjoint from every count here — enforced at the SOURCE, not by this query:
+  // every disposition path settles or never-creates its pending row within the run
+  // (scanned/skip-current → 'done', skip-cutoff/policy → 'skipped', past-cap settles a stale one via
+  // db.ts::settlePastCapUnit, throttle leaves 'pending' with NO row). A HISTORICAL re-render can
+  // overlap even so — a LATER run's throttle re-pends a branch this run scanned, and the same
+  // generation-time currency that drains this count to 0 refills it — while on a RESUMED run a
+  // deferred branch can ALSO carry an earlier invocation's
+  // append-only error (→ branchesErrored) or retained disposition row (→ that bucket) — the same
+  // both-ways divergences branchesErrored documents — so summing it into the partition would
+  // double-count. It is a QUEUE-side total, not a disposition. 'pending' alone counts: an
+  // in_progress row seen by a report generated beside a live audit is being attempted, not deferred.
+  //
+  // Source: the MUTABLE cross-run work_queue — one of TWO summary counts read outside the immutable
+  // run_unit_head slice (PROMPT.md §7 sanctions both; the other is discoveryScopesDeferred, which
+  // reads the run row's sealed evidence). By design, then, this is the CURRENT
+  // backlog at generation time: re-rendering an old --run-id reports 0 IF later runs drained the queue (a row no run
+  // re-enumerates never drains) — the count answers "what does this config still owe", a debt a future run retries or settles
+  // only for the units it still re-enumerates (a retry can throttle again). Known skews,
+  // queue-inherited (non-exhaustive): a throttled
+  // owner/repo DISCOVERY enqueues nothing, so branches it never enumerated are invisible here
+  // (UNDERCOUNT — though prior-run pending rows under such a repo remain and do count); and a
+  // pending row whose unit is never RE-ENUMERATED lingers (OVERCOUNT — nothing prunes work_queue):
+  // its branch deleted, its repo out of the kept set (deleted, renamed, newly archived/fork-filtered,
+  // or displaced past maxReposPerOrg — the reconciliation taxonomy), or its owner no longer
+  // discovered or accessible. Re-enumeration otherwise settles the row (scanned/skip-current →
+  // 'done'; skip-cutoff/skip-policy → 'skipped'; past-cap → 'skipped' via settlePastCapUnit) — or
+  // throttles again and leaves it pending.
+  branchesDeferred: number;
+  // The §4 DISCOVERY blind spot, made visible — the one hole branchesDeferred structurally cannot
+  // see. A throttled owner repo-listing or repository branch-listing enumerates nothing, so it
+  // enqueues no work unit and (by §4 design) records no errors row: its branches are invisible to
+  // the queue count above AND to branchesErrored. This counts the DISTINCT discovery scopes that
+  // exhausted their bounded RETRY/PAUSE budget during the reported run — ThrottleExhausted, which has
+  // TWO distinct mechanisms: a single call running out of retries (rate limiting or repeated HTTP
+  // 5xx), or the RUN spending its cumulative pause budget. A network/no-response failure exhausts as
+  // a permanent error instead and is NOT counted here.
+  //
+  // Read it as the OPPOSITE currency to branchesDeferred, and never sum the two:
+  //   - branchesDeferred      = the CURRENT pending backlog for the whole config, re-read at
+  //                             generation time (a later run drains it; re-rendering reports 0).
+  //   - discoveryScopesDeferred = IMMUTABLE per-run evidence, sealed by completeRun when the owner
+  //                             pool drained. Re-rendering an old run cannot launder it clean.
+  // One scope can hide an unbounded number of repos/branches, which is why it counts SCOPES and its
+  // name says so — it is not a branch count and must never be added to one.
+  //
+  // NULL means UNKNOWN, never "none": the run is still running, it failed, it predates schema v5
+  // (migrated rows backfill NULL by construction), or it was RESUMED and its completing invocation
+  // saw no throttles — that invocation cannot vouch for an earlier one, because the accumulator is
+  // per-invocation and in memory. A surface that renders NULL as 0 would assert the very
+  // completeness this field exists to disprove — say "unknown", or say nothing.
+  // EXACTNESS: on a fresh run the value is exact; on a RESUMED run a positive value is a LOWER
+  // BOUND (what the completing invocation counted), since earlier invocations' scopes are gone.
+  discoveryScopesDeferred: number | null;
   totalDependencyFindings: number;
   totalUsageFindings: number;
 }
@@ -116,7 +177,8 @@ export interface ReportSummary {
 // contract is separately enforced by reportSchema.ts in tests. errors[] stays untyped (leaf only).
 export interface EmittedReport {
   // PINNED to the constant, not a bare `number` (the COMPARE_FORMAT_VERSION precedent): this shape IS
-  // v2, so a build that emitted some other version here would be mislabelling itself, and reportSchema
+  // whatever XRAY_FORMAT_VERSION currently names, so a build that emitted some other version here
+  // would be mislabelling itself, and reportSchema
   // — the authoritative contract, but a TEST-ONLY one by design — would only catch it in the suite.
   formatVersion: typeof XRAY_FORMAT_VERSION; // the report/export/HTML artifact-set version
   runId: string;
@@ -193,6 +255,13 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
       .filter((k) => !headKeys.has(k)),
   ).size;
 
+  // §4 carve-out, made visible: the deferred remainder still pending in this config's queue.
+  // The ONE count sourced from the mutable work_queue — the deferred remainder exists
+  // nowhere else in SQLite; see the ReportSummary field comment for the full semantics.
+  const branchesDeferred = (db.read(
+    `SELECT COUNT(*) AS n FROM work_queue WHERE config_hash = ? AND scope = 'branch' AND status = 'pending'`,
+  ).get(run.configHash) as { n: number }).n;
+
   // Validate the WHOLE head set ONCE, then feed the SAME validated array to BOTH derivations below. This
   // replaces the old reliance on object-literal evaluation order (assertHeadsWellFormed ran INSIDE the
   // summary property while buildScanScope trusted the raw `heads`), so a property reorder can no longer
@@ -215,7 +284,11 @@ function buildReportInner(db: AuditDbReader, run: RunRecord): EmittedReport {
     // guarded only policy-BEARING rows while buildSummary counted by status alone, so a 'policy-excluded'
     // row naming no rule was counted as an exclusion yet never guarded — branchesExcludedByPolicy=1 with
     // excludedByDeny+excludedByAllow=0). Sweeping the whole set makes the two impossible to drift apart.
-    summary: buildSummary(scannedHeads, validatedHeads, depRows, usageRows, branchesErrored),
+    // discoveryScopesDeferred rides the RUN ROW, not a query: it was sealed at completion, and
+    // re-deriving it here would reintroduce the generation-time drift it exists to avoid.
+    summary: buildSummary(scannedHeads, validatedHeads, depRows, usageRows, {
+      branchesErrored, branchesDeferred, discoveryScopesDeferred: run.discoveryScopesDeferred,
+    }),
     scanScope: buildScanScope(validatedHeads),
   };
 }
@@ -227,7 +300,10 @@ function assertHeadsWellFormed(heads: HeadRow[]): HeadRow[] {
   return heads;
 }
 
-function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[], branchesErrored: number): ReportSummary {
+// The two externally-derived counts arrive as a keyed pair (not trailing positional numbers): keyed
+// passing removes SILENT positional transposition — an argument-order swap cannot compile, though
+// deliberately crossing the two values under the right keys still would.
+function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: DepRow[], usageRows: UsageRowDb[], counts: Pick<ReportSummary, "branchesErrored" | "branchesDeferred" | "discoveryScopesDeferred">): ReportSummary {
   const orgs = new Set(scannedHeads.map((h) => h.organization));
   const repos = new Set(scannedHeads.map((h) => `${h.organization}/${h.repository}`));
   return {
@@ -239,7 +315,9 @@ function buildSummary(scannedHeads: HeadRow[], allHeads: HeadRow[], depRows: Dep
     branchesSkippedByCutoff: allHeads.filter((h) => h.status === "skipped-cutoff").length,
     branchesExcludedByPolicy: allHeads.filter(isPolicyExcluded).length,
     branchesPastCap: allHeads.filter((h) => h.status === "past-cap").length,
-    branchesErrored,
+    branchesErrored: counts.branchesErrored,
+    branchesDeferred: counts.branchesDeferred,
+    discoveryScopesDeferred: counts.discoveryScopesDeferred,
     totalDependencyFindings: depRows.length,
     totalUsageFindings: usageRows.length,
   };
